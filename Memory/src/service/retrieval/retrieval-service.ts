@@ -40,7 +40,8 @@ import type { Embedder, LlmClient } from "../../model/types.js";
 import {
   kindFromMemory,
   Repositories,
-  type EpisodeRecord
+  type EpisodeRecord,
+  type RawTurnRecord
 } from "../../storage/repositories.js";
 import type {
   InjectedContext,
@@ -553,6 +554,42 @@ const MEMORY_PACKET_MAX_SNIPPET_BODY_CHARS = 640;
 
 const MEMORY_PACKET_SKILL_SUMMARY_CHARS = 200;
 const TURN_START_RECENT_RAW_TURN_EXCLUSION_LIMIT = 8;
+const QUERY_EXTRACT_HISTORY_MAX_CURRENT_CHARS = 2000;
+
+export interface QueryExtractHistoryTurn {
+  user: string;
+  assistant: string;
+}
+
+export function queryExtractHistoryFromRawTurns(
+  rawTurns: readonly RawTurnRecord[],
+  options: { currentTurnId?: string; maxTurns: number; maxChars: number }
+): QueryExtractHistoryTurn[] {
+  const maxTurns = Math.min(
+    Math.max(0, Math.trunc(options.maxTurns)),
+    TURN_START_RECENT_RAW_TURN_EXCLUSION_LIMIT
+  );
+  if (maxTurns === 0) return [];
+  const maxChars = Math.max(4, Math.trunc(options.maxChars));
+  const selected: QueryExtractHistoryTurn[] = [];
+  for (const turn of rawTurns) {
+    if (selected.length >= maxTurns) break;
+    if (turn.status !== "succeeded" || turn.redactedAt) continue;
+    if (options.currentTurnId && turn.turnId === options.currentTurnId) continue;
+    const user = (turn.userText ?? "").trim();
+    const assistant = (turn.assistantText ?? "").trim();
+    if (!user || !assistant) continue;
+    selected.push({ user: clip(user, maxChars), assistant: clip(assistant, maxChars) });
+  }
+  return selected.reverse();
+}
+
+function renderQueryExtractInput(raw: string, history: readonly QueryExtractHistoryTurn[]): string {
+  const current = `CURRENT USER INPUT:\n${raw.slice(0, 4000)}`;
+  if (history.length === 0 || raw.trim().length > QUERY_EXTRACT_HISTORY_MAX_CURRENT_CHARS) return current;
+  const lines = history.map((turn) => `user: ${turn.user}\nassistant: ${turn.assistant}`);
+  return `RECENT CONVERSATION (context only, oldest first):\n${lines.join("\n\n")}\n\n${current}`;
+}
 
 interface InjectedRenderOptions {
   contextHints?: Record<string, unknown>;
@@ -1837,12 +1874,12 @@ export class RetrievalService {
     const onboardingFirstReportHit = onboardingFirstReportMemory
       ? onboardingFirstReportRecallHit(onboardingFirstReportMemory)
       : null;
+    const recentRawTurns: RawTurnRecord[] = retrievalMode === "turn_start" && request.sessionId
+      ? this.deps.repos.runtime
+          .listRecentRawTurnsBySession(request.sessionId, TURN_START_RECENT_RAW_TURN_EXCLUSION_LIMIT)
+      : [];
     const recentRawTurnIds = retrievalMode === "turn_start" && request.sessionId
-      ? new Set(
-          this.deps.repos.runtime
-            .listRecentRawTurnsBySession(request.sessionId, TURN_START_RECENT_RAW_TURN_EXCLUSION_LIMIT)
-            .map((turn) => turn.id)
-        )
+      ? new Set(recentRawTurns.map((turn) => turn.id))
       : undefined;
     const tuning = this.retrievalTuningConfig();
     const allowedLayers = retrievalLayersForProfile(retrievalLayersForMode(retrievalMode), tuning);
@@ -1876,8 +1913,15 @@ export class RetrievalService {
           projectId: context.namespace.projectId?.trim() || null
         }) + userMemoryCount;
     const retrievalQuery = focusResearchRetrievalQuery(request.query, tuning.domain).text;
+    const queryExtractHistory = retrievalMode === "turn_start"
+      ? queryExtractHistoryFromRawTurns(recentRawTurns, {
+          currentTurnId: request.turnId,
+          maxTurns: this.deps.config.algorithm.retrieval.queryExtractHistoryTurns,
+          maxChars: this.deps.config.algorithm.retrieval.queryExtractHistoryTextChars
+        })
+      : [];
     const queryExtract = candidateCount > 0 && !onboardingFirstReportHit
-      ? await this.extractRetrievalQuery(retrievalQuery, timeZone)
+      ? await this.extractRetrievalQuery(retrievalQuery, timeZone, queryExtractHistory)
       : null;
     const queryVectorText = queryExtract?.queryVecText?.trim() || retrievalQuery;
     const timeFilter = semanticLayers.includes("L1") ? queryExtract?.timeFilter : undefined;
@@ -1950,6 +1994,10 @@ export class RetrievalService {
       : timeFilter
       ? { hits: retrieval.hits, status: ["time_filter:l1"] }
       : await this.filterRecallHits(queryVectorText, merged.hits);
+    // Only set when the filter step actually ran; the two shortcuts above never
+    // reach it. Pair it with the recorded status to tell a filter that returned
+    // early on too few candidates from one that ranked them.
+    const llmFilterMs = onboardingFirstReportHit || timeFilter ? undefined : Date.now() - rerankAt;
     const hits = onboardingFirstReportHit || timeFilter
       ? filteredHits.hits
       : mmrRecallHits(filteredHits.hits, retrievalLimit, tuning.mmrLambda);
@@ -2102,7 +2150,8 @@ export class RetrievalService {
           llmFilter: {
             outcome: filteredHits.status.length > 0 ? filteredHits.status.join(",") : "kept",
             kept: hits.length,
-            dropped: Math.max(0, merged.hits.length - hits.length)
+            dropped: Math.max(0, merged.hits.length - hits.length),
+            ...(llmFilterMs === undefined ? {} : { durationMs: llmFilterMs })
           },
           finalReturned: hits.length
         },
@@ -2496,7 +2545,11 @@ export class RetrievalService {
     }
   }
 
-  private async extractRetrievalQuery(rawQuery: string, timeZone: string): Promise<RetrievalQueryExtract | null> {
+  private async extractRetrievalQuery(
+    rawQuery: string,
+    timeZone: string,
+    history: readonly QueryExtractHistoryTurn[] = []
+  ): Promise<RetrievalQueryExtract | null> {
     const raw = rawQuery.trim();
     if (!raw || !this.deps.llm.isConfigured()) return null;
     try {
@@ -2512,7 +2565,7 @@ export class RetrievalService {
           },
           {
             role: "user",
-            content: `COMPLETE USER INPUT:\n${raw.slice(0, 4000)}`
+            content: renderQueryExtractInput(raw, history)
           }
         ],
         {

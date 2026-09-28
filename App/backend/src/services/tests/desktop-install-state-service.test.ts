@@ -60,6 +60,44 @@ describe("resetAccountRuntimeForDesktopInstallChange", () => {
     });
   });
 
+  it("keeps the active account across the reinstall marker used by MEMMY-594", async () => {
+    const context = createContext();
+    await seedAccountRuntime(context);
+
+    const result = await resetAccountRuntimeForDesktopInstallChange({
+      appStateStore: context.store,
+      databasePath: context.databasePath,
+      memmyConfigPath: context.memmyConfigPath,
+      installFingerprint: "1.1.8|win32|x64|C:\\Program Files\\Memmy\\Memmy.exe|2",
+      now: () => new Date("2026-06-20T10:00:00.000Z")
+    });
+
+    expect(result).toMatchObject({ changedInstall: true, resetAccountRuntime: false });
+    expect(context.store.repositories.accountSession.get()).toMatchObject({
+      authenticated: true,
+      profile: { userId: "user-a" }
+    });
+    expect(context.store.db.prepare("SELECT active_uuid FROM app_settings WHERE id = 'default'").get())
+      .toMatchObject({ active_uuid: "cloud-account-a" });
+  });
+
+  it("does not reactivate an account that was explicitly logged out before migration", async () => {
+    const context = createContext();
+    await seedAccountRuntime(context);
+    context.store.repositories.accountSession.clear();
+
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "email",
+      migrationConsistency: {
+        accountSourceIsAuthoritative: true,
+        runtimeSourceWasMigrated: true,
+        categorySourcesShareGeneration: false
+      }
+    })).rejects.toMatchObject({ code: "windows_data_migration_inconsistent" });
+    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+  });
+
   it("keeps account runtime when the desktop install fingerprint is unchanged", async () => {
     const context = createContext();
     await seedAccountRuntime(context);
