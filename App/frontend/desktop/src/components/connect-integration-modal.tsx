@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { isIntegrationSetupDiagnosticError, logHiddenIntegrationSetupDiagnosticError } from "../api/integration-errors.js";
+import { ApiRequestError } from "../api/http.js";
 import type { IntegrationsClient } from "../api/integrations-client.js";
 import { deriveIntegrationState, type IntegrationConnection } from "../integrations/connection-state.js";
 import { IntegrationLogoBadge, type IntegrationMeta } from "../integrations/integration-meta.js";
@@ -60,6 +61,9 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
   const mountedRef = useRef(false);
   const flowIdRef = useRef(0);
   const flowAbortRef = useRef<AbortController | null>(null);
+  const localErrorRef = useRef(false);
+  const integrationIdentityRef = useRef(props.integration?.identity ?? props.integration?.slug ?? null);
+  const integrationIdentity = props.integration?.identity ?? props.integration?.slug ?? null;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -73,11 +77,24 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
   }, []);
 
   useEffect(() => {
+    const integrationChanged = integrationIdentityRef.current !== integrationIdentity;
+    integrationIdentityRef.current = integrationIdentity;
+
+    if (!props.open || integrationChanged) {
+      localErrorRef.current = false;
+    }
+
+    // The connection list is refreshed in the background. Keep a local service
+    // error visible until the user dismisses it or retries the connection flow.
+    if (localErrorRef.current) {
+      return;
+    }
+
     setPhase(initialPhase);
     setActiveConnection(props.connection);
     setErrorMessage(props.errorMessage ?? "");
     setQrWarning(Boolean(props.qrWarning));
-  }, [initialPhase, props.connection, props.errorMessage, props.qrWarning]);
+  }, [initialPhase, integrationIdentity, props.connection, props.errorMessage, props.open, props.qrWarning]);
 
   useEffect(() => {
     if (!props.open) {
@@ -105,6 +122,8 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
     }
 
     flowAbortRef.current?.abort();
+    localErrorRef.current = false;
+    setErrorMessage("");
     const abortController = new AbortController();
     const flowId = flowIdRef.current + 1;
     flowIdRef.current = flowId;
@@ -120,6 +139,9 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
       signal: abortController.signal,
       onPhase: (nextPhase) => {
         if (isCurrentFlow()) {
+          if (nextPhase === "error") {
+            localErrorRef.current = true;
+          }
           setPhase(nextPhase);
         }
       },
@@ -148,6 +170,7 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
     }
 
     if (result.phase === "error") {
+      localErrorRef.current = true;
       setErrorMessage(result.errorCode === "service_unavailable"
         ? t("tools.modal.serviceUnavailableRetry")
         : toErrorMessage(result.error) || t("tools.modal.oauthTimeout"));
@@ -179,6 +202,7 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
       setPhase("idle");
       props.onChanged();
     } catch (error) {
+      localErrorRef.current = true;
       setErrorMessage(toErrorMessage(error));
       setPhase("error");
     }
@@ -325,7 +349,7 @@ export async function reportIntegrationConnectOutcome(
         surface: "integration",
         toolkit,
         event: "failed",
-        errorCode: toAnalyticsErrorCode(result.error)
+        errorCode: result.errorCode ?? toAnalyticsErrorCode(result.error)
       });
     }
   } catch (error) {
@@ -388,6 +412,12 @@ export async function runIntegrationConnectFlow(input: IntegrationConnectFlowInp
           return { phase: "error", errorCode: "service_unavailable" };
         }
 
+        if (isCloudServiceUnavailableError(error)) {
+          console.warn("[tools] Integration connection service unavailable while polling:", error);
+          input.onPhase?.("error");
+          return { phase: "error", errorCode: "service_unavailable" };
+        }
+
         console.warn("[tools] Failed to poll connection state; retrying on the next tick:", error);
         await wait(input.pollIntervalMs, input.signal);
         continue;
@@ -407,7 +437,7 @@ export async function runIntegrationConnectFlow(input: IntegrationConnectFlowInp
 
       if (state === "error") {
         input.onPhase?.("error");
-        return { phase: "error", connection, error: new Error("Connection failed") };
+        return { phase: "error", connection, errorCode: "service_unavailable", error: new Error("Connection failed") };
       }
 
       await wait(input.pollIntervalMs, input.signal);
@@ -645,4 +675,13 @@ function cancelledResult(): IntegrationConnectFlowResult {
  */
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Identifies errors that mean the cloud integration service cannot complete the
+ * connection flow. Ordinary errors remain retryable polling failures because a
+ * single transient response should not terminate an OAuth flow.
+ */
+function isCloudServiceUnavailableError(error: unknown): boolean {
+  return error instanceof ApiRequestError || error instanceof TypeError;
 }
