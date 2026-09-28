@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-const root = process.cwd();
+const root = path.resolve(import.meta.dirname, "../..");
+const buildEnv = {
+  ...process.env,
+  MEMMY_LEGAL_CN_BASE_URL: "https://memmy.cn",
+  MEMMY_LEGAL_INTL_BASE_URL: "https://memmy.bot",
+};
 const pptxScripts = path.join(root, "src/skills/pptx/scripts");
 const xlsxScripts = path.join(root, "src/skills/xlsx/scripts");
 
@@ -35,9 +40,13 @@ describe("document skill CLIs", () => {
     expect(missingXlsx.stdout).toContain('"ok":false');
   });
 
-  it("builds the new skills into dist with their static resources", () => {
-    execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "--ignore-scripts", "build"], { cwd: root, stdio: "pipe" });
-    expect(fs.existsSync(path.join(root, "dist/skills/pptx/schemas/SCHEMA-MANIFEST.json"))).toBe(true);
-    expect(fs.existsSync(path.join(root, "dist/skills/xlsx/SKILL.md"))).toBe(true);
+  it("preserves Office source CLIs without distributing their skills by default", () => {
+    const skills = ["docx", "pptx", "xlsx"];
+    const sources = skills.map((skill) => fs.readFileSync(path.join(root, "src/skills", skill, "SKILL.md"), "utf8"));
+    execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "--ignore-scripts", "build"], { cwd: root, env: buildEnv, stdio: "pipe" });
+    for (const [index, skill] of skills.entries()) {
+      expect(fs.existsSync(path.join(root, "dist/skills", skill))).toBe(false);
+      expect(fs.readFileSync(path.join(root, "src/skills", skill, "SKILL.md"), "utf8")).toBe(sources[index]);
+    }
   }, 60_000);
 });

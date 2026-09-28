@@ -71,8 +71,8 @@ For complete installation and configuration instructions, see the [Getting Start
 #### 1. Desktop App (Recommended)
 
 <p align="center">
-  <img src="docs/assets/first-scan-en.png" width="58%" alt="First scan">
-  <img src="docs/assets/first-report-en.png" width="38%" alt="First Meeting Report">
+  <img src="docs/assets/first-scan-en.png" width="59%" align="top" style="vertical-align: top;" alt="First scan">
+  <img src="docs/assets/first-report-en.png" width="36%" align="top" style="vertical-align: top;" alt="First Meeting Report">
 </p>
 
 Download Memmy from the [official website](https://memmy.bot/) or [GitHub Releases](https://github.com/MemTensor/memmy-agent/releases).
@@ -140,6 +140,20 @@ memmy-memory get <id>
 ```
 
 It connects to `http://127.0.0.1:18960` by default. Use `--url`, `--token`, `--config`, `--source`, and `--user-id` to specify the service and namespace.
+
+To run the memory service alone, without the Agent Runtime, build the CLI from source:
+
+```bash
+git clone https://github.com/MemTensor/memmy-agent.git
+cd memmy-agent
+npm install
+npm run memory:build
+mkdir -p ~/.local/bin
+ln -sf "$PWD/Memory/dist/src/cli/index.js" ~/.local/bin/memmy-memory
+memmy-memory install --service-only
+```
+
+`install --service-only` downloads the pinned Memory runtime, registers the user-level service, starts it, and verifies `/api/v1/health`, all without installing a Skill or adapter into any agent. Node.js `>=20` is required; use `Git Bash` on Windows. `npm run memory:binary` packages the same CLI as a portable archive under `Memory/src/cli/dist/binaries/` for the current platform, and `MEMMY_MEMORY_TARGET` selects another supported platform.
 
 #### 4. Start from the Source Code
 

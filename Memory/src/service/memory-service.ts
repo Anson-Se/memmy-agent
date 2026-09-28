@@ -86,6 +86,9 @@ import type {
   ToolCallPayload,
   ToolObserveRequest,
   TurnCompleteRequest,
+  SourceTurnCompleteRequest,
+  SourceTurnCompleteResponse,
+  TurnCompletionResult,
   TurnStartRequest
 } from "../types.js";
 import { MemoryServiceError } from "../utils/error.js";
@@ -119,6 +122,7 @@ import {
   titleFromImportTrace,
   toolCallsFromUnknown
 } from "./import/memory-import-pipeline.js";
+import { EpisodeTitleService } from "./episode-title/episode-title-service.js";
 import { recordApiLog } from "./model-audit/model-call-audit.js";
 import { ProjectEnvironmentService } from "./project-environment/project-environment-service.js";
 import {
@@ -195,26 +199,12 @@ export interface MemoryServiceOptions {
   llm?: LlmClient;
   skillLlm?: LlmClient;
   embedder?: Embedder;
+  /** Actual HTTP endpoint used by the current server instance. */
+  viewerEndpoint?: string;
 }
 
-export interface CompleteTurnResponse {
-  turnId: string;
-  sessionId: string;
-  episodeId: string;
-  rawTurnId: string;
-  userMemoryId: string;
-  userMemoryIds: string[];
-  l1MemoryId: string;
-  l1MemoryIds: string[];
-  closedEpisodeIds: string[];
-  scheduledEvolution: boolean;
-  jobs: JobRef[];
-  changeSeq: number;
-  syncCursor: string;
-  etag: string;
-  serverTime: string;
-  duplicate?: boolean;
-}
+export type CompleteTurnResponse = TurnCompletionResult;
+
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 
 interface DecisionRepairSummary {
@@ -254,6 +244,7 @@ export class MemoryService {
   private readonly feedbackExperience: FeedbackExperienceService;
   private readonly skillTrials: SkillTrialResolver;
   private readonly episodeReadModel: EpisodeReadModel;
+  private readonly episodeTitle: EpisodeTitleService;
   private readonly importJobs: ImportJobProcessor;
   private readonly l3WorldModelContextReadModel: L3WorldModelContextReadModel;
   private readonly projectEnvironment: ProjectEnvironmentService;
@@ -273,8 +264,10 @@ export class MemoryService {
   private skillLlm: LlmClient;
   private embedder: Embedder;
   private readonly embeddingRetryWorkerId = `embedding-retry-${newId("worker")}`;
+  private viewerEndpoint?: string;
 
   constructor(private readonly options: MemoryServiceOptions) {
+    this.viewerEndpoint = options.viewerEndpoint;
     this.repos = options.backend?.repositories() ?? new Repositories(requireMemoryDb(options).db);
     this.l3WorldModelContextReadModel = new L3WorldModelContextReadModel(this.repos);
     this.mode = options.mode ?? "local";
@@ -295,6 +288,14 @@ export class MemoryService {
     this.projectEnvironment = new ProjectEnvironmentService({
       repos: this.repos,
       get llm() { return projectEnvironmentOwner.skillLlm; }
+    });
+    const episodeTitleOwner = this;
+    this.episodeTitle = new EpisodeTitleService({
+      repos: this.repos,
+      get llm() { return episodeTitleOwner.llm; },
+      get language() { return episodeTitleOwner.config.language; },
+      nowIso,
+      namespaceIdFromSession
     });
     const workerHandlerOwner = this;
     this.workerHandlers = createWorkerJobHandlers({
@@ -318,13 +319,16 @@ export class MemoryService {
           updateL3WorldModel: (job) => this.evolutionJobs.updateL3WorldModel(job),
           updateProjectEnvironment: (job) => this.projectEnvironment.processProfileJob(job),
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
+          assignSkillCluster: (job) => this.evolutionJobs.assignSkillCluster(job),
+          evolveSkillCluster: (job) => this.evolutionJobs.evolveSkillCluster(job),
           associateL2: (job) => this.evolutionJobs.associateL2(job),
           splitBigTurn: (job) => this.evolutionJobs.splitBigTurn(job)
         },
         feedback: {
           applyReward: (job) => this.evolutionJobs.applyReward(job),
           reflectTrace: (job) => this.evolutionJobs.reflectTrace(job),
-          resolveSkillTrial: (job) => this.skillTrials.resolveSkillTrial(job)
+          resolveSkillTrial: (job) => this.skillTrials.resolveSkillTrial(job),
+          createDecisionRepair: (job) => this.createRevisionDecisionRepairFromJob(job)
         },
         embedding: {
           embedMemory: this.embedMemory.bind(this),
@@ -332,6 +336,9 @@ export class MemoryService {
         },
         workMemory: {
           extract: (job) => this.workMemory.extract(job)
+        },
+        episodeTitle: {
+          generate: (job) => this.episodeTitle.generate(job)
         }
       }
     });
@@ -354,7 +361,8 @@ export class MemoryService {
         llm: this.skillLlm
       }),
       scheduleEmbeddingAfterTextUpdate: (input) => this.embeddingJobs.scheduleEmbeddingAfterTextUpdate(input),
-      repairEvidenceValueDiff: sessionRepairEvidenceValueDiff
+      repairEvidenceValueDiff: sessionRepairEvidenceValueDiff,
+      queryVector: this.queryVector.bind(this)
     });
     const trialOwner = this;
     this.skillTrials = new SkillTrialResolver({
@@ -663,6 +671,11 @@ export class MemoryService {
     return Math.max(1, retrieval.tier1TopK + retrieval.tier2TopK);
   }
 
+  /** Set after the HTTP server binds, including when an ephemeral port is used. */
+  setViewerEndpoint(endpoint: string): void {
+    this.viewerEndpoint = endpoint;
+  }
+
   health(routes: string[] = []): HealthResponse {
     const schema = this.schemaVersion();
     const backend = this.storageCapabilities();
@@ -671,7 +684,7 @@ export class MemoryService {
       serviceVersion: PROJECT_VERSION,
       protocolVersion: MEMORY_PROTOCOL_VERSION,
       viewerVersion: MEMORY_VIEWER_VERSION,
-      viewerUrl: viewerUrlFromEndpoint(this.config.storage.endpoint),
+      viewerUrl: viewerUrlFromEndpoint(this.viewerEndpoint ?? this.config.storage.endpoint),
       version: PROJECT_VERSION,
       uptimeMs: Date.now() - this.startedAt,
       mode: this.mode,
@@ -1059,6 +1072,35 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
+  completeSourceTurn(request: SourceTurnCompleteRequest): SourceTurnCompleteResponse {
+    // Native scans have no Hook envelope. Use the configured owner only when
+    // the request (including authenticated scope) did not provide one.
+    const response = this.sessionTurns.completeSourceTurn(this.withTimeZone({
+      ...request,
+      namespace: {
+        source: request.sourceTurn?.source,
+        profileId: request.sourceTurn?.profileId,
+        sessionKey: request.sourceTurn?.conversationId,
+        ...request.namespace,
+        userId: request.namespace?.userId ?? this.config.userId
+      }
+    }));
+    serviceLogger.info("source_turn.complete", {
+      source: request.sourceTurn?.source,
+      profileId: request.sourceTurn?.profileId,
+      conversationId: request.sourceTurn?.conversationId,
+      turnId: request.sourceTurn?.turnId,
+      channel: request.channel,
+      status: response.status,
+      reason: response.reason,
+      sessionId: response.result?.sessionId,
+      episodeId: response.result?.episodeId,
+      rawTurnId: response.result?.rawTurnId,
+      l1MemoryIds: response.result?.l1MemoryIds
+    });
+    return response;
+  }
+
   completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): CompleteTurnResponse {
     return this.sessionTurns.completeTurn(turnId, this.withTimeZone(request));
   }
@@ -1164,6 +1206,7 @@ export class MemoryService {
     multiChannelBypass: boolean;
     skillInjectionMode: "summary" | "full";
     skillSummaryChars: number;
+    skillFullMaxChars: number;
     decayHalfLifeDays: number;
     domain: "" | "research";
     readOnlyInjectionProfile: "all" | "experience" | "skill" | "skill_experience";
@@ -1296,6 +1339,33 @@ export class MemoryService {
 
   async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
     return this.withModelTaskContext(() => this.feedbackExperience.feedback(request));
+  }
+
+  private async createRevisionDecisionRepairFromJob(job: EvolutionJobRecord): Promise<void> {
+    const feedbackId = typeof job.payload.feedbackId === "string" ? job.payload.feedbackId : undefined;
+    const contextHash = typeof job.payload.contextHash === "string" ? job.payload.contextHash : undefined;
+    if (!feedbackId || !contextHash) return;
+    const feedback = this.repos.runtime.getFeedback(feedbackId);
+    const session = job.sessionId ? this.repos.runtime.getSession(job.sessionId) : undefined;
+    if (!feedback || !session) return;
+    const request: FeedbackRequest = {
+      sessionId: feedback.sessionId,
+      episodeId: feedback.episodeId,
+      l1MemoryId: feedback.l1MemoryId,
+      rawTurnId: feedback.rawTurnId,
+      channel: feedback.channel,
+      polarity: feedback.polarity,
+      magnitude: feedback.magnitude,
+      rationale: feedback.rationale,
+      rawPayload: feedback.rawPayload,
+      namespace: namespaceForSession(session)
+    };
+    await this.feedbackExperience.createRevisionDecisionRepair(
+      request,
+      feedback,
+      contextHash,
+      namespaceIdFromContext(namespaceForSession(session))
+    );
   }
 
   exportBundle(request: MemoryExportRequest = {}): {
@@ -2677,9 +2747,12 @@ function sanitizeTraceToolCalls(toolCalls: ToolCallPayload[]): ToolCallPayload[]
   return toolCalls.map((call) => ({
     id: call.id,
     name: call.name,
+    input: call.input,
+    output: call.output,
+    status: call.status,
     success: call.success,
     errorCode: call.errorCode,
-    error: call.error ?? errorMessageFromUnknown(call.output),
+    error: call.error,
     startedAt: call.startedAt,
     endedAt: call.endedAt,
     thinkingBefore: call.thinkingBefore,

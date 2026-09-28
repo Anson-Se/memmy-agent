@@ -34,7 +34,10 @@ import type { ConversationMessage, ScanProgress, SourceAdapter } from "./adapter
 import {
   isCompleteTurn,
   orderedTurns,
-  splitTurn,
+  sourceTurnFromMessages,
+  sourceTurnFailureReason,
+  buildSourceTurnRequest,
+  renderTurnClipped,
   stableTurnIdentity,
   legacyTurnId,
   legacyTurnRequestId,
@@ -57,6 +60,10 @@ import {
 } from "./integration/target-registry.js";
 import { renderMemmyDefaultSkillManifest } from "./integration/templates/memmy-default.js";
 import { createWorkbuddySkillTarget } from "./integration/workbuddy/index.js";
+import type {
+  MemoryDesktopAddAnalytics,
+  MemoryDesktopAddScanMode
+} from "../server/memory-add-analytics.js";
 
 const logger = createMemoryLogger("agent-source");
 const INITIAL_SCAN_DELAY_MS = 5 * 60 * 1000;
@@ -125,6 +132,10 @@ export interface CreateAgentSourceExecutorOptions {
   /** Resolves the Agent root used for optional cross-Agent Skill ingestion. */
   resolveAgentSkillRoot?: (sourceId: string) => string | null;
   scanStoreDirectory?: string;
+  memoryAddAnalytics?: Pick<
+    MemoryDesktopAddAnalytics,
+    "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed"
+  >;
 }
 
 export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOptions): AgentSourceExecutor {
@@ -308,7 +319,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         store.saveSourceState({ ...(preparedState ?? { sourceId, mode, messageCount: store.count(sourceId), resultCount: store.resultCount(sourceId), errorCount: stage.scanErrorCount, updatedAt: new Date().toISOString() }), phase: "ingest", updatedAt: new Date().toISOString() });
         const result = await ingestStagedMessages(options.service, store, sourceId, signal, (progress) => {
           if (!scanPaused) { progressBeforePause = progress; scan = { ...scan, progress }; }
-        }, options.scheduleWorker);
+        }, options.scheduleWorker, options.memoryAddAnalytics, persistentScanMode(mode));
         const skillResult = await ingestAgentSkills(
           options.service,
           sourceId,
@@ -663,7 +674,10 @@ async function stageStandaloneSource(
     for await (const message of adapter.scan({
       ...(mode === "incremental" && stored.latestSeenAt ? { since: stored.latestSeenAt } : {}),
       order: mode === "initial_subset" ? "recent_first" : "source_default",
-      fullHistory: true,
+      // Incremental scans must honor the persisted boundary. Full-history
+      // streaming is only safe for an explicit full scan; otherwise the
+      // adapter would stage every historical message in an active session.
+      fullHistory: mode === "full",
       signal,
       onProgress
     })) {
@@ -726,7 +740,12 @@ async function ingestStagedMessages(
   sourceId: string,
   signal: AbortSignal,
   onProgress: (progress: ScanProgress) => void,
-  scheduleWorker?: () => void
+  scheduleWorker?: () => void,
+  memoryAddAnalytics?: Pick<
+    MemoryDesktopAddAnalytics,
+    "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed"
+  >,
+  scanMode?: MemoryDesktopAddScanMode
 ): Promise<{ written: number; messageCount: number; errors: string[]; errorCount: number; latestSeenAt: string | null }> {
   let written = 0;
   let messageCount = 0;
@@ -781,31 +800,71 @@ async function ingestStagedMessages(
     if (conversationMeta?.selected === false) continue;
     const selectedTurn = store.getTurnMeta(sourceId, turn.conversationId, stableTurnIdentity(turn));
     if (selectedTurn && !selectedTurn.selected) continue;
-    let succeeded = true;
-    // Leave ample room for JSON escaping and the add-memory envelope while
-    // keeping every request below the 1 MiB wire limit.
-    const parts = splitTurn(turn, 4000, 512 * 1024);
-    for (const part of parts) {
-      const requestId = parts.length === 1
-        ? legacyTurnRequestId(turn)
-        : createHash("sha256").update([stableTurnIdentity(turn), String(part.partIndex), part.contentHash].join("\u0000")).digest("hex");
-      const turnId = parts.length === 1 ? legacyTurnId(turn) : `${sourceId}:${part.parentTurnId}:${part.partIndex}`;
+    if (sourceId === "codex") {
       try {
-        const added = service.addMemory({
-          requestId, adapterId: `agent-source:${sourceId}`, content: part.content, layer: "L1",
-          title: titleForTurn(sourceId, part.messages), tags: ["agent-source", sourceId], source: sourceId,
-          turnId, createdAt: part.messages[0]!.createdAt, deferProcessing: true
-        });
-        if (added.duplicate) store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId: added.id });
-        else { store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId: added.id }); memoryIds.push(added.id); written += 1; }
+        const sourceTurn = sourceTurnFromMessages(turn.messages);
+        if (!sourceTurn) throw new Error(sourceTurnFailureReason(turn.messages));
+        const result = service.completeSourceTurn(buildSourceTurnRequest(sourceTurn, "agent_source_scan"));
+        if (result.status === "pending" || result.status === "conflict") throw new Error(result.reason ?? result.status);
+        const ids = result.result?.l1MemoryIds ?? [];
+        if (result.status === "stored") written += ids.length;
+        if (ids.length === 0) store.saveResult({ sourceId, conversationId: turn.conversationId });
+        for (const memoryId of ids) store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId });
+        messageCount += turn.messages.length;
+        if (result.status === "stored") scheduleWorker?.();
       } catch (error) {
-        succeeded = false;
         activeConversationFailed = true;
-        const reason = error instanceof Error ? error.message : String(error);
+        const reason = error instanceof Error ? error.message : "native turn ingestion failed";
         errorCount += 1;
         if (errors.length < 1000) errors.push(`${turn.conversationId}: ${reason}`);
         store.saveResult({ sourceId, conversationId: turn.conversationId, error: reason });
       }
+      processed += turn.messages.length;
+      onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
+      continue;
+    }
+    let succeeded = true;
+    const resolvedScanMode = persistentScanMode(store.getSourceState(sourceId)?.mode ?? scanMode);
+    const addAnalyticsBase = {
+      adapterId: `agent-source:${sourceId}`,
+      conversationId: turn.conversationId,
+      turnId: legacyTurnId(turn),
+      ...(resolvedScanMode ? { scanMode: resolvedScanMode } : {})
+    };
+    const addStartedAt = Date.now();
+    // One turn is one memory. Splitting an agentic turn fans a single exchange
+    // out into hundreds of near-empty tool-call fragments, so an oversized turn
+    // is clipped to the wire budget instead of being fanned out.
+    try {
+      const added = service.addMemory({
+        requestId: legacyTurnRequestId(turn), adapterId: `agent-source:${sourceId}`,
+        content: renderTurnClipped(turn.messages), layer: "L1",
+        title: titleForTurn(sourceId, turn.messages), tags: ["agent-source", sourceId], source: sourceId,
+        turnId: addAnalyticsBase.turnId, createdAt: turn.messages[0]!.createdAt, deferProcessing: true
+      });
+      if (!added.duplicate) {
+        memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+        memoryAddAnalytics?.trackAddSucceeded({
+          ...addAnalyticsBase,
+          durationMs: Date.now() - addStartedAt,
+          storedCount: 1
+        });
+      }
+      store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId: added.id });
+      if (!added.duplicate) { memoryIds.push(added.id); written += 1; }
+    } catch (error) {
+      succeeded = false;
+      activeConversationFailed = true;
+      const reason = error instanceof Error ? error.message : String(error);
+      errorCount += 1;
+      if (errors.length < 1000) errors.push(`${turn.conversationId}: ${reason}`);
+      store.saveResult({ sourceId, conversationId: turn.conversationId, error: reason });
+      memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+      memoryAddAnalytics?.trackAddFailed({
+        ...addAnalyticsBase,
+        durationMs: Date.now() - addStartedAt,
+        error
+      });
     }
     if (succeeded) {
       messageCount += turn.messages.length;
@@ -836,7 +895,7 @@ async function prepareStandaloneSource(
   sourceHash.update("[");
   let firstSourceMessage = true;
   const flushTurn = () => {
-    if (!currentTurn.length || !isCompleteTurn(currentTurn)) return;
+    if (!currentTurn.length || (sourceId !== "codex" && !isCompleteTurn(currentTurn))) return;
     const firstMessage = currentTurn[0]!;
     const lastMessage = currentTurn[currentTurn.length - 1]!;
     const turn = { sourceId, conversationId: firstMessage.conversationId, turnIndex: 0, messages: currentTurn };
@@ -848,13 +907,16 @@ async function prepareStandaloneSource(
       firstCreatedAt: firstMessage.createdAt,
       lastMessageId: lastMessage.messageId,
       lastCreatedAt: lastMessage.createdAt,
-      selected: true
+      // A conversation may contain years of history but only one new turn.
+      // Select turns at the watermark, not every turn in that conversation.
+      selected: mode !== "incremental" || !latestSeenAt ||
+        isAtOrAfter(lastMessage.createdAt, latestSeenAt)
     });
   };
   const flushConversation = () => {
     if (!currentConversation || !latest) return;
     hash.update("]");
-    const selected = mode !== "incremental" || !latestSeenAt || Date.parse(latest.createdAt) > Date.parse(latestSeenAt);
+    const selected = mode !== "incremental" || !latestSeenAt || isAtOrAfter(latest.createdAt, latestSeenAt);
     store.saveConversationMeta({
       sourceId,
       conversationId: currentConversation,
@@ -877,7 +939,7 @@ async function prepareStandaloneSource(
         hash.update("[");
         first = true;
       }
-      if (message.role === "user" && currentTurn.length > 0) {
+      if (currentTurn.length > 0 && (sourceId === "codex" ? message.rawMeta.sourceTurnId !== currentTurn[0]?.rawMeta.sourceTurnId : message.role === "user")) {
         flushTurn();
         currentTurn = [];
       }
@@ -890,7 +952,8 @@ async function prepareStandaloneSource(
         content: message.content,
         createdAt: message.createdAt,
         toolName: hashMeta(message, "toolName") ?? hashMeta(message, "hermesToolName"),
-        toolCallId: hashMeta(message, "toolCallId") ?? hashMeta(message, "hermesToolCallId")
+        toolCallId: hashMeta(message, "toolCallId") ?? hashMeta(message, "hermesToolCallId"),
+        ...(sourceId === "codex" ? { sourceTurn: message.rawMeta } : {})
       };
       const serialized = JSON.stringify(hashable);
       if (!firstSourceMessage) sourceHash.update(",");
@@ -908,6 +971,12 @@ async function prepareStandaloneSource(
   const contentHash = sourceHash.digest("hex");
   if (mode === "incremental" && previousContentHash !== contentHash) store.selectAllConversations(sourceId);
   return contentHash;
+}
+
+function isAtOrAfter(value: string, boundary: string): boolean {
+  const valueAt = Date.parse(value);
+  const boundaryAt = Date.parse(boundary);
+  return !Number.isFinite(valueAt) || !Number.isFinite(boundaryAt) || valueAt >= boundaryAt;
 }
 
 function hashMeta(message: ConversationMessage, key: string): string | undefined {
@@ -1031,6 +1100,10 @@ function frontmatterValue(content: string, key: string): string | undefined {
   return content.slice(3, end)
     .match(new RegExp(`^${key}:\\s*["']?([^\\n"']+)["']?\\s*$`, "im"))?.[1]
     ?.trim();
+}
+
+function persistentScanMode(value: string | undefined): MemoryDesktopAddScanMode | undefined {
+  return value === "initial_subset" || value === "incremental" || value === "full" ? value : undefined;
 }
 
 function titleForTurn(sourceId: string, messages: readonly ConversationMessage[]): string {
