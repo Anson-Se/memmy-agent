@@ -333,7 +333,8 @@ export class MemoryService {
     const projectEnvironmentOwner = this;
     this.projectEnvironment = new ProjectEnvironmentService({
       repos: this.repos,
-      get llm() { return projectEnvironmentOwner.skillLlm; }
+      get llm() { return projectEnvironmentOwner.skillLlm; },
+      get language() { return projectEnvironmentOwner.config.language; }
     });
     const episodeTitleOwner = this;
     this.episodeTitle = new EpisodeTitleService({
@@ -383,7 +384,10 @@ export class MemoryService {
           embedUserMemory: (job) => this.embeddingJobs.embedUserMemory(job)
         },
         workMemory: {
-          extract: (job) => this.workMemory.extract(job)
+          extract: (job) => this.workMemory.extract(job),
+          flushIdle: (job) => {
+            this.workMemory.flushIdle(job);
+          }
         },
         episodeTitle: {
           generate: (job) => this.episodeTitle.generate(job)
@@ -510,6 +514,7 @@ export class MemoryService {
       memoryBudgetModelSources: () => this.budgetModelSources(),
       memoryBudgetNextWakeAtMs: () => this.tokenBudgetLedger.nextWakeAtMs(),
       memoryBudgetNextReconcileAtMs: () => this.nextAppBudgetReconcileAtMs(),
+      summaryModelConfigured: () => workerRunnerOwner.llm.isConfigured(),
       nowIso,
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
       namespaceIdFromMemory,
@@ -661,6 +666,8 @@ export class MemoryService {
       shouldDeferBudgetedEvolutionLlm: () => this.shouldDeferBudgetedEvolutionLlm(),
       firstLine,
       memoryLayersForIntent,
+      armWorkMemoryIdleFlush: this.armWorkMemoryIdleFlush.bind(this),
+      extractUnextractedWorkMemory: this.extractUnextractedWorkMemory.bind(this),
       namespaceIdFromContext,
       namespaceIdFromMemory,
       namespaceIdFromSession,
@@ -1183,6 +1190,16 @@ export class MemoryService {
     return this.sessionTurns.closeSession(sessionId, this.withTimeZone(request));
   }
 
+  /** Arm the Work Memory idle flush for a Session inside the caller's transaction. */
+  private armWorkMemoryIdleFlush(sessionId: string, at: string): void {
+    this.workMemory.armIdleFlush(sessionId, at);
+  }
+
+  /** Extract unextracted Work Memory for a Session inside the caller's transaction. */
+  private extractUnextractedWorkMemory(sessionId: string, throughTraceSeq: number, at: string): void {
+    this.workMemory.extractUnextracted(sessionId, throughTraceSeq, at);
+  }
+
   l3WorldModelTraceHead(
     sessionId: string,
     request: L3WorldModelRequestEnvelope
@@ -1208,8 +1225,8 @@ export class MemoryService {
       trigger: request.trigger,
       throughL1MemoryId: request.throughL1MemoryId
     }, (frozen) => {
-      if (request.trigger === "token_compaction" && frozen.batchIds.length > 0) {
-        this.workMemory.scheduleBatchesInTransaction(frozen.batchIds, nowIso());
+      if (request.trigger === "token_compaction" && frozen.throughTraceSeq) {
+        this.workMemory.extractUnextracted(sessionId, frozen.throughTraceSeq, nowIso());
       }
     });
     if (!result.throughTraceSeq) {

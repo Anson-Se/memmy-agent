@@ -10,6 +10,7 @@ import {
   type WorkspaceUri
 } from "../contracts/index.js";
 import { retrievalDocumentForMemory } from "../algorithm/plugin-algorithms.js";
+import { displayFieldsForMemory } from "../service/read-model/display-fields.js";
 import type {
   ProjectEnvironmentKind,
   ProjectEnvironmentStateRecord
@@ -63,6 +64,7 @@ const BUNDLE_TABLES = [
   "user_memories",
   "sessions",
   "l3_world_model_session_cursors",
+  "work_memory_session_cursors",
   "episodes",
   "raw_turns",
   "l3_world_model_input_traces",
@@ -348,6 +350,12 @@ export interface L3WorldModelInputTraceRecord {
   rawTurnId: string;
   episodeId?: string;
   createdAt: string;
+}
+
+export interface WorkMemorySessionCursorRecord {
+  sessionId: string;
+  lastExtractedSeq: number;
+  updatedAt: string;
 }
 
 export interface L3WorldModelEvidenceBatchRecord {
@@ -1271,6 +1279,7 @@ export class MemoryRepository {
       summary: listSummaryForMemory(memory),
       tags: memory.tags,
       metrics: listMetricsForMemory(memory),
+      ...displayFieldsForMemory(memory),
       createdAt: memory.createdAt,
       updatedAt: memory.updatedAt,
       version: memory.version
@@ -3252,6 +3261,97 @@ export class RuntimeRepository {
     return Number(row.next_seq);
   }
 
+  /**
+   * Read the Work Memory extraction cursor for a Session.
+   *
+   * A missing row is seeded from the L3 cursor so Sessions that predate this
+   * table do not re-extract windows the L3 boundary already covered.
+   */
+  getWorkMemoryCursor(sessionId: string, at = nowIso()): WorkMemorySessionCursorRecord {
+    const seed = this.db.prepare(
+      `SELECT COALESCE(
+         (SELECT last_scheduled_seq FROM l3_world_model_session_cursors WHERE session_id = ?),
+         0
+       ) AS last_seq`
+    ).get(sessionId) as { last_seq: number };
+    return this.ensureWorkMemoryCursor(sessionId, Number(seed.last_seq), at);
+  }
+
+  /** Create the Work Memory cursor row for a Session when it is still missing. */
+  ensureWorkMemoryCursor(
+    sessionId: string,
+    lastExtractedSeq: number,
+    at = nowIso()
+  ): WorkMemorySessionCursorRecord {
+    this.db.prepare(
+      `INSERT INTO work_memory_session_cursors (session_id, last_extracted_seq, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO NOTHING`
+    ).run(sessionId, lastExtractedSeq, at);
+    const row = this.db.prepare(
+      `SELECT session_id, last_extracted_seq, updated_at
+       FROM work_memory_session_cursors WHERE session_id = ?`
+    ).get(sessionId) as { session_id: string; last_extracted_seq: number; updated_at: string };
+    return {
+      sessionId: row.session_id,
+      lastExtractedSeq: Number(row.last_extracted_seq),
+      updatedAt: row.updated_at
+    };
+  }
+
+  /** Advance the Work Memory extraction cursor. */
+  setWorkMemoryCursor(sessionId: string, lastExtractedSeq: number, at = nowIso()): void {
+    this.db.prepare(
+      `UPDATE work_memory_session_cursors
+       SET last_extracted_seq = ?, updated_at = ?
+       WHERE session_id = ?`
+    ).run(lastExtractedSeq, at, sessionId);
+  }
+
+  /**
+   * Arm the Work Memory idle flush for a Session, pushing `runAfter` forward.
+   *
+   * The generic enqueue path merges `runAfter` by keeping the earlier value,
+   * which is the opposite of re-arming. This upsert therefore reuses terminal
+   * rows as well and clears the retry bookkeeping, so the auto worker keeps
+   * scheduling the job.
+   */
+  armWorkMemoryIdleFlush(input: {
+    sessionId: string;
+    userId: string;
+    lastActivityAt: string;
+    runAfter: string;
+    at?: string;
+  }): EvolutionJobRecord {
+    const at = input.at ?? nowIso();
+    const dedupeKey = `work_memory_idle_flush:${input.sessionId}`;
+    const payload = toJson({ lastActivityAt: input.lastActivityAt, runAfter: input.runAfter });
+    const existing = this.getJobByDedupeKey(dedupeKey);
+    if (existing) {
+      this.db.prepare(
+        `UPDATE evolution_jobs
+         SET status = 'queued',
+             payload_json = ?,
+             attempts = 0,
+             leased_until = NULL,
+             last_error = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(payload, at, existing.id);
+    } else {
+      this.db.prepare(
+        `INSERT INTO evolution_jobs (
+           id, job_type, status, dedupe_key, user_id, session_id, episode_id,
+           target_memory_id, scope_key, scope_seq, payload_json, attempts,
+           max_attempts, leased_until, last_error, created_at, updated_at
+         ) VALUES (?, 'work_memory_idle_flush', 'queued', ?, ?, ?, NULL, NULL, NULL, NULL, ?, 0, 3, NULL, NULL, ?, ?)`
+      ).run(newId("job"), dedupeKey, input.userId, input.sessionId, payload, at, at);
+    }
+    const job = this.getJobByDedupeKey(dedupeKey);
+    if (!job) throw new Error(`failed to arm work memory idle flush: ${input.sessionId}`);
+    return job;
+  }
+
   listJobs(status?: JobStatus, limit = 50, userId?: string): EvolutionJobRecord[] {
     void userId;
     const clauses: string[] = [];
@@ -3290,6 +3390,7 @@ export class RuntimeRepository {
   nextWorkerRunAt(options?: {
     jobType?: string;
     jobTypes?: readonly string[];
+    excludedJobTypes?: readonly string[];
     includeEmbeddingRetries?: boolean;
   }): number | undefined {
     const jobTypes = options?.jobTypes ?? (options?.jobType ? [options.jobType] : undefined);
@@ -3298,7 +3399,14 @@ export class RuntimeRepository {
         ? "AND 1=0"
         : `AND job_type IN (${jobTypes.map(() => "?").join(", ")})`
       : "";
-    const jobTypeParams = jobTypes && jobTypes.length > 0 ? jobTypes : [];
+    const excluded = options?.excludedJobTypes?.length ? options.excludedJobTypes : undefined;
+    const excludeFilter = excluded
+      ? `AND job_type NOT IN (${excluded.map(() => "?").join(", ")})`
+      : "";
+    const jobTypeParams = [
+      ...(jobTypes && jobTypes.length > 0 ? jobTypes : []),
+      ...(excluded ?? [])
+    ];
     const queuedJob = this.db
       .prepare(
         `SELECT CAST(json_extract(payload_json, '$.runAfter') AS TEXT) AS run_after
@@ -3307,6 +3415,7 @@ export class RuntimeRepository {
            AND attempts < max_attempts
            AND json_type(payload_json, '$.runAfter') = 'text'
            ${jobTypeFilter}
+           ${excludeFilter}
          ORDER BY run_after ASC
          LIMIT 1`
       )
@@ -3319,6 +3428,7 @@ export class RuntimeRepository {
            AND attempts < max_attempts
            AND leased_until IS NOT NULL
            ${jobTypeFilter}
+           ${excludeFilter}
          ORDER BY leased_until ASC
          LIMIT 1`
       )
@@ -3437,7 +3547,8 @@ export class RuntimeRepository {
     leaseSeconds = 60,
     targetMemoryIds?: readonly string[],
     priorityCohortOnly = false,
-    allowedJobTypes?: readonly string[]
+    allowedJobTypes?: readonly string[],
+    excludedJobTypes?: readonly string[]
   ): EvolutionJobRecord[] {
     if (targetMemoryIds?.length === 0 || allowedJobTypes?.length === 0) {
       return [];
@@ -3508,11 +3619,12 @@ export class RuntimeRepository {
                )
              )
              ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
+             ${excludedJobTypes?.length ? `AND job_type NOT IN (${excludedJobTypes.map(() => "?").join(", ")})` : ""}
              ${targetFilter}
            ORDER BY ${evolutionJobOrderSql()}
            LIMIT ?`
         )
-        .all(at, at, ...(allowedJobTypes ?? []), ...(targetMemoryIds ?? []), limit) as Array<SqlJobRow & {
+        .all(at, at, ...(allowedJobTypes ?? []), ...(excludedJobTypes ?? []), ...(targetMemoryIds ?? []), limit) as Array<SqlJobRow & {
           queue_priority: number;
         }>;
       const queuePriority = candidates[0]?.queue_priority;
@@ -4985,6 +5097,39 @@ export class L3WorldModelRepository {
     return row ? l3WorldModelInputTraceFromSql(row) : undefined;
   }
 
+  /** Highest trace sequence registered for a Session, or 0 when it has none. */
+  maxInputTraceSeq(sessionId: string): number {
+    const row = this.db.prepare(
+      `SELECT COALESCE(MAX(trace_seq), 0) AS trace_seq
+       FROM l3_world_model_input_traces WHERE session_id = ?`
+    ).get(sessionId) as { trace_seq: number };
+    return Number(row.trace_seq);
+  }
+
+  /** Input traces for a Session in an inclusive trace sequence range, ascending. */
+  listInputTracesInRange(
+    sessionId: string,
+    afterTraceSeq: number,
+    throughTraceSeq: number
+  ): L3WorldModelInputTraceRecord[] {
+    return (this.db.prepare(
+      `SELECT * FROM l3_world_model_input_traces
+       WHERE session_id = ? AND trace_seq > ? AND trace_seq <= ?
+       ORDER BY trace_seq ASC`
+    ).all(sessionId, afterTraceSeq, throughTraceSeq) as SqlL3WorldModelInputTraceRow[])
+      .map(l3WorldModelInputTraceFromSql);
+  }
+
+  /** Most recent input trace timestamp, used as the real last activity of a Session. */
+  latestInputTraceCreatedAt(sessionId: string): string | undefined {
+    const row = this.db.prepare(
+      `SELECT created_at FROM l3_world_model_input_traces
+       WHERE session_id = ?
+       ORDER BY trace_seq DESC LIMIT 1`
+    ).get(sessionId) as { created_at: string } | undefined;
+    return row?.created_at;
+  }
+
   freezeBatches(input: {
     sessionId: string;
     trigger: L3WorldModelBatchTrigger;
@@ -6039,7 +6184,7 @@ function l3WorldModelSourceMemoryIds(memory?: MemoryRow): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && Boolean(item)) : [];
 }
 
-function splitL3TracesByRawTurn(
+export function splitL3TracesByRawTurn(
   traces: L3WorldModelInputTraceRecord[],
   maxRawTurns: number
 ): L3WorldModelInputTraceRecord[][] {
@@ -6346,7 +6491,6 @@ function listSummaryForMemory(memory: MemoryRow): string {
   return firstNonEmptyString(
     stringLike(memory.info.summary),
     stringLike(internal.summary),
-    stringLike(policy.trigger),
     stringLike(policy.procedure),
     stringLike(world.summary),
     stringLike(world.body),
@@ -7646,6 +7790,7 @@ function bundleIdentity(
     source_turn_captures: ["user_id", "source", "profile_id", "namespace_key", "conversation_id", "turn_id"],
     l3_world_model_scopes: ["scope_key"],
     l3_world_model_session_cursors: ["session_id"],
+    work_memory_session_cursors: ["session_id"],
     l3_world_model_input_traces: ["session_id", "trace_seq"],
     l3_world_model_evidence_batches: ["id"],
     l3_world_model_batch_targets: ["batch_id", "target_field"],

@@ -87,6 +87,7 @@ export type JobType =
   | "skill_batch_evolve"
   | "skill_trial_resolve"
   | "work_memory_extract"
+  | "work_memory_idle_flush"
   | "feedback_experience";
 
 export interface RuntimeNamespace {
@@ -251,6 +252,9 @@ export interface MemoryListItem {
   status: MemoryStatus;
   title: string;
   summary: string;
+  sourceText?: string;
+  generatedTitle?: string;
+  experienceDraft?: boolean;
   tags: string[];
   metrics?: {
     value?: number;
