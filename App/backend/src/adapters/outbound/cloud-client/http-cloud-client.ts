@@ -9,6 +9,8 @@ import {
   LegalAgreementUrlsSchema,
   IntegrationToolResultSchema,
   InvitationResultSchema,
+  LotteryRewardSchema,
+  LotteryStatusSchema,
   OkResponseSchema,
   PromotionFlagsSchema,
   QWEN_ASR_MODEL_ID,
@@ -20,6 +22,8 @@ import {
   type IntegrationConnection,
   type IntegrationConnectionsResponse,
   type LegalAgreementUrls,
+  type LotteryReward,
+  type LotteryStatus,
   type IntegrationToolResult,
   type OkResponse,
   type PromotionFlags,
@@ -45,10 +49,12 @@ import type {
   CloudStartSocialLoginResult,
   CloudLogoutInput,
   GetAccountInfoInput,
+  GetLotteryRewardInput,
   EnsureInvitationCodeInput,
   GetTokenQuotaEligibilityInput,
   GetTokenUsageInput,
   GrantTokensInput,
+  AckLotteryRewardInput,
   ReleaseCheckResult,
   RequestTokenQuotaInput,
   TokenQuotaApplyResult,
@@ -414,6 +420,36 @@ export function createHttpCloudClient(options: CreateHttpCloudClientOptions = {}
       } catch {
         return undefined;
       }
+    },
+
+    async getLotteryStatus(): Promise<LotteryStatus | undefined> {
+      try {
+        const data = await requestCloudData<unknown>(fetchImpl, baseUrl, timeoutMs, "/api/memmy/lottery/status", {
+          method: "GET",
+          lang: "zh"
+        });
+        const parsed = LotteryStatusSchema.safeParse(data);
+        return parsed.success ? parsed.data : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+
+    async getLotteryReward(input: GetLotteryRewardInput): Promise<LotteryReward> {
+      const data = await requestCloudData<unknown>(fetchImpl, baseUrl, timeoutMs, "/api/memmy/lottery/reward", {
+        method: "GET",
+        lang: "zh",
+        bearerCredential: input.uuid
+      });
+      return LotteryRewardSchema.parse(data);
+    },
+
+    async ackLotteryReward(input: AckLotteryRewardInput): Promise<void> {
+      await requestBoolean(fetchImpl, baseUrl, timeoutMs, "/api/memmy/lottery/reward/ack", {
+        body: input.drawId ? { drawId: input.drawId } : {},
+        lang: "zh",
+        bearerCredential: input.uuid
+      });
     }
   };
 }
@@ -508,7 +544,10 @@ function normalizeAgentRegion(value: string | undefined): "cn" | "intl" {
  */
 async function readCloudEnvelope(response: Response): Promise<CloudEnvelope> {
   try {
-    const value = await response.json() as Partial<CloudEnvelope>;
+    // Account IDs are BIGINT values. Parse their numeric JSON representation as
+    // strings before JSON.parse so JavaScript cannot round them past 2^53.
+    const raw = await response.text();
+    const value = JSON.parse(preserveIntegerIdentifiers(raw)) as Partial<CloudEnvelope>;
     return {
       code: typeof value.code === "number" ? value.code : response.ok ? 0 : response.status,
       message: typeof value.message === "string" ? value.message : undefined,
@@ -521,6 +560,10 @@ async function readCloudEnvelope(response: Response): Promise<CloudEnvelope> {
       data: null
     };
   }
+}
+
+function preserveIntegerIdentifiers(raw: string): string {
+  return raw.replace(/("(?:id|userId|user_id|accountUuid|account_uuid)"\s*:\s*)(\d{16,})/g, '$1"$2"');
 }
 
 /**

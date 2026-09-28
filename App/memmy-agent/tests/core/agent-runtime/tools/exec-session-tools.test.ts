@@ -276,7 +276,7 @@ describe("exec session tools", () => {
 
     let result = await tool.execute({
       command: pipeHoldingDescendantCommand(),
-      yield_time_ms: 100,
+      yield_time_ms: 1200,
     });
     if (result.includes("session_id:")) {
       result += `\n${await stdin.execute({

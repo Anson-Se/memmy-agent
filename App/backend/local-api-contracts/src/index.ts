@@ -80,9 +80,37 @@ export const AppSettingsDtoSchema = z.object({
     // Menu bar icon enabled.
     menuBarIconEnabled: z.boolean().default(true),
     // Stop the standalone Memory daemon when Desktop exits.
-    stopMemoryServiceOnExit: z.boolean().default(false)
+    stopMemoryServiceOnExit: z.boolean().default(false),
+    // Daily custom-key memory pipeline cap in million tokens. 0 means unlimited.
+    memoryByokDailyLimitM: z.number().int().min(0).max(99_999).default(10),
+    // Lifetime custom-key memory pipeline cap in million tokens. 0 means unlimited.
+    memoryByokTotalLimitM: z.number().int().min(0).max(99_999).default(500)
 });
 export type AppSettingsDto = z.infer<typeof AppSettingsDtoSchema>;
+
+export const MemoryTokenBudgetTriggerSchema = z.enum(["daily", "total"]);
+export type MemoryTokenBudgetTrigger = z.infer<typeof MemoryTokenBudgetTriggerSchema>;
+
+export const MemoryTokenBudgetDtoSchema = z.object({
+    dailyLimitM: z.number().int().min(0).max(99_999),
+    totalLimitM: z.number().int().min(0).max(99_999),
+    dailyUsed: z.number().int().nonnegative(),
+    lifetimeUsed: z.number().int().nonnegative(),
+    paused: z.boolean(),
+    trigger: MemoryTokenBudgetTriggerSchema.nullable(),
+    nextLocalMidnightAt: z.string().datetime(),
+    stale: z.boolean().optional()
+});
+export type MemoryTokenBudgetDto = z.infer<typeof MemoryTokenBudgetDtoSchema>;
+
+export const MemoryPipelineUsageDtoSchema = z.object({
+    dailyLimitM: z.number().int().min(0).max(99_999),
+    totalLimitM: z.number().int().min(0).max(99_999),
+    dailyUsed: z.number().int().nonnegative(),
+    lifetimeUsed: z.number().int().nonnegative(),
+    nextLocalMidnightAt: z.string().datetime()
+});
+export type MemoryPipelineUsageDto = z.infer<typeof MemoryPipelineUsageDtoSchema>;
 
 export const FirstEncounterReportStatusSchema = z.enum(["pending", "shown", "skipped"]);
 export type FirstEncounterReportStatus = z.infer<typeof FirstEncounterReportStatusSchema>;
@@ -592,6 +620,35 @@ export const PromotionFlagsSchema = z.object({
 });
 export type PromotionFlags = z.infer<typeof PromotionFlagsSchema>;
 
+export const LotteryStatusSchema = z.object({
+    shouldShow: z.boolean(),
+    startAt: z.number().int().nonnegative(),
+    endAt: z.number().int().nonnegative(),
+    serverNow: z.number().int().nonnegative(),
+    landingUrl: z.string().url()
+}).refine((status) => status.endAt > status.startAt, {
+    message: "Lottery endAt must be later than startAt",
+    path: ["endAt"]
+});
+export type LotteryStatus = z.infer<typeof LotteryStatusSchema>;
+
+export const LotteryRewardSchema = z.discriminatedUnion("hasReward", [
+    z.object({
+        hasReward: z.literal(false)
+    }),
+    z.object({
+        hasReward: z.literal(true),
+        drawId: z.string().min(1).optional(),
+        tokenAmount: z.number().int().positive()
+    })
+]);
+export type LotteryReward = z.infer<typeof LotteryRewardSchema>;
+
+export const LotteryRewardAckInputSchema = z.object({
+    drawId: z.string().min(1).optional()
+});
+export type LotteryRewardAckInput = z.infer<typeof LotteryRewardAckInputSchema>;
+
 export const AppBootstrapResponseSchema = z.object({
     app: AppSettingsDtoSchema,
     onboarding: OnboardingStateDtoSchema,
@@ -611,7 +668,8 @@ export const AppBootstrapResponseSchema = z.object({
     legal: LegalAgreementUrlsSchema.optional(),
     // Src module.
     // Promotions.
-    promotions: PromotionFlagsSchema.optional()
+    promotions: PromotionFlagsSchema.optional(),
+    lotteryStatus: LotteryStatusSchema.optional()
 });
 export type AppBootstrapResponse = z.infer<typeof AppBootstrapResponseSchema>;
 
@@ -626,7 +684,9 @@ export const PatchAppSettingsInputSchema = z
         taskDoneNotificationEnabled: z.boolean(),
         notificationSoundEnabled: z.boolean(),
         menuBarIconEnabled: z.boolean(),
-        stopMemoryServiceOnExit: z.boolean()
+        stopMemoryServiceOnExit: z.boolean(),
+        memoryByokDailyLimitM: z.number().int().min(0).max(99_999),
+        memoryByokTotalLimitM: z.number().int().min(0).max(99_999)
     })
     .partial();
 export type PatchAppSettingsInput = z.infer<typeof PatchAppSettingsInputSchema>;
@@ -1097,6 +1157,18 @@ export type AsrTranscriptionResponse = z.infer<typeof AsrTranscriptionResponseSc
 
 export const AccountChannelSchema = z.enum(["email", "phone"]);
 export type AccountChannel = z.infer<typeof AccountChannelSchema>;
+
+/**
+ * Map the desktop language setting onto a language Memory can write in.
+ * `system` follows the package channel: phone/CN defaults to Chinese, email/intl to English.
+ */
+export function resolveMemoryLanguage(
+  language: string | undefined,
+  accountChannel?: AccountChannel | string
+): "zh-CN" | "en-US" {
+  if (language === "zh-CN" || language === "en-US") return language;
+  return accountChannel === "email" ? "en-US" : "zh-CN";
+}
 
 export const AccountLocaleSchema = z.enum(["zh", "en"]);
 export type AccountLocale = z.infer<typeof AccountLocaleSchema>;

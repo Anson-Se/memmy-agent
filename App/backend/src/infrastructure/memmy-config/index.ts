@@ -10,6 +10,9 @@ import {
   type ActualModelContext,
   type ModelConfigInput,
   type ModelConfigView,
+  type AccountChannel,
+  type Language,
+  resolveMemoryLanguage,
   type ModelProvider,
   type ModelSelectionResolution,
   type ResolvedProviderSnapshot,
@@ -120,6 +123,12 @@ export interface MemmyConfigWriter {
   /** Atomically persist the active account/BYOK namespace without rewriting the model catalog. */
   writeUserMode?(mode: UserMode): Promise<void>;
 
+  /** Publish the interface language so Memory can write memories in it. */
+  writeMemoryLanguage?(language: Language): Promise<void>;
+
+  /** Publish custom-key memory pipeline token caps so the Memory worker can pause. */
+  writeMemoryTokenBudget?(budget: { dailyLimitM: number; totalLimitM: number }): Promise<void>;
+
   writeModelConfig?(input: ModelConfigInput): Promise<ModelConfigView>;
 
   /**
@@ -127,7 +136,11 @@ export interface MemmyConfigWriter {
    *
    * @param input the login credentials and user id returned by cloud agentUser/login.
    */
-  writeAccountModelProjection(input: { cloudUuid?: string; userId?: string }): Promise<RuntimeProjectionResult>;
+  writeAccountModelProjection(input: {
+    cloudUuid?: string;
+    userId?: string;
+    preserveAccountByokSelection?: boolean;
+  }): Promise<RuntimeProjectionResult>;
 
   /**
    * Clear the account-mode runtime login projection.
@@ -164,6 +177,8 @@ export interface CreateMemmyConfigWriterOptions {
    * - configPath: defaults to ~/.memmy/config.yaml; tests can inject a temporary path.
    */
   configPath?: string;
+  /** Package login channel. Resolves the `system` language to zh-CN or en-US. */
+  accountChannel?: AccountChannel;
 }
 
 /**
@@ -197,6 +212,26 @@ export function createMemmyConfigWriter(options: CreateMemmyConfigWriterOptions 
         const app = asRecord(config.app);
         if (app) app.userMode = mode;
         else config.app = { userMode: mode };
+      });
+    },
+
+    async writeMemoryLanguage(language) {
+      const resolved = resolveMemoryLanguage(language, options.accountChannel);
+      await mutateRuntimeConfig(configPath, (config) => {
+        const memory = asRecord(config.memmyMemory) ?? {};
+        memory.language = resolved;
+        config.memmyMemory = memory;
+      });
+    },
+
+    async writeMemoryTokenBudget(budget) {
+      await mutateRuntimeConfig(configPath, (config) => {
+        const memory = asRecord(config.memmyMemory) ?? {};
+        memory.tokenBudget = {
+          dailyLimitM: budget.dailyLimitM,
+          totalLimitM: budget.totalLimitM
+        };
+        config.memmyMemory = memory;
       });
     },
 
@@ -518,7 +553,11 @@ function readAccountProjection(
  * @param configPath the Memmy main config file path.
  */
 export async function writeAccountModelProjectionToMemmyConfig(
-  input: { cloudUuid?: string; userId?: string },
+  input: {
+    cloudUuid?: string;
+    userId?: string;
+    preserveAccountByokSelection?: boolean;
+  },
   configPath = resolveDefaultMemmyConfigPath()
 ): Promise<RuntimeProjectionResult> {
   const normalizedCloudUuid = input.cloudUuid?.trim();
@@ -528,6 +567,10 @@ export async function writeAccountModelProjectionToMemmyConfig(
   }
   const result = await mutateRuntimeConfig(configPath, (config) => {
     const appConfig = isRecord(config.app) ? { ...config.app } : {};
+    const hasLegacySelectionBaseline = Object.prototype.hasOwnProperty.call(
+      appConfig,
+      LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE
+    );
     if (normalizedCloudUuid) appConfig.cloudUuid = normalizedCloudUuid;
     if (normalizedUserId) appConfig.userId = normalizedUserId;
     delete appConfig[LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE];
@@ -592,7 +635,10 @@ export async function writeAccountModelProjectionToMemmyConfig(
       delete (presets[presetId] as Record<string, unknown>).label;
     }
     config.modelPresets = presets;
-    updateAccountAssignment(config, ownerAccountId, presetIds);
+    updateAccountAssignment(config, ownerAccountId, presetIds, {
+      preserveExistingByokCandidates: input.preserveAccountByokSelection === true
+        && !hasLegacySelectionBaseline
+    });
 
     const memory = { ...existingMemory };
     const roleRouting = { ...existingRoleRouting };
@@ -825,7 +871,8 @@ function accountPresetIds(ownerAccountId: string): AccountPresetIds {
 function updateAccountAssignment(
   config: Record<string, unknown>,
   ownerAccountId: string,
-  presetIds: AccountPresetIds
+  presetIds: AccountPresetIds,
+  options: { preserveExistingByokCandidates?: boolean } = {}
 ): void {
   const assignments = isRecord(config.modelAssignments) ? { ...config.modelAssignments } : {};
   const existing = isRecord(assignments.account) ? { ...assignments.account } : {};
@@ -845,7 +892,13 @@ function updateAccountAssignment(
   const byok = isRecord(assignments.byok) ? assignments.byok : {};
   const byokAgent = isRecord(byok.agent) ? byok.agent : {};
   const localCandidates = selectedUsableByokAgentCandidates(byokAgent, presets, ownerAccountId);
-  const candidates = [...platformCandidates, ...localCandidates];
+  const currentByokCandidates = selectedUsableByokAgentCandidates(agent, presets, ownerAccountId);
+  const candidates = [
+    ...platformCandidates,
+    ...(sameOwner && options.preserveExistingByokCandidates
+      ? currentByokCandidates
+      : localCandidates)
+  ];
   const currentDefault = existingString(agent.default);
   agent.candidates = candidates;
   agent.default = currentDefault && candidates.includes(currentDefault) ? currentDefault : presetIds.agent;

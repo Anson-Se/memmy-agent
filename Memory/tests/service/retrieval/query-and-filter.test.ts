@@ -183,6 +183,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     const { db, service } = createTestService();
     const namespace = { source: "codex", profileId: "default", userId: "dynamic-policy-user" };
     const session = service.openSession({ namespace });
+    const daysFromNow = (days: number) => new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
     insertActivePolicyMemory(db, {
       id: "policy_dynamic_stale",
       userId: namespace.userId,
@@ -193,8 +194,8 @@ describe("MemoryService / retrieval / query and filtering", () => {
       sourceTraceId: "trace_dynamic_policy",
       sourceEpisodeId: "episode_dynamic_policy",
       freshnessClass: "dynamic",
-      lastVerifiedAt: "2026-06-01T00:00:00.000Z",
-      revalidateAfter: "2026-07-01T00:00:00.000Z"
+      lastVerifiedAt: daysFromNow(-60),
+      revalidateAfter: daysFromNow(-30)
     });
     insertActivePolicyMemory(db, {
       id: "policy_dynamic_without_deadline",
@@ -206,7 +207,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
       sourceTraceId: "trace_dynamic_policy_without_deadline",
       sourceEpisodeId: "episode_dynamic_policy_without_deadline",
       freshnessClass: "dynamic",
-      lastVerifiedAt: "2026-08-18T00:00:00.000Z"
+      lastVerifiedAt: daysFromNow(-10)
     });
     insertActiveSkillMemoryForTest(db, {
       id: "skill_from_stale_policy",
@@ -257,8 +258,8 @@ describe("MemoryService / retrieval / query and filtering", () => {
         };
       };
     };
-    properties.internal_info.policy.last_verified_at = "2026-08-18T00:00:00.000Z";
-    properties.internal_info.policy.revalidate_after = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    properties.internal_info.policy.last_verified_at = daysFromNow(-1);
+    properties.internal_info.policy.revalidate_after = daysFromNow(30);
     db.db.prepare(`UPDATE memories SET properties_json = ? WHERE id = ?`)
       .run(JSON.stringify(properties), "policy_dynamic_stale");
 
@@ -1833,6 +1834,7 @@ function acceptedCaptureDecision(summary: string, messages: Array<{ role: string
   const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
   return {
     l1: {
+      title: summary.slice(0, 30),
       summary,
       evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
     },

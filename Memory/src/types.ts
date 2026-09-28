@@ -67,6 +67,7 @@ export interface MemoryProcessingRecord {
 }
 export type JobType =
   | "episode_idle_close"
+  | "episode_title"
   | "trace_summary"
   | "user_memory_embedding"
   | "import_summary"
@@ -82,8 +83,12 @@ export type JobType =
   | "l3_world_model_update"
   | "project_environment_profile"
   | "skill_crystallization"
+  | "skill_cluster_assign"
+  | "skill_batch_evolve"
   | "skill_trial_resolve"
-  | "work_memory_extract";
+  | "work_memory_extract"
+  | "work_memory_idle_flush"
+  | "feedback_experience";
 
 export interface RuntimeNamespace {
   source: string;
@@ -247,6 +252,9 @@ export interface MemoryListItem {
   status: MemoryStatus;
   title: string;
   summary: string;
+  sourceText?: string;
+  generatedTitle?: string;
+  experienceDraft?: boolean;
   tags: string[];
   metrics?: {
     value?: number;
@@ -381,6 +389,13 @@ export interface SourceTurnCompleteRequest extends Omit<TurnCompleteRequest, "se
   sourceTurn: SourceTurnIdentity;
   channel: "hook" | "agent_source_scan";
   workspacePath?: string;
+  /**
+   * Set only by initial and full agent-source scans. Those scans backfill history
+   * that completed before capture activation. Hooks and incremental scans must omit it.
+   */
+  captureLegacyHistory?: boolean;
+  /** Pre-native import turn id, recomputed from the first user message. */
+  legacyImportTurnId?: string;
 }
 
 export interface TurnCompletionResult {
@@ -406,6 +421,7 @@ export interface SourceTurnCompleteResponse {
   status: "stored" | "existing" | "rejected" | "pending" | "conflict";
   reason?: string;
   result?: TurnCompletionResult;
+  legacyImportMemoryId?: string;
 }
 
 export type UserMemoryType = "User Fact" | "User Preference" | "User Directive";
