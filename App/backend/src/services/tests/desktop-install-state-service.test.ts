@@ -81,7 +81,7 @@ describe("resetAccountRuntimeForDesktopInstallChange", () => {
       .toMatchObject({ active_uuid: "cloud-account-a" });
   });
 
-  it("does not reactivate an account that was explicitly logged out before migration", async () => {
+  it("restores an account whose active session was cleared before an authoritative migration", async () => {
     const context = createContext();
     await seedAccountRuntime(context);
     context.store.repositories.accountSession.clear();
@@ -94,8 +94,18 @@ describe("resetAccountRuntimeForDesktopInstallChange", () => {
         runtimeSourceWasMigrated: true,
         categorySourcesShareGeneration: false
       }
-    })).rejects.toMatchObject({ code: "windows_data_migration_inconsistent" });
-    expect(context.store.repositories.accountSession.get()).toEqual({ authenticated: false });
+    })).resolves.toMatchObject({
+      source: "runtime_config",
+      mode: "account",
+      hydratedAppState: true,
+      reason: "hydrated_account_from_runtime_config"
+    });
+    expect(context.store.repositories.accountSession.get()).toMatchObject({
+      authenticated: true,
+      profile: { userId: "user-a" }
+    });
+    expect(context.store.db.prepare("SELECT active_uuid FROM app_settings WHERE id = 'default'").get())
+      .toMatchObject({ active_uuid: "cloud-account-a" });
   });
 
   it("keeps account runtime when the desktop install fingerprint is unchanged", async () => {
