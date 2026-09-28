@@ -44,6 +44,7 @@ export interface IntegrationConnectFlowResult {
   phase: ConnectIntegrationPhase;
   connection?: IntegrationConnection;
   error?: unknown;
+  errorCode?: "service_unavailable";
   cancelled?: boolean;
 }
 
@@ -147,7 +148,9 @@ export function ConnectIntegrationModal(props: ConnectIntegrationModalProps) {
     }
 
     if (result.phase === "error") {
-      setErrorMessage(toErrorMessage(result.error) || t("tools.modal.oauthTimeout"));
+      setErrorMessage(result.errorCode === "service_unavailable"
+        ? t("tools.modal.serviceUnavailableRetry")
+        : toErrorMessage(result.error) || t("tools.modal.oauthTimeout"));
     }
   }, [props, t]);
 
@@ -381,8 +384,8 @@ export async function runIntegrationConnectFlow(input: IntegrationConnectFlowInp
       } catch (error) {
         if (isIntegrationSetupDiagnosticError(error)) {
           logHiddenIntegrationSetupDiagnosticError(error);
-          input.onPhase?.("idle");
-          return { phase: "idle" };
+          input.onPhase?.("error");
+          return { phase: "error", errorCode: "service_unavailable" };
         }
 
         console.warn("[tools] Failed to poll connection state; retrying on the next tick:", error);
@@ -423,12 +426,13 @@ export async function runIntegrationConnectFlow(input: IntegrationConnectFlowInp
 
     if (isIntegrationSetupDiagnosticError(error)) {
       logHiddenIntegrationSetupDiagnosticError(error);
-      input.onPhase?.("idle");
-      return { phase: "idle" };
+      input.onPhase?.("error");
+      return { phase: "error", errorCode: "service_unavailable" };
     }
 
+    console.warn("[tools] Integration connection service unavailable:", error);
     input.onPhase?.("error");
-    return { phase: "error", error };
+    return { phase: "error", errorCode: "service_unavailable" };
   }
 }
 
