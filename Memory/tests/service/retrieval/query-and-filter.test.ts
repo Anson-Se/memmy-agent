@@ -18,7 +18,8 @@ import {
   mergeSameTurnRecallHits,
   mmrRecallHits,
   parallelMemoryLaneLimit,
-  queryExtractHistoryFromRawTurns
+  queryExtractHistoryFromRawTurns,
+  turnStartMemoryLayers
 } from "../../../src/service/retrieval/retrieval-service.js";
 import {
   insertActivePolicyMemory,
@@ -321,7 +322,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     db.close();
   });
 
-  it("uses turn-start topK as the explicit search default limit", async () => {
+  it("uses the summed tier topK as the explicit search default limit", async () => {
     const config = {
       ...DEFAULT_MEMMY_CONFIG,
       algorithm: {
@@ -363,6 +364,149 @@ describe("MemoryService / retrieval / query and filtering", () => {
     });
 
     expect(recall.hits).toHaveLength(7);
+    db.close();
+  });
+
+  it("never includes L3 in turn-start layers, even when requested", () => {
+    const intentLayers = ["Skill", "L2", "L1", "L3"] as const;
+    expect(turnStartMemoryLayers([...intentLayers])).toEqual(["Skill", "L2", "L1"]);
+    expect(turnStartMemoryLayers([...intentLayers], ["L3"])).toEqual([]);
+    expect(turnStartMemoryLayers([...intentLayers], ["L1", "L3"])).toEqual(["L1"]);
+    expect(turnStartMemoryLayers(["Skill", "L2", "L1"], ["L2", "Skill"])).toEqual(["Skill", "L2"]);
+  });
+
+  it("keeps L3 world models out of turn-start recall while memory search still returns them", async () => {
+    const { db, service } = createTestService();
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "user-turn-start-no-l3"
+    };
+    const session = service.openSession({ namespace });
+    insertWorldModelMemoryForTest(db, {
+      id: "world_turn_start_excluded",
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      agentId: namespace.source,
+      appId: "memmy-test",
+      profileId: namespace.profileId,
+      memoryKey: "world:sqlite_migration",
+      domainKey: "sqlite|migration",
+      domainTags: ["sqlite", "migration"],
+      policyIds: []
+    });
+    const query = "sqlite migration checklist world model neutral reward skill";
+
+    const direct = await service.search({
+      sessionId: session.sessionId,
+      query,
+      layers: ["L3"],
+      limit: 5,
+      includeInjectedContext: true
+    });
+    expect(direct.hits.map((hit) => hit.id)).toContain("world_turn_start_excluded");
+    expect(direct.injectedContext.markdown).toContain("## L3 Environment Knowledge");
+
+    for (const layers of [undefined, ["L3"], ["Skill", "L1", "L3"]] as const) {
+      const start = await service.startTurn({
+        namespace,
+        sessionId: session.sessionId,
+        query,
+        layers: layers === undefined ? undefined : [...layers]
+      });
+      expect(start.hits.some((hit) => hit.memoryLayer === "L3")).toBe(false);
+      expect(start.sourceMemoryIds).not.toContain("world_turn_start_excluded");
+      expect(start.injectedContext.markdown).not.toContain("## L3 Environment Knowledge");
+    }
+    db.close();
+  });
+
+  it("keeps L3 world models out of read-only turn-start recall", async () => {
+    const { db } = createTestService();
+    const service = createTestMemoryService({
+      db,
+      mode: "dev",
+      config: configWithMemoryGates({
+        enableMemoryAdd: false,
+        enableMemorySearch: true
+      })
+    });
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "user-readonly-turn-start-no-l3"
+    };
+    const session = service.openSession({ namespace, sessionId: "readonly-no-l3-session" });
+    insertWorldModelMemoryForTest(db, {
+      id: "world_readonly_turn_start_excluded",
+      userId: namespace.userId,
+      sessionId: session.sessionId,
+      agentId: namespace.source,
+      appId: "memmy-test",
+      profileId: namespace.profileId,
+      memoryKey: "world:sqlite_migration",
+      domainKey: "sqlite|migration",
+      domainTags: ["sqlite", "migration"],
+      policyIds: []
+    });
+
+    const start = await service.startTurn({
+      namespace,
+      sessionId: session.sessionId,
+      turnId: "readonly-no-l3-turn",
+      query: "sqlite migration checklist world model neutral reward skill",
+      layers: ["L3"]
+    });
+    expect(start.hits).toEqual([]);
+    expect(start.status).toContain("memory_add:disabled:no_turn_write");
+    expect(start.injectedContext.markdown).not.toContain("## L3 Environment Knowledge");
+    db.close();
+  });
+
+  it("limits turn-start recall to tier1 + tier2 topK", async () => {
+    const config = {
+      ...DEFAULT_MEMMY_CONFIG,
+      algorithm: {
+        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        retrieval: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          tier1TopK: 1,
+          tier2TopK: 2,
+          tier3TopK: 4,
+          relativeThresholdFloor: 0,
+          minRecallScore: 0,
+          smartSeed: false,
+          llmFilterEnabled: false,
+          llmFilterFallbackMaxKeep: 20
+        }
+      }
+    };
+    const { db, service } = createTestService({ config });
+    const namespace = {
+      source: "codex",
+      profileId: "jiang",
+      userId: "user-turn-start-topk"
+    };
+
+    for (let index = 0; index < 10; index += 1) {
+      service.addMemory({
+        namespace,
+        layer: "L2",
+        title: `Turn start topK policy ${index}`,
+        content: `Use turn start topK policy evidence for retrieval limit checks ${index}.`
+      });
+    }
+    await service.runWorkerOnce(50);
+
+    const session = service.openSession({ namespace });
+    const start = await service.startTurn({
+      namespace,
+      sessionId: session.sessionId,
+      query: "Apply the turn start topK policy evidence for retrieval limit checks.",
+      layers: ["L2"]
+    });
+
+    expect(start.hits).toHaveLength(3);
     db.close();
   });
 

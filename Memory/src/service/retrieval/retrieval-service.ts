@@ -38,7 +38,6 @@ import {
 import { createMemoryLogger, memoryErrorFields } from "../../logging/logger.js";
 import type { Embedder, LlmClient } from "../../model/types.js";
 import {
-  isStrictL3WorldModelV2Memory,
   kindFromMemory,
   Repositories,
   type EpisodeRecord,
@@ -151,6 +150,23 @@ export function memoryLayersForIntent(kind: Parameters<typeof retrievalForIntent
   if (plan.tier2) layers.push("L2", "L1");
   if (plan.tier3) layers.push("L3");
   return layers;
+}
+
+// L3 world-model memory is not recalled by `turns/start`. The single activated L3
+// record per user/project reaches the model only through the session L3 context
+// (system-prompt) path, so turn-start retrieval never queries the L3 layer even
+// when the intent plan or the caller asks for it. `memory.search` and
+// `worldModelQuery` keep L3 searchable.
+const TURN_START_EXCLUDED_LAYERS: ReadonlySet<MemoryLayer> = new Set<MemoryLayer>(["L3"]);
+
+export function turnStartMemoryLayers(
+  baseLayers: MemoryLayer[],
+  requestedLayers?: MemoryLayer[]
+): MemoryLayer[] {
+  return baseLayers.filter((layer) =>
+    !TURN_START_EXCLUDED_LAYERS.has(layer) &&
+    (requestedLayers === undefined || requestedLayers.includes(layer))
+  );
 }
 
 export function readableMemoryIdKind(id: string): ReadableMemoryIdKind {
@@ -1799,6 +1815,12 @@ export class RetrievalService {
     return this.candidatePool.isMemoryReadyForRetrieval(memory);
   }
 
+  private defaultRetrievalLimit(retrievalMode: RetrievalMode): number {
+    if (retrievalMode === "turn_start") return this.deps.turnStartRetrievalLimit();
+    const retrieval = this.deps.config.algorithm.retrieval;
+    return Math.max(1, retrieval.tier1TopK + retrieval.tier2TopK + retrieval.tier3TopK);
+  }
+
   async search(request: InternalMemorySearchRequest): Promise<{
     searchEventId: string;
     hits: RecallHit[];
@@ -1906,7 +1928,7 @@ export class RetrievalService {
     const layers: MemoryLayer[] = onboardingFirstReportHit || timeFilter ? ["L1"] : semanticLayers;
     const retrievalLimit = timeFilter
       ? TIME_FILTERED_TRACE_LIMIT
-      : request.limit ?? this.deps.turnStartRetrievalLimit();
+      : request.limit ?? this.defaultRetrievalLimit(retrievalMode);
     const agentLaneLimit = includeUserMemory
       ? parallelMemoryLaneLimit(retrievalLimit)
       : retrievalLimit;
@@ -1936,8 +1958,7 @@ export class RetrievalService {
           currentAgentId: context.namespace.source
         });
     const memories = retrievalOutput.memories.filter((memory) =>
-      !memoryUsesStalePolicy(memory, stalePolicyIds) &&
-      (retrievalMode !== "turn_start" || !isStrictL3WorldModelV2Memory(memory))
+      !memoryUsesStalePolicy(memory, stalePolicyIds)
     );
     const allowedMemoryIds = new Set(memories.map((memory) => memory.id));
     const allowedEpisodeIds = new Set(memories.flatMap((memory) => {

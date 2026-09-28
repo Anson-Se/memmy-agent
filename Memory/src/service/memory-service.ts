@@ -164,7 +164,8 @@ import {
   memoryLayersForIntent,
   memoryMatchesTags,
   readableMemoryIdKind,
-  retrievedMemorySourceIds
+  retrievedMemorySourceIds,
+  turnStartMemoryLayers
 } from "./retrieval/retrieval-service.js";
 import {
   SessionTurnService,
@@ -666,6 +667,7 @@ export class MemoryService {
       shouldDeferBudgetedEvolutionLlm: () => this.shouldDeferBudgetedEvolutionLlm(),
       firstLine,
       memoryLayersForIntent,
+      turnStartMemoryLayers,
       armWorkMemoryIdleFlush: this.armWorkMemoryIdleFlush.bind(this),
       extractUnextractedWorkMemory: this.extractUnextractedWorkMemory.bind(this),
       namespaceIdFromContext,
@@ -885,8 +887,9 @@ export class MemoryService {
   }
 
   private turnStartRetrievalLimit(): number {
+    // Turn-start retrieval never queries L3, so tier3TopK does not contribute to its limit.
     const retrieval = this.config.algorithm.retrieval;
-    return Math.max(1, retrieval.tier1TopK + retrieval.tier2TopK + retrieval.tier3TopK);
+    return Math.max(1, retrieval.tier1TopK + retrieval.tier2TopK);
   }
 
   /** Set after the HTTP server binds, including when an ephemeral port is used. */
@@ -2655,10 +2658,8 @@ export class MemoryService {
   ): ReturnType<MemoryService["startTurn"]> {
     const turnId = request.turnId ?? newId("turn");
     const contextHints = turnStartContextHints(request);
-    const defaultLayers: MemoryLayer[] = ["Skill", "L2", "L1", "L3"];
-    const requestedLayers = request.layers === undefined
-      ? defaultLayers
-      : defaultLayers.filter((layer) => request.layers?.includes(layer));
+    const defaultLayers: MemoryLayer[] = ["Skill", "L2", "L1"];
+    const requestedLayers = turnStartMemoryLayers(defaultLayers, request.layers);
     const search = await this.search({
       requestId: request.requestId,
       adapterId: request.adapterId,

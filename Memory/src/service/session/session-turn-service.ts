@@ -1168,10 +1168,10 @@ export class SessionTurnService {
       endTopicDecision
     );
     const contextHints = turnStartContextHints(request);
-    const intentLayers = this.deps.memoryLayersForIntent(intentDecision.kind);
-    const requestedLayers = request.layers === undefined
-      ? intentLayers
-      : intentLayers.filter((layer: MemoryLayer) => request.layers?.includes(layer));
+    const requestedLayers: MemoryLayer[] = this.deps.turnStartMemoryLayers(
+      this.deps.memoryLayersForIntent(intentDecision.kind),
+      request.layers
+    );
     const searchPromise = this.deps.search({
       requestId: request.requestId,
       adapterId: request.adapterId,
