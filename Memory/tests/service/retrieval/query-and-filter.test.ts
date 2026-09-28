@@ -9,7 +9,7 @@ import {
   type MemoryRow,
   type RecallHit
 } from "../../../src/index.js";
-import { Repositories } from "../../../src/storage/repositories.js";
+import { Repositories, type RawTurnRecord } from "../../../src/storage/repositories.js";
 import {
   policyIsEligibleForDownstream,
   policyMetaFromMemory
@@ -17,7 +17,8 @@ import {
 import {
   mergeSameTurnRecallHits,
   mmrRecallHits,
-  parallelMemoryLaneLimit
+  parallelMemoryLaneLimit,
+  queryExtractHistoryFromRawTurns
 } from "../../../src/service/retrieval/retrieval-service.js";
 import {
   insertActivePolicyMemory,
@@ -405,7 +406,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     });
 
     expect(calls.map((call) => call.options.operation)).toEqual([
-      "retrieval.retrieval.query.extract.v2"
+      "retrieval.retrieval.query.extract.v3"
     ]);
     expect(calls[0]?.messages[0]?.content).toContain("CURRENT_TIME:");
     expect(calls[0]?.messages[0]?.content).toContain("TIME_ZONE:");
@@ -445,6 +446,10 @@ describe("MemoryService / retrieval / query and filtering", () => {
     );
     expect(logOutput.candidates.every((candidate) => candidate.content?.endsWith(`Summary:\n${candidate.summary}`))).toBe(true);
     expect(logOutput.candidates.some((candidate) => candidate.content?.includes("Historical user statement"))).toBe(false);
+    const timeFilterStats = (JSON.parse(latestSearchLog!.outputJson) as {
+      stats: { llmFilter: { durationMs?: number } };
+    }).stats;
+    expect(timeFilterStats.llmFilter.durationMs).toBeUndefined();
     db.close();
   });
 
@@ -927,9 +932,9 @@ describe("MemoryService / retrieval / query and filtering", () => {
         if (summaryFails && options.operation === "retrieval.retrieval.filter.v5") {
           throw new Error("summary filter unavailable");
         }
-        if (options.operation === "retrieval.retrieval.query.extract.v2") {
+        if (options.operation === "retrieval.retrieval.query.extract.v3") {
           return {
-            queryVecText: messages.find((message) => message.role === "user")?.content.replace(/^COMPLETE USER INPUT:\n/, "") ?? "",
+            queryVecText: currentUserInputOf(messages),
             keywords: []
           } as unknown as T;
         }
@@ -1032,7 +1037,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     });
 
     expect(summaryCalls.map((call) => call.operation)).toEqual([
-      "retrieval.retrieval.query.extract.v2",
+      "retrieval.retrieval.query.extract.v3",
       "retrieval.retrieval.filter.v5"
     ]);
     expect(evolutionCalls).toEqual([]);
@@ -1069,7 +1074,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     });
 
     expect(summaryCalls.map((call) => call.operation)).toEqual([
-      "retrieval.retrieval.query.extract.v2",
+      "retrieval.retrieval.query.extract.v3",
       "retrieval.retrieval.filter.v5"
     ]);
     expect(evolutionCalls.map((call) => call.operation)).toEqual(["retrieval.retrieval.filter.v5"]);
@@ -1077,7 +1082,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     db.close();
   });
 
-  it("skips the plugin retrieval filter for a single candidate by default", async () => {
+  it("runs the plugin retrieval filter for a single candidate by default", async () => {
     const root = createTestRoot("mindock-memory-llm-filter-single-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1111,6 +1116,65 @@ describe("MemoryService / retrieval / query and filtering", () => {
         source: "codex",
         profileId: "jiang",
         userId: "user-filter-single"
+      },
+      query: "pytest fixture"
+    });
+
+    expect(recall.hits).toHaveLength(1);
+    expect(calls.filter((call) => call.options.operation === "retrieval.retrieval.filter.v5")).toHaveLength(1);
+    const searchLog = service.apiLogs({ tools: ["memory_search"], limit: 1 }).logs[0]!;
+    const filterStats = (JSON.parse(searchLog.outputJson) as {
+      stats: { llmFilter: { durationMs?: number } };
+    }).stats;
+    expect(typeof filterStats.llmFilter.durationMs).toBe("number");
+    db.close();
+  });
+
+  it("skips the plugin retrieval filter when candidates stay below llmFilterMinCandidates", async () => {
+    const root = createTestRoot("mindock-memory-llm-filter-min-candidates-");
+    const db = new MemoryDb({
+      path: join(root, "memory.sqlite")
+    });
+    const config = DEFAULT_MEMMY_CONFIG;
+    const calls: Array<{
+      messages: Array<{ role: string; content: string }>;
+      options: { operation: string };
+    }> = [];
+    const service = createTestMemoryService({
+      db,
+      mode: "dev",
+      llm: createRankedRetrievalFilterLlm(calls, [1]),
+      embedder: createCapturingEmbedder([]),
+      config: {
+        ...config,
+        algorithm: {
+          ...config.algorithm,
+          retrieval: {
+            ...config.algorithm.retrieval,
+            llmFilterMinCandidates: 2
+          }
+        }
+      }
+    });
+    const session = service.openSession({
+      namespace: {
+        source: "codex",
+        profileId: "jiang",
+        userId: "user-filter-min-candidates"
+      }
+    });
+    service.completeTurn("turn-filter-min-candidates-1", {
+      sessionId: session.sessionId,
+      query: "Remember that pytest fixture setup failed",
+      answer: "Captured the pytest fixture failure context."
+    });
+    await service.runWorkerOnce(20);
+
+    const recall = await service.search({
+      namespace: {
+        source: "codex",
+        profileId: "jiang",
+        userId: "user-filter-min-candidates"
       },
       query: "pytest fixture"
     });
@@ -1284,7 +1348,307 @@ describe("MemoryService / retrieval / query and filtering", () => {
 
     db.close();
   });
+
+  it("selects query extract history from recent raw turns deterministically", () => {
+    const longText = "x".repeat(260);
+    const rawTurns: RawTurnRecord[] = [
+      queryExtractRawTurn({ id: "rt-7", turnId: "turn-current", status: "observed", userText: "current turn", assistantText: "" }),
+      queryExtractRawTurn({ id: "rt-6", turnId: "turn-6", status: "failed", userText: "failed q", assistantText: "failed a" }),
+      queryExtractRawTurn({ id: "rt-5", turnId: "turn-5", userText: "q5", assistantText: longText }),
+      queryExtractRawTurn({ id: "rt-4", turnId: "turn-4", userText: "q4", assistantText: "a4", redactedAt: "2026-09-01T00:00:00.000Z" }),
+      queryExtractRawTurn({ id: "rt-3", turnId: "turn-3", userText: "   ", assistantText: "a3" }),
+      queryExtractRawTurn({ id: "rt-2", turnId: "turn-2", userText: "q2", assistantText: "a2" }),
+      queryExtractRawTurn({ id: "rt-1", turnId: "turn-1", userText: "q1", assistantText: "a1" }),
+      queryExtractRawTurn({ id: "rt-0", turnId: "turn-0", userText: "q0", assistantText: "a0" })
+    ];
+
+    const history = queryExtractHistoryFromRawTurns(rawTurns, {
+      currentTurnId: "turn-current",
+      maxTurns: 5,
+      maxChars: 200
+    });
+
+    expect(history.map((turn) => turn.user)).toEqual(["q0", "q1", "q2", "q5"]);
+    expect(history.map((turn) => turn.assistant.length <= 200)).toEqual([true, true, true, true]);
+    expect(history[3]?.assistant).toBe(`${"x".repeat(197)}...`);
+
+    const succeededOnly = Array.from({ length: 8 }, (_, index) =>
+      queryExtractRawTurn({ id: `ok-${index}`, turnId: `turn-ok-${index}`, userText: `q${index}`, assistantText: `a${index}` })
+    );
+    expect(queryExtractHistoryFromRawTurns(succeededOnly, { maxTurns: 5, maxChars: 200 })).toHaveLength(5);
+    expect(queryExtractHistoryFromRawTurns(succeededOnly, { maxTurns: 5, maxChars: 200 }).map((turn) => turn.user))
+      .toEqual(["q4", "q3", "q2", "q1", "q0"]);
+    expect(queryExtractHistoryFromRawTurns(succeededOnly, { maxTurns: 0, maxChars: 200 })).toEqual([]);
+    expect(queryExtractHistoryFromRawTurns(succeededOnly, { maxTurns: 20, maxChars: 200 })).toHaveLength(8);
+    expect(queryExtractHistoryFromRawTurns([
+      queryExtractRawTurn({ id: "solo", turnId: "turn-solo", userText: "q-solo", assistantText: "a-solo" }),
+      queryExtractRawTurn({ id: "solo-current", turnId: "turn-solo-current", userText: "q-cur", assistantText: "a-cur" })
+    ], { currentTurnId: "turn-solo-current", maxTurns: 5, maxChars: 200 })).toEqual([{ user: "q-solo", assistant: "a-solo" }]);
+  });
+
+  it("feeds recent succeeded session turns into the turn start query extract input", async () => {
+    const extractInputs: string[] = [];
+    const { db, service } = createTestService({ llm: createQueryExtractCapturingLlm(extractInputs) });
+    const namespace = { source: "codex", profileId: "jiang", userId: "user-query-extract-history" };
+    const seeded = await seedQueryExtractHistory(service, namespace);
+    extractInputs.length = 0;
+
+    const currentQuery = "那个脚本还是挂";
+    await service.startTurn({
+      turnId: "turn-query-extract-history-3",
+      sessionId: seeded.sessionId,
+      query: currentQuery
+    });
+
+    expect(extractInputs).toHaveLength(1);
+    const input = extractInputs[0]!;
+    expect(input.startsWith("RECENT CONVERSATION (context only, oldest first):\n")).toBe(true);
+    expect(input).toBe([
+      "RECENT CONVERSATION (context only, oldest first):",
+      `user: ${seeded.firstQuery}`,
+      `assistant: ${seeded.firstAnswer.slice(0, 197)}...`,
+      "",
+      `user: ${seeded.secondQuery}`,
+      `assistant: ${seeded.secondAnswer}`,
+      "",
+      "CURRENT USER INPUT:",
+      currentQuery
+    ].join("\n"));
+    expect(input).not.toContain(seeded.firstAnswer);
+    expect(input).not.toContain(seeded.toolOutputMarker);
+    expect(input.indexOf(`user: ${seeded.firstQuery}`)).toBeLessThan(input.indexOf(`user: ${seeded.secondQuery}`));
+    db.close();
+  });
+
+  it("sends only the current input to query extract when the session has no history", async () => {
+    const extractInputs: string[] = [];
+    const { db, service } = createTestService({ llm: createQueryExtractCapturingLlm(extractInputs) });
+    const namespace = { source: "codex", profileId: "jiang", userId: "user-query-extract-empty-history" };
+    await seedQueryExtractHistory(service, namespace);
+    extractInputs.length = 0;
+
+    const freshSession = service.openSession({ namespace });
+    const currentQuery = "帮我看看 scripts/migrate_sqlite.py 跑 pytest 为什么挂";
+    await service.startTurn({
+      turnId: "turn-query-extract-empty-history-1",
+      sessionId: freshSession.sessionId,
+      query: currentQuery
+    });
+
+    expect(extractInputs).toEqual([`CURRENT USER INPUT:\n${currentQuery}`]);
+    db.close();
+  });
+
+  it("does not attach session history to query extract outside turn start", async () => {
+    const extractInputs: string[] = [];
+    const { db, service } = createTestService({ llm: createQueryExtractCapturingLlm(extractInputs) });
+    const namespace = { source: "codex", profileId: "jiang", userId: "user-query-extract-search-mode" };
+    const seeded = await seedQueryExtractHistory(service, namespace);
+    extractInputs.length = 0;
+
+    const currentQuery = "那个脚本还是挂";
+    await service.search({
+      namespace,
+      sessionId: seeded.sessionId,
+      query: currentQuery
+    });
+
+    expect(extractInputs).toEqual([`CURRENT USER INPUT:\n${currentQuery}`]);
+    expect(extractInputs[0]).not.toContain("RECENT CONVERSATION");
+    db.close();
+  });
+
+  it("disables query extract history when queryExtractHistoryTurns is 0", async () => {
+    const extractInputs: string[] = [];
+    const { db, service } = createTestService({
+      llm: createQueryExtractCapturingLlm(extractInputs),
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          retrieval: {
+            ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+            queryExtractHistoryTurns: 0
+          }
+        }
+      }
+    });
+    const namespace = { source: "codex", profileId: "jiang", userId: "user-query-extract-history-off" };
+    const seeded = await seedQueryExtractHistory(service, namespace);
+    extractInputs.length = 0;
+
+    const currentQuery = "那个脚本还是挂";
+    await service.startTurn({
+      turnId: "turn-query-extract-history-off-3",
+      sessionId: seeded.sessionId,
+      query: currentQuery
+    });
+
+    expect(extractInputs).toEqual([`CURRENT USER INPUT:\n${currentQuery}`]);
+    db.close();
+  });
+
+  it("drops query extract history when the current input exceeds 2000 characters", async () => {
+    const extractInputs: string[] = [];
+    const { db, service } = createTestService({ llm: createQueryExtractCapturingLlm(extractInputs) });
+    const namespace = { source: "codex", profileId: "jiang", userId: "user-query-extract-long-query" };
+    const seeded = await seedQueryExtractHistory(service, namespace);
+    extractInputs.length = 0;
+
+    const overLimitQuery = "长".repeat(2001);
+    await service.search({
+      namespace,
+      sessionId: seeded.sessionId,
+      retrievalMode: "turn_start",
+      query: overLimitQuery
+    });
+    expect(extractInputs).toEqual([`CURRENT USER INPUT:\n${overLimitQuery}`]);
+
+    extractInputs.length = 0;
+    const atLimitQuery = "长".repeat(2000);
+    await service.search({
+      namespace,
+      sessionId: seeded.sessionId,
+      retrievalMode: "turn_start",
+      query: atLimitQuery
+    });
+    expect(extractInputs).toHaveLength(1);
+    expect(extractInputs[0]!.startsWith("RECENT CONVERSATION (context only, oldest first):\n")).toBe(true);
+    expect(extractInputs[0]!.endsWith(`\n\nCURRENT USER INPUT:\n${atLimitQuery}`)).toBe(true);
+    db.close();
+  });
 });
+
+const CURRENT_USER_INPUT_LABEL = "CURRENT USER INPUT:\n";
+
+function currentUserInputOf(messages: Array<{ role: string; content: string }>): string {
+  const content = messages.find((message) => message.role === "user")?.content ?? "";
+  const labelIndex = content.lastIndexOf(CURRENT_USER_INPUT_LABEL);
+  return labelIndex < 0 ? content : content.slice(labelIndex + CURRENT_USER_INPUT_LABEL.length);
+}
+
+function queryExtractRawTurn(input: {
+  id: string;
+  turnId: string;
+  userText: string;
+  assistantText: string;
+  status?: string;
+  redactedAt?: string | null;
+}): RawTurnRecord {
+  return {
+    id: input.id,
+    sessionId: "session-query-extract",
+    episodeId: "episode-query-extract",
+    turnId: input.turnId,
+    userId: "user-query-extract",
+    userText: input.userText,
+    assistantText: input.assistantText,
+    toolCalls: [],
+    toolResults: [],
+    sourceMemoryIds: [],
+    usage: {},
+    status: input.status ?? "succeeded",
+    redactedAt: input.redactedAt ?? null,
+    deletedAt: null,
+    createdAt: "2026-09-01T00:00:00.000Z"
+  };
+}
+
+async function seedQueryExtractHistory(
+  service: ReturnType<typeof createTestService>["service"],
+  namespace: { source: string; profileId: string; userId: string }
+): Promise<{
+  sessionId: string;
+  firstQuery: string;
+  firstAnswer: string;
+  secondQuery: string;
+  secondAnswer: string;
+  toolOutputMarker: string;
+}> {
+  const session = service.openSession({ namespace });
+  const firstQuery = "帮我看看 scripts/migrate_sqlite.py 跑 pytest 为什么挂";
+  const firstAnswer = `失败在 test_migrate_schema，${"原因是 sqlite 版本低于 3.35 不支持 DROP COLUMN，需要升级 sqlite 或改写迁移脚本。".repeat(6)}`;
+  const secondQuery = "把迁移脚本改成兼容旧版 sqlite";
+  const secondAnswer = "已改为先建新表再复制数据，绕开 DROP COLUMN。";
+  const toolOutputMarker = "TOOL_OUTPUT_MARKER_pytest_1_failed";
+  expect(firstAnswer.length).toBeGreaterThan(200);
+  service.completeTurn("turn-query-extract-history-1", {
+    sessionId: session.sessionId,
+    query: firstQuery,
+    answer: firstAnswer,
+    toolCalls: [{
+      name: "shell",
+      input: "pytest tests/test_migrate.py",
+      output: toolOutputMarker,
+      success: true
+    }]
+  });
+  service.completeTurn("turn-query-extract-history-2", {
+    sessionId: session.sessionId,
+    query: secondQuery,
+    answer: secondAnswer
+  });
+  await service.runWorkerOnce(20);
+  return {
+    sessionId: session.sessionId,
+    firstQuery,
+    firstAnswer,
+    secondQuery,
+    secondAnswer,
+    toolOutputMarker
+  };
+}
+
+function createQueryExtractCapturingLlm(extractInputs: string[]): LlmClient {
+  return {
+    config: {
+      ...DEFAULT_MEMMY_CONFIG.summary,
+      provider: "host",
+      endpoint: "http://127.0.0.1/query-extract-history",
+      model: "query-extract-history"
+    },
+    isConfigured() {
+      return true;
+    },
+    async complete() {
+      return "{}";
+    },
+    async completeJson<T extends Record<string, unknown>>(
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      options: { operation: string }
+    ): Promise<T> {
+      if (options.operation === "capture.summarize") {
+        return acceptedCaptureDecision("query extract history trace", messages) as unknown as T;
+      }
+      if (options.operation === "retrieval.retrieval.query.extract.v3") {
+        extractInputs.push(messages.find((message) => message.role === "user")?.content ?? "");
+        return {
+          queryVecText: currentUserInputOf(messages),
+          keywords: []
+        } as unknown as T;
+      }
+      if (options.operation === "relation.classify.v1") {
+        return {
+          relation: "follow_up",
+          confidence: 0.7,
+          reason: "same migration script task"
+        } as unknown as T;
+      }
+      return {
+        ranked: [1],
+        sufficient: true
+      } as unknown as T;
+    },
+    status() {
+      return {
+        provider: "host",
+        model: "query-extract-history",
+        configured: true,
+        remote: true
+      };
+    }
+  };
+}
 
 function seededScoreTraceMemory(): MemoryRow {
   const at = "2026-06-18T00:00:00.000Z";
@@ -1442,9 +1806,9 @@ function createRankedRetrievalFilterLlm(
       if (options.operation === "capture.summarize") {
         return acceptedCaptureDecision("durable retrieval test trace", messages) as unknown as T;
       }
-      if (options.operation === "retrieval.retrieval.query.extract.v2") {
+      if (options.operation === "retrieval.retrieval.query.extract.v3") {
         return {
-          queryVecText: messages.find((message) => message.role === "user")?.content.replace(/^COMPLETE USER INPUT:\n/, "") ?? "",
+          queryVecText: currentUserInputOf(messages),
           keywords: []
         } as unknown as T;
       }
@@ -1503,9 +1867,9 @@ function createQueryRewriteLlm(
       options: { operation: string; timeoutMs?: number; maxRetries?: number }
     ): Promise<T> {
       calls.push({ messages, options });
-      if (options.operation === "retrieval.retrieval.query.extract.v2") {
+      if (options.operation === "retrieval.retrieval.query.extract.v3") {
         return {
-          queryVecText: messages.find((message) => message.role === "user")?.content.replace(/^COMPLETE USER INPUT:\n/, "") ?? "",
+          queryVecText: currentUserInputOf(messages),
           keywords: []
         } as unknown as T;
       }

@@ -267,6 +267,8 @@ export interface AlgorithmConfig {
     llmFilterFallbackMaxKeep: number;
     llmFilterMinCandidates: number;
     llmFilterCandidateBodyChars: number;
+    queryExtractHistoryTurns: number;
+    queryExtractHistoryTextChars: number;
     readOnlyInjectionProfile: ReadOnlyInjectionProfile;
   };
 }
@@ -522,8 +524,10 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       llmFilterEnabled: true,
       llmFilterMaxKeep: 8,
       llmFilterFallbackMaxKeep: 6,
-      llmFilterMinCandidates: 2,
+      llmFilterMinCandidates: 1,
       llmFilterCandidateBodyChars: 500,
+      queryExtractHistoryTurns: 5,
+      queryExtractHistoryTextChars: 200,
       readOnlyInjectionProfile: "all"
     }
   }
@@ -1294,6 +1298,8 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       llmFilterFallbackMaxKeep: numberValue(retrieval.llmFilterFallbackMaxKeep, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterFallbackMaxKeep),
       llmFilterMinCandidates: numberValue(retrieval.llmFilterMinCandidates, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterMinCandidates),
       llmFilterCandidateBodyChars: numberValue(retrieval.llmFilterCandidateBodyChars, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.llmFilterCandidateBodyChars),
+      queryExtractHistoryTurns: numberValue(retrieval.queryExtractHistoryTurns, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.queryExtractHistoryTurns),
+      queryExtractHistoryTextChars: numberValue(retrieval.queryExtractHistoryTextChars, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.queryExtractHistoryTextChars),
       readOnlyInjectionProfile: readOnlyInjectionProfile(
         retrieval.readOnlyInjectionProfile,
         DEFAULT_MEMMY_CONFIG.algorithm.retrieval.readOnlyInjectionProfile
