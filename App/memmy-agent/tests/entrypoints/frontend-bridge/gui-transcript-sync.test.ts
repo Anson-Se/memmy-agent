@@ -281,7 +281,12 @@ describe("GUI transcript synchronization", () => {
     const session = saveProjectedSession(sessions, workspace, "telegram:789");
     const key = `websocket:${toGuiChatId(session.key)}`;
 
-    const record = { event: "message", chat_id: "t-offset", text: "second" };
+    const record: {
+      event: string;
+      chat_id: string;
+      text: string;
+      transcript_offset?: number;
+    } = { event: "message", chat_id: "t-offset", text: "second" };
     const endOffset = appendTranscriptObject(key, record);
     const rows = readTranscriptLines(key);
 
