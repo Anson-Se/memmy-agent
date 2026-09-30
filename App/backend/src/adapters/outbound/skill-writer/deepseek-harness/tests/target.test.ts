@@ -44,6 +44,7 @@ describe("DeepSeek Harness skill target", () => {
     const packageManifest = JSON.parse(readFileSync(packagePath, "utf8")) as Record<string, unknown>;
     expect(packageManifest).toMatchObject({
       name: "@memmy/memmy-memory",
+      version: "1.0.0",
       type: "module",
       exports: {
         ".": "./index.mjs",
@@ -51,7 +52,6 @@ describe("DeepSeek Harness skill target", () => {
       },
       dsh: { client: { platform: "web" } }
     });
-    expect(packageManifest).not.toHaveProperty("version");
     expect(readFileSync(skillPath, "utf8")).toContain('memmy-memory search "query text" --source deepseek_harness');
     expect(readFileSync(resumeSkillPath, "utf8")).toContain("--source deepseek_harness");
     expect(patch).toContain("id: user-plugin");
@@ -361,7 +361,7 @@ describe("DeepSeek Harness skill target", () => {
     ) as { messages: Array<{ source: { kind: string }; content: Array<{ text: string }> }> };
 
     expect(decision.messages[0]).toBe(userMessage);
-    expect(decision.messages[1]?.source.kind).toBe("plugin");
+    expect(decision.messages[1]?.source.kind).toBe("memmy-memory");
     expect(decision.messages[1]?.content[0]?.text).toContain("User prefers concise answers.");
     expect(decision.messages[1]?.content[0]?.text).toContain("<current_user_request>\n检查 README");
     expect(decision.messages[2]).toBe(runtimeContext);
