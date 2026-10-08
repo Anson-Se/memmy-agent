@@ -2081,7 +2081,8 @@ export class RuntimeRepository {
 
   listIdleEpisodes(
     excludeEpisodeId: string | undefined,
-    inactiveBefore: string
+    inactiveBefore: string,
+    openTurnStartedAfter?: string
   ): EpisodeRecord[] {
     const clauses = [
       "episodes.status != 'closed'",
@@ -2109,6 +2110,27 @@ export class RuntimeRepository {
     if (excludeEpisodeId) {
       clauses.push("episodes.id != ?");
       params.push(excludeEpisodeId);
+    }
+    if (openTurnStartedAfter) {
+      // A turn that has started (turn_start recall) after the session's last completed turn is
+      // still running; closing its episode now would reopen it when the turn completes.
+      clauses.push(`NOT EXISTS (
+        SELECT 1
+        FROM recall_events
+        WHERE recall_events.session_id = episodes.session_id
+          AND json_extract(recall_events.request_json, '$.retrievalMode') = 'turn_start'
+          AND recall_events.created_at > ?
+          AND recall_events.created_at > COALESCE(
+            (SELECT MAX(COALESCE(
+               json_extract(raw_turns.message_payload_json, '$.turn_complete.completed_at'),
+               raw_turns.created_at
+             ))
+             FROM raw_turns
+             WHERE raw_turns.session_id = episodes.session_id),
+            ''
+          )
+      )`);
+      params.push(openTurnStartedAfter);
     }
     const rows = this.db
       .prepare(

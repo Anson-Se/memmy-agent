@@ -379,4 +379,65 @@ describe("MemoryService / session / idle sweep", () => {
     );
     db.close();
   });
+
+  async function idleEpisodeWithStartedTurn(
+    lastCompletedAgoMs: number,
+    turnStartedAgoMs: number | undefined
+  ): Promise<{ status: string }> {
+    const { db, service } = createTestService();
+    const idleSession = service.openSession({
+      namespace: { source: "codex", profileId: "jiang", userId: "open-turn-idle-user", sessionKey: "open-turn-idle" }
+    });
+    const idleTurn = service.completeTurn("turn-open-turn-idle-done", {
+      sessionId: idleSession.sessionId,
+      query: "Prepare the migration plan",
+      answer: "The migration plan is ready."
+    });
+    await service.runWorkerOnce(20);
+    setRawTurnActivityAt(db, idleTurn.rawTurnId, new Date(Date.now() - lastCompletedAgoMs).toISOString());
+    db.db.prepare(`UPDATE episodes SET updated_at = ? WHERE id = ?`)
+      .run(new Date(Date.now() - lastCompletedAgoMs).toISOString(), idleTurn.episodeId);
+    if (turnStartedAgoMs !== undefined) {
+      await service.startTurn({
+        turnId: "turn-open-turn-idle-running",
+        sessionId: idleSession.sessionId,
+        query: "Now run the migration and report back"
+      });
+      const startedAt = new Date(Date.now() - turnStartedAgoMs).toISOString();
+      db.db.prepare(
+        `UPDATE recall_events SET created_at = ? WHERE session_id = ? AND turn_id = ?`
+      ).run(startedAt, idleSession.sessionId, "turn-open-turn-idle-running");
+      db.db.prepare(`UPDATE episodes SET updated_at = ? WHERE id = ?`)
+        .run(new Date(Date.now() - lastCompletedAgoMs).toISOString(), idleTurn.episodeId);
+    }
+
+    const triggerSession = service.openSession({
+      namespace: { source: "codex", profileId: "jiang", userId: "open-turn-trigger-user", sessionKey: "open-turn-trigger" }
+    });
+    service.completeTurn("turn-open-turn-trigger", {
+      sessionId: triggerSession.sessionId,
+      query: "Start a separate release task",
+      answer: "Started."
+    });
+    await service.runWorkerOnce(20);
+
+    const row = db.db.prepare(`SELECT status FROM episodes WHERE id = ?`).get(idleTurn.episodeId) as { status: string };
+    db.close();
+    return row;
+  }
+
+  it("does not idle-close an episode while a turn started after its last completion is still running", async () => {
+    const hour = 60 * 60 * 1000;
+    expect(await idleEpisodeWithStartedTurn(3 * hour, 2.5 * hour)).toEqual({ status: "open" });
+  });
+
+  it("idle-closes the episode once the unfinished turn started more than six hours ago", async () => {
+    const hour = 60 * 60 * 1000;
+    expect(await idleEpisodeWithStartedTurn(8 * hour, 7 * hour)).toEqual({ status: "closed" });
+  });
+
+  it("ignores a turn start that is older than the session's last completion", async () => {
+    const hour = 60 * 60 * 1000;
+    expect(await idleEpisodeWithStartedTurn(3 * hour, 4 * hour)).toEqual({ status: "closed" });
+  });
 });

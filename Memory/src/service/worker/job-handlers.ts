@@ -31,6 +31,8 @@ import {
 
 export type ProcessingStage = "summary" | "embedding";
 export const EPISODE_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// A turn_start older than this without a completion is treated as abandoned (e.g. a cancelled turn).
+export const EPISODE_OPEN_TURN_GUARD_MS = 6 * 60 * 60 * 1000;
 export type JobChangeOperation = "queued" | "leased" | "succeeded" | "failed" | "dead_letter";
 export type EmbeddingRetryChangeOperation = "queued" | "retry" | "succeeded" | "failed";
 export type ClosedEpisodeTrigger = "topic_boundary" | "session_closed" | "episode_rewarded" | "idle_timeout" | "end_topic" | "capture_decided";
@@ -344,7 +346,11 @@ export function closeIdleEpisodesForMemoryWrite(
   const inactiveBefore = new Date(triggeredAtMs - EPISODE_IDLE_TIMEOUT_MS).toISOString();
   const closedAt = deps.nowIso();
   deps.repos.transaction(() => {
-    const episodes = deps.repos.runtime.listIdleEpisodes(triggerEpisodeId, inactiveBefore);
+    const episodes = deps.repos.runtime.listIdleEpisodes(
+      triggerEpisodeId,
+      inactiveBefore,
+      new Date(triggeredAtMs - EPISODE_OPEN_TURN_GUARD_MS).toISOString()
+    );
     for (const episode of episodes) {
       // Keep the original ordering: a missing session prevents the close.
       const session = deps.requireSession(episode.sessionId);
