@@ -71,7 +71,7 @@ const SUMMARY_CONTEXT_SAFETY_MARGIN = 512;
 // The largest summary-role operation is span.big_turn; retries must leave
 // room for its evidence rather than requesting the entire 8K window as output.
 const SUMMARY_OUTPUT_TOKEN_LIMIT = 4_096;
-const SUMMARY_INPUT_TRUNCATION_MARKER = "\n[... input truncated ...]\n";
+export const SUMMARY_INPUT_TRUNCATION_MARKER = "\n[... input truncated ...]\n";
 
 interface ThinkingControl {
   enabled: boolean;
@@ -589,6 +589,30 @@ class HttpLlmClient implements LlmClient {
   }
 }
 
+/** Input token budget the summary model call enforces for a given output limit. */
+export function summaryInputTokenBudget(outputTokens: number): number {
+  // cl100k_base is an estimate for compatible providers. The margin also
+  // reserves space for their chat template and special tokens.
+  return Math.min(
+    SUMMARY_INPUT_TOKEN_BUDGET,
+    SUMMARY_CONTEXT_TOKEN_LIMIT - outputTokens - SUMMARY_CONTEXT_SAFETY_MARGIN
+  );
+}
+
+/** Counts tokens the way the summary model call does (cl100k_base). */
+export function countSummaryTokens(text: string): number {
+  summaryEncoder ??= get_encoding("cl100k_base");
+  return summaryEncoder.encode(text, [], []).length;
+}
+
+/** Cuts the middle of `text` so it fits `budget` tokens, marking the cut like the call layer. */
+export function truncateSummaryTextMiddle(text: string, budget: number): string {
+  summaryEncoder ??= get_encoding("cl100k_base");
+  const tokens = summaryEncoder.encode(text, [], []);
+  if (tokens.length <= budget) return text;
+  return truncateSummaryContent(tokens, budget, summaryEncoder.encode(SUMMARY_INPUT_TRUNCATION_MARKER, [], []).length + 2);
+}
+
 function constrainSummaryMessages(
   messages: LlmMessage[],
   outputTokens: number,
@@ -597,12 +621,7 @@ function constrainSummaryMessages(
   summaryEncoder ??= get_encoding("cl100k_base");
   const encoded = messages.map((message) => summaryEncoder!.encode(message.content, [], []));
   const inputTokens = encoded.reduce((total, tokens) => total + tokens.length, 0);
-  // cl100k_base is an estimate for compatible providers. The margin also
-  // reserves space for their chat template and special tokens.
-  const budget = Math.min(
-    SUMMARY_INPUT_TOKEN_BUDGET,
-    SUMMARY_CONTEXT_TOKEN_LIMIT - outputTokens - SUMMARY_CONTEXT_SAFETY_MARGIN
-  );
+  const budget = summaryInputTokenBudget(outputTokens);
   if (inputTokens <= budget) return messages;
 
   const systemTokens = encoded.reduce((total, tokens, index) =>

@@ -7,6 +7,12 @@ import {
 } from "../../algorithm/plugin-algorithms.js";
 import { MEMORY_SUMMARY_MAX_TOKENS, type MemmyConfig } from "../../config/index.js";
 import { createMemoryLogger,memoryErrorFields } from "../../logging/logger.js";
+import {
+  countSummaryTokens,
+  summaryInputTokenBudget,
+  SUMMARY_INPUT_TRUNCATION_MARKER,
+  truncateSummaryTextMiddle
+} from "../../model/llm.js";
 import type { LlmClient } from "../../model/types.js";
 import {
   kindFromMemory,
@@ -755,25 +761,24 @@ private reflectionDownstreamPreview(job: EvolutionJobRecord, memory: MemoryRow):
     const userMemoryCandidates = this.userMemoryCandidatesForCapture(input.trace);
     const mustKeep = input.mustKeep === true;
     const lang = steeredPromptLanguage(this.deps.config.language, [input.userText, input.agentText]);
+    const systemMessages = [
+      TURN_MEMORY_CAPTURE_DECISION_SYSTEM_PROMPT,
+      languageSteeringLine(lang),
+      ...(mustKeep ? [TURN_MEMORY_CAPTURE_REQUIRED_L1_PROMPT] : [])
+    ];
+    const captureInput = turnMemoryCaptureInput(
+      input,
+      userMemoryCandidates,
+      systemMessages.reduce((total, content) => total + countSummaryTokens(content), 0)
+    );
     const result = await this.deps.llm.completeJson<{
       l1?: unknown;
       user?: unknown;
     }>([
-      {
-        role: "system",
-        content: TURN_MEMORY_CAPTURE_DECISION_SYSTEM_PROMPT
-      },
-      {
-        role: "system",
-        content: languageSteeringLine(lang)
-      },
-      ...(mustKeep ? [{
-        role: "system" as const,
-        content: TURN_MEMORY_CAPTURE_REQUIRED_L1_PROMPT
-      }] : []),
+      ...systemMessages.map((content) => ({ role: "system" as const, content })),
       {
         role: "user",
-        content: turnMemoryCapturePayload(input, userMemoryCandidates)
+        content: captureInput.payload
       }
     ], {
       operation: "capture.summarize",
@@ -835,8 +840,8 @@ private reflectionDownstreamPreview(job: EvolutionJobRecord, memory: MemoryRow):
     if (userMemoryAction === "create" && matchedUserMemoryId) {
       throw new Error("turn memory decision requires an empty user.target for create");
     }
-    const userMemoryEvidence = parseUserMemoryEvidence(user?.evidence, input.userText);
-    const l1Evidence = parseL1Evidence(l1?.evidence, input);
+    const userMemoryEvidence = parseUserMemoryEvidence(user?.evidence, captureInput.visible.userText);
+    const l1Evidence = parseL1Evidence(l1?.evidence, captureInput.visible);
     return {
       createL1: Boolean(l1),
       l1Title,
@@ -1484,7 +1489,27 @@ function traceSummaryPayload(input: {
   return clip(parts.join("\n\n"), includeToolOutput ? 5_000 : 3_500);
 }
 
-function turnMemoryCapturePayload(
+const CAPTURE_DECISION_REPLY_HALF_CHARS = 1_400;
+const CAPTURE_DECISION_TOOL_INPUT_CHARS = 180;
+const CAPTURE_DECISION_TOOL_OUTPUT_HALF_CHARS = 500;
+const CAPTURE_DECISION_TOOL_WINDOW_CHARS = 1_600;
+const CAPTURE_DECISION_SECTION_FLOOR_TOKENS = 300;
+const CAPTURE_DECISION_BUDGET_MARGIN_TOKENS = 256;
+const CAPTURE_TRUNCATION_MARKER = SUMMARY_INPUT_TRUNCATION_MARKER.trim();
+
+interface CaptureVisibleText {
+  userText: string;
+  agentText: string;
+  toolText: string;
+}
+
+/**
+ * Builds the capture decision input. The user text is kept whole, the reply and tool
+ * section keep their head and tail, and everything fits the summary model's token budget
+ * so the call layer never cuts the middle of the whole payload. Returns the text the
+ * model sees for each source so evidence quotes are checked against the same text.
+ */
+function turnMemoryCaptureInput(
   input: {
     trace: TraceMeta;
     userText: string;
@@ -1492,19 +1517,95 @@ function turnMemoryCapturePayload(
     toolCalls: ToolCallPayload[];
     reflectionText: string;
   },
-  candidates: Array<{ id: string; memoryTypes: UserMemoryType[]; content: string; updatedAt: string }>
-): string {
-  const turn = traceSummaryPayload(input, true);
+  candidates: Array<{ id: string; memoryTypes: UserMemoryType[]; content: string; updatedAt: string }>,
+  systemTokens: number
+): { payload: string; visible: CaptureVisibleText } {
+  const normalizedUser = normalizeCaptureSummaryUserText(input.userText);
   const candidatePayload = candidates.map((candidate) => ({
     memory_id: candidate.id,
     types: candidate.memoryTypes,
     content: clip(candidate.content, 500),
     updated_at: candidate.updatedAt
   }));
-  return [
-    turn,
+  let userText = collapseWhitespace(normalizedUser.requestText);
+  let agentText = headTailChars(collapseWhitespace(input.agentText), CAPTURE_DECISION_REPLY_HALF_CHARS);
+  let toolText = captureToolText(input.toolCalls, CAPTURE_DECISION_TOOL_OUTPUT_HALF_CHARS, CAPTURE_DECISION_TOOL_WINDOW_CHARS);
+  const render = () => collapseWhitespace([
+    `CAPTURED AT: ${formatZonedTime(input.trace.ts, input.trace.timeZone)}`,
+    userText ? `USER:\n${userText}` : "",
+    agentText ? `ASSISTANT:\n${agentText}` : "",
+    toolText ? `TOOLS:\n${toolText}` : "",
+    input.reflectionText ? `REFLECTION:\n${clip(input.reflectionText, 300)}` : "",
+    normalizedUser.attachmentMetadata.length > 0
+      ? [
+        "ATTACHMENT METADATA (internal context; do not quote as summary/evidence):",
+        clip(normalizedUser.attachmentMetadata.map((item) => `- ${item}`).join("\n"), 400)
+      ].join("\n")
+      : "",
     `EXISTING_USER_MEMORY_CANDIDATES:\n${stableStringify(candidatePayload)}`
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n"));
+
+  const budget = summaryInputTokenBudget(MEMORY_SUMMARY_MAX_TOKENS * 2) - systemTokens - CAPTURE_DECISION_BUDGET_MARGIN_TOKENS;
+  const overBudget = () => countSummaryTokens(render()) - budget;
+  // Cut order: the reply's middle, then the tool section, then the user's middle.
+  let excess = overBudget();
+  if (excess > 0 && agentText) {
+    agentText = shrinkToTokens(agentText, Math.max(CAPTURE_DECISION_SECTION_FLOOR_TOKENS, countSummaryTokens(agentText) - excess));
+    excess = overBudget();
+  }
+  if (excess > 0 && toolText) {
+    const target = Math.max(CAPTURE_DECISION_SECTION_FLOOR_TOKENS, countSummaryTokens(toolText) - excess);
+    for (const [outputHalf, window] of [[250, 1_600], [120, 1_600], [120, 800], [60, 400]] as const) {
+      if (countSummaryTokens(toolText) <= target) break;
+      toolText = captureToolText(input.toolCalls, outputHalf, window);
+    }
+    excess = overBudget();
+  }
+  if (excess > 0 && userText) {
+    userText = shrinkToTokens(userText, Math.max(CAPTURE_DECISION_SECTION_FLOOR_TOKENS, countSummaryTokens(userText) - excess));
+  }
+  return { payload: render(), visible: { userText, agentText, toolText } };
+}
+
+function captureToolText(calls: ToolCallPayload[], outputHalfChars: number, windowChars: number): string {
+  const rendered = calls.map((call) =>
+    `${call.name}(${clip(stringifyForMemory(call.input), CAPTURE_DECISION_TOOL_INPUT_CHARS)}) -> ` +
+    headTailChars(collapseWhitespace(stringifyForMemory({ output: call.output, error: call.error })), outputHalfChars)
+  );
+  const total = rendered.reduce((sum, text) => sum + text.length, 0);
+  if (total <= windowChars * 2) return rendered.join("; ");
+  // Keep whole calls from both ends; the last calls often hold the test run or final check.
+  const head: string[] = [];
+  let headChars = 0;
+  for (const text of rendered) {
+    if (head.length > 0 && headChars + text.length > windowChars) break;
+    head.push(text);
+    headChars += text.length;
+  }
+  const tail: string[] = [];
+  let tailChars = 0;
+  for (let index = rendered.length - 1; index >= head.length; index -= 1) {
+    const text = rendered[index]!;
+    if (tail.length > 0 && tailChars + text.length > windowChars) break;
+    tail.unshift(text);
+    tailChars += text.length;
+  }
+  const omitted = rendered.length - head.length - tail.length;
+  return [...head, ...(omitted > 0 ? [`[... ${omitted} tool calls omitted ...]`] : []), ...tail].join("; ");
+}
+
+function headTailChars(text: string, halfChars: number): string {
+  return text.length <= halfChars * 2
+    ? text
+    : `${text.slice(0, halfChars)} ${CAPTURE_TRUNCATION_MARKER} ${text.slice(-halfChars)}`;
+}
+
+function shrinkToTokens(text: string, budget: number): string {
+  return collapseWhitespace(truncateSummaryTextMiddle(text, budget));
+}
+
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function parseUserMemoryTypes(value: unknown): UserMemoryType[] {
@@ -1529,10 +1630,9 @@ function parseUserMemoryEvidence(
 
 function parseL1Evidence(
   value: unknown,
-  input: { userText: string; agentText: string; toolCalls: ToolCallPayload[] }
+  visible: CaptureVisibleText
 ): Array<{ quote: string; sourceRole: "user" | "assistant" | "tool"; kind: string }> {
   if (!Array.isArray(value)) return [];
-  const toolText = stringifyForMemory(input.toolCalls);
   return value.flatMap((item) => {
     if (!isRecord(item)) return [];
     const quote = stringOr(item.quote, "");
@@ -1542,7 +1642,7 @@ function parseL1Evidence(
     const kind = typeof item.kind === "string" && L1_EVIDENCE_KINDS.has(item.kind)
       ? item.kind
       : undefined;
-    const sourceText = sourceRole === "user" ? input.userText : sourceRole === "assistant" ? input.agentText : toolText;
+    const sourceText = sourceRole === "user" ? visible.userText : sourceRole === "assistant" ? visible.agentText : visible.toolText;
     return quote && sourceRole && kind && sourceText.includes(quote)
       ? [{ quote, sourceRole, kind }]
       : [];
