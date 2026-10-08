@@ -24,6 +24,7 @@ import {
 import type { LlmClient } from "../../model/types.js";
 import {
   jobToRef,
+  kindFromMemory,
   L3WorldModelScopeWorkspaceConflictError,
   Repositories,
   type EpisodeRecord,
@@ -206,9 +207,19 @@ function lateRouteMismatch(
   if (proposal.action === "append") {
     return !(proposal.mergeMode && continues);
   }
-  const reopen = base !== undefined && base.meta.closeReason !== "end_topic" && proposal.withinMergeWindow &&
+  return lateExpectedReopen(proposal, decision, base);
+}
+
+/** Whether an in-time judgment would have reopened the closed base episode (merge window, plan 5.2). */
+function lateExpectedReopen(
+  proposal: TurnRouteProposal,
+  decision: TurnRelationDecision,
+  base: EpisodeRecord | undefined
+): boolean {
+  const relation = decision.relation;
+  const continues = relation === "revision" || relation === "follow_up" || relation === "unknown";
+  return base !== undefined && base.meta.closeReason !== "end_topic" && proposal.withinMergeWindow &&
     (relation === "revision" || (proposal.mergeMode && continues));
-  return reopen;
 }
 
 function turnFeedbackFromRecord(value: unknown): TurnFeedbackJudgment | undefined {
@@ -3756,7 +3767,136 @@ export class SessionTurnService {
       signals: [...judgment.decision.signals, "late_result", ...(mismatch ? ["route_mismatch"] : [])]
     };
     this.writeRawTurnRouteProposal(rawTurn, { ...proposal, relationDecision: decision, feedback: judgment.feedback });
+    this.applyLateRelationEffects(rawTurn, proposal, decision, judgment.feedback);
     return true;
+  }
+
+  /**
+   * Does what an in-time judgment would have done, short of moving the turn: revision feedback,
+   * closing on end_topic, implicit feedback and an L3 freeze on new_task. Nothing is done once the
+   * turn's episode has closed, since its downstream processing has already run.
+   */
+  private applyLateRelationEffects(
+    rawTurn: RawTurnRecord,
+    proposal: TurnRouteProposal,
+    decision: TurnRelationDecision,
+    feedback: TurnFeedbackJudgment
+  ): void {
+    const episode = this.deps.repos.runtime.getEpisode(rawTurn.episodeId);
+    const session = this.deps.repos.runtime.getSession(rawTurn.sessionId);
+    const base = proposal.baseEpisodeId ? this.deps.repos.runtime.getEpisode(proposal.baseEpisodeId) : undefined;
+    if (!episode || !session || !base || episode.status === "closed") return;
+    const job = this.deps.repos.runtime.getJobByDedupeKey(`turn_relation:${rawTurn.id}`);
+    const targetMemoryId = typeof job?.payload.feedbackTargetMemoryId === "string"
+      ? job.payload.feedbackTargetMemoryId
+      : null;
+    const userText = rawTurn.userText ?? "";
+    const source = "turn.relation_result";
+    const at = nowIso();
+    if (decision.relation === "end_topic") {
+      this.excludeTurnFromL1(rawTurn, at);
+      if (episode.rawTurnIds[episode.rawTurnIds.length - 1] === rawTurn.id) {
+        this.closeEpisodeForLateEndTopic(session, episode, rawTurn, decision as EndTopicDecision, at);
+      }
+      return;
+    }
+    if (proposal.action === "append") {
+      if (decision.relation === "revision") {
+        this.recordRevisionFeedback(session, base, userText, source, targetMemoryId);
+      } else if (decision.relation === "new_task") {
+        this.recordImplicitTurnFeedback(session, base, userText, feedback, targetMemoryId);
+        if (session.meta.l3_world_model_protocol_version === 2) {
+          this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "new_task", at });
+        }
+      }
+      return;
+    }
+    if (lateExpectedReopen(proposal, decision, base)) {
+      if (decision.relation === "revision") {
+        this.recordRevisionFeedback(session, base, userText, source, targetMemoryId);
+      }
+    } else if (decision.relation === "new_task" || decision.relation === "revision") {
+      this.recordImplicitTurnFeedback(session, base, userText, feedback, targetMemoryId);
+    }
+  }
+
+  /** A late end_topic keeps its turn out of L1 as an in-time one would: reject a pending L1, delete an active one. */
+  private excludeTurnFromL1(rawTurn: RawTurnRecord, at: string): void {
+    const episode = this.deps.repos.runtime.getEpisode(rawTurn.episodeId);
+    if (!episode) return;
+    for (const memory of this.deps.repos.memories.getMany(episode.l1MemoryIds)) {
+      if (memory.status === "deleted" || this.deps.rawTurnIdFromMemory(memory) !== rawTurn.id) continue;
+      const internal = memory.properties.internal_info;
+      const pending = isRecord(internal.capture_decision) && internal.capture_decision.status === "pending";
+      if (pending) {
+        const summaryJob = this.deps.repos.runtime.getPendingJob(memory.id, "trace_summary");
+        if (summaryJob?.status === "queued") this.deps.repos.runtime.completeJob(summaryJob.id, at);
+        this.deps.repos.memories.update({
+          ...memory,
+          properties: {
+            ...memory.properties,
+            internal_info: {
+              ...internal,
+              capture_decision: {
+                ...(internal.capture_decision as Record<string, unknown>),
+                status: "rejected",
+                reason: "turn ends the topic",
+                decided_at: at
+              }
+            }
+          },
+          updatedAt: at
+        });
+        this.deps.repos.processing.delete(memory.id);
+      }
+      const deleted = this.deps.repos.memories.softDelete(memory.id, at);
+      if (deleted) {
+        this.deps.repos.runtime.appendChange({
+          memoryId: deleted.id,
+          namespaceId: this.deps.namespaceIdFromMemory(deleted),
+          kind: kindFromMemory(deleted),
+          op: "updated",
+          entityId: deleted.id,
+          userId: deleted.userId,
+          changeType: "update",
+          before: memory,
+          after: deleted,
+          source: "turn.relation_result.end_topic",
+          createdAt: at
+        });
+      }
+    }
+  }
+
+  private closeEpisodeForLateEndTopic(
+    session: SessionRecord,
+    episode: EpisodeRecord,
+    rawTurn: RawTurnRecord,
+    decision: EndTopicDecision,
+    at: string
+  ): void {
+    const closed = this.deps.repos.runtime.closeEpisode(episode.id, {
+      closeReason: "end_topic",
+      topicState: "ended",
+      relationDecision: decision,
+      endTopicTurnId: rawTurn.turnId,
+      closedBy: "turn.relation_result"
+    }, at);
+    if (!closed) return;
+    this.deps.repos.runtime.appendChange({
+      memoryId: closed.id,
+      namespaceId: this.deps.namespaceIdFromSession(session),
+      kind: "episode",
+      op: "updated",
+      entityId: closed.id,
+      userId: closed.userId,
+      changeType: "episode_closed",
+      before: episode,
+      after: closed,
+      source: "turn.relation_result.end_topic",
+      createdAt: at
+    });
+    this.deps.finalizeClosedEpisode(closed, at, "end_topic");
   }
 
   private markRelationFailed(rawTurn: RawTurnRecord): void {
@@ -3822,10 +3962,11 @@ export class SessionTurnService {
     session: SessionRecord,
     episode: EpisodeRecord,
     userText: string,
-    judgment: TurnFeedbackJudgment | undefined
+    judgment: TurnFeedbackJudgment | undefined,
+    targetMemoryId?: string | null
   ): void {
     if (!judgment) return;
-    const target = this.deps.feedbackTargetFromEpisode(episode);
+    const target = this.feedbackTarget(episode, targetMemoryId);
     if (!target) return;
     const rawTurnId = this.deps.rawTurnIdFromMemory(target);
     const signal = turnFeedbackSignal(judgment);
@@ -3919,13 +4060,27 @@ export class SessionTurnService {
     });
   }
 
+  /**
+   * The L1 a reaction is about: the target saved when the turn completed (null when none was saved,
+   * so a late result never points at the turn's own L1), else the episode's latest.
+   */
+  private feedbackTarget(episode: EpisodeRecord, targetMemoryId?: string | null): MemoryRow | undefined {
+    if (targetMemoryId === null) return undefined;
+    if (targetMemoryId) {
+      const saved = this.deps.repos.memories.get(targetMemoryId);
+      return saved && saved.status !== "deleted" ? saved : undefined;
+    }
+    return this.deps.feedbackTargetFromEpisode(episode);
+  }
+
   private recordRevisionFeedback(
     session: SessionRecord,
     episode: EpisodeRecord,
     userText: string,
-    source: string
+    source: string,
+    targetMemoryId?: string | null
   ): void {
-    const target = this.deps.feedbackTargetFromEpisode(episode);
+    const target = this.feedbackTarget(episode, targetMemoryId);
     if (!target) return;
     const contextHash = stableHash({
       source: "relation.revision",

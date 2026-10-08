@@ -271,4 +271,106 @@ describe("turn relation judged by the model", () => {
     expect(freeze).not.toHaveBeenCalled();
     db.close();
   });
+
+  describe("when the judgment arrives after the turn completed", () => {
+    function feedbackRows(db: ReturnType<typeof createTestService>["db"]) {
+      return db.db.prepare(
+        `SELECT channel, polarity, magnitude, l1_memory_id, rationale, raw_payload_json FROM feedback ORDER BY created_at`
+      ).all() as Array<{ channel: string; polarity: string; magnitude: number; l1_memory_id: string; rationale: string; raw_payload_json: string }>;
+    }
+
+    async function lateJudgment(answer: Record<string, unknown>, setup?: (
+      db: ReturnType<typeof createTestService>["db"],
+      first: { episodeId: string; rawTurnId: string; l1MemoryId: string }
+    ) => void) {
+      const { db, service } = createTestService({ llm: relationLlm([answer]) });
+      const session = open(service, `late-${String(answer.relation)}-user`);
+      const first = service.completeTurn("turn-late-effects-first", { sessionId: session.sessionId, query: "Configure nginx TLS", answer: "Use port 80." });
+      setup?.(db, first);
+      const next = service.completeTurn("turn-late-effects-next", { sessionId: session.sessionId, query: "还是不行", answer: "Rechecked the port." });
+      return { db, service, session, first, next };
+    }
+
+    it("adds revision feedback on the L1 saved at completion, not the turn's own", async () => {
+      const { db, service, first, next } = await lateJudgment(judged("revision", "negative"));
+      expect(feedbackRows(db)).toEqual([]);
+      await service.runWorkerOnce(20);
+      const rows = feedbackRows(db);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ channel: "explicit", polarity: "negative", magnitude: 1, l1_memory_id: first.l1MemoryId });
+      expect(next.episodeId).toBe(first.episodeId);
+      db.close();
+    });
+
+    it("adds implicit feedback for a new_task without moving the turn", async () => {
+      const { db, service, first, next } = await lateJudgment(judged("new_task", "improvement"));
+      await service.runWorkerOnce(20);
+      const rows = feedbackRows(db);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ channel: "implicit", polarity: "negative", magnitude: 0.6, l1_memory_id: first.l1MemoryId, rationale: "还是不行" });
+      expect(JSON.parse(rows[0]!.raw_payload_json)).toMatchObject({ method: "llm", reason: "reaction improvement" });
+      expect((db.db.prepare(`SELECT episode_id FROM raw_turns WHERE id = ?`).get(next.rawTurnId) as { episode_id: string }).episode_id)
+        .toBe(first.episodeId);
+      expect(routeProposalOf(db, next.rawTurnId).relationDecision.signals).toContain("route_mismatch");
+      db.close();
+    });
+
+    it("closes the episode for a late end_topic and keeps that turn out of L1", async () => {
+      const { db, service, first, next } = await lateJudgment(judged("end_topic", "positive"));
+      await service.runWorkerOnce(20);
+      expect(new Repositories(db.db).runtime.getEpisode(first.episodeId)).toMatchObject({
+        status: "closed",
+        meta: { closeReason: "end_topic", endTopicTurnId: "turn-late-effects-next" }
+      });
+      const ownL1 = db.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(next.l1MemoryId) as { status: string };
+      expect(ownL1.status).toBe("deleted");
+      expect(db.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(first.l1MemoryId)).not.toEqual({ status: "deleted" });
+      expect(routeProposalOf(db, next.rawTurnId).relationDecision.signals).not.toContain("route_mismatch");
+      db.close();
+    });
+
+    it("does not close for a late end_topic when the user has already gone on", async () => {
+      const { db, service, session, first, next } = await lateJudgment(judged("end_topic"));
+      service.completeTurn("turn-late-effects-after", { sessionId: session.sessionId, query: "Also enable HSTS", answer: "Enabled." });
+      const turnRelationJobs = db.db.prepare(`SELECT id FROM evolution_jobs WHERE job_type = 'turn_relation' ORDER BY created_at`).all() as Array<{ id: string }>;
+      db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded' WHERE id = ?`).run(turnRelationJobs[1]!.id);
+      await service.runWorkerOnce(20);
+      expect(new Repositories(db.db).runtime.getEpisode(first.episodeId)?.status).toBe("open");
+      expect((db.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(next.l1MemoryId) as { status: string }).status).toBe("deleted");
+      db.close();
+    });
+
+    it("only records the judgment once the turn's episode has closed", async () => {
+      const { db, service, first, next } = await lateJudgment(judged("revision", "negative"));
+      new Repositories(db.db).runtime.closeEpisode(first.episodeId, { closeReason: "idle_timeout" });
+      await service.runWorkerOnce(20);
+      expect(routeProposalOf(db, next.rawTurnId).relationDecision).toMatchObject({ relation: "revision", signals: expect.arrayContaining(["late_result"]) });
+      expect(feedbackRows(db)).toEqual([]);
+      db.close();
+    });
+
+    it("reroutes a turn that started a new episode: revision within the window gets revision feedback", async () => {
+      const { db, service, first, next } = await lateJudgment(judged("revision", "negative"), (database, firstTurn) => {
+        new Repositories(database.db).runtime.closeEpisode(firstTurn.episodeId, { closeReason: "idle_timeout" });
+      });
+      expect(next.episodeId).not.toBe(first.episodeId);
+      await service.runWorkerOnce(20);
+      const rows = feedbackRows(db);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ channel: "explicit", l1_memory_id: first.l1MemoryId });
+      expect(routeProposalOf(db, next.rawTurnId).relationDecision.signals).toContain("route_mismatch");
+      db.close();
+    });
+
+    it("reroutes a turn that started a new episode: follow_up adds no feedback", async () => {
+      const { db, service, next } = await lateJudgment(judged("follow_up", "positive"), (database, firstTurn) => {
+        new Repositories(database.db).runtime.closeEpisode(firstTurn.episodeId, { closeReason: "idle_timeout" });
+        setRawTurnActivityAt(database, firstTurn.rawTurnId, new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString());
+      });
+      await service.runWorkerOnce(20);
+      expect(feedbackRows(db)).toEqual([]);
+      expect(routeProposalOf(db, next.rawTurnId).relationDecision.signals).not.toContain("route_mismatch");
+      db.close();
+    });
+  });
 });
