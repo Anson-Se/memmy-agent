@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { LlmClient } from "../../../src/index.js";
+import { DEFAULT_MEMMY_CONFIG, type LlmClient } from "../../../src/index.js";
 import { L3WorldModelRepository, Repositories } from "../../../src/storage/repositories.js";
 import { MEMORY_BYOK_BUDGET_KV_KEY } from "../../../src/service/memory-token-budget-ledger.js";
 import { localCalendarDate } from "@memmy/agent-source-core";
@@ -269,6 +269,93 @@ describe("turn relation judged by the model", () => {
     await service.startTurn({ turnId: "turn-l3-soon", sessionId: session.sessionId, query: "标题短一点" });
     service.completeTurn("turn-l3-soon", { sessionId: session.sessionId, query: "标题短一点", answer: "Shorter." });
     expect(freeze).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("drops a late turn-start judgment made against an episode the turn no longer waits on, and lets the job judge it", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const calls: string[] = [];
+    const { db, service } = createTestService({
+      llm: relationLlm([
+        async () => {
+          await gate;
+          return judged("revision", "negative");
+        },
+        judged("new_task"),
+        judged("follow_up")
+      ], calls)
+    });
+    const session = open(service, "relation-stale-base-user");
+    service.completeTurn("turn-stale-base-first", { sessionId: session.sessionId, query: "Configure nginx TLS", answer: "Use port 80." });
+    await service.startTurn({ turnId: "turn-stale-base-slow", sessionId: session.sessionId, query: "Summarize the hiring plan" });
+    await service.startTurn({ turnId: "turn-stale-base-other", sessionId: session.sessionId, query: "Audit the backups" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const other = service.completeTurn("turn-stale-base-other", { sessionId: session.sessionId, query: "Audit the backups", answer: "Audited." });
+    const slow = service.completeTurn("turn-stale-base-slow", { sessionId: session.sessionId, query: "Summarize the hiring plan", answer: "Summarized." });
+    expect(slow.episodeId).toBe(other.episodeId);
+
+    releaseFirst?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(routeProposalOf(db, slow.rawTurnId).relationDecision.signals).toEqual(["model_pending"]);
+    expect(db.db.prepare(`SELECT COUNT(*) AS count FROM feedback`).get()).toEqual({ count: 0 });
+
+    const job = db.db.prepare(`SELECT id FROM evolution_jobs WHERE job_type = 'turn_relation'`).get() as { id: string };
+    makeRunnable(db, job.id);
+    await service.runWorkerOnce(20);
+    expect(routeProposalOf(db, slow.rawTurnId).relationDecision).toMatchObject({
+      relation: "follow_up",
+      signals: ["llm", "relation.classify.v2", "late_result"]
+    });
+    expect(calls).toHaveLength(3);
+    db.close();
+  });
+
+  it("starts a new episode for a turn without a result in episode_per_turn mode", async () => {
+    const { db, service } = createTestService({
+      config: {
+        ...DEFAULT_MEMMY_CONFIG,
+        algorithm: {
+          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          session: { ...DEFAULT_MEMMY_CONFIG.algorithm.session, followUpMode: "episode_per_turn" }
+        }
+      }
+    });
+    const session = open(service, "relation-per-turn-user");
+    const first = service.completeTurn("turn-per-turn-first", { sessionId: session.sessionId, query: "Plan a Kyoto trip", answer: "Day 1." });
+    const next = service.completeTurn("turn-per-turn-next", { sessionId: session.sessionId, query: "Add Nara", answer: "Day 4." });
+    expect(next.episodeId).not.toBe(first.episodeId);
+    db.close();
+  });
+
+  it("counts a reply that is not JSON as an invalid output", async () => {
+    const base = createBatchReflectionLlm([]);
+    const { db, service } = createTestService({
+      llm: {
+        ...base,
+        async completeJson(messages, options) {
+          if (options.operation === "relation.classify.v2") throw new SyntaxError("Unexpected token } in JSON");
+          return base.completeJson(messages, options);
+        }
+      }
+    });
+    const session = open(service, "relation-bad-json-user");
+    service.completeTurn("turn-bad-json-first", { sessionId: session.sessionId, query: "Plan a Kyoto trip", answer: "Day 1." });
+    service.completeTurn("turn-bad-json-next", { sessionId: session.sessionId, query: "Add Nara", answer: "Day 4." });
+    await service.runWorkerOnce(20);
+    expect(relationJob(db).payload).toMatchObject({ invalidOutputCount: 1, lastErrorCode: "model_output_invalid" });
+    db.close();
+  });
+
+  it("records only, with a job, a turn routed to a caller-given episode while its turn-start judgment is pending", async () => {
+    const { db, service } = createTestService();
+    const session = open(service, "relation-explicit-episode-user");
+    const first = service.completeTurn("turn-explicit-first", { sessionId: session.sessionId, query: "Plan a Kyoto trip", answer: "Day 1." });
+    await service.startTurn({ turnId: "turn-explicit-next", sessionId: session.sessionId, query: "Add Nara" });
+    service.completeTurn("turn-explicit-next", { sessionId: session.sessionId, episodeId: first.episodeId, query: "Add Nara", answer: "Day 4." });
+    expect(relationJob(db).payload).toMatchObject({ recordOnly: true, baseEpisodeId: first.episodeId });
     db.close();
   });
 

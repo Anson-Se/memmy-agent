@@ -2126,7 +2126,8 @@ export class RuntimeRepository {
                raw_turns.created_at
              ))
              FROM raw_turns
-             WHERE raw_turns.session_id = episodes.session_id),
+             WHERE raw_turns.session_id = episodes.session_id
+               AND json_type(raw_turns.message_payload_json, '$.turn_complete') = 'object'),
             ''
           )
       )`);
@@ -3874,7 +3875,7 @@ export class RuntimeRepository {
              payload_json = ?,
              updated_at = ?
          WHERE id = ?
-           AND status != 'dead_letter'`
+           AND status NOT IN ('dead_letter', 'succeeded')`
       )
       .run(deadLetter ? "dead_letter" : "failed", error, toJson(payload), at, id);
     return this.getJob(id);

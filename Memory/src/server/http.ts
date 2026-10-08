@@ -957,6 +957,14 @@ async function routeRequest(
     return result;
   }
 
+  const jobRetry = match(path, /^\/api\/v1\/jobs\/([^/]+)\/retry$/);
+  if (method === "POST" && jobRetry) {
+    requireMemoryWrite(principal);
+    const result = service.retryModelJudgmentJob(decodeMatchSegment(jobRetry, 1));
+    if (result.accepted) autoWorker.schedule();
+    return result;
+  }
+
   const memoryGet = match(path, /^\/api\/v1\/memory\/([^/]+)$/);
   if (method === "GET" && memoryGet) {
     requireMemoryRead(principal);

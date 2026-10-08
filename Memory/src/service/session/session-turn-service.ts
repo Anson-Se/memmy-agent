@@ -105,10 +105,12 @@ import {
 } from "../turn/turn-normalization.js";
 import { JobDeferredError } from "../worker/job-errors.js";
 import {
+  classifyProcessingError,
   EPISODE_IDLE_TIMEOUT_MS,
   MODEL_JUDGMENT_MAX_ATTEMPTS,
   MODEL_OUTPUT_INVALID_LIMIT
 } from "../worker/job-handlers.js";
+import { ModelHttpError } from "../../model/http.js";
 
 type TraceMeta = NonNullable<ReturnType<typeof traceMetaFromMemory>>;
 interface ToolFailureRecord { toolId: string; context: string; step: number; reason: string; ts: number; rawTurnId?: string; sessionId?: string; episodeId?: string; }
@@ -143,6 +145,8 @@ interface PendingTurnRelation {
   baseEpisodeId?: string;
   feedbackTargetMemoryId?: string;
   runAfter: string;
+  /** For a turn routed into a caller-given episode: a late judgment is only recorded, as an in-time one would be. */
+  recordOnly?: boolean;
 }
 interface CommittedTurnRoute extends EpisodeTurnRoute {
   closedEpisodeIds: string[];
@@ -611,7 +615,7 @@ export class SessionTurnService {
   private readonly toolStepCounters = new Map<string, number>();
 
   /** Relation judgments started at turn start that have not settled yet, by session and turn. */
-  private readonly relationCalls = new Map<string, Promise<void>>();
+  private readonly relationCalls = new Map<string, { call: Promise<void>; baseEpisodeId: string }>();
   /** Source-turn entry judgments in flight, so a repeated submission of the same turn reuses the call. */
   private readonly sourceRelationCalls = new Map<string, {
     holder: { judgment?: TurnRelationJudgment };
@@ -1388,7 +1392,7 @@ export class SessionTurnService {
     let entry = this.sourceRelationCalls.get(key);
     if (!entry) {
       const holder = this.startRelationCall(plan.sessionId, plan.turnId, plan.baseEpisodeId, plan.input);
-      const call = this.relationCalls.get(relationCallKey(plan.sessionId, plan.turnId)) ?? Promise.resolve();
+      const call = this.relationCalls.get(relationCallKey(plan.sessionId, plan.turnId))?.call ?? Promise.resolve();
       const created = { holder, call, baseEpisodeId: plan.baseEpisodeId };
       entry = created;
       this.sourceRelationCalls.set(key, created);
@@ -1982,14 +1986,17 @@ export class SessionTurnService {
           (gapInsert ? pendingRelationDecision() : undefined) ??
           classifyTurnRelation({ prevUserText: "", newUserText: request.query }) ??
           pendingRelationDecision();
-        const gapPending: PendingTurnRelation | undefined = gapInsert && !gapJudgment
+        // A turn routed into a caller-given episode (an out-of-order source turn, or a turn whose
+        // turn-start judgment is still pending) waits for a judgment that is only recorded.
+        const turnStartedAt = sourceTurn?.startedAt ?? turnStartRecall?.createdAt;
+        const gapPending: PendingTurnRelation | undefined = isPendingRelationDecision(decision)
           ? {
-              input: this.relationModelInput(episode, request.query, sourceTurn!.startedAt),
+              input: this.relationModelInput(episode, request.query, turnStartedAt),
               baseEpisodeId: episode.id,
-              ...(this.deps.feedbackTargetFromEpisode(episode)?.id
-                ? { feedbackTargetMemoryId: this.deps.feedbackTargetFromEpisode(episode)!.id }
-                : {}),
-              runAfter: at
+              recordOnly: true,
+              runAfter: turnStartedAt && this.relationCallInFlight(session.id, turnId, episode.id)
+                ? new Date(Date.parse(turnStartedAt) + RELATION_IN_FLIGHT_DEFER_MS).toISOString()
+                : at
             }
           : undefined;
         const routedEndTopicDecision = endTopicDecision ?? (
@@ -3543,10 +3550,15 @@ export class SessionTurnService {
         sessionLogger.warn("relation.call_failed", { sessionId, turnId, ...memoryErrorFields(error) });
       })
       .finally(() => {
-        if (this.relationCalls.get(key) === call) this.relationCalls.delete(key);
+        if (this.relationCalls.get(key)?.call === call) this.relationCalls.delete(key);
       });
-    this.relationCalls.set(key, call);
+    this.relationCalls.set(key, { call, baseEpisodeId });
     return holder;
+  }
+
+  /** Whether a call judging this turn against `baseEpisodeId` is still running. */
+  private relationCallInFlight(sessionId: string, turnId: string, baseEpisodeId: string | undefined): boolean {
+    return this.relationCalls.get(relationCallKey(sessionId, turnId))?.baseEpisodeId === baseEpisodeId;
   }
 
   private settleRelationCall(
@@ -3557,7 +3569,10 @@ export class SessionTurnService {
   ): void {
     const rawTurn = this.deps.repos.runtime.getRawTurnBySessionTurn(sessionId, turnId);
     if (rawTurn && isRecord(rawTurn.messagePayload?.turn_complete)) {
-      this.applyLateRelationJudgment(rawTurn.id, judgment);
+      // A judgment about another episode than the one the turn now waits on is dropped; the job judges it.
+      if (rawTurnRouteProposal(rawTurn)?.baseEpisodeId === baseEpisodeId) {
+        this.applyLateRelationJudgment(rawTurn.id, judgment);
+      }
       return;
     }
     const recall = this.deps.repos.runtime.getTurnStartRecallEvent(sessionId, turnId);
@@ -3776,11 +3791,18 @@ export class SessionTurnService {
             ? { feedbackTargetMemoryId: this.deps.feedbackTargetFromEpisode(latest)!.id }
             : {}),
           // Leave a still-running turn-start call time to land before the job asks again.
-          runAfter: this.relationCalls.has(relationCallKey(session.id, turnId))
+          runAfter: this.relationCallInFlight(session.id, turnId, latest.id)
             ? new Date(Date.parse(turnStartedAt) + RELATION_IN_FLIGHT_DEFER_MS).toISOString()
             : at
         }
       : undefined;
+    if (!base.mergeMode && latest?.status === "open" && !decided) {
+      // episode_per_turn splits every turn whatever the relation, so the usual split route applies.
+      return {
+        ...this.commitTurnRouteProposal(session, base, userText, "turn.complete", at, proposalStale, turnStartedAt, sourceStartedAt),
+        ...(pendingRelation ? { pendingRelation } : {})
+      };
+    }
     const routingFields = { mergeMode: base.mergeMode, withinMergeWindow: base.withinMergeWindow, gapMs: base.gapMs };
     let episode: EpisodeRecord;
     let action: TurnRouteAction;
@@ -3852,6 +3874,7 @@ export class SessionTurnService {
         rawTurnId: rawTurn.id,
         ...(pending.baseEpisodeId ? { baseEpisodeId: pending.baseEpisodeId } : {}),
         ...(pending.feedbackTargetMemoryId ? { feedbackTargetMemoryId: pending.feedbackTargetMemoryId } : {}),
+        ...(pending.recordOnly ? { recordOnly: true } : {}),
         input: pending.input,
         runAfter: pending.runAfter
       },
@@ -3867,7 +3890,7 @@ export class SessionTurnService {
     if (!rawTurn) return;
     const proposal = rawTurnRouteProposal(rawTurn);
     if (!proposal || !relationAwaitsResult(proposal.relationDecision)) return;
-    if (this.relationCalls.has(relationCallKey(rawTurn.sessionId, rawTurn.turnId))) {
+    if (this.relationCallInFlight(rawTurn.sessionId, rawTurn.turnId, proposal.baseEpisodeId)) {
       // Do not wait inside the job (the worker is serial); look again once the call has had time.
       throw new JobDeferredError(
         new Date(Date.parse(this.deps.nowIso?.() ?? nowIso()) + RELATION_IN_FLIGHT_DEFER_MS).toISOString(),
@@ -3875,13 +3898,19 @@ export class SessionTurnService {
       );
     }
     const input = relationModelInputFromPayload(job.payload.input);
-    if (!input) throw new Error(`turn_relation job has no input snapshot: ${job.id}`);
+    if (!input) {
+      // Rebuilding the input now would see this turn as the previous one; stop and mark it instead.
+      this.markRelationFailed(rawTurn);
+      return;
+    }
     let judgment: TurnRelationJudgment;
     try {
       judgment = await classifyTurnRelationWithModel(this.deps.llm, input);
     } catch (error) {
       const invalidOutputCount = typeof job.payload.invalidOutputCount === "number" ? job.payload.invalidOutputCount : 0;
-      if (error instanceof ModelOutputInvalidError && invalidOutputCount + 1 >= MODEL_OUTPUT_INVALID_LIMIT) {
+      const terminalRequest = ["invalid_model_request", "model_input_too_long"].includes(classifyProcessingError(error).code) &&
+        !(error instanceof ModelHttpError && error.httpStatus === 404);
+      if ((error instanceof ModelOutputInvalidError && invalidOutputCount + 1 >= MODEL_OUTPUT_INVALID_LIMIT) || terminalRequest) {
         this.markRelationFailed(rawTurn);
       }
       throw error;
@@ -3894,6 +3923,11 @@ export class SessionTurnService {
    * moved; when the judgment implies a different route, the record is marked route_mismatch.
    */
   private applyLateRelationJudgment(rawTurnId: string, judgment: TurnRelationJudgment): boolean {
+    // The record and the actions it implies commit together, so a failure leaves the turn pending for a retry.
+    return this.deps.repos.transaction(() => this.applyLateRelationJudgmentInTransaction(rawTurnId, judgment));
+  }
+
+  private applyLateRelationJudgmentInTransaction(rawTurnId: string, judgment: TurnRelationJudgment): boolean {
     const rawTurn = this.deps.repos.runtime.getRawTurn(rawTurnId);
     const proposal = rawTurn ? rawTurnRouteProposal(rawTurn) : undefined;
     if (!rawTurn || !proposal || !relationAwaitsResult(proposal.relationDecision)) return false;
@@ -3923,6 +3957,7 @@ export class SessionTurnService {
     const base = proposal.baseEpisodeId ? this.deps.repos.runtime.getEpisode(proposal.baseEpisodeId) : undefined;
     if (!episode || !session || !base || episode.status === "closed") return;
     const job = this.deps.repos.runtime.getJobByDedupeKey(`turn_relation:${rawTurn.id}`);
+    if (job?.payload.recordOnly === true) return;
     const targetMemoryId = typeof job?.payload.feedbackTargetMemoryId === "string"
       ? job.payload.feedbackTargetMemoryId
       : null;
@@ -3941,7 +3976,8 @@ export class SessionTurnService {
         this.recordRevisionFeedback(session, base, userText, source, targetMemoryId);
       } else if (decision.relation === "new_task") {
         this.recordImplicitTurnFeedback(session, base, userText, feedback, targetMemoryId);
-        if (session.meta.l3_world_model_protocol_version === 2) {
+        // The idle-gap freeze at commit already covers a turn that came after the idle timeout.
+        if (session.meta.l3_world_model_protocol_version === 2 && proposal.gapMs <= EPISODE_IDLE_TIMEOUT_MS) {
           this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "new_task", at });
         }
       }

@@ -691,15 +691,25 @@ export async function classifyTurnRelationWithModel(
   llm: LlmClient,
   input: TurnRelationModelInput
 ): Promise<TurnRelationJudgment> {
-  const value = await llm.completeJson<Record<string, unknown>>(relationClassifyMessages(input), {
-    operation: RELATION_CLASSIFY_OPERATION,
-    thinkingMode: "disabled",
-    temperature: llm.config.temperature,
-    maxTokens: MEMORY_SUMMARY_MAX_TOKENS,
-    timeoutMs: RELATION_CLASSIFY_TIMEOUT_MS,
-    maxRetries: 0,
-    jsonRetries: false
-  });
+  let value: Record<string, unknown>;
+  try {
+    value = await llm.completeJson<Record<string, unknown>>(relationClassifyMessages(input), {
+      operation: RELATION_CLASSIFY_OPERATION,
+      thinkingMode: "disabled",
+      temperature: llm.config.temperature,
+      maxTokens: MEMORY_SUMMARY_MAX_TOKENS,
+      timeoutMs: RELATION_CLASSIFY_TIMEOUT_MS,
+      maxRetries: 0,
+      jsonRetries: false
+    });
+  } catch (error) {
+    // A reply that is not valid JSON is an invalid output, not a transport failure.
+    if (error instanceof SyntaxError || (error instanceof Error && /\bjson\b|truncat|max token/i.test(error.message) &&
+        !/html instead of json|expected json/i.test(error.message))) {
+      throw new ModelOutputInvalidError(`relation output is not valid JSON: ${error.message}`);
+    }
+    throw error;
+  }
   return parseTurnRelationJudgment(value, llm.config.model);
 }
 

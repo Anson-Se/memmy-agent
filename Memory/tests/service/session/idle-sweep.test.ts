@@ -436,6 +436,44 @@ describe("MemoryService / session / idle sweep", () => {
     expect(await idleEpisodeWithStartedTurn(8 * hour, 7 * hour)).toEqual({ status: "closed" });
   });
 
+  it("keeps the guard when the running turn has only reported a tool call", async () => {
+    const hour = 60 * 60 * 1000;
+    const { db, service } = createTestService();
+    const idleSession = service.openSession({
+      namespace: { source: "codex", profileId: "jiang", userId: "observed-turn-idle-user", sessionKey: "observed-turn-idle" }
+    });
+    const idleTurn = service.completeTurn("turn-observed-idle-done", {
+      sessionId: idleSession.sessionId,
+      query: "Prepare the migration plan",
+      answer: "The migration plan is ready."
+    });
+    await service.runWorkerOnce(20);
+    const lastCompleted = new Date(Date.now() - 4 * hour).toISOString();
+    setRawTurnActivityAt(db, idleTurn.rawTurnId, lastCompleted);
+    db.db.prepare(`UPDATE episodes SET updated_at = ? WHERE id = ?`).run(lastCompleted, idleTurn.episodeId);
+    await service.startTurn({ turnId: "turn-observed-idle-running", sessionId: idleSession.sessionId, query: "Run the migration" });
+    const observed = await service.observeTool({
+      sessionId: idleSession.sessionId,
+      turnId: "turn-observed-idle-running",
+      toolCallId: "call-migrate",
+      toolName: "shell",
+      args: { command: "npm run migrate" }
+    });
+    const startedAt = new Date(Date.now() - 3 * hour).toISOString();
+    db.db.prepare(`UPDATE recall_events SET created_at = ? WHERE session_id = ? AND turn_id = ?`)
+      .run(startedAt, idleSession.sessionId, "turn-observed-idle-running");
+    db.db.prepare(`UPDATE raw_turns SET created_at = ? WHERE id = ?`).run(new Date(Date.now() - 2.5 * hour).toISOString(), observed.rawTurnId);
+    db.db.prepare(`UPDATE episodes SET updated_at = ? WHERE id = ?`).run(lastCompleted, idleTurn.episodeId);
+
+    const triggerSession = service.openSession({
+      namespace: { source: "codex", profileId: "jiang", userId: "observed-turn-trigger-user", sessionKey: "observed-turn-trigger" }
+    });
+    service.completeTurn("turn-observed-trigger", { sessionId: triggerSession.sessionId, query: "Start a separate task", answer: "Started." });
+    await service.runWorkerOnce(20);
+    expect(db.db.prepare(`SELECT status FROM episodes WHERE id = ?`).get(idleTurn.episodeId)).toEqual({ status: "open" });
+    db.close();
+  });
+
   it("ignores a turn start that is older than the session's last completion", async () => {
     const hour = 60 * 60 * 1000;
     expect(await idleEpisodeWithStartedTurn(3 * hour, 4 * hour)).toEqual({ status: "closed" });
