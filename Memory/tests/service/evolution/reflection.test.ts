@@ -50,7 +50,7 @@ function createUnusableReflectionLlm(): LlmClient {
       messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
       options: { operation: string }
     ): Promise<T> {
-      if (options.operation === "capture.reflection.batch.v13") {
+      if (options.operation === "capture.reflection.batch.v14") {
         const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
           steps?: Array<{ idx: number }>;
         };
@@ -142,6 +142,40 @@ function createCapturingReflectionLlm(calls: Array<{
         configured: true,
         remote: true
       };
+    }
+  };
+}
+
+function createSocialAwareReflectionLlm(
+  calls: Array<{
+    messages: Array<{ role: string; content: string }>;
+    options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" };
+  }>,
+  socialStates: string[],
+  failReflection = false
+): LlmClient {
+  const base = createBatchReflectionLlm(calls);
+  return {
+    ...base,
+    async completeJson<T extends Record<string, unknown>>(
+      messages: LlmMessage[],
+      options: LlmCompletionOptions
+    ): Promise<T> {
+      if (options.operation !== "capture.reflection.batch.v14") {
+        return base.completeJson<T>(messages, options);
+      }
+      calls.push({ messages, options });
+      if (failReflection) {
+        throw new Error("reflection model unavailable");
+      }
+      const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
+        steps?: Array<{ idx: number; state?: string }>;
+      };
+      return {
+        scores: (payload.steps ?? []).map((step) => socialStates.includes(step.state ?? "")
+          ? { idx: step.idx, relevance: "IRRELEVANT", reason: "model social" }
+          : { idx: step.idx, relevance: "RELATED", reason: "model related" })
+      } as unknown as T;
     }
   };
 }
@@ -311,7 +345,7 @@ describe("MemoryService / evolution / reflection", () => {
     db.close();
   });
 
-  it("classifies short social-only steps without calling the reflection model", async () => {
+  it("sends short social-only steps to the reflection model", async () => {
     const calls: Array<{
       messages: Array<{ role: string; content: string }>;
       options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" };
@@ -323,7 +357,7 @@ describe("MemoryService / evolution / reflection", () => {
     const service = createTestMemoryService({
       db,
       mode: "dev",
-      llm: createBatchReflectionLlm(calls)
+      llm: createSocialAwareReflectionLlm(calls, ["谢谢，辛苦了"])
     });
     const session = service.openSession({
       namespace: {
@@ -363,10 +397,15 @@ describe("MemoryService / evolution / reflection", () => {
         };
       };
     }).internal_info.trace;
-    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(false);
+    const reflectionCalls = calls.filter((call) => call.options.operation === "capture.reflection.batch.v14");
+    expect(reflectionCalls).toHaveLength(1);
+    const payload = JSON.parse(
+      reflectionCalls[0]!.messages.find((message) => message.role === "user")?.content ?? "{}"
+    ) as { steps: Array<{ idx: number; state: string }> };
+    expect(payload.steps).toEqual([expect.objectContaining({ idx: 0, state: "谢谢，辛苦了" })]);
     expect(trace.alpha).toBe(0);
     expect(trace.usable).toBe(false);
-    expect(trace.reflection_reason).toBe("SOCIAL_ONLY");
+    expect(trace.reflection_reason).toBe("model social");
     db.close();
   });
 
@@ -403,14 +442,14 @@ describe("MemoryService / evolution / reflection", () => {
     const trace = (JSON.parse(row.properties_json) as {
       internal_info: { trace: { reflection: string; reflection_reason?: string; alpha: number } };
     }).internal_info.trace;
-    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(true);
+    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v14")).toBe(true);
     expect(trace.reflection).toBe("PIVOTAL");
     expect(trace.reflection_reason).toBe("batch scored");
     expect(trace.alpha).toBe(1);
     db.close();
   });
 
-  it("removes short social steps from a mixed batch and trusts the model for the rest", async () => {
+  it("keeps short social steps in a mixed batch and lets the model score every step", async () => {
     const calls: Array<{
       messages: Array<{ role: string; content: string }>;
       options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" };
@@ -420,7 +459,7 @@ describe("MemoryService / evolution / reflection", () => {
     const service = createTestMemoryService({
       db,
       mode: "dev",
-      llm: createBatchReflectionLlm(calls)
+      llm: createSocialAwareReflectionLlm(calls, ["Hi, thanks"])
     });
     const session = service.openSession({
       namespace: {
@@ -444,7 +483,7 @@ describe("MemoryService / evolution / reflection", () => {
     await closeSessionAndRunWorkerRounds(service, session.sessionId);
 
     const reflectionCalls = calls.filter((call) =>
-      call.options.operation === "capture.reflection.batch.v13"
+      call.options.operation === "capture.reflection.batch.v14"
     );
     expect(reflectionCalls).toHaveLength(1);
     const summaryCalls = calls.filter((call) => call.options.operation === "capture.summarize");
@@ -460,7 +499,8 @@ describe("MemoryService / evolution / reflection", () => {
       reflectionCalls[0]!.messages.find((message) => message.role === "user")?.content ?? "{}"
     ) as { steps: Array<{ idx: number; state: string }> };
     expect(payload.steps).toEqual([
-      expect.objectContaining({ idx: 0, state: "为什么黑美人西瓜不常见？" })
+      expect.objectContaining({ idx: 0, state: "Hi, thanks" }),
+      expect.objectContaining({ idx: 1, state: "为什么黑美人西瓜不常见？" })
     ]);
     const socialTrace = (JSON.parse((db.db.prepare(
       `SELECT properties_json FROM memories WHERE id = ?`
@@ -474,11 +514,63 @@ describe("MemoryService / evolution / reflection", () => {
     }).internal_info.trace;
     expect(socialTrace).toMatchObject({
       reflection: "IRRELEVANT",
-      reflection_reason: "SOCIAL_ONLY"
+      reflection_reason: "model social"
     });
     expect(knowledgeTrace).toMatchObject({
-      reflection: "PIVOTAL",
-      reflection_reason: "batch scored"
+      reflection: "RELATED",
+      reflection_reason: "model related"
+    });
+    db.close();
+  });
+
+  it("marks social steps with SOCIAL_FALLBACK when every reflection window fails", async () => {
+    const calls: Array<{
+      messages: Array<{ role: string; content: string }>;
+      options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" };
+    }> = [];
+    const root = createTestRoot("mindock-memory-reflection-social-fallback-");
+    const db = new MemoryDb({ path: join(root, "memory.sqlite") });
+    const service = createTestMemoryService({
+      db,
+      mode: "dev",
+      llm: createSocialAwareReflectionLlm(calls, [], true)
+    });
+    const session = service.openSession({
+      namespace: {
+        source: "codex",
+        profileId: "jiang",
+        userId: "reflection-social-fallback-user"
+      }
+    });
+    const social = service.completeTurn("turn-reflection-fallback-social", {
+      sessionId: session.sessionId,
+      query: "Hi, thanks",
+      answer: "You're welcome."
+    });
+    const knowledge = service.completeTurn("turn-reflection-fallback-knowledge", {
+      sessionId: session.sessionId,
+      episodeId: social.episodeId,
+      query: "为什么黑美人西瓜不常见？",
+      answer: "主要受市场偏好、运输和品种迭代影响。"
+    });
+
+    await closeSessionAndRunWorkerRounds(service, session.sessionId);
+
+    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v14")).toBe(true);
+    const traceOf = (memoryId: string | undefined) => (JSON.parse((db.db.prepare(
+      `SELECT properties_json FROM memories WHERE id = ?`
+    ).get(memoryId) as { properties_json: string }).properties_json) as {
+      internal_info: { trace: { reflection: string; reflection_reason?: string; alpha: number } };
+    }).internal_info.trace;
+    expect(traceOf(social.l1MemoryId)).toMatchObject({
+      reflection: "IRRELEVANT",
+      reflection_reason: "SOCIAL_FALLBACK",
+      alpha: 0
+    });
+    expect(traceOf(knowledge.l1MemoryId)).toMatchObject({
+      reflection: "RELATED_DEFAULT",
+      reflection_reason: "FALLBACK_RELATED_DEFAULT",
+      alpha: 0.5
     });
     db.close();
   });
@@ -559,10 +651,10 @@ describe("MemoryService / evolution / reflection", () => {
     await closeSessionAndRunWorkerRounds(service, session.sessionId);
 
     const reflectionCall = evolutionCalls.find((call) =>
-      call.options.operation === "capture.reflection.batch.v13"
+      call.options.operation === "capture.reflection.batch.v14"
     );
     expect(reflectionCall?.options.thinkingMode).toBe("disabled");
-    expect(summaryCalls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(false);
+    expect(summaryCalls.some((call) => call.options.operation === "capture.reflection.batch.v14")).toBe(false);
     const summaryCall = summaryCalls.find((call) => call.options.operation === "capture.summarize");
     expect(summaryCall).toBeTruthy();
     expect(summaryCall!.messages[0]?.content).toContain("Judge L1 and User Memory");
@@ -623,10 +715,15 @@ describe("MemoryService / evolution / reflection", () => {
     await closeSessionAndRunWorkerRounds(service, session.sessionId);
 
     const reflectionCall = calls.find((call) =>
-      call.options.operation === "capture.reflection.batch.v13"
+      call.options.operation === "capture.reflection.batch.v14"
     );
     expect(reflectionCall).toBeTruthy();
     expect(reflectionCall!.messages[0]?.content).toContain("reviewing a WINDOW of one AI agent episode");
+    expect(reflectionCall!.messages[0]?.content).toContain("Each step is stored as an L1 trace, Memmy's evidence layer.");
+    expect(reflectionCall!.messages[0]?.content).toContain("Scoring rubric (choose one label for each step):");
+    expect(reflectionCall!.messages[0]?.content).toContain("label it at least RELATED (never\nIRRELEVANT;");
+    expect(reflectionCall!.messages[0]?.content).toContain("a reasonable attempt that fails is exploration and stays\n  RELATED");
+    expect(reflectionCall!.messages[0]?.content).not.toContain("apply in order");
     const payload = JSON.parse(reflectionCall!.messages.find((message) => message.role === "user")?.content ?? "{}") as {
       steps: Array<{ idx: number; action: string; tool_calls: Array<{ input: string; output: string }> }>;
       task_context?: string | null;
@@ -774,7 +871,7 @@ describe("MemoryService / evolution / reflection", () => {
 
     await closeSessionAndRunWorkerRounds(service, session.sessionId);
 
-    const batchCall = calls.find((call) => call.options.operation === "capture.reflection.batch.v13");
+    const batchCall = calls.find((call) => call.options.operation === "capture.reflection.batch.v14");
     expect(batchCall).toBeTruthy();
     expect(calls.some((call) => call.options.operation === "capture.alpha.reflection.score.v3")).toBe(false);
     const payload = JSON.parse(batchCall!.messages.find((message) => message.role === "user")?.content ?? "{}") as {
@@ -845,7 +942,7 @@ describe("MemoryService / evolution / reflection", () => {
     await closeSessionAndRunWorkerRounds(service, session.sessionId);
 
     const batchCall = calls.find((call) =>
-      call.options.operation === "capture.reflection.batch.v13"
+      call.options.operation === "capture.reflection.batch.v14"
     );
     expect(batchCall).toBeTruthy();
     expect(batchCall!.messages[0]?.content).toContain("reviewing a WINDOW of one AI agent episode");

@@ -17,7 +17,7 @@ describe("memory token budget rules", () => {
   it("counts pipeline operations and excludes retrieval plus agent chat", () => {
     expect(isBudgetedMemoryUsage({ kind: "memory_summary", operation: "episode_title.final" })).toBe(true);
     expect(isBudgetedMemoryUsage({ kind: "memory_summary", operation: "capture.summarize" })).toBe(true);
-    expect(isBudgetedMemoryUsage({ kind: "memory_evolution", operation: "capture.reflection.batch.v13" })).toBe(true);
+    expect(isBudgetedMemoryUsage({ kind: "memory_evolution", operation: "capture.reflection.batch.v14" })).toBe(true);
     expect(isBudgetedMemoryUsage({ kind: "memory_evolution", operation: "l3_world_model.project_contract" })).toBe(true);
     expect(isBudgetedMemoryUsage({ kind: "embedding", operation: "embedding.document" })).toBe(true);
     expect(isBudgetedMemoryUsage({ kind: "embedding", operation: "embedding.query" })).toBe(false);

@@ -353,18 +353,7 @@ private async scoreBatchReflectionWindow(
       throw new Error(`batch reflection payload length mismatch: expected ${memories.length}`);
     }
     const directScores = new Map<number, BatchReflectionScore>();
-    const modelStepIndices: number[] = [];
-    steps.forEach((value, idx) => {
-      const step = isRecord(value) ? value : undefined;
-      if (isSocialOnlyBatchReflectionStep(step)) {
-        directScores.set(idx, socialOnlyBatchReflectionScore(idx));
-      } else {
-        modelStepIndices.push(idx);
-      }
-    });
-    if (modelStepIndices.length === 0) {
-      return Array.from({ length: steps.length }, (_, idx) => directScores.get(idx)!);
-    }
+    const modelStepIndices = steps.map((_, idx) => idx);
     const modelPayload = {
       ...payload,
       steps: modelStepIndices.map((sourceIdx, idx) => ({
@@ -467,7 +456,7 @@ private async applyBatchReflectionScores(
         changeType: "update",
         before: previous,
         after: saved,
-        source: "worker.reflection.batch.v13",
+        source: "worker.reflection.batch.v14",
         createdAt: at
       });
       this.enqueuePostReflectionEmbedding(saved, job, at);
@@ -1211,13 +1200,13 @@ function batchReflectionWordCount(text: string): number {
     .length;
 }
 
-function socialOnlyBatchReflectionScore(idx: number): BatchReflectionScore {
+function socialFallbackBatchReflectionScore(idx: number): BatchReflectionScore {
   return {
     idx,
     reflectionText: "IRRELEVANT",
     alpha: 0,
     usable: false,
-    reason: "SOCIAL_ONLY"
+    reason: "SOCIAL_FALLBACK"
   };
 }
 
@@ -1252,7 +1241,7 @@ function batchRelatedDefaultScores(
   return Array.from({ length }, (_, idx) => {
     const step = isRecord(steps?.[idx]) ? steps[idx] : undefined;
     return isSocialOnlyBatchReflectionStep(step)
-      ? socialOnlyBatchReflectionScore(idx)
+      ? socialFallbackBatchReflectionScore(idx)
       : {
         idx,
         reflectionText: "RELATED_DEFAULT",

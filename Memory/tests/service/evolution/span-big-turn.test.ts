@@ -64,7 +64,7 @@ function createSpanBigTurnLlm(
       options: LlmCompletionOptions
     ): Promise<T> {
       calls.push({ messages, options });
-      if (options.operation === "capture.reflection.batch.v13") {
+      if (options.operation === "capture.reflection.batch.v14") {
         const payload = JSON.parse(messages.at(-1)?.content ?? "{}") as {
           steps?: Array<{ idx: number }>;
         };

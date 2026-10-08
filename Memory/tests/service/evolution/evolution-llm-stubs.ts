@@ -27,7 +27,7 @@ export function createCapturingL2Llm(calls: Array<{
       options: { operation: string }
     ): Promise<T> {
       calls.push({ messages, options });
-      if (options.operation === "capture.reflection.batch.v13") {
+      if (options.operation === "capture.reflection.batch.v14") {
         const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
           steps?: Array<{ idx: number }>;
         };

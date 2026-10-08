@@ -980,7 +980,7 @@ describe("native source turn submission", () => {
       expect.objectContaining({ job_type: "reflection", status: "succeeded" }),
       expect.objectContaining({ job_type: "reward" })
     ]));
-    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(true);
+    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v14")).toBe(true);
   });
 
   it("keeps the ordinary completeTurn Episode creation time at completion", async () => {

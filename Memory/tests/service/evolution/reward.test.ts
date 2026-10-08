@@ -196,7 +196,7 @@ function createMixedCaptureLlm(calls: Array<{ operation: string; stepCount?: num
       options: { operation: string }
     ): Promise<T> {
       const payload = messages.find((message) => message.role === "user")?.content ?? "";
-      if (options.operation === "capture.reflection.batch.v13") {
+      if (options.operation === "capture.reflection.batch.v14") {
         const parsed = JSON.parse(payload) as { steps?: Array<{ idx: number }> };
         calls.push({ operation: options.operation, stepCount: parsed.steps?.length ?? 0 });
         return {
@@ -424,7 +424,7 @@ describe("MemoryService / evolution / reward", () => {
     }).items.filter((item) => [second.l1MemoryId, third.l1MemoryId].includes(item.id));
     expect(reflectedItems).toHaveLength(2);
     expect(reflectedItems.every((item) => item.metrics?.reflectionDone)).toBe(true);
-    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(true);
+    expect(calls.some((call) => call.options.operation === "capture.reflection.batch.v14")).toBe(true);
     const rewardCalls = calls.filter((call) => call.options.operation === "reward.reward.r_human.v7");
     expect(rewardCalls).toHaveLength(1);
     const rewardInput = JSON.parse(
@@ -582,8 +582,8 @@ describe("MemoryService / evolution / reward", () => {
     ).get(accepted.episodeId)).toEqual({ count: 1 });
 
     await service.runWorkerOnce(20);
-    expect(calls.filter((call) => call.operation === "capture.reflection.batch.v13")).toEqual([
-      { operation: "capture.reflection.batch.v13", stepCount: 1 }
+    expect(calls.filter((call) => call.operation === "capture.reflection.batch.v14")).toEqual([
+      { operation: "capture.reflection.batch.v14", stepCount: 1 }
     ]);
     expect(db.db.prepare(
       `SELECT COUNT(*) AS count FROM evolution_jobs WHERE status = 'dead_letter'`

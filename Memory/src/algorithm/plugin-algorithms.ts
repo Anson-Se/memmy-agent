@@ -1765,7 +1765,7 @@ Return JSON:
 
 export const BATCH_REFLECTION_PROMPT = {
   id: "reflection.batch",
-  version: 13,
+  version: 14,
   description:
     "Tri-valued path-relevance scoring for each step in an episode window.",
   system: `You are reviewing a WINDOW of one AI agent episode.
@@ -1783,6 +1783,9 @@ Payload top-level fields: "steps" (required, array) and "task_context"
 
 Goal: decide each step's relevance to the final trajectory and to future
 memory retrieval. These are related but not identical.
+Each step is stored as an L1 trace, Memmy's evidence layer. Your label sets the
+step's share of the episode's reward, and only traces that receive value can
+become evidence for reusable policies (L2) and skills.
 You must NOT produce long natural-language reflection text.
 
 Hard override (must follow): if a step is purely social/polite phatic
@@ -1795,22 +1798,27 @@ a concrete user preference, identity fact, project fact, requirement,
 decision, commitment, constraint, or confirmed answer.
 
 Durable memory rule (must follow): if a step captures a concrete fact that
-would help answer a future user query, label it RELATED even when it has no
+would help answer a future user query, label it at least RELATED (never
+IRRELEVANT; PIVOTAL if it is also a turning point) even when it has no
 tool calls, no visible chain-of-thought, and no downstream execution. Common
 examples include "I like pineapple", "my default shell is zsh", "this project
 uses SQLite", "we decided to keep both sides of the conflict", or an agent
 confirming it has remembered such a fact.
 
-Scoring rubric (apply in order: IRRELEVANT vs on-path, then RELATED vs PIVOTAL):
+Scoring rubric (choose one label for each step):
 
-- IRRELEVANT => off-path, ineffective, or social-only (see hard override above),
-  and not useful as a durable memory fact.
-- RELATED => any step that is useful and on the task path. This is the default
+- IRRELEVANT => off-path, ineffective (adds nothing to the task, such as repeating
+  the same action; a reasonable attempt that fails is exploration and stays
+  RELATED, see Sequence A), or social-only (see hard override above), and not
+  useful as a durable memory fact.
+- RELATED => any step that is useful and on the task path but is not a turning
+  point (that is PIVOTAL). This is the default
   for on-path work. Do NOT reserve RELATED only for "deletable" steps; many
   RELATED steps are necessary, and deletion cost is NOT the criterion. Also
-  use RELATED for durable memory facts even when they are assistant-only or
-  do not advance a tool-based task.
-- PIVOTAL => a strict subset of RELATED. Prefer few PIVOTAL labels per window.
+  use RELATED for durable memory facts that are not turning points, even when
+  they are assistant-only or do not advance a tool-based task.
+- PIVOTAL => an on-path step that is also a turning point; other on-path steps
+  are RELATED. Prefer few PIVOTAL labels per window.
   PIVOTAL is the turning-point role: the step must both (a) redirect the
   episode's working direction and (b) enable smooth, on-path execution in
   LATER steps that actually run on what was decided or discovered here.
