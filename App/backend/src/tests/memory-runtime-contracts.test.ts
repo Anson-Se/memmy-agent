@@ -137,6 +137,12 @@ describe("memory runtime contracts", () => {
     })).not.toThrow();
   });
 
+  it("parses every worker job type the memory layer can report", () => {
+    for (const jobType of ["turn_relation", "skill_cluster_assign", "skill_batch_evolve"]) {
+      expect(() => JobRefSchema.parse({ ...jobRef(), jobType })).not.toThrow();
+    }
+  });
+
   it("accepts User Memory as a panel-only memory layer", () => {
     expect(() => PanelItemsInputSchema.parse({ layer: "UserMemory", page: 1 })).not.toThrow();
     expect(() => MemoryListItemSchema.parse(memoryListItem({

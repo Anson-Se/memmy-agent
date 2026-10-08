@@ -38,6 +38,8 @@ import {
   classifyProcessingError,
   type EnqueueJobInput,
   processingJobMatchesMemory,
+  isModelJudgmentJobType,
+  modelJudgmentFailurePlan,
   processingStageForJob,
   sanitizeProcessingError,
   workerJobCanRunInParallel
@@ -45,7 +47,7 @@ import {
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
-const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "episode_title"];
+const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "episode_title", "turn_relation"];
 
 const workerLogger = createMemoryLogger("worker");
 
@@ -596,6 +598,9 @@ export class WorkerRunner {
   }
 
   failLeasedWorkerJob(job: EvolutionJobRecord, error: unknown): WorkerJobRunResult {
+    if (isModelJudgmentJobType(job.jobType)) {
+      return this.failModelJudgmentJob(job, error);
+    }
     const errorMessage = processingStageForJob(job.jobType)
       ? sanitizeProcessingError(error)
       : error instanceof Error ? error.message : String(error);
@@ -630,6 +635,34 @@ export class WorkerRunner {
         ...jobToRef(job),
         status: failedJob.status === "dead_letter" ? "dead_letter" : "failed"
       }
+    };
+  }
+
+  private failModelJudgmentJob(job: EvolutionJobRecord, error: unknown): WorkerJobRunResult {
+    const at = this.deps.nowIso();
+    const plan = modelJudgmentFailurePlan(job, error, at);
+    const errorMessage = `${plan.errorCode}: ${sanitizeProcessingError(error)}`;
+    const failedJob = this.deps.repos.runtime.failJobWithPayload(job.id, errorMessage, plan.payload, plan.deadLetter, at) ?? {
+      ...job,
+      status: plan.deadLetter ? "dead_letter" as const : "failed" as const,
+      leasedUntil: null,
+      lastError: errorMessage,
+      payload: plan.payload,
+      updatedAt: at
+    };
+    const terminal = failedJob.status === "dead_letter";
+    this.deps.appendJobChange(failedJob, terminal ? "dead_letter" : "failed", job);
+    workerLogger.error("job.failed", {
+      ...workerJobLogFields(failedJob),
+      terminal,
+      errorCode: plan.errorCode,
+      ...(terminal ? {} : { runAfter: plan.payload.runAfter }),
+      ...memoryErrorFields(error)
+    });
+    return {
+      succeeded: 0,
+      failed: 1,
+      ref: { ...jobToRef(job), status: terminal ? "dead_letter" : "failed" }
     };
   }
 

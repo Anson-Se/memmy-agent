@@ -67,6 +67,7 @@ export interface MemoryProcessingRecord {
 }
 export type JobType =
   | "episode_idle_close"
+  | "turn_relation"
   | "episode_title"
   | "trace_summary"
   | "user_memory_embedding"

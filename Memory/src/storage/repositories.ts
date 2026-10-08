@@ -3854,6 +3854,51 @@ export class RuntimeRepository {
     return transaction();
   }
 
+  /** Fails a job with an explicit outcome and payload, e.g. to schedule a backoff retry via runAfter. */
+  failJobWithPayload(
+    id: string,
+    error: string,
+    payload: Record<string, unknown>,
+    deadLetter: boolean,
+    at = nowIso()
+  ): EvolutionJobRecord | undefined {
+    this.db
+      .prepare(
+        `UPDATE evolution_jobs
+         SET status = ?,
+             leased_until = NULL,
+             last_error = ?,
+             payload_json = ?,
+             updated_at = ?
+         WHERE id = ?
+           AND status != 'dead_letter'`
+      )
+      .run(deadLetter ? "dead_letter" : "failed", error, toJson(payload), at, id);
+    return this.getJob(id);
+  }
+
+  /** Puts a dead-lettered job back in the queue with fresh retry counters. */
+  requeueDeadLetterJob(id: string, at = nowIso()): EvolutionJobRecord | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM evolution_jobs WHERE id = ?`)
+      .get(id) as SqlJobRow | undefined;
+    if (!row || row.status !== "dead_letter") return undefined;
+    const { invalidOutputCount: _invalid, failureCount: _failures, runAfter: _runAfter, ...payload } =
+      parseJson<Record<string, unknown>>(row.payload_json, {});
+    this.db
+      .prepare(
+        `UPDATE evolution_jobs
+         SET status = 'queued',
+             attempts = 0,
+             leased_until = NULL,
+             payload_json = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(toJson({ ...payload, manualRetryAt: at }), at, id);
+    return this.getJob(id);
+  }
+
   failJob(
     id: string,
     error: string,
@@ -8081,6 +8126,7 @@ function evolutionJobPrioritySql(): string {
                OR (job_type = 'embedding' AND ${importedTarget}) THEN 2
              WHEN job_type = 'embedding' THEN 3
              WHEN job_type = 'episode_idle_close' THEN 10
+             WHEN job_type = 'turn_relation' THEN 12
              WHEN job_type = 'episode_title' THEN 15
              WHEN job_type = 'reflection' THEN 20
              WHEN job_type = 'decision_repair' THEN 25

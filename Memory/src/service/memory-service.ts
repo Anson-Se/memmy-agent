@@ -181,6 +181,7 @@ import {
 } from "./turn/turn-normalization.js";
 import {
   createWorkerJobHandlers,
+  isModelJudgmentJobType,
   type ClosedEpisodeTrigger,
   type EnqueueJobInput
 } from "./worker/job-handlers.js";
@@ -2336,6 +2337,21 @@ export class MemoryService {
     serverTime: string;
   } {
     return this.importJobs.memoryProcessingStatus(memoryIds, request);
+  }
+
+  /** Re-queues a dead-lettered model-judgment job (e.g. turn_relation) with fresh retry counters. */
+  retryModelJudgmentJob(jobId: string): { accepted: boolean; job?: JobRef; serverTime: string } {
+    const at = nowIso();
+    const job = this.repos.runtime.getJob(jobId);
+    if (!job) throw new MemoryServiceError("not_found", `job not found: ${jobId}`);
+    if (!isModelJudgmentJobType(job.jobType)) {
+      throw new MemoryServiceError("invalid_argument", `job type cannot be retried manually: ${job.jobType}`);
+    }
+    if (job.status !== "dead_letter") return { accepted: false, job: jobToRef(job), serverTime: at };
+    const requeued = this.repos.runtime.requeueDeadLetterJob(job.id, at);
+    if (!requeued) return { accepted: false, job: jobToRef(job), serverTime: at };
+    this.workerHandlers.appendJobChange(requeued, "queued", job);
+    return { accepted: true, job: jobToRef(requeued), serverTime: at };
   }
 
   retryMemoryProcessing(memoryId: string, request: RequestEnvelope = {}): {

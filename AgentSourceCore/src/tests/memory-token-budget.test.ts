@@ -34,6 +34,12 @@ describe("memory token budget rules", () => {
     expect(jobTypeConsumesMemoryBudget("episode_idle_close")).toBe(false);
   });
 
+  it("budgets turn relation judgments as summary-model work", () => {
+    expect(jobTypeBudgetRoles("turn_relation")).toEqual(["memory_summary"]);
+    expect(allowedMemoryBudgetJobTypes({ memory_summary: { source: "byok" } })).not.toContain("turn_relation");
+    expect(allowedMemoryBudgetJobTypes({ memory_summary: { source: "account" } })).toContain("turn_relation");
+  });
+
   it("holds only jobs whose current model source is BYOK", () => {
     const byok = {
       memory_summary: { source: "byok" },

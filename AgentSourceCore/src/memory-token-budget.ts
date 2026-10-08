@@ -6,6 +6,7 @@ export const EPISODE_IDLE_CLOSE_JOB_TYPE = "episode_idle_close";
 
 export const MEMORY_WORKER_JOB_TYPES = [
   "episode_idle_close",
+  "turn_relation",
   "episode_title",
   "trace_summary",
   "user_memory_embedding",
@@ -83,6 +84,7 @@ export function jobTypeBudgetRoles(jobType: string): MemoryBudgetModelRole[] {
     case "skill_cluster_assign":
     case "skill_trial_resolve":
       return [];
+    case "turn_relation":
     case "episode_title":
     case "trace_summary":
     case "import_summary":

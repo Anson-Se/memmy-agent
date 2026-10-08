@@ -623,6 +623,60 @@ export function classifyProcessingError(error: unknown): {
   return { code: "processing_failed", retryAction: "retry" };
 }
 
+/**
+ * Jobs whose work is a model judgment. A failed or rejected model call is retried with
+ * backoff instead of falling back to a rule or default, and only an unusable request or
+ * repeatedly invalid output dead-letters the job (L1 plan 5.4, L2 plan X1).
+ */
+export const MODEL_JUDGMENT_JOB_TYPES: readonly JobType[] = ["turn_relation"];
+export const MODEL_JUDGMENT_MAX_ATTEMPTS = 1_000_000;
+export const MODEL_OUTPUT_INVALID_LIMIT = 5;
+export const MODEL_RETRY_BACKOFF_BASE_MS = 60_000;
+export const MODEL_RETRY_BACKOFF_MAX_MS = 60 * 60 * 1000;
+
+/** Thrown when a model answered but its output failed the rule checks. */
+export class ModelOutputInvalidError extends Error {
+  override readonly name = "ModelOutputInvalidError";
+  readonly code = "model_output_invalid";
+}
+
+export function isModelJudgmentJobType(jobType: string): boolean {
+  return (MODEL_JUDGMENT_JOB_TYPES as readonly string[]).includes(jobType);
+}
+
+/** Decides how a failed model-judgment job is stored: retried later, or dead-lettered. */
+export function modelJudgmentFailurePlan(
+  job: EvolutionJobRecord,
+  error: unknown,
+  at: string
+): { deadLetter: boolean; errorCode: string; payload: Record<string, unknown> } {
+  const payload = { ...job.payload };
+  const failureCount = (typeof payload.failureCount === "number" ? payload.failureCount : 0) + 1;
+  payload.failureCount = failureCount;
+  let errorCode: string;
+  let deadLetter = false;
+  if (error instanceof ModelOutputInvalidError) {
+    // Network and quota failures neither count toward nor reset this limit; a valid output ends the job.
+    const invalidOutputCount = (typeof payload.invalidOutputCount === "number" ? payload.invalidOutputCount : 0) + 1;
+    payload.invalidOutputCount = invalidOutputCount;
+    errorCode = error.code;
+    deadLetter = invalidOutputCount >= MODEL_OUTPUT_INVALID_LIMIT;
+  } else {
+    const classification = classifyProcessingError(error);
+    // An empty, non-JSON or HTML reply and 404 match model_configuration text but are often transient.
+    const notFound = error instanceof ModelHttpError && error.httpStatus === 404;
+    errorCode = notFound ? "transient_provider_error" : classification.code;
+    deadLetter = !notFound &&
+      (classification.code === "invalid_model_request" || classification.code === "model_input_too_long");
+  }
+  if (!deadLetter) {
+    const delay = Math.min(MODEL_RETRY_BACKOFF_MAX_MS, MODEL_RETRY_BACKOFF_BASE_MS * 2 ** Math.min(failureCount - 1, 16));
+    payload.runAfter = new Date(Date.parse(at) + delay).toISOString();
+  }
+  payload.lastErrorCode = errorCode;
+  return { deadLetter, errorCode, payload };
+}
+
 export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "episodeId" | "targetMemoryId" | "payload">): string | undefined {
   const payload = input.payload ?? {};
   const payloadString = (key: string): string | undefined => {
@@ -641,6 +695,10 @@ export function evolutionJobDedupeKey(input: Pick<EnqueueJobInput, "jobType" | "
       return input.episodeId
         ? `episode_idle_close:${input.episodeId}:${payloadString("triggerRawTurnId") ?? "turn"}`
         : undefined;
+    case "turn_relation": {
+      const rawTurnId = payloadString("rawTurnId");
+      return rawTurnId ? `turn_relation:${rawTurnId}` : undefined;
+    }
     case "episode_title":
       return input.episodeId
         ? `episode_title:${input.episodeId}:${payloadString("stage") ?? "provisional"}`
