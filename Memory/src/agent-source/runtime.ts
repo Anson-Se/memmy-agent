@@ -840,7 +840,7 @@ async function ingestStagedMessages(
           continue;
         }
         const legacyImportTurnId = legacyImportTurnIdFromMessages(sourceId, turn.conversationId, turn.messages);
-        const result = service.completeSourceTurn({
+        const result = await service.completeSourceTurnJudged({
           ...buildSourceTurnRequest(sourceTurn, "agent_source_scan"),
           ...(legacyImportTurnId ? { legacyImportTurnId } : {}),
           ...(scanMode === "initial_subset" || scanMode === "full" ? { captureLegacyHistory: true } : {})

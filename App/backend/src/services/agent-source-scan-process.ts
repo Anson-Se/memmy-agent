@@ -18,7 +18,8 @@ import { isScanResumeStateReference, type AgentSourceScanProcessCommand, type Ag
 import { dirname, join } from "node:path";
 import { migrateLegacyScanJournal } from "./agent-source-scan-migration.js";
 
-const DEFAULT_MEMORY_LAYER_TIMEOUT_MS = 20_000;
+// A scanned turn without a turn-start record waits for its relation judgment (up to 60 seconds).
+const DEFAULT_MEMORY_LAYER_TIMEOUT_MS = 90_000;
 
 if (!process.send) {
   throw new Error("Agent source scan process requires an IPC channel");

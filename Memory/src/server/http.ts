@@ -689,7 +689,7 @@ async function routeRequest(
     const request = strictEnvelopeWithPrincipal({ ...input, namespace }, scopedPrincipal) as unknown as SourceTurnCompleteRequest;
     requireStringField(request, "query", "source-turn.complete");
     requireStringField(request, "answer", "source-turn.complete");
-    const result = service.completeSourceTurn({
+    const result = await service.completeSourceTurnJudged({
       namespace: request.namespace, timeZone: request.timeZone, source: request.source,
       sourceTurn: request.sourceTurn, channel: request.channel, workspacePath: request.workspacePath,
       ...(request.captureLegacyHistory === true ? { captureLegacyHistory: true } : {}),

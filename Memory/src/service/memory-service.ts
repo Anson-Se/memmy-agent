@@ -1315,19 +1315,21 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
-  completeSourceTurn(request: SourceTurnCompleteRequest): SourceTurnCompleteResponse {
-    // Native scans have no Hook envelope. Use the configured owner only when
-    // the request (including authenticated scope) did not provide one.
-    const response = this.sessionTurns.completeSourceTurn(this.withTimeZone({
-      ...request,
-      namespace: {
-        source: request.sourceTurn?.source,
-        profileId: request.sourceTurn?.profileId,
-        sessionKey: request.sourceTurn?.conversationId,
-        ...request.namespace,
-        userId: request.namespace?.userId ?? this.config.userId
-      }
-    }));
+  /**
+   * Source-turn capture for the hook and scan entries: a turn without a turn-start record is first
+   * judged by the relation model (hooks wait at most 15 seconds), then captured.
+   */
+  async completeSourceTurnJudged(request: SourceTurnCompleteRequest): Promise<SourceTurnCompleteResponse> {
+    const scoped = this.sourceTurnRequestWithOwner(request);
+    const relation = await this.withModelTaskContext(() => this.sessionTurns.judgeSourceTurnRelation(scoped));
+    return this.completeSourceTurn(request, relation);
+  }
+
+  completeSourceTurn(
+    request: SourceTurnCompleteRequest,
+    relation?: Awaited<ReturnType<SessionTurnService["judgeSourceTurnRelation"]>>
+  ): SourceTurnCompleteResponse {
+    const response = this.sessionTurns.completeSourceTurn(this.sourceTurnRequestWithOwner(request), relation);
     serviceLogger.info("source_turn.complete", {
       source: request.sourceTurn?.source,
       profileId: request.sourceTurn?.profileId,
@@ -1346,6 +1348,21 @@ export class MemoryService {
 
   completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): CompleteTurnResponse {
     return this.sessionTurns.completeTurn(turnId, this.withTimeZone(request));
+  }
+
+  private sourceTurnRequestWithOwner(request: SourceTurnCompleteRequest): SourceTurnCompleteRequest {
+    // Native scans have no Hook envelope. Use the configured owner only when
+    // the request (including authenticated scope) did not provide one.
+    return this.withTimeZone({
+      ...request,
+      namespace: {
+        source: request.sourceTurn?.source,
+        profileId: request.sourceTurn?.profileId,
+        sessionKey: request.sourceTurn?.conversationId,
+        ...request.namespace,
+        userId: request.namespace?.userId ?? this.config.userId
+      }
+    });
   }
 
   async observeTool(input: ToolObserveRequest): Promise<{

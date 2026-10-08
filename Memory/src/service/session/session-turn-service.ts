@@ -152,7 +152,26 @@ interface CommittedTurnRoute extends EpisodeTurnRoute {
   pendingRelation?: PendingTurnRelation;
 }
 const sessionLogger = createMemoryLogger("session");
+/** A relation judgment made at the source-turn entry, for a turn without a turn-start record. */
+interface SourceTurnRelation {
+  judgment: TurnRelationJudgment;
+  baseEpisodeId: string;
+}
+interface SourceTurnRelationPlan {
+  sessionId: string;
+  turnId: string;
+  baseEpisodeId: string;
+  input: TurnRelationModelInput;
+}
+/** Carries the read-only plan out of a rolled-back source-turn transaction. */
+class SourceTurnPlanned extends Error {
+  constructor(readonly plan: SourceTurnRelationPlan | undefined) {
+    super("source turn planned");
+  }
+}
 const RELATION_IN_FLIGHT_DEFER_MS = 60_000;
+/** A hook submission waits this long for the judgment; a scan waits for the call itself (60 seconds). */
+const SOURCE_HOOK_RELATION_WAIT_MS = 15_000;
 const RELATION_TITLE_LIMIT = 20;
 
 function pendingRelationDecision(): TurnRelationDecision {
@@ -593,6 +612,12 @@ export class SessionTurnService {
 
   /** Relation judgments started at turn start that have not settled yet, by session and turn. */
   private readonly relationCalls = new Map<string, Promise<void>>();
+  /** Source-turn entry judgments in flight, so a repeated submission of the same turn reuses the call. */
+  private readonly sourceRelationCalls = new Map<string, {
+    holder: { judgment?: TurnRelationJudgment };
+    call: Promise<void>;
+    baseEpisodeId: string;
+  }>();
 
   constructor(private readonly deps: SessionTurnDependencies) {}
 
@@ -1286,7 +1311,7 @@ export class SessionTurnService {
     const certainDecision = endTopicDecision ?? this.certainRelationDecision(latestEpisode, request.query);
     // Start the relation judgment now, but do not wait for it: the turn start only waits for recall.
     const relationCall = !certainDecision && latestEpisode && this.relationModelAvailable()
-      ? this.startRelationCall(session.id, turnId, latestEpisode, request.query)
+      ? this.startRelationCall(session.id, turnId, latestEpisode.id, this.relationModelInput(latestEpisode, request.query))
       : undefined;
     const contextHints = turnStartContextHints(request);
     const requestedLayers: MemoryLayer[] = this.deps.turnStartMemoryLayers(
@@ -1349,7 +1374,63 @@ export class SessionTurnService {
     };
   }
 
-  completeSourceTurn(request: SourceTurnCompleteRequest): SourceTurnCompleteResponse {
+  /**
+   * Judges the relation of a source turn that has no turn-start record before it is captured.
+   * A hook submission waits at most 15 seconds (the call continues and is written back if it lands
+   * later); a scan waits for the call. Returns undefined when no judgment is needed or available.
+   */
+  async judgeSourceTurnRelation(request: SourceTurnCompleteRequest): Promise<SourceTurnRelation | undefined> {
+    if (!this.relationModelAvailable()) return undefined;
+    const identity = request.sourceTurn;
+    const plan = this.planSourceTurnRelation(request);
+    if (!plan || !identity) return undefined;
+    const key = [identity.source, identity.profileId, identity.conversationId, identity.turnId].join("\u0000");
+    let entry = this.sourceRelationCalls.get(key);
+    if (!entry) {
+      const holder = this.startRelationCall(plan.sessionId, plan.turnId, plan.baseEpisodeId, plan.input);
+      const call = this.relationCalls.get(relationCallKey(plan.sessionId, plan.turnId)) ?? Promise.resolve();
+      const created = { holder, call, baseEpisodeId: plan.baseEpisodeId };
+      entry = created;
+      this.sourceRelationCalls.set(key, created);
+      void call.finally(() => {
+        if (this.sourceRelationCalls.get(key) === created) this.sourceRelationCalls.delete(key);
+      });
+    }
+    if (request.channel === "hook") {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        entry.call,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, SOURCE_HOOK_RELATION_WAIT_MS);
+          timer.unref?.();
+        })
+      ]);
+      if (timer) clearTimeout(timer);
+    } else {
+      await entry.call;
+    }
+    return entry.holder.judgment ? { judgment: entry.holder.judgment, baseEpisodeId: entry.baseEpisodeId } : undefined;
+  }
+
+  /** Runs the capture checks without writing (the transaction is rolled back) to find the turn's base episode. */
+  private planSourceTurnRelation(request: SourceTurnCompleteRequest): SourceTurnRelationPlan | undefined {
+    try {
+      // Every path ends in a throw, so even early returns that write (legacy adoption) are rolled back.
+      this.deps.repos.transaction(() => {
+        this.completeSourceTurn(request, undefined, true);
+        throw new SourceTurnPlanned(undefined);
+      });
+    } catch (error) {
+      if (error instanceof SourceTurnPlanned) return error.plan;
+    }
+    return undefined;
+  }
+
+  completeSourceTurn(
+    request: SourceTurnCompleteRequest,
+    relation?: SourceTurnRelation,
+    planOnly = false
+  ): SourceTurnCompleteResponse {
     const identity = request.sourceTurn;
     if (!identity || ![identity.source, identity.profileId, identity.conversationId, identity.turnId,
       identity.startedAt, identity.completedAt, identity.completionEvidence].every((value) => typeof value === "string" && value.trim())) {
@@ -1461,7 +1542,8 @@ export class SessionTurnService {
         if (!candidate || candidate.status !== "open" || !beforeRaw) {
           return detachLegacyHistory("source_episode_closed");
         }
-        if (explicitEndTopicDecision(normalized.query)) {
+        const gapRelation = relation?.baseEpisodeId === candidate.id ? relation.judgment.decision.relation : undefined;
+        if (explicitEndTopicDecision(normalized.query) || gapRelation === "new_task" || gapRelation === "end_topic") {
           return detachLegacyHistory("source_turn_out_of_order");
         }
         gapEpisode = candidate;
@@ -1511,8 +1593,25 @@ export class SessionTurnService {
       }, identity.conversationId)) {
         throw new MemoryServiceError("forbidden", "source_raw_turn_scope_conflict");
       }
+      if (planOnly) {
+        const hasOpening = Boolean(turnRouteProposalFromRecallRequest(
+          this.deps.repos.runtime.getTurnStartRecallEvent(session.id, identity.turnId)?.request
+        ));
+        const base = gapEpisode ?? this.deps.repos.runtime.latestEpisodeForSession(session.id);
+        const certain = explicitEndTopicDecision(normalized.query) ?? (base && !gapEpisode
+          ? this.certainRelationDecision(base, normalized.query)
+          : undefined);
+        throw new SourceTurnPlanned(!hasOpening && base && !certain
+          ? {
+              sessionId: session.id,
+              turnId: identity.turnId,
+              baseEpisodeId: base.id,
+              input: this.relationModelInput(base, normalized.query, gapEpisode ? sourceTurn.startedAt : undefined)
+            }
+          : undefined);
+      }
       const result = this.completeTurn(identity.turnId, { ...normalized, sessionId: session.id,
-        ...(gapEpisode ? { episodeId: gapEpisode.id } : {}) }, sourceTurn);
+        ...(gapEpisode ? { episodeId: gapEpisode.id } : {}) }, sourceTurn, undefined, relation);
       if (gapEpisode) this.deps.repos.runtime.orderEpisodeTurnsBySourceTime(gapEpisode.id);
       const response: SourceTurnCompleteResponse = result.l1MemoryIds.length > 0
         ? { status: "stored", result }
@@ -1755,7 +1854,8 @@ export class SessionTurnService {
     turnId: string,
     request: TurnCompleteRequest & Record<string, unknown>,
     sourceTurn?: SourceTurnIdentity,
-    fixedRelation?: TurnRelationDecision
+    fixedRelation?: TurnRelationDecision,
+    sourceRelation?: SourceTurnRelation
   ): CompleteTurnResponse {
     request = sanitizeTurnCompleteRequest(request);
     if (request.status === "cancelled") {
@@ -1874,9 +1974,24 @@ export class SessionTurnService {
       let route: CommittedTurnRoute;
       if (request.episodeId) {
         const episode = this.ensureEpisode(session, request.episodeId);
+        // An out-of-order source turn put back into its episode records the entry judgment, or waits for one.
+        const gapInsert = Boolean(sourceTurn && !endTopicDecision && !recalledProposal);
+        const gapJudgment = gapInsert && sourceRelation?.baseEpisodeId === episode.id ? sourceRelation.judgment : undefined;
         const decision = endTopicDecision ?? recalledProposal?.relationDecision ??
+          gapJudgment?.decision ??
+          (gapInsert ? pendingRelationDecision() : undefined) ??
           classifyTurnRelation({ prevUserText: "", newUserText: request.query }) ??
           pendingRelationDecision();
+        const gapPending: PendingTurnRelation | undefined = gapInsert && !gapJudgment
+          ? {
+              input: this.relationModelInput(episode, request.query, sourceTurn!.startedAt),
+              baseEpisodeId: episode.id,
+              ...(this.deps.feedbackTargetFromEpisode(episode)?.id
+                ? { feedbackTargetMemoryId: this.deps.feedbackTargetFromEpisode(episode)!.id }
+                : {}),
+              runAfter: at
+            }
+          : undefined;
         const routedEndTopicDecision = endTopicDecision ?? (
           decision.relation === "end_topic" ? decision as EndTopicDecision : undefined
         );
@@ -1886,12 +2001,13 @@ export class SessionTurnService {
           closedEpisodeIds: [],
           jobs: [],
           proposal: {
-            ...(recalledProposal ?? this.buildTurnRouteProposal(episode, decision, undefined, at)),
+            ...(recalledProposal ?? this.buildTurnRouteProposal(episode, decision, undefined, at, gapJudgment?.feedback)),
             action: routedEndTopicDecision ? "end_topic" : "append",
             baseEpisodeId: episode.id,
             relationDecision: decision
           },
-          proposalStale: false
+          proposalStale: false,
+          ...(gapPending ? { pendingRelation: gapPending } : {})
         };
       } else {
         const latest = this.deps.repos.runtime.latestEpisodeForSession(session.id);
@@ -1921,6 +2037,19 @@ export class SessionTurnService {
             "turn.complete",
             at,
             !proposalIsCurrent,
+            turnStartedAt,
+            sourceTurn?.startedAt
+          );
+        } else if (!proposalIsCurrent && sourceRelation && sourceRelation.baseEpisodeId === latest?.id) {
+          // The judgment made at the source-turn entry, for a turn without a turn-start record.
+          route = this.commitTurnRouteProposal(
+            session,
+            this.buildTurnRouteProposal(latest, sourceRelation.judgment.decision, lastTurnAtMs, turnStartedAt,
+              sourceRelation.judgment.feedback),
+            request.query,
+            "turn.complete",
+            at,
+            false,
             turnStartedAt,
             sourceTurn?.startedAt
           );
@@ -3363,10 +3492,17 @@ export class SessionTurnService {
   }
 
   /** The relation model's view of a task, built only from turns completed before the new one. */
-  private relationModelInput(episode: EpisodeRecord, newUserText: string): TurnRelationModelInput {
-    const texts = this.deps.repos.runtime.episodeRelationTexts(episode.id, episode.rawTurnIds);
+  private relationModelInput(episode: EpisodeRecord, newUserText: string, before?: string): TurnRelationModelInput {
+    const texts = this.deps.repos.runtime.episodeRelationTexts(episode.id, episode.rawTurnIds, before);
+    const earlierRawTurnIds = before
+      ? new Set(episode.rawTurnIds.filter((id) => {
+          const rawTurn = this.deps.repos.runtime.getRawTurn(id);
+          return rawTurn !== undefined && rawTurn.createdAt < before;
+        }))
+      : undefined;
     const recordedTitles = this.deps.repos.memories.getMany(episode.l1MemoryIds)
       .filter((memory) => memory.memoryLayer === "L1" && memory.status !== "deleted")
+      .filter((memory) => !earlierRawTurnIds || earlierRawTurnIds.has(this.deps.rawTurnIdFromMemory(memory) ?? ""))
       .map((memory) => ({
         title: typeof memory.info.title === "string" ? memory.info.title.trim() : "",
         createdAt: memory.createdAt
@@ -3392,15 +3528,15 @@ export class SessionTurnService {
   private startRelationCall(
     sessionId: string,
     turnId: string,
-    baseEpisode: EpisodeRecord,
-    userText: string
+    baseEpisodeId: string,
+    input: TurnRelationModelInput
   ): { judgment?: TurnRelationJudgment } {
     const holder: { judgment?: TurnRelationJudgment } = {};
     const key = relationCallKey(sessionId, turnId);
-    const call: Promise<void> = classifyTurnRelationWithModel(this.deps.llm, this.relationModelInput(baseEpisode, userText))
+    const call: Promise<void> = classifyTurnRelationWithModel(this.deps.llm, input)
       .then((judgment) => {
         holder.judgment = judgment;
-        this.settleRelationCall(sessionId, turnId, baseEpisode.id, judgment);
+        this.settleRelationCall(sessionId, turnId, baseEpisodeId, judgment);
       })
       .catch((error: unknown) => {
         // A failed call leaves the turn pending; the turn_relation job retries it.

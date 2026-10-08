@@ -2643,26 +2643,29 @@ export class RuntimeRepository {
     return row?.found === 1;
   }
 
-  episodeRelationTexts(episodeId: string, rawTurnIds: readonly string[] = []): {
+  /** With `before`, only turns that started before that time count (an out-of-order turn's view). */
+  episodeRelationTexts(episodeId: string, rawTurnIds: readonly string[] = [], before?: string): {
     firstUser: string;
     lastUser: string;
     lastAssistant: string;
     lastCompletedAt?: string;
   } {
-    const completed = `json_type(message_payload_json, '$.turn_complete') = 'object'`;
+    const completed = `json_type(message_payload_json, '$.turn_complete') = 'object'` +
+      (before ? " AND created_at < ?" : "");
+    const cutoff = before ? [before] : [];
     const boundary = (column: "user_text" | "assistant_text" | "created_at", edge: "first" | "last") => {
       const nonempty = column === "created_at" ? "1 = 1" : `trim(COALESCE(${column}, '')) != ''`;
       const time = this.db.prepare(`
         SELECT ${edge === "first" ? "MIN" : "MAX"}(created_at) AS boundary
         FROM raw_turns
         WHERE episode_id = ? AND ${completed} AND ${nonempty}
-      `).get(episodeId) as { boundary: string | null } | undefined;
+      `).get(episodeId, ...cutoff) as { boundary: string | null } | undefined;
       if (!time?.boundary) return [];
       return this.db.prepare(`
         SELECT id, created_at AS createdAt, user_text AS userText, assistant_text AS assistantText
         FROM raw_turns
         WHERE episode_id = ? AND ${completed} AND ${nonempty} AND created_at = ?
-      `).all(episodeId, time.boundary) as Array<{ id: string; createdAt: string; userText: string | null; assistantText: string | null }>;
+      `).all(episodeId, ...cutoff, time.boundary) as Array<{ id: string; createdAt: string; userText: string | null; assistantText: string | null }>;
     };
     const pick = (
       rows: Array<{ id: string; createdAt: string; userText: string | null; assistantText: string | null }>,
