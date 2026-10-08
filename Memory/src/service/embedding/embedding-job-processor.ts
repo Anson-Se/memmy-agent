@@ -63,6 +63,7 @@ type TurnCaptureDecision = {
   correctedUserMemoryContent?: string;
   l1Evidence: Array<{ quote: string; sourceRole: "user" | "assistant" | "tool"; kind: string }>;
   reason: string;
+  promptVersion?: string;
 };
 
 type UserMemoryCaptureResult = {
@@ -758,6 +759,7 @@ function recordTurnMemoryDecisionFields(
       kind: item.kind
     })),
     reason: decision.reason,
+    ...(decision.promptVersion ? { prompt_version: decision.promptVersion } : {}),
     decided_at: updatedAt
   };
 }
@@ -767,13 +769,11 @@ function constrainTurnMemoryDecision(
   memory: MemoryRow,
   trace: TraceMeta
 ): typeof decision {
-  const text = trace.userText.trim();
   const evidenceTypes = decision.userMemoryEvidence.map((item) => item.type);
   const userMemoryTypes = uniq(evidenceTypes);
-  const dynamicCurrent = isDynamicCurrentFactQuery(text);
-  const verifiedToolObservation = hasVerifiedDurableToolObservation(memory, trace, dynamicCurrent);
+  const verifiedToolObservation = hasVerifiedDurableToolObservation(memory, trace, false);
 
-  const createUserMemory = !dynamicCurrent && userMemoryTypes.length > 0 &&
+  const createUserMemory = userMemoryTypes.length > 0 &&
     decision.createUserMemory && decision.userMemoryEvidence.length > 0;
   let createL1 = decision.createL1;
   const guards: string[] = [];
@@ -783,10 +783,7 @@ function constrainTurnMemoryDecision(
   if (decision.createL1 && decision.l1Evidence.length === 0) {
     guards.push("l1-evidence-missing");
   }
-  if (dynamicCurrent) {
-    createL1 = false;
-    guards.push("dynamic-current");
-  } else if (verifiedToolObservation) {
+  if (isForcedL1Capture(memory, trace)) {
     createL1 = true;
     guards.push("verified-tool-evidence");
   }
@@ -826,7 +823,14 @@ function isPolicyEligibleCapture(
 }
 
 export function isForcedL1Capture(memory: MemoryRow, trace: TraceMeta): boolean {
-  return hasVerifiedDurableToolObservation(memory, trace, isDynamicCurrentFactQuery(trace.userText.trim()));
+  return isDeviceMemoryObservation(memory) &&
+    hasVerifiedDurableToolObservation(memory, trace, isDynamicCurrentFactQuery(trace.userText.trim()));
+}
+
+function isDeviceMemoryObservation(memory: MemoryRow): boolean {
+  if (!memory.memoryKey?.startsWith("trace:environment:device:")) return false;
+  const claims = memory.properties.internal_info.claims;
+  return Array.isArray(claims) && claims.some((claim) => isRecord(claim) && claim.key === "device.total_memory");
 }
 
 function hasVerifiedDurableToolObservation(

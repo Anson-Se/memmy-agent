@@ -1447,6 +1447,154 @@ describe("User Memory", () => {
       .toContain(completed.l1MemoryIds[0]);
     db.close();
   });
+
+  describe("capture decision with a configured model", () => {
+    function promptRecordingLlm(prompts: string[], decision: LegacyCaptureDecision): LlmClient {
+      const llm = captureDecisionLlm([], decision);
+      const completeJson = llm.completeJson.bind(llm);
+      llm.completeJson = async (messages, options) => {
+        if (options.operation === "capture.summarize") {
+          prompts.push(messages.map((message) => message.content).join("\n"));
+        }
+        return completeJson(messages, options);
+      };
+      return llm;
+    }
+
+    function captureDecisionOf(db: ReturnType<typeof createTestService>["db"], memoryId: string | undefined) {
+      const row = db.db.prepare(`SELECT status, properties_json FROM memories WHERE id = ?`)
+        .get(memoryId) as { status: string; properties_json: string };
+      return {
+        status: row.status,
+        decision: (JSON.parse(row.properties_json) as {
+          internal_info: { capture_decision: Record<string, unknown> };
+        }).internal_info.capture_decision
+      };
+    }
+
+    it("sends the v2 capture prompt and records its version on rejected decisions", async () => {
+      const prompts: string[] = [];
+      const { db, service } = createTestService({
+        llm: promptRecordingLlm(prompts, {
+          create_l1: false,
+          l1_summary: "",
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "real-time lookup"
+        })
+      });
+      const session = open(service, "model-realtime-lookup-user");
+      const completed = service.completeTurn("turn-model-realtime-lookup", {
+        sessionId: session.sessionId,
+        query: "上海今天天气怎么样？",
+        answer: "工具查到上海今天 23 度，多云。",
+        toolCalls: [{ name: "weather", input: { city: "上海" } }],
+        toolResults: [{ temperature: "23", condition: "多云" }]
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status, decision } = captureDecisionOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("deleted");
+      expect(decision).toMatchObject({ status: "rejected", create_l1: false, prompt_version: "capture.decision.v2" });
+      expect(String(decision.reason ?? "")).not.toContain("dynamic-current");
+      expect(prompts).toHaveLength(1);
+      const prompt = prompts[0]!;
+      expect(prompt).toContain("What you are writing:");
+      expect(prompt).toContain("- For a durable claim, choose one action:");
+      expect(prompt).toContain("L1 — create L1 when the turn holds work a future agent could continue, reuse, or check");
+      expect(prompt).toContain("Real-time lookups: if the turn only looks up a value that changes over time");
+      expect(prompt).toContain("- Time: do not put relative time expressions");
+      expect(prompt).not.toContain("apply in order");
+      expect(prompt).not.toContain("choose the first matching action");
+      expect(prompt).not.toContain("Do not return l1: null");
+      expect(prompt.indexOf("Real-time lookups:")).toBeLessThan(prompt.indexOf("A durable Agent work convention"));
+      db.close();
+    });
+
+    it("keeps a durable preference stated while looking up a real-time value", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: false,
+          l1_summary: "",
+          create_user_memory: true,
+          user_memory_types: ["User Preference"],
+          user_memory_evidence: [{ quote: "我一直用港币结算", type: "User Preference" }],
+          reason: "lookup value is not recorded; settlement preference is durable"
+        })
+      });
+      const session = open(service, "model-realtime-preference-user");
+      const completed = service.completeTurn("turn-model-realtime-preference", {
+        sessionId: session.sessionId,
+        query: "今天港币汇率是多少？我一直用港币结算",
+        answer: "今天 1 港币约合 0.92 元人民币。"
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      expect(db.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(completed.l1MemoryIds[0]))
+        .toEqual({ status: "deleted" });
+      expect(rowCount(db, "user_memories")).toBe(1);
+      db.close();
+    });
+
+    it("creates L1 when a real-time lookup turn also does other work", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: true,
+          l1_title: "编写回测脚本",
+          l1_summary: "用户要求编写股票回测脚本。",
+          l1_evidence: [{ quote: "顺便帮我写个回测脚本", source_role: "user", kind: "task_request" }],
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "the backtest script is durable work"
+        })
+      });
+      const session = open(service, "model-realtime-mixed-user");
+      const completed = service.completeTurn("turn-model-realtime-mixed", {
+        sessionId: session.sessionId,
+        query: "今天茅台股价多少？顺便帮我写个回测脚本",
+        answer: "已写好回测脚本 backtest.py。"
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status, decision } = captureDecisionOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("activated");
+      expect(decision).toMatchObject({ status: "accepted", create_l1: true, prompt_version: "capture.decision.v2" });
+      expect(String(decision.reason ?? "")).not.toContain("dynamic-current");
+      db.close();
+    });
+
+    it("does not force L1 for an ordinary tool result the model rejects", async () => {
+      const prompts: string[] = [];
+      const { db, service } = createTestService({
+        llm: promptRecordingLlm(prompts, {
+          create_l1: false,
+          l1_summary: "",
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "listing a directory is not worth remembering"
+        })
+      });
+      const session = open(service, "model-ordinary-tool-user");
+      const completed = service.completeTurn("turn-model-ordinary-tool", {
+        sessionId: session.sessionId,
+        query: "看一下当前目录有哪些文件",
+        answer: "目录里有 README.md 和 src。",
+        toolCalls: [{ name: "shell", input: { command: "ls" } }],
+        toolResults: [{ output: "README.md\nsrc" }]
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status, decision } = captureDecisionOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("deleted");
+      expect(String(decision.reason ?? "")).not.toContain("verified-tool-evidence");
+      expect(prompts.some((prompt) => prompt.includes("Do not return l1: null"))).toBe(false);
+      db.close();
+    });
+  });
 });
 
 function open(service: ReturnType<typeof createTestService>["service"], userId: string) {
