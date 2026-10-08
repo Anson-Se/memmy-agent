@@ -1244,6 +1244,7 @@ function createBc08SummaryLlm(): LlmClient {
       if (payload.includes("以后不要写不必要的兜底代码")) {
         return {
           l1: {
+            unverified_answer: false,
             title: "保持代码简洁",
             summary: "用户要求代码保持简洁、避免不必要的兜底；本轮已精简并通过测试。",
             evidence: [{
@@ -1268,6 +1269,7 @@ function createBc08SummaryLlm(): LlmClient {
       }
       return {
         l1: {
+          unverified_answer: false,
           title: "删除不必要兜底",
           summary: "按既有反馈删除不必要兜底，并通过测试验证。",
           evidence: [{

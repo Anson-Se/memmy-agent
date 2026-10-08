@@ -81,6 +81,7 @@ function createSpanBigTurnLlm(
         const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
         return {
           l1: {
+            unverified_answer: false,
             title: "定位并修复构建失败",
             summary: "定位构建失败、修改依赖配置并验证修复结果",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]

@@ -64,6 +64,8 @@ type TurnCaptureDecision = {
   l1Evidence: Array<{ quote: string; sourceRole: "user" | "assistant" | "tool"; kind: string }>;
   reason: string;
   promptVersion?: string;
+  unverifiedAnswer?: boolean;
+  markUnverified?: boolean;
 };
 
 type UserMemoryCaptureResult = {
@@ -682,19 +684,24 @@ function acceptTurnMemoryDecision(
 ): MemoryRow {
   const internal = memory.properties.internal_info;
   const pending = isRecord(internal.capture_decision) ? internal.capture_decision : {};
-  const originalEvidenceStatus = typeof pending.original_evidence_status === "string"
-    ? pending.original_evidence_status
-    : undefined;
+  const restoredEvidenceStatus = pending.original_evidence_status === "verified" ? "verified" : undefined;
   const { evidence_status: _infoEvidenceStatus, ...info } = memory.info;
   const { evidence_status: _propertyInfoEvidenceStatus, ...propertyInfo } = memory.properties.info ?? {};
   const { evidence_status: _internalEvidenceStatus, ...internalWithoutEvidence } = internal;
+  // An unverified general-fact answer gets the same fields the keyword question branch used to write.
+  const observedAt = typeof internal.observed_at === "string" ? internal.observed_at : memory.createdAt;
+  const evidenceFields = decision.markUnverified
+    ? { observed_at: observedAt, evidence_status: "provisional" }
+    : restoredEvidenceStatus
+      ? { evidence_status: restoredEvidenceStatus }
+      : {};
   return {
     ...memory,
     status: "activated",
     info: {
       ...info,
       policy_eligible: decision.policyEligible,
-      ...(originalEvidenceStatus ? { evidence_status: originalEvidenceStatus } : {})
+      ...evidenceFields
     },
     properties: {
       ...memory.properties,
@@ -702,12 +709,15 @@ function acceptTurnMemoryDecision(
       info: {
         ...propertyInfo,
         policy_eligible: decision.policyEligible,
-        ...(originalEvidenceStatus ? { evidence_status: originalEvidenceStatus } : {})
+        ...evidenceFields
       },
       internal_info: {
         ...internalWithoutEvidence,
         policy_eligible: decision.policyEligible,
-        ...(originalEvidenceStatus ? { evidence_status: originalEvidenceStatus } : {}),
+        ...evidenceFields,
+        ...(decision.markUnverified
+          ? { claims: [{ source_role: "agent", evidence_status: "provisional", observed_at: observedAt }] }
+          : {}),
         capture_decision: recordTurnMemoryDecisionFields(pending, decision, "accepted", updatedAt)
       }
     },
@@ -760,6 +770,7 @@ function recordTurnMemoryDecisionFields(
     })),
     reason: decision.reason,
     ...(decision.promptVersion ? { prompt_version: decision.promptVersion } : {}),
+    ...(typeof decision.unverifiedAnswer === "boolean" ? { unverified_answer: decision.unverifiedAnswer } : {}),
     decided_at: updatedAt
   };
 }
@@ -787,7 +798,11 @@ function constrainTurnMemoryDecision(
     createL1 = true;
     guards.push("verified-tool-evidence");
   }
-  const policyEligible = isPolicyEligibleCapture(decision, createL1, verifiedToolObservation);
+  // A visible non-recall tool result is support by definition, so it overrides the model's flag.
+  const markUnverified = createL1 && decision.unverifiedAnswer === true && !verifiedToolObservation;
+  const policyEligible = markUnverified
+    ? false
+    : isPolicyEligibleCapture(decision, createL1, verifiedToolObservation);
 
   return {
     ...decision,
@@ -795,6 +810,7 @@ function constrainTurnMemoryDecision(
     l1Title: createL1 ? decision.l1Title.trim() : "",
     l1Summary: createL1 ? decision.l1Summary.trim() : "",
     policyEligible,
+    markUnverified,
     createUserMemory,
     userMemoryTypes: createUserMemory ? userMemoryTypes : [],
     userMemoryAction: createUserMemory ? decision.userMemoryAction : "none",

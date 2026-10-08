@@ -1594,6 +1594,213 @@ describe("User Memory", () => {
       expect(prompts.some((prompt) => prompt.includes("Do not return l1: null"))).toBe(false);
       db.close();
     });
+
+    function evidenceOf(db: ReturnType<typeof createTestService>["db"], memoryId: string | undefined) {
+      const row = db.db.prepare(`SELECT status, info_json, properties_json FROM memories WHERE id = ?`)
+        .get(memoryId) as { status: string; info_json: string; properties_json: string };
+      const info = JSON.parse(row.info_json) as Record<string, unknown>;
+      const internal = (JSON.parse(row.properties_json) as { internal_info: Record<string, unknown> }).internal_info;
+      return { status: row.status, info, internal };
+    }
+
+    it("does not mark a project question unverified when the model says it is not a general fact", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: true,
+          l1_title: "登录测试失败原因",
+          l1_summary: "登录测试失败是因为 token 过期时间配置为 0。",
+          l1_evidence: [{ quote: "为什么我们的登录测试会失败？", source_role: "user", kind: "task_request" }],
+          create_user_memory: false,
+          user_memory_types: [],
+          unverified_answer: false,
+          reason: "project question"
+        })
+      });
+      const session = open(service, "model-project-question-user");
+      const completed = service.completeTurn("turn-model-project-question", {
+        sessionId: session.sessionId,
+        query: "为什么我们的登录测试会失败？",
+        answer: "因为 token 过期时间配置为 0。"
+      });
+
+      await service.runWorkerOnce(20);
+
+      const { status, info, internal } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("activated");
+      expect(info.evidence_status).toBeUndefined();
+      expect(internal.evidence_status).toBeUndefined();
+      expect(internal.capture_decision).toMatchObject({ unverified_answer: false });
+      const recall = await service.search({
+        sessionId: session.sessionId,
+        query: "登录测试失败",
+        layers: ["L1"],
+        limit: 5
+      });
+      expect(recall.hits.flatMap((hit) => hit.memberMemoryIds ?? [hit.id])).toContain(completed.l1MemoryIds[0]);
+      db.close();
+    });
+
+    it("marks an unsupported general-fact answer provisional with the question-branch fields", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: true,
+          l1_title: "火星基本数据",
+          l1_summary: "为课件写了一段火星的基本数据。",
+          l1_evidence: [{ quote: "给我的课件写一段火星的基本数据", source_role: "user", kind: "task_request" }],
+          policy_eligible: true,
+          create_user_memory: false,
+          user_memory_types: [],
+          unverified_answer: true,
+          reason: "general facts from common knowledge"
+        })
+      });
+      const session = open(service, "model-general-fact-user");
+      const completed = service.completeTurn("turn-model-general-fact", {
+        sessionId: session.sessionId,
+        query: "给我的课件写一段火星的基本数据",
+        answer: "火星是太阳系第四颗行星，直径约 6779 公里。"
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status, info, internal } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("activated");
+      expect(info).toMatchObject({ evidence_status: "provisional", policy_eligible: false });
+      expect(typeof info.observed_at).toBe("string");
+      expect(internal).toMatchObject({
+        evidence_status: "provisional",
+        policy_eligible: false,
+        observed_at: info.observed_at,
+        claims: [{ source_role: "agent", evidence_status: "provisional", observed_at: info.observed_at }]
+      });
+      expect(internal.capture_decision).toMatchObject({
+        status: "accepted",
+        unverified_answer: true,
+        policy_eligible: false
+      });
+      db.close();
+    });
+
+    it("ignores the unverified flag when a non-recall tool result supports the answer", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: true,
+          l1_title: "查询火星直径",
+          l1_summary: "工具查到火星直径约 6779 公里。",
+          create_user_memory: false,
+          user_memory_types: [],
+          unverified_answer: true,
+          reason: "model flagged it anyway"
+        })
+      });
+      const session = open(service, "model-tool-supported-user");
+      const completed = service.completeTurn("turn-model-tool-supported", {
+        sessionId: session.sessionId,
+        query: "火星直径多少？",
+        answer: "工具查到约 6779 公里。",
+        toolCalls: [{ name: "web_search", input: { q: "火星直径" } }],
+        toolResults: [{ answer: "6779 km" }]
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status, info, internal } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(status).toBe("activated");
+      expect(info.evidence_status).toBe("verified");
+      expect(internal.evidence_status).toBe("verified");
+      expect(internal.capture_decision).toMatchObject({ unverified_answer: true });
+      db.close();
+    });
+
+    it("treats a recall-only tool turn as unsupported and overwrites its verified claims", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: true,
+          l1_title: "火星基本数据",
+          l1_summary: "写了一段火星的基本数据。",
+          create_user_memory: false,
+          user_memory_types: [],
+          unverified_answer: true,
+          reason: "only recalled memory"
+        })
+      });
+      const session = open(service, "model-recall-only-user");
+      const completed = service.completeTurn("turn-model-recall-only", {
+        sessionId: session.sessionId,
+        query: "给我的课件写一段火星的基本数据",
+        answer: "火星是太阳系第四颗行星。",
+        toolCalls: [{ name: "memmy_memory_search", input: { query: "火星" } }],
+        toolResults: [{ hits: [] }]
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { info, internal } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(info.evidence_status).toBe("provisional");
+      expect(internal.claims).toEqual([
+        { source_role: "agent", evidence_status: "provisional", observed_at: info.observed_at }
+      ]);
+      db.close();
+    });
+
+    it("fails the capture decision when an L1 object omits unverified_answer", async () => {
+      const llm = captureDecisionLlm([], {
+        create_l1: true,
+        l1_summary: "写了一段火星的基本数据。",
+        create_user_memory: false,
+        user_memory_types: [],
+        reason: "missing flag"
+      });
+      const completeJson = llm.completeJson.bind(llm);
+      llm.completeJson = async <T extends Record<string, unknown>>(messages: LlmMessage[], options: LlmCompletionOptions) => {
+        const result = await completeJson<T>(messages, options);
+        if (options.operation === "capture.summarize" && result.l1 && typeof result.l1 === "object") {
+          delete (result.l1 as Record<string, unknown>).unverified_answer;
+        }
+        return result;
+      };
+      const { db, service } = createTestService({ llm });
+      const session = open(service, "model-missing-flag-user");
+      const completed = service.completeTurn("turn-model-missing-flag", {
+        sessionId: session.sessionId,
+        query: "给我的课件写一段火星的基本数据",
+        answer: "火星是太阳系第四颗行星。"
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { status } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(status).not.toBe("activated");
+      const job = db.db.prepare(
+        `SELECT last_error FROM evolution_jobs WHERE target_memory_id = ? AND job_type = 'trace_summary'`
+      ).get(completed.l1MemoryIds[0]) as { last_error: string | null };
+      expect(job.last_error).toContain("unverified_answer");
+      db.close();
+    });
+
+    it("records no unverified_answer when the model returns l1 null", async () => {
+      const { db, service } = createTestService({
+        llm: captureDecisionLlm([], {
+          create_l1: false,
+          l1_summary: "",
+          create_user_memory: false,
+          user_memory_types: [],
+          reason: "greeting"
+        })
+      });
+      const session = open(service, "model-null-l1-flag-user");
+      const completed = service.completeTurn("turn-model-null-l1-flag", {
+        sessionId: session.sessionId,
+        query: "你好",
+        answer: "你好！"
+      });
+
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+
+      const { internal } = evidenceOf(db, completed.l1MemoryIds[0]);
+      expect(internal.capture_decision).not.toHaveProperty("unverified_answer");
+      db.close();
+    });
   });
 });
 
@@ -1619,6 +1826,7 @@ type LegacyCaptureDecision = {
   matched_user_memory_id?: string;
   corrected_user_memory_content?: string;
   l1_evidence?: unknown[];
+  unverified_answer?: boolean;
   reason: string;
 };
 
@@ -1695,6 +1903,7 @@ function compactCaptureDecision(decision: LegacyCaptureDecision): Record<string,
       : "create";
   return {
     l1: decision.create_l1 ? {
+      unverified_answer: decision.unverified_answer ?? false,
       title: decision.l1_title?.trim() || clipTitle(decision.l1_summary),
       summary: decision.l1_summary,
       evidence: l1Evidence

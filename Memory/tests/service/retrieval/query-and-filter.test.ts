@@ -1978,6 +1978,7 @@ function acceptedCaptureDecision(summary: string, messages: Array<{ role: string
   const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
   return {
     l1: {
+      unverified_answer: false,
       title: summary.slice(0, 30),
       summary,
       evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]

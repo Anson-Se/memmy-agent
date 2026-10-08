@@ -75,6 +75,7 @@ function createDirectSkillLlm(calls: DirectSkillCall[]): LlmClient {
           ?? "filled report.xlsx";
         return {
           l1: {
+            unverified_answer: false,
             title: turnSummary.slice(0, 30),
             summary: turnSummary,
             evidence: [{ quote: turnSummary, role: "user", kind: "task_outcome" }]

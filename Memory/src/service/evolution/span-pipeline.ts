@@ -49,6 +49,7 @@ export interface TurnMemoryCaptureDecision {
   l1Evidence: Array<{ quote: string; sourceRole: "user" | "assistant" | "tool"; kind: string }>;
   reason: string;
   promptVersion?: string;
+  unverifiedAnswer?: boolean;
 }
 
 const pipelineLogger = createMemoryLogger("pipeline");
@@ -796,6 +797,9 @@ private reflectionDownstreamPreview(job: EvolutionJobRecord, memory: MemoryRow):
     if (l1 && (!l1Title || !rawL1Summary)) {
       throw new Error("turn memory decision requires l1.title and l1.summary when l1 is not null");
     }
+    if (l1 && typeof l1.unverified_answer !== "boolean") {
+      throw new Error("turn memory decision requires l1.unverified_answer to be a boolean when l1 is not null");
+    }
     const l1Summary = l1
       ? clip(sanitizeCaptureSummary(rawL1Summary, input), CAPTURE_SUMMARY_MAX_CHARS)
       : "";
@@ -845,6 +849,7 @@ private reflectionDownstreamPreview(job: EvolutionJobRecord, memory: MemoryRow):
       ...(matchedUserMemoryId ? { matchedUserMemoryId } : {}),
       ...(correctedUserMemoryContent ? { correctedUserMemoryContent } : {}),
       l1Evidence,
+      ...(l1 ? { unverifiedAnswer: l1.unverified_answer === true } : {}),
       reason: "",
       promptVersion: TURN_MEMORY_CAPTURE_DECISION_PROMPT_VERSION
     };
@@ -1091,6 +1096,7 @@ When creating L1:
 - "title": short name, at most ${CAPTURE_TITLE_MAX_CHARS} characters. Do not restate the first sentence or write "user asks".
 - "summary": at most ${CAPTURE_SUMMARY_MAX_CHARS} characters of retrievable durable facts.
 - Time: do not put relative time expressions (today, tomorrow, yesterday, next week, last month, recently, that day, some time ago) in the title or summary. Leave out any claim that depends on one, and do not convert them to dates. Words that only give an order ("run the tests before committing") are not time expressions.
+- "unverified_answer": true only if the main content of the L1 is general facts the assistant supplied (common knowledge or facts about the outside world, such as the answer to a general factual question) and the turn shows no support for them: no tool result and no material provided by the user. It is false when the main content is anything else or the turn shows such support, including answers about the user's own project, code, files, data, or environment even when no tool call is visible (the agent may have checked them in ways you cannot see), and discussions, decisions, plans, and requests. An L1 marked true is kept, but it is not recalled to agents or used as evidence for policies or skills, because such facts may be wrong and recalling them later would repeat the error as if it were remembered. This flag never changes whether L1 is created. Examples, for turns where L1 is created: "给我的课件写一段火星的基本数据" answered from general knowledge = true; "Why does our login test fail?" answered from the project's code = false; "Should we split this into two PRs?" discussed and decided = false.
 ATTACHMENT METADATA is internal context. Never summarize its wrapper or generic
 attachment/file wording; summarize the actual request, content, or outcome.
 
@@ -1098,12 +1104,12 @@ OUTPUT
 - Use null when that memory is not created. Every evidence quote must be a non-empty exact substring of its source. Drop quotes that are not exact substrings. An empty evidence array is allowed and does not fail this JSON.
 - create: target="", replacement="". confirm: exact candidate target, replacement="". correct: exact candidate target and complete replacement.
 - Return exactly this shape:
-{"l1":null|{"title":string,"summary":string,"evidence":[{"quote":string,"role":"user|assistant|tool","kind":"task_request|user_fact|user_preference|user_directive|temporal_update|task_outcome|verified_tool_result|environment_fact|decision|correction"}]},"user":null|{"action":"create|confirm|correct","evidence":[{"quote":string,"type":"User Fact|User Preference"}],"target":string,"replacement":string}}
+{"l1":null|{"title":string,"summary":string,"evidence":[{"quote":string,"role":"user|assistant|tool","kind":"task_request|user_fact|user_preference|user_directive|temporal_update|task_outcome|verified_tool_result|environment_fact|decision|correction"}],"unverified_answer":boolean},"user":null|{"action":"create|confirm|correct","evidence":[{"quote":string,"type":"User Fact|User Preference"}],"target":string,"replacement":string}}
 
 Boundary examples:
 USER=财经类新闻呢？我喜欢看吗 => {"l1":null,"user":null}
 USER=我现在最喜欢西瓜; candidate um1=我最喜欢苹果 => {"l1":null,"user":{"action":"create","evidence":[{"quote":"我现在最喜欢西瓜","type":"User Preference"}],"target":"","replacement":""}}
-USER=前面说错了，我最喜欢西瓜，不是苹果; candidate um1=我最喜欢苹果 => {"l1":{"title":"纠正水果偏好","summary":"用户纠正最喜欢的水果为西瓜","evidence":[{"quote":"前面说错了","role":"user","kind":"correction"}]},"user":{"action":"correct","evidence":[{"quote":"我最喜欢西瓜","type":"User Preference"}],"target":"um1","replacement":"我最喜欢西瓜"}}`;
+USER=前面说错了，我最喜欢西瓜，不是苹果; candidate um1=我最喜欢苹果 => {"l1":{"title":"纠正水果偏好","summary":"用户纠正最喜欢的水果为西瓜","evidence":[{"quote":"前面说错了","role":"user","kind":"correction"}],"unverified_answer":false},"user":{"action":"correct","evidence":[{"quote":"我最喜欢西瓜","type":"User Preference"}],"target":"um1","replacement":"我最喜欢西瓜"}}`;
 
 interface BatchReflectionScore {
   idx: number;

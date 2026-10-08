@@ -61,6 +61,7 @@ function createDecisionRepairLlm(
       if (options.operation === "capture.summarize") {
         return {
           l1: {
+            unverified_answer: false,
             title: "Sqlite migration workflow",
             summary: "sqlite migration workflow",
             evidence: []

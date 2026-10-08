@@ -410,6 +410,7 @@ export function createBatchReflectionLlm(calls: Array<{
         const userQuote = payload.match(/USER:\s*([^\n]+)/)?.[1]?.trim() ?? "";
         return {
           l1: {
+            unverified_answer: false,
             title: "测试捕获标题",
             summary: captureSummary,
             evidence: [{ quote: evidenceQuote || userQuote, role: "user", kind: "task_outcome" }]

@@ -48,6 +48,7 @@ function createCountingLlm(
         const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
         return {
           l1: {
+            unverified_answer: false,
             title: "Completed task turn",
             summary: "completed task turn",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]

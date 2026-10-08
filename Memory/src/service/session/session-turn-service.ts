@@ -323,7 +323,12 @@ function rawTurnIsExcludedFromL1(rawTurn: RawTurnRecord): boolean {
   return false;
 }
 
-function l1ObservationMetadata(rawTurn: RawTurnRecord, session: SessionRecord, at: string): {
+function l1ObservationMetadata(
+  rawTurn: RawTurnRecord,
+  session: SessionRecord,
+  at: string,
+  modelDecidesCapture = false
+): {
   memoryKey?: string;
   info: Record<string, unknown>;
   internal: Record<string, unknown>;
@@ -374,7 +379,7 @@ function l1ObservationMetadata(rawTurn: RawTurnRecord, session: SessionRecord, a
       }
     };
   }
-  if (isQuestionLike(text) && !isTaskLinkedUserFeedback(text)) {
+  if (!modelDecidesCapture && isQuestionLike(text) && !isTaskLinkedUserFeedback(text)) {
     return {
       info: { observed_at: at, evidence_status: "provisional", policy_eligible: false },
       internal: {
@@ -1978,7 +1983,7 @@ export class SessionTurnService {
           : this.deps.repos.runtime.getRawTurn(stepRawTurnId) ?? rawTurn;
         const modelDecidesCapture = this.deps.llm.isConfigured();
         const observation = modelDecidesCapture
-          ? pendingL1DecisionMetadata(l1ObservationMetadata(sourceRawTurn, session, at))
+          ? pendingL1DecisionMetadata(l1ObservationMetadata(sourceRawTurn, session, at, true))
           : l1ObservationMetadata(sourceRawTurn, session, at);
         const signature = signatureFromTraceParts(step.tags, step.toolCalls, step.reflection.text ?? "");
         const l1Memory = this.deps.buildMemory({
