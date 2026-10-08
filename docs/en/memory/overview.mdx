@@ -49,8 +49,8 @@ An L1 imported by an Agent history scan enters the `summary_queued` pipeline fir
 
 ### Episodes, feedback, and higher-level memory
 
-- Consecutive follow-ups are merged into one episode by default, with a maximum gap of 2 hours.
-- When an episode closes because of a topic boundary, session close, or 2 hours of inactivity, Memmy generates and scores reflections first.
+- Consecutive follow-ups are merged into one episode by default; an open episode is never split by elapsed time, and a closed episode is reopened by a later message only within 2 hours of closing.
+- When an episode closes because of a switch to a different task, session close, or 2 hours of inactivity, Memmy generates and scores reflections first.
 - It waits through a default 30-second feedback window, then computes task reward and propagates it back through the episode's L1 traces.
 - Eligible L1 traces enter a candidate pool and are induced into L2. A new L2 triggers L3 abstraction and Skill crystallization.
 - Explicit user feedback, repeated tool failures, and divergent success/failure distributions can also adjust value and create failure-avoidance experience or decision repair.

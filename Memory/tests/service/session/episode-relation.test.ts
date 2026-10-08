@@ -8,6 +8,7 @@ import {
 import { Repositories } from "../../../src/storage/repositories.js";
 import {
   accountRuntimeConfig,
+  createBatchReflectionLlm,
   createCapturingEmbedder,
   createMemoryServiceFixture,
   runWorkerRounds
@@ -50,7 +51,7 @@ function createRelationClassifierLlm(
       }
       calls.push(options.operation);
       optionCalls?.push({ operation: options.operation, thinkingMode: options.thinkingMode });
-      if (options.operation === "relation.classify.v1") {
+      if (options.operation === "relation.classify.v2") {
         const currentRelation = Array.isArray(relation)
           ? relation[Math.min(relationIndex++, relation.length - 1)] ?? "follow_up"
           : relation;
@@ -59,7 +60,8 @@ function createRelationClassifierLlm(
           confidence: currentRelation === "end_topic" ? 0.98 : 0.7,
           reason: currentRelation === "end_topic"
             ? "user explicitly ends the current topic"
-            : "database certificate rotation appears adjacent"
+            : "database certificate rotation appears adjacent",
+          feedback: { type: "none", confidence: 0.9, reason: "no reaction to the previous result" }
         } as unknown as T;
       }
       return {
@@ -108,11 +110,12 @@ function createFollowUpRelationClassifierLlm(calls: string[]): LlmClient {
           confidence: 0.85
         } as unknown as T;
       }
-      if (options.operation === "relation.classify.v1") {
+      if (options.operation === "relation.classify.v2") {
         return {
           relation: "follow_up",
           confidence: 0.8,
-          reason: "same user preference and project fact"
+          reason: "same user preference and project fact",
+          feedback: { type: "none", confidence: 0.9, reason: "no reaction to the previous result" }
         } as unknown as T;
       }
       return {
@@ -129,6 +132,38 @@ function createFollowUpRelationClassifierLlm(calls: string[]): LlmClient {
       };
     }
   };
+}
+
+type ScriptedRelation = {
+  relation: "follow_up" | "revision" | "new_task" | "end_topic" | "unknown";
+  feedback?: { type: "verdict" | "negative" | "improvement" | "positive" | "none"; verdictPolarity?: "positive" | "negative" };
+};
+
+/** Answers relation.classify.v2 from a script and leaves capture, reflection and reward to the batch fake. */
+function scriptedRelationLlm(script: ScriptedRelation[], calls: string[] = []): LlmClient {
+  const base = createBatchReflectionLlm([]);
+  let index = 0;
+  return {
+    ...base,
+    async completeJson<T extends Record<string, unknown>>(
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+      options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" }
+    ): Promise<T> {
+      if (options.operation !== "relation.classify.v2") return base.completeJson<T>(messages, options);
+      calls.push(options.operation);
+      const next = script[Math.min(index++, script.length - 1)]!;
+      return {
+        relation: next.relation,
+        confidence: 0.9,
+        reason: `scripted ${next.relation}`,
+        feedback: { type: "none", confidence: 0.9, reason: "scripted feedback", ...next.feedback }
+      } as unknown as T;
+    }
+  };
+}
+
+async function flushRelationCalls(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 describe("MemoryService / session / episode relation", () => {
@@ -268,7 +303,7 @@ describe("MemoryService / session / episode relation", () => {
       query: "That covers everything for this topic"
     });
     expect(started.status).toContain("relation:end_topic:proposed");
-    expect(relationCalls).toContain("relation.classify.v1");
+    expect(relationCalls).toContain("relation.classify.v2");
     expect(service.getMemory(first.episodeId)).toMatchObject({
       kind: "episode",
       status: "open"
@@ -419,7 +454,7 @@ describe("MemoryService / session / episode relation", () => {
       kind: "episode",
       status: "open"
     });
-    expect(relationCalls).toEqual(["relation.classify.v1"]);
+    expect(relationCalls).toEqual(["relation.classify.v2"]);
 
     service.completeTurn("turn-pending-end-topic-close", {
       sessionId: session.sessionId,
@@ -442,8 +477,8 @@ describe("MemoryService / session / episode relation", () => {
     });
   });
 
-  it("splits a new-task turn into a fresh episode using the plugin relation heuristic", async () => {
-    const { db, service } = createTestService();
+  it("splits a turn the relation model judges new_task into a fresh episode", async () => {
+    const { db, service } = createTestService({ llm: scriptedRelationLlm([{ relation: "new_task" }]) });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -483,7 +518,11 @@ describe("MemoryService / session / episode relation", () => {
     });
     expect(completed.episodeId).not.toBe(first.episodeId);
     expect(completed.closedEpisodeIds).toEqual([first.episodeId]);
-    expect(completed.jobs.map((job) => job.jobType)).toContain("reflection");
+    // With a capture model, reflection waits until the episode's capture decisions are made.
+    await runWorkerRounds(service, 2, 20);
+    expect(db.db.prepare(
+      "SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type = 'reflection' AND episode_id = ?"
+    ).get(first.episodeId)).toEqual({ count: 1 });
 
     const rows = db.db.prepare(
       `SELECT id, status, meta_json
@@ -554,8 +593,10 @@ describe("MemoryService / session / episode relation", () => {
     db.close();
   });
 
-  it("reclassifies a stale route proposal and records the stale marker", async () => {
-    const { db, service } = createTestService();
+  it("treats a proposal for an episode that is no longer the latest as a judgment that has not arrived", async () => {
+    const { db, service } = createTestService({
+      llm: scriptedRelationLlm([{ relation: "new_task" }, { relation: "new_task" }])
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -571,22 +612,29 @@ describe("MemoryService / session / episode relation", () => {
     await service.startTurn({
       turnId: "turn-stale-proposed",
       sessionId: session.sessionId,
-      query: "new task: summarize the hiring plan"
+      query: "Summarize the hiring plan"
+    });
+    await service.startTurn({
+      turnId: "turn-stale-intervening",
+      sessionId: session.sessionId,
+      query: "Audit the database backups"
     });
     const intervening = service.completeTurn("turn-stale-intervening", {
       sessionId: session.sessionId,
-      query: "new task: audit database backups",
+      query: "Audit the database backups",
       answer: "The database backup audit is complete."
     });
     expect(intervening.episodeId).not.toBe(first.episodeId);
 
     const completed = service.completeTurn("turn-stale-proposed", {
       sessionId: session.sessionId,
-      query: "new task: summarize the hiring plan",
+      query: "Summarize the hiring plan",
       answer: "The hiring plan is summarized."
     });
-    expect(completed.episodeId).not.toBe(intervening.episodeId);
-    expect(completed.closedEpisodeIds).toEqual([intervening.episodeId]);
+    // The new_task judgment was made against the first episode; it is not applied to the new one.
+    expect(completed.episodeId).toBe(intervening.episodeId);
+    expect(completed.closedEpisodeIds).toEqual([]);
+    expect(completed.jobs.map((job) => job.jobType)).toContain("turn_relation");
     const raw = db.db.prepare(
       "SELECT message_payload_json FROM raw_turns WHERE id = ?"
     ).get(completed.rawTurnId) as { message_payload_json: string };
@@ -594,14 +642,14 @@ describe("MemoryService / session / episode relation", () => {
       turn_start: {
         routeProposalStale: true,
         routeProposal: {
-          baseEpisodeId: first.episodeId,
-          action: "split"
+          baseEpisodeId: intervening.episodeId,
+          action: "append",
+          relationDecision: { relation: "unknown", confidence: 0, reason: "model pending", signals: ["model_pending"] }
         }
       }
     });
     db.close();
   });
-
   it("honors an explicit episode id over a conflicting start proposal", async () => {
     const { db, service } = createTestService();
     const session = service.openSession({
@@ -766,7 +814,7 @@ describe("MemoryService / session / episode relation", () => {
       query: "青竹项目的部署端口是多少？林浩偏好什么回答风格？"
     });
     expect(prepared).not.toHaveProperty("episodeId");
-    expect(relationCalls).toEqual(["relation.classify.v1"]);
+    expect(relationCalls).toEqual(["relation.classify.v2"]);
     const reserved = db.db.prepare(
       `SELECT id, episode_id, status
        FROM raw_turns
@@ -860,7 +908,7 @@ describe("MemoryService / session / episode relation", () => {
     db.close();
   });
 
-  it("uses the configured relation classifier during turn.start arbitration", async () => {
+  it("asks the relation model once and follows its judgment without arbitration", async () => {
     const root = createTestRoot("mindock-memory-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -890,7 +938,7 @@ describe("MemoryService / session / episode relation", () => {
     });
 
     expect(prepared).not.toHaveProperty("episodeId");
-    expect(calls).toEqual(["relation.classify.v1", "relation.arbitration.v1"]);
+    expect(calls).toEqual(["relation.classify.v2"]);
     const beforeComplete = db.db.prepare(
       `SELECT meta_json
        FROM episodes
@@ -903,94 +951,59 @@ describe("MemoryService / session / episode relation", () => {
       query: "Database certificate rotation details please",
       answer: "Rotate the certificate and reload the database client."
     });
-    expect(completed.episodeId).toBe(first.episodeId);
-    const rows = db.db.prepare(
-      `SELECT meta_json
-       FROM episodes
-       WHERE session_id = ?
-       ORDER BY opened_at ASC`
-    ).all(session.sessionId) as Array<{ meta_json: string }>;
-    expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0]!.meta_json)).toMatchObject({
+    // A self-reported confidence of 0.7 no longer triggers a second, follow_up-leaning call.
+    expect(completed.episodeId).not.toBe(first.episodeId);
+    expect(completed.closedEpisodeIds).toEqual([first.episodeId]);
+    const row = db.db.prepare(`SELECT meta_json FROM episodes WHERE id = ?`)
+      .get(first.episodeId) as { meta_json: string };
+    expect(JSON.parse(row.meta_json)).toMatchObject({
       relationDecision: {
-        relation: "follow_up",
-        signals: expect.arrayContaining(["arbitration_override"])
+        relation: "new_task",
+        confidence: 0.7,
+        signals: ["llm", "relation.classify.v2"]
       }
     });
     db.close();
   });
-
-  it("runs memory retrieval while the relation classifier is still pending", async () => {
-    let signalRelationStarted: (() => void) | undefined;
-    let releaseRelation: (() => void) | undefined;
-    const relationStarted = new Promise<void>((resolve) => {
-      signalRelationStarted = resolve;
+  function gatedRelationLlm(relation: ScriptedRelation["relation"]): {
+    llm: LlmClient;
+    started: Promise<void>;
+    release: () => void;
+  } {
+    let signalStarted: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
     });
-    const relationRelease = new Promise<void>((resolve) => {
-      releaseRelation = resolve;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    let retrievalExtractStarted = false;
+    const base = createBatchReflectionLlm([]);
     const llm: LlmClient = {
-      config: {
-        ...DEFAULT_MEMMY_CONFIG.summary,
-        provider: "host",
-        endpoint: "http://127.0.0.1/parallel-turn-start",
-        model: "parallel-turn-start"
-      },
-      isConfigured() {
-        return true;
-      },
-      async complete() {
-        return "{}";
-      },
+      ...base,
       async completeJson<T extends Record<string, unknown>>(
-        _messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-        options: { operation: string }
+        messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+        options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" }
       ): Promise<T> {
-        if (options.operation === "relation.classify.v1") {
-          signalRelationStarted?.();
-          await relationRelease;
-          return {
-            relation: "new_task",
-            confidence: 0.95,
-            reason: "the database task is unrelated to nginx"
-          } as unknown as T;
-        }
-        if (options.operation === "retrieval.retrieval.query.extract.v3") {
-          retrievalExtractStarted = true;
-          return {
-            queryVecText: "database certificate rotation",
-            keywords: ["database", "certificate"]
-          } as unknown as T;
-        }
-        return { ranked: [1], sufficient: true } as unknown as T;
-      },
-      status() {
+        if (options.operation !== "relation.classify.v2") return base.completeJson<T>(messages, options);
+        signalStarted?.();
+        await gate;
         return {
-          provider: "host",
-          model: "parallel-turn-start",
-          configured: true,
-          remote: true
-        };
+          relation,
+          confidence: 0.95,
+          reason: "the database task has its own goal",
+          feedback: { type: "positive", confidence: 0.8, reason: "thanks for the TLS setup" }
+        } as unknown as T;
       }
     };
-    const config = {
-      ...DEFAULT_MEMMY_CONFIG,
-      algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
-        retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
-          llmFilterEnabled: false
-        }
-      }
-    };
-    const { db, service } = createTestService({ llm, config });
+    return { llm, started, release: () => release?.() };
+  }
+
+  it("returns turn start without waiting for the relation model and routes by its judgment when it lands in time", async () => {
+    const gated = gatedRelationLlm("new_task");
+    const { db, service } = createTestService({ llm: gated.llm });
     const session = service.openSession({
-      namespace: {
-        source: "codex",
-        profileId: "jiang",
-        userId: "user-parallel-turn-start"
-      }
+      namespace: { source: "codex", profileId: "jiang", userId: "user-parallel-turn-start" }
     });
     const first = service.completeTurn("turn-parallel-first", {
       sessionId: session.sessionId,
@@ -998,26 +1011,33 @@ describe("MemoryService / session / episode relation", () => {
       answer: "Use port 443 and verify the certificate chain."
     });
 
-    const startPromise = service.startTurn({
+    const started = await service.startTurn({
       turnId: "turn-parallel-next",
       sessionId: session.sessionId,
       query: "Database certificate rotation details please"
     });
-    await relationStarted;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const retrievalStartedBeforeRelationCompleted = retrievalExtractStarted;
-    releaseRelation?.();
-    const started = await startPromise;
+    await gated.started;
+    expect(started.status).toContain("relation:pending:proposed");
+    const pendingRecall = db.db.prepare(
+      "SELECT request_json FROM recall_events WHERE id = ?"
+    ).get(started.searchEventId) as { request_json: string };
+    expect(JSON.parse(pendingRecall.request_json)).toMatchObject({
+      retrievalMode: "turn_start",
+      routeProposal: { relationDecision: { relation: "unknown", signals: ["model_pending"] } }
+    });
 
-    expect(retrievalStartedBeforeRelationCompleted).toBe(true);
+    gated.release();
+    await flushRelationCalls();
     const recall = db.db.prepare(
       "SELECT request_json FROM recall_events WHERE id = ?"
     ).get(started.searchEventId) as { request_json: string };
     expect(JSON.parse(recall.request_json)).toMatchObject({
+      retrievalMode: "turn_start",
       routeProposal: {
         action: "split",
         baseEpisodeId: first.episodeId,
-        relationDecision: { relation: "new_task" }
+        relationDecision: { relation: "new_task", signals: ["llm", "relation.classify.v2"] },
+        feedback: { type: "positive" }
       }
     });
 
@@ -1027,8 +1047,85 @@ describe("MemoryService / session / episode relation", () => {
       answer: "Rotate the database certificate and reload the client."
     });
     expect(completed.episodeId).not.toBe(first.episodeId);
+    expect(completed.jobs.map((job) => job.jobType)).not.toContain("turn_relation");
+    db.close();
   });
 
+  it("joins the open episode when the judgment is late and records it, marked, when it lands", async () => {
+    const gated = gatedRelationLlm("new_task");
+    const { db, service } = createTestService({ llm: gated.llm });
+    const session = service.openSession({
+      namespace: { source: "codex", profileId: "jiang", userId: "user-late-relation" }
+    });
+    const first = service.completeTurn("turn-late-first", {
+      sessionId: session.sessionId,
+      query: "Configure nginx TLS for the service",
+      answer: "Use port 443 and verify the certificate chain."
+    });
+    const started = await service.startTurn({
+      turnId: "turn-late-next",
+      sessionId: session.sessionId,
+      query: "Database certificate rotation details please"
+    });
+    await gated.started;
+
+    const completed = service.completeTurn("turn-late-next", {
+      sessionId: session.sessionId,
+      query: "Database certificate rotation details please",
+      answer: "Rotate the database certificate and reload the client."
+    });
+    expect(completed.episodeId).toBe(first.episodeId);
+    expect(completed.closedEpisodeIds).toEqual([]);
+    const job = db.db.prepare(
+      `SELECT status, max_attempts, payload_json FROM evolution_jobs WHERE job_type = 'turn_relation'`
+    ).get() as { status: string; max_attempts: number; payload_json: string };
+    const payload = JSON.parse(job.payload_json) as Record<string, unknown>;
+    expect(job.status).toBe("queued");
+    expect(job.max_attempts).toBeGreaterThan(1_000);
+    expect(payload).toMatchObject({
+      rawTurnId: completed.rawTurnId,
+      baseEpisodeId: first.episodeId,
+      feedbackTargetMemoryId: first.l1MemoryId,
+      input: {
+        firstUserText: "Configure nginx TLS for the service",
+        latestUserText: "Configure nginx TLS for the service",
+        previousAssistantText: "Use port 443 and verify the certificate chain.",
+        newUserText: "Database certificate rotation details please"
+      }
+    });
+    const recallCreatedAt = (db.db.prepare(`SELECT created_at FROM recall_events WHERE id = ?`)
+      .get(started.searchEventId) as { created_at: string }).created_at;
+    expect(Date.parse(String(payload.runAfter)) - Date.parse(recallCreatedAt)).toBe(60_000);
+    const episodeMeta = JSON.parse((db.db.prepare(`SELECT meta_json FROM episodes WHERE id = ?`)
+      .get(first.episodeId) as { meta_json: string }).meta_json);
+    expect(episodeMeta).toMatchObject({
+      relation: "unknown",
+      relationDecision: { signals: ["model_pending"] },
+      relationRouting: { action: "append_to_open_episode" }
+    });
+
+    gated.release();
+    await flushRelationCalls();
+    const raw = JSON.parse((db.db.prepare(
+      "SELECT message_payload_json FROM raw_turns WHERE id = ?"
+    ).get(completed.rawTurnId) as { message_payload_json: string }).message_payload_json);
+    expect(raw.turn_start.routeProposal).toMatchObject({
+      action: "append",
+      relationDecision: {
+        relation: "new_task",
+        signals: ["llm", "relation.classify.v2", "late_result", "route_mismatch"]
+      },
+      feedback: { type: "positive" }
+    });
+    // The turn is not moved.
+    expect(service.getMemory(first.episodeId)).toMatchObject({ status: "open" });
+
+    // The job sees the record is no longer pending and finishes without another call.
+    await service.runWorkerOnce(20);
+    expect((db.db.prepare(`SELECT status FROM evolution_jobs WHERE job_type = 'turn_relation'`).get() as { status: string }).status)
+      .not.toBe("failed");
+    db.close();
+  });
   it("uses the account summary model for relation classification", async () => {
     const root = createTestRoot("mindock-memory-account-relation-");
     const db = new MemoryDb({
@@ -1064,18 +1161,20 @@ describe("MemoryService / session / episode relation", () => {
       query: "Database certificate rotation details please"
     });
 
-    expect(summaryCalls).toEqual(["relation.classify.v1", "relation.arbitration.v1"]);
+    expect(summaryCalls).toEqual(["relation.classify.v2"]);
     expect(evolutionCalls).toEqual([]);
     expect(summaryOptions).toEqual([
-      { operation: "relation.classify.v1", thinkingMode: "disabled" },
-      { operation: "relation.arbitration.v1", thinkingMode: "disabled" }
+      { operation: "relation.classify.v2", thinkingMode: "disabled" }
     ]);
     db.close();
   });
 
   it("records revision feedback immediately but defers reward backprop until episode close", async () => {
     const repairCalls: string[] = [];
-    const { db, service } = createTestService({ skillLlm: createFollowUpRelationClassifierLlm(repairCalls) });
+    const { db, service } = createTestService({
+      llm: scriptedRelationLlm([{ relation: "revision", feedback: { type: "negative" } }]),
+      skillLlm: createFollowUpRelationClassifierLlm(repairCalls)
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -1204,7 +1303,7 @@ describe("MemoryService / session / episode relation", () => {
   });
 
   it("clears a stale final reward when a closed episode is reopened", async () => {
-    const { db, service } = createTestService();
+    const { db, service } = createTestService({ llm: scriptedRelationLlm([{ relation: "revision", feedback: { type: "negative" } }]) });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -1256,8 +1355,10 @@ describe("MemoryService / session / episode relation", () => {
     db.close();
   });
 
-  it("records plugin-style implicit turn feedback before opening the next episode", async () => {
-    const { db, service } = createTestService();
+  it("records the model's reading of the reaction as implicit feedback before opening the next episode", async () => {
+    const { db, service } = createTestService({
+      llm: scriptedRelationLlm([{ relation: "new_task", feedback: { type: "negative" } }])
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",
@@ -1313,8 +1414,10 @@ describe("MemoryService / session / episode relation", () => {
     });
     expect(JSON.parse(feedback.raw_payload_json)).toMatchObject({
       source: "turn_feedback_classifier",
-      method: "rule",
-      classifierPolarity: "negative"
+      method: "llm",
+      confidence: 0.9,
+      classifierPolarity: "negative",
+      reason: "scripted feedback"
     });
 
     const rewardBeforeReflection = db.db.prepare(
@@ -1325,7 +1428,7 @@ describe("MemoryService / session / episode relation", () => {
     ).get(feedback.id) as { count: number };
     expect(rewardBeforeReflection.count).toBe(0);
 
-    await service.runWorkerOnce(20);
+    await runWorkerRounds(service, 3, 20);
     const queuedReward = db.db.prepare(
       `SELECT payload_json
        FROM evolution_jobs

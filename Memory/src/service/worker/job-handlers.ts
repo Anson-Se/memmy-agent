@@ -14,6 +14,7 @@ import type {
   SessionRecord
 } from "../../storage/repositories.js";
 import { ModelHttpError } from "../../model/http.js";
+import { ModelOutputInvalidError } from "../../model/output-errors.js";
 import type { JobType,MemoryRow,RuntimeNamespace } from "../../types.js";
 import { newId,stableHash } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
@@ -91,6 +92,9 @@ export interface WorkerJobProcessors {
   };
   episodeTitle: {
     generate(job: EvolutionJobRecord): MaybePromise<void>;
+  };
+  relation: {
+    resolveTurnRelation(job: EvolutionJobRecord): MaybePromise<void>;
   };
 }
 
@@ -233,6 +237,9 @@ export async function processJob(
   switch (job.jobType) {
     case "episode_idle_close":
       closeIdleEpisodesForMemoryWrite(deps, job);
+      return;
+    case "turn_relation":
+      await deps.processors.relation.resolveTurnRelation(job);
       return;
     case "trace_summary":
       await deps.processors.import.summarizeCapturedTrace(job);
@@ -634,11 +641,7 @@ export const MODEL_OUTPUT_INVALID_LIMIT = 5;
 export const MODEL_RETRY_BACKOFF_BASE_MS = 60_000;
 export const MODEL_RETRY_BACKOFF_MAX_MS = 60 * 60 * 1000;
 
-/** Thrown when a model answered but its output failed the rule checks. */
-export class ModelOutputInvalidError extends Error {
-  override readonly name = "ModelOutputInvalidError";
-  readonly code = "model_output_invalid";
-}
+export { ModelOutputInvalidError };
 
 export function isModelJudgmentJobType(jobType: string): boolean {
   return (MODEL_JUDGMENT_JOB_TYPES as readonly string[]).includes(jobType);

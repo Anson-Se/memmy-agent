@@ -1846,6 +1846,14 @@ function captureDecisionLlm(calls: string[], decision: LegacyCaptureDecision): L
     ): Promise<T> {
       calls.push(options.operation);
       if (options.operation === "capture.summarize") return compactCaptureDecision(decision) as T;
+      if (options.operation === "relation.classify.v2") {
+        return {
+          relation: "follow_up",
+          confidence: 0.9,
+          reason: "continues the current task",
+          feedback: { type: "none", confidence: 0.9, reason: "no reaction to the previous result" }
+        } as unknown as T;
+      }
       return { summary: decision.l1_summary } as unknown as T;
     },
     status: () => ({

@@ -393,6 +393,9 @@ export class MemoryService {
         },
         episodeTitle: {
           generate: (job) => this.episodeTitle.generate(job)
+        },
+        relation: {
+          resolveTurnRelation: (job) => this.sessionTurns.resolveTurnRelationJob(job)
         }
       }
     });
@@ -647,6 +650,7 @@ export class MemoryService {
       isMemoryReadyForRetrieval: this.isMemoryReadyForRetrieval.bind(this),
       maybeCreateDecisionRepair: this.feedbackExperience.maybeCreateDecisionRepair.bind(this.feedbackExperience),
       memoryAddEnabled: this.memoryAddEnabled.bind(this),
+      memoryBudgetPaused: () => this.isMemoryBudgetPaused(),
       memorySearchEnabled: this.memorySearchEnabled.bind(this),
       observeToolNoWrite: this.observeToolNoWrite.bind(this),
       openSessionNoWrite: this.openSessionNoWrite.bind(this),

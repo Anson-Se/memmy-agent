@@ -343,8 +343,12 @@ describe("native source turn submission", () => {
     const before = counts(db);
     expect(service.completeSourceTurn(request({ sourceTurn: { ...request().sourceTurn, turnId: "late-turn", sequence: 0, startedAt: "2099-01-01T09:00:00.000Z", completedAt: "2099-01-01T09:01:00.000Z" } }))).toMatchObject({ status: "pending", reason: "source_turn_out_of_order" });
     new Repositories(db.db).runtime.closeEpisode(first.result!.episodeId, { closeReason: "idle" }, "2099-01-01T10:01:30.000Z");
-    expect(service.completeSourceTurn(request({ sourceTurn: { ...request().sourceTurn, turnId: "after-close", sequence: 2, startedAt: "2099-01-01T10:02:00.000Z", completedAt: "2099-01-01T10:03:00.000Z" } }))).toMatchObject({ status: "pending", reason: "source_episode_closed" });
     expect(counts(db)).toEqual(before);
+    // A turn that started after the closure goes through normal routing: a new Episode, never a reopen.
+    const afterClose = service.completeSourceTurn(request({ sourceTurn: { ...request().sourceTurn, turnId: "after-close", sequence: 2, startedAt: "2099-01-01T10:02:00.000Z", completedAt: "2099-01-01T10:03:00.000Z" } }));
+    expect(afterClose).toMatchObject({ status: "stored" });
+    expect(afterClose.result!.episodeId).not.toBe(first.result!.episodeId);
+    expect(new Repositories(db.db).runtime.getEpisode(first.result!.episodeId)?.status).toBe("closed");
   });
 
   it("rejects pre-activation turns while allowing a turn that completes after activation", () => {

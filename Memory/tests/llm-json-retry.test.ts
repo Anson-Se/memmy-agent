@@ -26,8 +26,7 @@ describe("memory summary input budget", () => {
     ["reward.r_human.v1", 700],
     ["retrieval.query_extract.v1", 320],
     ["retrieval.filter.v1", 512],
-    ["relation.classify.v1", 512],
-    ["relation.arbitration.v1", 512]
+    ["relation.classify.v2", 512]
   ])("budgets the summary role for %s", async (operation, maxTokens) => {
     const fetchMock = sequenceFetch([openAiResponse("ok")]);
     vi.stubGlobal("fetch", fetchMock);
@@ -249,6 +248,20 @@ describe("memory LLM JSON length retry", () => {
     )).resolves.toEqual({ ok: true, items: [1, 2, 3] });
 
     expect(requestBodies(fetchMock).map((body) => body.max_tokens)).toEqual([4096, 8192]);
+  });
+
+  it("makes a single request when a caller turns JSON retries off", async () => {
+    for (const first of [openAiResponse('{"ok":}', "stop"), openAiResponse('{"ok":true,"items":[1', "length")]) {
+      const fetchMock = sequenceFetch([first, openAiResponse('{"ok":true}', "stop")]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const client = createLlmClient(llmConfig({ malformedRetries: 1 }));
+      await expect(client.completeJson<{ ok: boolean }>(
+        [{ role: "user", content: "classify" }],
+        { operation: "relation.classify.v2", jsonRetries: false }
+      )).rejects.toThrow();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("keeps the same max tokens for a normal malformed JSON retry", async () => {

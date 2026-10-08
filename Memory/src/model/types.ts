@@ -13,6 +13,8 @@ export interface LlmCompletionOptions {
   timeoutMs?: number;
   maxRetries?: number;
   jsonMode?: boolean;
+  /** false: no extra call for malformed or truncated JSON; the caller retries the whole judgment. */
+  jsonRetries?: boolean;
 }
 
 export interface LlmClient {

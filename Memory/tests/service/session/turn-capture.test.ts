@@ -301,7 +301,21 @@ describe("MemoryService / session / turn capture", () => {
   });
 
   it("rebinds observed tool data when turn.complete commits a split proposal", async () => {
-    const { db, service } = createTestService();
+    const base = createBatchReflectionLlm([]);
+    const { db, service } = createTestService({
+      llm: {
+        ...base,
+        async completeJson(messages, options) {
+          if (options.operation !== "relation.classify.v2") return base.completeJson(messages, options);
+          return {
+            relation: "new_task",
+            confidence: 0.9,
+            reason: "the hiring plan has its own goal",
+            feedback: { type: "none", confidence: 0.9, reason: "no reaction" }
+          } as never;
+        }
+      }
+    });
     const session = service.openSession({
       namespace: {
         source: "codex",

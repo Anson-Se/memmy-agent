@@ -181,8 +181,8 @@ class HttpLlmClient implements LlmClient {
     options: LlmCompletionOptions
   ): Promise<T> {
     let lastError: unknown;
-    let malformedRetriesRemaining = Math.max(0, this.config.malformedRetries);
-    let lengthRetryUsed = false;
+    let malformedRetriesRemaining = options.jsonRetries === false ? 0 : Math.max(0, this.config.malformedRetries);
+    let lengthRetryUsed = options.jsonRetries === false;
     let previousWasTruncated = false;
     let maxTokens = this.outputTokenBudget(options.maxTokens);
     let jsonAttempt = 0;

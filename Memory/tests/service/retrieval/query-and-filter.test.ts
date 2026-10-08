@@ -1771,11 +1771,12 @@ function createQueryExtractCapturingLlm(extractInputs: string[]): LlmClient {
           keywords: []
         } as unknown as T;
       }
-      if (options.operation === "relation.classify.v1") {
+      if (options.operation === "relation.classify.v2") {
         return {
           relation: "follow_up",
           confidence: 0.7,
-          reason: "same migration script task"
+          reason: "same migration script task",
+          feedback: { type: "none", confidence: 0.9, reason: "no reaction" }
         } as unknown as T;
       }
       return {

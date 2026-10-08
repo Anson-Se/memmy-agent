@@ -44,6 +44,7 @@ import {
   sanitizeProcessingError,
   workerJobCanRunInParallel
 } from "./job-handlers.js";
+import { JobDeferredError } from "./job-errors.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -507,6 +508,12 @@ export class WorkerRunner {
     } catch (error) {
       if (error instanceof SummaryModelUnconfiguredError) {
         return this.holdUnconfiguredSummaryJob(job);
+      }
+      if (error instanceof JobDeferredError) {
+        const deferred = this.deps.repos.runtime.deferLeasedJob(job.id, error.runAfter, this.deps.nowIso()) ?? job;
+        this.deps.appendJobChange(deferred, "queued", job);
+        workerLogger.info("job.deferred", { ...workerJobLogFields(deferred), runAfter: error.runAfter, reason: error.message });
+        return { succeeded: 0, failed: 0, ref: { ...jobToRef(job), status: "queued" } };
       }
       return this.failLeasedWorkerJob(job, error);
     }

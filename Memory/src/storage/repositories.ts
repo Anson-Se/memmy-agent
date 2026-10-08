@@ -3877,6 +3877,23 @@ export class RuntimeRepository {
     return this.getJob(id);
   }
 
+  /** Returns a leased job to the queue until `runAfter` without counting the lease as an attempt. */
+  deferLeasedJob(id: string, runAfter: string, at = nowIso()): EvolutionJobRecord | undefined {
+    this.db
+      .prepare(
+        `UPDATE evolution_jobs
+         SET status = 'queued',
+             attempts = MAX(0, attempts - 1),
+             leased_until = NULL,
+             payload_json = json_set(payload_json, '$.runAfter', ?),
+             updated_at = ?
+         WHERE id = ?
+           AND status = 'leased'`
+      )
+      .run(runAfter, at, id);
+    return this.getJob(id);
+  }
+
   /** Puts a dead-lettered job back in the queue with fresh retry counters. */
   requeueDeadLetterJob(id: string, at = nowIso()): EvolutionJobRecord | undefined {
     const row = this.db

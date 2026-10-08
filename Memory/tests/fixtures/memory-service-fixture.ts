@@ -391,6 +391,14 @@ export function createBatchReflectionLlm(calls: Array<{
       options: { operation: string; thinkingMode?: "inherit" | "enabled" | "disabled" }
     ): Promise<T> {
       calls.push({ messages, options });
+      if (options.operation === "relation.classify.v2") {
+        return {
+          relation: "follow_up",
+          confidence: 0.9,
+          reason: "continues the current task",
+          feedback: { type: "none", confidence: 0.9, reason: "no reaction to the previous result" }
+        } as unknown as T;
+      }
       if (options.operation === "capture.reflection.batch.v14") {
         const payload = JSON.parse(messages.find((message) => message.role === "user")?.content ?? "{}") as {
           steps?: Array<{ idx: number }>;

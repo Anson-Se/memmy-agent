@@ -495,6 +495,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     },
     session: {
       followUpMode: "merge_follow_ups",
+      // How long after a closed episode a follow-up may still reopen it. Open episodes are never split by time.
       mergeMaxGapMs: 2 * 60 * 60 * 1000
     },
     retrieval: {
