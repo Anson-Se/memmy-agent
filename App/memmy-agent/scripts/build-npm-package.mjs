@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 const scriptRoot = dirname(fileURLToPath(import.meta.url));
 const agentRoot = resolve(scriptRoot, "..");
 const repoRoot = resolve(agentRoot, "../..");
-const outputRoot = join(agentRoot, ".npm-package");
+const outputRoot = join(agentRoot, "npm-packages", "memmy-agent");
 const vendorRoot = join(outputRoot, "vendor");
 const sourceManifest = JSON.parse(await readFile(join(agentRoot, "package.json"), "utf8"));
 const packageName = "@memtensor/memmy-agent";
