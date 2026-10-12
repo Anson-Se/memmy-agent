@@ -22,6 +22,7 @@ import {
   type WebuiSessionTarget
 } from "../api/memmy-agent-client.js";
 import type { AnalyticsEvent } from "../analytics/analytics-events.js";
+import { ApiRequestError } from "../api/http.js";
 import { setAnalyticsModelSource } from "../analytics/analytics-context.js";
 import { buildOnboardingActivationEvent } from "../analytics/onboarding-analytics.js";
 import { useAnalytics } from "../analytics/use-analytics.js";
@@ -84,9 +85,9 @@ import {
   type AgentQuestionCardPayload,
   type AgentQuestionResponse,
 } from "./agent-question-card.js";
-import { PluginCapabilityHost, selectRegionPluginCalls } from "./plugin-capability-host.js";
+import { PluginCapabilityHost, pinnedCapabilityKey, selectRegionPluginCalls, selectVisiblePluginCalls } from "./plugin-capability-host.js";
 import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
-import { RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn } from "./recording-entry.js";
+import { RecordingEntryCard, RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn } from "./recording-entry.js";
 import { PluginArtifactPreviewPanel } from "./plugin-artifact-preview-panel.js";
 import { AgentWorkspaceContext } from "./agent-workspace-context.js";
 import { AppFrame } from "./app-frame.js";
@@ -537,9 +538,11 @@ export function collectPluginScenarios(plugins: InstalledPlugin[]): PluginScenar
  * Renders nothing when no plugin pinned anything, so the composer keeps its
  * usual layout for everyone else.
  */
-function PinnedPluginCommandBar(props: {
+export function PinnedPluginCommandBar(props: {
   targets: PluginCommandTarget[];
   disabled: boolean;
+  recordingOpen: boolean;
+  onRecordingPress(): void;
   /** Buttons whose card is on screen, as `pluginId:capabilityId`. */
   active: ReadonlySet<string>;
   /** Pressing a button opens its card, or closes the one it already opened. */
@@ -550,7 +553,10 @@ function PinnedPluginCommandBar(props: {
     <div className="pinned-command-bar">
       {props.targets.map((target) => {
         const Icon = resolveContributionIcon(target.command.icon);
-        const open = props.active.has(`${target.plugin.id}:${target.command.capabilityId}`);
+        // The composer recording entry controls its compact card independently
+        // of the top-bar page and pending material collection calls.
+        const recording = target.command.topbar === true;
+        const open = recording ? props.recordingOpen : props.active.has(`${target.plugin.id}:${target.command.capabilityId}`);
         return (
           <button
             key={`${target.plugin.id}:${target.command.command}`}
@@ -562,7 +568,7 @@ function PinnedPluginCommandBar(props: {
             // this the card and the button that raised it look unrelated.
             data-open={open ? "true" : undefined}
             aria-pressed={open}
-            onClick={() => props.onPress(target)}
+            onClick={() => recording ? props.onRecordingPress() : props.onPress(target)}
           >
             <Icon size={13} aria-hidden="true" />
             {target.command.name}
@@ -583,48 +589,90 @@ function PinnedPluginCommandBar(props: {
 export function selectOpenPinnedCapabilities(
   calls: readonly PluginUiCall[],
   dismissedCallIds?: ReadonlySet<string>,
-  pinnedCapabilities: ReadonlySet<string> = new Set()
+  pinnedCapabilities: ReadonlySet<string> = new Set(),
+  hiddenCallIds?: ReadonlySet<string>
 ): Set<string> {
   const open = new Set<string>();
   for (const call of calls) {
-    if (call.origin !== "user" && !pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`)) continue;
-    // A card the user just closed is gone before its cancellation has made it
-    // back from the plugin, so the button has to stop reading as open now
-    // rather than a round trip later.
-    if (dismissedCallIds?.has(call.callId)) continue;
+    if (call.origin !== "user" && !pinnedCapabilities.has(pinnedCapabilityKey(call))) continue;
+    // Hidden cards keep their calls alive but no longer highlight the button.
+    if (dismissedCallIds?.has(call.callId) || hiddenCallIds?.has(call.callId)) continue;
     if (call.events.some((event) => event.type === "result" || event.type === "error")) continue;
-    open.add(`${call.pluginId}:${call.capabilityId}`);
+    open.add(pinnedCapabilityKey(call));
   }
   return open;
 }
 
-/**
- * Finds the card a pinned button opened, so a second press can close it.
- *
- * A user-raised card is a candidate, as is a skill-raised card whose capability
- * is represented by this pinned command. Pressing a button again closes the
- * card shown by that button. A card that already finished has nothing left to
- * close, so its button goes back to opening a new one.
- */
-export function selectPinnedDismissal(
+/** Finds a pending call to hide or show, including one already hidden. */
+export function selectPinnedToggleCall(
   calls: readonly PluginUiCall[],
   pluginId: string,
   capabilityId: string,
   dismissedCallIds?: ReadonlySet<string>,
   pinnedCapabilities: ReadonlySet<string> = new Set()
 ): string | null {
-  for (let index = calls.length - 1; index >= 0; index -= 1) {
-    const call = calls[index]!;
-    if (call.pluginId !== pluginId || call.capabilityId !== capabilityId) continue;
-    if (call.origin !== "user" && !pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`)) continue;
-    // A card already closed is not something a press can close again. Its
-    // cancellation is still in flight, and treating it as the open card would
-    // make the button a no-op until the plugin answers.
+  const prioritized = [...calls.filter((call) => call.origin !== "agent"), ...calls.filter((call) => call.origin === "agent")];
+  for (let index = prioritized.length - 1; index >= 0; index -= 1) {
+    const call = prioritized[index]!;
+    if (pinnedCapabilityKey(call) !== `${pluginId}:${capabilityId}`) continue;
+    if (call.origin !== "user" && !pinnedCapabilities.has(pinnedCapabilityKey(call))) continue;
+    // Explicitly cancelled calls cannot be restored; hidden calls can.
     if (dismissedCallIds?.has(call.callId)) continue;
     if (call.events.some((event) => event.type === "result" || event.type === "error")) continue;
     return call.callId;
   }
   return null;
+}
+
+/** A visibility gesture never answers, cancels, or restarts a pending call. */
+export async function pressPinnedPluginCommand(options: {
+  calls: readonly PluginUiCall[];
+  pluginId: string;
+  capabilityId: string;
+  dismissedCallIds?: ReadonlySet<string>;
+  pinnedCapabilities: ReadonlySet<string>;
+  toggleVisibility(callId: string): void;
+  open(): Promise<unknown>;
+  opening?: Set<string>;
+  conversationId?: string;
+}): Promise<void> {
+  const callId = selectPinnedToggleCall(options.calls, options.pluginId, options.capabilityId,
+    options.dismissedCallIds, options.pinnedCapabilities);
+  if (callId) options.toggleVisibility(callId);
+  else {
+    const key = JSON.stringify([options.conversationId ?? null, options.pluginId, options.capabilityId]);
+    if (options.opening?.has(key)) return;
+    options.opening?.add(key);
+    try { await options.open(); } finally { options.opening?.delete(key); }
+  }
+}
+
+/** Closing one step must never hide the next request in the same call. */
+export function pluginInteractionSignature(call: PluginUiCall | undefined): string {
+  return call?.events.filter((event) => event.type === "interaction")
+    .map((event) => event.type === "interaction" ? event.request.interactionId : "").join("\n") ?? "";
+}
+
+export function reconcileHiddenPluginCalls(hidden: Set<string>, hiddenSteps: ReadonlyMap<string, string>, calls: readonly PluginUiCall[]): Set<string> {
+  const next = new Set(hidden);
+  for (const id of hidden) {
+    const call = calls.find((candidate) => candidate.callId === id);
+    if (call?.events.some((event) => event.type === "interaction")
+      && hiddenSteps.get(id) !== pluginInteractionSignature(call)) next.delete(id);
+  }
+  return next.size === hidden.size ? hidden : next;
+}
+
+export function buildLegalDiagnosisContinuation(call: PluginUiCall): string {
+  const result = call.events.find((event) => event.type === "result");
+  const output = result?.type === "result" && result.output && typeof result.output === "object"
+    ? result.output as Record<string, unknown> : {};
+  if (typeof output.sessionId !== "string" || !output.sessionId.trim()) {
+    throw new Error("诊断材料已上传，但未取得诊断会话 ID，请重新打开诊断指引后重试。");
+  }
+  return `/legal-diagnosis 已完成调研，继续已有法律诊断会话，sessionId=${JSON.stringify(output.sessionId)}。`
+    + "请使用这个 sessionId 调用 session-status 核对已上传材料与进度，再继续后续诊断并生成报告。"
+    + "本次是已有会话的继续操作，请跳过 skill 中新建会话的 session-start 步骤，不要再次弹出诊断指引或重复收集材料。";
 }
 
 export function parsePluginCommandInvocation(input: string, targets: PluginCommandTarget[]): {
@@ -1198,7 +1246,12 @@ function ComposerCaretMenu(props: {
  */
 export function HomePage() {
   const { clients } = useApiClients();
-  const { calls: pluginUiCalls, openSurface, routeChatFeedback } = usePluginUi();
+  const { calls: pluginUiCalls, openSurface, routeChatFeedback,
+    hiddenCallIds: hiddenPluginCalls, setHiddenCallIds: setHiddenPluginCalls,
+    hiddenInteractionSteps: hiddenPluginSteps, openingCommands: openingPluginCommands,
+    dismissedCallIds: dismissedPluginCalls, setDismissedCallIds: setDismissedPluginCalls,
+    answeredInteractions: answeredPluginInteractions, setAnsweredInteractions: setAnsweredPluginInteractions
+  } = usePluginUi();
   const { state, dispatch } = useAppState();
   const modelWorkspace = createModelWorkspace(state.modelConfig);
   const { language, t } = useTranslation();
@@ -1235,14 +1288,6 @@ export function HomePage() {
   } | null>(null);
   const [pluginArtifactPreview, setPluginArtifactPreview] = useState<PluginArtifactRef | null>(null);
   const [recordingSession, setRecordingSession] = useState<RecordingPanelSession | null>(null);
-  // Calls the user closed from their own button or pane. Their cancellation is
-  // expected, so the card stays gone instead of being replaced by that report.
-  const [dismissedPluginCalls, setDismissedPluginCalls] = useState<Set<string>>(() => new Set());
-  // Answered interactions live here rather than in each host, because a call can
-  // cross regions mid-flight: the recorder is answered in the side column and
-  // its upload step then appears over the composer, and that second region has
-  // to know the first interaction is done.
-  const [answeredPluginInteractions, setAnsweredPluginInteractions] = useState<Set<string>>(() => new Set());
   const [installedPlugins, setInstalledPlugins] = useState<InstalledPlugin[]>([]);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(520);
   const [isCreatingChat, setIsCreatingChat] = useState(false);
@@ -1325,7 +1370,16 @@ export function HomePage() {
   const recordingEntry = useRecordingEntry(
     clients?.asr,
     clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined,
-    (transcript, mode) => deliverRecordingRef.current?.(transcript, mode)
+    (transcript, mode) => deliverRecordingRef.current?.(transcript, mode),
+    { scope: String(state.account.userId ?? "local"),
+      ...(state.agent.currentSessionKey ? { sessionKey: state.agent.currentSessionKey } : {}),
+      resolveAudio: async (entry) => {
+        if (!clients || !entry.audioPath) return entry.audioUrl;
+        const result = await clients.memmyAgent.resolveArtifact(entry.audioPath, entry.sessionKey
+          ?? state.agent.currentSessionKey ?? "");
+        return result.media_url ?? null;
+      }
+    }
   );
   const chatScopeKey = agentChatScopeKey(state.agent.currentChatId, state.agent.newChatRequestId);
   const pluginUiPluginKey = useMemo(() => [...new Set(pluginUiCalls.map((call) => call.pluginId))].sort().join("\n"), [pluginUiCalls]);
@@ -1340,9 +1394,22 @@ export function HomePage() {
       .map((command) => `${plugin.id}:${command.capabilityId}`))),
     [installedPlugins]
   );
+  const preparedPluginCalls = useMemo(
+    () => selectVisiblePluginCalls(visiblePluginCalls, answeredPluginInteractions),
+    [visiblePluginCalls, answeredPluginInteractions]
+  );
+  useEffect(() => {
+    setHiddenPluginCalls((current) => {
+      return reconcileHiddenPluginCalls(current, hiddenPluginSteps, preparedPluginCalls);
+    });
+  }, [hiddenPluginSteps, preparedPluginCalls, setHiddenPluginCalls]);
+  const pinnedCardCalls = useMemo(
+    () => selectRegionPluginCalls(preparedPluginCalls, "pinned", pinnedPluginCapabilities),
+    [preparedPluginCalls, pinnedPluginCapabilities]
+  );
   const openPinnedCapabilities = useMemo(
-    () => selectOpenPinnedCapabilities(visiblePluginCalls, dismissedPluginCalls, pinnedPluginCapabilities),
-    [dismissedPluginCalls, pinnedPluginCapabilities, visiblePluginCalls]
+    () => selectOpenPinnedCapabilities(pinnedCardCalls, dismissedPluginCalls, pinnedPluginCapabilities, hiddenPluginCalls),
+    [dismissedPluginCalls, hiddenPluginCalls, pinnedPluginCapabilities, pinnedCardCalls]
   );
   // The recorder is the one card that lives in the side column rather than in
   // the pinned bar, so the page needs to know whether it is there and what to
@@ -1350,8 +1417,8 @@ export function HomePage() {
   // A closed card is gone even if its call has not finished unwinding, so the
   // pane that card opened leaves with it rather than standing empty.
   const panelRecorders = useMemo(
-    () => selectRegionPluginCalls(visiblePluginCalls, "panel").filter((call) => !dismissedPluginCalls.has(call.callId)),
-    [dismissedPluginCalls, visiblePluginCalls]
+    () => selectRegionPluginCalls(preparedPluginCalls, "panel", pinnedPluginCapabilities).filter((call) => !dismissedPluginCalls.has(call.callId)),
+    [dismissedPluginCalls, preparedPluginCalls, pinnedPluginCapabilities]
   );
   const panelRecorderTitle = panelRecorders[0]
     ? installedPlugins
@@ -2136,38 +2203,91 @@ export function HomePage() {
   // No plugin, no button: the top bar is the conversation's, and only a plugin
   // that asked for a place there gets one.
   const topbarPluginCommand = selectTopbarPluginCommand(pluginCommandTargets);
-  // A pinned button is a shortcut for typing the command, so it invokes the
-  // same capability the same way. User-raised calls can be closed outright;
-  // skill-raised calls are promoted to this same surface by the Host.
+  const togglePluginCallVisibility = (callId: string) => {
+    setHiddenPluginCalls((current) => {
+      const next = new Set(current);
+      if (next.has(callId)) next.delete(callId);
+      else {
+        hiddenPluginSteps.set(callId, pluginInteractionSignature(preparedPluginCalls.find((call) => call.callId === callId)));
+        next.add(callId);
+      }
+      return next;
+    });
+  };
+  const hidePluginCall = (callId: string) => {
+    hiddenPluginSteps.set(callId, pluginInteractionSignature(preparedPluginCalls.find((call) => call.callId === callId)));
+    setHiddenPluginCalls((current) => new Set(current).add(callId));
+  };
+  const toggleRecordingEntry = () => {
+    setPluginArtifactPreview(null);
+    setPreviewPanelOpen(false);
+    setEnvironmentPanelOpen(false);
+    putRecorderCardAside();
+    recordingEntry.toggle();
+  };
   const invokePinnedPluginCommand = (target: PluginCommandTarget) => {
     if (!clients) return;
-    // A second press closes what the first one opened. The card is the user's
-    // own, so closing it is a cancel: the plugin stops waiting and nothing is
-    // sent to the model, which is what "关闭卡片不触发模型思考" asks for.
-    const openCallId = selectPinnedDismissal(
-      visiblePluginCalls,
-      target.plugin.id,
-      target.command.capabilityId,
-      dismissedPluginCalls,
-      pinnedPluginCapabilities
-    );
-    if (openCallId) {
-      setDismissedPluginCalls((current) => new Set(current).add(openCallId));
-      void clients.plugins.cancel(target.plugin.id, openCallId).catch(() => undefined);
-      return;
-    }
     const conversationId = state.agent.currentChatId ?? state.agent.currentSessionKey ?? chatScopeKey;
-    void clients.plugins.invoke(target.plugin.id, target.command.capabilityId, {
+    void pressPinnedPluginCommand({
+      calls: preparedPluginCalls,
+      pluginId: target.plugin.id,
+      capabilityId: target.command.capabilityId,
+      dismissedCallIds: dismissedPluginCalls,
+      pinnedCapabilities: pinnedPluginCapabilities,
+      opening: openingPluginCommands,
       conversationId,
-      input: { command: target.command.command, arguments: "", context: { references: [] } },
-      origin: "user"
+      toggleVisibility: togglePluginCallVisibility,
+      open: () => clients.plugins.invoke(target.plugin.id, target.command.capabilityId, {
+        conversationId,
+        input: { command: target.command.command, arguments: "", context: { references: [] } },
+        origin: "user"
+      })
     }).catch((error) => {
       dispatch(agentActions.operationFailed("chat", createAgentOperationError({
         source: "send",
-        message: error instanceof Error ? error.message : "network_unavailable",
+        message: pluginInvocationError(error),
         scopeKey: chatScopeKey
       })));
     });
+  };
+  const generateLegalDiagnosis = async (call: PluginUiCall) => {
+    if (!clients) return;
+    try {
+      if (preparedPluginCalls.some((pending) => pending.pluginId === call.pluginId && pending.origin === "agent"
+        && pending.events.some((event) => event.type === "interaction")
+        && !pending.events.some((event) => event.type === "result" || event.type === "error"))) {
+        throw new Error("材料已保存，当前 Agent 仍在等待另一张诊断卡片。请先完成该卡片，或停止当前任务后继续已有诊断会话。");
+      }
+      if (resolvedConversationModel.unavailable) throw new Error(t("home.modelSelector.unavailable"));
+      if (resolvedConversationModel.candidate?.source === "platform" && isAccountTokenQuotaExhausted(state.bootstrap)) {
+        throw new Error(t("agent.error.quotaExceeded"));
+      }
+      const sent = await submitAgentComposerMessage({
+        chatId: state.agent.currentChatId,
+        target: state.agent.currentChatId ? null : draftTarget,
+        connection,
+        ensureChatSubscription,
+        content: buildAgentRoutedPluginPrompt(buildLegalDiagnosisContinuation(call), pluginCommandTargets)
+          ?? buildLegalDiagnosisContinuation(call).replace("/legal-diagnosis", "$labor-risk-diagnosis"),
+        displayContent: t("plugin.ui.generateDiagnosis"),
+        language,
+        pendingAttachments: [],
+        uploadAgentMedia: (attachments) => clients.memmyAgent.uploadAgentMedia(attachments),
+        dispatch, track,
+        setCreatingChat: setIsCreatingChat,
+        clearComposer: () => undefined,
+        chatSelectionEpoch: state.agent.chatSelectionEpoch,
+        getChatSelectionEpoch: () => chatSelectionEpochRef.current,
+        scopeKey: chatScopeKey,
+        modelPreset: resolvedConversationModel.candidateId ?? undefined
+      });
+      if (!sent) throw new Error(t("plugin.ui.responseFailed"));
+    } catch (error) {
+      dispatch(agentActions.operationFailed("chat", createAgentOperationError({
+        source: "send", message: pluginInvocationError(error), scopeKey: chatScopeKey
+      })));
+      throw error;
+    }
   };
   // A pinned command already has a button of its own above the composer.
   // Listing it in the palette too would offer the same action twice under two
@@ -2392,20 +2512,12 @@ export function HomePage() {
     setAnsweredPluginInteractions((current) => new Set(current).add(key));
   }
 
-  /**
-   * Closes the column that holds the recorder.
-   *
-   * Closing the pane is the same act as dismissing the card inside it, so the
-   * recorder's own call is cancelled and the pane follows it out. Without that
-   * the pane would close onto an empty column with the card still waiting.
-   */
+  /** Hides the recorder without interrupting its pending interaction or audio. */
   function closeRecorderPane() {
     if (recordingEntry.open) recordingEntry.close();
-    setRecordingSession(null);
     const target = panelRecorders[0];
-    if (!target || !clients) return;
-    dismissPluginCall(target.callId);
-    void clients.plugins.cancel(target.pluginId, target.callId).catch(() => undefined);
+    if (target) hidePluginCall(target.callId);
+    else setRecordingSession(null);
   }
 
   /**
@@ -2416,17 +2528,14 @@ export function HomePage() {
    * back on top of it the moment the pane closed.
    */
   function putRecorderCardAside() {
-    // A recording that is still running is never interrupted by a pane switch:
-    // the microphone is the one thing here that cannot be re-run, so the pane
-    // stays on top until the recording ends. One that has already produced its
-    // transcript is a document like any other, so it steps aside — and its
-    // transcript stays in the history with the recording.
-    if (recordingSession && recordingSession.status !== "done") return;
-    setRecordingSession(null);
-    const target = panelRecorders[0];
-    if (!target || !clients) return;
-    dismissPluginCall(target.callId);
-    void clients.plugins.cancel(target.pluginId, target.callId).catch(() => undefined);
+    // Switching panes hides every recorder card while leaving its microphone
+    // and pending interaction mounted. A completed transcript can be retired.
+    if (panelRecorders.length > 0) {
+      for (const call of panelRecorders) hiddenPluginSteps.set(call.callId, pluginInteractionSignature(call));
+      setHiddenPluginCalls((current) => new Set([...current, ...panelRecorders.map((call) => call.callId)]));
+    } else if (!recordingSession || recordingSession.status === "done") {
+      setRecordingSession(null);
+    }
   }
 
   /**
@@ -2731,7 +2840,7 @@ export function HomePage() {
         }).catch((error) => {
           dispatch(agentActions.operationFailed("chat", createAgentOperationError({
             source: "send",
-            message: error instanceof Error ? error.message : "network_unavailable",
+            message: pluginInvocationError(error),
             scopeKey: chatScopeKey
           })));
         });
@@ -2758,7 +2867,7 @@ export function HomePage() {
       void clients.plugins.invoke(plugin.id, contribution.capabilityId, { conversationId, input: invocationInput, origin: "user" }).catch((error) => {
         dispatch(agentActions.operationFailed("chat", createAgentOperationError({
           source: "send",
-          message: error instanceof Error ? error.message : "network_unavailable",
+          message: pluginInvocationError(error),
           scopeKey: chatScopeKey
         })));
       });
@@ -3683,7 +3792,10 @@ export function HomePage() {
   // it instead of the recorder hanging over the conversation. The top-bar
   // recording page is a tab of the file preview, so it keeps that panel open
   // rather than this one.
-  const recorderPaneOpen = recordingSession !== null || panelRecorders.length > 0;
+  const recorderPaneMounted = recordingSession !== null || panelRecorders.length > 0;
+  const recorderPaneOpen = !recordingEntry.open && (panelRecorders.length > 0
+    ? panelRecorders.some((call) => !hiddenPluginCalls.has(call.callId))
+    : recordingSession !== null);
   const sidePreviewOpen = previewPanelOpen || pluginArtifactPreview !== null || recorderPaneOpen || recordingEntry.open;
   const previewToggle = previewScope ? (
     <button
@@ -3741,7 +3853,7 @@ export function HomePage() {
       emptyDetail={previewRootLabel}
     />
   ) : null;
-  const pluginPreviewPanel = pluginArtifactPreview && clients && !recordingSession ? (
+  const pluginPreviewPanel = pluginArtifactPreview && clients && (!recordingSession || !recorderPaneOpen) ? (
     <PluginArtifactPreviewPanel
       key={pluginArtifactPreview.id}
       artifact={pluginArtifactPreview}
@@ -3762,17 +3874,21 @@ export function HomePage() {
     uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
     asrClient={clients?.asr}
     onRecordingSession={setRecordingSession}
+                  onRecordingArchived={recordingEntry.archive}
     dismissedCallIds={dismissedPluginCalls}
+    hiddenCallIds={hiddenPluginCalls}
+    onCallHidden={hidePluginCall}
     onCallDismissed={dismissPluginCall}
     answeredInteractions={answeredPluginInteractions}
     onInteractionAnswered={rememberPluginInteraction}
   />;
-  const recordingPreviewPanel = recorderPaneOpen ? (
+  const recordingPreviewPanel = recorderPaneMounted ? (
     <InterviewRecordingPanel
+      hidden={!recorderPaneOpen}
       session={recordingSession}
       bar={panelRecorders.length > 0 ? recordingRecorder : undefined}
       title={panelRecorderTitle ?? undefined}
-      onClose={closeRecorderPane}
+      onClose={() => { closeRecorderPane(); if (!recordingEntry.open) recordingEntry.toggle(); }}
       onWidthChange={setPreviewPanelWidth}
       sharedRowWidth={workspaceLayoutWidth}
       sharedRowReservedWidth={SHARED_ROW_PRIMARY_RESERVE}
@@ -3827,16 +3943,7 @@ export function HomePage() {
                 aria-pressed={false}
                 title={topbarPluginCommand.command.name}
                 data-recording-toggle
-                onClick={() => {
-                  // One panel at a time: the recording page and the file
-                  // preview share the side panel, so opening one closes the
-                  // other.
-                  setPluginArtifactPreview(null);
-                  setPreviewPanelOpen(false);
-                  setEnvironmentPanelOpen(false);
-                  putRecorderCardAside();
-                  recordingEntry.toggle();
-                }}
+                onClick={toggleRecordingEntry}
               >
                 {(() => {
                   const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
@@ -3877,13 +3984,17 @@ export function HomePage() {
                 */}
                 <PluginCapabilityHost
                   region="pinned"
+                  onRequestDiagnosis={generateLegalDiagnosis}
                   calls={visiblePluginCalls}
                   plugins={installedPlugins}
                   client={clients?.plugins ?? null}
                   uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
                   asrClient={clients?.asr}
                   onRecordingSession={setRecordingSession}
+                  onRecordingArchived={recordingEntry.archive}
                   dismissedCallIds={dismissedPluginCalls}
+                  hiddenCallIds={hiddenPluginCalls}
+                  onCallHidden={hidePluginCall}
                   onRegionWheelOverflow={scrollAgentConversationBy}
                   onCallDismissed={dismissPluginCall}
                   answeredInteractions={answeredPluginInteractions}
@@ -4185,22 +4296,34 @@ export function HomePage() {
                 */}
                 <PluginCapabilityHost
                   region="pinned"
+                  onRequestDiagnosis={generateLegalDiagnosis}
                   calls={visiblePluginCalls}
                   plugins={installedPlugins}
                   client={clients?.plugins ?? null}
                   uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
                   asrClient={clients?.asr}
                   onRecordingSession={setRecordingSession}
+                  onRecordingArchived={recordingEntry.archive}
                   dismissedCallIds={dismissedPluginCalls}
+                  hiddenCallIds={hiddenPluginCalls}
+                  onCallHidden={hidePluginCall}
                   onRegionWheelOverflow={scrollAgentConversationBy}
                   onCallDismissed={dismissPluginCall}
                   answeredInteractions={answeredPluginInteractions}
                   onInteractionAnswered={rememberPluginInteraction}
                 />
+                {recordingEntry.compactOpen ? <RecordingEntryCard
+                  session={recordingEntry.session}
+                  disabled={!clients?.asr}
+                  onClose={recordingEntry.closeCompact}
+                  onOpenList={() => { if (!recordingEntry.open) toggleRecordingEntry(); }}
+                /> : null}
                 <PinnedPluginCommandBar
                   targets={selectPinnedPluginCommands(pluginCommandTargets)}
                   disabled={!clients}
                   active={openPinnedCapabilities}
+                  recordingOpen={recordingEntry.compactOpen}
+                  onRecordingPress={recordingEntry.toggleCompact}
                   onPress={invokePinnedPluginCommand}
                 />
                 <div className="agent-composer-stack">
@@ -4773,6 +4896,12 @@ type HomeTranslate = (key: MessageKey, values?: MessageValues) => string;
 
 const defaultHomeTranslate: HomeTranslate = (key, values) => formatMessage(zhCNMessages[key], values);
 
+export function pluginInvocationError(error: unknown): string {
+  return error instanceof ApiRequestError && error.code
+    ? error.code
+    : error instanceof Error ? error.message : "network_unavailable";
+}
+
 export function agentErrorText(error: string | null, t: HomeTranslate = defaultHomeTranslate): string | null {
   if (!error) {
     return null;
@@ -4792,6 +4921,7 @@ export function agentErrorText(error: string | null, t: HomeTranslate = defaultH
 }
 
 const AGENT_OPERATION_ERROR_MESSAGE_KEYS: Record<string, MessageKey> = {
+  plugin_entitlement_required: "home.error.pluginEntitlementRequired",
   network_unavailable: "home.error.network",
   request_timeout: "home.error.timeout",
   project_directory_unavailable: "home.error.projectUnavailable",

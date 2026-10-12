@@ -130,6 +130,35 @@ afterEach(() => {
 });
 
 describe("MCP connection helpers", () => {
+  it("refreshes an already connected plugin catalog after install and disable without closing the transport", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const servers = { plugins: { command: "plugin-bridge" } };
+    saveConfig(new Config({ tools: { mcpServers: servers } }));
+    const names: string[] = [];
+    const session = fakeSession(names);
+    const closed: string[] = [];
+    setMcpRuntimeForTest(runtimeFor({ "plugin-bridge": session }, { closed }) as any);
+    const registry = new ToolRegistry();
+    const state = { mcpServers: servers, mcpStacks: await connectMcpServers(servers, registry) };
+    expect(registry.toolNames).toEqual([]);
+
+    names.push("plugin_session-start", "plugin_material-collect");
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: true, refreshed: ["plugins"] });
+    expect(registry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    expect(registry.has("mcp_plugins_plugin_material-collect")).toBe(true);
+    const stack = state.mcpStacks.plugins;
+    session.listTools = async () => { throw new Error("temporary discovery outage"); };
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: false, failed: ["plugins"] });
+    expect(registry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    session.listTools = fakeSession(names).listTools;
+    names.length = 0;
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: true, refreshed: ["plugins"] });
+    expect(registry.toolNames).toEqual([]);
+    expect(state.mcpStacks.plugins).toBe(stack);
+    expect(closed).toEqual([]);
+    await stack!.aclose();
+  });
   it("sanitizes tool names and safely noops when MCP runtime is unavailable", async () => {
     expect(sanitizeName("mcp/fs.read-file")).toBe("mcp_fs_read-file");
     await expect(connectMcpServers({}, new ToolRegistry())).resolves.toEqual({});

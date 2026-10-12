@@ -94,6 +94,16 @@ function createContext(
 }
 
 describe("PluginService", () => {
+  it("does not download or reinstall an unchanged installed release on account refresh", async () => {
+    const { service, artifactManager } = createContext();
+    await service.install(release.manifest.id);
+    vi.mocked(artifactManager.install).mockClear();
+    await service.update(release.manifest.id);
+    await service.update(release.manifest.id);
+    expect(artifactManager.install).not.toHaveBeenCalled();
+    expect(service.list()).toHaveLength(1);
+  });
+
   it("loads a declared renderer from the installed plugin artifact", async () => {
     const rendererRelease: PluginRelease = {
       manifest: { ...release.manifest, ui: { renderer: { entry: "ui/index.html", capabilities: ["run"] } } }

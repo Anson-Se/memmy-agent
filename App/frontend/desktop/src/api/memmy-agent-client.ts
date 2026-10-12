@@ -489,7 +489,7 @@ const UploadedAgentAudioSchema = z.object({
   bytes: z.number()
 });
 
-const UploadedAgentMediaSchema = z.discriminatedUnion("kind", [
+export const UploadedAgentMediaSchema = z.discriminatedUnion("kind", [
   UploadedAgentImageSchema,
   UploadedAgentFileSchema,
   UploadedAgentAudioSchema

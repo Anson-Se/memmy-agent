@@ -34,19 +34,27 @@ export interface CreatePluginArtifactManagerOptions {
   trustedLocalRoots?: readonly string[];
   /** Supplies account credentials so a registry can gate entitlement-restricted downloads. */
   authHeaders?: () => Record<string, string>;
+  /** Only this origin receives account credentials; signed storage URLs need none. */
+  authOrigin?: string;
 }
 
 export function createPluginArtifactManager(options: CreatePluginArtifactManagerOptions): PluginArtifactManager {
   const configuredInstallRoot = resolve(options.installRoot);
   const trustedLocalRoots = (options.trustedLocalRoots ?? []).map((root) => resolve(root));
   const fetchFn = options.fetchFn ?? fetch.bind(globalThis);
+  const authOrigin = options.authOrigin ? new URL(options.authOrigin).origin : undefined;
 
   return {
     async install(release) {
       if (!release.artifact) return { artifactHash: null, rootPath: null };
-      const bytes = "localPath" in release.artifact && release.artifact.localPath
-        ? await readTrustedLocalArtifact(release.artifact.localPath, trustedLocalRoots)
-        : await downloadArtifact(assertArtifactUrl(release.artifact.url), fetchFn, options.authHeaders?.());
+      let bytes: Buffer;
+      if ("localPath" in release.artifact && release.artifact.localPath) {
+        bytes = await readTrustedLocalArtifact(release.artifact.localPath, trustedLocalRoots);
+      } else {
+        const url = assertArtifactUrl(release.artifact.url);
+        bytes = await downloadArtifact(url, fetchFn,
+          authOrigin && url.origin === authOrigin ? options.authHeaders?.() : undefined);
+      }
       const digest = createHash("sha256").update(bytes).digest("hex");
       if (digest !== release.artifact.sha256.toLowerCase()) {
         throw Object.assign(new Error("Plugin artifact SHA-256 mismatch"), { code: "plugin_invalid" });

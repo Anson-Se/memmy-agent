@@ -348,6 +348,9 @@ function startSse(
       payload: event
     });
   });
+  for (const payload of progressBus.pendingPluginEvents()) {
+    send({ id: randomUUID(), type: "plugin.capability_event", timestamp: new Date().toISOString(), payload });
+  }
 
   const cleanup = () => {
     // Clean up the heartbeat timer promptly after the client disconnects, avoiding orphaned tasks lingering in the background.

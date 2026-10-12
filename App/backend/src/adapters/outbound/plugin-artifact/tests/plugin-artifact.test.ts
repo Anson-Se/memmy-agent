@@ -47,6 +47,27 @@ async function release(fileName = "runtime/plugin.sh") {
 }
 
 describe("PluginArtifactManager", () => {
+  it.each([
+    ["https://registry.example/plugin.zip", true],
+    ["https://memos-file.oss-cn-shanghai.aliyuncs.com/memmy/legal-plugins/legal.zip?Signature=test", false]
+  ])("sends account credentials only to the registry origin: %s", async (url, receivesAuth) => {
+    root = mkdtempSync(join(tmpdir(), "memmy-plugin-artifact-"));
+    const input = await release();
+    input.release.artifact.url = url;
+    const fetchFn = vi.fn<typeof fetch>(async () => new Response(input.bytes));
+    const authHeaders = vi.fn(() => ({ authorization: "Bearer account-token" }));
+    const manager = createPluginArtifactManager({
+      installRoot: root, fetchFn, authHeaders, authOrigin: "https://registry.example/api"
+    });
+    await manager.install(input.release);
+    expect(fetchFn.mock.calls[0]?.[1]?.headers).toEqual({
+      accept: "application/zip, application/octet-stream",
+      ...(receivesAuth ? { authorization: "Bearer account-token" } : {})
+    });
+    expect(authHeaders).toHaveBeenCalledTimes(receivesAuth ? 1 : 0);
+    expect(fetchFn.mock.calls[0]?.[1]?.redirect).toBe("error");
+  });
+
   it("verifies and atomically installs a ZIP artifact", async () => {
     root = mkdtempSync(join(tmpdir(), "memmy-plugin-artifact-"));
     const input = await release();

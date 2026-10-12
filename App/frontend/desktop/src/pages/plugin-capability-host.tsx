@@ -1,3 +1,4 @@
+import type { RecordingArchiveEntry } from "./recording-entry.js";
 import {
   useCallback,
   useEffect,
@@ -15,6 +16,11 @@ import {
   ChevronRight,
   Download,
   FileOutput,
+  FileSpreadsheet,
+  FileText,
+  Folder,
+  Plus,
+  Upload,
   HelpCircle,
   MessageSquarePlus,
   Mic,
@@ -46,6 +52,7 @@ import {
 } from "./interview-recording-panel.js";
 import { materializePluginUploadFile } from "../lib/plugin-upload-file.js";
 import { startBrowserDownload } from "./agent-message-content.js";
+import { RecordingWaveform } from "./recording-waveform.js";
 
 const TASK_STATUS_KEYS = {
   pending: "plugin.ui.task.pending",
@@ -63,6 +70,8 @@ interface PluginCapabilityHostProps {
   asrClient?: AsrClient;
   onAddArtifact?: (artifact: PluginArtifactRef) => void;
   onOpenArtifact?: (artifact: PluginArtifactRef) => void;
+  /** Starts an explicitly requested report after user-raised material collection completes. */
+  onRequestDiagnosis?: (call: PluginUiCall) => Promise<void>;
   /**
    * Which region this host is filling.
    *
@@ -74,15 +83,13 @@ interface PluginCapabilityHostProps {
   region?: PluginCardRegion;
   /** Opens the side panel that a recording interaction transcribes into. */
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
-  /**
-   * Calls the page has already closed, which must not come back as an error.
-   *
-   * A pinned button toggles: the second press cancels the call, and a cancelled
-   * call ends with the plugin reporting that cancellation. Left alone that
-   * report would take the place of the card the user just dismissed, so the
-   * page names the calls it closed and the host drops them instead.
-   */
+  onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
+  /** Explicitly cancelled calls, whose cancellation reports stay dismissed. */
   dismissedCallIds?: ReadonlySet<string>;
+  /** Hidden pending calls stay mounted so inputs and recordings survive. */
+  hiddenCallIds?: ReadonlySet<string>;
+  /** A pinned card's close control only hides it. */
+  onCallHidden?: (callId: string) => void;
   /**
    * Moves the conversation when a gesture runs past the end of a card.
    *
@@ -139,6 +146,27 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const { t } = useTranslation();
   const [localAnsweredInteractions, setLocalAnsweredInteractions] = useState<Set<string>>(() => new Set());
   const [dismissedCalls, setDismissedCalls] = useState<Set<string>>(() => new Set());
+  const diagnosisRequested = useRef(new Set<string>());
+  const responseFlights = useRef(new Map<string, Promise<void>>());
+  const [diagnosisRetries, setDiagnosisRetries] = useState(new Map<string, PluginUiCall>());
+  const retryFlights = useRef(new Set<string>());
+  const [retryingDiagnosis, setRetryingDiagnosis] = useState(new Set<string>());
+  const [pendingDiagnoses, setPendingDiagnoses] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    for (const call of props.calls) {
+      if (!pendingDiagnoses.has(call.callId)) continue;
+      const terminal = call.events.find((event) => event.type === "result" || event.type === "error");
+      if (!terminal) continue;
+      setPendingDiagnoses((current) => { const next = new Set(current); next.delete(call.callId); return next; });
+      if (terminal.type === "result" && !diagnosisRequested.current.has(call.callId)) {
+        diagnosisRequested.current.add(call.callId);
+        void props.onRequestDiagnosis?.(call).catch(() => {
+          setDiagnosisRetries((current) => new Map(current).set(call.callId, call));
+        });
+      }
+    }
+  }, [props.calls, props.onRequestDiagnosis, pendingDiagnoses]);
+
   // The page owns this set once there is more than one region, because a call
   // can move between them mid-flight and the region it lands in has to know
   // what was already answered. Standing alone, the host keeps its own.
@@ -181,7 +209,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
           selectVisiblePluginCalls(props.calls, answeredInteractions)
             .filter((call) => !dismissedCalls.has(`${call.pluginId}:${call.callId}`))
             .filter((call) => !props.dismissedCallIds?.has(call.callId))
-        )
+        ), pinnedCapabilities
       ),
       region,
       pinnedCapabilities
@@ -189,14 +217,34 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
     [answeredInteractions, dismissedCalls, pinnedCapabilities, props.calls, props.dismissedCallIds, region]
   );
   const orderedCalls = useMemo(() => orderPluginCallsForDisplay(calls), [calls]);
-  if (calls.length === 0) return null;
+  const currentRetries = [...diagnosisRetries.values()].filter((retry) => props.calls.some((call) => call.callId === retry.callId));
+  if (calls.length === 0 && currentRetries.length === 0) return null;
 
   return (
     <section
       className={region === "pinned" ? "space-y-3 plugin-capability-region plugin-capability-region--pinned" : "space-y-3 plugin-capability-region"}
       aria-label={t("plugin.ui.regionLabel")}
+      style={currentRetries.length === 0 && calls.length > 0 && calls.every((call) => props.hiddenCallIds?.has(call.callId)
+        && !call.events.some((event) => event.type === "result" || event.type === "error")) ? { display: "none" } : undefined}
       onWheel={region === "pinned" ? forwardWheelOverflow : undefined}
     >
+      {currentRetries.map((call) => <article key={`retry:${call.callId}`} className="diagnostic-upload-card">
+        <div className="diagnostic-upload-card__body"><p className="diagnostic-upload-card__description" role="status">{t("plugin.ui.diagnosisSaved")}</p></div>
+        <footer className="diagnostic-upload-card__footer"><p role="alert">{t("plugin.ui.responseFailed")}</p>
+          <button type="button" className="diagnostic-guidance-card__action diagnostic-guidance-card__action--primary"
+            disabled={retryingDiagnosis.has(call.callId)} onClick={() => {
+              if (retryFlights.current.has(call.callId) || !props.onRequestDiagnosis) return;
+              retryFlights.current.add(call.callId);
+              setRetryingDiagnosis((current) => new Set(current).add(call.callId));
+              void props.onRequestDiagnosis(call).then(() => {
+                setDiagnosisRetries((current) => { const next = new Map(current); next.delete(call.callId); return next; });
+              }).catch(() => undefined).finally(() => {
+                retryFlights.current.delete(call.callId);
+                setRetryingDiagnosis((current) => { const next = new Set(current); next.delete(call.callId); return next; });
+              });
+            }}>{t("plugin.ui.generateDiagnosis")}</button>
+        </footer>
+      </article>)}
       {orderedCalls.map((call) => {
         const plugin = plugins.get(call.pluginId);
         const renderer = plugin?.manifest.ui?.renderer;
@@ -209,7 +257,13 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         );
         const respond = async (interactionId: string, response: unknown) => {
           if (!props.client) return Promise.reject(new Error("Plugin client unavailable"));
-          await props.client.respond(call.pluginId, call.callId, interactionId, response);
+          const key = interactionKey(call, interactionId);
+          if (answeredInteractions.has(key)) return;
+          const existing = responseFlights.current.get(key);
+          if (existing) return existing;
+          const flight = props.client.respond(call.pluginId, call.callId, interactionId, response);
+          responseFlights.current.set(key, flight);
+          try { await flight; } finally { responseFlights.current.delete(key); }
           // A refresh is an intermediate action in a multi-step card. Keep the
           // renderer mounted until its next authoritative interaction arrives.
           if (asRecord(response).action === "refresh") return;
@@ -219,16 +273,20 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
           if (!props.client) return Promise.reject(new Error("Plugin client unavailable"));
           return props.client.cancel(call.pluginId, call.callId);
         };
-        // Closing a card the user raised themselves is not an answer. The call
-        // is cancelled so the plugin stops waiting, and the card is dropped
-        // locally so a cancellation error does not take its place — the user
-        // asked for it to go away, not to be told it went away.
+        const autoPinned = pinnedCapabilities.has(pinnedCapabilityKey(call));
+        // Pinned cards can reopen the same interaction. Other dismissals
+        // explicitly retire the call and hide its cancellation report.
         const dismiss = async () => {
+          if (autoPinned && props.onCallHidden) {
+            props.onCallHidden(call.callId);
+            return;
+          }
           setDismissedCalls((current) => new Set(current).add(`${call.pluginId}:${call.callId}`));
           props.onCallDismissed?.(call.callId);
           await cancel().catch(() => undefined);
         };
-        const autoPinned = pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`);
+        const hidden = props.hiddenCallIds?.has(call.callId)
+          && !call.events.some((event) => event.type === "result" || event.type === "error");
         const dismissable = (call.origin === "user" || (region === "pinned" && autoPinned))
           && call.events.some((event) => event.type === "interaction")
           && !call.events.some((event) => event.type === "result" || event.type === "error");
@@ -238,11 +296,15 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             conversationId={call.conversationId}
             pluginId={call.pluginId}
             origin={call.origin}
+            guidance={call.pluginId === "legal-labor" && call.capabilityId === "session-start"}
+            diagnosticUpload={call.pluginId === "legal-labor" && ["session-start", "material-collect"].includes(call.capabilityId)}
+            onGenerateDiagnosis={call.origin === "user" && props.onRequestDiagnosis
+              ? () => setPendingDiagnoses((current) => new Set(current).add(call.callId)) : undefined}
             onRespond={respond}
             onCancel={cancel}
             onUploadFiles={props.uploadFiles}
             onDismiss={dismissable ? () => void dismiss() : undefined}
-            onRecordingSession={props.onRecordingSession}
+            onRecordingSession={props.onRecordingSession} onRecordingArchived={props.onRecordingArchived}
             asrClient={props.asrClient}
             onAddArtifact={props.onAddArtifact}
             onOpenArtifact={props.onOpenArtifact}
@@ -255,9 +317,11 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         // Progress and task-list events are status updates, not user-facing
         // cards. Keep them in the chat flow as text so a job cannot take over
         // the conversation with a second progress panel.
-        if (isBarePresentation(call) || isStatusOnlyPresentation(call)) return <div key={call.callId}>{cards}</div>;
+        if (isBarePresentation(call) || isStatusOnlyPresentation(call)
+          || (call.pluginId === "legal-labor" && ((call.capabilityId === "session-start" && guidanceQuestion(call.events))
+            || (["session-start", "material-collect"].includes(call.capabilityId) && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input"))))) return <div key={call.callId} hidden={hidden}>{cards}</div>;
         return (
-          <div key={call.callId} className="rounded-card border border-border-stone/30 bg-background-paper p-3 shadow-sm">
+          <div key={call.callId} hidden={hidden} className="rounded-card border border-border-stone/30 bg-background-paper p-3 shadow-sm">
             <div className="mb-2 flex items-start justify-between gap-2">
               <p className="text-xs font-medium text-text-ink/55">
                 {plugin?.manifest.name ?? call.pluginId}
@@ -298,12 +362,16 @@ function GenericPluginCards(props: {
   conversationId?: string;
   pluginId?: string;
   origin?: PluginInvocationOrigin;
+  guidance?: boolean;
+  diagnosticUpload?: boolean;
+  onGenerateDiagnosis?: () => void;
   events: CapabilityEvent[];
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onCancel(): Promise<void>;
   onUploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
   onDismiss?: () => void;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
+  onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
   onAddArtifact?: (artifact: PluginArtifactRef) => void;
   onOpenArtifact?: (artifact: PluginArtifactRef) => void;
@@ -318,20 +386,36 @@ function GenericPluginCards(props: {
   // engagement.
   const setupEvents = artifactEvents.filter((event) => event.artifact.role === "setup");
   const deliverableEvents = artifactEvents.filter((event) => event.artifact.role !== "setup");
+  // Template events remain in the call's history after the guide is answered.
+  // A bare audio step belongs to the recorder, where those files are unrelated.
+  const liveEvents = props.events.filter((event) => event.type !== "artifact");
+  const recordingOnly = !terminal && liveEvents.length > 0
+    && liveEvents.every((event) => event.type === "interaction" && event.request.type === "audio-record");
+  const uploadInteraction = props.diagnosticUpload && !terminal
+    ? props.events.find((event) => event.type === "interaction" && event.request.type === "file-input") : undefined;
+  if (uploadInteraction?.type === "interaction") return <InteractionCard
+    request={uploadInteraction.request} conversationId={props.conversationId} pluginId={props.pluginId}
+    diagnosticUpload onGenerateDiagnosis={props.onGenerateDiagnosis} onDismiss={props.onDismiss}
+    onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
+  const guide = props.guidance && !terminal ? guidanceQuestion(props.events) : undefined;
+  if (guide && setupEvents.length > 0) return <DiagnosticGuidanceCard
+    request={guide} templates={setupEvents} onRespond={props.onRespond}
+    onClose={props.onDismiss} onRead={props.onReadArtifact} />;
+
   return (
     <div className="space-y-2">
       {props.events.filter((event) => event.type !== "artifact").map((event) => {
         if (event.type === "progress") return terminal ? null : <ProgressText key="progress" event={event} canCancel={Boolean(event.cancellable)} onCancel={props.onCancel} />;
         if (event.type === "task-list") return terminal ? null : <TaskText key="tasks" event={event} />;
         if (event.type === "interaction") {
-          return terminal ? null : <InteractionCard key={`interaction:${event.request.interactionId}`} request={event.request} conversationId={props.conversationId} pluginId={props.pluginId} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} onDismiss={props.onDismiss} onRecordingSession={props.onRecordingSession} asrClient={props.asrClient} />;
+          return terminal ? null : <InteractionCard key={`interaction:${event.request.interactionId}`} request={event.request} conversationId={props.conversationId} pluginId={props.pluginId} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} onDismiss={props.onDismiss} onRecordingSession={props.onRecordingSession} onRecordingArchived={props.onRecordingArchived} asrClient={props.asrClient} />;
         }
         if (event.type === "error") {
           return props.origin === "user" && isCancellation(event.code) ? null : <ErrorCard key="error" event={event} />;
         }
         return null;
       })}
-      {setupEvents.length > 0 ? (
+      {setupEvents.length > 0 && !recordingOnly ? (
         <ArtifactGroup
           events={setupEvents}
           labelKey="plugin.ui.setupCollection"
@@ -352,6 +436,61 @@ function GenericPluginCards(props: {
       ) : null}
     </div>
   );
+}
+
+/** The legal plugin's two explicit guidance choices identify its template card. */
+function guidanceQuestion(events: CapabilityEvent[]): PluginInteractionRequest | undefined {
+  const event = events.find((candidate) => {
+    if (candidate.type !== "interaction" || candidate.request.type !== "question") return false;
+    const options = readOptions(asRecord(candidate.request.payload).options);
+    return options.some((option) => option.value === "record") && options.some((option) => option.value === "upload");
+  });
+  return event?.type === "interaction" ? event.request : undefined;
+}
+
+/** Templates remain downloadable independently of the diagnosis interaction. */
+export function DiagnosticGuidanceCard(props: {
+  request: PluginInteractionRequest;
+  templates: Array<Extract<CapabilityEvent, { type: "artifact" }>>;
+  onRespond(interactionId: string, response: unknown): Promise<void>;
+  onClose?: () => void;
+  onRead?: PluginsClient["readArtifact"];
+}) {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<"idle" | "submitting" | "answered" | "error">("idle");
+  const payload = asRecord(props.request.payload);
+  const description = firstString(payload, ["description", "detail", "hint"]) ?? "";
+  const options = readOptions(payload.options);
+  const submitting = useRef(false);
+  const submit = async (value: unknown) => {
+    if (submitting.current) return;
+    submitting.current = true;
+    setStatus("submitting");
+    try { await props.onRespond(props.request.interactionId, value); setStatus("answered"); }
+    catch { submitting.current = false; setStatus("error"); }
+  };
+  return <article className="diagnostic-guidance-card" aria-label={firstString(payload, ["title"]) ?? t("plugin.ui.question")}>
+    <header className="diagnostic-guidance-card__header">
+      <h3>{firstString(payload, ["title"]) ?? t("plugin.ui.question")}</h3>
+      {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
+        title={t("plugin.ui.dismissCard")} disabled={status === "submitting"} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={18} /></button> : null}
+    </header>
+    <div className="diagnostic-guidance-card__templates">
+      {props.templates.map((event) => {
+        const prefix = `《${event.artifact.name}》：`;
+        const detail = description.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length) ?? "";
+        return <ArtifactCard key={event.artifact.id} event={event} onRead={props.onRead} guidanceDescription={detail} />;
+      })}
+    </div>
+    <footer className="diagnostic-guidance-card__footer">
+      {options.map((option) => <button key={String(option.value)} type="button"
+        className={`diagnostic-guidance-card__action${option.value === "record" ? " diagnostic-guidance-card__action--primary" : ""}`}
+        disabled={status === "submitting" || status === "answered"} onClick={() => void submit(option.value)}>
+        {option.value === "record" ? <Mic size={16} aria-hidden="true" /> : <Upload size={16} aria-hidden="true" />}{option.label}
+      </button>)}
+      {status === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
+    </footer>
+  </article>;
 }
 
 function ProgressText(props: {
@@ -412,10 +551,13 @@ function InteractionCard(props: {
   conversationId?: string;
   pluginId?: string;
   request: PluginInteractionRequest;
+  diagnosticUpload?: boolean;
+  onGenerateDiagnosis?: () => void;
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onUploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
   onDismiss?: () => void;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
+  onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
 }) {
   const { t } = useTranslation();
@@ -431,13 +573,17 @@ function InteractionCard(props: {
   const multiple = payload.multiple === true;
   const allowText = questions.length === 0 && (options.length === 0 || payload.allowText === true);
   const disabled = status === "submitting" || status === "answered";
+  const submitting = useRef(false);
 
   const submit = async (response: unknown) => {
+    if (submitting.current) return;
+    submitting.current = true;
     setStatus("submitting");
     try {
       await props.onRespond(props.request.interactionId, response);
       setStatus("answered");
     } catch {
+      submitting.current = false;
       setStatus("error");
     }
   };
@@ -447,20 +593,22 @@ function InteractionCard(props: {
   };
 
   if (props.request.type === "file-input") {
-    return <FileInputCard conversationId={props.conversationId} pluginId={props.pluginId} request={props.request} title={title} description={description} disabled={disabled} status={status} onStatus={setStatus} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
+    return <FileInputCard diagnosticUpload={props.diagnosticUpload} onGenerateDiagnosis={props.onGenerateDiagnosis} onClose={props.onDismiss} conversationId={props.conversationId} pluginId={props.pluginId} request={props.request} title={title} description={description} disabled={disabled} status={status} onStatus={setStatus} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
   }
 
   if (props.request.type === "audio-record") {
     return (
       <AudioRecordCard
+        conversationId={props.conversationId}
         request={props.request}
-        title={title}
+        title={props.pluginId === "legal-labor" ? t("recording.page.title") : title}
+        interview={props.pluginId === "legal-labor"}
         description={description}
         status={status}
         onStatus={setStatus}
         onRespond={props.onRespond}
         onDismiss={props.onDismiss}
-        onRecordingSession={props.onRecordingSession}
+        onRecordingSession={props.onRecordingSession} onRecordingArchived={props.onRecordingArchived}
         asrClient={props.asrClient}
         uploadFiles={props.onUploadFiles}
       />
@@ -538,14 +686,17 @@ function InteractionCard(props: {
  * `onRecordingSession`.
  */
 function AudioRecordCard(props: {
+  conversationId?: string;
   request: PluginInteractionRequest;
   title: string;
+  interview?: boolean;
   description: string | null;
   status: "idle" | "submitting" | "answered" | "error";
   onStatus(value: "idle" | "submitting" | "answered" | "error"): void;
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onDismiss?: () => void;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
+  onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
   uploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
 }) {
@@ -572,6 +723,8 @@ function AudioRecordCard(props: {
     }
   });
   const answered = props.status === "answered";
+  const submitting = useRef(false);
+  const starting = useRef(false);
   const busy = props.status === "submitting" || recorder.isTranscribing;
 
   const remainingMs = asrRecordingTimeRemainingMs(elapsedMs);
@@ -585,19 +738,44 @@ function AudioRecordCard(props: {
   // An object URL outlives the render that made it, so it is revoked when the
   // card goes away rather than left for the tab to collect.
   useEffect(() => () => {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    if (audioUrl?.startsWith("blob:")) URL.revokeObjectURL(audioUrl);
   }, [audioUrl]);
 
   const finish = async () => {
+    if (submitting.current || busy || answered) return;
+    submitting.current = true;
     props.onStatus("submitting");
     try {
       const result = await recorder.finishAndTranscribe({ diarization });
-      setAudioUrl(URL.createObjectURL(result.recording));
+      const blobUrl = URL.createObjectURL(result.recording);
+      setAudioUrl(blobUrl);
       setTranscript({ text: result.text, segments: result.segments ?? [] });
       // The recording and its transcript are deliverables in their own right,
       // so both are persisted and handed back as files. The plugin still never
       // receives audio bytes, only a Host-owned path.
       const files = await persistRecording(result, t, props.uploadFiles);
+      if (files.audio) setAudioUrl(files.audio.url);
+      props.onRecordingArchived?.({
+        id: `plugin:${files.audio?.path ?? props.request.interactionId}`, title: props.title,
+        recordedAt: result.transcribedAt, durationMs: result.durationMs ?? elapsedMs,
+        speakerCount: new Set((result.segments ?? []).map((segment) => segment.speakerId ?? 0)).size || 1,
+        transcript: { text: result.text, segments: result.segments ?? [] },
+        audioUrl: files.audio?.url ?? blobUrl, status: "ready",
+        ...(files.audio ? { audioPath: files.audio.path } : {}),
+        ...(props.conversationId ? { sessionKey: props.conversationId.startsWith("websocket:")
+          ? props.conversationId : `websocket:${props.conversationId}` } : {}),
+        files: [files.audio, files.transcript].filter((file): file is UploadedAgentMedia => file !== undefined)
+      });
+      // Responding may immediately unmount this card. Publish the durable URL
+      // synchronously instead of waiting for a React effect that might never run.
+      finishedRef.current = true;
+      props.onRecordingSession?.({
+        title: props.title, status: "done", elapsedMs: result.durationMs ?? elapsedMs,
+        lines, transcript: { text: result.text, segments: result.segments ?? [] },
+        audioUrl: files.audio?.url ?? blobUrl,
+        onPause: () => undefined, onResume: () => undefined, onFinish: () => undefined,
+        onClose: () => props.onRecordingSession?.(null)
+      });
       await props.onRespond(props.request.interactionId, {
         text: result.text,
         segments: result.segments ?? [],
@@ -607,6 +785,7 @@ function AudioRecordCard(props: {
       });
       props.onStatus("answered");
     } catch {
+      submitting.current = false;
       props.onStatus("error");
     }
   };
@@ -618,23 +797,28 @@ function AudioRecordCard(props: {
   }, [recorder.status, remainingMs]);
 
   const skip = async () => {
+    if (submitting.current || busy || answered) return;
+    submitting.current = true;
     recorder.cancel();
     props.onStatus("submitting");
     try {
       await props.onRespond(props.request.interactionId, { text: "", segments: [], durationMs: 0 });
       props.onStatus("answered");
     } catch {
+      submitting.current = false;
       props.onStatus("error");
     }
   };
 
   const start = () => {
+    if (starting.current || submitting.current || busy || answered || recorder.isRecording || recorder.isStarting) return;
+    starting.current = true;
     setElapsedMs(0);
     setLines([]);
     setLevels([]);
     setTranscript(null);
     setLiveError(null);
-    void recorder.start().catch(() => undefined);
+    void recorder.start().catch(() => undefined).finally(() => { starting.current = false; });
   };
 
   // The panel mirrors the card, so it is published from the card's own state
@@ -692,8 +876,8 @@ function AudioRecordCard(props: {
           : null;
 
   return (
-    <div className={`recording-bar${recorder.isRecording ? " recording-bar--live" : ""}`}>
-      <span className="recording-bar__icon" aria-hidden="true"><Mic size={14} /></span>
+    <div className={`recording-bar${props.interview ? " recording-bar--interview" : ""}${recorder.isRecording ? " recording-bar--live" : ""}`}>
+      <span className="recording-bar__icon" aria-hidden="true"><Mic size={props.interview ? 18 : 14} /></span>
       <p className="recording-bar__title">
         {recorder.isRecording
           ? (recorder.status === "paused" ? t("plugin.ui.audio.paused") : t("plugin.ui.audio.recording"))
@@ -702,7 +886,8 @@ function AudioRecordCard(props: {
       <span className="recording-bar__clock" role="timer" aria-label={t("plugin.ui.audio.elapsed")}>
         {formatClock(elapsedMs)}
       </span>
-      <Waveform levels={levels} active={recorder.status === "recording"} />
+      <RecordingWaveform levels={levels} active={recorder.status === "recording"}
+        idle={!recorder.isRecording && !recorder.isTranscribing && !answered && elapsedMs === 0} />
       <div className="recording-bar__actions">
         {recorder.isRecording ? (
           <>
@@ -739,10 +924,9 @@ function AudioRecordCard(props: {
             className="recording-bar__close"
             aria-label={t("plugin.ui.dismissCard")}
             title={t("plugin.ui.dismissCard")}
-            onClick={() => {
-              recorder.cancel();
-              props.onDismiss?.();
-            }}
+            // Explicit dismissal unmounts this card and the recorder cleans
+            // up then. A visibility-only close keeps the recorder running.
+            onClick={props.onDismiss}
           >
             ✕
           </button>
@@ -764,29 +948,21 @@ function AudioRecordCard(props: {
 const REMAINING_WARNING_MS = 5 * 60 * 1_000;
 
 /** How many bars the recording waveform shows. */
-const WAVEFORM_BARS = 48;
+const WAVEFORM_BARS = 40;
 
-/** Live loudness readout for the recording bar. */
-function Waveform(props: { levels: number[]; active: boolean }) {
-  // Padded to full width so the bars stay put as readings arrive instead of
-  // the whole waveform sliding across the bar.
-  const padded = [
-    ...new Array(Math.max(0, WAVEFORM_BARS - props.levels.length)).fill(0),
-    ...props.levels
-  ];
-  return (
-    <div className={`recording-waveform${props.active ? " recording-waveform--active" : ""}`} aria-hidden="true">
-      {padded.map((level, index) => (
-        <span key={index} className="recording-waveform__bar" style={{ height: `${Math.round(8 + level * 92)}%` }} />
-      ))}
-    </div>
-  );
+function formatUploadFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function FileInputCard(props: {
+export function FileInputCard(props: {
   conversationId?: string;
   pluginId?: string;
   request: PluginInteractionRequest;
+  diagnosticUpload?: boolean;
+  onGenerateDiagnosis?: () => void;
+  onClose?: () => void;
   title: string;
   description: string | null;
   disabled: boolean;
@@ -798,6 +974,7 @@ function FileInputCard(props: {
   const { t } = useTranslation();
   const payload = asRecord(props.request.payload);
   const [files, setFiles] = useState<File[]>([]);
+  const submitting = useRef(false);
   const pendingFeedback = useRef<PluginChatFeedback | null>(null);
   const fileDraftKey = JSON.stringify([props.pluginId, props.conversationId, payload.taskId, payload.cardType, payload.targetPaperId]);
   const fileDrafts = usePluginChatFeedback(payload.chatFeedback === true ? props.conversationId : undefined, (feedback) => {
@@ -810,14 +987,15 @@ function FileInputCard(props: {
   useEffect(() => { if (!props.disabled && pendingFeedback.current) void releaseForChat(); }, [props.disabled]);
   async function releaseForChat() {
     const feedback = pendingFeedback.current;
-    if (!feedback || props.disabled) return;
+    if (!feedback || props.disabled || submitting.current) return;
+    submitting.current = true;
     pendingFeedback.current = null;
     fileDrafts?.set(fileDraftKey, files);
     props.onStatus("submitting");
     try {
       await props.onRespond(props.request.interactionId, { action: "chat-feedback", ...feedback, files: [], values: { selectedFileNames: files.map((file) => file.name) } });
       props.onStatus("answered");
-    } catch { props.onStatus("error"); }
+    } catch { submitting.current = false; props.onStatus("error"); }
   }
 
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -829,6 +1007,7 @@ function FileInputCard(props: {
   const fileStates = files.map((file) => classifyPluginInputFile(file, accept, maxBytes, fileRules, t));
   const readyFiles = fileStates.filter((item) => item.status === "ready").map((item) => item.file);
   const choose = (event: ChangeEvent<HTMLInputElement>) => {
+    if (submitting.current || props.disabled) return;
     // Picking again adds to the selection instead of replacing it. A lawyer
     // assembling a case pulls together a transcript, a workbook and a handful
     // of scans; replacing meant each new file pushed the last one out, so the
@@ -843,6 +1022,7 @@ function FileInputCard(props: {
     setValidationError(validateReadyFileCount(nextReady, maxFiles, minFiles, t));
   };
   const remove = (index: number) => {
+    if (submitting.current || props.disabled) return;
     const next = files.filter((_file, candidateIndex) => candidateIndex !== index);
     setFiles(next);
     if (fileDrafts?.has(fileDraftKey)) {
@@ -853,11 +1033,13 @@ function FileInputCard(props: {
     setValidationError(validateReadyFileCount(nextReady, maxFiles, minFiles, t));
   };
   const upload = async () => {
+    if (submitting.current || props.disabled) return;
     const error = validateReadyFileCount(readyFiles, maxFiles, minFiles, t);
     if (error || !props.onUploadFiles) {
       setValidationError(error ?? t("plugin.ui.responseFailed"));
       return;
     }
+    submitting.current = true;
     props.onStatus("submitting");
     try {
       const uploaded = await props.onUploadFiles(readyFiles.map((file) => {
@@ -875,19 +1057,70 @@ function FileInputCard(props: {
         fileDrafts?.delete(fileDraftKey);
       }
       props.onStatus("answered");
+      if (!feedback) props.onGenerateDiagnosis?.();
     } catch {
+      submitting.current = false;
       props.onStatus("error");
     }
   };
   const skip = async () => {
+    if (submitting.current || props.disabled) return;
+    submitting.current = true;
     props.onStatus("submitting");
     try {
       await props.onRespond(props.request.interactionId, { files: [] });
       props.onStatus("answered");
     } catch {
+      submitting.current = false;
       props.onStatus("error");
     }
   };
+  if (props.diagnosticUpload) return <article className="diagnostic-upload-card" aria-label={props.title}>
+    <header className="diagnostic-upload-card__header">
+      <h3>{props.title}</h3>
+      <span className="diagnostic-upload-card__count">{t("plugin.ui.fileCount", { count: files.length })}</span>
+      {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
+        disabled={props.disabled} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={18} /></button> : null}
+    </header>
+    <div className="diagnostic-upload-card__body">
+      {props.description ? <p className="diagnostic-upload-card__description">{props.description}</p> : null}
+      {fileStates.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
+        {fileStates.map((item, index) => {
+          const spreadsheet = /\.(xlsx?|csv)$/i.test(item.file.name);
+          const Icon = spreadsheet ? FileSpreadsheet : FileText;
+          return <li key={`${item.file.name}:${item.file.size}:${index}`} className="diagnostic-upload-card__file">
+            <span className={`diagnostic-upload-card__file-icon${spreadsheet ? " diagnostic-upload-card__file-icon--sheet" : ""}`} aria-hidden="true"><Icon size={21} /></span>
+            <div className="diagnostic-upload-card__file-info">
+              <p>{item.file.webkitRelativePath || item.file.name}</p>
+              {item.status === "blocked" ? <p className="diagnostic-upload-card__error" role="alert">{item.message}</p> : null}
+            </div>
+            <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(item.file.size)}</span>
+            <button type="button" className="diagnostic-upload-card__remove" disabled={props.disabled}
+              aria-label={t("plugin.ui.removeFile", { name: item.file.name })} onClick={() => remove(index)}><X size={17} /></button>
+          </li>;
+        })}
+      </ul> : <p className="diagnostic-upload-card__empty">{t("plugin.ui.noFiles")}</p>}
+      <div className="diagnostic-upload-card__pickers">
+        <label className="diagnostic-upload-card__picker"><Plus size={16} aria-hidden="true" />{t("plugin.ui.uploadFiles")}
+          <input className="sr-only" type="file" aria-label={t("plugin.ui.uploadFiles")} accept={accept || undefined}
+            multiple={payload.multiple === true} disabled={props.disabled} onChange={choose} />
+        </label>
+        {payload.allowDirectory === true ? <label className="diagnostic-upload-card__picker"><Folder size={16} aria-hidden="true" />{t("plugin.ui.chooseFolder")}
+          <input className="sr-only" type="file" aria-label={t("plugin.ui.chooseFolder")} multiple disabled={props.disabled}
+            onChange={choose} {...{ webkitdirectory: "" } as Record<string, string>} />
+        </label> : null}
+      </div>
+      {validationError ? <p className="diagnostic-upload-card__error" role="alert">{validationError}</p> : null}
+      {props.status === "error" ? <p className="diagnostic-upload-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
+      {props.status === "answered" ? <p role="status">{t("plugin.ui.answered")}</p> : null}
+    </div>
+    <footer className="diagnostic-upload-card__footer">
+      {accept ? <p>{t("plugin.ui.acceptedFormats", { formats: summarizeAcceptedFormats(accept, t) })}</p> : null}
+      <button type="button" className="diagnostic-guidance-card__action diagnostic-guidance-card__action--primary"
+        disabled={props.disabled || readyFiles.length === 0 || Boolean(validationError) || !props.onUploadFiles}
+        onClick={() => void upload()}>{t("plugin.ui.generateDiagnosis")}</button>
+    </footer>
+  </article>;
   return (
     <div className="rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3">
       <div className="flex items-start gap-2">
@@ -1062,17 +1295,21 @@ function ArtifactCard(props: {
   onAddToChat?: (artifact: PluginArtifactRef) => void;
   onOpen?: (artifact: PluginArtifactRef) => void;
   onRead?: PluginsClient["readArtifact"];
+  guidanceDescription?: string;
 }) {
   const { t } = useTranslation();
   const artifact = props.event.artifact;
   const downloadUri = artifact.downloadUri ?? artifact.uri;
   const [downloadState, setDownloadState] = useState<"idle" | "pending" | "error">("idle");
+  const downloading = useRef(false);
   const download = async () => {
+    if (downloading.current) return;
     if (!props.onRead) {
       const safeUri = resolveSafeArtifactUri(downloadUri);
       if (safeUri) startBrowserDownload(safeUri, artifact.name);
       return;
     }
+    downloading.current = true;
     setDownloadState("pending");
     try {
       const blob = await props.onRead(downloadUri);
@@ -1082,8 +1319,26 @@ function ArtifactCard(props: {
       setDownloadState("idle");
     } catch {
       setDownloadState("error");
+    } finally {
+      downloading.current = false;
     }
   };
+  if (props.guidanceDescription !== undefined) {
+    const extension = artifact.name.match(/\.[^.]+$/)?.[0] ?? "";
+    const name = extension ? artifact.name.slice(0, -extension.length) : artifact.name;
+    return <div className="diagnostic-guidance-card__template">
+      <span className="diagnostic-guidance-card__file-icon" aria-hidden="true"><FileSpreadsheet size={25} strokeWidth={1.5} /></span>
+      <div className="diagnostic-guidance-card__file-info">
+        <p className="diagnostic-guidance-card__file-name">{name}<span>{extension}</span></p>
+        {props.guidanceDescription ? <p className="diagnostic-guidance-card__description">{props.guidanceDescription}</p> : null}
+      </div>
+      <button type="button" className="diagnostic-guidance-card__download" disabled={downloadState === "pending"}
+        aria-label={`${t("plugin.ui.download")} ${artifact.name}`} onClick={() => void download()}>
+        <Download size={17} aria-hidden="true" />{t("plugin.ui.download")}
+      </button>
+      {downloadState === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.downloadFailed")}</p> : null}
+    </div>;
+  }
   return (
     <div className="flex items-center gap-3 rounded-card border border-border-stone/30 px-3 py-2.5">
       <FileOutput size={18} className="shrink-0 text-action-sky" aria-hidden="true" />
@@ -1220,23 +1475,27 @@ function interactionKey(call: Pick<PluginUiCall, "pluginId" | "callId">, interac
  */
 export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): PluginUiCall[] {
   const isLive = (call: PluginUiCall) => !call.events.some((event) => event.type === "result" || event.type === "error");
-  const groups = new Map<string, { live?: PluginUiCall; finished?: PluginUiCall }>();
+  const groups = new Map<string, { live: PluginUiCall[]; finished?: PluginUiCall }>();
   const order: string[] = [];
   for (const call of calls) {
-    const key = `${call.pluginId}:${call.capabilityId}`;
+    const key = `${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
     let group = groups.get(key);
     if (!group) {
-      group = {};
+      group = { live: [] };
       groups.set(key, group);
       order.push(key);
     }
-    if (isLive(call)) group.live = call;
+    if (isLive(call)) group.live.push(call);
     else group.finished = call;
   }
   return order
     .flatMap((key) => {
       const group = groups.get(key)!;
-      if (group.live) return [group.live];
+      if (group.live.length) {
+        // A second invocation cannot hide a tool that still needs an answer.
+        const waiting = group.live.filter((call) => call.events.some((event) => event.type === "interaction"));
+        return waiting.length ? waiting : group.live.slice(-1);
+      }
       if (group.finished?.events.some((event) => event.type === "artifact")) return [group.finished];
       return [];
     })
@@ -1274,7 +1533,7 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
     if (hasDeliverableArtifact) return true;
     // A setup-only call that finished (result or dismissed) is history:
     // the templates were handed over and the card has nothing left to offer.
-    if (hasArtifact && terminal) return false;
+    if (hasArtifact && terminal && !hasError) return false;
     if (hasArtifact && !terminal) return true;
     if (hasError) return !recoveredByLaterRetry;
     if (!terminal && call.events.some((event) => event.type === "interaction")) return true;
@@ -1283,18 +1542,16 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
 }
 
 /**
- * Hides user-raised cards while the Agent is waiting on one of its own.
+ * Hides incidental user-raised cards while the Agent is waiting on its own.
  *
- * User-raised cards are pinned entry points the user opens whenever it suits
- * them, so they can already be on screen when the model asks its own question.
- * Two live cards competing for the same answer is ambiguous, and the Agent's is
- * the one blocking progress, so it wins. Nothing is cancelled — the hidden card
- * comes back once the Agent's interaction is answered.
+ * Explicit pinned commands remain available independently of the Agent's
+ * question. Other competing cards return after that question is answered;
+ * hiding them never cancels their calls.
  *
  * @param calls Visible calls.
  * @returns Calls with occluded ones removed.
  */
-export function occludeUserRaisedCalls(calls: PluginUiCall[]): PluginUiCall[] {
+export function occludeUserRaisedCalls(calls: PluginUiCall[], pinnedCapabilities: ReadonlySet<string> = new Set()): PluginUiCall[] {
   const agentIsWaiting = calls.some((call) => (
     call.origin === "agent"
     && call.events.some((event) => event.type === "interaction")
@@ -1307,6 +1564,7 @@ export function occludeUserRaisedCalls(calls: PluginUiCall[]): PluginUiCall[] {
   // reply — so leaving it up costs the Agent's card nothing.
   return calls.filter((call) => (
     call.origin !== "user"
+    || pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`)
     || isBarePresentation(call)
     || !call.events.some((event) => event.type === "interaction")
   ));
@@ -1354,13 +1612,22 @@ export function isStatusOnlyPresentation(call: PluginUiCall): boolean {
  * @param pinnedCapabilities Capability keys represented by a pinned command.
  * @returns The calls that belong to that region.
  */
+/** The guide and its upload step share one composer entry. */
+export function pinnedCapabilityKey(call: PluginUiCall): string {
+  if (call.pluginId === "legal-labor" && call.capabilityId === "material-collect"
+    && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input")) {
+    return "legal-labor:session-start";
+  }
+  return `${call.pluginId}:${call.capabilityId}`;
+}
+
 export function selectRegionPluginCalls(
   calls: PluginUiCall[],
   region: PluginCardRegion,
   pinnedCapabilities: ReadonlySet<string> = new Set()
 ): PluginUiCall[] {
   const isLiveUserCall = (call: PluginUiCall) => (
-    (call.origin === "user" || pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`))
+    (call.origin === "user" || pinnedCapabilities.has(pinnedCapabilityKey(call)))
     && !call.events.some((event) => event.type === "result" || event.type === "error")
   );
   return calls.filter((call) => {

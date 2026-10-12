@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { Window as TestWindow } from "happy-dom";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UploadedAgentMedia, UploadAgentMediaInput } from "../../api/memmy-agent-client.js";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginUiProvider, usePluginUi, reducePluginUiCalls, type PluginUiCall } from "../../app/plugin-ui-context.js";
+import { pressPinnedPluginCommand } from "../home-page.js";
 import { buildRendererDocument, isBarePresentation, isStatusOnlyPresentation, occludeUserRaisedCalls, PluginCapabilityHost, readQuestions, resolveRendererInteractionStates, resolveSafeArtifactUri, selectCurrentPluginCalls, selectRegionPluginCalls, selectVisiblePluginCalls, summarizeAcceptedFormats } from "../plugin-capability-host.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -41,6 +42,31 @@ const plugin = InstalledPluginSchema.parse({
   updatedAt: "2026-08-31T00:00:00.000Z"
 });
 describe("PluginCapabilityHost", () => {
+  it("accepts only the first rapid guidance action, ignores close during submit, and permits retry after failure", async () => {
+    const legal = InstalledPluginSchema.parse({ ...plugin, id: "legal-labor", manifest: {
+      ...plugin.manifest, id: "legal-labor", capabilities: [{ ...plugin.manifest.capabilities[0], id: "session-start" }], commands: [{ command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }]
+    } });
+    let reject!: (error: Error) => void;
+    const respond = vi.fn(() => new Promise<void>((_resolve, fail) => { reject = fail; }));
+    const hidden = vi.fn();
+    const call: PluginUiCall = { pluginId: legal.id, capabilityId: "session-start", callId: "rapid", conversationId: "chat-1", origin: "agent", events: [
+      { type: "artifact", artifact: { id: "setup", name: "template.xlsx", role: "setup", uri: "plugin-artifact://setup", mediaType: "application/vnd.ms-excel" } },
+      { type: "interaction", request: { interactionId: "guide", type: "question", payload: { title: "诊断指引", options: [{ label: "录音", value: "record" }, { label: "上传", value: "upload" }] } } }
+    ] };
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><PluginCapabilityHost
+      region="pinned" calls={[call]} plugins={[legal]} client={{ getUi: vi.fn(), respond, cancel: vi.fn() }} onCallHidden={hidden} /></I18nProvider></PluginUiProvider>));
+    const buttons = container.querySelectorAll<HTMLButtonElement>(".diagnostic-guidance-card__action");
+    const close = container.querySelector<HTMLButtonElement>('[aria-label="关闭卡片"]')!;
+    await act(async () => { buttons[0]!.click(); buttons[1]!.click(); close.click(); });
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith(legal.id, call.callId, "guide", "record");
+    expect(hidden).not.toHaveBeenCalled();
+    await act(async () => reject(new Error("offline")));
+    expect(container.textContent).toContain("提交失败，请重试");
+    respond.mockImplementation(async () => undefined);
+    await act(async () => buttons[1]!.click());
+    expect(respond).toHaveBeenCalledTimes(2);
+  });
   let container: HTMLDivElement;
   let root: Root;
 
@@ -54,6 +80,122 @@ describe("PluginCapabilityHost", () => {
     act(() => root.unmount());
     document.body.replaceChildren();
     vi.restoreAllMocks();
+  });
+
+  it("downloads guidance templates through the host asset reader and only responds to an explicit choice", async () => {
+    const legal = InstalledPluginSchema.parse({ ...plugin, id: "legal-labor", manifest: {
+      ...plugin.manifest, id: "legal-labor", capabilities: [{ ...plugin.manifest.capabilities[0], id: "session-start" }],
+      commands: [{ command: "/legal-guide", name: "诊断指引", description: "Guide", capabilityId: "session-start", pinned: true }]
+    } });
+    const readArtifact = vi.fn().mockRejectedValueOnce(new Error("Asset reader unavailable")).mockResolvedValue(new Blob(["decrypted template"]));
+    const respond = vi.fn(async () => undefined);
+    const cancel = vi.fn(async () => undefined);
+    const call: PluginUiCall = { pluginId: legal.id, capabilityId: "session-start", callId: "guide", origin: "user", events: [
+      { type: "artifact", artifact: { id: "a", name: "准备清单.xlsx", role: "setup", uri: "plugin-artifact://legal-labor/checklist", mediaType: "application/vnd.ms-excel" } },
+      { type: "artifact", artifact: { id: "b", name: "诊断模板.xlsx", role: "setup", uri: "plugin-artifact://legal-labor/workbook", mediaType: "application/vnd.ms-excel" } },
+      { type: "interaction", request: { interactionId: "choice", type: "question", payload: {
+        title: "诊断指引", description: "《准备清单.xlsx》：提前准备企业资料。\n《诊断模板.xlsx》：现场对照并记录。",
+        options: [{ label: "我在现场，要录音", value: "record" }, { label: "已完成调研，上传资料", value: "upload" }]
+      } } }
+    ] };
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><PluginCapabilityHost
+      region="pinned" calls={[call]} plugins={[legal]} client={{ getUi: vi.fn(), readArtifact, respond, cancel }}
+      onCallHidden={vi.fn()} /></I18nProvider></PluginUiProvider>));
+    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(1);
+    expect(container.querySelectorAll(".diagnostic-guidance-card__template")).toHaveLength(2);
+    expect(container.querySelectorAll(".diagnostic-guidance-card__description")[0]?.textContent).toBe("提前准备企业资料。");
+    expect(container.querySelectorAll(".diagnostic-guidance-card__description")[1]?.textContent).toBe("现场对照并记录。");
+    const download = container.querySelector<HTMLButtonElement>('[aria-label="下载 准备清单.xlsx"]')!;
+    await act(async () => { download.click(); download.click(); });
+    expect(container.textContent).toContain("下载失败，请重试");
+    expect(respond).not.toHaveBeenCalled();
+    const objectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:guidance-download");
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    await act(async () => { download.click(); download.click(); });
+    expect(readArtifact).toHaveBeenNthCalledWith(2, "plugin-artifact://legal-labor/checklist");
+    expect(objectUrl).toHaveBeenCalled();
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(container.textContent).not.toContain("下载失败，请重试");
+    expect(respond).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-guidance-card__action--primary")!.click());
+    expect(respond).toHaveBeenCalledWith("legal-labor", "guide", "choice", "record");
+  });
+
+  it.each([
+    { origin: "user", terminal: "result", expected: 1 },
+    { origin: "agent", terminal: "result", expected: 0 },
+    { origin: "user", terminal: "error", expected: 0 }
+  ] as const)("collects legal $origin selections locally and requests a report only after $terminal commits", async ({ origin, terminal, expected }) => {
+    const legal = InstalledPluginSchema.parse({ ...plugin, id: "legal-labor", manifest: {
+      ...plugin.manifest, id: "legal-labor", capabilities: [{ ...plugin.manifest.capabilities[0], id: "session-start" }],
+      commands: [{ command: "/legal-guide", name: "诊断指引", description: "Guide", capabilityId: "session-start", pinned: true }]
+    } });
+    const respond = vi.fn(async () => undefined);
+    const cancel = vi.fn(async () => undefined);
+    const generate = vi.fn(async () => undefined);
+    if (origin === "user" && terminal === "result") generate.mockRejectedValueOnce(new Error("offline"));
+    const upload = vi.fn(async (files: UploadAgentMediaInput[]) => files.map((file) => ({ name: file.name, path: `/staged/${file.name}`, kind: file.kind, mime: file.mime, bytes: file.blob.size, url: "http://localhost/staged" })));
+    const hide = vi.fn();
+    const call: PluginUiCall = { pluginId: legal.id, capabilityId: "session-start", callId: "upload-guide", origin, events: [
+      { type: "artifact", artifact: { id: "setup", role: "setup", name: "template.xlsx", uri: "plugin-artifact://template", mediaType: "application/vnd.ms-excel" } },
+      { type: "interaction", request: { interactionId: "upload", type: "file-input", payload: {
+        title: "补充诊断材料", description: "上传企业资料与现场记录。", accept: ".pdf,.xlsx", multiple: true, allowDirectory: true, maxFiles: 2
+      } } }
+    ] };
+    const mount = (calls: PluginUiCall[]) => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><PluginCapabilityHost
+      region="pinned" calls={calls} plugins={[legal]} client={{ getUi: vi.fn(), respond, cancel }} uploadFiles={upload}
+      onCallHidden={hide} onRequestDiagnosis={generate} /></I18nProvider></PluginUiProvider>);
+    await act(async () => mount([call]));
+    expect(container.querySelectorAll(".diagnostic-upload-card")).toHaveLength(1);
+    expect(container.querySelector(".diagnostic-guidance-card")).toBeNull();
+    expect(container.textContent).not.toContain("template.xlsx");
+    const submit = container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!;
+    expect(submit.textContent).toBe("生成 AI 诊断报告");
+    expect(submit.disabled).toBe(true);
+    const choose = async (input: HTMLInputElement, files: File[]) => act(async () => {
+      Object.defineProperty(input, "files", { configurable: true, value: files });
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const picker = container.querySelector<HTMLInputElement>('input[aria-label="上传文件"]')!;
+    const folder = container.querySelector<HTMLInputElement>('input[webkitdirectory]')!;
+    const pdf = new File(["pdf"], "现场记录.pdf", { type: "application/pdf" });
+    const sheet = new File([new Uint8Array(2048)], "诊断.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    await choose(picker, [pdf]);
+    await choose(folder, [pdf, sheet]);
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(2);
+    expect(container.textContent).toContain("2 个文件");
+    expect(container.textContent).toContain("2.0 KB");
+    expect(upload).not.toHaveBeenCalled();
+    expect(respond).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭卡片"]')!.click());
+    expect(hide).toHaveBeenCalledWith(call.callId);
+    expect(cancel).not.toHaveBeenCalled();
+    await choose(picker, [new File(["third"], "第三份.pdf", { type: "application/pdf" })]);
+    expect(submit.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="移除文件 第三份.pdf"]')!.click());
+    expect(submit.disabled).toBe(false);
+    const closeWhileUploading = container.querySelector<HTMLButtonElement>('[aria-label="关闭卡片"]')!;
+    const hideCount = hide.mock.calls.length;
+    await act(async () => { submit.click(); submit.click(); closeWhileUploading.click(); });
+    expect(hide).toHaveBeenCalledTimes(hideCount);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0]?.[0].map((file) => file.name)).toEqual([pdf.name, sheet.name]);
+    expect(respond).toHaveBeenCalledWith(legal.id, call.callId, "upload", { files: expect.any(Array) });
+    expect(generate).not.toHaveBeenCalled();
+    const done: PluginUiCall = { ...call, events: [...call.events, terminal === "result"
+      ? { type: "result", output: { totalMaterials: 2 } }
+      : { type: "error", code: "collection_failed", message: "Collection failed", retryable: true }] };
+    await act(async () => mount([done]));
+    await act(async () => mount([done]));
+    expect(generate).toHaveBeenCalledTimes(expected);
+    if (expected) {
+      expect(container.textContent).toContain("诊断材料已保存");
+      await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
+      expect(generate).toHaveBeenCalledTimes(2);
+      expect(upload).toHaveBeenCalledTimes(1);
+      expect(container.textContent).not.toContain("诊断材料已保存");
+    }
   });
 
   it("closes a card the user raised without answering the model", async () => {
@@ -75,6 +217,50 @@ describe("PluginCapabilityHost", () => {
     expect(respond).not.toHaveBeenCalled();
     // And the card goes away rather than being replaced by a cancellation error.
     expect(container.textContent).not.toContain("Guidance");
+  });
+
+  it.each(["agent", "user"] as const)("hides and restores a %s guidance call without cancelling, restarting, or uploading", async (origin) => {
+    const pinnedPlugin = InstalledPluginSchema.parse({ ...plugin, manifest: { ...plugin.manifest,
+      commands: [{ command: "/guide", name: "Guidance", description: "Guidance", capabilityId: "run", pinned: true }]
+    } });
+    const client = { getUi: vi.fn(), cancel: vi.fn(async () => undefined), respond: vi.fn(async () => undefined) };
+    const open = vi.fn(async () => undefined);
+    const uploadFiles = vi.fn(async (): Promise<UploadedAgentMedia[]> => [{ path: "/staged/selected.pdf", name: "selected.pdf", kind: "file", mime: "application/pdf", bytes: 4, url: "http://localhost/file" }]);
+    const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "run", callId: "waiting-session", conversationId: "websocket:chat-1", origin, events: [
+      { type: "interaction", request: { interactionId: "upload-materials", type: "file-input", payload: { title: "Guidance", accept: [".pdf"] } } }
+    ] };
+    function Page() {
+      const [hidden, setHidden] = useState(new Set<string>());
+      const hide = (id: string) => setHidden((current) => new Set(current).add(id));
+      return <><button data-testid="toggle" onClick={() => void pressPinnedPluginCommand({
+        calls: [call], pluginId: plugin.id, capabilityId: "run", pinnedCapabilities: new Set([`${plugin.id}:run`]), open,
+        toggleVisibility: (id) => setHidden((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })
+      })}>Guidance toggle</button><PluginCapabilityHost region="pinned" calls={[call]} plugins={[pinnedPlugin]} client={client}
+        hiddenCallIds={hidden} onCallHidden={hide} uploadFiles={uploadFiles} /></>;
+    }
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Page /></I18nProvider></PluginUiProvider>));
+    const picker = container.querySelector('input[type="file"]')!;
+    Object.defineProperty(picker, "files", { value: [new File(["test"], "selected.pdf", { type: "application/pdf" })] });
+    await act(async () => picker.dispatchEvent(new Event("change", { bubbles: true })));
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="toggle"]')!;
+    await act(async () => toggle.click());
+    expect(container.querySelector<HTMLElement>("section")!.style.display).toBe("none");
+    await act(async () => toggle.click());
+    expect(container.querySelector<HTMLElement>("section")!.style.display).toBe("");
+    expect(container.querySelector('input[type="file"]')).toBe(picker);
+    expect(container.textContent).toContain("selected.pdf");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!.click());
+    expect(container.querySelector<HTMLElement>("section")!.style.display).toBe("none");
+    await act(async () => toggle.click());
+    expect(client.cancel).not.toHaveBeenCalled();
+    expect(client.respond).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+    expect(uploadFiles).not.toHaveBeenCalled();
+    await act(async () => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "Upload")!.click());
+    expect(uploadFiles).toHaveBeenCalledTimes(1);
+    expect(client.respond).toHaveBeenCalledTimes(1);
+    expect(client.respond).toHaveBeenCalledWith(plugin.id, "waiting-session", "upload-materials", expect.objectContaining({ files: expect.arrayContaining([expect.objectContaining({ name: "selected.pdf" })]) }));
+    expect(client.cancel).not.toHaveBeenCalled();
   });
 
   it("renders a live user-raised card above the composer and not in the transcript", async () => {

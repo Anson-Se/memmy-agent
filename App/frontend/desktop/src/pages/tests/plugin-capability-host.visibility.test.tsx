@@ -1,0 +1,309 @@
+// @vitest-environment happy-dom
+import { act, useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { InstalledPluginSchema } from "@memmy/local-api-contracts";
+import { expect, it, vi } from "vitest";
+import { I18nProvider } from "../../i18n/i18n-provider.js";
+import { PluginUiProvider, usePluginUi, type PluginUiCall } from "../../app/plugin-ui-context.js";
+import { PluginCapabilityHost } from "../plugin-capability-host.js";
+import { InterviewRecordingPanel } from "../interview-recording-panel.js";
+import { pressPinnedPluginCommand } from "../home-page.js";
+
+const recorder = vi.hoisted(() => ({ cancel: vi.fn(), unmount: vi.fn(), start: vi.fn(), pause: vi.fn(), resume: vi.fn(), finishAndTranscribe: vi.fn() }));
+vi.mock("../asr-recorder.js", async (original) => {
+  const actual = await original<typeof import("../asr-recorder.js")>();
+  const { useEffect } = await import("react");
+  return { ...actual, useAsrRecorder: () => {
+    useEffect(() => recorder.unmount, []);
+    return { ...recorder, status: "recording", isRecording: true, isTranscribing: false, isStarting: false, error: null };
+  } };
+});
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const plugin = InstalledPluginSchema.parse({
+  id: "legal-labor", version: "1.0.0", manifest: {
+    apiVersion: "memmy/v1", id: "legal-labor", name: "Legal", version: "1.0.0", runtime: { adapter: "http" },
+    capabilities: [{ id: "interview-record", name: "Record", description: "Record", inputSchema: {}, outputSchema: {}, execution: "job" }],
+    commands: [{ command: "/record", name: "Record", description: "Record", capabilityId: "interview-record", pinned: true }], permissions: []
+  }, state: "active", approvedPermissions: [], config: {}, lastError: null,
+  createdAt: "2026-10-09T00:00:00.000Z", updatedAt: "2026-10-09T00:00:00.000Z"
+});
+
+it.each(["user", "agent"] as const)("keeps templates out of the %s recorder and restores it without stopping audio", async (origin) => {
+  vi.clearAllMocks();
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
+  const open = vi.fn(async () => undefined);
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "interview-record", callId: "recording", origin, events: [
+    { type: "artifact", artifact: { id: "checklist", name: "准备清单.xlsx", role: "setup", uri: "plugin-artifact://legal-labor/checklist", mediaType: "application/vnd.ms-excel" } },
+    { type: "artifact", artifact: { id: "table", name: "诊断表.xlsx", role: "setup", uri: "plugin-artifact://legal-labor/table", mediaType: "application/vnd.ms-excel" } },
+    { type: "interaction", request: { interactionId: "guide", type: "question", payload: { options: [{ label: "Record", value: "record" }, { label: "Upload", value: "upload" }] } } },
+    { type: "interaction", request: { interactionId: "audio", type: "audio-record", payload: { title: "Recording" } } }
+  ] };
+  function Page() {
+    const [hidden, setHidden] = useState(new Set<string>());
+    const toggle = () => void pressPinnedPluginCommand({ calls: [call], pluginId: plugin.id, capabilityId: call.capabilityId,
+      pinnedCapabilities: new Set([`${plugin.id}:${call.capabilityId}`]), open,
+      toggleVisibility: (id) => setHidden((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; }) });
+    return <><button data-testid="toggle" onClick={toggle}>Toggle</button><InterviewRecordingPanel session={null} hidden={hidden.has(call.callId)} bar={
+      <PluginCapabilityHost region="panel" calls={[call]} plugins={[plugin]} client={client} hiddenCallIds={hidden}
+        answeredInteractions={new Set([`${plugin.id}:recording:guide`])}
+        onCallHidden={(id) => setHidden((current) => new Set(current).add(id))} />
+    } /></>;
+  }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Page /></I18nProvider></PluginUiProvider>));
+    const bar = container.querySelector(".recording-bar")!;
+    expect(bar).not.toBeNull();
+    expect(container.textContent).not.toContain(".xlsx");
+    expect(container.querySelector(".plugin-artifact-card")).toBeNull();
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="toggle"]')!;
+    await act(async () => toggle.click());
+    expect(container.querySelector<HTMLElement>("section")!.style.display).toBe("none");
+    expect(container.querySelector<HTMLElement>("aside")!.style.display).toBe("none");
+    expect(container.querySelector(".sidebar-resize-handle")).toBeNull();
+    await act(async () => toggle.click());
+    expect(container.querySelector(".recording-bar")).toBe(bar);
+    expect(container.textContent).not.toContain(".xlsx");
+    expect(container.querySelector<HTMLElement>("aside")!.hidden).toBe(false);
+    expect(container.querySelector(".sidebar-resize-handle")).not.toBeNull();
+    if (origin === "user") {
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!.click());
+    } else {
+      await act(async () => toggle.click());
+    }
+    expect(container.querySelector<HTMLElement>("section")!.style.display).toBe("none");
+    await act(async () => toggle.click());
+    expect(container.querySelector(".recording-bar")).toBe(bar);
+    expect(recorder.unmount).not.toHaveBeenCalled();
+    expect(recorder.cancel).not.toHaveBeenCalled();
+    expect(recorder.start).not.toHaveBeenCalled();
+    expect(client.cancel).not.toHaveBeenCalled();
+    expect(client.respond).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+  }
+});
+
+it("reopens diagnosis guidance beside an old recording without replacing the recorder or answering the Agent", async () => {
+  const { selectVisiblePluginCalls, selectRegionPluginCalls } = await import("../plugin-capability-host.js");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
+  const pinned = new Set([`${plugin.id}:interview-record`]);
+  const old: PluginUiCall = { pluginId: plugin.id, capabilityId: "interview-record", callId: "old-guide", origin: "user", events: [
+    { type: "interaction", request: { interactionId: "choice", type: "question", payload: { prompt: "Old guidance", options: ["Record"] } } },
+    { type: "interaction", request: { interactionId: "audio", type: "audio-record", payload: { title: "Existing recording" } } }
+  ] };
+  const fresh: PluginUiCall = { ...old, callId: "new-guide", events: [
+    { type: "interaction", request: { interactionId: "guide", type: "question", payload: { prompt: "Diagnosis guidance", options: ["Upload", "Record"] } } }
+  ] };
+  const waiting: PluginUiCall = { ...old, callId: "agent-question", capabilityId: "gap-resolve", origin: "agent", events: [
+    { type: "interaction", request: { interactionId: "gap", type: "question", payload: { prompt: "Agent question", options: ["Answer"] } } }
+  ] };
+  const answered = new Set([`${plugin.id}:old-guide:choice`]);
+  const open = vi.fn();
+  function Page() {
+    const [calls, setCalls] = useState([old, waiting]);
+    const [hidden, setHidden] = useState(new Set<string>());
+    const toggle = () => void pressPinnedPluginCommand({
+      calls: selectRegionPluginCalls(selectVisiblePluginCalls(calls, answered), "pinned", pinned),
+      pluginId: plugin.id, capabilityId: old.capabilityId, pinnedCapabilities: pinned,
+      open: async () => { open(); setCalls((current) => [...current, fresh]); },
+      toggleVisibility: (id) => setHidden((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })
+    });
+    return <><button data-testid="guide" onClick={toggle}>Guide</button>
+      {(["panel", "pinned", "flow"] as const).map((region) => <PluginCapabilityHost key={region} region={region}
+        calls={calls} plugins={[plugin]} client={client} answeredInteractions={answered} hiddenCallIds={hidden} />)}
+    </>;
+  }
+  try {
+    vi.clearAllMocks();
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Page /></I18nProvider></PluginUiProvider>));
+    const bar = container.querySelector(".recording-bar");
+    expect(bar).not.toBeNull();
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!;
+    await act(async () => button.click());
+    expect(container.textContent).toContain("Diagnosis guidance");
+    expect(container.textContent).toContain("Agent question");
+    expect(container.querySelector(".recording-bar")).toBe(bar);
+    await act(async () => button.click());
+    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("none");
+    await act(async () => button.click());
+    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("");
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(recorder.unmount).not.toHaveBeenCalled();
+    expect(recorder.cancel).not.toHaveBeenCalled();
+    expect(client.respond).not.toHaveBeenCalled();
+    expect(client.cancel).not.toHaveBeenCalled();
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+  }
+});
+
+it("keeps every pending confirmation reachable when another call uses the same capability", async () => {
+  const { selectCurrentPluginCalls } = await import("../plugin-capability-host.js");
+  const waiting: PluginUiCall = { pluginId: plugin.id, capabilityId: "session-start", callId: "agent-waiting", conversationId: "websocket:chat-1", origin: "agent", events: [
+    { type: "interaction", request: { type: "question", interactionId: "guide", payload: {} } }
+  ] };
+  const later: PluginUiCall = { ...waiting, callId: "user-opened", origin: "user" };
+  expect(selectCurrentPluginCalls([waiting, later]).map((call) => call.callId)).toEqual([waiting.callId, later.callId]);
+  const { selectPinnedToggleCall } = await import("../home-page.js");
+  expect(selectPinnedToggleCall([waiting, later], plugin.id, waiting.capabilityId, new Set(), new Set([`${plugin.id}:${waiting.capabilityId}`]))).toBe(waiting.callId);
+});
+
+it("reopens the upload step after closing guidance without reopening the same closed step", async () => {
+  const { pluginInteractionSignature, reconcileHiddenPluginCalls, buildLegalDiagnosisContinuation } = await import("../home-page.js");
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "session-start", callId: "workflow", conversationId: "websocket:chat-1", origin: "agent", events: [
+    { type: "interaction", request: { type: "question", interactionId: "guide", payload: {} } }
+  ] };
+  const hidden = new Set([call.callId]);
+  const steps = new Map([[call.callId, pluginInteractionSignature(call)]]);
+  expect(reconcileHiddenPluginCalls(hidden, steps, [call])).toBe(hidden);
+  const next: PluginUiCall = { ...call, events: [{ type: "interaction", request: { type: "file-input", interactionId: "upload", payload: {} } }] };
+  expect(reconcileHiddenPluginCalls(hidden, steps, [next]).size).toBe(0);
+  const done: PluginUiCall = { ...next, events: [{ type: "result", output: { sessionId: "the-uploaded-session" } }] };
+  expect(buildLegalDiagnosisContinuation(done)).toContain('sessionId="the-uploaded-session"');
+  expect(buildLegalDiagnosisContinuation(done)).toContain("跳过 skill 中新建会话");
+  expect(() => buildLegalDiagnosisContinuation(next)).toThrow("会话 ID");
+});
+
+it("opens only one workflow on rapid repeated presses and permits retry after failure", async () => {
+  let complete!: () => void;
+  const open = vi.fn(() => new Promise<void>((resolve) => { complete = resolve; }));
+  const opening = new Set<string>();
+  const options = { calls: [], pluginId: plugin.id, capabilityId: "session-start", pinnedCapabilities: new Set<string>(), toggleVisibility: vi.fn(), opening, open };
+  const first = pressPinnedPluginCommand(options);
+  await Promise.all([pressPinnedPluginCommand(options), pressPinnedPluginCommand(options)]);
+  expect(open).toHaveBeenCalledTimes(1);
+  const otherConversation = vi.fn(async () => undefined);
+  await pressPinnedPluginCommand({ ...options, conversationId: "another-chat", open: otherConversation });
+  expect(otherConversation).toHaveBeenCalledTimes(1);
+  complete();
+  await first;
+  expect(opening.size).toBe(0);
+  await expect(pressPinnedPluginCommand({ ...options, open: async () => { throw new Error("offline"); } })).rejects.toThrow("offline");
+  expect(opening.size).toBe(0);
+});
+
+it("reuses the Agent upload step for every guide press and close/reopen without starting another collection", async () => {
+  const { selectRegionPluginCalls } = await import("../plugin-capability-host.js");
+  const { selectOpenPinnedCapabilities } = await import("../home-page.js");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
+  const open = vi.fn(async () => undefined);
+  const pinned = new Set(["legal-labor:session-start"]);
+  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
+    ...(plugin.manifest.commands ?? []), { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
+  ] } };
+  const upload: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "agent-upload",
+    conversationId: "chat", origin: "agent", events: [{ type: "interaction", request: {
+      interactionId: "upload", type: "file-input", payload: { title: "Supplement diagnosis materials", multiple: true }
+    } }] };
+  expect(selectRegionPluginCalls([upload], "flow", pinned)).toEqual([]);
+  expect(selectRegionPluginCalls([upload], "pinned", pinned)).toEqual([upload]);
+  expect(selectOpenPinnedCapabilities([upload], new Set(), pinned)).toEqual(new Set(["legal-labor:session-start"]));
+  function Page() {
+    const [hidden, setHidden] = useState(new Set<string>());
+    const hide = (id: string) => setHidden((current) => new Set(current).add(id));
+    return <><button data-testid="guide" onClick={() => void pressPinnedPluginCommand({
+      calls: [upload], pluginId: plugin.id, capabilityId: "session-start", pinnedCapabilities: pinned,
+      open, toggleVisibility: (id) => setHidden((current) => {
+        const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next;
+      })
+    })}>Guide</button><PluginCapabilityHost calls={[upload]} plugins={[legal]} client={client}
+      region="pinned" hiddenCallIds={hidden} onCallHidden={hide} /></>;
+  }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Page /></I18nProvider></PluginUiProvider>));
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!;
+    const card = container.querySelector(".diagnostic-upload-card");
+    expect(card).not.toBeNull();
+    for (let index = 0; index < 6; index++) await act(async () => button.click());
+    expect(container.querySelectorAll(".diagnostic-upload-card")).toHaveLength(1);
+    expect(container.querySelector(".diagnostic-upload-card")).toBe(card);
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!.click());
+    await act(async () => button.click());
+    expect(container.querySelector(".diagnostic-upload-card")).toBe(card);
+    expect(open).not.toHaveBeenCalled();
+    expect(client.respond).not.toHaveBeenCalled();
+    expect(client.cancel).not.toHaveBeenCalled();
+  } finally { act(() => root.unmount()); container.remove(); }
+});
+
+it("keeps a closed card and answered guidance closed across settings route remounts", async () => {
+  const { pluginInteractionSignature, reconcileHiddenPluginCalls } = await import("../home-page.js");
+  const { selectVisiblePluginCalls } = await import("../plugin-capability-host.js");
+  const container = document.createElement("div"); document.body.append(container);
+  const root = createRoot(container);
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
+  const open = vi.fn(async () => undefined);
+  const pinned = new Set(["legal-labor:session-start"]);
+  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
+    { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
+  ] } };
+  let ui!: ReturnType<typeof usePluginUi>;
+  let settings!: (value: boolean) => void;
+  function Chat() {
+    const context = usePluginUi();
+    const calls = selectVisiblePluginCalls(context.calls, context.answeredInteractions);
+    useEffect(() => context.setHiddenCallIds((current) => reconcileHiddenPluginCalls(current, context.hiddenInteractionSteps, calls)), [context.calls, context.answeredInteractions]);
+    const hide = (id: string) => {
+      context.hiddenInteractionSteps.set(id, pluginInteractionSignature(calls.find((call) => call.callId === id)));
+      context.setHiddenCallIds((current) => new Set(current).add(id));
+    };
+    return <><button data-testid="guide" onClick={() => void pressPinnedPluginCommand({
+      calls, pluginId: legal.id, capabilityId: "session-start", pinnedCapabilities: pinned, open,
+      toggleVisibility: (id) => context.setHiddenCallIds((current) => {
+        const next = new Set(current); if (next.has(id)) next.delete(id);
+        else { context.hiddenInteractionSteps.set(id, pluginInteractionSignature(calls.find((call) => call.callId === id))); next.add(id); }
+        return next;
+      })
+    })}>Guide</button><PluginCapabilityHost calls={context.calls} plugins={[legal]} client={client} region="pinned"
+      hiddenCallIds={context.hiddenCallIds} answeredInteractions={context.answeredInteractions} onCallHidden={hide}
+      onInteractionAnswered={(key) => context.setAnsweredInteractions((current) => new Set(current).add(key))} /></>;
+  }
+  function Routes() { ui = usePluginUi(); const [isSettings, setSettings] = useState(false); settings = setSettings; return isSettings ? <div>Settings</div> : <Chat />; }
+  const event = (interactionId: string, type: "question" | "file-input") => ({
+    pluginId: legal.id, capabilityId: "session-start", callId: "route-guide", conversationId: "chat", origin: "agent" as const,
+    event: { type: "interaction" as const, request: { interactionId, type, payload: type === "question"
+      ? { title: "Diagnosis guidance", options: [{ label: "Record", value: "record" }, { label: "Upload", value: "upload" }] }
+      : { title: "Supplement diagnosis materials", multiple: true } } }
+  });
+  const close = () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!;
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Routes /></I18nProvider></PluginUiProvider>));
+    await act(async () => ui.receive({ ...event("guide", "question"), event: { type: "artifact", artifact: {
+      id: "route-template", name: "Survey.xlsx", mediaType: "application/vnd.ms-excel", role: "setup",
+      uri: "plugin-artifact://legal-labor/route-template"
+    } } }));
+    await act(async () => ui.receive(event("guide", "question")));
+    await act(async () => close().click());
+    for (let index = 0; index < 3; index++) {
+      await act(async () => settings(true)); await act(async () => settings(false));
+      expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("none");
+    }
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!.click());
+    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("");
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Upload")!.click());
+    expect(ui.answeredInteractions.has("legal-labor:route-guide:guide")).toBe(true);
+    await act(async () => ui.receive(event("upload", "file-input")));
+    expect(container.querySelector(".diagnostic-upload-card")).not.toBeNull();
+    await act(async () => close().click());
+    await act(async () => settings(true)); await act(async () => settings(false));
+    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("none");
+    expect(container.querySelector(".diagnostic-guidance-card")).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!.click());
+    expect(container.querySelectorAll(".diagnostic-upload-card")).toHaveLength(1);
+    expect(client.respond).toHaveBeenCalledTimes(1);
+    expect(client.cancel).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+  } finally { act(() => root.unmount()); container.remove(); }
+});
