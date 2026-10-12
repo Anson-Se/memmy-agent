@@ -5,6 +5,7 @@ import { Window } from "happy-dom";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { InstalledPluginSchema } from "@memmy/local-api-contracts";
+import { ApiRequestError } from "../../api/http.js";
 import { MemmyAgentMessageRejectedError, MemmyAgentRequestError } from "../../api/memmy-agent-client.js";
 import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
 import { AppProviders } from "../../app/providers.js";
@@ -24,6 +25,7 @@ import {
   AgentOperationErrorSlot,
   agentComposerPrimaryAction,
   agentErrorText,
+  pluginInvocationError,
   agentStatusText,
   agentChatScopeKey,
   attachmentFilesFromDataTransfer,
@@ -35,7 +37,8 @@ import {
   selectSlashPluginCommands,
   selectTopbarPluginCommand,
   selectOpenPinnedCapabilities,
-  selectPinnedDismissal,
+  selectPinnedToggleCall,
+  pressPinnedPluginCommand,
   clipboardAttachmentFilesFromDataTransfer,
   dataTransferHasAttachmentFiles,
   hasActiveAgentConversation,
@@ -212,7 +215,7 @@ describe("HomePage", () => {
     ).toBe("/record");
   });
 
-  it("finds the card a pinned button opened so a second press closes it", () => {
+  it("finds the pending card a pinned button can hide or restore", () => {
     const call = (callId: string, origin: "user" | "agent", events: PluginUiCall["events"]): PluginUiCall => ({
       pluginId: "com.example.review",
       capabilityId: "run",
@@ -227,11 +230,11 @@ describe("HomePage", () => {
     const finished: PluginUiCall["events"] = [{ type: "result", output: {} }];
 
     // A live card the user opened is what the button closes.
-    expect(selectPinnedDismissal([call("live", "user", live)], "com.example.review", "run")).toBe("live");
+    expect(selectPinnedToggleCall([call("live", "user", live)], "com.example.review", "run")).toBe("live");
     // An Agent's question is not this button's to close, even under the same
     // plugin and capability: the Agent is still waiting on the answer.
-    expect(selectPinnedDismissal([call("asked", "agent", live)], "com.example.review", "run")).toBeNull();
-    expect(selectPinnedDismissal(
+    expect(selectPinnedToggleCall([call("asked", "agent", live)], "com.example.review", "run")).toBeNull();
+    expect(selectPinnedToggleCall(
       [call("asked", "agent", live)],
       "com.example.review",
       "run",
@@ -240,28 +243,44 @@ describe("HomePage", () => {
     )).toBe("asked");
     // A card that already delivered has nothing left to close, so its button
     // goes back to opening a new one.
-    expect(selectPinnedDismissal([call("done", "user", finished)], "com.example.review", "run")).toBeNull();
+    expect(selectPinnedToggleCall([call("done", "user", finished)], "com.example.review", "run")).toBeNull();
     // Another plugin's card must not be mistaken for this button's.
-    expect(selectPinnedDismissal([call("live", "user", live)], "com.example.other", "run")).toBeNull();
+    expect(selectPinnedToggleCall([call("live", "user", live)], "com.example.other", "run")).toBeNull();
     // With both on screen the newest is the one the button just opened.
     expect(
-      selectPinnedDismissal([call("older", "user", live), call("newer", "user", live)], "com.example.review", "run")
+      selectPinnedToggleCall([call("older", "user", live), call("newer", "user", live)], "com.example.review", "run")
     ).toBe("newer");
     // A card the user just closed is still in the call list until the plugin's
     // cancellation comes back. It is not something a press can close again, so
     // counting it would turn the next press into a no-op instead of reopening.
     expect(
-      selectPinnedDismissal([call("closed", "user", live)], "com.example.review", "run", new Set(["closed"]))
+      selectPinnedToggleCall([call("closed", "user", live)], "com.example.review", "run", new Set(["closed"]))
     ).toBeNull();
     // With the closed one out of the way the press finds the card still open.
     expect(
-      selectPinnedDismissal(
+      selectPinnedToggleCall(
         [call("closed", "user", live), call("open", "user", live)],
         "com.example.review",
         "run",
         new Set(["closed"])
       )
     ).toBe("open");
+  });
+
+  it("opens a fresh card only when there is no pending call to restore", async () => {
+    const open = vi.fn(async () => undefined);
+    const toggleVisibility = vi.fn();
+    const options = { calls: [] as PluginUiCall[], pluginId: "legal-labor", capabilityId: "session-start", pinnedCapabilities: new Set(["legal-labor:session-start"]), open, toggleVisibility };
+    await pressPinnedPluginCommand(options);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(toggleVisibility).not.toHaveBeenCalled();
+    const pending: PluginUiCall = { pluginId: "legal-labor", capabilityId: "session-start", callId: "pending", origin: "agent", events: [] };
+    expect(selectOpenPinnedCapabilities([pending], undefined, options.pinnedCapabilities, new Set(["pending"]))).toEqual(new Set());
+    await pressPinnedPluginCommand({ ...options, calls: [pending] });
+    expect(toggleVisibility).toHaveBeenCalledWith("pending");
+    expect(open).toHaveBeenCalledTimes(1);
+    await pressPinnedPluginCommand({ ...options, calls: [{ ...pending, events: [{ type: "result", result: { sessionId: "session-1" } }] }] });
+    expect(open).toHaveBeenCalledTimes(2);
   });
 
   it("stops highlighting a pinned button the moment its card is closed", () => {
@@ -1616,6 +1635,8 @@ describe("HomePage", () => {
   });
 
   it("translates media send error keys for visible agent errors", () => {
+    const denied = pluginInvocationError(new ApiRequestError("Plugin grant missing", 403, "plugin_entitlement_required"));
+    expect(agentErrorText(denied)).toBe("当前账号未获得此插件的使用授权，请刷新账号状态后重试。");
     expect(agentErrorText("home.media.error.sendUnsupported")).toBe("当前不支持此文件格式。请上传图片、PDF、Office 文档或文本文件。");
     expect(agentErrorText("home.modelSelector.unavailable")).toBe("当前模型或连接已失效，无法继续调用，需要切换模型。");
     expect(agentErrorText("message_request_rejected:model_selection_unavailable")).toBe("当前模型或连接已失效，无法继续调用，需要切换模型。");

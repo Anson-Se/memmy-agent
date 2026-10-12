@@ -25,6 +25,35 @@ const release = {
 };
 
 describe("HttpPluginRegistry", () => {
+  it("resolves the local registry's relative download URL against its origin", async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      ...release, artifact: { ...release.artifact, url: "/api/v1/plugins/com.example.review/artifact?version=1.0.0" }
+    })));
+    const registry = createHttpPluginRegistry({ baseUrl: "https://registry.example", fetchFn });
+    const resolved = await registry.resolve(release.manifest.id);
+    expect(resolved.artifact?.url).toBe("https://registry.example/api/v1/plugins/com.example.review/artifact?version=1.0.0");
+  });
+
+  it("preserves an OSS signature while authenticating only the resolve request", async () => {
+    const url = "https://memos-file.oss-cn-shanghai.aliyuncs.com/memmy/legal-plugins/legal.zip?Expires=123&Signature=a%2Bb%3D";
+    const fetchFn = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      ...release, artifact: { ...release.artifact, url }
+    })));
+    const registry = createHttpPluginRegistry({
+      baseUrl: "https://registry.example", fetchFn, authHeaders: () => ({ authorization: "Bearer test" })
+    });
+    expect((await registry.resolve(release.manifest.id)).artifact?.url).toBe(url);
+    expect(fetchFn.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: "Bearer test" });
+  });
+
+  it("rejects an insecure storage download URL", async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      ...release, artifact: { ...release.artifact, url: "http://storage.example/legal.zip" }
+    })));
+    const registry = createHttpPluginRegistry({ baseUrl: "https://registry.example", fetchFn });
+    await expect(registry.resolve(release.manifest.id)).rejects.toThrow(/HTTPS/);
+  });
+
   it("resolves a plugin by id and version without accepting a client URL", async () => {
     const fetchFn = vi.fn(async () => new Response(JSON.stringify(release), {
       headers: { "content-type": "application/json" }

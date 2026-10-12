@@ -28,4 +28,8 @@ artifacts/literature-review-*.json
 !App/memmy-agent/src/tools/computer-history/win/.gitkeep
 App/backend/src/adapters/outbound/skill-writer/workspace-bridge/memmy-workspace-bridge.mjs
 Memory/src/agent-source/integration/workspace-bridge/memmy-workspace-bridge.mjs
+
+# Office rendering executables and libraries are provisioned during packaging.
+App/memmy-agent/extra-dependencies/office-rendering/*/bin/
+App/memmy-agent/extra-dependencies/office-rendering/*/native/
 /Mac软件打包/

@@ -707,7 +707,7 @@ export class MCPPromptWrapper extends Tool {
   }
 }
 
-type Stack = { close?: () => Promise<void>; aclose: () => Promise<void> };
+type Stack = { close?: () => Promise<void>; aclose: () => Promise<void>; refreshTools?: () => Promise<void> };
 
 async function enterMaybe(context: any, stack: Array<() => Promise<void>>): Promise<any> {
   const value = await context;
@@ -829,30 +829,36 @@ export async function connectMcpServers(
         }
         return { tools, resources, prompts };
       })(), 15, `MCP server '${name}' discovery timed out`);
-      const tools = discovered.tools;
       const enabledTools = new Set(cfgValue(cfg, "enabled_tools", "enabledTools") ?? ["*"]);
       const allowAll = enabledTools.has("*");
-      const matched = new Set<string>();
-      const availableRaw = (tools?.tools ?? []).map((tool: any) => tool.name);
-      const availableWrapped = (tools?.tools ?? []).map((tool: any) => sanitizeName(`mcp_${name}_${tool.name}`));
-      for (const toolDef of tools?.tools ?? []) {
-        const wrapped = sanitizeName(`mcp_${name}_${toolDef.name}`);
-        if (!allowAll && !enabledTools.has(toolDef.name) && !enabledTools.has(wrapped)) continue;
-        registry.register(new MCPToolWrapper(liveSession, name, toolDef, cfgValue(cfg, "tool_timeout", "toolTimeout") ?? 30, undefined, managed));
-        if (enabledTools.has(toolDef.name)) matched.add(toolDef.name);
-        if (enabledTools.has(wrapped)) matched.add(wrapped);
-      }
-      if (enabledTools.size && !allowAll) {
-        const unknown = [...enabledTools].map(String).filter((entry) => !matched.has(entry)
-          && !(managed && ["get_screen_state", "mcp_open_computer_use_get_screen_state"].includes(entry)));
-        if (unknown.length) {
-          console.warn(
-            `MCP server '${name}': enabledTools entries not found: ${unknown.join(", ")}. ` +
-              `Available raw names: ${availableRaw.join(", ") || "(none)"}. ` +
-              `Available wrapped names: ${availableWrapped.join(", ") || "(none)"}`,
-          );
+      const registeredTools = new Set<string>();
+      const registerTools = (tools: any) => {
+        for (const toolName of registeredTools) registry.unregister(toolName);
+        registeredTools.clear();
+        const matched = new Set<string>();
+        const availableRaw = (tools?.tools ?? []).map((tool: any) => tool.name);
+        const availableWrapped = (tools?.tools ?? []).map((tool: any) => sanitizeName(`mcp_${name}_${tool.name}`));
+        for (const toolDef of tools?.tools ?? []) {
+          const wrapped = sanitizeName(`mcp_${name}_${toolDef.name}`);
+          if (!allowAll && !enabledTools.has(toolDef.name) && !enabledTools.has(wrapped)) continue;
+          registry.register(new MCPToolWrapper(liveSession, name, toolDef, cfgValue(cfg, "tool_timeout", "toolTimeout") ?? 30, undefined, managed));
+          registeredTools.add(wrapped);
+          if (enabledTools.has(toolDef.name)) matched.add(toolDef.name);
+          if (enabledTools.has(wrapped)) matched.add(wrapped);
         }
-      }
+        if (enabledTools.size && !allowAll) {
+          const unknown = [...enabledTools].map(String).filter((entry) => !matched.has(entry)
+            && !(managed && ["get_screen_state", "mcp_open_computer_use_get_screen_state"].includes(entry)));
+          if (unknown.length) {
+            console.warn(
+              `MCP server '${name}': enabledTools entries not found: ${unknown.join(", ")}. ` +
+                `Available raw names: ${availableRaw.join(", ") || "(none)"}. ` +
+                `Available wrapped names: ${availableWrapped.join(", ") || "(none)"}`,
+            );
+          }
+        }
+      };
+      registerTools(discovered.tools);
       for (const resource of discovered.resources) {
         registry.register(new MCPResourceWrapper(liveSession, name, resource, cfgValue(cfg, "tool_timeout", "toolTimeout") ?? 30));
       }
@@ -860,6 +866,11 @@ export async function connectMcpServers(
         registry.register(new MCPPromptWrapper(liveSession, name, prompt, cfgValue(cfg, "tool_timeout", "toolTimeout") ?? 30));
       }
       stacks[name] = {
+        refreshTools: async () => {
+          // Discover first so a temporary failure does not discard usable tools or interrupt active calls.
+          const tools = await timeoutPromise(liveSession.listTools?.(), 15, `MCP server '${name}' tool refresh timed out`);
+          registerTools(tools);
+        },
         close: async () => {
           for (const close of closers.reverse()) await close().catch(() => undefined);
         },
@@ -1107,7 +1118,21 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
     state.mcpConnected = Object.keys(state.mcpStacks).length > 0;
 
     const failed = toConnectNames.filter((name) => !(name in connected)).sort();
-    const unchanged = !removed.length && !added.length && !changed.length && !retryMissing.length;
+    const refreshed: string[] = [];
+    // The local plugin bridge's URL stays the same when plugins are installed or disabled.
+    // Refresh its live catalog without replacing the transport used by ongoing interactions.
+    if (nextNames.has("plugins") && !toConnectNames.includes("plugins")) {
+      const refresh = state.mcpStacks?.plugins?.refreshTools;
+      if (refresh) {
+        try {
+          await refresh();
+          refreshed.push("plugins");
+        } catch {
+          failed.push("plugins");
+        }
+      }
+    }
+    const unchanged = !removed.length && !added.length && !changed.length && !retryMissing.length && !refreshed.length;
     let message: string;
     if (failed.length) message = `MCP config reloaded, but some servers did not connect: ${failed.join(", ")}`;
     else if (unchanged) message = "MCP config is already live.";
@@ -1121,6 +1146,7 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
       changed,
       removed,
       retried: retryMissing,
+      refreshed,
       connected: Object.keys(state.mcpStacks).sort(),
       configured: Object.keys(state.mcpServers).sort(),
       failed,

@@ -6,7 +6,9 @@ import {
   useEffect,
   useRef,
   useState,
-  type ReactNode
+  type ReactNode,
+  type Dispatch,
+  type SetStateAction
 } from "react";
 import type { CapabilityEvent, PluginCapabilityEventPayload, PluginInvocationOrigin } from "@memmy/local-api-contracts";
 
@@ -36,6 +38,15 @@ interface PluginUiContextValue {
   registerChatFeedback(conversationId: string, handler: (feedback: PluginChatFeedback) => boolean): () => void;
   routeChatFeedback(chatId: string, feedback: PluginChatFeedback): boolean;
   fileDrafts: Map<string, File[]>;
+  /** Card decisions outlive route pages, just like the calls they belong to. */
+  hiddenCallIds: Set<string>;
+  setHiddenCallIds: Dispatch<SetStateAction<Set<string>>>;
+  hiddenInteractionSteps: Map<string, string>;
+  dismissedCallIds: Set<string>;
+  setDismissedCallIds: Dispatch<SetStateAction<Set<string>>>;
+  answeredInteractions: Set<string>;
+  setAnsweredInteractions: Dispatch<SetStateAction<Set<string>>>;
+  openingCommands: Set<string>;
   calls: PluginUiCall[];
   activeSurface: PluginInvocationContext | null;
   openSurface(context: PluginInvocationContext): void;
@@ -49,6 +60,11 @@ const PluginUiContext = createContext<PluginUiContextValue | null>(null);
 export function PluginUiProvider(props: { children: ReactNode }) {
   const feedbackHandlers = useRef(new Map<symbol, { conversationId: string; handler: (feedback: PluginChatFeedback) => boolean }>());
   const fileDrafts = useRef(new Map<string, File[]>()).current;
+  const [hiddenCallIds, setHiddenCallIds] = useState<Set<string>>(() => new Set());
+  const hiddenInteractionSteps = useRef(new Map<string, string>()).current;
+  const [dismissedCallIds, setDismissedCallIds] = useState<Set<string>>(() => new Set());
+  const [answeredInteractions, setAnsweredInteractions] = useState<Set<string>>(() => new Set());
+  const openingCommands = useRef(new Set<string>()).current;
   const registerChatFeedback = useCallback((conversationId: string, handler: (feedback: PluginChatFeedback) => boolean) => {
     const id = Symbol();
     feedbackHandlers.current.set(id, { conversationId, handler });
@@ -70,7 +86,11 @@ export function PluginUiProvider(props: { children: ReactNode }) {
   }, []);
   const openSurface = useCallback((context: PluginInvocationContext) => setActiveSurface(context), []);
   const closeSurface = useCallback(() => setActiveSurface(null), []);
-  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts }), [activeSurface, calls, closeSurface, openSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts]);
+  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts,
+    hiddenCallIds, setHiddenCallIds, hiddenInteractionSteps, dismissedCallIds, setDismissedCallIds,
+    answeredInteractions, setAnsweredInteractions, openingCommands
+  }), [activeSurface, calls, closeSurface, openSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts,
+    hiddenCallIds, hiddenInteractionSteps, dismissedCallIds, answeredInteractions, openingCommands]);
   return <PluginUiContext.Provider value={value}>{props.children}</PluginUiContext.Provider>;
 }
 
@@ -93,7 +113,11 @@ export function reducePluginUiCalls(
       conversationId: payload.conversationId,
       origin: payload.origin,
       events: [payload.event]
-    }].slice(-MAX_PLUGIN_CALLS);
+    }].filter((call, position, all) => {
+      // Prune completed history, never the sole UI for a still waiting tool.
+      if (!call.events.some((event) => event.type === "result" || event.type === "error")) return true;
+      return position >= all.length - MAX_PLUGIN_CALLS;
+    });
   }
   const current = calls[index]!;
   const next = [...calls];

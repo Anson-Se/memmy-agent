@@ -1,7 +1,7 @@
-import type { AccountChannel } from "@memmy/local-api-contracts";
+import type { AccountChannel, InstalledPlugin } from "@memmy/local-api-contracts";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { resolveCloudClientConfig } from "../config/service-urls.js";
+import { resolveCloudClientConfig, resolvePluginRegistryBaseUrl } from "../config/service-urls.js";
 import type { AppStateStore } from "../infrastructure/app-state-store/index.js";
 import { type MemmyConfigWriter } from "../infrastructure/memmy-config/index.js";
 import type { ScanPreferencesStore } from "../infrastructure/memmy-config/agent-access.js";
@@ -77,6 +77,7 @@ import { createPluginLocalArtifactService } from "./plugin-local-artifact-servic
 import { createPluginModelInferenceService } from "./plugin-model-inference-service.js";
 import { reconcileEntitledPlugins } from "./plugin-entitlement-reconcile-service.js";
 import { createPluginAsrService } from "./plugin-asr-service.js";
+import { createPluginAssetKeyService } from "./plugin-asset-key-service.js";
 import { createPluginHostServiceRouter } from "./plugin-host-service-router.js";
 import { resolvePluginModelSelection } from "./plugin-model-policy.js";
 
@@ -192,6 +193,12 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
   });
   const pluginHostServices = options.pluginHostServices ?? createPluginHostServiceRouter([
     { services: ["model-inference", "embedding-inference"], invoker: pluginModelInference },
+    { services: ["asset-key"], invoker: createPluginAssetKeyService({
+      baseUrl: resolveCloudClientConfig(process.env).baseUrl,
+      getPlugin: (id) => pluginRepository.get(id),
+      authHeaders: pluginRegistryAuthHeaders,
+      isEntitlementGranted
+    }) },
     {
       services: ["asr"],
       invoker: createPluginAsrService({ asr: asrService, audioRoots: pluginFileInputRoots })
@@ -219,6 +226,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
     artifactManager: options.pluginArtifactManager ?? createPluginArtifactManager({
       installRoot: join(dirname(options.appStateStore.databasePath), "plugins"),
       trustedLocalRoots: options.trustedBundledPluginRoots,
+      authOrigin: resolvePluginRegistryBaseUrl(process.env),
       authHeaders: pluginRegistryAuthHeaders
     }),
     skillManager: createPluginSkillManager({ skillsRoot: join(resolveAgentWorkspace(process.env), "skills") }),
@@ -315,12 +323,21 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       memoryClient: options.memoryClient,
       accountChannel: options.accountChannel,
       onAccountGrantsRefreshed: async () => {
+        const previousCapabilities = activePluginCapabilities(plugins.list());
         const failures = await reconcileEntitledPlugins({
           plugins,
           entitlements: accountSessionRepository.getEntitlements()
         });
         for (const failure of failures) {
           console.warn(`Entitled plugin reconciliation failed for ${failure.pluginId}: ${failure.message}`);
+        }
+        if (previousCapabilities !== activePluginCapabilities(plugins.list())) {
+          try {
+            const result = await memmyAgentAdminClient.reloadMcpConfig();
+            if (!result.ok) console.warn(`Agent plugin tool reload did not complete: ${result.message}`);
+          } catch (error) {
+            console.warn(`Agent plugin tool reload unavailable: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
       }
     }),
@@ -447,6 +464,11 @@ function agentApiType(protocol: string): "auto" | "chatCompletions" | "responses
   if (protocol === "openai-responses") return "responses";
   if (protocol === "openai-chat-completions" || protocol === "memmy-account") return "chatCompletions";
   return "auto";
+}
+
+function activePluginCapabilities(plugins: InstalledPlugin[]): string {
+  return JSON.stringify(plugins.filter((plugin) => plugin.state === "active")
+    .map((plugin) => [plugin.id, plugin.version]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
 }
 
 function createUnavailableMemmyConfigWriter(): MemmyConfigWriter {

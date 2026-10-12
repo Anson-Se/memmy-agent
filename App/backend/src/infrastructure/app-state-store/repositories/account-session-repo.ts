@@ -39,6 +39,8 @@ export interface AccountSessionProfileInput extends AccountProfileView {
 
 export interface UpsertAccountSessionInput {
   profile: AccountSessionProfileInput;
+  /** Local edits merge raw fields; cloud refreshes replace them so revoked grants are removed. */
+  rawProfileMode?: "replace" | "merge";
   /** Uuid. */
   uuid?: string;
   /** Cloud uuid. */
@@ -192,7 +194,13 @@ export function createAccountSessionRepository(db: DatabaseSync, secretStore: Se
         toNullableInteger(input.profile.hasFinishedGuide),
         input.profile.region,
         registeredAt,
-        JSON.stringify(buildPersistedRawProfile(previous, input.profile.rawProfile, input.authChannel)),
+        JSON.stringify(buildPersistedRawProfile(
+          previous,
+          input.rawProfileMode === "merge" && previous?.user_id === input.profile.userId
+            ? { ...parseRawProfile(previous.raw_profile_json ?? "{}"), ...input.profile.rawProfile }
+            : input.profile.rawProfile,
+          input.authChannel
+        )),
         previous?.cloud_uuid_ref ?? null,
         now,
         now,

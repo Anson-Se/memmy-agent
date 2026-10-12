@@ -40,6 +40,8 @@ export interface RecordingPanelSession {
 }
 
 export interface InterviewRecordingPanelProps {
+  /** Keeps the recorder mounted while the whole panel is out of view. */
+  hidden?: boolean;
   /**
    * The live recording, once one has started.
    *
@@ -89,7 +91,7 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
 
   return (
     <>
-      <SidebarResizeHandle
+      {!props.hidden && <SidebarResizeHandle
         label={t("workspaceArtifact.resize")}
         width={resize.appliedWidth}
         minWidth={resize.appliedMinWidth}
@@ -97,10 +99,11 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
         isResizing={resize.isResizing}
         onResizeStart={resize.beginResize}
         onResizeBy={resize.resizeBy}
-      />
+      />}
       <aside
         className="workspace-artifact-preview-pane workspace-artifact-preview-pane--lifted"
-        style={resize.sidebarStyle}
+        hidden={props.hidden}
+        style={{ ...resize.sidebarStyle, ...(props.hidden ? { display: "none" } : {}) }}
         aria-label={heading}
       >
       <header className="workspace-artifact-preview-toolbar">
@@ -148,7 +151,7 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
           </div>
         ) : null}
 
-        {session?.audioUrl ? <RecordingPlayer src={session.audioUrl} /> : null}
+        {session?.audioUrl ? <RecordingPlayer src={session.audioUrl} durationMs={session.elapsedMs} /> : null}
 
         {session?.transcript ? (
           <>
@@ -224,12 +227,13 @@ function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): React
 }
 
 /** Playback control for the finished recording. */
-function RecordingPlayer(props: { src: string }): ReactNode {
+export function RecordingPlayer(props: { src: string; durationMs?: number }): ReactNode {
   const { t } = useTranslation();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
-  const [durationMs, setDurationMs] = useState(0);
+  const [durationMs, setDurationMs] = useState(props.durationMs ?? 0);
+  useEffect(() => { setPlaying(false); setCurrentMs(0); setDurationMs(props.durationMs ?? 0); }, [props.src, props.durationMs]);
 
   return (
     <div className="recording-panel__player">
@@ -243,7 +247,7 @@ function RecordingPlayer(props: { src: string }): ReactNode {
         // it is finite.
         onLoadedMetadata={(event) => {
           const seconds = event.currentTarget.duration;
-          if (Number.isFinite(seconds)) setDurationMs(seconds * 1_000);
+          if (Number.isFinite(seconds) && seconds > 0) setDurationMs(seconds * 1_000);
         }}
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}

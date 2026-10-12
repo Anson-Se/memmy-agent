@@ -181,6 +181,7 @@ export function createAccountService(options: CreateAccountServiceOptions): Acco
       }
 
       const updated = options.accountSessionRepository.upsert({
+        rawProfileMode: "merge",
         profile: {
           ...session.profile,
           nickname: input.nickname,

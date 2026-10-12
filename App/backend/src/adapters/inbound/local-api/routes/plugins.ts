@@ -158,6 +158,10 @@ export function registerPluginRoutes(app: FastifyInstance, options: RegisterPlug
       const { id, callId, interactionId } = InteractionParamsSchema.parse(request.params);
       const { response } = PluginInteractionResponseInputSchema.parse(request.body);
       await options.plugins.respond(id, callId, interactionId, response);
+      // Refresh keeps the same prompt active; every other response resolves it.
+      if (!(response && typeof response === "object" && "action" in response && response.action === "refresh")) {
+        options.progressBus.acknowledgePluginInteraction(id, callId, interactionId);
+      }
       return reply.send({ ok: true });
     })
   );

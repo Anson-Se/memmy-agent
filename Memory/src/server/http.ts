@@ -1,4 +1,3 @@
-import { EmbeddingInferenceInputSchema } from "@memmy/local-api-contracts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
@@ -7,6 +6,7 @@ import {
   type AgentSourceExecutor
 } from "../agent-source/runtime.js";
 import {
+  EmbeddingInferenceInputSchema,
   L3WorldModelBoundaryRequestSchema,
   L3WorldModelRequestEnvelopeSchema,
   OpenSessionInputSchema

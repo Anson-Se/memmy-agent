@@ -8,13 +8,12 @@
  * recording becomes a row in that list, and a row can be sent into the
  * conversation either as a summary task or as material for the current one.
  *
- * Recording itself is the same `useAsrRecorder` the plugin's recording card
- * uses. The card is still the path for a recording that has to reach the
- * diagnosis; this page is for the user who wants to capture an interview
- * without a card open.
+ * The composer opens a compact recorder; the top-bar icon opens the list.
+ * They share one recording session. Sending a recording is an explicit action
+ * on its row. Agent-requested recording cards remain separate inputs.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronLeft, Mic, Pause, Play, Plus, Sparkles, Square, Upload } from "lucide-react";
+import { ChevronLeft, Mic, Pause, Play, Plus, Sparkles, Square, Upload, X } from "lucide-react";
 import type { AsrTranscriptSegment } from "@memmy/local-api-contracts";
 import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
@@ -22,9 +21,12 @@ import type { I18nContextValue } from "../i18n/i18n-provider.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { mergeLiveLines, type AsrLiveLine } from "../lib/asr-live-transcription.js";
 import type { RecordingPanelTranscript } from "./interview-recording-panel.js";
-import { formatClock, groupSpeakerTurns } from "./interview-recording-panel.js";
+import { formatClock, groupSpeakerTurns, RecordingPlayer } from "./interview-recording-panel.js";
 import { blobToAudioBase64, isLiveAsrTimeout, useAsrRecorder } from "./asr-recorder.js";
+import { pushWaveformLevel } from "../lib/audio-pcm-tap.js";
 import { persistRecording } from "../lib/recording-deliverables.js";
+import { saveRecordingArchiveEntry, useRecordingArchive } from "../lib/recording-archive.js";
+import { RecordingWaveform } from "./recording-waveform.js";
 
 /**
  * Where a finished recording is sent.
@@ -48,6 +50,10 @@ export interface RecordingArchiveEntry {
   transcript: RecordingPanelTranscript;
   /** Object URL of the audio, when it was captured here and can be played back. */
   audioUrl: string | null;
+  /** Durable audio path; gateway playback URLs are renewed when reopened. */
+  audioPath?: string;
+  sessionKey?: string;
+  files?: UploadedAgentMedia[];
   /** The row can exist before ASR has finished, or when ASR failed. */
   status?: "transcribing" | "ready" | "failed";
 }
@@ -59,6 +65,7 @@ export interface RecordingEntrySession {
   status: "idle" | "starting" | "recording" | "paused" | "transcribing";
   elapsedMs: number;
   lines: AsrLiveLine[];
+  levels?: number[];
   /** The recording captured in this page, once it has been transcribed. */
   live: RecordingArchiveEntry | null;
   /** Captured recordings in this session, newest first. */
@@ -88,9 +95,13 @@ export interface RecordingEntrySession {
 
 export interface RecordingEntryController {
   open: boolean;
+  compactOpen: boolean;
+  toggleCompact(): void;
+  closeCompact(): void;
   toggle(): void;
   close(): void;
   session: RecordingEntrySession;
+  archive(entry: RecordingArchiveEntry): void;
 }
 
 /** Sends a transcript into the conversation, however the host wires that up. */
@@ -115,18 +126,37 @@ export type Translate = I18nContextValue["t"];
 export function useRecordingEntry(
   asrClient: AsrClient | undefined,
   uploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>,
-  deliver?: RecordingDeliverFn
+  deliver?: RecordingDeliverFn,
+  archiveOptions?: { scope: string; sessionKey?: string; resolveAudio(entry: RecordingArchiveEntry): Promise<string | null> }
 ): RecordingEntryController {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const [compactOpen, setCompactOpen] = useState(false);
+  const [levels, setLevels] = useState<number[]>([]);
   const [view, setView] = useState<RecordingEntrySession["view"]>("list");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [lines, setLines] = useState<AsrLiveLine[]>([]);
   const [live, setLive] = useState<RecordingArchiveEntry | null>(null);
   const [recordings, setRecordings] = useState<RecordingArchiveEntry[]>([]);
+  const archived = useRecordingArchive(archiveOptions?.scope);
+  const archive = useCallback((entry: RecordingArchiveEntry) => {
+    if (archiveOptions?.scope) saveRecordingArchiveEntry(archiveOptions.scope, entry);
+    else setRecordings((current) => [entry, ...current.filter((row) => row.id !== entry.id)]);
+  }, [archiveOptions?.scope]);
+  const allRecordings = useMemo(() => [...recordings.filter((row) => !archived.some((entry) => entry.id === row.id
+    || (entry.audioPath && entry.audioPath === row.audioPath))), ...archived]
+    .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt)), [recordings, archived]);
   const [opened, setOpened] = useState<RecordingArchiveEntry | null>(null);
+  const lastScope = useRef(archiveOptions?.scope);
+  useEffect(() => {
+    if (lastScope.current === archiveOptions?.scope) return;
+    lastScope.current = archiveOptions?.scope;
+    setRecordings([]); setLive(null); setOpened(null);
+  }, [archiveOptions?.scope]);
   const [deliverables, setDeliverables] = useState<UploadedAgentMedia[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const startInFlight = useRef(false);
+  const finishInFlight = useRef(false);
   // The transcription request outlives the click that starts it. Keeping the
   // view in a ref lets its completion preserve a deliberate return to the
   // recording list instead of unexpectedly navigating back into the transcript.
@@ -134,6 +164,7 @@ export function useRecordingEntry(
   viewRef.current = view;
   const recorder = useAsrRecorder(asrClient, {
     live: {
+      onLevel: (level) => setLevels((current) => pushWaveformLevel(current, level, 40)),
       onLine: (line) => setLines((current) => mergeLiveLines(current, line)),
       // Same reasoning as the plugin's recording card: a failed live segment
       // or a streaming connection that never opens must not look like nothing
@@ -157,6 +188,8 @@ export function useRecordingEntry(
   }, []);
 
   const finish = useCallback(() => {
+    if (finishInFlight.current || !recorder.isRecording) return;
+    finishInFlight.current = true;
     setError(null);
     void (async () => {
       const id = `rec-${Date.now()}`;
@@ -199,7 +232,13 @@ export function useRecordingEntry(
         transcriptionCompleted = true;
         if (viewRef.current === "live") setView("transcript");
         const files = await persistRecording(result, t, uploadFiles);
-        setDeliverables([files.audio, files.transcript].filter((item): item is UploadedAgentMedia => item !== undefined));
+        const keptFiles = [files.audio, files.transcript].filter((item): item is UploadedAgentMedia => item !== undefined);
+        setDeliverables(keptFiles);
+        const kept = { ...entry, audioUrl: files.audio?.url ?? entry.audioUrl, files: keptFiles,
+          ...(files.audio ? { audioPath: files.audio.path } : {}),
+          ...(archiveOptions?.sessionKey ? { sessionKey: archiveOptions.sessionKey } : {}) };
+        setLive(kept);
+        archive(kept);
       } catch (caught) {
         // The recorder surfaces its own message through `recorder.error`, which
         // the page shows. Keep the stopped audio in the list so returning to
@@ -209,11 +248,16 @@ export function useRecordingEntry(
           setLive((current) => current?.id === id ? { ...current, status: "failed" } : current);
         }
         setError(caught instanceof Error ? caught.message : null);
+      } finally {
+        finishInFlight.current = false;
       }
     })();
-  }, [elapsedMs, recorder, t, uploadFiles]);
+  }, [elapsedMs, recorder, t, uploadFiles, archive, archiveOptions?.sessionKey]);
 
   const start = useCallback(() => {
+    if (!asrClient || startInFlight.current || finishInFlight.current || recorder.isRecording || recorder.isStarting || recorder.isTranscribing) return;
+    startInFlight.current = true;
+    setLevels([]);
     setError(null);
     setLive(null);
     setElapsedMs(0);
@@ -225,8 +269,8 @@ export function useRecordingEntry(
       setError(caught instanceof Error ? caught.message : null);
       viewRef.current = "list";
       setView("list");
-    });
-  }, [recorder]);
+    }).finally(() => { startInFlight.current = false; });
+  }, [asrClient, recorder]);
 
   const upload = useCallback((file: File) => {
     if (!asrClient) {
@@ -259,6 +303,12 @@ export function useRecordingEntry(
         });
         setLive(entry);
         setRecordings((current) => [entry, ...current]);
+        const files = await persistRecording({ ...result, recording: file, recordingMimeType: file.type, durationMs: lastOffset(transcript.segments) }, t, uploadFiles);
+        const keptFiles = [files.audio, files.transcript].filter((item): item is UploadedAgentMedia => item !== undefined);
+        const kept = { ...entry, audioUrl: files.audio?.url ?? audioUrl, files: keptFiles,
+          ...(files.audio ? { audioPath: files.audio.path } : {}),
+          ...(archiveOptions?.sessionKey ? { sessionKey: archiveOptions.sessionKey } : {}) };
+        setLive(kept); setDeliverables(keptFiles); archive(kept);
         if (viewRef.current === "live") {
           viewRef.current = "transcript";
           setView("transcript");
@@ -269,7 +319,7 @@ export function useRecordingEntry(
         setView("list");
       }
     })();
-  }, [asrClient, t]);
+  }, [asrClient, t, uploadFiles, archive, archiveOptions?.sessionKey]);
 
   const reset = useCallback(() => {
     setLive(null);
@@ -281,12 +331,20 @@ export function useRecordingEntry(
     setView("list");
   }, []);
 
-  // Closing the page while the microphone is open would leave it recording with
-  // no way back to it, so closing also stops the recording.
+  // A pane close changes visibility only. Reopening the list offers the active
+  // recording row, so the microphone and any transcription remain reachable.
   const close = useCallback(() => {
-    if (recorder.isRecording) recorder.cancel();
     setOpen(false);
-  }, [recorder]);
+  }, []);
+
+  const toggle = useCallback(() => {
+    if (!open) {
+      setOpened(null);
+      viewRef.current = "list";
+      setView("list");
+    }
+    setOpen(!open);
+  }, [open]);
 
   const status: RecordingEntrySession["status"] = recorder.status === "recording"
     ? "recording"
@@ -303,8 +361,9 @@ export function useRecordingEntry(
     status,
     elapsedMs,
     lines,
+    levels,
     live,
-    recordings,
+    recordings: allRecordings,
     opened,
     deliverables,
     error: !asrClient ? t("plugin.ui.audio.unavailable") : error ?? recorder.error?.message ?? null,
@@ -324,6 +383,11 @@ export function useRecordingEntry(
     },
     open: (entry) => {
       setOpened(entry);
+      if (entry.audioPath && archiveOptions) {
+        void archiveOptions.resolveAudio(entry).then((url) => {
+          if (url) setOpened((current) => current?.id === entry.id ? { ...current, audioUrl: url } : current);
+        }).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : null));
+      }
       viewRef.current = "transcript";
       setView("transcript");
     },
@@ -335,16 +399,55 @@ export function useRecordingEntry(
     },
     reset
   }), [
-    asrClient, deliverables, elapsedMs, error, finish, lines, live, opened, recorder, recordings,
+    asrClient, deliverables, elapsedMs, error, finish, lines, levels, live, opened, recorder, allRecordings, archiveOptions,
     reset, start, status, t, upload, deliver, view
   ]);
 
   return {
+    archive,
     open,
-    toggle: () => setOpen((current) => !current),
+    compactOpen,
+    toggleCompact: () => setCompactOpen((current) => !current),
+    closeCompact: () => setCompactOpen(false),
+    toggle,
     close,
     session
   };
+}
+
+/** Compact composer recorder; hiding it leaves the shared microphone running. */
+export function RecordingEntryCard(props: {
+  session: RecordingEntrySession;
+  disabled?: boolean;
+  onClose(): void;
+  onOpenList(): void;
+}): ReactNode {
+  const { t } = useTranslation();
+  const session = props.session;
+  const recording = session.status === "recording" || session.status === "paused";
+  const busy = session.status === "starting" || session.status === "transcribing";
+  const levels = session.levels ?? [];
+  return <div className={`recording-bar recording-bar--interview recording-entry-card${recording ? " recording-bar--live" : ""}`}>
+    <span className="recording-bar__icon" aria-hidden="true"><Mic size={18} /></span>
+    <p className="recording-bar__title">{recording
+      ? t(session.status === "paused" ? "plugin.ui.audio.paused" : "plugin.ui.audio.recording")
+      : t("recording.page.title")}</p>
+    <span className="recording-bar__clock" role="timer" aria-label={t("plugin.ui.audio.elapsed")}>{formatClock(session.elapsedMs)}</span>
+    <RecordingWaveform levels={levels} active={session.status === "recording"} idle={session.status === "idle"} />
+    <div className="recording-bar__actions">
+      {recording ? <>
+        <button type="button" className="recording-bar__button" onClick={session.status === "paused" ? session.resume : session.pause}>
+          {t(session.status === "paused" ? "plugin.ui.audio.resume" : "plugin.ui.audio.pause")}
+        </button>
+        <button type="button" className="recording-bar__button recording-bar__button--primary" onClick={session.finish}>{t("plugin.ui.audio.stop")}</button>
+      </> : <button type="button" className="recording-bar__button recording-bar__button--primary"
+        disabled={props.disabled || busy} onClick={session.start}>{t("plugin.ui.audio.start")}</button>}
+      {session.live ? <button type="button" className="recording-bar__button" onClick={props.onOpenList}>{t("recording.page.list")}</button> : null}
+      <button type="button" className="recording-bar__close" aria-label={t("plugin.ui.dismissCard")} onClick={props.onClose}><X size={16} /></button>
+    </div>
+    {session.status === "transcribing" ? <span className="recording-bar__note" role="status">{t("plugin.ui.audio.transcribing")}</span> : null}
+    {session.error ? <span className="recording-bar__note recording-bar__note--warning" role="alert">{session.error}</span> : null}
+  </div>;
 }
 
 /**
@@ -539,7 +642,7 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
           </button>
         </div>
       </header>
-      {props.entry.audioUrl ? <RecordingPlayback src={props.entry.audioUrl} /> : null}
+      {props.entry.audioUrl ? <RecordingPlayer src={props.entry.audioUrl} durationMs={props.entry.durationMs} /> : null}
       <p className="recording-panel__section">{t("plugin.ui.audio.transcript")}</p>
       <TranscriptTurns transcript={props.entry.transcript} />
       <div className="recording-page__footer">
@@ -551,11 +654,11 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
           {t("recording.page.newRecording")}
         </button>
       </div>
-      {props.session.deliverables.length > 0 ? (
+      {(props.entry.files?.length ?? 0) > 0 ? (
         <div className="recording-page__deliverables">
           <p className="recording-panel__section">{t("recording.page.deliverables")}</p>
           <ul>
-            {props.session.deliverables.map((item) => (
+            {props.entry.files?.map((item) => (
               <li key={item.path}>
                 <Upload size={13} aria-hidden="true" />
                 <span title={item.name}>{item.name}</span>
@@ -586,64 +689,6 @@ function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): React
           <p className="recording-panel__turn-text">{turn.text}</p>
         </div>
       ))}
-    </div>
-  );
-}
-
-/** Playback control for a finished recording; mirrors the recording panel's. */
-function RecordingPlayback(props: { src: string }): ReactNode {
-  const { t } = useTranslation();
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const [currentMs, setCurrentMs] = useState(0);
-  const [durationMs, setDurationMs] = useState(0);
-  return (
-    <div className="recording-panel__player">
-      <audio
-        ref={audioRef}
-        src={props.src}
-        preload="metadata"
-        onTimeUpdate={(event) => setCurrentMs(event.currentTarget.currentTime * 1_000)}
-        // A MediaRecorder blob often reports an unknown duration until it has
-        // been read through once, so the metadata value is only trusted when
-        // it is finite.
-        onLoadedMetadata={(event) => {
-          const seconds = event.currentTarget.duration;
-          if (Number.isFinite(seconds)) setDurationMs(seconds * 1_000);
-        }}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={() => setPlaying(false)}
-      />
-      <button
-        type="button"
-        className="recording-panel__player-button"
-        aria-label={playing ? t("common.pause") : t("common.play")}
-        onClick={() => {
-          const audio = audioRef.current;
-          if (!audio) return;
-          if (playing) audio.pause();
-          else void audio.play();
-        }}
-      >
-        {playing ? <Pause size={14} aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
-      </button>
-      <span className="recording-panel__player-time">{formatClock(currentMs)}</span>
-      <input
-        type="range"
-        className="recording-panel__player-scrubber"
-        min={0}
-        max={Math.max(durationMs, 1)}
-        value={Math.min(currentMs, durationMs)}
-        aria-label={t("plugin.ui.audio.seek")}
-        onChange={(event) => {
-          const audio = audioRef.current;
-          const nextMs = Number(event.target.value);
-          setCurrentMs(nextMs);
-          if (audio) audio.currentTime = nextMs / 1_000;
-        }}
-      />
-      <span className="recording-panel__player-time">{formatClock(durationMs)}</span>
     </div>
   );
 }

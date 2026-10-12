@@ -14574,11 +14574,12 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   color: var(--color-status-success);
 }
 
-/* Loudness readout. Bars are laid out centre-out so quiet audio reads as a flat line. */
+/* Live loudness uses mic samples; idle has a static mint illustration. */
 .recording-waveform {
   display: flex;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
+  gap: 3px;
   height: 22px;
   flex: 1 1 120px;
   min-width: 80px;
@@ -14586,11 +14587,15 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 }
 
 .recording-waveform__bar {
-  flex: 1 1 0;
-  min-width: 1px;
+  flex: 0 0 1.5px;
+  width: 1.5px;
   border-radius: 1px;
   background: color-mix(in srgb, var(--color-text-ink) 18%, transparent);
   transition: height 90ms linear;
+}
+
+.recording-waveform--idle .recording-waveform__bar {
+  background: color-mix(in srgb, var(--color-action-sky) 35%, transparent);
 }
 
 .recording-waveform--active .recording-waveform__bar {
@@ -14906,6 +14911,86 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+
+/* The composer and legal interview recorder share the same compact treatment. */
+.recording-bar--interview {
+  min-height: 60px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--color-action-sky) 4%, var(--color-background-paper));
+}
+.recording-bar--interview .recording-bar__icon { width: 34px; height: 34px; border-radius: 9px; background: color-mix(in srgb, var(--color-action-sky) 7%, var(--color-background-paper)); }
+.recording-bar--interview .recording-bar__title { font-size: 14px; font-weight: 600; color: var(--color-text-ink); }
+.recording-bar--interview .recording-bar__clock { color: color-mix(in srgb, var(--color-text-ink) 60%, var(--color-background-paper)); }
+.recording-bar--interview .recording-waveform { height: 30px; flex-basis: 60px; min-width: 40px; max-width: 180px; margin: 0 auto; }
+.recording-bar--interview .recording-bar__button { padding: 6px 10px; }
+.recording-bar--interview.recording-bar--live .recording-bar__icon { background: color-mix(in srgb, var(--color-status-error) 8%, var(--color-background-paper)); }
+.recording-entry-card { margin-bottom: 10px; }
+
+/* Diagnosis guidance follows a readable document list above the composer. */
+.diagnostic-guidance-card {
+  overflow: hidden;
+  border: 1px solid var(--color-border-stone);
+  border-radius: 12px;
+  background: var(--color-background-paper);
+  color: var(--color-text-ink);
+}
+.diagnostic-guidance-card__header {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 12px; border-bottom: 1px solid var(--color-border-stone);
+}
+.diagnostic-guidance-card__header h3 { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.5; }
+.diagnostic-guidance-card__close { display: flex; padding: 5px; border-radius: 6px; color: color-mix(in srgb, var(--color-text-ink) 65%, var(--color-background-paper)); }
+.diagnostic-guidance-card__close:hover { color: var(--color-text-ink); background: color-mix(in srgb, var(--color-text-ink) 5%, var(--color-background-paper)); }
+.diagnostic-guidance-card__templates { display: flex; flex-direction: column; gap: 14px; padding: 14px; }
+.diagnostic-guidance-card__template { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.diagnostic-guidance-card__file-icon { display: flex; align-items: center; justify-content: center; width: 28px; height: 34px; flex: none; color: var(--color-status-success); background: color-mix(in srgb, var(--color-status-success) 5%, var(--color-background-paper)); border: 1px solid var(--color-border-stone); border-radius: 3px; }
+.diagnostic-guidance-card__file-info { min-width: 0; }
+.diagnostic-guidance-card__file-name { margin: 0; font-size: 13px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.diagnostic-guidance-card__file-name span { font-weight: 400; color: color-mix(in srgb, var(--color-text-ink) 72%, var(--color-background-paper)); }
+.diagnostic-guidance-card__description { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: color-mix(in srgb, var(--color-text-ink) 78%, var(--color-background-paper)); overflow-wrap: anywhere; }
+.diagnostic-guidance-card__download, .diagnostic-guidance-card__action { display: inline-flex; align-items: center; justify-content: center; gap: 4px; flex: none; padding: 6px 9px; border: 1px solid var(--color-border-stone); border-radius: 8px; font-size: 12px; line-height: 1.5; }
+.diagnostic-guidance-card__download { color: color-mix(in srgb, var(--color-action-sky) 65%, var(--color-text-ink)); }
+.diagnostic-guidance-card__download:hover:not(:disabled) { background: color-mix(in srgb, var(--color-action-sky) 6%, var(--color-background-paper)); }
+.diagnostic-guidance-card__footer { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; padding: 10px 12px; border-top: 1px solid var(--color-border-stone); }
+.diagnostic-guidance-card__action { font-weight: 500; color: var(--color-text-ink); }
+.diagnostic-guidance-card__action--primary { color: #fff; border-color: transparent; background: var(--color-action-sky); }
+.diagnostic-guidance-card__action--primary:hover:not(:disabled) { background: var(--color-action-sky-hover); }
+.diagnostic-guidance-card button:disabled { opacity: .55; cursor: wait; }
+.diagnostic-guidance-card button:focus-visible { outline: 2px solid var(--color-action-sky); outline-offset: 3px; }
+.diagnostic-guidance-card__error { flex-basis: 100%; margin: 0; font-size: 13px; color: var(--color-status-error); }
+
+/* Legal material upload: selection is separate from report submission. */
+.diagnostic-upload-card { overflow: hidden; border: 1px solid var(--color-border-stone); border-radius: 12px; background: var(--color-background-paper); color: var(--color-text-ink); }
+.diagnostic-upload-card__header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--color-border-stone); }
+.diagnostic-upload-card__header h3 { flex: 1; margin: 0; font-size: 14px; font-weight: 600; line-height: 1.5; }
+.diagnostic-upload-card__count { font-size: 13px; color: color-mix(in srgb, var(--color-text-ink) 70%, var(--color-background-paper)); }
+.diagnostic-upload-card__body { padding: 12px; }
+.diagnostic-upload-card__description { margin: 0 0 14px; white-space: pre-line; font-size: 13px; line-height: 1.7; color: color-mix(in srgb, var(--color-text-ink) 78%, var(--color-background-paper)); }
+.diagnostic-upload-card__files { max-height: 220px; overflow: auto; margin: 0; padding: 0; list-style: none; border: 1px solid var(--color-border-stone); border-radius: 9px; }
+.diagnostic-upload-card__file { display: flex; align-items: center; gap: 10px; padding: 10px; }
+.diagnostic-upload-card__file + .diagnostic-upload-card__file { border-top: 1px solid var(--color-border-stone); }
+.diagnostic-upload-card__file-icon { display: flex; flex: none; color: #3978c5; }
+.diagnostic-upload-card__file-icon--sheet { color: var(--color-status-success); }
+.diagnostic-upload-card__file-info { flex: 1; min-width: 0; }
+.diagnostic-upload-card__file-info p { margin: 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.diagnostic-upload-card__file-size { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; color: color-mix(in srgb, var(--color-text-ink) 70%, var(--color-background-paper)); }
+.diagnostic-upload-card__remove { flex: none; padding: 4px; border-radius: 5px; color: color-mix(in srgb, var(--color-text-ink) 65%, var(--color-background-paper)); }
+.diagnostic-upload-card__remove:hover:not(:disabled) { color: var(--color-status-error); }
+.diagnostic-upload-card__pickers { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.diagnostic-upload-card__picker { display: inline-flex; align-items: center; gap: 5px; position: relative; padding: 6px 9px; border: 1px solid var(--color-border-stone); border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; }
+.diagnostic-upload-card__picker:has(input:disabled) { opacity: .55; cursor: default; }
+.diagnostic-upload-card__picker:hover { background: color-mix(in srgb, var(--color-action-sky) 5%, var(--color-background-paper)); }
+.diagnostic-upload-card__picker:focus-within, .diagnostic-upload-card button:focus-visible { outline: 2px solid var(--color-action-sky); outline-offset: 3px; }
+.diagnostic-upload-card__footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--color-border-stone); }
+.diagnostic-upload-card__footer > p, .diagnostic-upload-card__empty { margin: 0; font-size: 13px; line-height: 1.6; color: color-mix(in srgb, var(--color-text-ink) 78%, var(--color-background-paper)); }
+.diagnostic-upload-card__error { margin: 8px 0 0; font-size: 13px; color: var(--color-status-error); }
+.diagnostic-upload-card button:disabled { opacity: .55; cursor: default; }
+@media (max-width: 640px) {
+  .diagnostic-upload-card__header, .diagnostic-upload-card__body { padding: 12px; }
+  .diagnostic-upload-card__file { gap: 8px; padding: 10px 9px; }
+  .diagnostic-upload-card__footer .diagnostic-guidance-card__action { flex: 1 1 200px; }
+}
+
 /* Computer History uses the shared memory header and preference switch.
  * Timeline colours follow the product tokens; destructive actions use error. */
 .ch {
