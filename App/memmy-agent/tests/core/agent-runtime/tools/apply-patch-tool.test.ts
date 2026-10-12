@@ -29,7 +29,7 @@ describe("ApplyPatchTool contract", () => {
     const tool = new ApplyPatchTool({ workspace: workspace() });
 
     expect(tool.description).toBe(
-      "Apply a patch to add, update, delete, or move one or more workspace-relative files.",
+      "Apply a patch to add, update, delete, or move one or more files inside the workspace.",
     );
     expect(tool.parameters).toMatchObject({
       type: "object",
@@ -45,7 +45,9 @@ describe("ApplyPatchTool contract", () => {
     expect(tool.parameters.properties.input.description).toContain("*** Move to:");
     expect(tool.parameters.properties.input.description).toContain("@@");
     expect(tool.parameters.properties.input.description).toContain("*** End of File");
-    expect(tool.parameters.properties.input.description).toContain("workspace-relative");
+    expect(tool.parameters.properties.input.description).toContain(
+      "workspace-relative or absolute paths inside the workspace",
+    );
     expect(tool.parameters.properties.input.description).toContain("at most 20");
   });
 
