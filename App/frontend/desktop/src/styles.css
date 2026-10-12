@@ -13666,7 +13666,14 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   padding: 24px clamp(20px, 6%, 52px) 48px;
   color: color-mix(in srgb, var(--color-text-ink) 86%, transparent);
   font-size: 14px;
+}
+
+.file-preview__markdown {
   line-height: 1.7;
+}
+
+.file-preview__office-document {
+  line-height: 1.15;
 }
 
 .file-preview__markdown > :first-child,
@@ -13693,9 +13700,12 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 
 .file-preview__markdown p,
 .file-preview__markdown ul,
-.file-preview__markdown ol,
-.file-preview__office-document p {
+.file-preview__markdown ol {
   margin: 0.75em 0;
+}
+
+.file-preview__office-document p {
+  margin: 0;
 }
 
 .file-preview__markdown code {
@@ -13746,6 +13756,21 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   font-size: 12px;
 }
 
+.file-preview__office-document table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+  tab-size: 4;
+}
+
+.file-preview__office-document td {
+  white-space: pre-wrap;
+}
+
+.file-preview__office-document td p {
+  margin: 0;
+}
+
 .file-preview__markdown th,
 .file-preview__markdown td,
 .file-preview__office-document td,
@@ -13759,6 +13784,82 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 
 .file-preview__office-space {
   height: 12px;
+}
+
+.file-preview__office-image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin: 0.8em auto;
+}
+
+.file-preview__office-drawing {
+  position: relative;
+  container-type: inline-size;
+  margin: 0.9em auto;
+}
+
+.file-preview__office-drawing-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.file-preview__office-drawing-svg marker path {
+  fill: #222;
+}
+
+.file-preview__office-shape {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 3px;
+  background: #fff;
+  color: #222;
+  text-align: center;
+}
+
+.file-preview__office-shape.is-box,
+.file-preview__office-shape.is-round {
+  border: 1px solid #222;
+}
+
+.file-preview__office-shape.is-round {
+  border-radius: 999px;
+}
+
+.file-preview__office-shape.is-diamond,
+.file-preview__office-shape.is-label {
+  background: transparent;
+  border: 0;
+}
+
+.file-preview__office-diamond {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.file-preview__office-diamond polygon {
+  fill: #fff;
+  stroke: #222;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.file-preview__office-shape-text {
+  position: relative;
+  z-index: 1;
+  font-size: clamp(10px, 2.3cqw, 14px);
+  line-height: 1.2;
+  white-space: pre-wrap;
 }
 
 .file-preview__spreadsheet {
