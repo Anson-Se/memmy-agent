@@ -3,7 +3,7 @@
 /** OOXML preview parser tests. */
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
-import { readDocxBlocks, readXlsxSheets } from "../office-preview.js";
+import { docxLineHeightCss, readDocxBlocks, readXlsxSheets, type DocxBlock, type DocxTableCell } from "../office-preview.js";
 
 const WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -41,9 +41,10 @@ describe("docx preview parser", () => {
     expect(blocks[3]).toEqual({ kind: "paragraph", headingLevel: null, spans: [] });
     expect(blocks[4]).toEqual({
       kind: "table",
+      columnWidths: [],
       rows: [
-        [[{ text: "板块", bold: false, italic: false }], [{ text: "判定", bold: false, italic: false }]],
-        [[{ text: "社保", bold: false, italic: false }], [{ text: "不合规", bold: false, italic: false }]]
+        [cell("板块"), cell("判定")],
+        [cell("社保"), cell("不合规")]
       ]
     });
   });
@@ -65,7 +66,172 @@ describe("docx preview parser", () => {
     `));
 
     const table = blocks[0] as Extract<typeof blocks[number], { kind: "table" }>;
-    expect(table.rows[0]?.[0]).toEqual([{ text: "外层", bold: false, italic: false }]);
+    expect(table.rows[0]?.[0]?.content).toEqual([
+      paragraph("外层"),
+      {
+        kind: "table",
+        columnWidths: [],
+        rows: [[cell("内层")]]
+      }
+    ]);
+  });
+
+  it("keeps content controls, merged cells, column widths, and separate paragraphs", async () => {
+    const blocks = await readDocxBlocks(await buildDocx(`
+      <w:sdt><w:sdtContent><w:p><w:r><w:t>控件内</w:t></w:r></w:p></w:sdtContent></w:sdt>
+      <w:tbl>
+        <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="4000"/></w:tblGrid>
+        <w:tr>
+          <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>标题</w:t></w:r></w:p><w:p><w:r><w:t>副题</w:t></w:r></w:p></w:tc>
+        </w:tr>
+        <w:tr>
+          <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>合并</w:t></w:r></w:p></w:tc>
+          <w:tc><w:p><w:r><w:t>右上</w:t></w:r></w:p></w:tc>
+        </w:tr>
+        <w:tr>
+          <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>被并入</w:t></w:r></w:p></w:tc>
+          <w:tc><w:p><w:r><w:t>右下</w:t></w:r></w:p></w:tc>
+        </w:tr>
+      </w:tbl>
+    `));
+
+    expect(blocks[0]).toEqual(paragraph("控件内"));
+    const table = blocks[1] as Extract<typeof blocks[number], { kind: "table" }>;
+    expect(table.columnWidths).toEqual([2000, 4000]);
+    expect(table.rows[0]).toEqual([cell("标题", { colSpan: 2, content: [paragraph("标题"), paragraph("副题")] })]);
+    expect(table.rows[1]?.[0]).toMatchObject({ rowSpan: 2, content: [paragraph("合并")] });
+    expect(table.rows[1]?.map((item) => item.content[0])).toEqual([paragraph("合并"), paragraph("右上")]);
+    expect(table.rows[2]).toEqual([cell("右下")]);
+  });
+
+  it("applies direct paragraph metrics and inherits style spacing", async () => {
+    const blocks = await readDocxBlocks(await buildDocx(`
+      <w:p>
+        <w:pPr>
+          <w:ind w:left="720" w:firstLineChars="200"/>
+          <w:spacing w:before="200" w:after="80" w:line="276" w:lineRule="exact"/>
+          <w:jc w:val="right"/>
+        </w:pPr>
+        <w:r><w:t>直接</w:t></w:r>
+      </w:p>
+      <w:p>
+        <w:pPr><w:pStyle w:val="Note"/></w:pPr>
+        <w:r><w:t>样式</w:t></w:r>
+      </w:p>
+      <w:p>
+        <w:pPr>
+          <w:pStyle w:val="Note"/>
+          <w:ind w:hanging="360"/>
+          <w:spacing w:after="0" w:beforeLines="100"/>
+        </w:pPr>
+        <w:r><w:t>悬挂</w:t></w:r>
+      </w:p>
+    `, `
+      <w:docDefaults><w:pPrDefault><w:pPr>
+        <w:spacing w:after="120" w:line="360" w:lineRule="auto"/>
+      </w:pPr></w:pPrDefault></w:docDefaults>
+      <w:style w:styleId="Body"><w:pPr>
+        <w:ind w:left="420"/>
+        <w:jc w:val="both"/>
+      </w:pPr></w:style>
+      <w:style w:styleId="Note"><w:basedOn w:val="Body"/><w:pPr>
+        <w:jc w:val="center"/>
+      </w:pPr></w:style>
+    `));
+
+    expect(blocks[0]).toMatchObject({
+      format: {
+        align: "right",
+        indentLeft: 720,
+        firstLineChars: 200,
+        before: 200,
+        after: 80,
+        line: 276,
+        lineRule: "exact"
+      }
+    });
+    expect(blocks[1]).toMatchObject({
+      format: {
+        align: "center",
+        indentLeft: 420,
+        after: 120,
+        line: 360,
+        lineRule: "auto"
+      }
+    });
+    expect(docxLineHeightCss(14, "auto")).toBe(1);
+    expect(docxLineHeightCss(360, "auto")).toBe(1.5);
+    expect(docxLineHeightCss(320, "exact")).toBe("max(16pt, 1.15em)");
+    expect(blocks[2]).toMatchObject({
+      format: {
+        align: "center",
+        indentLeft: 420,
+        firstLine: -360,
+        beforeLines: 100,
+        after: 0,
+        line: 360,
+        lineRule: "auto"
+      }
+    });
+  });
+
+  it("draws embedded images and positioned diagrams without flattening their text", async () => {
+    const png = Uint8Array.from(atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    ), (char) => char.charCodeAt(0));
+    const blocks = await readDocxBlocks(await buildDocx(`
+      <w:p>
+        <w:r>
+          <w:drawing>
+            <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+              <wp:extent cx="1270000" cy="635000"/>
+              <a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="${OFFICE_RELS_NS}" r:embed="rId9"/>
+            </wp:inline>
+          </w:drawing>
+        </w:r>
+        <w:r><w:t>图注</w:t></w:r>
+      </w:p>
+      <w:p>
+        <w:r>
+          <mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+            <mc:Choice Requires="wps">
+              <w:drawing>
+                <w:txbxContent><w:p><w:r><w:t>不要重复</w:t></w:r></w:p></w:txbxContent>
+              </w:drawing>
+            </mc:Choice>
+            <mc:Fallback>
+              <w:pict>
+                <v:group xmlns:v="urn:schemas-microsoft-com:vml" style="width:200pt;height:100pt;" coordsize="2000,1000">
+                  <v:rect style="position:absolute;left:100;top:100;width:600;height:300;" filled="t" stroked="t">
+                    <v:textbox><w:txbxContent><w:p><w:r><w:t>工控计算机</w:t></w:r></w:p></w:txbxContent></v:textbox>
+                  </v:rect>
+                  <v:shape style="position:absolute;left:800;top:200;width:400;height:20;" filled="f" stroked="t" xmlns:o="urn:schemas-microsoft-com:office:office" o:spt="32">
+                    <v:stroke endarrow="block"/>
+                  </v:shape>
+                </v:group>
+              </w:pict>
+            </mc:Fallback>
+          </mc:AlternateContent>
+        </w:r>
+      </w:p>
+    `, undefined, {
+      "word/_rels/document.xml.rels": `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="${PACKAGE_RELS_NS}"><Relationship Id="rId9" Type="${OFFICE_RELS_NS}/image" Target="media/image1.png"/></Relationships>`,
+      "word/media/image1.png": png
+    }));
+
+    expect(blocks[0]).toMatchObject({ kind: "image", widthPt: 100, heightPt: 50 });
+    expect((blocks[0] as Extract<DocxBlock, { kind: "image" }>).src.startsWith("data:image/png;base64,")).toBe(true);
+    expect(blocks[1]).toMatchObject({ kind: "paragraph", spans: [{ text: "图注" }] });
+    expect(blocks[2]).toMatchObject({
+      kind: "drawing",
+      widthPt: 200,
+      heightPt: 100,
+      shapes: [
+        { role: "box", text: "工控计算机", left: 5, top: 10, width: 30, height: 30 },
+        { role: "line", text: "", endArrow: true, left: 40, top: 20, width: 20, height: 2 }
+      ]
+    });
+    expect(JSON.stringify(blocks)).not.toContain("不要重复");
   });
 
   it("rejects an archive that is not a Word document", async () => {
@@ -155,9 +321,26 @@ describe("xlsx preview parser", () => {
   });
 });
 
-async function buildDocx(body: string): Promise<ArrayBuffer> {
+function paragraph(text: string): Extract<DocxBlock, { kind: "paragraph" }> {
+  return { kind: "paragraph", headingLevel: null, spans: [{ text, bold: false, italic: false }] };
+}
+
+function cell(text: string, extra?: Partial<DocxTableCell>): DocxTableCell {
+  return {
+    content: [paragraph(text)],
+    colSpan: 1,
+    rowSpan: 1,
+    ...extra
+  };
+}
+
+async function buildDocx(body: string, styles?: string, files?: Record<string, string | Uint8Array>): Promise<ArrayBuffer> {
   const zip = new JSZip();
   zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="${WORD_NS}"><w:body>${body}</w:body></w:document>`);
+  if (styles) {
+    zip.file("word/styles.xml", `<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="${WORD_NS}">${styles}</w:styles>`);
+  }
+  for (const [path, contents] of Object.entries(files ?? {})) zip.file(path, contents);
   return zip.generateAsync({ type: "arraybuffer" });
 }
 
