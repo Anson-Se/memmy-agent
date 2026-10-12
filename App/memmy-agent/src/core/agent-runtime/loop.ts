@@ -1,3 +1,4 @@
+import { requestTiming } from "../../utils/request-timing.js";
 import { initializeDesktopScreenCapture } from '../../tools/computer-use/desktop-screen-capture.js';
 import fs from "node:fs";
 import path from "node:path";
@@ -3866,6 +3867,7 @@ export class AgentLoop {
         ctx.userPersistedEarly = Boolean(persisted.entry || ctx.msg.content.trim() || ctx.msg.media.length);
       } else {
         ctx.userPersistedEarly = this.persistUserMessageEarly(ctx.msg, ctx.session!);
+        requestTiming("agent.user_persisted");
       }
     }
     if (ctx.userPersistedEarly && !internalGoal) {
@@ -3888,6 +3890,7 @@ export class AgentLoop {
     if (revalidated.cwd !== sessionWorkspace || revalidated.projectId !== ctx.sessionProjectId) {
       throw new SessionWorkspaceError("workspace_conflict");
     }
+    requestTiming("agent.prompt_hooks_start");
     await this.lifecycleHook().beforeBuildSystemPrompt(new AgentHookContext({
       session: ctx.session,
       sessionKey: ctx.sessionKey,
@@ -3895,6 +3898,7 @@ export class AgentLoop {
       spec: { hostProjectId: ctx.sessionProjectId, workspace: sessionWorkspace },
       metadata: { lifecycle: "system_prompt" },
     }));
+    requestTiming("agent.prompt_hooks_end");
     const compactionOptions: {
       replayMaxMessages: number | null;
       notifyOnLockWait?: boolean;
@@ -3920,11 +3924,14 @@ export class AgentLoop {
       };
       compactionOptions.onCompactionEvent = ctx.onTokenCompactionEvent;
     }
+    requestTiming("agent.compaction_start");
     await (ctx.consolidator ?? this.consolidator).maybeConsolidateByTokens(
       ctx.session!,
       compactionOptions,
     );
+    requestTiming("agent.compaction_end");
     await initializeDesktopScreenCapture();
+    requestTiming("agent.screen_capture_ready");
     ctx.tools = this.createToolRegistry("turn", sessionWorkspace, {
       includeConnectedMcp: true,
       messageSendCallback: ctx.messageSendCallback,
@@ -4035,6 +4042,7 @@ export class AgentLoop {
   }
 
   async stateRun(ctx: TurnContext): Promise<string> {
+    requestTiming("agent.prepared");
     if (ctx.slot?.state === "running") ctx.slot.acceptingSteer = true;
     const settleSlot = (): void => {
       if (!ctx.slot || ctx.slot.state === "closed") return;
@@ -5477,7 +5485,9 @@ export class AgentLoop {
     const pendingMarker = new AsyncQueue<InboundMessage>();
     this.pendingQueues.set(key, pendingMarker);
     try {
+      requestTiming("agent.tools_start");
       await this.initializeRuntimeTools();
+      requestTiming("agent.tools_ready");
       const msg = new InboundMessage({
         channel,
         chatId,

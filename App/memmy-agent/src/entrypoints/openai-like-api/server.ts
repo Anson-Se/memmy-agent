@@ -1,3 +1,4 @@
+import { requestTiming, withRequestTiming } from "../../utils/request-timing.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Config } from "../../config/schema.js";
@@ -249,6 +250,10 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
 }
 
 export async function handleChatCompletions(request: Request, ctx?: ApiContext): Promise<Response> {
+  return withRequestTiming(request.headers.get("x-memmy-trace-id"), () => handleTimedChatCompletions(request, ctx));
+}
+
+async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): Promise<Response> {
   const context = ctx ?? {
     agentLoop: null,
     modelName: "memmy",
@@ -324,10 +329,12 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
         void (async () => {
           let failed = false;
           const onStream = async (token: string) => {
+            if (token) requestTiming("api.first_content", true);
             if (token) emitted = true;
             write(sseChunk(token, context.modelName, chunkId));
           };
           const onProgress = withProgressCapabilities(async (content: string, options: Record<string, any> = {}) => {
+            if (options.reasoning && content) requestTiming("api.first_reasoning", true);
             if (options.reasoning && content) write(sseMemmyEvent("thinking_delta", { text: content }, context.modelName, chunkId));
             if (options.reasoningEnd) write(sseMemmyEvent("thinking_end", {}, context.modelName, chunkId));
             for (const event of options.toolEvents ?? []) {
@@ -354,6 +361,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
           const onStreamEnd = async () => undefined;
           try {
             await withSessionLock(context, sessionKey, async () => {
+              requestTiming("api.session_lock_acquired");
               const response = await withTimeout(
                 Promise.resolve(
                   callAgent(context, {
@@ -371,12 +379,14 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
               }
             });
           } catch {
+            requestTiming("api.error");
             failed = true;
           } finally {
             if (!failed) {
               write(sseChunk("", context.modelName, chunkId, "stop"));
               write(SSE_DONE);
             }
+            requestTiming("api.finished");
             close();
           }
         })();
