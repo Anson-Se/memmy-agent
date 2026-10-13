@@ -11,7 +11,7 @@ $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens
 if ($parseErrors.Count) { throw (($parseErrors | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n") }
 $native = [regex]::Match($source, '(?s)Add-Type -TypeDefinition @"\r?\n(.*?)\r?\n"@')
 if (-not $native.Success) { throw "Embedded C# definition not found" }
-Add-Type -TypeDefinition $native.Groups[1].Value -CompilerOptions "/langversion:5"
+Add-Type -TypeDefinition $native.Groups[1].Value
 $definitions = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))
 foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
 $productionReceiverGuard = (Get-Item Function:\Assert-ReceiverBelongsToTarget).ScriptBlock
