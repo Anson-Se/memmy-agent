@@ -71,7 +71,7 @@ if [ -z "$VERSION" ]; then
   VERSION="${LATEST_URL##*/}"
 fi
 VERSION="${VERSION#v}"
-if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$ ]]; then
   fail "invalid release version: $VERSION"
 fi
 
