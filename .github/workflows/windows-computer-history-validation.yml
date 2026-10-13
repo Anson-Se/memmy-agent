@@ -77,7 +77,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native recorder PE, identity or embedded source verification failed' }
           $probe = & $native --self-test | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $probe.runtimeId -ne 'MemmyWindowsHistoryRuntimeV1' -or -not $probe.pureSelfTest -or $probe.desktopAccess -ne $false) { throw 'Pure native recorder self-test failed' }
-          $workerProbe = & $powershell -NoProfile -NonInteractive -MTA -ExecutionPolicy Bypass -File App/native-computer-history/apps/OpenComputerHistoryWindows/worker.ps1 -SelfTest | ConvertFrom-Json
+          # The native recorder writes its embedded UTF-8 worker with a BOM before
+          # launching Windows PowerShell 5.1. Exercise those exact on-disk bytes.
+          $workerBytes = [IO.File]::ReadAllBytes('App/native-computer-history/apps/OpenComputerHistoryWindows/worker.ps1')
+          $workerForTest = Join-Path $env:RUNNER_TEMP 'memmy-history-worker-self-test.ps1'
+          $materializedWorker = [byte[]]::new($workerBytes.Length + 3)
+          $materializedWorker[0] = 0xef; $materializedWorker[1] = 0xbb; $materializedWorker[2] = 0xbf
+          [Array]::Copy($workerBytes, 0, $materializedWorker, 3, $workerBytes.Length)
+          [IO.File]::WriteAllBytes($workerForTest, $materializedWorker)
+          $workerProbe = & $powershell -NoProfile -NonInteractive -MTA -ExecutionPolicy Bypass -File $workerForTest -SelfTest | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or -not $workerProbe.workerApiCompiled -or -not $workerProbe.pureSelfTest -or $workerProbe.desktopAccess -ne $false) { throw 'Pure worker API compile and self-test failed' }
           $apps = & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $staged -List | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or @($apps).Count -lt 1) { throw 'Windows app catalog is unavailable' }

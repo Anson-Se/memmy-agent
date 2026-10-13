@@ -12,7 +12,7 @@ fi
 # Go downloads this official toolchain once when it is not already cached.
 export GOTOOLCHAIN="${MEMMY_WINDOWS_GO_TOOLCHAIN:-go1.22.12}"
 go version
-VERSION="$(node -p "require('$ROOT_DIR/App/shell/desktop/package.json').version")"
+VERSION="$(cd "$ROOT_DIR" && node -p "require('./App/shell/desktop/package.json').version")"
 mkdir -p "$(dirname "$OUTPUT")"
 (
   cd "$ROOT_DIR/App/native-computer-use/apps/OpenComputerUseWindows"
