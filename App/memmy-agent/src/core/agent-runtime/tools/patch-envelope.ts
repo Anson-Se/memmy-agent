@@ -111,7 +111,7 @@ export function normalizePatchPath(raw: string): string {
 
   const absolute = path.isAbsolute(value);
   const slashPath = value.replace(/\\/g, "/");
-  if (!absolute && slashPath.split("/").some((segment) => segment === "..")) {
+  if (slashPath.split("/").some((segment) => segment === "..")) {
     throw new PatchError(`patch path must not contain '..': ${raw}`);
   }
   const normalized = absolute

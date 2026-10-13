@@ -118,12 +118,16 @@ describe("Bug 671 reproduction", () => {
     const root = workspace();
     const outside = workspace();
     const outsideFile = path.join(outside, "outside.txt");
+    const absoluteTraversal = `${root}${path.sep}nested${path.sep}..${path.sep}escaped.txt`;
     fs.writeFileSync(outsideFile, "outside\n");
     fs.symlinkSync(outsideFile, path.join(root, "outside-link.txt"));
     const tool = new ApplyPatchTool({ workspace: root });
 
     expect(await tool.execute(input("*** Add File: ../escaped.txt", "+escaped")))
       .toContain("must not contain '..'");
+    expect(await tool.execute(input(`*** Add File: ${absoluteTraversal}`, "+escaped")))
+      .toContain("must not contain '..'");
+    expect(fs.existsSync(path.join(root, "escaped.txt"))).toBe(false);
     expect(await tool.execute(input(`*** Delete File: ${outsideFile}`)))
       .toContain("patch path escapes workspace");
     expect(await tool.execute(input("*** Delete File: outside-link.txt")))

@@ -133,9 +133,14 @@ describe("patch envelope parser", () => {
   });
 
   it("accepts absolute paths and normalizes separators and dot segments", () => {
-    const absolute = path.resolve("workspace", "src", "..", "file.ts");
+    const absolute = path.resolve("workspace", "file.ts");
     expect(path.isAbsolute(normalizePatchPath(` ${absolute} `))).toBe(true);
     expect(normalizePatchPath(" ./src\\nested//./file.ts ")).toBe("src/nested/file.ts");
+  });
+
+  it("rejects parent traversal in absolute paths before normalization", () => {
+    const absolute = `${path.resolve("workspace")}${path.sep}nested${path.sep}..${path.sep}file.ts`;
+    expect(() => normalizePatchPath(absolute)).toThrow("must not contain '..'");
   });
 });
 
