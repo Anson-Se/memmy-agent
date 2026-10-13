@@ -61,6 +61,9 @@ export function ApiKeyOptionalPage() {
   const { t } = useTranslation();
   const { track } = useAnalytics();
   const initialModelForm = hydrateModelConfigForm(state.modelConfig, "local");
+  const initialWorkspace = createModelWorkspace(state.modelConfig);
+  const initialAsrEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "asr");
+  const initialImageEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "image_generation");
   const initialAsrModel = initialModelForm.asrModelId;
   const initialAsrEndpoint = initialModelForm.asrEndpoint || ASR_DEFAULT_ENDPOINT;
   const [asrModel, setAsrModel] = useState(initialAsrModel);
@@ -70,7 +73,10 @@ export function ApiKeyOptionalPage() {
   const [asrValidation, setAsrValidation] = useState<ModelConfigValidationState>(initialModelForm.asrValidation);
   const [asrWarningAcknowledged, setAsrWarningAcknowledged] = useState(false);
   const [asrApiKeyMasked] = useState(initialModelForm.asrApiKeyMasked);
-  const asrFormValues = createAsrModelFormValues(asrModel, asrEndpoint, asrApiKey, asrApiKeyMasked);
+  const asrFormValues = {
+    ...createAsrModelFormValues(asrModel, asrEndpoint, asrApiKey, asrApiKeyMasked),
+    endpointId: !asrApiKey.trim() && asrApiKeyMasked ? initialAsrEndpointId : undefined
+  };
   const isAsrUsable = canSaveModelConfig(asrFormValues, asrValidation);
   const asrTestKey = createModelConfigValidationKey(asrFormValues);
   const isAsrTestStale = Boolean(asrValidation.testedKey && asrValidation.testedKey !== asrTestKey);
@@ -82,7 +88,14 @@ export function ApiKeyOptionalPage() {
   const [imageGenValidation, setImageGenValidation] = useState<ModelConfigValidationState>(initialModelForm.imageGenValidation);
   const [imageGenWarningAcknowledged, setImageGenWarningAcknowledged] = useState(false);
   const [imageGenApiKeyMasked] = useState(initialModelForm.imageGenApiKeyMasked);
-  const imageGenFormValues = createImageGenModelFormValues(imageGenProtocol, imageGenModel, imageGenEndpoint, imageGenApiKey, imageGenApiKeyMasked);
+  const imageGenFormValues = {
+    ...createImageGenModelFormValues(imageGenProtocol, imageGenModel, imageGenEndpoint, imageGenApiKey, imageGenApiKeyMasked),
+    endpointId: !imageGenApiKey.trim()
+      && imageGenApiKeyMasked
+      && imageGenProtocol === initialModelForm.imageGenProtocol
+      ? initialImageEndpointId
+      : undefined
+  };
   const isImageGenUsable = canSaveModelConfig(imageGenFormValues, imageGenValidation);
   const imageGenTestKey = createModelConfigValidationKey(imageGenFormValues);
   const isImageGenTestStale = Boolean(imageGenValidation.testedKey && imageGenValidation.testedKey !== imageGenTestKey);
@@ -108,9 +121,6 @@ export function ApiKeyOptionalPage() {
     imageGeneration: isImageGenUsable ? imageGenTestKey : null
   });
   const savedCatalogSignatureRef = useRef<string | null>(null);
-  const initialWorkspace = createModelWorkspace(state.modelConfig);
-  const initialAsrEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "asr");
-  const initialImageEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "image_generation");
   const savedEndpointIdentitiesRef = useRef<Partial<Record<"asr" | "imageGeneration", SavedEndpointIdentity>>>({
     ...(initialAsrEndpointId
       ? { asr: { endpointId: initialAsrEndpointId, credentialSignature: asrCredentialSignature } }

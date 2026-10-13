@@ -77,6 +77,42 @@ describe("BYOK setup save feedback", () => {
     expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 
+  it("retests masked first-step keys through their saved endpoints", async () => {
+    const catalog = configuredCatalog();
+    const workspace = createModelWorkspace(catalog);
+    const agentEndpointId = assignedCatalogEndpointId(workspace, "byok", "agent");
+    const embeddingEndpointId = assignedCatalogEndpointId(workspace, "byok", "embedding");
+    const testModelConfig = vi.fn(async () => ({
+      ok: true,
+      message: "ok",
+      checkedAt: "2026-10-13T00:00:00.000Z"
+    }));
+    mocks.state = { ...createInitialAppState(), modelConfig: maskedSavedModelConfig(catalog) };
+    mocks.clients = createClients(vi.fn(async () => maskedSavedModelConfig(catalog)), { testModelConfig });
+    await render(<ApiKeyPage />);
+
+    const primaryInput = [...container.querySelectorAll("label")]
+      .find((candidate) => candidate.textContent === "apiKey.key")
+      ?.parentElement?.querySelector("input");
+    expect(primaryInput?.placeholder).toBe(maskApiKey("sk-primary"));
+
+    await click(testButton());
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ endpointId: agentEndpointId, apiKey: "" }),
+      "chat",
+      "primary"
+    ));
+
+    await click(testButton(1));
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ endpointId: embeddingEndpointId, apiKey: "" }),
+      "embedding",
+      "embedding"
+    ));
+  });
+
   it("defaults a genuinely absent BYOK embedding assignment to the local model", async () => {
     const catalog = configuredCatalog(false);
     catalog.modelAssignments.byok.embedding = null;
@@ -436,6 +472,69 @@ describe("BYOK setup save feedback", () => {
       .toBe(initialAsrEndpointId);
     expect(assignedCatalogEndpointId(createModelWorkspace(savedCatalog), "byok", "image_generation"))
       .toBe(initialImageEndpointId);
+  });
+
+  it("retests masked optional keys through their saved endpoints", async () => {
+    const catalog = configuredCatalog();
+    const workspace = createModelWorkspace(catalog);
+    const asrEndpointId = assignedCatalogEndpointId(workspace, "byok", "asr");
+    const imageEndpointId = assignedCatalogEndpointId(workspace, "byok", "image_generation");
+    const testModelConfig = vi.fn(async () => ({
+      ok: true,
+      message: "ok",
+      checkedAt: "2026-10-13T00:00:00.000Z"
+    }));
+    mocks.state = { ...createInitialAppState(), modelConfig: maskedSavedModelConfig(catalog) };
+    mocks.clients = createClients(vi.fn(async () => maskedSavedModelConfig(catalog)), { testModelConfig });
+    await render(<ApiKeyOptionalPage />);
+
+    await click(testButton());
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ endpointId: asrEndpointId, apiKey: "" }),
+      "asr",
+      "asr"
+    ));
+
+    await click(testButton(1));
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ endpointId: imageEndpointId, apiKey: "" }),
+      "image",
+      "image"
+    ));
+  });
+
+  it("retests masked inherited middle-step keys through the saved agent endpoint", async () => {
+    const catalog = configuredCatalog(false);
+    const agentEndpointId = assignedCatalogEndpointId(createModelWorkspace(catalog), "byok", "agent");
+    const testModelConfig = vi.fn(async () => ({
+      ok: true,
+      message: "ok",
+      checkedAt: "2026-10-13T00:00:00.000Z"
+    }));
+    mocks.state = { ...createInitialAppState(), modelConfig: maskedSavedModelConfig(catalog) };
+    mocks.clients = createClients(vi.fn(async () => maskedSavedModelConfig(catalog)), { testModelConfig });
+    await render(<ModelPage />);
+
+    const reuseButtons = () => [...container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')];
+    await click(reuseButtons()[1]!);
+    await click(testButton());
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ endpointId: agentEndpointId, apiKey: "" }),
+      "chat",
+      "skill"
+    ));
+
+    await click(reuseButtons()[0]!);
+    await click(testButton());
+    await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ endpointId: agentEndpointId, apiKey: "" }),
+      "chat",
+      "memory"
+    ));
   });
 
   it("keeps the middle step pending and retryable when its catalog save fails", async () => {

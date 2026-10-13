@@ -84,6 +84,8 @@ export function ModelPage() {
   const { t } = useTranslation();
   const { track } = useAnalytics();
   const initialModelForm = hydrateModelConfigForm(state.modelConfig, "local");
+  const initialWorkspace = createModelWorkspace(state.modelConfig);
+  const primaryEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "agent");
   const [primaryModel] = useState<PrimaryModelValues>(() => ({
     protocol: initialModelForm.protocol,
     modelId: initialModelForm.modelId,
@@ -99,6 +101,14 @@ export function ModelPage() {
   const skillValues = createModelFormValues(skill, primaryModel);
   const evolutionModel = modelFormValuesAsPrimary(skillValues);
   const memoryValues = createModelFormValues(mem, evolutionModel);
+  const skillEndpointId = skill.reuse
+    ? primaryEndpointId
+    : assignedCatalogEndpointId(initialWorkspace, "byok", "memory_evolution")
+      ?? (skillValues.apiKeyMasked ? primaryEndpointId : undefined);
+  const memoryEndpointId = mem.reuse
+    ? skillEndpointId
+    : assignedCatalogEndpointId(initialWorkspace, "byok", "memory_summary")
+      ?? (memoryValues.apiKeyMasked ? skillEndpointId : undefined);
   const canContinue = canUseModelConfig(mem, memoryValues) && canUseModelConfig(skill, skillValues);
 
   /** Handles patch mem. */
@@ -121,7 +131,12 @@ export function ModelPage() {
     const values = createModelFormValues(config, inheritedModel);
     testModelConnection({
       configClient: clients?.config,
-      values,
+      values: {
+        ...values,
+        endpointId: values.apiKeyMasked
+          ? secretTarget === "skill" ? skillEndpointId : memoryEndpointId
+          : undefined
+      },
       setValidation: (validation) => patch({ validation }),
       secretTarget,
       messages: createTestModelConnectionMessages(t)

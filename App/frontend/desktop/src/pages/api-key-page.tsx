@@ -83,6 +83,9 @@ export function ApiKeyPage() {
   const { t } = useTranslation();
   const { track } = useAnalytics();
   const initialModelForm = hydrateModelConfigForm(state.modelConfig, "local");
+  const initialWorkspace = createModelWorkspace(state.modelConfig);
+  const initialAgentEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "agent");
+  const initialEmbeddingEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "embedding");
   const initialProvider = fromProtocol(initialModelForm.protocol);
   const [provider, setProvider] = useState(initialProvider);
   const selectedProvider = providerOptions.find((option) => option.value === provider) ?? defaultProvider;
@@ -93,6 +96,7 @@ export function ApiKeyPage() {
   const [showApiKey, setShowApiKey] = useState(false);
   const modelFormValues = {
     provider,
+    endpointId: !apiKey.trim() && apiKeyMasked ? initialAgentEndpointId : undefined,
     endpoint,
     model,
     apiKey,
@@ -100,7 +104,6 @@ export function ApiKeyPage() {
     hasExistingApiKey: Boolean(apiKeyMasked)
   };
   const [llmValidation, setLlmValidation] = useState<ModelConfigValidationState>(initialModelForm.llmValidation);
-  const initialWorkspace = createModelWorkspace(state.modelConfig);
   const initialEmbeddingMode: EmbeddingMode = initialWorkspace.catalog.modelAssignments.byok.embedding
     ? "custom"
     : "local";
@@ -114,6 +117,7 @@ export function ApiKeyPage() {
   const [showEmbeddingApiKey, setShowEmbeddingApiKey] = useState(false);
   const embeddingFormValues = {
     provider: "openai",
+    endpointId: !embeddingConfig.apiKey.trim() && embeddingConfig.apiKeyMasked ? initialEmbeddingEndpointId : undefined,
     endpoint: embeddingConfig.endpoint,
     model: embeddingConfig.model,
     apiKey: embeddingConfig.apiKey,
@@ -145,8 +149,6 @@ export function ApiKeyPage() {
   );
   const saveSignature = `${embeddingMode}\n${testedKey}\n${embeddingTestKey}`;
   const savedCatalogSignatureRef = useRef<string | null>(null);
-  const initialAgentEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "agent");
-  const initialEmbeddingEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "embedding");
   const savedEndpointIdentitiesRef = useRef<Partial<Record<"agent" | "embedding", SavedEndpointIdentity>>>({
     ...(initialAgentEndpointId
       ? { agent: { endpointId: initialAgentEndpointId, credentialSignature: agentCredentialSignature } }
