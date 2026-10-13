@@ -94,6 +94,7 @@ export async function loadBundledPluginCatalog(directory: string): Promise<Bundl
     releases: bundledReleases,
     managedPluginIds: declaredManagedPluginIds ?? bundledReleases.map((release) => release.id),
     registry: {
+      async list() { return [...releases.values()].map((release) => structuredClone(release.manifest)); },
       async resolve(pluginId, version) {
         const release = releases.get(pluginId);
         if (!release || (version && release.manifest.version !== version)) {

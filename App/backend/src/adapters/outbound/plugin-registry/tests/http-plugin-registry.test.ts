@@ -45,6 +45,22 @@ describe("HttpPluginRegistry", () => {
     await expect(registry.resolve(release.manifest.id)).rejects.toThrow(/different release/);
   });
 
+  it("keeps the catalog version when the default changes and rejects a server substitution", async () => {
+    const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/v1/plugins") return new Response(JSON.stringify([release.manifest]));
+      const selected = url.searchParams.get("version") ?? "2.0.0";
+      return new Response(JSON.stringify({ ...release, manifest: { ...release.manifest, version: selected } }));
+    });
+    const registry = createHttpPluginRegistry({ baseUrl: "https://registry.example", fetchFn: fetchFn as typeof fetch });
+    const [selected] = await registry.list!();
+    expect((await registry.resolve(selected!.id, selected!.version)).manifest.version).toBe("1.0.0");
+    fetchFn.mockImplementation(async () => new Response(JSON.stringify({
+      ...release, manifest: { ...release.manifest, version: "2.0.0" }
+    })));
+    await expect(registry.resolve(selected!.id, selected!.version)).rejects.toThrow(/different release/);
+  });
+
   it("rejects an insecure non-loopback registry", () => {
     expect(() => createHttpPluginRegistry({ baseUrl: "http://registry.example" })).toThrow(/HTTPS/);
   });

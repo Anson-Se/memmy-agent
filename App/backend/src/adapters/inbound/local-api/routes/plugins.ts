@@ -1,6 +1,7 @@
 /** Third-party plugin management and capability routes. */
 import {
   InstallPluginInputSchema,
+  PluginCatalogSchema,
   InstalledPluginSchema,
   InvokePluginCapabilityInputSchema,
   PluginInteractionResponseInputSchema,
@@ -35,6 +36,10 @@ const ArtifactParamsSchema = PluginParamsSchema.extend({ token: z.string().uuid(
 
 export function registerPluginRoutes(app: FastifyInstance, options: RegisterPluginRoutesOptions): void {
   const protectedRoute = { preHandler: options.authenticateRuntimeToken };
+
+  app.get("/api/v1/plugins/catalog", protectedRoute, withErrorEnvelope(async (_request, reply) =>
+    reply.send(PluginCatalogSchema.parse(await options.plugins.catalog()))
+  ));
 
   app.post("/api/v1/plugins/install", protectedRoute, withErrorEnvelope(async (request, reply) => {
     const input = InstallPluginInputSchema.parse(request.body);

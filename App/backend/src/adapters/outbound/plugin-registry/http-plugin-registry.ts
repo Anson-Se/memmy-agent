@@ -25,6 +25,14 @@ export function createHttpPluginRegistry(options: CreateHttpPluginRegistryOption
   const fetchFn = options.fetchFn ?? fetch.bind(globalThis);
 
   return {
+    async list() {
+      const response = await fetchFn(new URL("/api/v1/plugins", baseUrl), {
+        headers: { accept: "application/json", ...options.authHeaders?.() },
+        redirect: "error", signal: AbortSignal.timeout(15_000)
+      });
+      if (!response.ok) throw new Error(`Plugin catalog request failed with ${response.status}`);
+      return z.array(PluginManifestSchema).parse(JSON.parse(await readLimitedText(response)));
+    },
     async resolve(pluginId, version) {
       const url = new URL(`/api/v1/plugins/${encodeURIComponent(pluginId)}`, baseUrl);
       if (version) url.searchParams.set("version", version);

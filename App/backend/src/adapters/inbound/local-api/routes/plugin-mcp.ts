@@ -138,7 +138,7 @@ export function registerPluginMcpRoutes(app: FastifyInstance, options: RegisterP
 
 function capabilityTools(plugins: PluginMcpService): CapabilityTool[] {
   return plugins.list()
-    .filter((plugin) => plugin.state === "active")
+    .filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)
     .flatMap((plugin) => plugin.manifest.capabilities.map((capability) => ({
       name: capabilityToolName(plugin.id, capability.id),
       plugin,

@@ -36,6 +36,9 @@ describe("live marketplace controller", () => {
     return {
       plugins: {
         list: vi.fn(async () => [...records]),
+        catalog: vi.fn(async () => [{ manifest: { ...pending.manifest, name: "文献综述", version: "0.5.18",
+          rules: { requiresLogin: true, recommendsOfficialModel: true } },
+          eligibility: { visible: true, canInstall: Boolean(context.state.account.userId), canUse: Boolean(context.state.account.userId), reason: context.state.account.userId ? null : "login_required" } }]),
         install: vi.fn(async () => { records = [pending]; return pending; }),
         approvePermissions: vi.fn(async (_pluginId: string, permissions: PluginPermission[]) => {
           records = [{ ...records[0], approvedPermissions: permissions, state: "installed" }];
@@ -179,8 +182,7 @@ describe("live marketplace controller", () => {
     expect(container.textContent).toContain("插件列表加载失败");
     expect(button("安装文献综述").disabled).toBe(true);
     expect(container.querySelector('article[aria-label="文献综述"]')?.textContent).not.toContain("即将上线");
-    // The official catalog still lists every plugin on load failure; none should read as "coming soon".
-    expect(container.querySelector('article[aria-label="Office"]')).not.toBeNull();
+    // The server catalog remains visible when reading installation state fails.
     expect(container.textContent).not.toContain("即将上线");
     await click("刷新");
     expect(button("安装文献综述").disabled).toBe(false);

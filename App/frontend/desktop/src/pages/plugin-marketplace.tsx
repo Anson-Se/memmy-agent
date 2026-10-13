@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { InstalledPlugin } from "@memmy/local-api-contracts";
+import type { InstalledPlugin, PluginCatalogEntry } from "@memmy/local-api-contracts";
 import { useApiClients } from "../app/providers.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { agentActions, appActions } from "../state/app-actions.js";
 import { agentChatScopeKey } from "../state/agent-composer-state.js";
 import { useAppState } from "../state/app-state.js";
-import { officialPluginCatalog } from "./official-plugin-catalog.js";
 import {
   addPluginCommandToDraft,
   PluginMarketplaceSection,
@@ -20,6 +19,7 @@ export function PluginMarketplace() {
   const { state, dispatch } = useAppState();
   const { language } = useTranslation();
   const en = language === "en-US";
+  const [catalog, setCatalog] = useState<PluginCatalogEntry[] | null>(null);
   const [installed, setInstalled] = useState<InstalledPlugin[]>([]);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -51,9 +51,13 @@ export function PluginMarketplace() {
       setModelError(en ? "Could not read model settings. Refresh to check availability." : "无法读取模型配置，请刷新后查看模型状态。");
     });
     try {
+      await clients.account?.getSession?.();
+      const entries = await clients.plugins.catalog?.();
+      if (generation.current === current && entries) setCatalog(entries);
       const plugins = await clients.plugins.list();
       if (generation.current !== current) return;
       setInstalled(plugins);
+      if (entries) setCatalog(entries);
       setError(null);
     } catch {
       if (generation.current !== current) return;
@@ -65,7 +69,8 @@ export function PluginMarketplace() {
 
   useEffect(() => {
     void refresh();
-    return () => { generation.current += 1; };
+    const interval = window.setInterval(() => { if (!busy.current) void refresh(); }, 30_000);
+    return () => { generation.current += 1; window.clearInterval(interval); };
   }, [refresh]);
 
   async function mutate(plugin: MarketplacePlugin, operation: () => Promise<unknown>) {
@@ -97,7 +102,15 @@ export function PluginMarketplace() {
     await clients!.plugins.enable(plugin.id);
   }
 
-  const plugins = officialPluginCatalog({ language, installed });
+  const plugins: MarketplacePlugin[] = catalog ? catalog.map((entry) => ({
+    id: entry.manifest.id, name: entry.manifest.name, eligibility: entry.eligibility,
+    description: entry.manifest.capabilities[0]?.description ?? "",
+    category: "other", version: entry.manifest.version,
+    requiresLogin: entry.eligibility.reason === "login_required" || entry.manifest.rules?.requiresLogin,
+    requiresOfficialModel: entry.manifest.rules?.recommendsOfficialModel,
+    installable: entry.eligibility.canInstall,
+    installed: installed.find((plugin) => plugin.id === entry.manifest.id)
+  })) : [];
 
   return <>
     {modelError && <p role="alert" className="mb-4 text-sm text-text-ink/60">{modelError}</p>}

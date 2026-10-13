@@ -22,6 +22,7 @@ const literature: MarketplacePlugin = {
   category: "research",
   defaultInstalled: true,
   requiresOfficialModel: true,
+  requiresLogin: true,
   installable: true
 };
 const office: MarketplacePlugin = {
@@ -145,12 +146,12 @@ describe("PluginMarketplaceSection", () => {
     await click("文献综述更多操作");
     await click("卸载");
     expect(props.onUninstall).not.toHaveBeenCalled();
-    expect(container.querySelector("[role=dialog]")?.textContent).toContain("新任务将无法使用此插件");
-    await click("取消", container.querySelector("[role=dialog]")!);
+    expect(document.querySelector("[role=dialog]")?.textContent).toContain("新任务将无法使用此插件");
+    await click("取消", document.querySelector("[role=dialog]")!);
     expect(props.onUninstall).not.toHaveBeenCalled();
     await click("文献综述更多操作");
     await click("卸载");
-    await click("卸载", container.querySelector("[role=dialog]")!);
+    await click("卸载", document.querySelector("[role=dialog]")!);
     expect(props.onUninstall).toHaveBeenCalledExactlyOnceWith(props.plugins[0]);
     expect(container.querySelector('article [aria-label="将文献综述加入对话"]')).not.toBeNull();
     await render({ plugins: [literature, office] });
@@ -163,24 +164,25 @@ describe("PluginMarketplaceSection", () => {
     expect(button("即将上线").disabled).toBe(true);
     await click("即将上线");
     await click("查看Office详情");
-    const dialog = container.querySelector("[role=dialog]")!;
+    const dialog = document.querySelector("[role=dialog]")!;
     expect(dialog.textContent).toContain("当前尚未提供可安装版本");
     expect(button("即将上线", dialog).disabled).toBe(true);
     await click("即将上线", dialog);
     expect(props.onInstall).not.toHaveBeenCalled();
   });
 
-  it("explains the model requirement only for literature review tasks and offers model setup", async () => {
+  it("recommends official models without blocking use of custom models", async () => {
     await render({ officialModelReady: false });
     const reviewCard = container.querySelector('article[aria-label="文献综述"]')!;
     expect(reviewCard.textContent).not.toContain("需配置模型");
     expect(reviewCard.querySelector('[aria-label="将文献综述加入对话"]')).not.toBeNull();
     await click("查看文献综述详情");
-    expect(container.querySelector("[role=dialog]")?.textContent).toContain("该插件推荐使用 Memmy 官方模型");
-    await click("配置官方模型", container.querySelector("[role=dialog]")!);
-    expect(props.onConfigureModel).toHaveBeenCalledOnce();
+    expect(document.querySelector("[role=dialog]")?.textContent).toContain("该插件推荐使用 Memmy 官方模型");
+    await click("加入对话", document.querySelector("[role=dialog]")!);
+    expect(props.onConfigureModel).not.toHaveBeenCalled();
+    expect(props.onAddToChat).toHaveBeenCalledOnce();
     expect(props.onInstall).not.toHaveBeenCalled();
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
     expect(button("安装Office", container.querySelector('article[aria-label="Office"]')!).disabled).toBe(false);
   });
 
@@ -188,7 +190,7 @@ describe("PluginMarketplaceSection", () => {
     await render({ plugins: [office] });
     await click("安装Office");
     expect(props.onInstall).toHaveBeenCalledExactlyOnceWith(office);
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
     expect(button("安装Office").disabled).toBe(false);
     expect(container.querySelector('article [aria-label="将Office加入对话"]')).toBeNull();
   });
@@ -196,7 +198,7 @@ describe("PluginMarketplaceSection", () => {
   it("installs from details with one click without fabricating an installed state", async () => {
     await render({ plugins: [literature], officialModelReady: false });
     await click("查看文献综述详情");
-    await click("安装文献综述", container.querySelector("[role=dialog]")!);
+    await click("安装文献综述", document.querySelector("[role=dialog]")!);
     expect(props.onInstall).toHaveBeenCalledExactlyOnceWith(literature);
     expect(container.querySelector(".confirm-dialog")).toBeNull();
     expect(button("安装文献综述").disabled).toBe(false);
@@ -212,7 +214,7 @@ describe("PluginMarketplaceSection", () => {
     await click("重试安装文献综述");
     expect(props.onEnable).toHaveBeenCalledExactlyOnceWith(plugin);
     expect(props.onInstall).not.toHaveBeenCalled();
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
     expect(container.querySelector('article [aria-label="将文献综述加入对话"]')).toBeNull();
   });
 
@@ -221,7 +223,7 @@ describe("PluginMarketplaceSection", () => {
     expect(container.querySelector("article")?.textContent).not.toContain("默认提供");
     expect(container.querySelector("article")?.textContent).not.toContain("需官方模型");
     await click("查看文献综述详情");
-    const dialog = container.querySelector("[role=dialog]")!;
+    const dialog = document.querySelector("[role=dialog]")!;
     expect(dialog.querySelector("figure")).not.toBeNull();
     expect(dialog.querySelector("figure button")).toBeNull();
     expect(dialog.textContent).toContain("需登录；推荐 Memmy 官方模型");
@@ -233,7 +235,7 @@ describe("PluginMarketplaceSection", () => {
     expect(dialog.textContent).not.toContain("授权");
     await click("重试安装文献综述", dialog);
     expect(props.onEnable).toHaveBeenCalledExactlyOnceWith(props.plugins[0]);
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
   });
 
   it("disables lifecycle actions while the parent is processing a mutation", async () => {
@@ -250,17 +252,17 @@ describe("PluginMarketplaceSection", () => {
     await click("文献综述更多操作");
     await click("卸载");
     await render({ loading: true });
-    expect(button("卸载", container.querySelector("[role=dialog]")!).disabled).toBe(true);
-    await click("卸载", container.querySelector("[role=dialog]")!);
+    expect(button("卸载", document.querySelector("[role=dialog]")!).disabled).toBe(true);
+    await click("卸载", document.querySelector("[role=dialog]")!);
     expect(props.onUninstall).not.toHaveBeenCalled();
-    await click("取消", container.querySelector("[role=dialog]")!);
+    await click("取消", document.querySelector("[role=dialog]")!);
     expect(button("安装Office").disabled).toBe(true);
     expect(button("文献综述更多操作").disabled).toBe(true);
     await render({ plugins: [installed(literature, "pending_approval"), office] });
     expect(button("重试安装文献综述").disabled).toBe(true);
     await click("重试安装文献综述");
     expect(props.onEnable).not.toHaveBeenCalled();
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
   });
 
   it("renders a localized installed empty state and supports refresh", async () => {
@@ -280,10 +282,10 @@ describe("PluginMarketplaceSection", () => {
     await click("文献综述更多操作");
     await click("卸载");
     await render({ actionsDisabled: true, error: "插件列表加载失败，请重试。" });
-    expect(button("卸载", container.querySelector("[role=dialog]")!).disabled).toBe(true);
-    await click("卸载", container.querySelector("[role=dialog]")!);
+    expect(button("卸载", document.querySelector("[role=dialog]")!).disabled).toBe(true);
+    await click("卸载", document.querySelector("[role=dialog]")!);
     expect(props.onUninstall).not.toHaveBeenCalled();
-    await click("取消", container.querySelector("[role=dialog]")!);
+    await click("取消", document.querySelector("[role=dialog]")!);
     expect(button("安装Office").disabled).toBe(true);
     await click("文献综述更多操作");
     expect(button("卸载", container.querySelector("[role=menu]")!).disabled).toBe(true);
@@ -300,11 +302,11 @@ describe("PluginMarketplaceSection", () => {
     expect(container.textContent).not.toContain("需配置模型");
     expect(container.textContent).not.toContain("配置官方模型");
     await click("查看文献综述详情");
-    const dialog = container.querySelector("[role=dialog]")!;
-    expect(dialog.textContent).toContain("暂未获取模型状态");
+    const dialog = document.querySelector("[role=dialog]")!;
+    expect(dialog.textContent).not.toContain("暂未获取模型状态");
     expect(button("卸载", dialog).disabled).toBe(false);
     await click("卸载", dialog);
-    await click("卸载", container.querySelector("[role=dialog]")!);
+    await click("卸载", document.querySelector("[role=dialog]")!);
     expect(props.onUninstall).toHaveBeenCalledExactlyOnceWith(props.plugins[0]);
     expect(props.onConfigureModel).not.toHaveBeenCalled();
   });
@@ -314,10 +316,10 @@ describe("PluginMarketplaceSection", () => {
     await click("将文献综述加入对话");
     expect(props.onAddToChat).toHaveBeenCalledExactlyOnceWith(props.plugins[0]);
     await click("查看文献综述详情");
-    await click("加入对话", container.querySelector("[role=dialog]")!);
+    await click("加入对话", document.querySelector("[role=dialog]")!);
     expect(props.onAddToChat).toHaveBeenCalledTimes(2);
     expect(props.onAddToChat).toHaveBeenLastCalledWith(props.plugins[0]);
-    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.querySelector("[role=dialog]")).toBeNull();
   });
 
   it("gates only login-required plugins when signed out and leaves others installable", async () => {
@@ -329,7 +331,7 @@ describe("PluginMarketplaceSection", () => {
     const officeCard = container.querySelector('article[aria-label="Office"]')!;
     await click("安装Office", officeCard);
     expect(props.onInstall).toHaveBeenCalledExactlyOnceWith(office);
-    // Literature requires the official model (an account feature), so it prompts sign-in instead of add-to-chat.
+    // Literature explicitly requires login; its model recommendation is independent.
     const reviewCard = container.querySelector('article[aria-label="文献综述"]')!;
     expect(reviewCard.querySelector('[aria-label="将文献综述加入对话"]')).toBeNull();
     await click("去登录", reviewCard);
@@ -339,7 +341,7 @@ describe("PluginMarketplaceSection", () => {
   it("prompts sign-in from details for a login-required plugin without offering add-to-chat", async () => {
     await render({ signedIn: false });
     await click("查看文献综述详情");
-    const dialog = container.querySelector("[role=dialog]")!;
+    const dialog = document.querySelector("[role=dialog]")!;
     expect(dialog.textContent).toContain("需登录");
     expect(button("去登录", dialog)).toBeDefined();
     expect(Array.from(dialog.querySelectorAll("button")).some((item) => item.textContent === "加入对话")).toBe(false);

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { BookOpen, Check, FileText, Loader2, LogIn, MessageSquare, MoreHorizontal, Plus, Puzzle, RefreshCw, Scale, Search, X } from "lucide-react";
-import type { InstalledPlugin } from "@memmy/local-api-contracts";
+import type { InstalledPlugin, PluginEligibility } from "@memmy/local-api-contracts";
 import { Button } from "../components/button.js";
 import { ConfirmDialog } from "../components/confirm-dialog.js";
 import { Modal } from "../components/modal.js";
@@ -19,9 +19,10 @@ export interface MarketplacePlugin {
   defaultInstalled?: boolean;
   /** Declared by the plugin: needs a signed-in account to install/use. */
   requiresLogin?: boolean;
-  /** Declared by the plugin: locked to the account-owned official model (implies login). */
+  /** Presentation recommendation only; never restricts installation or use. */
   requiresOfficialModel?: boolean;
   installed?: InstalledPlugin;
+  eligibility?: PluginEligibility;
   installable: boolean;
 }
 
@@ -71,7 +72,7 @@ type PrimaryAction = "install" | "enable" | "configure" | "sign-in" | "unavailab
 
 /** A plugin needs sign-in when it declares login (or an official model, which is account-owned) and the user is signed out. */
 function pluginNeedsSignIn(plugin: MarketplacePlugin, signedIn: boolean): boolean {
-  return !signedIn && Boolean(plugin.requiresLogin || plugin.requiresOfficialModel);
+  return plugin.eligibility?.reason === "login_required" || (!signedIn && Boolean(plugin.requiresLogin));
 }
 
 /** Catalog presentation only: installation state always comes from the parent. */
@@ -144,7 +145,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
   }
 
   function addToChat(plugin: MarketplacePlugin) {
-    if (plugin.installed?.state !== "active") return;
+    if (plugin.installed?.state !== "active" || plugin.installed.eligibility?.canUse === false || plugin.eligibility?.canUse === false) return;
     setMenuId(null);
     setDetailId(null);
     props.onAddToChat(plugin);
@@ -154,7 +155,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
     const action = primaryAction(plugin, signedIn, props.officialModelReady);
     if (!action) return null;
     const working = props.busyId === plugin.id || isTransitioning(plugin);
-    const label = action === "unavailable" ? copy("即将上线", "Coming soon")
+    const label = action === "unavailable" ? plugin.eligibility?.reason ? copy("暂无使用资格", "Access unavailable") : copy("即将上线", "Coming soon")
       : action === "install" ? copy("安装", "Install")
       : action === "configure" ? copy("配置官方模型", "Set up official model")
       : action === "sign-in" ? copy("去登录", "Sign in")
@@ -177,8 +178,6 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
     if (plugin.installed.state === "failed") return copy("安装失败", "Installation failed");
     if (plugin.installed.state !== "active") return copy("安装未完成", "Installation incomplete");
     if (pluginNeedsSignIn(plugin, signedIn)) return copy("已安装 · 需登录", "Installed · Sign in required");
-    if (plugin.requiresOfficialModel && props.officialModelReady === undefined) return copy("暂未获取模型状态", "Model status unavailable");
-    if (plugin.requiresOfficialModel && !props.officialModelReady) return copy("已安装 · 需配置模型", "Installed · Model setup required");
     return copy("已安装", "Installed");
   };
 
@@ -248,6 +247,8 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
                   <LogIn size={14} aria-hidden="true" />
                   {copy("去登录", "Sign in")}
                 </Button>
+              ) : plugin.eligibility?.canUse === false ? (
+                <span className="plugin-marketplace-coming-soon">{copy("暂无使用资格", "Access unavailable")}</span>
               ) : !plugin.installed ? (
                 <button type="button" className={plugin.installable ? "plugin-marketplace-icon-button" : "plugin-marketplace-coming-soon"}
                   aria-label={plugin.installable ? copy(`安装${plugin.name}`, `Install ${plugin.name}`) : copy("即将上线", "Coming soon")}
@@ -321,7 +322,8 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
             <p className="plugin-marketplace-detail-description">
               {capabilityDescription(detail.category, zh)}{detail.requiresOfficialModel ? ` ${copy("该插件推荐使用 Memmy 官方模型。", "Memmy official models are recommended for this plugin.")}` : ""}
             </p>
-            {!detail.installed && !detail.installable ? <p className="plugin-marketplace-detail-note">{copy("当前尚未提供可安装版本。", "An installable release is not available yet.")}</p> : null}
+            {detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{copy("需登录；", "Sign-in required; ")}{detail.requiresOfficialModel ? copy("推荐 Memmy 官方模型", "Memmy official models recommended") : ""}</p> : null}
+            {!detail.installed && !detail.installable && !detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{copy("当前尚未提供可安装版本。", "An installable release is not available yet.")}</p> : null}
             {detail.installed?.state === "failed" ? <p className="plugin-marketplace-detail-error">{copy("安装未能完成，请重试安装。如果仍然失败，请稍后重试或联系支持。", "Installation could not complete. Retry installation, or contact support if the problem continues.")}</p> : null}
           </div>
         </Modal>,
@@ -349,13 +351,15 @@ function isTransitioning(plugin: MarketplacePlugin): boolean {
 }
 
 function primaryAction(plugin: MarketplacePlugin, signedIn: boolean, officialModelReady: boolean | undefined): PrimaryAction {
+  if (pluginNeedsSignIn(plugin, signedIn)) return "sign-in";
+  if (plugin.eligibility?.canUse === false) return "unavailable";
   if (!plugin.installed) {
     if (!plugin.installable) return "unavailable";
     return pluginNeedsSignIn(plugin, signedIn) ? "sign-in" : "install";
   }
   if (plugin.installed.state !== "active") return "enable";
   if (pluginNeedsSignIn(plugin, signedIn)) return "sign-in";
-  if (plugin.requiresOfficialModel && officialModelReady === false) return "configure";
+  void officialModelReady;
   return null;
 }
 

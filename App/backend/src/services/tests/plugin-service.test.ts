@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { reconcileEntitledPlugins } from "../plugin-entitlement-reconcile-service.js";
 import { createInMemoryPluginRegistry, type PluginRelease } from "../../adapters/outbound/plugin-registry/index.js";
 import { createAppStateStore, type AppStateStore } from "../../infrastructure/app-state-store/index.js";
 import {
@@ -51,7 +52,8 @@ const release = {
 
 function createContext(
   releases: PluginRelease[] = [release],
-  localArtifactService?: PluginLocalArtifactService
+  localArtifactService?: PluginLocalArtifactService,
+  isAuthenticated?: () => boolean
 ) {
   root = mkdtempSync(join(tmpdir(), "memmy-plugin-service-"));
   store = createAppStateStore({ databasePath: join(root, "app.sqlite") });
@@ -88,12 +90,57 @@ function createContext(
       runtimeHost,
       artifactManager,
       skillManager,
-      localArtifactService
+      localArtifactService,
+      isAuthenticated
     })
   };
 }
 
 describe("PluginService", () => {
+  it("automatically installs after login, drains calls on logout, restores without download, and respects uninstall", async () => {
+    let authenticated = false;
+    const literature: PluginRelease = { manifest: {
+      ...release.manifest, id: "literature-review", permissions: [], configSchema: undefined,
+      rules: { distribution: "account", installation: "automatic", requiresLogin: true,
+        unavailableVisibility: "visible", autoUpdate: true, recommendsOfficialModel: true }
+    } };
+    const { service, artifactManager, runtimeHost } = createContext([literature], undefined, () => authenticated);
+    const reconcile = () => reconcileEntitledPlugins({ plugins: service, entitlements: [],
+      userUninstalledIds: new Set(store!.repositories.plugins.listUserUninstalledIds()) });
+    expect((await service.catalog())[0].eligibility.reason).toBe("login_required");
+    await expect(service.install("literature-review")).rejects.toThrow(/access denied/);
+    await reconcile();
+    expect(service.list()).toHaveLength(0);
+    authenticated = true;
+    await reconcile();
+    expect(service.get("literature-review").state).toBe("active");
+    runtimeHost.invoke = async function* () {
+      yield { type: "progress", current: 1 };
+      yield { type: "result", output: { ok: true } };
+    };
+    const call = service.invoke({ callId: "existing", pluginId: "literature-review", capabilityId: "run",
+      conversationId: "chat", input: { topic: "memory" } })[Symbol.asyncIterator]();
+    await call.next();
+    authenticated = false;
+    await reconcile();
+    expect(runtimeHost.deactivate).not.toHaveBeenCalled();
+    expect(service.list()[0].eligibility?.canUse).toBe(false);
+    await expect(service.invoke({ callId: "new", pluginId: "literature-review", capabilityId: "run",
+      conversationId: "chat", input: { topic: "memory" } })[Symbol.asyncIterator]().next()).rejects.toThrow(/access denied/);
+    expect((await call.next()).value).toMatchObject({ type: "result" });
+    await call.next();
+    expect(service.get("literature-review").state).toBe("disabled");
+    authenticated = true;
+    await reconcile();
+    expect(service.get("literature-review").state).toBe("active");
+    expect(artifactManager.install).toHaveBeenCalledTimes(1);
+    await service.uninstall("literature-review");
+    await reconcile();
+    expect(service.list()).toHaveLength(0);
+    await service.install("literature-review");
+    expect(store!.repositories.plugins.listUserUninstalledIds()).toEqual([]);
+  });
+
   it("loads a declared renderer from the installed plugin artifact", async () => {
     const rendererRelease: PluginRelease = {
       manifest: { ...release.manifest, ui: { renderer: { entry: "ui/index.html", capabilities: ["run"] } } }

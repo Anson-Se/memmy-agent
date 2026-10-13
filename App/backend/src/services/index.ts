@@ -233,6 +233,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
         }
       }
     }),
+    isAuthenticated: () => accountSessionRepository.get().authenticated,
     isEntitlementGranted
   });
   const sourceRegistry =
@@ -317,6 +318,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       onAccountGrantsRefreshed: async () => {
         const failures = await reconcileEntitledPlugins({
           plugins,
+          userUninstalledIds: new Set(pluginRepository.listUserUninstalledIds()),
           entitlements: accountSessionRepository.getEntitlements()
         });
         for (const failure of failures) {

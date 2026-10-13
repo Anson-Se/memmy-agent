@@ -88,7 +88,6 @@ import { PluginCapabilityHost, selectRegionPluginCalls } from "./plugin-capabili
 import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
 import { RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn } from "./recording-entry.js";
 import { PluginArtifactPreviewPanel } from "./plugin-artifact-preview-panel.js";
-import { pluginRequiresOfficialModel } from "./official-plugin-catalog.js";
 import { AgentWorkspaceContext } from "./agent-workspace-context.js";
 import { AppFrame } from "./app-frame.js";
 import {
@@ -2254,8 +2253,7 @@ export function HomePage() {
   const pluginCommandInvocation = parsePluginCommandInvocation(input, pluginCommandTargets);
   // A login-required official plugin in the composer still requires sign-in,
   // but does not force the model. The official model stays a recommendation on the plugin page.
-  const loginRequiredPluginActive = pluginRequiresOfficialModel(pluginCommandInvocation?.plugin.id)
-    || input.trim().split(/\s/, 1)[0]?.toLowerCase() === "/literature-review";
+  const loginRequiredPluginActive = Boolean(pluginCommandInvocation?.plugin.manifest.rules?.requiresLogin);
   const agentRoutedPluginPrompt = buildAgentRoutedPluginPrompt(input, pluginCommandTargets);
   const isDirectPluginCommand = Boolean(pluginCommandInvocation && !agentRoutedPluginPrompt);
   const composerSendDisabled = isDirectPluginCommand
@@ -3989,7 +3987,7 @@ export function HomePage() {
                   </div>
                   <div className="composer-actions absolute bottom-3 right-4 z-50">
                     <AgentModelSelector
-                      mode={selectorMode}
+                      mode={modelWorkspaceMode}
                       scopeKey={modelSelectionScopeKey}
                       disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}
                       seedConfig={state.modelConfig}
@@ -4328,7 +4326,7 @@ export function HomePage() {
                       </div>
                       <div className="composer-actions">
                         <AgentModelSelector
-                          mode={selectorMode}
+                          mode={modelWorkspaceMode}
                           scopeKey={modelSelectionScopeKey}
                           disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}
                           seedConfig={state.modelConfig}

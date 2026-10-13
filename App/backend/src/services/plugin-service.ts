@@ -4,12 +4,14 @@ import {
   PluginManifestSchema,
   PluginPermissionSchema,
   type InstalledPlugin,
+  type PluginCatalogEntry,
   type CapabilityCall,
   type CapabilityEvent,
   type PluginPermission,
   type PluginUiSlot,
   type UpdatePluginConfigInput
 } from "@memmy/local-api-contracts";
+import { pluginEligibility } from "./plugin-rules.js";
 import { Ajv } from "ajv";
 import { fileURLToPath } from "node:url";
 import type { PluginRegistry } from "../adapters/outbound/plugin-registry/index.js";
@@ -29,6 +31,8 @@ export type { PluginRuntimeHost } from "../adapters/outbound/plugin-runtime/inde
 
 export interface PluginService {
   list(): InstalledPlugin[];
+  catalog(): Promise<PluginCatalogEntry[]>;
+  suspend(id: string): Promise<void>;
   get(id: string): InstalledPlugin;
   readUi(id: string, slot: PluginUiSlot): Promise<string>;
   openArtifact(id: string, token: string): Promise<HostedPluginArtifact>;
@@ -55,15 +59,20 @@ export interface CreatePluginServiceOptions {
   skillManager?: PluginSkillManager;
   localArtifactService?: PluginLocalArtifactService;
   /** Resolves whether the signed-in account holds a manifest-declared entitlement. */
+  isAuthenticated?: () => boolean;
   isEntitlementGranted?: (entitlement: string) => boolean;
 }
 
 export function createPluginService(options: CreatePluginServiceOptions): PluginService {
   const skillManager = options.skillManager ?? noopPluginSkillManager;
   const localArtifacts = options.localArtifactService ?? createPluginLocalArtifactService();
-  const isEntitlementGranted = options.isEntitlementGranted ?? (() => true);
+  const isEntitlementGranted = options.isEntitlementGranted ?? (() => false);
   // Enforced here rather than only in the reconciler so a direct local-API call cannot bypass it.
-  const assertEntitled = (manifest: { id: string; requiredEntitlement?: string }) => {
+  const eligibility = (manifest: PluginRecord["manifest"]) => pluginEligibility(manifest, options.isAuthenticated?.() ?? false, isEntitlementGranted);
+  const activeCalls = new Map<string, number>();
+  const suspended = new Set<string>();
+  const assertEntitled = (manifest: PluginRecord["manifest"]) => {
+    if (!eligibility(manifest).canUse) throw pluginError("plugin_entitlement_required", `Plugin access denied: ${manifest.id}`);
     const entitlement = manifest.requiredEntitlement;
     if (!entitlement || isEntitlementGranted(entitlement)) return;
     throw pluginError(
@@ -97,7 +106,18 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
 
   return {
     list() {
-      return options.repository.list().map(publicPlugin);
+      return options.repository.list().map((plugin) => ({ ...publicPlugin(plugin), eligibility: eligibility(plugin.manifest) }));
+    },
+    async catalog() {
+      const manifests = await options.registry.list?.() ?? [];
+      return manifests.filter((manifest) => eligibility(manifest).visible).map((manifest) => ({
+        manifest, eligibility: eligibility(manifest),
+        ...(options.repository.get(manifest.id) ? { installed: this.list().find((plugin) => plugin.id === manifest.id) } : {})
+      }));
+    },
+    async suspend(id) {
+      suspended.add(id);
+      if (!activeCalls.get(id)) await this.disable(id);
     },
 
     get(id) {
@@ -267,6 +287,7 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     },
 
     async enable(id) {
+      suspended.delete(id);
       const plugin = required(id);
       if (plugin.state === "active") return publicPlugin(plugin);
       assertEntitled(plugin.manifest);
@@ -325,6 +346,7 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
       if (!plugin.manifest.capabilities.some((capability) => capability.id === call.capabilityId)) {
         throw pluginError("plugin_unavailable", `Capability not found: ${call.capabilityId}`);
       }
+      activeCalls.set(plugin.id, (activeCalls.get(plugin.id) ?? 0) + 1);
       const startedAt = Date.now();
       let outcome: "success" | "error" | "interrupted" = "interrupted";
       let errorCode: string | null = null;
@@ -358,6 +380,8 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
           : "plugin_runtime_error";
         throw error;
       } finally {
+        activeCalls.set(plugin.id, (activeCalls.get(plugin.id) ?? 1) - 1);
+        if (suspended.has(plugin.id) && !activeCalls.get(plugin.id)) await this.disable(plugin.id);
         try {
           options.repository.recordCall({
             callId: call.callId,
@@ -388,6 +412,8 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     async restoreActive() {
       for (const plugin of options.repository.list().filter((candidate) => candidate.state === "active")) {
         try {
+          if (!eligibility(plugin.manifest).canUse) { options.repository.setState(plugin.id, "disabled"); continue; }
+          assertEntitled(plugin.manifest);
           if (!hasAllPermissions(plugin)) throw new Error("Plugin permissions have changed");
           validateConfig(plugin, plugin.config);
           await activateContributions(plugin, readSecrets(plugin, options.secretStore));

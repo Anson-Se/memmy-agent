@@ -151,6 +151,24 @@ export const PluginScenarioContributionSchema = z.object({
 });
 export type PluginScenarioContribution = z.infer<typeof PluginScenarioContributionSchema>;
 
+/** Product policy declared by the plugin; account facts are supplied by the Host. */
+export const PluginRulesSchema = z.object({
+  distribution: z.enum(["public", "account"]).default("public"),
+  installation: z.enum(["manual", "automatic"]).default("manual"),
+  requiresLogin: z.boolean().default(false),
+  unavailableVisibility: z.enum(["visible", "hidden"]).default("visible"),
+  autoUpdate: z.boolean().default(true),
+  recommendsOfficialModel: z.boolean().default(false)
+});
+export type PluginRules = z.infer<typeof PluginRulesSchema>;
+export const PluginEligibilitySchema = z.object({
+  visible: z.boolean(),
+  canInstall: z.boolean(),
+  canUse: z.boolean(),
+  reason: z.enum(["login_required", "entitlement_required"]).nullable()
+});
+export type PluginEligibility = z.infer<typeof PluginEligibilitySchema>;
+
 export const PluginManifestSchema = z.object({
   apiVersion: z.literal("memmy/v1"),
   id: PluginIdentifierSchema,
@@ -164,6 +182,7 @@ export const PluginManifestSchema = z.object({
   commands: z.array(PluginCommandContributionSchema).max(100).optional(),
   scenarios: z.array(PluginScenarioContributionSchema).max(8).optional(),
   ui: PluginUiSchema.optional(),
+  rules: PluginRulesSchema.optional(),
   /** Account grant the Host verifies before installing, enabling, or invoking this plugin. */
   requiredEntitlement: PluginEntitlementSchema.optional(),
   /** Host-enforced restriction on the model presets this plugin may reach through host services. */
@@ -343,6 +362,7 @@ export const InstalledPluginSchema = z.object({
   id: PluginIdentifierSchema,
   version: z.string().min(1),
   manifest: PluginManifestSchema,
+  eligibility: PluginEligibilitySchema.optional(),
   state: PluginStateSchema,
   approvedPermissions: z.array(PluginPermissionSchema),
   config: z.record(z.string(), z.unknown()),
@@ -420,3 +440,11 @@ export const PluginCapabilityEventPayloadSchema = z.object({
   event: CapabilityEventSchema
 });
 export type PluginCapabilityEventPayload = z.infer<typeof PluginCapabilityEventPayloadSchema>;
+
+export const PluginCatalogEntrySchema = z.object({
+  manifest: PluginManifestSchema,
+  eligibility: PluginEligibilitySchema,
+  installed: InstalledPluginSchema.optional()
+});
+export const PluginCatalogSchema = z.array(PluginCatalogEntrySchema);
+export type PluginCatalogEntry = z.infer<typeof PluginCatalogEntrySchema>;
