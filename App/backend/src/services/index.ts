@@ -236,6 +236,11 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
     isAuthenticated: () => accountSessionRepository.get().authenticated,
     isEntitlementGranted
   });
+  const pluginToolSignature = () => JSON.stringify(plugins.list()
+    .filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)
+    .map((plugin) => [plugin.id, plugin.version, plugin.manifest.capabilities])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  let publishedPluginTools = pluginToolSignature();
   const sourceRegistry =
     options.sourceRegistry ??
     createBuiltinAgentSourceRegistry();
@@ -323,6 +328,16 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
         });
         for (const failure of failures) {
           console.warn(`Entitled plugin reconciliation failed for ${failure.pluginId}: ${failure.message}`);
+        }
+        // Account reconciliation bypasses the management routes. Publish its
+        // capability changes too, including logout and eligibility restoration.
+        const nextPluginTools = pluginToolSignature();
+        if (nextPluginTools !== publishedPluginTools) {
+          const result = await memmyAgentAdminClient.reloadMcpConfig();
+          if (result.ok) publishedPluginTools = nextPluginTools;
+          else console.warn(`Agent plugin tools refresh did not complete: ${result.message}`);
+          // Keep the previous signature on failure so the next account refresh
+          // retries (e.g. if the agent was busy when eligibility changed).
         }
       }
     }),

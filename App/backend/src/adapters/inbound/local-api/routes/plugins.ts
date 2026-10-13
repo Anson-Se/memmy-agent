@@ -43,7 +43,9 @@ export function registerPluginRoutes(app: FastifyInstance, options: RegisterPlug
 
   app.post("/api/v1/plugins/install", protectedRoute, withErrorEnvelope(async (request, reply) => {
     const input = InstallPluginInputSchema.parse(request.body);
-    return reply.code(201).send(InstalledPluginSchema.parse(await options.plugins.install(input.pluginId, input.version)));
+    const plugin = InstalledPluginSchema.parse(await options.plugins.install(input.pluginId, input.version));
+    await refreshAgentTools(options);
+    return reply.code(201).send(plugin);
   }));
 
   app.get("/api/v1/plugins", protectedRoute, withErrorEnvelope(async (_request, reply) =>

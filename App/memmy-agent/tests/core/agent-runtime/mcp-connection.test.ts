@@ -468,6 +468,44 @@ describe("MCP connection helpers", () => {
     expect(closed).toEqual(["browserbase-mcp"]);
   });
 
+  it("rediscovers plugin tools with unchanged config while preserving other live connections", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const config = new Config({ tools: { mcpServers: {
+      plugins: { command: "plugin-bridge" },
+      other: { command: "other-mcp" },
+    } } });
+    saveConfig(config);
+    const closed: string[] = [];
+    const sessions = { "plugin-bridge": fakeSession([]), "other-mcp": fakeSession(["read"]) };
+    setMcpRuntimeForTest(runtimeFor(sessions, { closed }) as any);
+    const loop = makeLoop(root, {});
+    try {
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.toolNames.filter((name) => name.startsWith("mcp_plugins_"))).toEqual([]);
+      const otherStack = (loop as any).mcpStacks.other;
+      sessions["plugin-bridge"] = fakeSession(["review_create_task", "review_get_status"]);
+      const installed = await reloadServers(loop as any, loop.tools);
+      expect(installed).toMatchObject({ ok: true, changed: [], refreshed: ["plugins"], tool_counts: { plugins: 2, other: 1 } });
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(true);
+      expect(loop.tools.has("mcp_plugins_review_get_status")).toBe(true);
+      expect((loop as any).mcpStacks.other).toBe(otherStack);
+      expect(closed).toEqual(["plugin-bridge"]);
+
+      sessions["plugin-bridge"] = fakeSession([]);
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(false);
+      expect(loop.tools.has("mcp_plugins_review_get_status")).toBe(false);
+      expect(loop.tools.has("mcp_other_read")).toBe(true);
+
+      sessions["plugin-bridge"] = fakeSession(["review_create_task"]);
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(true);
+    } finally {
+      await loop.closeMcp();
+    }
+  });
+
   it("routes MCP reload requests through runtime control without restart", async () => {
     const root = tempRoot();
     setConfigPath(path.join(root, "config.yaml"));

@@ -1088,26 +1088,32 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
     const changed = [...currentNames]
       .filter((name) => nextNames.has(name) && serverSignature(currentServers[name]) !== serverSignature(nextServers[name]))
       .sort();
+    // The built-in plugin bridge keeps the same URL while installation and
+    // account eligibility change its tools. Rediscover it on explicit reload,
+    // even when the transport config is unchanged. Other live servers retain
+    // their connections, including the computer-use session.
+    const refreshed = [...nextNames].filter((name) => name === "plugins"
+      && currentNames.has(name) && !changed.includes(name) && name in (state.mcpStacks ?? {}));
 
     let toolsRemoved = 0;
-    for (const name of [...removed, ...changed]) {
+    for (const name of [...removed, ...changed, ...refreshed]) {
       toolsRemoved += unregisterServerTools(state, registry, name);
       await closeServer(state, name);
     }
 
     state.mcpServers = nextServers;
-    const changedOrAdded = new Set([...added, ...changed]);
+    const changedOrAdded = new Set([...added, ...changed, ...refreshed]);
     const retryMissing = [...nextNames]
       .filter((name) => !(name in (state.mcpStacks ?? {})) && !changedOrAdded.has(name))
       .sort();
-    const toConnectNames = [...new Set([...added, ...changed, ...retryMissing])].sort();
+    const toConnectNames = [...new Set([...added, ...changed, ...refreshed, ...retryMissing])].sort();
     const toConnect = Object.fromEntries(toConnectNames.map((name) => [name, nextServers[name]]));
     const connected = toConnectNames.length ? await connectMcpServers(toConnect, registry) : {};
     Object.assign(state.mcpStacks, connected);
     state.mcpConnected = Object.keys(state.mcpStacks).length > 0;
 
     const failed = toConnectNames.filter((name) => !(name in connected)).sort();
-    const unchanged = !removed.length && !added.length && !changed.length && !retryMissing.length;
+    const unchanged = !removed.length && !added.length && !changed.length && !refreshed.length && !retryMissing.length;
     let message: string;
     if (failed.length) message = `MCP config reloaded, but some servers did not connect: ${failed.join(", ")}`;
     else if (unchanged) message = "MCP config is already live.";
@@ -1119,10 +1125,14 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
       message,
       added,
       changed,
+      refreshed,
       removed,
       retried: retryMissing,
       connected: Object.keys(state.mcpStacks).sort(),
       configured: Object.keys(state.mcpServers).sort(),
+      tool_counts: Object.fromEntries([...nextNames].sort().map((name) => [
+        name, registry.toolNames.filter((toolName) => toolName.startsWith(toolPrefix(name))).length,
+      ])),
       failed,
       tools_removed: toolsRemoved,
       requires_restart: false,
