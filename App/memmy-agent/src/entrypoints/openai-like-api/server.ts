@@ -225,6 +225,7 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
     sessionKey: args.sessionKey ?? args.session_key,
     channel: args.channel,
     chatId: args.chatId ?? args.chat_id,
+    metadata: args.metadata,
     onProgress: args.onProgress,
     onStream: args.onStream,
     onStreamEnd: args.onStreamEnd,
@@ -241,6 +242,7 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
         senderId: "api",
         content: args.content,
         media: args.media ?? [],
+        metadata: args.metadata,
         sessionKey: args.session_key ?? args.sessionKey,
       }),
     );
@@ -300,6 +302,9 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
     channel: "api",
     chat_id: API_CHAT_ID,
     chatId: API_CHAT_ID,
+    // An explicit API model selects this server's configured default, overriding a stale session binding.
+    ...(requestedModel && typeof context.agentLoop?.modelPreset === "string"
+      ? { metadata: { model_preset: context.agentLoop.modelPreset } } : {}),
   };
 
   if (stream) {
@@ -378,9 +383,14 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
                 if (finalText.trim()) write(sseChunk(finalText, context.modelName, chunkId));
               }
             });
-          } catch {
+          } catch (error) {
             requestTiming("api.error");
             failed = true;
+            const selectionUnavailable = error instanceof Error && error.message === "model_selection_unavailable";
+            write(`data: ${JSON.stringify({ error: {
+              code: selectionUnavailable ? "model_selection_unavailable" : "server_error",
+              message: selectionUnavailable ? "会话绑定的模型已不可用，请重新选择模型。" : "Memmy runtime failed while processing the request.",
+            } })}\n\n`);
           } finally {
             if (!failed) {
               write(sseChunk("", context.modelName, chunkId, "stop"));
