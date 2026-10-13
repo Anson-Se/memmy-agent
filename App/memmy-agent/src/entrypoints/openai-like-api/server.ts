@@ -4,6 +4,7 @@ import { Config } from "../../config/schema.js";
 import { getMediaDir } from "../../config/paths.js";
 import { InboundMessage } from "../../core/runtime-messages/events.js";
 import { FileSizeExceeded, saveBase64DataUrl } from "../../utils/media-decode.js";
+import { withProgressCapabilities } from "../../utils/progress-events.js";
 import { EMPTY_FINAL_RESPONSE_MESSAGE } from "../../utils/runtime.js";
 
 export const API_SESSION_KEY = "api:default";
@@ -105,6 +106,17 @@ export function sseChunk(delta: string, model: string, chunkId: string, finishRe
     ],
   };
   return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+export function sseMemmyEvent(type: string, payload: Record<string, any>, model: string, chunkId: string): string {
+  return `data: ${JSON.stringify({
+    id: chunkId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [],
+    memmy_event: { type, ...payload },
+  })}\n\n`;
 }
 
 export const SSE_DONE = "data: [DONE]\n\n";
@@ -315,6 +327,30 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
             if (token) emitted = true;
             write(sseChunk(token, context.modelName, chunkId));
           };
+          const onProgress = withProgressCapabilities(async (content: string, options: Record<string, any> = {}) => {
+            if (options.reasoning && content) write(sseMemmyEvent("thinking_delta", { text: content }, context.modelName, chunkId));
+            if (options.reasoningEnd) write(sseMemmyEvent("thinking_end", {}, context.modelName, chunkId));
+            for (const event of options.toolEvents ?? []) {
+              const phase = String(event?.phase ?? "");
+              if (phase === "start") {
+                write(sseMemmyEvent("tool_call", {
+                  callId: String(event.call_id ?? event.ui_tool_call_id ?? "call"),
+                  name: String(event.name ?? "tool"),
+                  input: event.arguments ?? {},
+                }, context.modelName, chunkId));
+              } else if (phase === "end" || phase === "error") {
+                write(sseMemmyEvent("tool_result", {
+                  callId: String(event.call_id ?? event.ui_tool_call_id ?? "call"),
+                  name: String(event.name ?? "tool"),
+                  output: phase === "error" ? event.error ?? "Tool execution failed" : event.result ?? null,
+                  ok: phase === "end",
+                }, context.modelName, chunkId));
+                for (const media of mediaFromToolEvent(event)) {
+                  write(sseMemmyEvent("media", { media: [media] }, context.modelName, chunkId));
+                }
+              }
+            }
+          }, { reasoning: true, toolEvents: true });
           const onStreamEnd = async () => undefined;
           try {
             await withSessionLock(context, sessionKey, async () => {
@@ -322,6 +358,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
                 Promise.resolve(
                   callAgent(context, {
                     ...baseArgs,
+                    onProgress,
                     onStream,
                     onStreamEnd,
                   }),
@@ -377,6 +414,41 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
     if (message.startsWith("Request timed out")) return errorJson(504, message);
     return errorJson(500, "Internal server error", "server_error");
   }
+}
+
+function mediaFromToolEvent(event: Record<string, any>): Array<Record<string, string>> {
+  const media: Array<Record<string, string>> = [];
+  const seen = new Set<string>();
+  const push = (item: Record<string, string>): void => {
+    const key = `${item.kind}:${item.url ?? item.path ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    media.push(item);
+  };
+  const add = (value: any): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (value.type === "resource_link" && typeof value.uri === "string" && value.uri.trim()) {
+      const mime = typeof value.mimeType === "string" ? value.mimeType : "";
+      const kind = mime.startsWith("image/") || /\.(?:png|jpe?g|gif|webp|svg)$/iu.test(value.uri) ? "image" : "file";
+      push({ kind, ...(value.uri.startsWith("http") || value.uri.startsWith("data:") ? { url: value.uri } : { path: value.uri }), ...(typeof value.name === "string" && value.name ? { name: value.name } : {}) });
+      return;
+    }
+    if (value.type === "image_url" && typeof value.image_url?.url === "string" && value.image_url.url.trim()) {
+      push({ kind: "image", url: value.image_url.url });
+      return;
+    }
+    for (const child of [value.files, value.embeds, value.content, value.result]) add(child);
+  };
+  for (const file of event.files ?? []) {
+    if (typeof file === "string" && file.trim()) add({ type: "resource_link", uri: file });
+  }
+  add(event.embeds);
+  add(event.result);
+  return media;
 }
 
 export async function handleModels(request?: Request, ctx?: Pick<ApiContext, "modelName">): Promise<Response> {
