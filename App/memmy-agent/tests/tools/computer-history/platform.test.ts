@@ -1,3 +1,4 @@
+import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToolLoader } from "../../../src/core/agent-runtime/tools/loader.js";
 import { isComputerHistorySupported, isPersonalWeChatHistorySupported } from "../../../src/tools/computer-history/platform.js";
@@ -17,13 +18,18 @@ const classes = [ComputerHistoryTool, ComputerHistoryStatusTool, ComputerHistory
 const names = ["computer_history", "computer_history_status", "computer_history_get_settings", "computer_history_update_settings"];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   service.get.mockClear();
 });
 
-describe.each(["win32", "linux"] as const)("Computer History unavailable on %s", (platform) => {
+describe.each([
+  { platform: "win32", release: "10.0.19045" },
+  { platform: "linux", release: "6.0.0" },
+] as const)("Computer History unavailable on $platform ($release)", ({ platform, release }) => {
   it.each([undefined, "1", "0"])("cannot register or invoke tools with MEMMY_COMPUTER_HISTORY=%s", async (enabled) => {
     vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    vi.spyOn(os, "release").mockReturnValue(release);
     vi.stubEnv("MEMMY_COMPUTER_HISTORY", enabled);
 
     expect(isComputerHistorySupported()).toBe(false);
@@ -38,8 +44,32 @@ describe.each(["win32", "linux"] as const)("Computer History unavailable on %s",
   });
 });
 
+describe("Computer History Windows 11 availability", () => {
+  it.each([undefined, "1"])("registers tools with MEMMY_COMPUTER_HISTORY=%s", (enabled) => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(os, "release").mockReturnValue("10.0.26200");
+    vi.stubEnv("MEMMY_COMPUTER_HISTORY", enabled);
+
+    expect(isComputerHistorySupported()).toBe(true);
+    for (const cls of classes) expect(cls.enabled()).toBe(true);
+    const registry = new ToolLoader({ testClasses: classes }).loadRegistry();
+    expect(registry.toolNames.sort()).toEqual([...names].sort());
+  });
+
+  it("respects an explicit opt-out", () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(os, "release").mockReturnValue("10.0.26200");
+    vi.stubEnv("MEMMY_COMPUTER_HISTORY", "0");
+
+    expect(isComputerHistorySupported()).toBe(true);
+    const registry = new ToolLoader({ testClasses: classes }).loadRegistry();
+    expect(registry.getDefinitions()).toEqual([]);
+    expect(service.get).not.toHaveBeenCalled();
+  });
+});
+
 describe("Personal WeChat History availability", () => {
-  it("exists only on Apple silicon macOS", () => {
+  it("supports Apple silicon macOS and Windows 11", () => {
     expect(isPersonalWeChatHistorySupported("darwin", "arm64")).toBe(true);
     expect(isPersonalWeChatHistorySupported("darwin", "x64")).toBe(false);
     expect(isPersonalWeChatHistorySupported("win32", "x64", "10.0.26200")).toBe(true);

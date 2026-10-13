@@ -15,7 +15,9 @@ const roots = [];
 const prefix = "dist/runtime/memmy-agent/dist/tools/computer-history/mac";
 const windowsPrefix = "dist/runtime/memmy-agent/dist/tools/computer-history/win";
 const nativeWindowsPrefix = "dist/runtime/memmy-agent/dist/native-computer-history/windows";
-const builtNativeBinary = fileURLToPath(new URL("../App/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe", import.meta.url));
+// Build output may exist during Windows CI module collection. Resolve the path
+// as data so the test runner never treats the generated EXE as a JS dependency.
+const builtNativeBinary = join(dirname(fileURLToPath(import.meta.url)), "../App/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe");
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
