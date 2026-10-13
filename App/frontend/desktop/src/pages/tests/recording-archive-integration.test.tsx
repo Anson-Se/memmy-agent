@@ -7,7 +7,7 @@ import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginCapabilityHost } from "../plugin-capability-host.js";
 import { RecordingEntryPage, useRecordingEntry, type RecordingEntryController } from "../recording-entry.js";
 import { readRecordingArchive } from "../../lib/recording-archive.js";
-import type { PluginUiCall } from "../../app/plugin-ui-context.js";
+import { PluginUiProvider, usePluginUi, type PluginUiCall } from "../../app/plugin-ui-context.js";
 import type { RecordingPanelSession } from "../interview-recording-panel.js";
 
 const mock = vi.hoisted(() => ({ status: "idle", isRecording: false, isStarting: false, isTranscribing: false,
@@ -40,13 +40,21 @@ it("archives a guidance recording before its card disappears, reopens it from th
   function Page() {
     controller=useRecordingEntry({} as never,upload,undefined,{ scope,sessionKey:"websocket:chat-test",resolveAudio });
     const [calls,setCalls]=useState([call]);
+    const ui=usePluginUi();
+    const client={ respond: async (_plugin: string, _call: string, interactionId: string) => {
+      expect(readRecordingArchive(scope)).toHaveLength(1);
+      await respond();
+      setCalls(interactionId === "interview-question" ? [{ ...call, events: [{ type:"interaction", request:{
+        type:"file-input", interactionId:"material-files", payload:{title:"补充诊断材料", multiple:true}
+      } }] }] : []);
+    } };
     return <>
-      <PluginCapabilityHost region="panel" calls={calls} plugins={[plugin]} client={{ respond: async () => {
-        // Archive must already exist when the response removes the recorder.
-        expect(readRecordingArchive(scope)).toHaveLength(1);
-        await respond();setCalls([]);
-      } } as never} asrClient={{} as never} uploadFiles={upload}
-        onRecordingArchived={controller.archive} onRecordingSession={(value) => { panel=value; }} />
+      <PluginCapabilityHost region="panel" calls={calls} plugins={[plugin]} client={client as never} asrClient={{} as never} uploadFiles={upload}
+        onRecordingArchived={(entry) => {
+          controller.archive(entry);
+          ui.addRecordingMaterials("legal-labor", entry.sessionKey!, (entry.files ?? []).map((file) => ({...file,collected:entry.collected === true})));
+        }} onRecordingSession={(value) => { panel=value; }} />
+      <PluginCapabilityHost region="pinned" calls={calls} plugins={[plugin]} client={client as never} uploadFiles={upload} />
       <button data-testid="back" onClick={() => controller.toggle()}>返回</button>
       {controller.open ? <RecordingEntryPage session={controller.session} /> : null}
     </>;
@@ -55,12 +63,17 @@ it("archives a guidance recording before its card disappears, reopens it from th
   mock.start.mockImplementation(async () => { mock.status="recording";mock.isRecording=true; });
   mock.finishAndTranscribe.mockImplementation(async () => { mock.status="idle";mock.isRecording=false;
     return { recording:new Blob(["audio"]),recordingMimeType:"audio/webm",durationMs:4000,text:"录音测试",segments:[],transcribedAt:"2026-10-12T06:58:14Z" }; });
-  const render=async (shown=true) => act(async () => root.render(<I18nProvider language="zh-CN">{shown ? <Page /> : <span>设置</span>}</I18nProvider>));
+  const render=async (shown=true) => act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN">{shown ? <Page /> : <span>设置</span>}</I18nProvider></PluginUiProvider>));
   try {
     await render();
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-bar__button--primary")!.click());
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-bar__button--primary")!.click());
     expect(respond).toHaveBeenCalledTimes(1);
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(2);
+    expect(container.querySelector(".diagnostic-upload-card")?.textContent).toContain("访谈转写.txt");
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
+    expect(respond).toHaveBeenCalledTimes(2);
+    expect(upload).toHaveBeenCalledTimes(1);
     expect(panel!.audioUrl).toBe("http://127.0.0.1/api/media/initial/audio");
     await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="back"]')!.click());
     expect(container.querySelectorAll(".recording-page__list-row")).toHaveLength(1);
@@ -87,4 +100,42 @@ it("archives a guidance recording before its card disappears, reopens it from th
     expect(restored[0]?.transcript.text).toBe("录音测试");
     expect(restored[0]?.files?.map((file)=>file.name)).toEqual(["访谈录音.webm","访谈转写.txt"]);
   } finally { await act(async () => root.unmount());window.localStorage.removeItem(`memmy.recordingArchive.v1:${scope}`); }
+});
+
+
+it("automatically stages a recording from the compact/list controller into the current diagnosis without another upload", async () => {
+  vi.clearAllMocks(); mock.status="idle"; mock.isRecording=false;
+  const storage=new Map<string,string>();
+  Object.defineProperty(window,"localStorage",{configurable:true,value:{getItem:(k:string)=>storage.get(k)??null,setItem:(k:string,v:string)=>storage.set(k,v),removeItem:(k:string)=>storage.delete(k)}});
+  const container=document.createElement("div"); document.body.append(container); const root=createRoot(container);
+  let controller!: RecordingEntryController;
+  const scope=`compact-materials-${crypto.randomUUID()}`;
+  const receipts=[
+    {kind:"audio" as const,path:"/compact/audio.webm",name:"现场录音.webm",mime:"audio/webm" as const,bytes:10,url:"/audio"},
+    {kind:"file" as const,path:"/compact/transcript.txt",name:"现场转写.txt",mime:"text/plain" as const,bytes:20,url:"/text"}
+  ];
+  const upload=vi.fn(async()=>receipts); const respond=vi.fn(async()=>undefined);
+  const plugin=InstalledPluginSchema.parse({id:"legal-labor",version:"1.0.0",state:"active",config:{},approvedPermissions:[],lastError:null,
+    createdAt:"2026-10-13T00:00:00Z",updatedAt:"2026-10-13T00:00:00Z",manifest:{apiVersion:"memmy/v1",id:"legal-labor",name:"法律",version:"1.0.0",
+      runtime:{adapter:"http"},permissions:[],capabilities:[{id:"session-start",name:"开始",description:"开始",inputSchema:{},outputSchema:{},execution:"job"}],
+      commands:[{command:"/guide",name:"指引",description:"指引",capabilityId:"session-start",pinned:true}]}});
+  const call:PluginUiCall={pluginId:plugin.id,callId:"compact-upload",capabilityId:"material-collect",conversationId:"compact-chat",origin:"agent",
+    events:[{type:"interaction",request:{type:"file-input",interactionId:"files",payload:{title:"补充诊断材料",multiple:true}}}]};
+  function Page(){
+    const ui=usePluginUi();
+    controller=useRecordingEntry({} as never,upload,undefined,{scope,sessionKey:"websocket:compact-chat",resolveAudio:async()=>null,
+      onArchived:entry=>ui.addRecordingMaterials(plugin.id,entry.sessionKey!,entry.files??[])});
+    return <PluginCapabilityHost region="pinned" calls={[call]} plugins={[plugin]} client={{respond} as never} uploadFiles={upload}/>;
+  }
+  mock.start.mockImplementation(async()=>{mock.status="recording";mock.isRecording=true;});
+  mock.finishAndTranscribe.mockImplementation(async()=>{mock.status="idle";mock.isRecording=false;return {recording:new Blob(["audio"]),recordingMimeType:"audio/webm",durationMs:3000,text:"访谈内容",segments:[],transcribedAt:"2026-10-13T03:00:00Z"};});
+  try{
+    await act(async()=>root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page/></I18nProvider></PluginUiProvider>));
+    await act(async()=>controller.session.start());
+    await act(async()=>controller.session.finish());
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(2);
+    await act(async()=>container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith(plugin.id,call.callId,"files",{files:receipts});
+  }finally{await act(async()=>root.unmount());window.localStorage.removeItem(`memmy.recordingArchive.v1:${scope}`);}
 });

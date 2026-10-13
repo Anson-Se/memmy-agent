@@ -92,7 +92,7 @@ export interface WorkspaceArtifactPanelProps {
   onAddToChat: (reference: ComposerContextReference) => void;
   /** Bump when a completed turn may have generated new workspace files. */
   refreshKey?: string | number;
-  /** Reports the persisted outer pane width to layouts that anchor overlays beside it. */
+  /** Reports the visible pane width to layouts that anchor controls beside it. */
   onWidthChange?: (width: number) => void;
   /**
    * Measured inline size of the row this pane shares with the chat.
@@ -219,8 +219,10 @@ export function WorkspaceArtifactPanel(props: WorkspaceArtifactPanelProps): Reac
   useEffect(() => {
     // Report the rendered width, not the preference: the top-bar actions are
     // positioned against this value and must track the pane as it narrows.
+    // Hidden file/recording panes stay mounted, but cannot position the toolbar.
+    if (props.hidden) return;
     props.onWidthChange?.(previewResize.appliedWidth);
-  }, [previewResize.appliedWidth, props.onWidthChange]);
+  }, [previewResize.appliedWidth, props.onWidthChange, props.hidden]);
 
   const requestDirectory = useCallback(async (
     scope: WorkspaceFilesScope,

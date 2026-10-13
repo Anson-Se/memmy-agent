@@ -85,9 +85,9 @@ import {
   type AgentQuestionCardPayload,
   type AgentQuestionResponse,
 } from "./agent-question-card.js";
-import { PluginCapabilityHost, pinnedCapabilityKey, selectRegionPluginCalls, selectVisiblePluginCalls } from "./plugin-capability-host.js";
+import { PluginCapabilityHost, RecordingBarPortalContext, isLegalFlowInteraction, pinnedCapabilityKey, selectRegionPluginCalls, selectVisiblePluginCalls } from "./plugin-capability-host.js";
 import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
-import { RecordingEntryCard, RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn } from "./recording-entry.js";
+import { RecordingEntryCard, RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn, type RecordingArchiveEntry } from "./recording-entry.js";
 import { PluginArtifactPreviewPanel } from "./plugin-artifact-preview-panel.js";
 import { AgentWorkspaceContext } from "./agent-workspace-context.js";
 import { AppFrame } from "./app-frame.js";
@@ -551,7 +551,7 @@ export function PinnedPluginCommandBar(props: {
   return (
     <div className="pinned-command-bar">
       {props.targets.map((target) => {
-        const Icon = resolveContributionIcon(target.command.icon);
+        const Icon = target.plugin.id === "legal-labor" && target.command.topbar === true ? Mic : resolveContributionIcon(target.command.icon);
         // The composer recording entry controls its compact card independently
         // of the top-bar page and pending material collection calls.
         const recording = target.command.topbar === true;
@@ -576,6 +576,12 @@ export function PinnedPluginCommandBar(props: {
       })}
     </div>
   );
+}
+
+/** Legal shortcuts belong only to conversations that actually invoked the plugin. */
+export function selectConversationPinnedCommands(targets: PluginCommandTarget[], calls: readonly PluginUiCall[]): PluginCommandTarget[] {
+  const invoked = new Set(calls.map((call) => call.pluginId));
+  return selectPinnedPluginCommands(targets).filter((target) => target.plugin.id !== "legal-labor" || invoked.has(target.plugin.id));
 }
 
 /**
@@ -1245,7 +1251,7 @@ function ComposerCaretMenu(props: {
  */
 export function HomePage() {
   const { clients } = useApiClients();
-  const { calls: pluginUiCalls, openSurface, routeChatFeedback,
+  const { calls: pluginUiCalls, openSurface, routeChatFeedback, addRecordingMaterials,
     hiddenCallIds: hiddenPluginCalls, setHiddenCallIds: setHiddenPluginCalls,
     hiddenInteractionSteps: hiddenPluginSteps, openingCommands: openingPluginCommands,
     dismissedCallIds: dismissedPluginCalls, setDismissedCallIds: setDismissedPluginCalls,
@@ -1276,6 +1282,7 @@ export function HomePage() {
   const [historyDagPanel, setHistoryDagPanel] = useState<HistoryDagPanelState>({ open: false });
   const [environmentPanelOpen, setEnvironmentPanelOpen] = useState(false);
   const [previewPanelOpen, setPreviewPanelOpen] = useState(false);
+  const [recordingBarTarget, setRecordingBarTarget] = useState<HTMLDivElement | null>(null);
   const [previewFocusFile, setPreviewFocusFile] = useState<{ path: string; nonce: number } | null>(null);
   const [previewFocusExternalFile, setPreviewFocusExternalFile] = useState<{
     id: string;
@@ -1366,12 +1373,17 @@ export function HomePage() {
   // How a recording reaches the conversation is wired further down, once the
   // composer's own helpers exist; the hook only needs a stable way to call it.
   const deliverRecordingRef = useRef<RecordingDeliverFn | undefined>(undefined);
+  const normalRecordingReadyRef = useRef<(entry: RecordingArchiveEntry) => void>(() => undefined);
+  const stageRecordingMaterials = useCallback((entry: RecordingArchiveEntry) => {
+    if (entry.sessionKey && entry.files?.length) addRecordingMaterials("legal-labor", entry.sessionKey,
+      entry.files.map((file) => ({ ...file, collected: entry.collected === true })));
+  }, [addRecordingMaterials]);
   const recordingEntry = useRecordingEntry(
     clients?.asr,
     clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined,
     (transcript, mode) => deliverRecordingRef.current?.(transcript, mode),
-    { scope: String(state.account.userId ?? "local"),
-      ...(state.agent.currentSessionKey ? { sessionKey: state.agent.currentSessionKey } : {}),
+    { scope: String(state.account.userId ?? "local"), onArchived: (entry) => { stageRecordingMaterials(entry); normalRecordingReadyRef.current(entry); },
+      ...((state.agent.currentSessionKey ?? state.agent.currentChatId) ? { sessionKey: state.agent.currentSessionKey ?? `websocket:${state.agent.currentChatId}` } : {}),
       resolveAudio: async (entry) => {
         if (!clients || !entry.audioPath) return entry.audioUrl;
         const result = await clients.memmyAgent.resolveArtifact(entry.audioPath, entry.sessionKey
@@ -1380,6 +1392,10 @@ export function HomePage() {
       }
     }
   );
+  const archivePluginRecording = useCallback((entry: RecordingArchiveEntry) => {
+    recordingEntry.archive(entry);
+    stageRecordingMaterials(entry);
+  }, [recordingEntry.archive, stageRecordingMaterials]);
   const chatScopeKey = agentChatScopeKey(state.agent.currentChatId, state.agent.newChatRequestId);
   const pluginUiPluginKey = useMemo(() => [...new Set(pluginUiCalls.map((call) => call.pluginId))].sort().join("\n"), [pluginUiCalls]);
   const visiblePluginCalls = useMemo(() => pluginUiCalls.filter((call) => (
@@ -1406,6 +1422,10 @@ export function HomePage() {
     () => selectRegionPluginCalls(preparedPluginCalls, "pinned", pinnedPluginCapabilities),
     [preparedPluginCalls, pinnedPluginCapabilities]
   );
+  const legalFlowCardOpen = preparedPluginCalls.some((call) => isLegalFlowInteraction(call) && !dismissedPluginCalls.has(call.callId));
+  const legalGuideOpen = pinnedCardCalls.some((call) => call.pluginId === "legal-labor" && !isLegalFlowInteraction(call)
+    && call.events.some((event) => event.type === "interaction" && event.request.type === "question")
+    && !hiddenPluginCalls.has(call.callId) && !dismissedPluginCalls.has(call.callId));
   const openPinnedCapabilities = useMemo(
     () => selectOpenPinnedCapabilities(pinnedCardCalls, dismissedPluginCalls, pinnedPluginCapabilities, hiddenPluginCalls),
     [dismissedPluginCalls, hiddenPluginCalls, pinnedPluginCapabilities, pinnedCardCalls]
@@ -2227,7 +2247,8 @@ export function HomePage() {
   ]);
   // No plugin, no button: the top bar is the conversation's, and only a plugin
   // that asked for a place there gets one.
-  const topbarPluginCommand = selectTopbarPluginCommand(pluginCommandTargets);
+  const topbarPluginCommand = selectTopbarPluginCommand(selectConversationPinnedCommands(pluginCommandTargets, visiblePluginCalls));
+  const conversationPinnedCommands = selectConversationPinnedCommands(pluginCommandTargets, visiblePluginCalls);
   const togglePluginCallVisibility = (callId: string) => {
     setHiddenPluginCalls((current) => {
       const next = new Set(current);
@@ -2251,10 +2272,11 @@ export function HomePage() {
     recordingEntry.toggle();
   };
   const invokePinnedPluginCommand = (target: PluginCommandTarget) => {
-    if (!clients) return;
+    if (!clients || legalFlowCardOpen) return;
+    recordingEntry.closeCompact();
     const conversationId = state.agent.currentChatId ?? state.agent.currentSessionKey ?? chatScopeKey;
     void pressPinnedPluginCommand({
-      calls: preparedPluginCalls,
+      calls: visiblePluginCalls,
       pluginId: target.plugin.id,
       capabilityId: target.command.capabilityId,
       dismissedCallIds: dismissedPluginCalls,
@@ -2273,6 +2295,52 @@ export function HomePage() {
         message: pluginInvocationError(error),
         scopeKey: chatScopeKey
       })));
+    });
+  };
+  const toggleCompactRecording = () => {
+    if (legalFlowCardOpen) return;
+    for (const call of pinnedCardCalls) {
+      if (call.pluginId === "legal-labor" && !isLegalFlowInteraction(call)) hidePluginCall(call.callId);
+    }
+    if (panelRecorders[0]) togglePluginCallVisibility(panelRecorders[0].callId);
+    else recordingEntry.toggleCompact();
+  };
+  const recordingCollectionFlights = useRef(new Set<string>());
+  normalRecordingReadyRef.current = (entry) => {
+    if (!clients || !entry.files?.length || !entry.sessionKey || recordingCollectionFlights.current.has(entry.id)) return;
+    const currentConversation = state.agent.currentSessionKey ?? state.agent.currentChatId;
+    if (!currentConversation || entry.sessionKey.replace(/^websocket:/, "") !== currentConversation.replace(/^websocket:/, "")) return;
+    const legalCalls = visiblePluginCalls.filter((call) => call.pluginId === "legal-labor");
+    const pendingLegalCalls = preparedPluginCalls.filter((call) => call.pluginId === "legal-labor");
+    if (!legalCalls.length) return;
+    recordingEntry.closeCompact();
+    if (pendingLegalCalls.some(isLegalFlowInteraction)) return;
+    recordingCollectionFlights.current.add(entry.id);
+    const guides = pendingLegalCalls.filter((call) => !call.events.some((event) => event.type === "result" || event.type === "error")
+      && call.events.some((event) => event.type === "interaction" && event.request.type === "question"
+        && Array.isArray((event.request.payload as { options?: unknown[] })?.options)
+        && (event.request.payload as { options: Array<{ value?: string }> }).options.some((option) => option.value === "upload")));
+    const collect = async () => {
+      if (guides.length) {
+        await Promise.all(guides.map(async (call) => {
+          const event = call.events.find((item) => item.type === "interaction" && item.request.type === "question");
+          if (event?.type !== "interaction") return;
+          await clients.plugins.respond(call.pluginId, call.callId, event.request.interactionId, "upload");
+          rememberPluginInteraction(`${call.pluginId}:${call.callId}:${event.request.interactionId}`);
+        }));
+      } else {
+        const sessionResult = [...legalCalls].reverse().flatMap((call) => call.events).find((event) => event.type === "result"
+          && typeof (event.output as { sessionId?: unknown })?.sessionId === "string");
+        const sessionId = sessionResult?.type === "result" ? (sessionResult.output as { sessionId: string }).sessionId : undefined;
+        if (!sessionId) return;
+        await clients.plugins.invoke("legal-labor", "material-collect", {
+          conversationId: currentConversation, origin: "user", input: { sessionId, mode: "upload", append: true }
+        });
+      }
+    };
+    void collect().catch((error) => {
+      recordingCollectionFlights.current.delete(entry.id);
+      dispatch(agentActions.operationFailed("chat", createAgentOperationError({ source: "send", message: pluginInvocationError(error), scopeKey: chatScopeKey })));
     });
   };
   const generateLegalDiagnosis = async (call: PluginUiCall) => {
@@ -3799,6 +3867,20 @@ export function HomePage() {
     );
   }
 
+  const openLegalArtifact = (artifact: PluginArtifactRef) => {
+    recordingEntry.close();
+    putRecorderCardAside();
+    if (artifact.path && sessionArtifactClient) {
+      void sessionArtifactClient.previewArtifact(artifact.path).then((opened) => {
+        if (!opened) { setPreviewPanelOpen(false); setPluginArtifactPreview(artifact); }
+      });
+    } else { setPreviewPanelOpen(false); setPluginArtifactPreview(artifact); }
+  };
+  const reopenPluginRecording = (start: boolean) => {
+    recordingEntry.close();
+    setHiddenPluginCalls((current) => new Set([...current].filter((id) => !panelRecorders.some((call) => call.callId === id))));
+    if (start) recordingSession?.onStart?.();
+  };
   const environmentPanel = environmentPanelOpen && environmentScope ? (
     <AgentEnvironmentPanel
       client={clients?.memmyAgent ?? null}
@@ -3812,13 +3894,11 @@ export function HomePage() {
     />
   ) : null;
 
-  // The recorder lives in the side column: it is there while a recording runs,
-  // and as soon as its card is raised, so the pane opens where the design puts
-  // it instead of the recorder hanging over the conversation. The top-bar
-  // recording page is a tab of the file preview, so it keeps that panel open
+  // Keep the microphone owner mounted while its bar is in the composer dock.
+  // The side pane opens after recording starts; the top-bar entry opens the list.
   // rather than this one.
   const recorderPaneMounted = recordingSession !== null || panelRecorders.length > 0;
-  const recorderPaneOpen = !recordingEntry.open && (panelRecorders.length > 0
+  const recorderPaneOpen = recordingSession !== null && recordingSession.status !== "idle" && !recordingEntry.open && (panelRecorders.length > 0
     ? panelRecorders.some((call) => !hiddenPluginCalls.has(call.callId))
     : recordingSession !== null);
   const sidePreviewOpen = previewPanelOpen || pluginArtifactPreview !== null || recorderPaneOpen || recordingEntry.open;
@@ -3858,7 +3938,13 @@ export function HomePage() {
           const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
           return <Icon size={12} aria-hidden="true" />;
         })(),
-        render: () => <RecordingEntryPage session={recordingEntry.session} />,
+        render: () => <RecordingEntryPage session={recordingEntry.session}
+          uploadBlocked={panelRecorders.length > 0}
+          onStart={panelRecorders.length > 0 ? () => reopenPluginRecording(true) : undefined}
+          externalRecording={recordingSession && ["recording", "paused", "starting", "transcribing"].includes(recordingSession.status) ? {
+            title: recordingSession.title, elapsedMs: recordingSession.elapsedMs, status: recordingSession.status,
+            onOpen: () => reopenPluginRecording(false)
+          } : undefined} />,
         onClose: recordingEntry.close
       }] : []}
       rootLabel={previewRootLabel}
@@ -3882,7 +3968,7 @@ export function HomePage() {
     <PluginArtifactPreviewPanel
       key={pluginArtifactPreview.id}
       artifact={pluginArtifactPreview}
-      readArtifact={clients.plugins.readArtifact}
+      readArtifact={(uri) => uri.startsWith("blob:") ? fetch(uri).then((response) => response.blob()) : clients.plugins.readArtifact(uri)}
       onClose={() => setPluginArtifactPreview(null)}
       onWidthChange={setPreviewPanelWidth}
       sharedRowWidth={workspaceLayoutWidth}
@@ -3891,7 +3977,7 @@ export function HomePage() {
   ) : null;
   // A running interview takes over the visible side panel while the workspace
   // preview remains mounted in the background so its tabs and view state survive.
-  const recordingRecorder = <PluginCapabilityHost
+  const recordingRecorder = <RecordingBarPortalContext.Provider value={{ target: recordingBarTarget, hidden: legalFlowCardOpen || legalGuideOpen || panelRecorders.every((call) => hiddenPluginCalls.has(call.callId)) }}><PluginCapabilityHost
     region="panel"
     calls={visiblePluginCalls}
     plugins={installedPlugins}
@@ -3899,14 +3985,14 @@ export function HomePage() {
     uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
     asrClient={clients?.asr}
     onRecordingSession={setRecordingSession}
-                  onRecordingArchived={recordingEntry.archive}
+                  onRecordingArchived={archivePluginRecording}
     dismissedCallIds={dismissedPluginCalls}
     hiddenCallIds={hiddenPluginCalls}
     onCallHidden={hidePluginCall}
     onCallDismissed={dismissPluginCall}
     answeredInteractions={answeredPluginInteractions}
     onInteractionAnswered={rememberPluginInteraction}
-  />;
+  /></RecordingBarPortalContext.Provider>;
   const recordingPreviewPanel = recorderPaneMounted ? (
     <InterviewRecordingPanel
       hidden={!recorderPaneOpen}
@@ -3966,7 +4052,7 @@ export function HomePage() {
                 the close action while open; this title-bar button is rendered
                 only while the panel is closed so two audio controls cannot
                 overlap while the pane width is settling. */}
-            {topbarPluginCommand && !recordingEntry.open ? (
+            {topbarPluginCommand && !sidePreviewOpen ? (
               <button
                 type="button"
                 className="agent-preview-toggle"
@@ -4012,16 +4098,18 @@ export function HomePage() {
                   A card already in flight still renders here, since a recording
                   must stay reachable wherever the user navigates.
                 */}
+                <div ref={setRecordingBarTarget} className="legal-recording-bar-slot" />
                 <PluginCapabilityHost
                   region="pinned"
                   onRequestDiagnosis={generateLegalDiagnosis}
+                  onOpenArtifact={openLegalArtifact}
                   calls={visiblePluginCalls}
                   plugins={installedPlugins}
                   client={clients?.plugins ?? null}
                   uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
                   asrClient={clients?.asr}
                   onRecordingSession={setRecordingSession}
-                  onRecordingArchived={recordingEntry.archive}
+                  onRecordingArchived={archivePluginRecording}
                   dismissedCallIds={dismissedPluginCalls}
                   hiddenCallIds={hiddenPluginCalls}
                   onCallHidden={hidePluginCall}
@@ -4237,7 +4325,7 @@ export function HomePage() {
                 forceMessageActionsForMessageId={firstEncounterRelayAnswerMessageId}
                 retryWaitStatus={state.agent.currentChatId ? state.agent.retryWaitStatusByChatId[state.agent.currentChatId] ?? null : null}
                 isSending={state.agent.isSending}
-                waitingForPluginInteraction={visiblePluginCalls.some((call) => call.events.some((event) => event.type === "interaction") && !call.events.some((event) => event.type === "result" || event.type === "error"))}
+                waitingForPluginInteraction={preparedPluginCalls.some((call) => call.events.some((event) => event.type === "interaction") && !call.events.some((event) => event.type === "result" || event.type === "error"))}
                 sanitizePlatformApiErrors={sanitizePlatformApiErrors}
                 artifactClient={sessionArtifactClient}
                 memoryRuntimeClient={clients?.memoryRuntime ?? null}
@@ -4325,16 +4413,18 @@ export function HomePage() {
                   raise them, directly above the composer, so they stay
                   reachable instead of scrolling away up the transcript.
                 */}
+                <div ref={setRecordingBarTarget} className="legal-recording-bar-slot" />
                 <PluginCapabilityHost
                   region="pinned"
                   onRequestDiagnosis={generateLegalDiagnosis}
+                  onOpenArtifact={openLegalArtifact}
                   calls={visiblePluginCalls}
                   plugins={installedPlugins}
                   client={clients?.plugins ?? null}
                   uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
                   asrClient={clients?.asr}
                   onRecordingSession={setRecordingSession}
-                  onRecordingArchived={recordingEntry.archive}
+                  onRecordingArchived={archivePluginRecording}
                   dismissedCallIds={dismissedPluginCalls}
                   hiddenCallIds={hiddenPluginCalls}
                   onCallHidden={hidePluginCall}
@@ -4343,18 +4433,18 @@ export function HomePage() {
                   answeredInteractions={answeredPluginInteractions}
                   onInteractionAnswered={rememberPluginInteraction}
                 />
-                {recordingEntry.compactOpen ? <RecordingEntryCard
+                {recordingEntry.compactOpen && !legalFlowCardOpen && !legalGuideOpen && panelRecorders.length === 0 ? <RecordingEntryCard
                   session={recordingEntry.session}
                   disabled={!clients?.asr}
                   onClose={recordingEntry.closeCompact}
                   onOpenList={() => { if (!recordingEntry.open) toggleRecordingEntry(); }}
                 /> : null}
                 <PinnedPluginCommandBar
-                  targets={selectPinnedPluginCommands(pluginCommandTargets)}
+                  targets={legalFlowCardOpen ? [] : conversationPinnedCommands}
                   disabled={!clients}
                   active={openPinnedCapabilities}
-                  recordingOpen={recordingEntry.compactOpen}
-                  onRecordingPress={recordingEntry.toggleCompact}
+                  recordingOpen={recordingEntry.compactOpen || panelRecorders.some((call) => !hiddenPluginCalls.has(call.callId))}
+                  onRecordingPress={toggleCompactRecording}
                   onPress={invokePinnedPluginCommand}
                 />
                 <div className="agent-composer-stack">

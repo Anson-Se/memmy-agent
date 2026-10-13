@@ -2,7 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { formatClock, groupSpeakerTurns, InterviewRecordingPanel, type RecordingPanelSession } from "../interview-recording-panel.js";
 
@@ -137,4 +137,49 @@ describe("InterviewRecordingPanel", () => {
     // A finished recording has no running clock to report.
     expect(container.querySelector(".recording-panel__status")).toBeNull();
   });
+
+  it("keeps recording text controls separate from preview icons and targets each action", () => {
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const finish = vi.fn();
+    const toggle = vi.fn();
+    const mount = (status: RecordingPanelSession["status"]) => render({
+      session: session({ status, onPause: pause, onResume: resume, onFinish: finish }),
+      toolbarEnd: <button aria-label="预览面板" onClick={toggle}>面板</button>
+    });
+    mount("recording");
+    const toolbar = container.querySelector(".recording-panel__toolbar")!;
+    // The preview's absolute icon strip constrains every direct button to 28px.
+    expect(toolbar.querySelector(".workspace-artifact-preview-toolbar__actions")).toBeNull();
+    act(() => toolbar.querySelectorAll<HTMLButtonElement>(".recording-panel__controls button")[0]!.click());
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(finish).not.toHaveBeenCalled();
+    mount("paused");
+    act(() => toolbar.querySelectorAll<HTMLButtonElement>(".recording-panel__controls button")[0]!.click());
+    expect(resume).toHaveBeenCalledTimes(1);
+    act(() => toolbar.querySelector<HTMLButtonElement>('[aria-label="预览面板"]')!.click());
+    expect(toggle).toHaveBeenCalledTimes(1);
+    expect(finish).not.toHaveBeenCalled();
+    act(() => toolbar.querySelector<HTMLButtonElement>(".recording-panel__action--primary")!.click());
+    expect(finish).toHaveBeenCalledTimes(1);
+    mount("done");
+    expect(toolbar.querySelector(".recording-panel__controls")).toBeNull();
+    expect(toolbar.querySelector('[aria-label="预览面板"]')).not.toBeNull();
+  });
+});
+
+it("seeks and plays the recorded audio when a transcript timestamp is clicked", async () => {
+  const { vi } = await import("vitest");
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<I18nProvider language="zh-CN"><InterviewRecordingPanel session={{
+      title: "访谈录音", status: "done", elapsedMs: 10_000, lines: [], audioUrl: "blob:recording",
+      transcript: { text: "测试", segments: [{ speakerId: 0, startMs: 6_000, text: "测试" }] },
+      onPause() {}, onResume() {}, onFinish() {}, onClose() {}
+    }} /></I18nProvider>));
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-panel__turn-time")!.click());
+    expect(container.querySelector<HTMLAudioElement>("audio")!.currentTime).toBe(6);
+    expect(play).toHaveBeenCalledTimes(1);
+  } finally { act(() => root.unmount()); container.remove(); play.mockRestore(); }
 });

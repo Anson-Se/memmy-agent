@@ -118,7 +118,7 @@ describe("PluginCapabilityHost", () => {
     expect(container.textContent).not.toContain("下载失败，请重试");
     expect(respond).not.toHaveBeenCalled();
     expect(cancel).not.toHaveBeenCalled();
-    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-guidance-card__action--primary")!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-guidance-card__footer .button-primary")!.click());
     expect(respond).toHaveBeenCalledWith("legal-labor", "guide", "choice", "record");
   });
 
@@ -168,8 +168,7 @@ describe("PluginCapabilityHost", () => {
     expect(container.textContent).toContain("2.0 KB");
     expect(upload).not.toHaveBeenCalled();
     expect(respond).not.toHaveBeenCalled();
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭卡片"]')!.click());
-    expect(hide).toHaveBeenCalledWith(call.callId);
+    expect(hide).not.toHaveBeenCalled();
     expect(cancel).not.toHaveBeenCalled();
     await choose(picker, [new File(["third"], "第三份.pdf", { type: "application/pdf" })]);
     expect(submit.disabled).toBe(true);
