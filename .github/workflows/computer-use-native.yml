@@ -64,7 +64,7 @@ jobs:
       - name: Build Memmy Computer Use for macOS
         if: runner.os == 'macOS'
         run: |
-          bash scripts/internal/mac/build-memmy-computer-use.sh "$RUNNER_TEMP/Memmy Computer Use.app" "$(uname -m)" -
+          bash scripts/internal/mac/build-memmy-computer-use.sh "$RUNNER_TEMP/Memmy Computer Use.app" "$(uname -m)" - cn.memtensor.memmy
           echo "OCU_BINARY=$RUNNER_TEMP/Memmy Computer Use.app/Contents/MacOS/MemmyComputerUse" >> "$GITHUB_ENV"
       - name: Test Memmy macOS native source
         if: runner.os == 'macOS'
