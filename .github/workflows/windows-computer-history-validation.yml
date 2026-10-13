@@ -95,6 +95,34 @@ jobs:
             }
           }
           Write-Host "Validated $(@($apps).Count) installed or running app entries"
+      - name: Diagnose History packaging test module loading
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --check tests/computer-history-packaging.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'History packaging test syntax check failed' }
+          $probe = @'
+          const imports = [
+            'app-builder-lib/out/asar/asarUtil.js',
+            'app-builder-lib/out/fileMatcher.js',
+            'yaml',
+            'typescript',
+            './tests/fixtures/windows-pe-fixture.mjs',
+            './scripts/internal/win/verify-computer-history-runtime.mjs',
+          ];
+          for (const spec of imports) {
+            try {
+              await import(spec);
+              console.log(`IMPORT PASS ${spec}`);
+            } catch (error) {
+              console.error(`IMPORT FAIL ${spec}`);
+              console.error(error.stack ?? error);
+              process.exitCode = 1;
+              break;
+            }
+          }
+          '@
+          node --input-type=module -e $probe
+          if ($LASTEXITCODE -ne 0) { throw 'History packaging test dependency import failed' }
       - name: Verify packaged observer inclusion and agent platform contracts
         run: >-
           node node_modules/vitest/vitest.mjs run
