@@ -192,13 +192,13 @@ it("opens only one workflow on rapid repeated presses and permits retry after fa
   expect(opening.size).toBe(0);
 });
 
-it("reuses the Agent upload step for every guide press and close/reopen without starting another collection", async () => {
+it("skips an Agent upload round on close without starting another collection", async () => {
   const { selectRegionPluginCalls } = await import("../plugin-capability-host.js");
   const { selectOpenPinnedCapabilities } = await import("../home-page.js");
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
   const open = vi.fn(async () => undefined);
   const pinned = new Set(["legal-labor:session-start"]);
   const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
@@ -231,10 +231,9 @@ it("reuses the Agent upload step for every guide press and close/reopen without 
     expect(container.querySelectorAll(".diagnostic-upload-card")).toHaveLength(1);
     expect(container.querySelector(".diagnostic-upload-card")).toBe(card);
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!.click());
-    await act(async () => button.click());
-    expect(container.querySelector(".diagnostic-upload-card")).toBe(card);
+    expect(container.querySelector(".diagnostic-upload-card")).toBeNull();
     expect(open).not.toHaveBeenCalled();
-    expect(client.respond).not.toHaveBeenCalled();
+    expect(client.respond).toHaveBeenCalledWith(plugin.id, "agent-upload", "upload", { action: "skip", files: [] });
     expect(client.cancel).not.toHaveBeenCalled();
   } finally { act(() => root.unmount()); container.remove(); }
 });
@@ -299,11 +298,101 @@ it("keeps a closed card and answered guidance closed across settings route remou
     expect(container.querySelector(".diagnostic-upload-card")).not.toBeNull();
     await act(async () => close().click());
     await act(async () => settings(true)); await act(async () => settings(false));
-    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("none");
+    expect(container.querySelector(".diagnostic-upload-card")).toBeNull();
     expect(container.querySelector(".diagnostic-guidance-card")).toBeNull();
-    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!.click());
-    expect(container.querySelectorAll(".diagnostic-upload-card")).toHaveLength(1);
-    expect(client.respond).toHaveBeenCalledTimes(1);
+    expect(ui.answeredInteractions.has("legal-labor:route-guide:upload")).toBe(true);
+    expect(client.respond).toHaveBeenCalledTimes(2);
     expect(client.cancel).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
   } finally { act(() => root.unmount()); container.remove(); }
+});
+
+
+it("shows one guide when an Agent invocation arrives after the manually opened guide and answers both waiting calls", async () => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
+    { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
+  ] } };
+  const guide = (callId: string, origin: "agent" | "user"): PluginUiCall => ({ pluginId: plugin.id, capabilityId: "session-start",
+    callId, origin, conversationId: "websocket:race-chat", events: [
+      { type: "artifact", artifact: { id: `template-${callId}`, uri: "/template.xlsx", name: "调研模板.xlsx", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", role: "setup" } },
+      { type: "interaction", request: { interactionId: `guide-${callId}`, type: "question", payload: { title: "诊断指引", options: [
+        { label: "我在现场，要录音", value: "record" }, { label: "已完成调研，上传资料", value: "upload" }
+      ] } } }
+    ] });
+  let setCalls!: (calls: PluginUiCall[]) => void;
+  const respond = vi.fn(async () => undefined);
+  const cancel = vi.fn();
+  function Page() {
+    const [calls, update] = useState([guide("manual", "user")]); setCalls = update;
+    const ui = usePluginUi();
+    return <PluginCapabilityHost calls={calls} plugins={[legal]} region="pinned" client={{ respond, cancel, getUi: vi.fn() }}
+      answeredInteractions={ui.answeredInteractions} onInteractionAnswered={(key) => ui.setAnsweredInteractions((current) => new Set(current).add(key))} />;
+  }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
+    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(1);
+    await act(async () => setCalls([guide("manual", "user"), guide("automatic", "agent")]));
+    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(1);
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.includes("已完成调研"))!.click());
+    expect(respond.mock.calls).toEqual([
+      [plugin.id, "manual", "guide-manual", "upload"], [plugin.id, "automatic", "guide-automatic", "upload"]
+    ]);
+    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(0);
+    expect(cancel).not.toHaveBeenCalled();
+  } finally { await act(async () => root.unmount()); container.remove(); }
+});
+
+it.each([false, true])("automatically lists saved recording files, scopes them to the chat and avoids another upload (already collected: %s)", async (collected) => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  let ui!: ReturnType<typeof usePluginUi>;
+  const respond = vi.fn(async () => undefined); const upload = vi.fn();
+  const receipts = [
+    { kind: "audio" as const, path: "/media/audio.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio", collected },
+    { kind: "file" as const, path: "/media/transcript.txt", name: "访谈转写.txt", mime: "text/plain" as const, bytes: 20, url: "/text", collected }
+  ];
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "upload-files", conversationId: "chat-materials", origin: "agent",
+    events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
+  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
+    { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
+  ] } };
+  function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[legal]} region="pinned"
+    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={upload} />; }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
+    await act(async () => ui.addRecordingMaterials(plugin.id, "another-chat", receipts));
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(0);
+    await act(async () => { ui.addRecordingMaterials(plugin.id, "websocket:chat-materials", receipts); ui.addRecordingMaterials(plugin.id, "chat-materials", receipts); });
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(2);
+    expect(container.textContent).toContain("访谈转写.txt");
+    const submit=container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!;
+    expect(submit.disabled).toBe(false);
+    await act(async () => { submit.click(); submit.click(); });
+    expect(upload).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", { files: collected ? [] : receipts.map(({ collected: _collected, ...file }) => file) });
+  } finally { await act(async () => root.unmount()); container.remove(); }
+});
+
+it("keeps the microphone owner mounted while its composer bar is occluded", async () => {
+  const { RecordingBarPortalContext } = await import("../plugin-capability-host.js");
+  vi.clearAllMocks();
+  const container = document.createElement("div"); const dock = document.createElement("div"); document.body.append(container, dock);
+  const root = createRoot(container);
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "interview-record", callId: "portal-recorder", conversationId: "chat", origin: "agent",
+    events: [{ type: "interaction", request: { interactionId: "audio", type: "audio-record", payload: {} } }] };
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
+  const render = (hidden: boolean) => <I18nProvider language="en-US"><RecordingBarPortalContext.Provider value={{ target: dock, hidden }}>
+    <InterviewRecordingPanel hidden session={null} bar={<PluginCapabilityHost region="panel" calls={[call]} plugins={[plugin]} client={client} />} />
+  </RecordingBarPortalContext.Provider></I18nProvider>;
+  try {
+    await act(async () => root.render(render(false)));
+    const bar = dock.querySelector(".recording-bar"); expect(bar).not.toBeNull();
+    expect(container.querySelector(".recording-bar")).toBeNull();
+    await act(async () => root.render(render(true)));
+    expect(dock.firstElementChild?.getAttribute("hidden")).toBe("");
+    await act(async () => root.render(render(false)));
+    expect(dock.querySelector(".recording-bar")).toBe(bar);
+    expect(recorder.unmount).not.toHaveBeenCalled(); expect(recorder.cancel).not.toHaveBeenCalled();
+    expect(client.cancel).not.toHaveBeenCalled(); expect(client.respond).not.toHaveBeenCalled();
+  } finally { act(() => root.unmount()); container.remove(); dock.remove(); }
 });

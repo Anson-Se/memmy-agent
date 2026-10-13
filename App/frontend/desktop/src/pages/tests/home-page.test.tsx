@@ -34,6 +34,7 @@ import {
   collectPluginCommandTargets,
   collectPluginScenarios,
   selectPinnedPluginCommands,
+  selectConversationPinnedCommands,
   selectSlashPluginCommands,
   selectTopbarPluginCommand,
   selectOpenPinnedCapabilities,
@@ -2477,3 +2478,17 @@ class MemoryStorage implements SlashCommandStorageLike {
     this.values.delete(key);
   }
 }
+
+
+it("hides legal composer shortcuts until the current conversation actually invokes the legal plugin", () => {
+  const legal=InstalledPluginSchema.parse({ id:"legal-labor", version:"1.0.0", state:"active", approvedPermissions:[], config:{}, lastError:null,
+    createdAt:"2026-10-13T00:00:00Z", updatedAt:"2026-10-13T00:00:00Z", manifest:{ apiVersion:"memmy/v1", id:"legal-labor", name:"Legal", version:"1.0.0",
+      runtime:{adapter:"http"}, permissions:[], capabilities:[{id:"session-start",name:"Guide",description:"Guide",inputSchema:{},outputSchema:{},execution:"job"}],
+      commands:[{command:"/legal-guide",name:"诊断指引",description:"Guide",capabilityId:"session-start",pinned:true},
+        {command:"/legal-record",name:"访谈录音",description:"Record",capabilityId:"session-start",pinned:true,topbar:true}] } });
+  const targets=collectPluginCommandTargets([legal]);
+  expect(selectConversationPinnedCommands(targets, [])).toEqual([]);
+  const invocation: PluginUiCall={pluginId:"legal-labor", capabilityId:"session-start",callId:"starting",conversationId:"law-chat",origin:"agent",events:[]};
+  expect(selectConversationPinnedCommands(targets,[invocation])).toHaveLength(2);
+  expect(selectConversationPinnedCommands(targets,[{...invocation,pluginId:"another-plugin"}])).toEqual([]);
+});
