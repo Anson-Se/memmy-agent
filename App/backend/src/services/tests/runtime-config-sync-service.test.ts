@@ -70,10 +70,13 @@ describe("syncRuntimeConfigWithAppState", () => {
       mode: "account",
       provider: "memmy_account",
       model: "agent_chat",
-      hydratedAppState: true
+      hydratedAppState: true,
+      wroteConfig: true,
+      reason: "restored_account_projection_and_hydrated_account"
     });
 
     const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.app.userMode).toBe("account");
     expect(saved.providers.memmy_account).toMatchObject({
       ownerAccountId: "owner-a",
       apiKey: "cloud-token-a"

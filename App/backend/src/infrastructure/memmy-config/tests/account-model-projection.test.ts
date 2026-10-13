@@ -97,6 +97,7 @@ describe("account model projection current catalog", () => {
 
     expect(result).toEqual({ changed: true, memoryConfigAffected: true });
     const saved = await readConfig(file);
+    expect(saved.app.userMode).toBe("account");
     expect(saved.providers.memmy_account).toMatchObject({
       ownerAccountId: "owner-a",
       apiKey: "cloud-token",

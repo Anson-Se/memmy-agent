@@ -9,7 +9,8 @@ import {
   readRuntimeMemmyConfigUserMode,
   readRuntimeMemmyConfigState,
   writeAccountModelProjectionToMemmyConfig,
-  type RuntimeMemmyConfigState
+  type RuntimeMemmyConfigState,
+  type RuntimeProjectionResult
 } from "../infrastructure/memmy-config/index.js";
 
 export interface RuntimeConfigMigrationConsistency {
@@ -91,7 +92,8 @@ export async function syncRuntimeConfigWithAppState(
     }
     return accountChannelMismatchResult(options.appStateStore, wroteConfig);
   }
-  state = await restoreMissingActiveAccountProjection(options, state);
+  const restored = await restoreMissingActiveAccountProjection(options, state);
+  state = restored.state;
   switch (state.status) {
     case "valid_byok": {
       const clearedDormantProjection = await clearUntrustedAccountProjection(options, state.accountProjection);
@@ -101,7 +103,7 @@ export async function syncRuntimeConfigWithAppState(
         : hydrated;
     }
     case "valid_account":
-      return hydrateAccountRuntimeConfig(options, state);
+      return hydrateAccountRuntimeConfig(options, state, restored.projection);
     case "missing":
     case "empty":
       return {
@@ -140,31 +142,37 @@ export async function syncRuntimeConfigWithAppState(
 async function restoreMissingActiveAccountProjection(
   options: SyncRuntimeConfigWithAppStateOptions,
   state: RuntimeMemmyConfigState
-): Promise<RuntimeMemmyConfigState> {
+): Promise<{
+  state: RuntimeMemmyConfigState;
+  projection?: RuntimeProjectionResult;
+}> {
   if (state.status === "valid_account" || state.status === "invalid_yaml" || state.status === "conflict") {
-    return state;
+    return { state };
   }
 
   const session = options.appStateStore.repositories.accountSession.get();
-  if (!session.authenticated) return state;
+  if (!session.authenticated) return { state };
   if (options.appStateStore.repositories.bootstrap.getAppSettings().userMode !== "account") {
-    return state;
+    return { state };
   }
 
   // An explicit BYOK selection remains authoritative even while the user is signed in.
   // The repair is only for an account-mode database paired with an unset/incomplete runtime projection.
   if (await readRuntimeMemmyConfigUserMode(options.memmyConfigPath) === "byok") {
-    return state;
+    return { state };
   }
 
   const cloudUuid = options.appStateStore.repositories.accountSession.getCloudUuid();
-  if (!cloudUuid) return state;
-  await writeAccountModelProjectionToMemmyConfig({
+  if (!cloudUuid) return { state };
+  const projection = await writeAccountModelProjectionToMemmyConfig({
     cloudUuid,
     userId: session.profile.userId,
     preserveAccountByokSelection: true
   }, options.memmyConfigPath);
-  return readRuntimeMemmyConfigState(options.memmyConfigPath);
+  return {
+    state: await readRuntimeMemmyConfigState(options.memmyConfigPath),
+    projection
+  };
 }
 
 /** Handles sync runtime config for startup. */
@@ -279,7 +287,8 @@ function hydrateByokRuntimeConfig(
 
 async function hydrateAccountRuntimeConfig(
   options: SyncRuntimeConfigWithAppStateOptions,
-  state: Extract<RuntimeMemmyConfigState, { status: "valid_account" }>
+  state: Extract<RuntimeMemmyConfigState, { status: "valid_account" }>,
+  restoredProjection?: RuntimeProjectionResult
 ): Promise<RuntimeConfigSyncResult> {
   const { appStateStore } = options;
   const activated = appStateStore.repositories.accountSession.activateByCloudUuid(
@@ -303,15 +312,18 @@ async function hydrateAccountRuntimeConfig(
       source: "none",
       mode: appStateStore.repositories.bootstrap.getAppSettings().userMode,
       hydratedAppState: false,
-      wroteConfig: projection.changed,
+      wroteConfig: projection.changed || restoredProjection?.changed === true,
       reason: "account_projection_has_no_matching_local_session"
     };
   }
-  const projection = await writeAccountModelProjectionToMemmyConfig({
-    cloudUuid: state.cloudUuid,
-    userId: session.profile.userId,
-    preserveAccountByokSelection: true
-  }, options.memmyConfigPath);
+  const projection = restoredProjection ?? await writeAccountModelProjectionToMemmyConfig(
+    {
+      cloudUuid: state.cloudUuid,
+      userId: session.profile.userId,
+      preserveAccountByokSelection: true
+    },
+    options.memmyConfigPath
+  );
   appStateStore.repositories.bootstrap.updateAppSettings({ userMode: "account" });
   return {
     source: "runtime_config",
@@ -320,9 +332,11 @@ async function hydrateAccountRuntimeConfig(
     model: "agent_chat",
     hydratedAppState: true,
     wroteConfig: projection.changed,
-    reason: projection.changed
-      ? "refreshed_account_projection_and_hydrated_account"
-      : "hydrated_account_from_runtime_config"
+    reason: restoredProjection?.changed
+      ? "restored_account_projection_and_hydrated_account"
+      : projection.changed
+        ? "refreshed_account_projection_and_hydrated_account"
+        : "hydrated_account_from_runtime_config"
   };
 }
 
