@@ -382,7 +382,7 @@ func TestWindowsRuntimeFocusGuardCoversActionAndSnapshotFailures(t *testing.T) {
 			t.Fatalf("Windows runtime focus guard missing %q", required)
 		}
 	}
-	if !strings.Contains(windowsRuntimeScript, "} finally {\n            Assert-SafeAfterAction $script:focusBefore $process.Id $hwnd") {
+	if !hasFocusGuardFinally(windowsRuntimeScript) {
 		t.Fatal("Windows runtime must verify focus even if an action or snapshot fails")
 	}
 	for _, required := range []string{
@@ -394,6 +394,18 @@ func TestWindowsRuntimeFocusGuardCoversActionAndSnapshotFailures(t *testing.T) {
 		if !strings.Contains(windowsRuntimeScript, required) {
 			t.Fatalf("Windows runtime must guard every dispatch and verify foreground undo, missing %q", required)
 		}
+	}
+}
+
+func hasFocusGuardFinally(script string) bool {
+	return strings.Contains(strings.ReplaceAll(script, "\r\n", "\n"), "} finally {\n            Assert-SafeAfterAction $script:focusBefore $process.Id $hwnd")
+}
+
+func TestWindowsRuntimeFocusGuardFinallyAcceptsCRLF(t *testing.T) {
+	lf := strings.ReplaceAll(windowsRuntimeScript, "\r\n", "\n")
+	crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+	if !hasFocusGuardFinally(crlf) {
+		t.Fatal("Windows checkout line endings must not hide the focus guard finally block")
 	}
 }
 

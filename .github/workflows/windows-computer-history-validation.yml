@@ -57,7 +57,9 @@ jobs:
           try {
             go test ./...
             if ($LASTEXITCODE -ne 0) { throw 'Native recorder pure tests failed' }
-            go vet ./...
+            # Win32 hook LPARAM is a native record pointer carried as uintptr;
+            # unsafeptr cannot infer that callback ABI contract. Keep every other analyzer.
+            go vet -unsafeptr=false ./...
             if ($LASTEXITCODE -ne 0) { throw 'Native recorder vet failed' }
           } finally { Pop-Location }
       - name: Build agent and native History recorder from source
