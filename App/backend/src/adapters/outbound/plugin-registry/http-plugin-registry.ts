@@ -7,7 +7,8 @@ const MAX_REGISTRY_RESPONSE_BYTES = 1024 * 1024;
 const PluginReleaseSchema = z.object({
   manifest: PluginManifestSchema,
   artifact: z.object({
-    url: z.string().url(),
+    // Local registries return an origin-relative authenticated download path.
+    url: z.string().url().or(z.string().regex(/^\/(?!\/)/)),
     sha256: z.string().regex(/^[a-f0-9]{64}$/i)
   }).optional()
 });
@@ -53,6 +54,11 @@ export function createHttpPluginRegistry(options: CreateHttpPluginRegistryOption
       const release = PluginReleaseSchema.parse(JSON.parse(await readLimitedText(response)));
       if (release.manifest.id !== pluginId || (version && release.manifest.version !== version)) {
         throw Object.assign(new Error("Plugin registry returned a different release"), { code: "plugin_invalid" });
+      }
+      if (release.artifact) {
+        const artifactUrl = new URL(release.artifact.url, baseUrl);
+        assertAllowedProtocol(artifactUrl);
+        release.artifact.url = artifactUrl.toString();
       }
       return release;
     }

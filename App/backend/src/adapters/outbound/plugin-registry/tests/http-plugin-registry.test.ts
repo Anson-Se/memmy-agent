@@ -36,6 +36,30 @@ describe("HttpPluginRegistry", () => {
     );
   });
 
+  it("resolves local authenticated download paths against the registry origin", async () => {
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({
+      ...release,
+      artifact: { ...release.artifact, url: "/api/v1/plugins/com.example.review/artifact?version=1.0.0" }
+    })));
+    const registry = createHttpPluginRegistry({
+      baseUrl: "http://127.0.0.1:8101", fetchFn: fetchFn as typeof fetch,
+      authHeaders: () => ({ authorization: "Bearer local-test-token" })
+    });
+    const resolved = await registry.resolve(release.manifest.id, "1.0.0");
+    expect(resolved.artifact?.url).toBe("http://127.0.0.1:8101/api/v1/plugins/com.example.review/artifact?version=1.0.0");
+    expect(fetchFn).toHaveBeenCalledWith(expect.any(URL), expect.objectContaining({
+      headers: expect.objectContaining({ authorization: "Bearer local-test-token" })
+    }));
+  });
+
+  it("rejects insecure artifact origins and ambiguous relative paths", async () => {
+    for (const artifactUrl of ["http://outside.example/review.zip", "//outside.example/review.zip", "../review.zip"]) {
+      const registry = createHttpPluginRegistry({ baseUrl: "http://127.0.0.1:8101", fetchFn: (async () =>
+        new Response(JSON.stringify({ ...release, artifact: { ...release.artifact, url: artifactUrl } }))) as typeof fetch });
+      await expect(registry.resolve(release.manifest.id, "1.0.0")).rejects.toThrow();
+    }
+  });
+
   it("rejects a mismatched manifest", async () => {
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({
       ...release,
