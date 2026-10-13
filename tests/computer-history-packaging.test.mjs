@@ -15,23 +15,24 @@ const roots = [];
 const prefix = "dist/runtime/memmy-agent/dist/tools/computer-history/mac";
 const windowsPrefix = "dist/runtime/memmy-agent/dist/tools/computer-history/win";
 const nativeWindowsPrefix = "dist/runtime/memmy-agent/dist/native-computer-history/windows";
-// Build output may exist during Windows CI module collection. Resolve the path
-// as data so the test runner never treats the generated EXE as a JS dependency.
-const builtNativeBinary = join(dirname(fileURLToPath(import.meta.url)), "../App/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe");
+// File paths are test data, including generated EXEs and PowerShell scripts.
+// Keep them out of the test runner's import/asset URL transform.
+const repoFile = (...parts) => join(dirname(fileURLToPath(import.meta.url)), "..", ...parts);
+const builtNativeBinary = repoFile("App", "memmy-agent", "dist", "native-computer-history", "windows", "amd64", "memmy-computer-history.exe");
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 async function packagedFixture(filename) {
-  const config = parse(readFileSync(new URL(`../App/shell/desktop/${filename}`, import.meta.url), "utf8"));
+  const config = parse(readFileSync(repoFile("App", "shell", "desktop", filename), "utf8"));
   const root = mkdtempSync(join(tmpdir(), "history-asar-"));
   roots.push(root);
   const source = join(root, "source");
   const staged = join(root, "staged");
   const include = new FileMatcher(source, staged, (value) => value, config.files).createFilter();
   const files = [
-    ["native-helper.js", ts.transpileModule(readFileSync(new URL(
-      `../App/memmy-agent/src/tools/computer-history/mac/native-helper.ts`, import.meta.url,
+    ["native-helper.js", ts.transpileModule(readFileSync(repoFile(
+      "App", "memmy-agent", "src", "tools", "computer-history", "mac", "native-helper.ts",
     ), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText],
     ["wechat/connect.py", "# Connection helper fixture"],
     ["wechat/read_messages.py", "# Reader fixture"],
@@ -113,7 +114,7 @@ it.runIf(process.platform === "darwin")("Electron resolves and executes both pac
       }
     })().catch(error => { console.error(error); process.exitCode = 1; });
   `);
-  const electron = fileURLToPath(new URL("../App/shell/desktop/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron", import.meta.url));
+  const electron = repoFile("App", "shell", "desktop", "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron");
   const stdout = execFileSync(electron, [probe], {
     encoding: "utf8", timeout: 30_000,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", HOME: root, PATH: join(root, "no-tools") },
@@ -122,13 +123,13 @@ it.runIf(process.platform === "darwin")("Electron resolves and executes both pac
 });
 
 it.each(["electron-builder.win.yml", "electron-builder.win.unsigned.yml"])("%s unpacks the Windows 11 observer next to app.asar", async (filename) => {
-  const config = parse(readFileSync(new URL(`../App/shell/desktop/${filename}`, import.meta.url), "utf8"));
+  const config = parse(readFileSync(repoFile("App", "shell", "desktop", filename), "utf8"));
   const root = mkdtempSync(join(tmpdir(), "history-win-asar-"));
   roots.push(root);
   const source = join(root, "source");
   const staged = join(root, "staged");
   const relative = `${windowsPrefix}/win11-observer.ps1`;
-  const script = readFileSync(new URL(`../App/memmy-agent/src/tools/computer-history/win/win11-observer.ps1`, import.meta.url));
+  const script = readFileSync(repoFile("App", "memmy-agent", "src", "tools", "computer-history", "win", "win11-observer.ps1"));
   const file = join(source, relative);
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, script);
@@ -149,7 +150,7 @@ it.each(["electron-builder.win.yml", "electron-builder.win.unsigned.yml"])("%s u
 });
 
 it.each(["electron-builder.win.yml", "electron-builder.win.unsigned.yml"])("%s includes and unpacks the x64 native History recorder and excludes arm64", async (filename) => {
-  const config = parse(readFileSync(new URL(`../App/shell/desktop/${filename}`, import.meta.url), "utf8"));
+  const config = parse(readFileSync(repoFile("App", "shell", "desktop", filename), "utf8"));
   const root = mkdtempSync(join(tmpdir(), "history-native-asar-")); roots.push(root);
   const source = join(root, "source"); const staged = join(root, "staged");
   const include = new FileMatcher(source, staged, (value) => value, config.files).createFilter();
@@ -170,7 +171,7 @@ it.each(["electron-builder.win.yml", "electron-builder.win.unsigned.yml"])("%s i
 });
 
 it.each(["electron-builder.yml", "electron-builder.unsigned.yml"])("%s excludes Windows History binaries from Mac packages", filename => {
-  const config = parse(readFileSync(new URL(`../App/shell/desktop/${filename}`, import.meta.url), "utf8"));
+  const config = parse(readFileSync(repoFile("App", "shell", "desktop", filename), "utf8"));
   const root = mkdtempSync(join(tmpdir(), "history-native-mac-")); roots.push(root);
   const source = join(root, "source");
   const include = new FileMatcher(source, join(root, "staged"), value => value, config.files).createFilter();
@@ -193,7 +194,7 @@ it("rejects stale source, wrong architecture and inert History executables in th
 
 it.runIf(existsSync(builtNativeBinary))("validates the actual source-built History binary separately from package fixtures", () => {
   const bytes = readFileSync(builtNativeBinary);
-  const worker = readFileSync(new URL("../App/native-computer-history/apps/OpenComputerHistoryWindows/worker.ps1", import.meta.url));
+  const worker = readFileSync(repoFile("App", "native-computer-history", "apps", "OpenComputerHistoryWindows", "worker.ps1"));
   const identity = JSON.parse(readFileSync(`${builtNativeBinary}.build.json`, "utf8"));
   expect(bytes.length).toBeGreaterThan(1_000_000);
   expect(verifyWindowsComputerHistoryRuntime(bytes, "x64", worker)).toBe(identity.sha256);
@@ -206,7 +207,7 @@ it.each([
   ["electron-builder.win.yml", false],
   ["electron-builder.win.unsigned.yml", false],
 ])("%s stages SQLCipher only as a macOS external resource", (filename, macOS) => {
-  const config = parse(readFileSync(new URL(`../App/shell/desktop/${filename}`, import.meta.url), "utf8"));
+  const config = parse(readFileSync(repoFile("App", "shell", "desktop", filename), "utf8"));
   const root = mkdtempSync(join(tmpdir(), "history-sqlcipher-package-"));
   roots.push(root);
   const source = join(root, "source");
