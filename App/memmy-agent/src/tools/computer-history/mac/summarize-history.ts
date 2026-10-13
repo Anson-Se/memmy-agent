@@ -495,6 +495,8 @@ function reusableHumanAction(record: JsonRecord, { navigationHint = "" }: { navi
   if (record.eventType === "text_input") {
     return details.redacted
       ? `Text was entered in ${application} (\`${bundleId}\`) but was intentionally redacted; require a current task variable or stop instead of guessing it.`
+      : details.textSource === "focused_field_value"
+        ? `Set the matching semantic field in ${application} (\`${bundleId}\`) to the recorded current value ${cleanInline(JSON.stringify(details.text ?? ""), 240)}, then verify it. Do not append the entire value as new keystrokes.`
       : `Enter ${cleanInline(JSON.stringify(details.text ?? ""), 240)} in the matching semantic field in ${application} (\`${bundleId}\`), then verify the visible value.`;
   }
   if (record.eventType === "key_press") {
@@ -569,6 +571,7 @@ function derivedHumanTitle(events: JsonRecord[], fallback: string): string {
   }
   const textInput = events.find((event) => (
     event.eventType === "text_input"
+    && event.details?.textPurpose === "search_query"
     && event.details?.redacted === false
     && typeof event.details?.text === "string"
     && event.details.text.trim()

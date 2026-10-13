@@ -183,13 +183,17 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       headers: { "x-memmy-mcp-token": composioMcpToken },
       toolTimeout: 60
     });
-    if (options.memmyAgentAdminClient) {
-      try {
-        const result = await options.memmyAgentAdminClient.reloadMcpConfig();
-        if (!result.ok) console.warn(`Agent MCP reload did not complete: ${result.message}`);
-      } catch (error) {
-        console.warn(`Agent MCP reload unavailable during backend startup: ${error instanceof Error ? error.message : String(error)}`);
-      }
+    const memmyAgentAdminClient = options.memmyAgentAdminClient;
+    if (memmyAgentAdminClient) {
+      // The bridge config must be written first, but MCP connections must not delay the first window.
+      void Promise.resolve()
+        .then(() => memmyAgentAdminClient.reloadMcpConfig())
+        .then((result) => {
+          if (!result.ok) console.warn(`Agent MCP reload did not complete: ${result.message}`);
+        })
+        .catch((error: unknown) => {
+          console.warn(`Agent MCP reload unavailable during backend startup: ${error instanceof Error ? error.message : String(error)}`);
+        });
     }
 
     const runtimeConfig = RuntimeConfigSchema.parse({
