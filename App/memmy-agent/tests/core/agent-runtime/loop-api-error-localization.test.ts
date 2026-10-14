@@ -27,10 +27,10 @@ function loopWithResponse(response: LLMResponse, options: { contextWindowTokens?
     provider,
     workspace: root,
     model: "test-model",
-    contextWindowTokens: options.contextWindowTokens ?? 16_384,
+    contextWindowTokens: options.contextWindowTokens ?? 200_000,
     sessionDir: path.join(root, "sessions"),
     config: new Config({
-      agents: { defaults: { contextWindowTokens: 16_384 } },
+      agents: { defaults: { contextWindowTokens: 200_000 } },
       memmyMemory: { enabled: false },
     }),
   });
@@ -160,7 +160,7 @@ describe("AgentLoop WebUI API error localization", () => {
   });
 
   it("keeps the raw provider error outside WebUI", async () => {
-    const agent = loopWithResponse(apiErrorResponse(), { contextWindowTokens: 0 });
+    const agent = loopWithResponse(apiErrorResponse(), { contextWindowTokens: 200_000 });
 
     const outbound = await agent.processDirect("hello", { sessionKey: "cli:api-error" });
 
