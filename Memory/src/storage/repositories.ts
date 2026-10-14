@@ -2621,6 +2621,32 @@ export class RuntimeRepository {
     return row?.found === 1;
   }
 
+  // Completed raw turns of a session that came before the given turn, oldest
+  // first. Order is by turn time (created_at), then insertion order, so a
+  // judgment made later never reads this turn or any turn after it.
+  completedRawTurnsBefore(rawTurnId: string, options: { episodeId?: string } = {}): RawTurnRecord[] {
+    const anchor = this.db.prepare(`SELECT rowid AS seq, session_id AS sessionId, created_at AS createdAt
+      FROM raw_turns WHERE id = ?`).get(rawTurnId) as { seq: number; sessionId: string; createdAt: string } | undefined;
+    if (!anchor) return [];
+    const rows = this.db.prepare(`
+      SELECT * FROM raw_turns
+      WHERE session_id = @sessionId
+        AND (@episodeId IS NULL OR episode_id = @episodeId)
+        AND id != @rawTurnId
+        AND deleted_at IS NULL
+        AND json_type(message_payload_json, '$.turn_complete') = 'object'
+        AND (created_at < @createdAt OR (created_at = @createdAt AND rowid < @seq))
+      ORDER BY created_at ASC, rowid ASC
+    `).all({
+      sessionId: anchor.sessionId,
+      episodeId: options.episodeId ?? null,
+      rawTurnId,
+      createdAt: anchor.createdAt,
+      seq: anchor.seq
+    }) as SqlRawTurnRow[];
+    return rows.map(rawTurnFromSql);
+  }
+
   episodeRelationTexts(episodeId: string, rawTurnIds: readonly string[] = []): {
     firstUser: string;
     lastUser: string;
