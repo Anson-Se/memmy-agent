@@ -350,7 +350,10 @@ export function BrowserPanel({ hidden = false, active = true, initialAddress,
       </div>
       {error ? <div className="memmy-browser-error" role="alert">{error}</div> : null}
       <div className="memmy-browser-content">
+        {/* Serialize this Electron attribute as a string: React drops unknown boolean attributes.
+            The main-process handler still denies native popups and routes valid URLs to Memmy tabs. */}
         <webview ref={webviewRef} className="memmy-browser-webview" src={initialUrl.current || 'about:blank'}
+          allowpopups={"true" as unknown as boolean}
           partition="persist:memmy-browser" style={section === 'browser'
             ? { display: 'flex' }
             : { position: 'fixed', left: -10_000, top: 0, width: 800, height: 600,
