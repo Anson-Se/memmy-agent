@@ -54,6 +54,12 @@ type RuntimeConfigSyncErrorState = {
   reason: string;
 };
 
+interface RestoredAccountProjection {
+  cloudUuid: string;
+  userId: string;
+  result: RuntimeProjectionResult;
+}
+
 /**
  * Hydrate current AppState from config.yaml. Missing runtime config is left untouched:
  * importing SQLite model rows into YAML belongs exclusively to startup migrations.
@@ -144,7 +150,7 @@ async function restoreMissingActiveAccountProjection(
   state: RuntimeMemmyConfigState
 ): Promise<{
   state: RuntimeMemmyConfigState;
-  projection?: RuntimeProjectionResult;
+  projection?: RestoredAccountProjection;
 }> {
   if (state.status === "valid_account" || state.status === "invalid_yaml" || state.status === "conflict") {
     return { state };
@@ -171,7 +177,7 @@ async function restoreMissingActiveAccountProjection(
   }, options.memmyConfigPath);
   return {
     state: await readRuntimeMemmyConfigState(options.memmyConfigPath),
-    projection
+    projection: { cloudUuid, userId: session.profile.userId, result: projection }
   };
 }
 
@@ -288,7 +294,7 @@ function hydrateByokRuntimeConfig(
 async function hydrateAccountRuntimeConfig(
   options: SyncRuntimeConfigWithAppStateOptions,
   state: Extract<RuntimeMemmyConfigState, { status: "valid_account" }>,
-  restoredProjection?: RuntimeProjectionResult
+  restoredProjection?: RestoredAccountProjection
 ): Promise<RuntimeConfigSyncResult> {
   const { appStateStore } = options;
   const activated = appStateStore.repositories.accountSession.activateByCloudUuid(
@@ -312,11 +318,14 @@ async function hydrateAccountRuntimeConfig(
       source: "none",
       mode: appStateStore.repositories.bootstrap.getAppSettings().userMode,
       hydratedAppState: false,
-      wroteConfig: projection.changed || restoredProjection?.changed === true,
+      wroteConfig: projection.changed || restoredProjection?.result.changed === true,
       reason: "account_projection_has_no_matching_local_session"
     };
   }
-  const projection = restoredProjection ?? await writeAccountModelProjectionToMemmyConfig(
+  // Reuse a completed repair only after validating the session and its account identity.
+  const restoredForCurrentAccount = restoredProjection?.cloudUuid === state.cloudUuid
+    && restoredProjection.userId === session.profile.userId;
+  const projection = restoredForCurrentAccount ? restoredProjection.result : await writeAccountModelProjectionToMemmyConfig(
     {
       cloudUuid: state.cloudUuid,
       userId: session.profile.userId,
@@ -331,8 +340,8 @@ async function hydrateAccountRuntimeConfig(
     provider: "memmy_account",
     model: "agent_chat",
     hydratedAppState: true,
-    wroteConfig: projection.changed,
-    reason: restoredProjection?.changed
+    wroteConfig: projection.changed || restoredProjection?.result.changed === true,
+    reason: restoredForCurrentAccount && restoredProjection.result.changed
       ? "restored_account_projection_and_hydrated_account"
       : projection.changed
         ? "refreshed_account_projection_and_hydrated_account"

@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppStateStore, type AppStateStore } from "../../infrastructure/app-state-store/index.js";
+import * as memmyConfig from "../../infrastructure/memmy-config/index.js";
 import {
   createMemmyConfigWriter,
   writeAccountModelProjectionToMemmyConfig
@@ -21,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   store?.close();
   store = undefined;
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
@@ -62,6 +64,10 @@ describe("syncRuntimeConfigWithAppState", () => {
     };
     context.writeConfig(config);
 
+    const writeProjection = vi.spyOn(memmyConfig, "writeAccountModelProjectionToMemmyConfig");
+    const activateSession = vi.spyOn(context.store.repositories.accountSession, "activateByCloudUuid");
+    const updateSettings = vi.spyOn(context.store.repositories.bootstrap, "updateAppSettings");
+
     await expect(syncRuntimeConfigWithAppState({
       ...context,
       accountChannel: "phone"
@@ -74,6 +80,9 @@ describe("syncRuntimeConfigWithAppState", () => {
       wroteConfig: true,
       reason: "restored_account_projection_and_hydrated_account"
     });
+    expect(writeProjection).toHaveBeenCalledTimes(1);
+    expect(activateSession).toHaveBeenCalledWith("cloud-token-a", "phone");
+    expect(updateSettings).toHaveBeenCalledWith({ userMode: "account" });
 
     const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
     expect(saved.app.userMode).toBe("account");
@@ -84,6 +93,86 @@ describe("syncRuntimeConfigWithAppState", () => {
     expect(saved.modelAssignments.account.agent.candidates).toContainEqual(
       expect.stringMatching(/^memmy-account-.+-agent$/)
     );
+
+    const repairedConfig = readFileSync(context.memmyConfigPath, "utf8");
+    await expect(syncRuntimeConfigWithAppState({
+      ...context,
+      accountChannel: "phone"
+    })).resolves.toMatchObject({
+      mode: "account",
+      hydratedAppState: true,
+      wroteConfig: false,
+      reason: "hydrated_account_from_runtime_config"
+    });
+    // A normal restart still refreshes the projection, but makes no redundant changes.
+    expect(writeProjection).toHaveBeenCalledTimes(2);
+    expect(readFileSync(context.memmyConfigPath, "utf8")).toBe(repairedConfig);
+  });
+
+  it("validates the session after repairing a missing account projection", async () => {
+    const context = createContext();
+    seedAccountSession(context);
+    const config = currentByokCatalog() as any;
+    config.app.userMode = "unset";
+    context.writeConfig(config);
+    const writeProjection = vi.spyOn(memmyConfig, "writeAccountModelProjectionToMemmyConfig");
+    vi.spyOn(context.store.repositories.accountSession, "activateByCloudUuid").mockReturnValue(false);
+    const updateSettings = vi.spyOn(context.store.repositories.bootstrap, "updateAppSettings");
+
+    await expect(syncRuntimeConfigWithAppState({ ...context, accountChannel: "email" }))
+      .resolves.toMatchObject({
+        source: "none",
+        hydratedAppState: false,
+        wroteConfig: true,
+        reason: "account_projection_has_no_matching_local_session"
+      });
+    expect(writeProjection).toHaveBeenCalledTimes(1);
+    expect(updateSettings).not.toHaveBeenCalled();
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.providers.memmy_account).toBeUndefined();
+  });
+
+  it("refreshes a different account if its projection replaces the repaired config before hydration", async () => {
+    const context = createContext();
+    seedAccountSession(context);
+    const session = context.store.repositories.accountSession.get();
+    if (!session.authenticated) throw new Error("Expected the seeded account session");
+    context.store.repositories.accountSession.upsert({
+      profile: { ...session.profile, userId: "owner-b" },
+      uuid: "account-b",
+      cloudUuid: "cloud-token-b",
+      authChannel: "email"
+    });
+    context.store.repositories.accountSession.activateByCloudUuid("cloud-token-a", "email");
+    const config = currentByokCatalog() as any;
+    config.app.userMode = "unset";
+    context.writeConfig(config);
+    const originalWrite = memmyConfig.writeAccountModelProjectionToMemmyConfig;
+    const writeProjection = vi.spyOn(memmyConfig, "writeAccountModelProjectionToMemmyConfig")
+      .mockImplementationOnce(async (...args) => {
+        const result = await originalWrite(...args);
+        // Model a concurrent account switch while the repaired config is being re-read.
+        context.writeRaw(YAML.stringify(currentAccountCatalog())
+          .replaceAll("owner-a", "owner-b")
+          .replaceAll("cloud-token-a", "cloud-token-b"));
+        return result;
+      });
+
+    await expect(syncRuntimeConfigWithAppState({ ...context, accountChannel: "email" }))
+      .resolves.toMatchObject({ mode: "account", hydratedAppState: true, wroteConfig: true });
+    expect(writeProjection).toHaveBeenCalledTimes(2);
+    expect(writeProjection).toHaveBeenLastCalledWith({
+      cloudUuid: "cloud-token-b", userId: "owner-b", preserveAccountByokSelection: true
+    }, context.memmyConfigPath);
+    expect(context.store.repositories.accountSession.get()).toMatchObject({
+      authenticated: true, profile: { userId: "owner-b" }
+    });
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.providers.memmy_account.ownerAccountId).toBe("owner-b");
+    expect(saved.modelAssignments.account.ownerAccountId).toBe("owner-b");
+    expect(saved.modelPresets[saved.modelAssignments.account.memorySummary]).toMatchObject({
+      source: "account", ownerAccountId: "owner-b", capabilities: ["memory_summary"]
+    });
   });
 
   it("keeps an explicit BYOK runtime selection while the account remains authenticated", async () => {
