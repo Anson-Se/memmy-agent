@@ -353,7 +353,7 @@ export function MemoriesSubPage(props: MemoriesSubPageProps) {
     if (props.openRequest) {
       openDetailById(props.openRequest.id);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [props.openRequest?.requestId]);
 
   useEffect(() => {

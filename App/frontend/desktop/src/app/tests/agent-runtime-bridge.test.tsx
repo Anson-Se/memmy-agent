@@ -33,7 +33,7 @@ describe("AgentRuntimeBridge", () => {
     const acknowledgeCronDelivery = vi.fn();
     const connection = { getReadyGeneration: () => generation, acknowledgeCronDelivery };
     const acknowledged = new Set<string>();
-    let state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "ready", chat_id: "chat-1" } });
+    const state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "ready", chat_id: "chat-1" } });
     state = agentReducer(state, { type: "agent/chatViewVisibilityChanged", visible: true });
     const event = { event: "message", chat_id: "chat-1", text: "暂无微信新消息",
       metadata: { proactiveDelivery: "cron", deliveryId: "delivery-1" } };
@@ -54,7 +54,7 @@ describe("AgentRuntimeBridge", () => {
 
   it("does not acknowledge transcript replay or history identities", () => {
     const acknowledgeCronDelivery = vi.fn();
-    let state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "message", chat_id: "chat-old",
+    const state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "message", chat_id: "chat-old",
       text: "旧消息", metadata: { proactiveDelivery: "cron", deliveryId: "history-1", replayed: true } } });
     expect(state.proactiveDeliveryIdsByChatId["chat-old"]).toEqual(["history-1"]);
     acknowledgeProcessedCronDeliveries({ getReadyGeneration: () => 1, acknowledgeCronDelivery }, 1,
