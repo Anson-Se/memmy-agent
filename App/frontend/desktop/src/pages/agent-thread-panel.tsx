@@ -805,7 +805,7 @@ function ThreadOverviewPopover(props: {
   onPointerLeave: () => void;
 }) {
   const { t } = useTranslation();
-  const [position, setPosition] = useState<{ top: number; left: number; height: number } | null>(null);
+  const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
   const { anchor } = props;
 
   useLayoutEffect(() => {
@@ -813,8 +813,8 @@ function ThreadOverviewPopover(props: {
     const update = () => {
       const rect = anchor.getBoundingClientRect();
       const left = Math.max(POPOVER_VIEWPORT_PADDING, Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - POPOVER_VIEWPORT_PADDING));
-      const height = Math.max(160, Math.min(POPOVER_HEIGHT, window.innerHeight - rect.bottom - POPOVER_VIEWPORT_PADDING));
-      setPosition({ top: rect.bottom, left, height });
+      const maxHeight = Math.max(0, Math.min(POPOVER_HEIGHT, window.innerHeight - rect.bottom - POPOVER_VIEWPORT_PADDING));
+      setPosition({ top: rect.bottom, left, maxHeight });
     };
     update();
     window.addEventListener("resize", update);
@@ -828,7 +828,7 @@ function ThreadOverviewPopover(props: {
       className="thread-popover"
       role="dialog"
       aria-label={t("home.threadPanel.overview")}
-      style={position ? { top: position.top, left: position.left, height: position.height } : { visibility: "hidden" }}
+      style={position ? { top: position.top, left: position.left, maxHeight: position.maxHeight } : { visibility: "hidden" }}
       onPointerEnter={props.onPointerEnter}
       onPointerLeave={props.onPointerLeave}
     >
