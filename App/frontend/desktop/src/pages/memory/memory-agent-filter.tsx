@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Bot, Ellipsis } from "lucide-react";
 import { Select } from "../../components/Select.js";
+import { useTranslation } from "../../i18n/use-translation.js";
 import {
   agentSourceDisplayName,
   agentSourceLogoUrl,
@@ -22,6 +23,7 @@ export interface MemoryAgentFilterProps {
 }
 
 export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
+  const { t } = useTranslation();
   const options = useMemo(() => [
     {
       value: "",
@@ -30,7 +32,7 @@ export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
     },
     ...MEMORY_AGENT_SOURCE_VALUES.map((value) => ({
       value,
-      label: agentSourceDisplayName(value),
+      label: value === "computer_history" ? t("memory.memories.historySource") : agentSourceDisplayName(value),
       icon: <SourceAgentLogo sourceAgent={value} />
     })),
     {
@@ -38,7 +40,7 @@ export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
       label: props.otherLabel,
       icon: <Ellipsis size={15} strokeWidth={2} className="memory-source-filter__icon memory-source-filter__icon--other" />
     }
-  ], [props.allLabel, props.otherLabel]);
+  ], [props.allLabel, props.otherLabel, t]);
 
   return (
     <Select

@@ -15,7 +15,7 @@ import {
 } from "@memmy/local-api-contracts";
 import YAML from "yaml";
 import { getConfigPath, loadConfig, resolveConfigEnvVars } from "../config/loader.js";
-import type { Config } from "../config/schema.js";
+import { Config } from "../config/schema.js";
 import { buildProviderSnapshot, type ProviderSnapshot } from "./factory.js";
 
 export type { ActualModelContext, CommittedModelSelection } from "@memmy/local-api-contracts";
@@ -101,7 +101,11 @@ export function resolveModelSelection(input: ModelSelectionInput): ResolvedModel
   if (!resolution.ok) return null;
 
   try {
-    const snapshot = buildProviderSnapshot(config, {
+    // Agent fallbacks do not apply to background memory summaries. Clone only
+    // in memory so resolving this role never changes user configuration.
+    const providerConfig = scope.capability === "memory_summary" ? new Config(config.toObject()) : config;
+    if (scope.capability === "memory_summary") providerConfig.agents.defaults.fallbackModels = [];
+    const snapshot = buildProviderSnapshot(providerConfig, {
       presetName: resolution.context.presetId,
       validateCredentials: false,
     });

@@ -26,6 +26,18 @@ import {
 } from "../memory-agent-filter.js";
 
 describe("MemoriesSubPage", () => {
+  it("在所有记忆列表明确标注没有提炼为记忆的观察和原因", () => {
+    const html = renderMemories({ status: "ready", data: panelItemsOutput([{
+      ...memoryListItemFixture,
+      kind: "observed_activity",
+      status: "archived",
+      summary: "重复的窗口切换没有提供新上下文。",
+      metadata: { source: "computer_history", observationStatus: "skipped", observationSkipReason: "重复的窗口切换没有提供新上下文。" }
+    }]), detail: null });
+    expect(html).toContain("未提炼为记忆");
+    expect(html).toContain("重复的窗口切换没有提供新上下文。");
+    expect(html).not.toContain("memory-card__score");
+  });
   it("把搜索转换为只读取原始记忆的 PanelItemsInput", () => {
     expect(buildPanelItemsInput({ query: "偏好" })).toEqual({
       q: "偏好",
@@ -65,6 +77,7 @@ describe("MemoriesSubPage", () => {
   it("筛选器和详情共用统一的 Agent 名称格式", () => {
     expect(MEMORY_AGENT_SOURCE_VALUES.map(agentSourceDisplayName)).toEqual([
       "Memmy",
+      "Computer History",
       "Cursor",
       "Claude Code",
       "Codex",
@@ -77,6 +90,7 @@ describe("MemoriesSubPage", () => {
       "QwenWork"
     ]);
     expect(agentSourceDisplayName("MEMMY_AGENT")).toBe("Memmy");
+    expect(agentSourceDisplayName("computer_history")).toBe("Computer History");
     expect(agentSourceDisplayName("claude-code")).toBe("Claude Code");
     expect(agentSourceDisplayName("OPENCLAW")).toBe("OpenClaw");
   });

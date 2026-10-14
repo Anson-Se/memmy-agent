@@ -13,7 +13,7 @@ const helper = vi.hoisted(() => ({
   onCommand: undefined as ((command: string, args: string[]) => void) | undefined,
 }));
 vi.mock("../../../../src/tools/computer-history/mac/native-helper.js", () => ({
-  ensureNativeHistoryHelper: async () => "/fixture/human-recorder",
+  historyNativeCommand: async () => ({ binary: "/fixture/human-recorder", args: [], managed: false }),
 }));
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -108,29 +108,115 @@ test("persists startup fullTree and every diff across input bursts and shortcuts
   assert.equal(events.find((event) => event.eventType === "recording_started").ax.mode, "fullTree");
 });
 
-test("filters startup and incremental AX before persistence, including unknown website context", async () => {
+test("excludes a blocked CLI context URL from raw metadata", async () => {
+  helper.events = [];
+  const events = await record({ observation: {
+    defaultApplicationBehavior: "observe", defaultURLBehavior: "observe",
+    rules: [{ scope: "url", urlDomain: "bank.com", behavior: "do_not_observe" }],
+  } }, { flags: ["--context-url", "https://bank.com/SECRET_CONTEXT"] });
+  assert.equal(events[0].contextUrl, undefined);
+  assert.equal(JSON.stringify(events).includes("SECRET_CONTEXT"), false);
+});
+
+test("drops an excluded website and unverifiable address, then rebases on an allowed website", async () => {
   const browser = { ...app, bundleIdentifier: "com.google.Chrome" };
   helper.events = [
     { kind: "session.started", app: browser, window: { url: "https://bank.com" }, ax: full },
     { kind: "keyboard.text_input", app: browser, window: { url: "https://bank.com" }, keyboard: { text: "x" }, ax: firstTree },
-    { kind: "keyboard.shortcut", app: browser, window: {}, keyboard: { keyEquivalent: "c", modifiers: ["cmd"] }, ax: secondTree },
-    { kind: "mouse.click", app: browser, window: { url: "https://example.com" }, ax: thirdTree },
+    { kind: "keyboard.shortcut", app: browser, window: { browser: true }, keyboard: { keyEquivalent: "c", modifiers: ["cmd"] }, ax: secondTree },
+    { kind: "mouse.click", app: browser, window: { browser: true, url: "https://example.com" }, ax: thirdTree },
   ];
   const events = await record({ observation: {
     defaultApplicationBehavior: "observe", defaultURLBehavior: "observe",
     rules: [{ scope: "url", urlDomain: "bank.com", behavior: "do_not_observe" }],
-  } });
+  } }, { flags: ["--capture-text"] });
   assert.deepEqual(events.filter((event) => event.ax).map((event) => event.ax), [thirdTree]);
+  assert.equal(events.filter((event) => event.eventType === "key_press").length, 0);
   assert.deepEqual(events.filter((event) => event.eventType === "page_context").map((event) => event.details.url), ["https://example.com"]);
 });
 
-test("never persists a private startup snapshot or secure text input", async () => {
+test("never persists private or unknown browser content, or secure text input", async () => {
+  const unknownBrowser = { browser: true, privateBrowsingUnknown: true,
+    title: "Private browsing probe", url: "https://private-probe.invalid/" };
   helper.events = [
     { kind: "session.started", app, window: { privateBrowsing: true }, ax: full },
     { kind: "keyboard.text_input", app: { ...app, secureInput: true }, keyboard: { text: "sensitive" } },
+    { kind: "mouse.click", app: { ...app, bundleIdentifier: "com.google.Chrome" }, window: unknownBrowser,
+      mouse: { target: { role: "AXButton", title: "Private target probe" } }, ax: full },
+    { kind: "keyboard.text_input", app: { ...app, bundleIdentifier: "com.google.Chrome" }, window: unknownBrowser,
+      keyboard: { text: "Private typed probe" }, ax: firstTree },
+  ];
+  const events = await record(undefined, { flags: ["--capture-text"] });
+  assert.equal(events.some((event) => event.ax || event.eventType === "text_input"), false);
+  assert.equal(/Private .*probe|private-probe\.invalid/u.test(JSON.stringify(events)), false);
+});
+
+test("does not record content when the app identity cannot be checked against exclusions", async () => {
+  helper.events = [
+    { kind: "mouse.click", app: { ...app, bundleIdentifier: "unknown" }, ax: full,
+      mouse: { target: { role: "AXButton", title: "UNIDENTIFIED_APP_CONTENT" } } },
+    { kind: "keyboard.text_input", app: { name: "Unknown" }, keyboard: {
+      text: "UNIDENTIFIED_TYPED_CONTENT", target: { role: "AXTextField" },
+    } },
+    { kind: "mouse.click", app, ax: full,
+      mouse: { target: { role: "AXButton", title: "Allowed button" } } },
+  ];
+  const events = await record(undefined, { flags: ["--capture-text"] });
+  assert.doesNotMatch(JSON.stringify(events), /UNIDENTIFIED_APP_CONTENT|UNIDENTIFIED_TYPED_CONTENT/);
+  assert.equal(events.some((event) => event.eventType === "mouse_click"
+    && event.details?.accessibility?.title === "Allowed button"), true);
+});
+
+test("retains ordinary typing and selection in an observed app but never password input", async () => {
+  const textTarget = { role: "AXTextArea", description: "Chat composer" };
+  const passwordTarget = { role: "AXTextField", subrole: "AXSecureTextField" };
+  helper.events = [
+    { kind: "keyboard.text_input", app, keyboard: { text: "hello", target: textTarget } },
+    { kind: "keyboard.text_input", app, keyboard: { text: "PASSWORD_PROBE", target: passwordTarget } },
+    { kind: "selection.changed", app, selection: { selectedText: "selected note", target: textTarget } },
+    { kind: "selection.changed", app, selection: { selectedText: "SELECTED_PASSWORD_PROBE", target: passwordTarget } },
+  ];
+  const events = await record(allow, { flags: ["--capture-text"] });
+  assert.deepEqual(events.filter((event) => event.eventType === "text_input")
+    .map((event) => event.details.text), ["hello"]);
+  assert.deepEqual(events.filter((event) => event.eventType === "selection_changed")
+    .map((event) => event.details.text), ["selected note"]);
+  assert.equal(JSON.stringify(events).includes("PASSWORD_PROBE"), false);
+});
+
+test("an explicit allow-app restricts retained text in a manual capture", async () => {
+  const target = { role: "AXTextField", description: "Composer" };
+  const otherApp = { ...app, name: "DingTalk", bundleIdentifier: "com.alibaba.DingTalkMac" };
+  helper.events = [
+    { kind: "keyboard.text_input", app: otherApp, keyboard: { text: "other text", target } },
+    { kind: "keyboard.text_input", app, keyboard: { text: "allowed text", target } },
+  ];
+  const events = await record(allow, { flags: ["--capture-text", "--allow-app", app.bundleIdentifier] });
+  assert.deepEqual(events.filter((event) => event.eventType === "text_input")
+    .map((event) => [event.details.text, event.details.redacted]), [
+      ["[REDACTED]", true], ["allowed text", false],
+    ]);
+});
+
+test("a legacy helper cannot persist a private minimized window title through a foreground Dock click or drag", async () => {
+  const privateWindow = {
+    role: "AXDockItem", subrole: "AXMinimizedWindowDockItem",
+    title: "微博 – 随时随地发现新鲜事", value: "https://weibo.com/",
+    ancestors: [{ role: "AXApplication", title: "Dock" }],
+  };
+  helper.events = [
+    { kind: "mouse.click", app, mouse: { target: privateWindow, button: "left" } },
+    { kind: "mouse.context_menu", app, mouse: { target: privateWindow } },
+    { kind: "mouse.drag", app, mouse: { origin: { element: privateWindow },
+      destination: { element: { role: "AXButton", title: "Allowed drop target" } } } },
+    { kind: "mouse.click", app, mouse: { target: { role: "AXButton", title: "Allowed button" } } },
   ];
   const events = await record();
-  assert.equal(events.some((event) => event.ax || event.eventType === "text_input"), false);
+  assert.equal(/微博|weibo\.com|MinimizedWindowDockItem/u.test(JSON.stringify(events)), false);
+  assert.deepEqual(events.find((event) => event.eventType === "mouse_click").details.accessibility, { role: "AXUnknown" });
+  assert.deepEqual(events.find((event) => event.eventType === "mouse_drag").details.origin, { role: "AXUnknown" });
+  assert.equal(JSON.stringify(events).includes("Allowed drop target"), true);
+  assert.equal(JSON.stringify(events).includes("Allowed button"), true);
 });
 
 const allow = { observation: {
@@ -146,7 +232,7 @@ test.each([
   { scope: "url", urlDomain: "example.com", behavior: "do_not_observe" },
 ])("applies a live $scope exclusion to buffered keys and later AX events without restarting", async (rule) => {
   helper.events = [
-    { kind: "keyboard.text_input", app: chrome, window, keyboard: { text: "buffered", target: searchTarget } },
+    { kind: "keyboard.text_input", app: chrome, window, keyboard: { text: "buffered", target: ordinaryTarget } },
     { kind: "mouse.click", app: chrome, window, ax: firstTree },
     { kind: "mouse.click", app: chrome, window, ax: full },
   ];
@@ -154,7 +240,7 @@ test.each([
     if (index < 2) fs.writeFileSync(path.join(directory, "settings.json"), JSON.stringify(index === 0
       ? { observation: { ...allow.observation, rules: [rule] } } : allow));
   };
-  const events = await record(allow, { flags: ["--capture-search-text"] });
+  const events = await record(allow, { flags: ["--capture-text"] });
   assert.equal(events.some((event) => event.eventType === "text_input"), false);
   assert.deepEqual(events.filter((event) => event.ax).map((event) => event.ax), [full]);
   assert.equal(events.filter((event) => event.eventType === "mouse_click").length, 1);
