@@ -237,6 +237,10 @@ export interface AlgorithmConfig {
   session: {
     followUpMode: "merge_follow_ups" | "episode_per_turn";
     mergeMaxGapMs: number;
+    // Test-period switch for the per-turn judgment (turn.judge.v1): one model call
+    // after each turn judges the task relation, feedback, L1 and User Memory. Off
+    // keeps the start-of-turn relation call and the capture-only decision.
+    turnJudge: boolean;
   };
   retrieval: {
     tier1TopK: number;
@@ -495,7 +499,8 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     },
     session: {
       followUpMode: "merge_follow_ups",
-      mergeMaxGapMs: 2 * 60 * 60 * 1000
+      mergeMaxGapMs: 2 * 60 * 60 * 1000,
+      turnJudge: false
     },
     retrieval: {
       tier1TopK: 3,
@@ -1271,7 +1276,8 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
     },
     session: {
       followUpMode: "merge_follow_ups",
-      mergeMaxGapMs: numberValue(session.mergeMaxGapMs, DEFAULT_MEMMY_CONFIG.algorithm.session.mergeMaxGapMs)
+      mergeMaxGapMs: numberValue(session.mergeMaxGapMs, DEFAULT_MEMMY_CONFIG.algorithm.session.mergeMaxGapMs),
+      turnJudge: booleanValue(session.turnJudge, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudge)
     },
     retrieval: {
       tier1TopK: numberValue(retrieval.tier1TopK, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.tier1TopK),
