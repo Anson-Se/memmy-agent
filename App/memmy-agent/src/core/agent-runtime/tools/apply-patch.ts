@@ -328,8 +328,7 @@ Paths may be workspace-relative or absolute paths inside the workspace. Use at m
     return params;
   }
 
-  resolve(requestedPath: string): string {
-    const normalized = normalizePatchPath(requestedPath);
+  private resolveNormalizedPath(normalized: string, requestedPath = normalized): string {
     const target = path.isAbsolute(normalized)
       ? path.resolve(normalized)
       : path.resolve(this.workspace, ...normalized.split("/"));
@@ -356,6 +355,10 @@ Paths may be workspace-relative or absolute paths inside the workspace. Use at m
       }
     }
     return target;
+  }
+
+  resolve(requestedPath: string): string {
+    return this.resolveNormalizedPath(normalizePatchPath(requestedPath), requestedPath);
   }
 
   private normalizeOperations(operations: PatchFileOperation[]): PatchFileOperation[] {
@@ -395,9 +398,9 @@ Paths may be workspace-relative or absolute paths inside the workspace. Use at m
     const resolved = new Map<string, string>();
     for (const operation of operations) {
       throwIfAborted(signal);
-      resolved.set(operation.path, this.resolve(operation.path));
+      resolved.set(operation.path, this.resolveNormalizedPath(operation.path));
       if (operation.kind === "update" && operation.moveTo) {
-        resolved.set(operation.moveTo, this.resolve(operation.moveTo));
+        resolved.set(operation.moveTo, this.resolveNormalizedPath(operation.moveTo));
       }
     }
 
