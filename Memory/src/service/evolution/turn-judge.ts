@@ -752,7 +752,7 @@ export interface TurnJudgeSnapshot {
   promptVersion: typeof TURN_JUDGE_PROMPT_VERSION;
   builtAt: string;
   taskEmpty: boolean;
-  filedByRule?: "first_turn" | "subagent_complete" | "catch_up";
+  filedByRule?: "first_turn" | "subagent_complete" | "catch_up" | "previous_task_closed";
   baseEpisodeId?: string;
   previousRawTurnId?: string;
   previousL1MemoryId?: string;

@@ -78,6 +78,26 @@ describe("turn.judge.v1 capture (switch on)", () => {
     expect(third).toContain("<previous_assistant_reply>第二轮回答。</previous_assistant_reply>");
   });
 
+  it("leaves TASK SO FAR empty when the previous turn's task is already closed", async () => {
+    const { llm, judgeCalls } = createTurnJudgeLlm();
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
+    const session = openSession(service, "turn-judge-closed-task");
+    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写周报", answer: "好。" });
+    await service.runWorkerOnce(20);
+    db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'end_topic') WHERE id = ?`)
+      .run(first.episodeId);
+    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：接着写周报", answer: "好。" });
+    await service.runWorkerOnce(20);
+
+    expect(judgeCalls.find((call) => call.user.startsWith("第二轮"))!.messages.at(-1)!.content)
+      .toContain("<first_user_message></first_user_message>");
+    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.input).toMatchObject({
+      taskEmpty: true,
+      filedByRule: "previous_task_closed",
+      baseEpisodeId: first.episodeId
+    });
+  });
+
   it("sends USER from the stored turn in full, not the 4000-character trace copy", async () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service } = createTestService({ llm, config: turnJudgeConfig() });
