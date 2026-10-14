@@ -36,6 +36,25 @@ describe("Windows application-level Excel adapter", () => {
     await expect(nativeWindowsExcelStatus(rejected("Multiple Excel application instances are running."))).rejects.toThrow("Multiple Excel");
   });
 
+  it("retries a not-yet-registered Excel only for connection probes", async () => {
+    const stopped = { available: true, connected: false, workbooks: [], activeWorkbookId: null };
+    const unavailable = JSON.stringify({ ok: false, code: "NOT_CONNECTED",
+      error: "The running Excel application is not available for control. HRESULT -2147221021", writeAttempted: false });
+    const statusRun = vi.fn<WindowsExcelRunner>().mockResolvedValueOnce(unavailable).mockResolvedValueOnce(success(stopped));
+    expect(await nativeWindowsExcelStatus(statusRun)).toEqual(stopped);
+    expect(statusRun).toHaveBeenCalledTimes(2);
+    const authorizeRun = vi.fn<WindowsExcelRunner>().mockResolvedValueOnce(unavailable).mockResolvedValueOnce(success(stopped));
+    expect(await nativeWindowsExcelAuthorize(authorizeRun)).toEqual(stopped);
+    expect(authorizeRun).toHaveBeenCalledTimes(2);
+    const invokeRun = vi.fn<WindowsExcelRunner>().mockResolvedValue(unavailable);
+    await expect(nativeWindowsExcelInvoke({ kind: "write_range", workbook: id, address: "A1", values: [[1]] }, invokeRun))
+      .rejects.toThrow("not available for control");
+    expect(invokeRun).toHaveBeenCalledOnce();
+    const persistentRun = vi.fn<WindowsExcelRunner>().mockResolvedValue(unavailable);
+    await expect(nativeWindowsExcelStatus(persistentRun)).rejects.toThrow("HRESULT -2147221021");
+    expect(persistentRun).toHaveBeenCalledTimes(4);
+  });
+
   it("checks whether Excel is running without attaching to it", async () => {
     const run = vi.fn<WindowsExcelRunner>()
       .mockResolvedValueOnce('"EXCEL.EXE","2345","Console","1","210,512 K"\r\n')
@@ -73,7 +92,9 @@ describe("Windows application-level Excel adapter", () => {
     expect(decode(run.mock.calls[0][2])).toEqual({ operation: "authorize" });
     const source = script(run.mock.calls[0][1]);
     expect(source).toContain("$app.Visible = $true");
+    expect(source).toContain("$app.UserControl = $true");
     expect(source).toContain("GetActiveObject('Excel.Application')");
+    expect(source).toContain("GetBaseException().HResult");
     expect(source).toContain("GetWindowThreadProcessId([IntPtr]$app.Hwnd");
     expect(source).toContain("$instance = [string]$excelProcess");
     expect(source).toContain("ReleaseComObject");

@@ -35,6 +35,7 @@ const EXCEL_FAILURE_MESSAGES: ReadonlyArray<readonly [RegExp, MessageKey]> = [
   [/permission was denied/i, "settings.computerUse.excelPermissionCheck"],
   [/Excel returned an? (?:invalid|inconsistent)|Excel response is too large/i, "settings.computerUse.excelUnexpectedResponse"],
 ];
+const WINDOWS_EXCEL_ATTACH_UNAVAILABLE = /running Excel application is not available for control/i;
 
 export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform?: string; browserExtensionFocusNonce?: number; excelConnectionFocusNonce?: number }) {
   const { t } = useTranslation();
@@ -221,9 +222,14 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   const excelFailureDetail = excelError?.message ?? (excelStatusError ? "" : excelStatus?.error ?? "");
   const excelAutomationError = props.platform === "darwin" && !excelLegacyScope
     ? excelAutomationFailure(excelFailureDetail) : null;
-  const excelHardFailure = excelFailureDetail ? describeKnownExcelFailure(excelFailureDetail) : null;
+  const excelAttachUnavailable = props.platform === "win32" && WINDOWS_EXCEL_ATTACH_UNAVAILABLE.test(excelFailureDetail);
+  const excelAttachChecking = excelAttachUnavailable && excelEnabled && excelStatusFailures < 3;
+  const excelHardFailure = excelFailureDetail && !excelAttachUnavailable
+    ? describeKnownExcelFailure(excelFailureDetail) : null;
   const excelHasFailure = Boolean(excelError || excelStatusError || excelStatus?.error);
-  const excelFailureText = excelHardFailure ?? (excelError
+  const excelFailureText = excelAttachUnavailable
+    ? t(excelAttachChecking ? "settings.computerUse.excelChecking" : "settings.computerUse.excelStartupUnavailable")
+    : excelHardFailure ?? (excelError
     ? t(excelRetryEnabled ? "settings.computerUse.excelConnectIncomplete"
       : "settings.computerUse.excelDisconnectIncomplete")
     : t(excelStatusFailures < 3 ? "settings.computerUse.excelChecking"
@@ -278,6 +284,18 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
       setExcelStatusError(false);
       setExcelStatusFailures(0);
       if (next.scope === "application" || !next.manualInstallPath) setAwaitingExcelPermission(false);
+      if (props.platform === "win32" && next.scope === "application") {
+        // A successful authorization can precede Excel's registration for the next process.
+        // Confirm with a fresh probe before presenting it as connected.
+        try {
+          const verified = await props.client.getExcelAddinStatus();
+          setExcelStatus(verified);
+          setExcelStatusFailures(verified.error ? 1 : 0);
+        } catch {
+          setExcelStatusError(true);
+          setExcelStatusFailures(1);
+        }
+      }
     } catch (error) {
       failedExcelAction.current = true;
       setExcelError(error instanceof Error ? error : new Error());
@@ -428,7 +446,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
             <small>{t(excelLegacyScope ? "settings.computerUse.excelDescription" : "settings.computerUse.excelApplicationDescription")}</small>
             {excelBusy && <small>{t(excelLegacyScope ? "settings.computerUse.excelPreparing"
               : excelRetryEnabled ? "settings.computerUse.excelConnecting" : "settings.computerUse.excelDisconnecting")}</small>}
-            {excelEnabled && excelStatus?.connected && !excelStatusError && !excelStatus.error
+            {excelEnabled && excelStatus?.connected && (props.platform !== "win32" || !excelBusy) && !excelStatusError && !excelStatus.error
               && <small>{t("settings.computerUse.excelConnected")}</small>}
             {excelConnectionHint && !excelBusy && <small>{t(excelConnectionHint)}</small>}
             {!excelLegacyScope && excelHasFailure && !excelBusy && <small role={excelHardFailure ? "alert" : undefined}
@@ -438,7 +456,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
             {excelAutomationError === "denied" && <button type="button" className={styles.setupButton} disabled={excelBusy}
               onClick={() => void openExternalUrl("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")}>
               {t("settings.computerUse.excelOpenAutomation")}</button>}
-            {(excelError || (!excelLegacyScope && excelStatusFailures >= 3) || (excelApplicationScope
+            {((excelError && !excelAttachChecking) || (!excelLegacyScope && excelStatusFailures >= 3) || (excelApplicationScope
               && (excelStatus.permissionRequired || excelHardFailure))) &&
               <button type="button" className={styles.setupButton} disabled={excelBusy}
                 onClick={() => void setExcelEnabled(excelError ? excelRetryEnabled : true)}>{t("settings.computerUse.excelControlRetry")}</button>}

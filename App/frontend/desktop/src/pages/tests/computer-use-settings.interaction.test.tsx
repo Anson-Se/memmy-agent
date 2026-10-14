@@ -284,6 +284,33 @@ describe("computer use settings", () => {
     }
   });
 
+  it("confirms a Windows Excel grant before showing connected", async () => {
+    const connected = applicationExcelStatus({ enabled: true, configured: true, connected: true,
+      connectionCount: 1, workbooks: [{ id: "book1", name: "Book1" }], activeWorkbookId: "book1" });
+    const unavailable = applicationExcelStatus({ enabled: true, configured: true,
+      error: "The running Excel application is not available for control. HRESULT -2147221021" });
+    let finishCheck!: (value: ExcelControlStatus) => void;
+    const pendingCheck = new Promise<ExcelControlStatus>(resolve => { finishCheck = resolve; });
+    const getExcelAddinStatus = vi.fn().mockResolvedValueOnce(applicationExcelStatus()).mockReturnValueOnce(pendingCheck);
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExcelAddinStatus, setExcelAddinEnabled: vi.fn().mockResolvedValue(connected),
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    await act(async () => {
+      root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform="win32" /></I18nProvider>);
+    });
+    const toggle = container.querySelector('input[role="switch"][aria-label="Microsoft Excel"]') as HTMLInputElement;
+    await act(async () => { toggle.click(); await Promise.resolve(); });
+    expect(container.textContent).toContain("正在连接");
+    expect(container.textContent).not.toContain("已连接");
+    await act(async () => { finishCheck(unavailable); await pendingCheck; });
+    expect(getExcelAddinStatus).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("正在确认 Excel 连接");
+    expect(container.textContent).not.toContain("已连接");
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+  });
+
   it("requires an explicit retry after native Excel permission is denied and never asks for Full Disk Access", async () => {
     vi.useFakeTimers();
     const openExternal = vi.fn().mockResolvedValue(undefined);
@@ -443,8 +470,6 @@ describe("computer use settings", () => {
       error: "Excel is busy because a cell is being edited or a dialog is open. Ask the user to press Enter or close the dialog in Excel, then try again." },
     { name: "several Windows Excel instances", platform: "win32", language: "zh-CN", shown: "检测到同时运行着多个 Excel 程序",
       error: "Multiple Excel application instances are running. Keep one Excel instance open to select a workbook safely." },
-    { name: "an Excel dialog blocking the connection", platform: "win32", language: "zh-CN", shown: "Excel 正在运行，但暂时无法连接",
-      error: "The running Excel application is not available for control. Finish any Excel dialog and try again." },
     { name: "a locked Mac", platform: "darwin", language: "zh-CN", shown: "需要在电脑解锁的状态下才能操作 Excel",
       error: "macOS is locked; Excel operation was not executed" },
     { name: "an unresponsive Excel", platform: "darwin", language: "zh-CN", shown: "Excel 长时间没有响应",
@@ -463,6 +488,42 @@ describe("computer use settings", () => {
     expect(container.textContent).toContain(shown);
     expect(container.textContent).not.toContain(error);
     expect(container.textContent).toContain(language === "en-US" ? "Retry connection" : "重试连接");
+  });
+
+  it("waits through a Windows Excel startup attachment failure and clears it when polling recovers", async () => {
+    vi.useFakeTimers();
+    try {
+      const connected = applicationExcelStatus({ enabled: true, configured: true, connected: true });
+      const unavailable = applicationExcelStatus({ enabled: true, configured: true,
+        error: "The running Excel application is not available for control. COM HRESULT: 0x800401E3" });
+      const getExcelAddinStatus = vi.fn().mockResolvedValueOnce(connected)
+        .mockResolvedValueOnce(unavailable).mockResolvedValueOnce(unavailable)
+        .mockResolvedValueOnce(unavailable).mockResolvedValueOnce(connected);
+      const client = {
+        getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+        getExcelAddinStatus,
+        getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+      } as unknown as MemmyAgentClient;
+      await act(async () => {
+        root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform="win32" /></I18nProvider>);
+      });
+      expect(container.textContent).toContain("已连接");
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(container.textContent).toContain("正在确认 Excel 连接");
+      expect(container.textContent).not.toContain("已连接");
+      expect(container.textContent).not.toContain("重试连接");
+      expect(container.textContent).not.toContain("0x800401E3");
+      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(container.textContent).toContain("请确认 Excel 已完成启动、没有待处理的窗口");
+      expect(container.textContent).toContain("重试连接");
+      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(container.textContent).toContain("已连接");
+      expect(container.textContent).not.toContain("重试连接");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not flash a raw Excel status error and clears it when the next check recovers", async () => {
