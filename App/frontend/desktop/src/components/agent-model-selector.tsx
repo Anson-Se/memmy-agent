@@ -102,12 +102,6 @@ export function AgentModelSelector(props: AgentModelSelectorProps) {
   const thinkingConfig = resolveThinkingConfigForModel(workspace, resolved.candidate);
 
   return (
-    <div className="agent-model-selector-with-thinking">
-      <AgentThinkingControl
-        scopeKey={props.scopeKey}
-        thinkingConfig={thinkingConfig}
-        disabled={props.disabled}
-      />
     <div className="agent-model-selector" data-model-selector-scope={props.scopeKey}>
       <Select
         label={t("home.modelSelector.label")}
@@ -122,6 +116,15 @@ export function AgentModelSelector(props: AgentModelSelectorProps) {
         className="select-control--compact select-control--subtle agent-model-selector__control"
         buttonClassName="agent-model-selector__button"
         menuClassName="agent-model-selector__menu"
+        optionAside={(option) => (
+          option.value === resolved.candidateId && thinkingConfig
+            ? <AgentThinkingControl
+                scopeKey={props.scopeKey}
+                thinkingConfig={thinkingConfig}
+                disabled={props.disabled}
+              />
+            : null
+        )}
         menuFooter={({ close }) => (
           <div className="agent-model-selector__footer">
             <button
@@ -138,7 +141,6 @@ export function AgentModelSelector(props: AgentModelSelectorProps) {
           </div>
         )}
       />
-    </div>
     </div>
   );
 }

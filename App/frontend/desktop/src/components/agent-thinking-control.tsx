@@ -1,10 +1,8 @@
-import { ChevronDown } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Check } from "lucide-react";
 import {
   resolveThinkingEnabled,
   resolveThinkingLevel,
-  type ModelThinkingConfig,
-  type ThinkingLevel
+  type ModelThinkingConfig
 } from "@memmy/local-api-contracts";
 import { useTranslation } from "../i18n/use-translation.js";
 import { agentActions } from "../state/app-actions.js";
@@ -16,99 +14,53 @@ export interface AgentThinkingControlProps {
   disabled: boolean;
 }
 
+/** Thinking settings shown inside the open model menu. */
 export function AgentThinkingControl(props: AgentThinkingControlProps) {
   const { t } = useTranslation();
   const { state, dispatch } = useAppState();
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
   const config = props.thinkingConfig;
 
+  if (!config) return null;
+
   const thinkingState = state.agent.thinkingStateByScope[props.scopeKey];
-  const enabled = config
-    ? resolveThinkingEnabled(config, thinkingState?.enabled)
-    : false;
-  const currentLevel = config
-    ? resolveThinkingLevel(config, thinkingState?.level)
-    : null;
-
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const handleClickOutside = (event: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
-        setPickerOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [pickerOpen]);
-
-  if (!config) {
-    return null;
-  }
-
-  const hasLevels = config.levels.length > 0;
-  const showLevels = hasLevels && enabled && currentLevel !== null;
-  const level: ThinkingLevel | null = showLevels ? currentLevel : null;
-
-  function toggleThinking() {
-    dispatch(agentActions.thinkingToggled(props.scopeKey, !enabled));
-  }
-
-  function selectLevel(next: string) {
-    dispatch(agentActions.thinkingLevelChanged(props.scopeKey, next));
-    setPickerOpen(false);
-  }
+  const enabled = resolveThinkingEnabled(config, thinkingState?.enabled);
+  const currentLevel = resolveThinkingLevel(config, thinkingState?.level);
+  const showLevels = enabled && config.levels.length > 0;
 
   return (
-    <div ref={containerRef} className="agent-thinking-control">
+    <div className="agent-thinking-control" aria-label={t("home.thinking.label")}>
       {config.switchable && (
         <button
           type="button"
-          onClick={toggleThinking}
+          role="switch"
+          aria-checked={enabled}
+          onClick={() => dispatch(agentActions.thinkingToggled(props.scopeKey, !enabled))}
           disabled={props.disabled}
-          aria-pressed={enabled}
-          className={`thinking-toggle ${enabled ? "thinking-toggle--on" : ""}`}
-          aria-label={t("home.thinking.toggle")}
+          className="thinking-toggle"
         >
-          <span className="thinking-toggle__label">{t("home.thinking.label")}</span>
-          <div className={`thinking-toggle__switch ${enabled ? "thinking-toggle__switch--on" : ""}`}>
-            <div className="thinking-toggle__switch-thumb" />
-          </div>
+          <span>{t("home.thinking.label")}</span>
+          <span className={`thinking-toggle__switch ${enabled ? "thinking-toggle__switch--on" : ""}`} aria-hidden="true">
+            <span className="thinking-toggle__switch-thumb" />
+          </span>
         </button>
       )}
 
-      {level !== null && (
-        <div className="thinking-level-trigger-container">
-          <button
-            type="button"
-            onClick={() => setPickerOpen(!pickerOpen)}
-            disabled={props.disabled}
-            className="thinking-level-trigger"
-            aria-label={t("home.thinking.selectLevel")}
-          >
-            <span className="thinking-level-trigger__label">
-              {t("home.thinking.level")}: {t(`home.thinking.levelValue.${level}`)}
-            </span>
-            <ChevronDown size={14} className="thinking-level-trigger__icon" />
-          </button>
-
-          {pickerOpen && (
-            <div className="thinking-level-picker">
-              <div className="thinking-level-picker__header">
-                {t("home.thinking.levelHeader")}
-              </div>
-              {config.levels.map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  onClick={() => selectLevel(option)}
-                  className={`thinking-level-option ${level === option ? "thinking-level-option--selected" : ""}`}
-                >
-                  {t(`home.thinking.levelValue.${option}`)}
-                </button>
-              ))}
-            </div>
-          )}
+      {showLevels && (
+        <div className="thinking-level-picker" role="group" aria-label={t("home.thinking.levelHeader")}>
+          <div className="thinking-level-picker__header">{t("home.thinking.levelHeader")}</div>
+          {config.levels.map((option) => (
+            <button
+              key={option}
+              type="button"
+              aria-pressed={currentLevel === option}
+              onClick={() => dispatch(agentActions.thinkingLevelChanged(props.scopeKey, option))}
+              disabled={props.disabled}
+              className={`thinking-level-option ${currentLevel === option ? "thinking-level-option--selected" : ""}`}
+            >
+              <span>{t(`home.thinking.levelValue.${option}`)}</span>
+              {currentLevel === option && <Check size={15} strokeWidth={2.4} aria-hidden="true" />}
+            </button>
+          ))}
         </div>
       )}
     </div>
