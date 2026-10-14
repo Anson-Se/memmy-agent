@@ -765,15 +765,39 @@ export interface TurnJudgeSnapshot {
   overBudget: boolean;
 }
 
+// What is stored on the raw turn: the snapshot without the system prompt,
+// which is fixed for a prompt version and put back from code when read.
+export function storedTurnJudgeInput(snapshot: TurnJudgeSnapshot): Record<string, unknown> {
+  const [first, ...rest] = snapshot.messages;
+  const omitsPrompt = first?.role === "system" && first.content === TURN_JUDGE_SYSTEM_PROMPT;
+  return {
+    ...snapshot,
+    messages: omitsPrompt ? rest : snapshot.messages,
+    ...(omitsPrompt ? { systemPromptOmitted: true } : {})
+  };
+}
+
+// After a successful judgment only the small fields stay: which task it was
+// judged against, the previous turn, token count and cut steps.
+export function prunedTurnJudgeInput(stored: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(stored)) return undefined;
+  const { messages: _messages, visible: _visible, systemPromptOmitted: _omitted, ...rest } = stored;
+  return { ...rest, inputPruned: true };
+}
+
 export function turnJudgeSnapshotFromPayload(value: unknown): TurnJudgeSnapshot | undefined {
   if (!isRecord(value) || value.promptVersion !== TURN_JUDGE_PROMPT_VERSION) return undefined;
   if (!Array.isArray(value.messages) || !isRecord(value.visible)) return undefined;
-  const messages = value.messages.filter((message): message is { role: "system" | "user"; content: string } =>
+  const storedMessages = value.messages.filter((message): message is { role: "system" | "user"; content: string } =>
     isRecord(message) && (message.role === "system" || message.role === "user") && typeof message.content === "string");
-  if (messages.length !== value.messages.length || messages.length === 0) return undefined;
+  if (storedMessages.length !== value.messages.length || storedMessages.length === 0) return undefined;
+  const messages = value.systemPromptOmitted === true
+    ? [{ role: "system" as const, content: TURN_JUDGE_SYSTEM_PROMPT }, ...storedMessages]
+    : storedMessages;
   const visible = value.visible;
+  const { systemPromptOmitted: _omitted, ...fields } = value;
   return {
-    ...(value as unknown as TurnJudgeSnapshot),
+    ...(fields as unknown as TurnJudgeSnapshot),
     messages,
     visible: {
       userText: typeof visible.userText === "string" ? visible.userText : "",

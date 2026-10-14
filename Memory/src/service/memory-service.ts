@@ -504,6 +504,7 @@ export class MemoryService {
       decideTurnMemoryForCapture: this.evolutionJobs.decideTurnMemoryForCapture.bind(this.evolutionJobs),
       buildTurnJudgeSnapshot: this.evolutionJobs.buildTurnJudgeSnapshot.bind(this.evolutionJobs),
       judgeTurnForCapture: this.evolutionJobs.judgeTurnForCapture.bind(this.evolutionJobs),
+      turnJudgeKeepInput: () => this.config.algorithm.session.turnJudgeKeepInput,
       finalizeClosedEpisode: (episode, at) => this.workerHandlers.finalizeClosedEpisode(episode, at, "capture_decided")
     });
     const workerRunnerOwner = this;
