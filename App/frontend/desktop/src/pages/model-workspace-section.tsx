@@ -5,7 +5,6 @@ import {
   THINKING_LEVELS,
   defaultThinkingLevel,
   type ModelEndpointProtocol,
-  type ModelThinkingConfig,
   type ModelThinkingConfigDto,
   type ThinkingLevel
 } from "@memmy/local-api-contracts";
@@ -79,6 +78,59 @@ interface ConnectionTestState {
   message: string | null;
 }
 
+type CustomThinkingMode = "interface-default" | "switchable" | "always-on";
+
+interface CustomModelOptions {
+  thinkingMode: CustomThinkingMode;
+  defaultEnabled: boolean;
+  levels: ThinkingLevel[];
+  defaultLevel: ThinkingLevel;
+  imageInput: boolean;
+}
+
+interface ConnectionEditorModel {
+  presetId?: string;
+  name: string;
+  capabilities: ModelCapability[];
+  customOptions?: CustomModelOptions;
+}
+
+function defaultCustomModelOptions(): CustomModelOptions {
+  return {
+    thinkingMode: "interface-default",
+    defaultEnabled: true,
+    levels: ["medium"],
+    defaultLevel: "medium",
+    imageInput: false
+  };
+}
+
+function customOptionsFromModel(entry: ModelConnection["modelEntries"][number]): CustomModelOptions {
+  const thinking = entry.thinking;
+  const levels = thinking?.levels.length ? [...thinking.levels] : ["medium" as ThinkingLevel];
+  return {
+    thinkingMode: !thinking
+      ? "interface-default"
+      : thinking.switchable ? "switchable" : "always-on",
+    defaultEnabled: thinking?.defaultEnabled ?? true,
+    levels,
+    defaultLevel: thinking?.defaultLevel && levels.includes(thinking.defaultLevel)
+      ? thinking.defaultLevel
+      : defaultThinkingLevel(levels) ?? "medium",
+    imageInput: entry.inputModalities?.includes("image") === true
+  };
+}
+
+function thinkingConfigFromOptions(options: CustomModelOptions | undefined): ModelThinkingConfigDto | undefined {
+  if (!options || options.thinkingMode === "interface-default") return undefined;
+  return {
+    switchable: options.thinkingMode === "switchable",
+    defaultEnabled: options.thinkingMode === "switchable" ? options.defaultEnabled : true,
+    levels: [...options.levels],
+    defaultLevel: options.defaultLevel
+  };
+}
+
 interface ConnectionEditorState {
   connectionId: string | null;
   provider: Protocol;
@@ -86,18 +138,10 @@ interface ConnectionEditorState {
   apiKey: string;
   customProtocol: CustomProtocol | null;
   region: string;
-  customThinkingEnabled: boolean;
-  customThinkingSwitchable: boolean;
-  customThinkingDefaultEnabled: boolean;
-  customThinkingLevels: string;
-  customImageInput: boolean;
-  models: Array<{
-    presetId?: string;
-    name: string;
-    capabilities: ModelCapability[];
-  }>;
+  models: ConnectionEditorModel[];
   modelDraft: string;
   capabilityDrafts: ModelCapability[];
+  modelDraftOptions: CustomModelOptions;
   addingModel: boolean;
   editingModelIndex: number | null;
 }
@@ -239,14 +283,10 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       apiKey: "",
       customProtocol: provider === "custom" ? "openai-chat-completions" : null,
       region: "",
-      customThinkingEnabled: false,
-      customThinkingSwitchable: true,
-      customThinkingDefaultEnabled: true,
-      customThinkingLevels: "",
-      customImageInput: false,
       models: [],
       modelDraft: DEFAULT_MODEL_IDS[provider],
       capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+      modelDraftOptions: defaultCustomModelOptions(),
       addingModel: true,
       editingModelIndex: null
     });
@@ -296,7 +336,6 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       : connection.protocol === "openai-responses"
         ? "openai_responses"
         : protocolFromConnection(connection.provider);
-    const thinking = connection.modelEntries[0]?.thinking;
     const savedTest = connectionTestState(connection, testStates);
     setFormError(null);
     setEditorTest(savedTest
@@ -310,26 +349,28 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       apiKey: "",
       customProtocol: isCustom ? connection.protocol as CustomProtocol : null,
       region: connection.region ?? "",
-      customThinkingEnabled: Boolean(thinking),
-      customThinkingSwitchable: thinking?.switchable ?? true,
-      customThinkingDefaultEnabled: thinking?.defaultEnabled ?? true,
-      customThinkingLevels: thinking?.levels.join(",") ?? "",
-      customImageInput: connection.modelEntries[0]?.inputModalities?.includes("image") === true,
       models: connection.modelEntries.map((entry) => ({
         presetId: entry.presetId,
         name: entry.model,
-        capabilities: normalizeEditorCapabilities(entry.capabilities.map(fromCatalogCapability))
+        capabilities: normalizeEditorCapabilities(entry.capabilities.map(fromCatalogCapability)),
+        ...(isCustom ? { customOptions: customOptionsFromModel(entry) } : {})
       })),
       modelDraft: "",
       capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+      modelDraftOptions: defaultCustomModelOptions(),
       addingModel: false,
       editingModelIndex: null
     });
   }
 
+  function updateDraftCustomOptions(next: CustomModelOptions) {
+    setEditor((current) => current ? { ...current, modelDraftOptions: next } : null);
+    setEditorTest({ status: "idle", message: null });
+  }
+
   function resolveEditorModels() {
     if (!editor) {
-      return { models: [] as Array<{ presetId?: string; name: string; capabilities: ModelCapability[] }>, error: null as string | null };
+      return { models: [] as ConnectionEditorModel[], error: null as string | null };
     }
     const draftName = editor.modelDraft.trim();
     if (!editor.addingModel || !draftName) {
@@ -350,7 +391,8 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
     const nextModel = {
       ...(editedModel?.presetId ? { presetId: editedModel.presetId } : {}),
       name: draftName,
-      capabilities: editor.capabilityDrafts
+      capabilities: editor.capabilityDrafts,
+      ...(editor.provider === "custom" ? { customOptions: editor.modelDraftOptions } : {})
     };
     return {
       models: editor.editingModelIndex !== null
@@ -382,23 +424,6 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
         capabilities,
         providerChanged ? undefined : existing?.protocol
       );
-    const levels = editor.customThinkingLevels
-      .split(",")
-      .map((level) => level.trim())
-      .filter((level): level is ThinkingLevel => THINKING_LEVELS.includes(level as ThinkingLevel));
-    const customThinkingConfig: ModelThinkingConfigDto | null = editor.provider === "custom" && editor.customThinkingEnabled
-      ? {
-          switchable: editor.customThinkingSwitchable,
-          defaultEnabled: editor.customThinkingSwitchable
-            ? editor.customThinkingDefaultEnabled
-            : true,
-          levels: [...levels],
-          defaultLevel: defaultThinkingLevel(levels)
-        }
-      : null;
-    const inputModalities = editor.provider === "custom"
-      ? (editor.customImageInput ? ["text", "image"] as const : ["text"] as const)
-      : undefined;
     const result = upsertModelConnection(workspace, props.mode, {
       id: editor.connectionId ?? undefined,
       provider: catalogProvider,
@@ -408,17 +433,20 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       apiKey: editor.apiKey || undefined,
       apiKeyMasked: providerChanged ? undefined : existing?.apiKeyMasked,
       models: resolved.models.map((model) => model.name),
-      modelEntries: resolved.models.map((model) => ({
-        ...(model.presetId ? { presetId: model.presetId } : {}),
-        model: model.name,
-        capability: model.capabilities[0]!,
-        capabilities: model.capabilities,
-        ...(editor.provider === "custom" ? {
-          custom: true,
-          thinking: customThinkingConfig,
-          inputModalities: [...inputModalities!]
-        } : {})
-      })),
+      modelEntries: resolved.models.map((model) => {
+        const thinking = thinkingConfigFromOptions(model.customOptions);
+        return {
+          ...(model.presetId ? { presetId: model.presetId } : {}),
+          model: model.name,
+          capability: model.capabilities[0]!,
+          capabilities: model.capabilities,
+          ...(editor.provider === "custom" ? {
+            custom: true,
+            ...(thinking ? { thinking } : {}),
+            inputModalities: model.customOptions?.imageInput ? ["text", "image"] : ["text"]
+          } : {})
+        };
+      }),
       modelCapabilities: Object.fromEntries(
         resolved.models.map((model) => [model.name, model.capabilities[0]!])
       )
@@ -514,7 +542,8 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
     const nextModel = {
       ...(editedModel?.presetId ? { presetId: editedModel.presetId } : {}),
       name,
-      capabilities: editor.capabilityDrafts
+      capabilities: editor.capabilityDrafts,
+      ...(editor.provider === "custom" ? { customOptions: editor.modelDraftOptions } : {})
     };
     const models = editor.editingModelIndex !== null
       ? editor.models.map((model, index) => index === editor.editingModelIndex ? nextModel : model)
@@ -524,6 +553,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       models,
       modelDraft: "",
       capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+      modelDraftOptions: defaultCustomModelOptions(),
       addingModel: false,
       editingModelIndex: null
     });
@@ -539,6 +569,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       ...editor,
       modelDraft: model.name,
       capabilityDrafts: model.capabilities,
+      modelDraftOptions: model.customOptions ?? defaultCustomModelOptions(),
       addingModel: true,
       editingModelIndex: modelIndex
     });
@@ -551,6 +582,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
       ...editor,
       modelDraft: "",
       capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+      modelDraftOptions: defaultCustomModelOptions(),
       addingModel: false,
       editingModelIndex: null
     });
@@ -569,6 +601,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
         ? {
             modelDraft: "",
             capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+            modelDraftOptions: defaultCustomModelOptions(),
             addingModel: false,
             editingModelIndex: null
           }
@@ -1135,6 +1168,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
                       models: [],
                       modelDraft: DEFAULT_MODEL_IDS[provider],
                       capabilityDrafts: [...DEFAULT_TEXT_CAPABILITIES],
+                      modelDraftOptions: defaultCustomModelOptions(),
                       addingModel: true,
                       editingModelIndex: null
                     })
@@ -1157,7 +1191,10 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
               <Select
                 label={t("settings.modelWorkspace.customProtocol")}
                 value={editor.customProtocol ?? "openai-chat-completions"}
-                onValueChange={(value) => setEditor((prev) => prev ? { ...prev, customProtocol: value as CustomProtocol } : null)}
+                onValueChange={(value) => {
+                  setEditor((prev) => prev ? { ...prev, customProtocol: value as CustomProtocol } : null);
+                  setEditorTest({ status: "idle", message: null });
+                }}
                 className="select-control--subtle"
                 options={CUSTOM_PROTOCOL_OPTIONS.map((option) => ({
                   value: option.value,
@@ -1168,57 +1205,13 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
                 <ConfigField
                   label={t("settings.modelWorkspace.region")}
                   value={editor.region}
-                  onChange={(region) => setEditor((prev) => prev ? { ...prev, region } : prev)}
+                  onChange={(region) => {
+                    setEditor((prev) => prev ? { ...prev, region } : prev);
+                    setEditorTest({ status: "idle", message: null });
+                  }}
                   placeholder={t("settings.modelWorkspace.regionPlaceholder")}
                 />
               )}
-              <div className="custom-thinking-config">
-                <CustomCapabilityOption
-                  checked={editor.customThinkingEnabled}
-                  label={t("settings.modelWorkspace.customThinkingEnabled")}
-                  hint={t("settings.modelWorkspace.customThinkingEnabledHint")}
-                  onChange={(customThinkingEnabled) => setEditor((prev) => prev ? { ...prev, customThinkingEnabled } : null)}
-                />
-                {editor.customThinkingEnabled && (
-                  <>
-                    <CustomCapabilityOption
-                      checked={editor.customThinkingSwitchable}
-                      label={t("settings.modelWorkspace.customThinkingSwitchable")}
-                      hint={t("settings.modelWorkspace.customThinkingSwitchableHint")}
-                      onChange={(customThinkingSwitchable) => setEditor((prev) => prev ? { ...prev, customThinkingSwitchable } : null)}
-                    />
-                    {editor.customThinkingSwitchable && (
-                      <CustomCapabilityOption
-                        checked={editor.customThinkingDefaultEnabled}
-                        label={t("settings.modelWorkspace.customThinkingDefaultEnabled")}
-                        hint={t("settings.modelWorkspace.customThinkingDefaultEnabledHint")}
-                        onChange={(customThinkingDefaultEnabled) => setEditor((prev) => prev ? { ...prev, customThinkingDefaultEnabled } : null)}
-                      />
-                    )}
-                    <div className="custom-thinking-levels">
-                      <label className="custom-thinking-levels__label">
-                        {t("settings.modelWorkspace.customThinkingLevels")}
-                      </label>
-                      <input
-                        type="text"
-                        placeholder={t("settings.modelWorkspace.customThinkingLevelsPlaceholder")}
-                        value={editor.customThinkingLevels}
-                        onChange={(event) => setEditor((prev) => prev ? { ...prev, customThinkingLevels: event.target.value } : null)}
-                        className="custom-thinking-levels__input"
-                      />
-                      <p className="custom-thinking-levels__hint">
-                        {t("settings.modelWorkspace.customThinkingLevelsHint")}
-                      </p>
-                    </div>
-                  </>
-                )}
-                <CustomCapabilityOption
-                  checked={editor.customImageInput}
-                  label={t("settings.modelWorkspace.customImageInput")}
-                  hint={t("settings.modelWorkspace.customImageInputHint")}
-                  onChange={(customImageInput) => setEditor((prev) => prev ? { ...prev, customImageInput } : null)}
-                />
-              </div>
             </>
           )}
           <ConfigField
@@ -1231,9 +1224,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
             placeholder={DEFAULT_ENDPOINTS[editor.provider]}
           />
           <PasswordConfigField
-            label={editor.connectionId && !editorProviderChanged
-              ? t("settings.modelWorkspace.replaceKey")
-              : t("apiKey.key")}
+            label={t("apiKey.key")}
             value={editor.apiKey}
             onChange={(value) => {
               setEditor((current) => current ? { ...current, apiKey: value } : current);
@@ -1242,9 +1233,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
             maskedValue={editor.connectionId && !editorProviderChanged
               ? editorExistingConnection?.apiKeyMasked
               : undefined}
-            placeholder={editor.connectionId && !editorProviderChanged
-              ? t("settings.modelWorkspace.replaceKeyPlaceholder")
-              : "sk-..."}
+            placeholder={t("settings.modelWorkspace.apiKeyPlaceholder")}
             showPassword={showEditorApiKey}
             onTogglePassword={() => setShowEditorApiKey((show) => !show)}
           />
@@ -1262,6 +1251,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
                     capabilityDrafts: editorExistingConnection
                       ? editorCapabilitiesForProtocol(editorExistingConnection.protocol)
                       : [...DEFAULT_TEXT_CAPABILITIES],
+                    modelDraftOptions: defaultCustomModelOptions(),
                     addingModel: true,
                     editingModelIndex: null
                   })}
@@ -1309,9 +1299,18 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
                 />
                 <ModelCapabilityPicker
                   capabilities={editor.capabilityDrafts}
-                  onChange={(capabilityDrafts) => setEditor({ ...editor, capabilityDrafts })}
+                  onChange={(capabilityDrafts) => {
+                    setEditor({ ...editor, capabilityDrafts });
+                    setEditorTest({ status: "idle", message: null });
+                  }}
                 />
               </div>
+              {editor.provider === "custom" && editor.capabilityDrafts.includes("chat") && (
+                <CustomModelSettings
+                  options={editor.modelDraftOptions}
+                  onChange={updateDraftCustomOptions}
+                />
+              )}
               <div className="model-editor-actions">
                 <button
                   type="button"
@@ -1411,9 +1410,7 @@ function ProviderModelList(props: {
             index > 0 ? "border-t border-border-stone/30" : ""
           }`}
         >
-          <span className="min-w-0 flex-1 truncate text-sm text-text-ink/70" title={item.model}>
-            {item.model}
-          </span>
+          <span className="min-w-0 flex-1 truncate text-sm text-text-ink/70" title={item.model}>{item.model}</span>
           <div className="flex shrink-0 items-center gap-1.5">
             <span className="rounded-tag bg-canvas-oat px-2 py-0.5 text-[10px] text-text-ink/50">
               {t(modelKindMessageKey(modelKindForCapabilities(item.capabilities)))}
@@ -1776,7 +1773,7 @@ function CustomCapabilityOption(props: {
     <label className="custom-thinking-config__label">
       <input
         type="checkbox"
-        className="custom-thinking-config__checkbox"
+        className="custom-thinking-config__checkbox check-sky"
         checked={props.checked}
         onChange={(event) => props.onChange(event.target.checked)}
       />
@@ -1784,5 +1781,104 @@ function CustomCapabilityOption(props: {
         <span>{props.label}</span>
       </Tooltip>
     </label>
+  );
+}
+
+function CustomModelSettings(props: {
+  options: CustomModelOptions;
+  onChange: (next: CustomModelOptions) => void;
+}) {
+  const { t } = useTranslation();
+  const thinkingConfigured = props.options.thinkingMode !== "interface-default";
+
+  function toggleLevel(level: ThinkingLevel) {
+    const levels = props.options.levels.includes(level)
+      ? props.options.levels.filter((item) => item !== level)
+      : THINKING_LEVELS.filter((item) => item === level || props.options.levels.includes(item));
+    if (levels.length === 0) return;
+    props.onChange({
+      ...props.options,
+      levels,
+      defaultLevel: levels.includes(props.options.defaultLevel)
+        ? props.options.defaultLevel
+        : defaultThinkingLevel(levels) ?? levels[0]!
+    });
+  }
+
+  return (
+    <fieldset className="custom-thinking-config">
+      <legend className="custom-thinking-config__title">{t("settings.modelWorkspace.modelAbilities")}</legend>
+      <div className="custom-thinking-config__capabilities">
+        <CustomCapabilityOption
+          checked={props.options.imageInput}
+          label={t("settings.modelWorkspace.customImageInput")}
+          hint={t("settings.modelWorkspace.customImageInputHint")}
+          onChange={(imageInput) => props.onChange({ ...props.options, imageInput })}
+        />
+        <CustomCapabilityOption
+          checked={thinkingConfigured}
+          label={t("settings.modelWorkspace.thinkingMode")}
+          hint={t("settings.modelWorkspace.thinkingModeToggleHint")}
+          onChange={(checked) => props.onChange({
+            ...props.options,
+            thinkingMode: checked ? "always-on" : "interface-default"
+          })}
+        />
+      </div>
+      {thinkingConfigured && (
+        <>
+          <div className="custom-thinking-config__capabilities">
+            <CustomCapabilityOption
+              checked={props.options.thinkingMode === "switchable"}
+              label={t("settings.modelWorkspace.allowThinkingOff")}
+              hint={t("settings.modelWorkspace.allowThinkingOffHint")}
+              onChange={(allowed) => props.onChange({
+                ...props.options,
+                thinkingMode: allowed ? "switchable" : "always-on"
+              })}
+            />
+            {props.options.thinkingMode === "switchable" && (
+              <CustomCapabilityOption
+                checked={props.options.defaultEnabled}
+                label={t("settings.modelWorkspace.customThinkingDefaultEnabled")}
+                hint={t("settings.modelWorkspace.customThinkingDefaultEnabledHint")}
+                onChange={(defaultEnabled) => props.onChange({ ...props.options, defaultEnabled })}
+              />
+            )}
+          </div>
+          <div className="custom-thinking-config__section">
+            <div className="custom-thinking-config__section-title">{t("settings.modelWorkspace.supportedThinkingLevels")}</div>
+            <div className="custom-thinking-level-options">
+              {THINKING_LEVELS.map((level) => (
+                <label key={level} className="custom-thinking-level-option">
+                  <input
+                    type="checkbox"
+                    className="check-sky"
+                    checked={props.options.levels.includes(level)}
+                    disabled={props.options.levels.length === 1 && props.options.levels[0] === level}
+                    onChange={() => toggleLevel(level)}
+                  />
+                  <span>{t(`home.thinking.levelValue.${level}`)}</span>
+                </label>
+              ))}
+            </div>
+            <p className="custom-thinking-config__hint">{t("settings.modelWorkspace.supportedThinkingLevelsHint")}</p>
+          </div>
+          <Select
+            label={t("settings.modelWorkspace.defaultThinkingLevel")}
+            value={props.options.defaultLevel}
+            options={props.options.levels.map((level) => ({
+              value: level,
+              label: t(`home.thinking.levelValue.${level}`)
+            }))}
+            onValueChange={(value) => props.onChange({
+              ...props.options,
+              defaultLevel: value as ThinkingLevel
+            })}
+            className="select-control--subtle"
+          />
+        </>
+      )}
+    </fieldset>
   );
 }

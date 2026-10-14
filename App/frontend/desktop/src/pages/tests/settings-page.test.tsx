@@ -213,32 +213,23 @@ describe("自定义模型能力选择", () => {
     expect(source).toContain('className="select-control--subtle model-capability-select"');
     expect(source.match(/t\("settings\.modelWorkspace\.modelCapability"\)/g)).toHaveLength(1);
     expect(source).toContain("normalizeEditorCapabilities(entry.capabilities.map(fromCatalogCapability))");
-    expect(source).toContain("checked={editor.customThinkingEnabled}");
-    expect(source).toContain("checked={editor.customImageInput}");
-    expect(source).toContain('t("settings.modelWorkspace.customThinkingEnabledHint")');
-    expect(source).toContain('t("settings.modelWorkspace.customThinkingSwitchableHint")');
+    expect(source).toContain("checked={thinkingConfigured}");
+    expect(source).toContain('t("settings.modelWorkspace.allowThinkingOff")');
     expect(source).toContain('t("settings.modelWorkspace.customThinkingDefaultEnabledHint")');
     expect(source).toContain('t("settings.modelWorkspace.customImageInputHint")');
-    expect(source).toContain('className="custom-thinking-config__checkbox"');
+    expect(source).toContain('className="custom-thinking-config__checkbox check-sky"');
+    expect(source).toContain('className="check-sky"');
     expect(styles).toContain(".custom-thinking-config__checkbox");
-    expect(styles).toContain("cursor: pointer");
+    expect(styles).toContain('.custom-thinking-config input[type="checkbox"].check-sky:checked');
     expect(source).not.toContain('t("settings.modelWorkspace.textRoles")');
     expect(source).not.toContain('t("settings.modelWorkspace.capability.agent")');
   });
 
-  it("支持思考的说明提醒 Chat Completions 的 gpt 模型关掉思考", () => {
-    expect(zhCNMessages["settings.modelWorkspace.customThinkingEnabledHint"]).toContain(
-      "使用 Chat Completions 并且使用 gpt 模型时，请关闭支持思考，否则可能导致错误。"
-    );
-    expect(zhCNMessages["settings.modelWorkspace.customThinkingEnabledHint"]).toContain(
-      "gpt 模型建议使用 Responses 接口获得最佳体验。"
-    );
-    expect(enUSMessages["settings.modelWorkspace.customThinkingEnabledHint"]).toContain(
-      "When using Chat Completions with a GPT model, turn off Supports thinking, or the request may fail."
-    );
-    expect(enUSMessages["settings.modelWorkspace.customThinkingEnabledHint"]).toContain(
-      "GPT models should use the Responses API for the best experience."
-    );
+  it("思考模式说明区分接口默认行为与允许关闭", () => {
+    expect(zhCNMessages["settings.modelWorkspace.thinkingModeToggleHint"]).toContain("模型接口按默认行为处理");
+    expect(zhCNMessages["settings.modelWorkspace.allowThinkingOffHint"]).toContain("不勾选则思考始终开启");
+    expect(enUSMessages["settings.modelWorkspace.thinkingModeToggleHint"]).toContain("endpoint's default behavior");
+    expect(enUSMessages["settings.modelWorkspace.allowThinkingOffHint"]).toContain("thinking stays on");
   });
 });
 
@@ -943,16 +934,14 @@ describe("SettingsPageView", () => {
     expect(source).toContain("setWorkspace(createModelWorkspace(saved));");
   });
 
-  it("模型工作区连接编辑展示已保存脱敏 key，且保存不回传脱敏值", () => {
+  it("模型工作区新建时提示输入 API Key，编辑时显示已配置密钥的脱敏值", () => {
     const workspaceSource = readFileSync(fileURLToPath(new URL("../model-workspace-section.tsx", import.meta.url)), "utf8");
-    const fieldsSource = readFileSync(fileURLToPath(new URL("../api-key-form-fields.tsx", import.meta.url)), "utf8");
 
+    expect(workspaceSource).toContain('label={t("apiKey.key")}');
+    expect(workspaceSource).toContain('placeholder={t("settings.modelWorkspace.apiKeyPlaceholder")}');
     expect(workspaceSource).toContain("maskedValue={editor.connectionId && !editorProviderChanged");
     expect(workspaceSource).toContain("apiKey: editor.apiKey || undefined");
-    expect(workspaceSource).toContain("apiKeyMasked:");
-    expect(fieldsSource).toContain("const placeholder = !props.value.trim() && props.maskedValue ? props.maskedValue : props.placeholder;");
-    expect(fieldsSource).toContain("placeholder={placeholder}");
-    expect(fieldsSource).not.toContain("const showSavedSecret = !props.value.trim() && Boolean(props.maskedValue)");
+    expect(workspaceSource).toContain("apiKeyMasked: providerChanged ? undefined : existing?.apiKeyMasked");
   });
   it("设置页已移除旧内联模型保存链路，模型工作区只走 catalog API", () => {
     const source = readFileSync(settingsPageSourcePath, "utf8");

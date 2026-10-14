@@ -198,10 +198,13 @@ describe("HomePage", () => {
     expect(selectorSource).toContain("agentActions.pendingModelPresetUpdated");
     expect(selectorSource).toContain("AgentThinkingControl");
     expect(selectorSource).toContain("resolveThinkingConfigForModel");
+    expect(selectorSource).toContain("optionAside={(option) => (");
+    expect(selectorSource).toContain("option.value === resolved.candidateId && thinkingConfig");
     expect(selectorSource).not.toContain("localStorage");
     expect(source).not.toContain('sendMessage({ chatId: state.agent.currentChatId, content: "/model');
     expect(styles).toContain(".agent-model-selector .agent-model-selector__menu");
-    expect(styles).toContain(".agent-model-selector-with-thinking");
+    expect(styles).toContain(".agent-model-selector__menu .select-control__aside");
+    expect(styles).not.toContain(".agent-model-selector-with-thinking");
     expect(styles).toContain(".agent-thinking-control");
     expect(styles).toContain("top: calc(100% + 6px)");
     expect(styles).toContain(".agent-model-selector__configure");
