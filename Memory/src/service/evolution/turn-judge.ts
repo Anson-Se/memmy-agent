@@ -784,6 +784,28 @@ export function turnJudgeSnapshotFromPayload(value: unknown): TurnJudgeSnapshot 
   };
 }
 
+// ---------- Job flags ----------
+
+const TURN_JUDGE_JOB_FLAG_KEYS = [
+  "decideCapture",
+  "captureUserMemory",
+  "turnJudge",
+  "promptVersion",
+  "turnAt",
+  "turnJudgeCatchUp",
+  "turnJudgeNoise"
+] as const;
+
+// A trace_summary job rebuilt by a manual retry, startup repair or summary
+// guard copies these from the job it replaces, so it makes the same per-turn
+// judgment instead of a plain summary. Jobs without turnJudge copy nothing.
+export function turnJudgeJobFlags(previousPayload: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (previousPayload?.turnJudge !== true) return {};
+  return Object.fromEntries(TURN_JUDGE_JOB_FLAG_KEYS
+    .filter((key) => key in previousPayload)
+    .map((key) => [key, previousPayload[key]]));
+}
+
 // A reaction with no attitude: turn.judge.v1 writes one every turn, and it
 // never stands in for an earlier positive or negative reaction when one
 // feedback is picked to represent a task.

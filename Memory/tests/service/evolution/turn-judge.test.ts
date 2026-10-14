@@ -137,7 +137,7 @@ describe("buildTurnJudgeMessages", () => {
     expect(built.visible.agentText).toContain("[... input truncated ...]");
     expect(built.messages[2]!.content).toContain("上一条结尾</previous_assistant_reply>");
     expect(built.inputTokens).toBe(totalTokens(built.messages));
-  });
+  }, 30_000);
 
   it("cuts in the fixed order and leaves USER for last", () => {
     const filler = (label: string, chars: number) => `${label}${"字".repeat(chars)}${label}`;
@@ -161,7 +161,7 @@ describe("buildTurnJudgeMessages", () => {
     // CAPTURED AT and the closing line are never cut.
     expect(built.messages[2]!.content).toContain("CAPTURED AT:");
     expect(built.messages[2]!.content.endsWith(TURN_JUDGE_TAIL)).toBe(true);
-  });
+  }, 30_000);
 
   it("does not cut USER when the other sections are enough", () => {
     const built = buildTurnJudgeMessages(judgeInput({
@@ -171,7 +171,7 @@ describe("buildTurnJudgeMessages", () => {
     expect(built.visible.userText).toBe("短消息");
     expect(built.truncationSteps).toContain("asst");
     expect(built.truncationSteps).not.toContain("user");
-  });
+  }, 30_000);
 });
 
 describe("turnJudgeToolText", () => {

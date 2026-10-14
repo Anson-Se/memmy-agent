@@ -164,7 +164,8 @@ export interface TurnRelationInput {
 
 export interface TurnRelationDecision {
   relation: TurnRelation;
-  confidence: number;
+  // Absent on turn.judge.v1 decisions; older records keep their value.
+  confidence?: number;
   reason: string;
   signals: string[];
   llmModel?: string;
@@ -692,7 +693,7 @@ export async function classifyTurnRelationWithLlm(
 
   const rules = collectTurnRelationRules(input, gapMs);
   const top = rules[0];
-  if (top && top.confidence >= RELATION_STRONG_HEURISTIC_THRESHOLD) {
+  if (top && (top.confidence ?? 0) >= RELATION_STRONG_HEURISTIC_THRESHOLD) {
     return top;
   }
 
@@ -703,7 +704,7 @@ export async function classifyTurnRelationWithLlm(
         callRelationLlm(llm, input),
         options.timeoutMs ?? 6000
       );
-      if (result.relation === "new_task" && result.confidence < RELATION_ARBITRATION_THRESHOLD) {
+      if (result.relation === "new_task" && (result.confidence ?? 0) < RELATION_ARBITRATION_THRESHOLD) {
         try {
           const arbitration = await relationWithTimeout(
             callRelationArbitration(llm, input),
@@ -772,12 +773,12 @@ function collectTurnRelationRules(input: TurnRelationInput, gapMs: number): Turn
   if (relationDomainShift(text, input.prevTags)) {
     rules.push(relationDecision("new_task", 0.55, "no domain-tag overlap with previous episode", ["r7_domain_shift"]));
   }
-  rules.sort((a, b) => b.confidence - a.confidence || relationTiePriority(b) - relationTiePriority(a));
+  rules.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0) || relationTiePriority(b) - relationTiePriority(a));
   return rules;
 }
 
 function safeHeuristicRelation(decision: TurnRelationDecision): TurnRelationDecision {
-  if (decision.relation !== "new_task" || decision.confidence >= RELATION_ARBITRATION_THRESHOLD) {
+  if (decision.relation !== "new_task" || (decision.confidence ?? 0) >= RELATION_ARBITRATION_THRESHOLD) {
     return decision;
   }
   return relationDecision(

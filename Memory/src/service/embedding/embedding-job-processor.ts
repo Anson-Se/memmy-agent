@@ -185,6 +185,17 @@ export interface EmbeddingJobProcessorDeps {
     snapshot: TurnJudgeSnapshot;
   }): Promise<TurnJudgment>;
   finalizeClosedEpisode(episode: EpisodeRecord, at: string): EvolutionJobRecord[];
+  // turn.judge.v1 (PR-2): files the judged turn and records its feedback.
+  applyTurnJudgment?(input: {
+    rawTurnId: string;
+    relation: TurnJudgment["relation"];
+    feedback: TurnJudgment["feedback"];
+    reason: string;
+    baseEpisodeId?: string;
+    previousRawTurnId?: string;
+    previousL1MemoryId?: string;
+    at: string;
+  }): { affectedEpisodeIds: string[]; jobs: EvolutionJobRecord[] };
 }
 
 export class EmbeddingJobProcessor {
@@ -393,11 +404,16 @@ export class EmbeddingJobProcessor {
     if (!this.deps.llm.isConfigured()) throw new SummaryModelUnconfiguredError();
 
     const turnJudge = job.payload.turnJudge === true;
+    if (turnJudge && typeof job.payload.turnJudgeNoise === "string") {
+      this.skipNoiseTurn(job, memory, trace, job.payload.turnJudgeNoise);
+      return;
+    }
     const decideCapture = job.payload.decideCapture === true;
     const mustKeep = turnJudge ? isDeviceMemoryForcedCapture(memory, trace) : isForcedL1Capture(memory, trace);
-    const judgment = turnJudge
+    const judged = turnJudge
       ? await this.judgeCapturedTurn(job, memory, trace, mustKeep)
       : undefined;
+    const judgment = judged?.judgment;
     const proposedDecision = judgment
       ? captureDecisionFromTurnJudgment(judgment)
       : decideCapture
@@ -430,8 +446,28 @@ export class EmbeddingJobProcessor {
     }
 
     let finalizedEpisodeId: string | undefined;
+    const affectedEpisodeIds: string[] = [];
+    // Filing the turn and its feedback commit with the capture result, after the
+    // L1 row is written (the move rewrites its episode); the closing work of
+    // every episode it touched runs after the commit.
+    const applyJudgment = () => {
+      if (!judged || !currentTrace.rawTurnId) return;
+      this.recordTurnJudgment(currentTrace.rawTurnId, judged.judgment, at);
+      const applied = this.deps.applyTurnJudgment?.({
+        rawTurnId: currentTrace.rawTurnId,
+        relation: judged.snapshot.taskEmpty ? null : judged.judgment.relation,
+        feedback: judged.snapshot.taskEmpty ? null : judged.judgment.feedback,
+        reason: judged.judgment.reason,
+        ...(judged.snapshot.filedByRule ? {} : {
+          baseEpisodeId: judged.snapshot.baseEpisodeId,
+          previousRawTurnId: judged.snapshot.previousRawTurnId,
+          previousL1MemoryId: judged.snapshot.previousL1MemoryId
+        }),
+        at
+      });
+      if (applied) affectedEpisodeIds.push(...applied.affectedEpisodeIds);
+    };
     this.deps.repos.transaction(() => {
-      if (judgment && currentTrace.rawTurnId) this.recordTurnJudgment(currentTrace.rawTurnId, judgment, at);
       let userMemoryCapture = userMemoryCaptureFromJob(job);
       if (decision?.createUserMemory && job.payload.captureUserMemory === true) {
         userMemoryCapture = this.captureUserMemoryFromDecision(current, currentTrace, decision, job, at);
@@ -448,6 +484,7 @@ export class EmbeddingJobProcessor {
         if (episodeId) {
           finalizedEpisodeId = episodeId;
         }
+        applyJudgment();
         return;
       }
       const previous = current;
@@ -473,6 +510,109 @@ export class EmbeddingJobProcessor {
         at
       });
       if (decision) finalizedEpisodeId = currentTrace.episodeId ?? job.episodeId;
+      applyJudgment();
+    });
+    const movedTo = judged && currentTrace.rawTurnId
+      ? this.deps.repos.runtime.getRawTurn(currentTrace.rawTurnId)?.episodeId
+      : undefined;
+    for (const episodeId of new Set([finalizedEpisodeId, movedTo, ...affectedEpisodeIds])) {
+      if (!episodeId) continue;
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      if (episode?.status === "closed") this.deps.finalizeClosedEpisode(episode, at);
+    }
+  }
+
+  // A host-generated turn (task notification, heartbeat, ...) is recognised by
+  // its structure and never sent to the model: no L1, no routing, no feedback.
+  private skipNoiseTurn(job: EvolutionJobRecord, memory: MemoryRow, trace: TraceMeta, noiseKind: string): void {
+    const at = this.deps.nowIso();
+    let finalizedEpisodeId: string | undefined;
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.memories.get(memory.id);
+      if (!current || !processingJobMatchesMemory(job, current)) return;
+      const rawTurn = trace.rawTurnId ? this.deps.repos.runtime.getRawTurn(trace.rawTurnId) : undefined;
+      if (rawTurn) {
+        this.deps.repos.runtime.updateRawTurn({
+          ...rawTurn,
+          messagePayload: {
+            ...rawTurn.messagePayload,
+            turn_judge: { prompt_version: TURN_JUDGE_PROMPT_VERSION, status: "skipped", noise_kind: noiseKind, judged_at: at }
+          }
+        });
+      }
+      const pending = isRecord(current.properties.internal_info.capture_decision) ? current.properties.internal_info.capture_decision : {};
+      const rejected = this.deps.repos.memories.update({
+        ...current,
+        properties: {
+          ...current.properties,
+          internal_info: {
+            ...current.properties.internal_info,
+            capture_decision: {
+              ...pending,
+              status: "rejected",
+              create_l1: false,
+              prompt_version: TURN_JUDGE_PROMPT_VERSION,
+              reason: `noise:${noiseKind}`,
+              decided_at: at
+            }
+          }
+        },
+        updatedAt: at
+      });
+      const deleted = this.deps.repos.memories.softDelete(rejected.id, at);
+      if (deleted) this.appendMemoryChange(deleted, current, "worker.turn_judge.noise", at);
+      this.deps.repos.processing.delete(current.id);
+      finalizedEpisodeId = trace.episodeId ?? job.episodeId;
+    });
+    if (finalizedEpisodeId) {
+      const episode = this.deps.repos.runtime.getEpisode(finalizedEpisodeId);
+      if (episode?.status === "closed") this.deps.finalizeClosedEpisode(episode, at);
+    }
+  }
+
+  // A per-turn judgment that failed on every attempt: the L1 is not written,
+  // the turn stays where it was filed, no feedback is recorded, and the
+  // capture record is marked failed so the task's closing work can run. A
+  // manual retry rebuilds the job with the same flags and input.
+  markTurnJudgeFailed(job: EvolutionJobRecord): void {
+    const at = this.deps.nowIso();
+    let finalizedEpisodeId: string | undefined;
+    this.deps.repos.transaction(() => {
+      const memory = job.targetMemoryId ? this.deps.repos.memories.get(job.targetMemoryId) : undefined;
+      if (!memory) return;
+      const pending = isRecord(memory.properties.internal_info.capture_decision) ? memory.properties.internal_info.capture_decision : {};
+      if (pending.status !== "pending") return;
+      const failed = this.deps.repos.memories.update({
+        ...memory,
+        properties: {
+          ...memory.properties,
+          internal_info: {
+            ...memory.properties.internal_info,
+            capture_decision: {
+              ...pending,
+              status: "failed",
+              prompt_version: TURN_JUDGE_PROMPT_VERSION,
+              failed_at: at,
+              error: job.lastError ?? null
+            }
+          }
+        },
+        updatedAt: at
+      });
+      this.appendMemoryChange(failed, memory, "worker.turn_judge.failed", at);
+      const trace = traceMetaFromMemory(failed);
+      const rawTurn = trace?.rawTurnId ? this.deps.repos.runtime.getRawTurn(trace.rawTurnId) : undefined;
+      if (rawTurn) {
+        const stored = isRecord(rawTurn.messagePayload?.turn_judge) ? rawTurn.messagePayload.turn_judge : {};
+        this.deps.repos.runtime.updateRawTurn({
+          ...rawTurn,
+          messagePayload: {
+            ...rawTurn.messagePayload,
+            turn_judge: { ...stored, prompt_version: TURN_JUDGE_PROMPT_VERSION, status: "failed", failed_at: at }
+          }
+        });
+      }
+      finalizedEpisodeId = trace?.episodeId ?? job.episodeId;
     });
     if (finalizedEpisodeId) {
       const episode = this.deps.repos.runtime.getEpisode(finalizedEpisodeId);
@@ -487,9 +627,22 @@ export class EmbeddingJobProcessor {
     memory: MemoryRow,
     trace: TraceMeta,
     mustKeep: boolean
-  ): Promise<TurnJudgment> {
+  ): Promise<{ judgment: TurnJudgment; snapshot: TurnJudgeSnapshot }> {
     const rawTurn = trace.rawTurnId ? this.deps.repos.runtime.getRawTurn(trace.rawTurnId) : undefined;
     if (!rawTurn) throw new Error(`turn judgment raw turn is missing: ${memory.id}`);
+    const previousDecision = isRecord(memory.properties.internal_info.capture_decision)
+      ? memory.properties.internal_info.capture_decision
+      : undefined;
+    if (previousDecision?.status === "failed") {
+      // A rerun after the failed state: hold the task's closing work again until it is judged.
+      this.deps.repos.memories.update({
+        ...memory,
+        properties: {
+          ...memory.properties,
+          internal_info: { ...memory.properties.internal_info, capture_decision: { ...previousDecision, status: "pending" } }
+        }
+      });
+    }
     const stored = isRecord(rawTurn.messagePayload?.turn_judge) ? rawTurn.messagePayload.turn_judge : {};
     let snapshot = turnJudgeSnapshotFromPayload(stored.input);
     if (!snapshot) {
@@ -508,7 +661,7 @@ export class EmbeddingJobProcessor {
         }
       });
     }
-    return this.deps.judgeTurnForCapture({ trace, rawTurn, snapshot });
+    return { judgment: await this.deps.judgeTurnForCapture({ trace, rawTurn, snapshot }), snapshot };
   }
 
   private recordTurnJudgment(rawTurnId: string, judgment: TurnJudgment, at: string): void {
