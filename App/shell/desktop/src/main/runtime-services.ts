@@ -1,7 +1,13 @@
 import { bindScreenCaptureIpc, type ScreenCaptureHandler } from './desktop-screen-capture.js';
+import { bindComputerUseWindowCaptureIpc } from './computer-use-window-capture.js';
 import { bindComputerUseOnboardingIpc, type ComputerUseOnboarding } from './computer-use-onboarding.js';
 import { mutateRuntimeConfig } from "@memmy/migrations";
-import type { AgentGatewayStartupIssue } from "@memmy/local-api-contracts";
+import { BROWSER_PROFILE_CLEAR_REQUEST, BROWSER_ACCESS_RESULT, BROWSER_DOWNLOAD_RESULT, BROWSER_CAPABILITY_RESULT, EMBEDDED_BROWSER_RESULT, NATIVE_APP_ACCESS_RESULT,
+  isBrowserAccessRequest, isBrowserDownloadRequest, isBrowserCapabilityRequest, isBrowserProfileClearResult, isComputerUseSurfaceAction, isComputerUseSurfaceMessage, isNativeAppAccessRequest, type AgentGatewayStartupIssue,
+  type BrowserCapabilityRequest,
+  type NativeAppAccessRequest, type NativeAppAccessDecision,
+  isEmbeddedBrowserRequest, isEmbeddedBrowserCancel, type EmbeddedBrowserRequest,
+  type ComputerUseSurfaceAction, type ComputerUseSurfaceMessage } from "@memmy/local-api-contracts";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -11,6 +17,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import YAML from "yaml";
 import { createRotatingWriter, type RotatingWriter } from "./rotating-log-file.js";
 import type { LogLevel } from "./log-level.js";
+import { compareVersionSegments } from "./version-compare.js";
 
 const LOCAL_HOST = "127.0.0.1";
 const DEFAULT_MEMORY_URL = "http://127.0.0.1:18960";
@@ -49,7 +56,13 @@ export interface ManagedRuntimeServices {
     workspace: string;
     startupIssue?: AgentGatewayStartupIssue;
   };
+  /** Starts the Agent gateway once. An initial failure starts background recovery. */
+  startAgentGateway(): Promise<AgentGatewayStartupIssue | null>;
+  /** Starts browser preparation once, independently of the first window. */
+  startBrowserPreparation(): PackagedBrowserPreparation | null;
   restartMemory(): Promise<void>;
+  sendComputerUseSurfaceAction(action: ComputerUseSurfaceAction): boolean;
+  clearBrowserData(): Promise<void>;
   close(options?: { stopMemory?: boolean }): Promise<void>;
   terminateSync(options?: { stopMemory?: boolean }): void;
 }
@@ -63,8 +76,23 @@ export interface StartPackagedRuntimeServicesOptions {
 }
 
 export interface StartManagedRuntimeServicesOptions extends StartPackagedRuntimeServicesOptions {
+  /** Privacy-safe progress for startup diagnostics; never contains runtime paths or config values. */
+  onStartupStage?: (stage: "migration-start" | "migration-ready" | "config-ready" | "data-ready" | "skills-ready" | "gateway-start" | "gateway-settled", elapsedMs: number) => void;
+  /** Let the first window load before starting the Agent child. Defaults to false. */
+  deferAgentGatewayStartup?: boolean;
+  /** Let the first window load before preparing Playwright's browser. Defaults to false. */
+  deferBrowserPreparation?: boolean;
   captureScreen?: ScreenCaptureHandler;
+  captureComputerUseWindow?: (target: string, width: number, height: number, options: { pid?: number }) => Promise<string | null>;
   computerUseOnboarding?: ComputerUseOnboarding;
+  onComputerUseSurface?: (message: ComputerUseSurfaceMessage, sendAction: (action: ComputerUseSurfaceAction) => void) => void;
+  onComputerUseSurfaceStop?: () => void;
+  handleEmbeddedBrowserRequest?: (request: EmbeddedBrowserRequest,
+    isCurrentChild: () => boolean) => Promise<unknown>;
+  approveBrowserAccess?: (origin: string, url: string) => Promise<'allow-once' | 'allow-always' | 'deny'>;
+  approveBrowserCapability?: (request: BrowserCapabilityRequest) => Promise<boolean>;
+  approveNativeAppAccess?: (request: NativeAppAccessRequest) => Promise<NativeAppAccessDecision>;
+  chooseBrowserDownload?: (name: string, url: string) => Promise<string | null>;
   runtimeEntries?: RuntimeEntryPaths;
   runtimeExecutable?: string;
   platform?: NodeJS.Platform;
@@ -175,9 +203,15 @@ export interface MemoryServerLock {
 export async function startManagedRuntimeServices(
   options: StartManagedRuntimeServicesOptions
 ): Promise<ManagedRuntimeServices> {
+  const startupStartedAt = Date.now();
+  const reportStartupStage = (stage: Parameters<NonNullable<StartManagedRuntimeServicesOptions["onStartupStage"]>>[0]): void => {
+    try { options.onStartupStage?.(stage, Date.now() - startupStartedAt); }
+    catch { /* Diagnostics cannot interrupt startup. */ }
+  };
   const entries = resolveRuntimeEntryPaths(options);
   const migrationTargets = await resolvePackagedRuntimeMigrationTargets();
   const memmyConfigPreexisting = existsSync(migrationTargets.configPath);
+  reportStartupStage("migration-start");
   await runPackagedMigrationCommand({
     agentEntry: entries.agentEntry,
     configPath: migrationTargets.configPath,
@@ -187,12 +221,15 @@ export async function startManagedRuntimeServices(
     logLevel: options.logLevel,
     runtimeExecutable: options.runtimeExecutable
   });
+  reportStartupStage("migration-ready");
   const runtimeConfig = await preparePackagedRuntimeConfig();
+  reportStartupStage("config-ready");
   runtimeConfig.appDatabaseFile = options.appDatabaseFile;
   await options.beforeStartServices?.({
     databasePath: options.appDatabaseFile,
     configPath: runtimeConfig.configPath
   });
+  reportStartupStage("data-ready");
   const browserPreparationAttemptId = randomUUID();
   const children: ManagedChild[] = [];
   const gatewaySupervisor = new AgentGatewaySupervisor(
@@ -208,10 +245,38 @@ export async function startManagedRuntimeServices(
   let browserPreparation: PackagedBrowserPreparation | null = null;
   let closing = false;
   let stopMemoryOnClose = false;
+  const agentGateway: ManagedRuntimeServices["agentGateway"] = {
+    baseUrl: runtimeConfig.agentGatewayBaseUrl,
+    bootstrapSecret: runtimeConfig.agentGatewayBootstrapSecret,
+    configPath: runtimeConfig.configPath,
+    workspace: runtimeConfig.agentWorkspace
+  };
+
+  function startBrowserPreparation(): PackagedBrowserPreparation | null {
+    if (closing) return null;
+    browserPreparation ??= startPackagedBrowserPreparation(
+      entries,
+      runtimeConfig,
+      options,
+      spawn,
+      browserPreparationAttemptId
+    );
+    return browserPreparation;
+  }
+
+  function stopBrowserPreparation(): void {
+    browserPreparation?.stop();
+  }
+
+  const startAgentGateway = createAgentGatewayStarter(gatewaySupervisor, agentGateway, {
+    isClosing: () => closing,
+    onStart: () => reportStartupStage("gateway-start"),
+    onSettled: () => reportStartupStage("gateway-settled")
+  });
 
   async function restartMemoryRuntime(): Promise<void> {
     if (closing) throw new Error("Memmy is shutting down");
-    await memoryStartup;
+    await waitForMemoryStartupBeforeRestart(memoryStartup);
     if (closing) throw new Error("Memmy is shutting down");
     if (!memoryRestart) {
       memoryRestart = restartManagedMemoryService(
@@ -237,13 +302,8 @@ export async function startManagedRuntimeServices(
       agentEntry: entries.agentEntry,
       agentWorkspace: runtimeConfig.agentWorkspace
     });
-    browserPreparation = startPackagedBrowserPreparation(
-      entries,
-      runtimeConfig,
-      options,
-      spawn,
-      browserPreparationAttemptId
-    );
+    reportStartupStage("skills-ready");
+    if (!options.deferBrowserPreparation) startBrowserPreparation();
     const memoryReady = ensureMemoryService(
       entries,
       runtimeConfig,
@@ -267,7 +327,7 @@ export async function startManagedRuntimeServices(
           });
         }
       });
-    const agentGatewayStartupIssue = await startAgentGatewayWithRecovery(gatewaySupervisor);
+    if (!options.deferAgentGatewayStartup) await startAgentGateway();
 
     return {
       memory: {
@@ -277,20 +337,22 @@ export async function startManagedRuntimeServices(
         configPath: runtimeConfig.configPath,
         ready: memoryReady
       },
-      agentGateway: {
-        baseUrl: runtimeConfig.agentGatewayBaseUrl,
-        bootstrapSecret: runtimeConfig.agentGatewayBootstrapSecret,
-        configPath: runtimeConfig.configPath,
-        workspace: runtimeConfig.agentWorkspace,
-        ...(agentGatewayStartupIssue ? { startupIssue: agentGatewayStartupIssue } : {})
-      },
+      agentGateway,
+      startAgentGateway,
+      startBrowserPreparation,
       async restartMemory() {
         await restartMemoryRuntime();
+      },
+      sendComputerUseSurfaceAction(action) {
+        return gatewaySupervisor.sendSurfaceAction(action);
+      },
+      async clearBrowserData() {
+        await gatewaySupervisor.clearBrowserData();
       },
       async close(closeOptions = {}) {
         closing = true;
         stopMemoryOnClose = closeOptions.stopMemory === true;
-        browserPreparation?.stop();
+        stopBrowserPreparation();
         await memoryRestart?.catch(() => undefined);
         await gatewaySupervisor.close();
         if (closeOptions.stopMemory && options.offlineMemoryRuntimeDirectory) {
@@ -314,7 +376,7 @@ export async function startManagedRuntimeServices(
       terminateSync(terminateOptions = {}) {
         closing = true;
         stopMemoryOnClose = terminateOptions.stopMemory === true;
-        browserPreparation?.stop();
+        stopBrowserPreparation();
         if (terminateOptions.stopMemory && options.offlineMemoryRuntimeDirectory) {
           runBundledMemoryCliSync(
             options.offlineMemoryRuntimeDirectory,
@@ -330,7 +392,7 @@ export async function startManagedRuntimeServices(
   } catch (error) {
     closing = true;
     stopMemoryOnClose = true;
-    browserPreparation?.stop();
+    stopBrowserPreparation();
     await gatewaySupervisor.close();
     await stopManagedChildren(children);
     throw error;
@@ -347,6 +409,10 @@ export async function preparePackagedRuntimeConfig(
   options: PreparePackagedRuntimeConfigOptions = {}
 ): Promise<PackagedRuntimeConfig> {
   const env = options.env ?? process.env;
+  const testPortBase = env.MEMMY_TEST_PROFILE_ROOT ? Number(env.MEMMY_TEST_PORT_BASE) : null;
+  if (testPortBase !== null && (!Number.isInteger(testPortBase) || testPortBase < 30000 || testPortBase > 59997)) {
+    throw new Error('Invalid isolated test profile port base');
+  }
   const shouldWriteConfig = options.writeConfig ?? true;
   const shouldEnsureDirectories = options.ensureDirectories ?? true;
   const shouldFillMissingAgentSecret = options.fillMissingAgentSecret ?? true;
@@ -359,7 +425,7 @@ export async function preparePackagedRuntimeConfig(
     if (!existsSync(configPath)) {
       config.tools = {
         mcpServers: {
-          open_computer_use: {
+          memmy_computer_use: {
             type: "stdio",
             command: "open-computer-use",
             args: ["mcp"]
@@ -409,6 +475,16 @@ export async function preparePackagedRuntimeConfig(
     setMissing(gateway, "port", DEFAULT_AGENT_GATEWAY_HEALTH_PORT);
     setMissing(heartbeat, "enabled", false);
     setMissing(defaults, "workspace", agentWorkspace);
+    if (testPortBase !== null) {
+      // A test instance must never discover or join the user's local services.
+      storage.sqlitePath = memoryDatabasePath;
+      storage.endpoint = `http://${LOCAL_HOST}:${testPortBase}`;
+      websocket.host = LOCAL_HOST;
+      websocket.port = testPortBase + 2;
+      gateway.host = LOCAL_HOST;
+      gateway.port = testPortBase + 1;
+      defaults.workspace = agentWorkspace;
+    }
     return config;
   };
   const config = shouldWriteConfig
@@ -717,6 +793,7 @@ export function startPackagedBrowserPreparation(
         env: {
           ...process.env,
           MEMMY_CONFIG: runtimeConfig.configPath,
+          MEMMY_AGENT_DATA_DIR: dirname(runtimeConfig.configPath),
           MEMMY_AGENT_WORKSPACE: runtimeConfig.agentWorkspace,
           [BROWSER_PREPARATION_ATTEMPT_ID_ENV]: attemptId,
           ELECTRON_RUN_AS_NODE: "1",
@@ -904,7 +981,7 @@ export async function ensureMemoryService(
   );
 }
 
-/** Only replace a runtime installed by this Desktop, after its migrations finish. */
+/** Replace a Desktop-owned runtime when its version or build changes, after migrations finish. */
 async function stopOlderBundledMemoryRuntime(
   runtimeConfig: PackagedRuntimeConfig,
   options: StartManagedRuntimeServicesOptions,
@@ -925,11 +1002,18 @@ async function stopOlderBundledMemoryRuntime(
     return false;
   }
   if (!isRecord(bundled) || !isRecord(installed) || !isRecord(running)) return false;
-  const bundledVersion = parseStableMemoryVersion(bundled.version);
-  const installedVersion = parseStableMemoryVersion(installed.version);
+  const bundledVersion = parseMemoryVersion(bundled.version);
+  const installedVersion = parseMemoryVersion(installed.version);
   if (!bundledVersion || !installedVersion) return false;
-  const difference = bundledVersion.map((part, index) => part - installedVersion[index]!).find((delta) => delta !== 0) ?? 0;
-  if (difference <= 0 || bundled.protocolVersion !== SUPPORTED_MEMORY_PROTOCOL_VERSION
+  // SemVer precedence keeps prerelease test builds ordered; an identical
+  // version is replaced only when the bundled build identity changed.
+  const difference = compareVersionSegments(bundledVersion, installedVersion);
+  const changedBuild = typeof bundled.buildId === "string" && /^[a-f0-9]{64}$/.test(bundled.buildId)
+    && bundled.buildId !== installed.buildId;
+  if (difference < 0 || (difference === 0 && !changedBuild)
+    || (typeof bundled.schemaVersion === "number" && typeof installed.schemaVersion === "number"
+      && bundled.schemaVersion < installed.schemaVersion)
+    || bundled.protocolVersion !== SUPPORTED_MEMORY_PROTOCOL_VERSION
     || installed.protocolVersion !== SUPPORTED_MEMORY_PROTOCOL_VERSION) return false;
 
   // The standalone CLI records its own Node executable. Sharing a home or a
@@ -982,10 +1066,12 @@ async function stopOlderBundledMemoryRuntime(
   return true;
 }
 
-function parseStableMemoryVersion(value: unknown): number[] | undefined {
-  if (typeof value !== "string" || !/^\d+\.\d+\.\d+$/.test(value)) return undefined;
-  const parts = value.split(".").map(Number);
-  return parts.every(Number.isSafeInteger) ? parts : undefined;
+function parseMemoryVersion(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+  if (!match) return undefined;
+  const numericIdentifiers = [...match.slice(1, 4), ...(match[4]?.split(".").filter((part) => /^\d+$/.test(part)) ?? [])];
+  return numericIdentifiers.every((part) => Number.isSafeInteger(Number(part))) ? value : undefined;
 }
 
 function hasPreviousMemoryRuntimeMarker(configPath: string): boolean {
@@ -1147,7 +1233,7 @@ async function startManagedMemoryService(
     logLevel: options.logLevel,
     ipc: Boolean(onRestartRequested),
     executablePath: runtimeExecutable ?? options.runtimeExecutable,
-    persistOnDesktopExit: true
+    persistOnDesktopExit: !process.env.MEMMY_TEST_PROFILE_ROOT
   });
   if (onRestartRequested) {
     memoryChild.process.on("message", (message) => {
@@ -1398,6 +1484,24 @@ async function restartManagedMemoryService(
   await ensureMemoryService(entries, runtimeConfig, children, options, true, onRestartRequested);
 }
 
+/** Bound a user-requested restart without racing the ongoing installer or migrations. */
+export async function waitForMemoryStartupBeforeRestart(startup: Promise<void> | null): Promise<void> {
+  if (!startup) return;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      startup,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(
+          "Memory startup is still in progress; restart was not started. Try again after the service becomes ready."
+        )), MEMORY_STARTUP_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export async function restartExternalMemoryService(input: {
   baseUrl: string;
   token: string;
@@ -1442,6 +1546,31 @@ export interface AgentGatewaySupervisorDependencies {
   stopManagedChild?: typeof stopManagedChild;
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
+}
+
+/** Shares one explicitly requested startup, including while the first attempt is in flight. */
+export function createAgentGatewayStarter(
+  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery">,
+  agentGateway: { startupIssue?: AgentGatewayStartupIssue },
+  lifecycle: {
+    isClosing: () => boolean;
+    onStart?: () => void;
+    onSettled?: () => void;
+  }
+): () => Promise<AgentGatewayStartupIssue | null> {
+  let startup: Promise<AgentGatewayStartupIssue | null> | null = null;
+  return () => {
+    if (lifecycle.isClosing()) return Promise.resolve(null);
+    if (startup) return startup;
+    lifecycle.onStart?.();
+    startup = startAgentGatewayWithRecovery(supervisor).then((issue) => {
+      lifecycle.onSettled?.();
+      if (lifecycle.isClosing()) return null;
+      if (issue) agentGateway.startupIssue = issue;
+      return issue;
+    });
+    return startup;
+  };
 }
 
 export async function startAgentGatewayWithRecovery(
@@ -1512,6 +1641,52 @@ export class AgentGatewaySupervisor {
     return this.startPromise;
   }
 
+  sendSurfaceAction(action: ComputerUseSurfaceAction): boolean {
+    if (this.stopping || !isComputerUseSurfaceAction(action)) return false;
+    const child = this.ownedChild;
+    if (!child?.process.connected) return false;
+    try {
+      child.process.send(action, () => undefined);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  clearBrowserData(): Promise<void> {
+    const child = this.ownedChild;
+    if (this.stopping || !child?.process.connected) {
+      return Promise.reject(new Error('Managed browser service is unavailable'));
+    }
+    const requestId = randomUUID();
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        child.process.removeListener('message', onMessage);
+        child.process.removeListener('exit', onExit);
+      };
+      const onMessage = (message: unknown) => {
+        if (!isBrowserProfileClearResult(message) || message.requestId !== requestId) return;
+        cleanup();
+        if (message.ok) resolve();
+        else reject(new Error(message.error || 'Browser data could not be cleared'));
+      };
+      const onExit = () => { cleanup(); reject(new Error('Managed browser service stopped')); };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Browser data clearing timed out'));
+      }, 60_000);
+      timeout.unref?.();
+      child.process.on('message', onMessage);
+      child.process.once('exit', onExit);
+      try {
+        child.process.send({ type: BROWSER_PROFILE_CLEAR_REQUEST, requestId }, error => {
+          if (error) { cleanup(); reject(error); }
+        });
+      } catch (error) { cleanup(); reject(error); }
+    });
+  }
+
   startRecovery(): void {
     if (this.stopping || this.hasReachedReady) return;
     this.scheduleReplacement();
@@ -1573,9 +1748,13 @@ export class AgentGatewaySupervisor {
       String(this.runtimeConfig.agentGatewayHealthPort)
     ], {
       MEMMY_CONFIG: this.runtimeConfig.configPath,
+      MEMMY_AGENT_DATA_DIR: dirname(this.runtimeConfig.configPath),
       MEMMY_AGENT_WORKSPACE: this.runtimeConfig.agentWorkspace,
       MEMMY_MEMORY_URL: this.runtimeConfig.memoryBaseUrl,
       MEMMY_MEMORY_TOKEN: this.runtimeConfig.memoryToken,
+      ...(existsSync(join(this.options.resourcesPath, "native", "sqlcipher", "libsqlcipher.dylib"))
+        ? { MEMMY_SQLCIPHER_LIBRARY: join(this.options.resourcesPath, "native", "sqlcipher", "libsqlcipher.dylib") }
+        : {}),
       MEMORY_SERVICE_URL: this.runtimeConfig.memoryBaseUrl,
       MEMORY_SERVICE_TOKEN: this.runtimeConfig.memoryToken,
       [MIGRATIONS_READY_CONFIG_ENV]: this.runtimeConfig.configPath,
@@ -1628,12 +1807,102 @@ export class AgentGatewaySupervisor {
       () => !this.stopping && this.ownedChild === child && this.childGeneration === generation
         && this.pendingRestartNotice?.childGeneration !== generation,
       this.options.captureScreen);
+    bindComputerUseWindowCaptureIpc(child.process,
+      () => !this.stopping && this.ownedChild === child && this.childGeneration === generation
+        && this.pendingRestartNotice?.childGeneration !== generation,
+      this.options.captureComputerUseWindow);
     let closed = false;
+    const pendingEmbeddedRequests = new Map<string, AbortController>();
     child.process.on("message", (message) => {
       if (this.stopping
         || this.ownedChild !== child
         || this.childGeneration !== generation
         || this.pendingRestartNotice?.childGeneration === generation) {
+        return;
+      }
+      if (isComputerUseSurfaceMessage(message)) {
+        this.options.onComputerUseSurface?.(message, action => {
+          if (!isComputerUseSurfaceAction(action) || !child.process.connected
+              || this.ownedChild !== child || this.childGeneration !== generation) return;
+          try { child.process.send(action, () => undefined); } catch { /* Child exited. */ }
+        });
+        return;
+      }
+      if (isEmbeddedBrowserCancel(message)) {
+        pendingEmbeddedRequests.get(message.requestId)?.abort();
+        return;
+      }
+      if (isEmbeddedBrowserRequest(message)) {
+        if (pendingEmbeddedRequests.has(message.requestId)) return;
+        const controller = new AbortController();
+        pendingEmbeddedRequests.set(message.requestId, controller);
+        const isCurrentChild = () => !this.stopping && child.process.connected
+          && this.ownedChild === child && this.childGeneration === generation
+          && this.pendingRestartNotice?.childGeneration !== generation
+          && !controller.signal.aborted;
+        void Promise.resolve(this.options.handleEmbeddedBrowserRequest?.(message, isCurrentChild) ?? null)
+          .then(result => {
+            if (isCurrentChild()) {
+              child.process.send({ type: EMBEDDED_BROWSER_RESULT, requestId: message.requestId,
+                ok: true, result }, () => undefined);
+            }
+          }).catch(error => {
+            if (isCurrentChild()) {
+              child.process.send({ type: EMBEDDED_BROWSER_RESULT, requestId: message.requestId,
+                ok: false, error: String(error instanceof Error ? error.message : error).slice(0, 500) }, () => undefined);
+            }
+          }).finally(() => { pendingEmbeddedRequests.delete(message.requestId); });
+        return;
+      }
+      if (isBrowserAccessRequest(message)) {
+        void Promise.resolve(this.options.approveBrowserAccess?.(message.origin, message.url) ?? 'deny')
+          .then(decision => {
+            if (!child.process.connected || this.ownedChild !== child || this.childGeneration !== generation) return;
+            child.process.send({ type: BROWSER_ACCESS_RESULT, requestId: message.requestId, decision }, () => undefined);
+          }).catch(() => {
+            if (child.process.connected) child.process.send({ type: BROWSER_ACCESS_RESULT,
+              requestId: message.requestId, decision: 'deny' }, () => undefined);
+          });
+        return;
+      }
+      if (isBrowserCapabilityRequest(message)) {
+        void Promise.resolve(this.options.approveBrowserCapability?.(message) ?? false)
+          .then(approved => {
+            if (!child.process.connected || this.ownedChild !== child || this.childGeneration !== generation) return;
+            child.process.send({ type: BROWSER_CAPABILITY_RESULT, requestId: message.requestId,
+              approved: approved === true }, () => undefined);
+          }).catch(() => {
+            if (child.process.connected && this.ownedChild === child && this.childGeneration === generation) {
+              child.process.send({ type: BROWSER_CAPABILITY_RESULT, requestId: message.requestId,
+                approved: false }, () => undefined);
+            }
+          });
+        return;
+      }
+      if (isNativeAppAccessRequest(message)) {
+        void Promise.resolve(this.options.approveNativeAppAccess?.(message) ?? 'deny')
+          .then(decision => {
+            if (!child.process.connected || this.ownedChild !== child || this.childGeneration !== generation) return;
+            const safeDecision = decision === 'allow-once' || decision === 'allow-always' ? decision : 'deny';
+            child.process.send({ type: NATIVE_APP_ACCESS_RESULT, requestId: message.requestId,
+              decision: safeDecision }, () => undefined);
+          }).catch(() => {
+            if (child.process.connected && this.ownedChild === child && this.childGeneration === generation) {
+              child.process.send({ type: NATIVE_APP_ACCESS_RESULT, requestId: message.requestId,
+                decision: 'deny' }, () => undefined);
+            }
+          });
+        return;
+      }
+      if (isBrowserDownloadRequest(message)) {
+        void Promise.resolve(this.options.chooseBrowserDownload?.(message.name, message.url) ?? null)
+          .then(filePath => {
+            if (!child.process.connected || this.ownedChild !== child || this.childGeneration !== generation) return;
+            child.process.send({ type: BROWSER_DOWNLOAD_RESULT, requestId: message.requestId, filePath }, () => undefined);
+          }).catch(() => {
+            if (child.process.connected) child.process.send({ type: BROWSER_DOWNLOAD_RESULT,
+              requestId: message.requestId, filePath: null }, () => undefined);
+          });
         return;
       }
       const notice = parseDesktopManagedRestartNotice(message);
@@ -1657,6 +1926,9 @@ export class AgentGatewaySupervisor {
     child.process.once("close", (code, signal) => {
       if (closed) return;
       closed = true;
+      if (this.ownedChild === child && this.childGeneration === generation) {
+        this.options.onComputerUseSurfaceStop?.();
+      }
       child.exitDescription = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
       this.handleOwnedChildClose(child, generation, code);
     });

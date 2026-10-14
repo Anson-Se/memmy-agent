@@ -273,8 +273,8 @@ export interface AlgorithmConfig {
   };
 }
 
-/** Concrete languages the host app can pin memory output to. */
-export type MemoryLanguage = "zh-CN" | "en-US";
+/** A canonical, concrete BCP 47 locale validated when host configuration is loaded. */
+export type MemoryLanguage = string;
 
 export interface MemmyConfig {
   version: 1;
@@ -650,8 +650,21 @@ function configFromEnv(): Record<string, unknown> {
  * Anything the host cannot resolve to a concrete language is left unset, so
  * callers fall back to reading the language from the content itself.
  */
-function memoryLanguage(value: unknown): MemoryLanguage | undefined {
-  return value === "zh-CN" || value === "en-US" ? value : undefined;
+export function normalizeMemoryLanguage(value: unknown): MemoryLanguage | undefined {
+  if (typeof value !== "string" || !value.trim() || value.trim().toLowerCase() === "system") return undefined;
+  try {
+    const canonical = Intl.getCanonicalLocales(value.trim())[0];
+    if (!canonical) return undefined;
+    const locale = new Intl.Locale(canonical);
+    // Match the host's concrete output-language contract without importing App.
+    if (!/^[a-z]{2,3}$/u.test(locale.language)
+      || /^(?:und|mul|mis|zxx|qps)$/u.test(locale.language)
+      || /^q[a-t][a-z]$/u.test(locale.language)
+      || locale.region === "XA" || locale.region === "XB") return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeConfig(input: Record<string, unknown>): MemmyConfig {
@@ -671,12 +684,13 @@ function normalizeConfig(input: Record<string, unknown>): MemmyConfig {
   const embedding = normalizeEmbedding(asRecord(input.embedding));
   const agentAccess = normalizeAgentAccess(asRecord(input.agentAccess));
   const algorithm = normalizeAlgorithm(asRecord(input.algorithm));
+  const language = normalizeMemoryLanguage(input.language);
   return {
     version: 1,
     domain: memoryDomainName(input.domain, DEFAULT_MEMMY_CONFIG.domain),
     roleRouting: normalizeRoleRouting(asRecord(input.roleRouting)),
     userId: optionalString(input.userId),
-    ...(memoryLanguage(input.language) ? { language: memoryLanguage(input.language)! } : {}),
+    ...(language ? { language } : {}),
     storage,
     summary,
     evolution,
@@ -947,19 +961,25 @@ function resolveMemoryEmbedding(
   hasCatalog: boolean
 ): Record<string, unknown> {
   const embedding = asRecord(memory.embedding);
-  const configuredMode = optionalString(embedding.mode);
-  const embeddingMode = configuredMode === "cloud"
-    || configuredMode === "local"
-    || configuredMode === "custom"
-    ? configuredMode
-    : mode === "account" && hasCatalog
-      ? "cloud"
-      : DEFAULT_MEMMY_CONFIG.embedding.mode;
   const activeAssignment = mode
     ? asRecord(asRecord(rootConfig.modelAssignments)[mode])
     : {};
   const rawAssignedPreset = activeAssignment.embedding;
   const hasExplicitAssignment = rawAssignedPreset !== undefined && rawAssignedPreset !== null;
+  const resolved = resolveMemoryAssignment(rootConfig, mode, "embedding");
+  const configuredMode = optionalString(embedding.mode);
+  const embeddingMode = configuredMode === "cloud"
+    || configuredMode === "local"
+    || configuredMode === "custom"
+    ? configuredMode
+    : rawAssignedPreset === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID
+      || (mode === "byok" && hasCatalog && !hasExplicitAssignment)
+      ? "local"
+      : hasExplicitAssignment && resolved.ok && embeddingProtocolSupported(resolved.context.protocol)
+        ? resolved.context.source === "account" ? "cloud" : "custom"
+        : mode === "account" && hasCatalog
+          ? "cloud"
+          : DEFAULT_MEMMY_CONFIG.embedding.mode;
   if (rawAssignedPreset === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID) {
     const assignmentOwner = optionalString(activeAssignment.ownerAccountId);
     const activeAccountId = optionalString(asRecord(rootConfig.app).userId);
@@ -988,8 +1008,6 @@ function resolveMemoryEmbedding(
     };
   }
 
-  const resolved = resolveMemoryAssignment(rootConfig, mode, "embedding");
-
   if (mode === "byok" && hasCatalog && !hasExplicitAssignment) {
     return localEmbeddingConfig(embedding);
   }
@@ -1006,7 +1024,7 @@ function resolveMemoryEmbedding(
     return localEmbeddingConfig(embedding);
   }
 
-  if (embeddingMode === "custom") {
+  if (embeddingMode === "custom" && (configuredMode === "custom" || !hasExplicitAssignment)) {
     const custom = asRecord(embedding.custom);
     return {
       ...embedding,

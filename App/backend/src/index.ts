@@ -274,7 +274,18 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       // work remains bounded by the plugin runtime's own timeout.
       toolTimeout: 7 * 24 * 60 * 60
     });
-    await reloadAgentMcp(options.memmyAgentAdminClient);
+    const memmyAgentAdminClient = options.memmyAgentAdminClient;
+    if (memmyAgentAdminClient) {
+      // The bridge config must be written first, but MCP connections must not delay the first window.
+      void Promise.resolve()
+        .then(() => memmyAgentAdminClient.reloadMcpConfig())
+        .then((result) => {
+          if (!result.ok) console.warn(`Agent MCP reload did not complete: ${result.message}`);
+        })
+        .catch((error: unknown) => {
+          console.warn(`Agent MCP reload unavailable during backend startup: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    }
 
     const runtimeConfig = RuntimeConfigSchema.parse({
       baseUrl: `http://127.0.0.1:${(address as AddressInfo).port}`,
