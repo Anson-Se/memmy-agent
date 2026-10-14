@@ -290,4 +290,22 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     };
     await expect(run('screenshot', {}, url => !url.includes('/blocked'))).rejects.toThrow(/blocked/);
   });
+
+  it('blocks untargeted click, keyboard and wheel before input when an iframe is denied, while allowed DOM targets still work', async () => {
+    await page.evaluate(`const frame=document.createElement('iframe');frame.src=${JSON.stringify(origin + '/blocked')};document.body.append(frame)`);
+    const privateInput = page.locator('iframe').contentFrame().locator('#private');
+    await privateInput.waitFor(); await privateInput.focus();
+    const allow = (url: string) => !url.includes('/blocked');
+    for (const [action, args] of [
+      ['click', { x: 20, y: 180 }], ['pressKey', { key: 'A' }], ['scroll', { deltaY: 300 }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const inputCount = bridge.methods.filter(method => method.startsWith('Input.')).length;
+      await expect(run(action, args, allow)).rejects.toThrow(/Untargeted input.*blocked/);
+      expect(bridge.methods.filter(method => method.startsWith('Input.'))).toHaveLength(inputCount);
+    }
+    expect(await privateInput.inputValue()).toBe('');
+    const allowed = await run('click', { target: '#action' }, allow);
+    expect(allowed.ok).toBe(true);
+    expect(await page.locator('#result').textContent()).toBe('Done');
+  });
 });

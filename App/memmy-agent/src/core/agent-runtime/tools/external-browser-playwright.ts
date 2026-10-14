@@ -206,6 +206,13 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       const page = session.page!;
       const observed = async (result: Record<string, unknown>) => ({ ...result,
         observation: await capture(session!, allowFrame) });
+      const assertUntargetedInputAllowed = (afterInput = false) => {
+        if (session!.relay.hasBlockedFrames() || page.frames().some(frame =>
+          !['about:blank', 'about:srcdoc'].includes(frame.url()) && !allowFrame(frame.url()))) {
+          throw Object.assign(new Error('Untargeted input is unavailable while the page contains a frame blocked by site policy'),
+            { inputTargetUncertain: afterInput });
+        }
+      };
       switch (action) {
         case 'consoleMessages': return { messages: session.relay.consoleMessages() };
         case 'networkRequests': return { requests: session.relay.networkRequests() };
@@ -215,8 +222,12 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
             regex: args.regex ? String(args.regex).slice(0, 250) : undefined });
         }
         case 'click': {
-          if (Number.isFinite(args.x) && Number.isFinite(args.y)) await page.mouse.click(args.x, args.y,
-            { button: args.button || 'left', clickCount: args.doubleClick ? 2 : 1 });
+          if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+            assertUntargetedInputAllowed();
+            await page.mouse.click(args.x, args.y,
+              { button: args.button || 'left', clickCount: args.doubleClick ? 2 : 1 });
+            assertUntargetedInputAllowed(true);
+          }
           else {
             const locator = await target(session, args.target || args.ref, allowFrame);
             const options = { button: args.button || 'left', modifiers: args.modifiers };
@@ -241,9 +252,17 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         case 'pressKey': {
           const key = String(args.key || '').replace(/\bCtrl\b/g, 'Control').replace(/\bCommand\b/g, 'Meta');
           if (!key || key.length > 50) throw new Error('Invalid key');
-          await page.keyboard.press(key); return await observed({ ok: true, inputDispatched: true });
+          assertUntargetedInputAllowed();
+          await page.keyboard.press(key);
+          assertUntargetedInputAllowed(true);
+          return await observed({ ok: true, inputDispatched: true });
         }
-        case 'scroll': await page.mouse.wheel(Number(args.deltaX) || 0, Number(args.deltaY) || 0); return await observed({ ok: true });
+        case 'scroll': {
+          assertUntargetedInputAllowed();
+          await page.mouse.wheel(Number(args.deltaX) || 0, Number(args.deltaY) || 0);
+          assertUntargetedInputAllowed(true);
+          return await observed({ ok: true, inputDispatched: true });
+        }
         case 'upload': {
           if (!Array.isArray(uploadPaths) || !uploadPaths.length || uploadPaths.length > 20
             || uploadPaths.some(file => typeof file !== 'string' || !file)) throw new Error('Approved upload paths are required');
@@ -286,7 +305,9 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       const message = signal?.aborted ? 'Browser executor cancelled' : String((error as Error)?.message || error);
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none') {
         return { ok: false, dispatchState, inputDispatched: dispatchState === 'confirmed',
-          noActionDispatched: false, freshObservationRequired: true, error: message };
+          noActionDispatched: false, freshObservationRequired: true, error: message,
+          ...((error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain
+            ? { inputTargetUncertain: true } : {}) };
       }
       const failure = error instanceof Error && !signal?.aborted ? error : new Error(message);
       Object.assign(failure, { dispatchState, noActionDispatched: dispatchState === 'none', freshObservationRequired: true });

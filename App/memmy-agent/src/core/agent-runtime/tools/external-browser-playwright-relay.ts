@@ -247,7 +247,7 @@ export class ExternalBrowserPlaywrightRelay {
     const commandParams = method === 'Target.setAutoAttach' ? { ...params, waitForDebuggerOnStart: false,
       filter: [{ type: 'iframe', exclude: false }] } : params;
     const mutation = method === 'Input.insertText' || method === 'DOM.setFileInputFiles'
-      || (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed')
+      || (method === 'Input.dispatchMouseEvent' && ['mousePressed', 'mouseWheel'].includes(params.type))
       || (method === 'Input.dispatchKeyEvent' && params.type === 'keyDown')
       || (method === 'Runtime.callFunctionOn'
         && /\.(?:selectOptions|fill|focusNode|setInputFiles|setChecked)\(/.test(String(params.functionDeclaration || '')));
