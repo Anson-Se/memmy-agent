@@ -1,4 +1,5 @@
 import { DEFAULT_MEMMY_CONFIG, type LlmClient } from "../../../src/index.js";
+import { withTurnJudgeKeys } from "../../fixtures/memory-service-fixture.js";
 
 export function createCapturingL2Llm(calls: Array<{
   messages: Array<{ role: string; content: string }>;
@@ -42,14 +43,14 @@ export function createCapturingL2Llm(calls: Array<{
       if (options.operation === "capture.summarize") {
         const payload = messages.find((message) => message.role === "user")?.content ?? "";
         const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
-        return {
+        return withTurnJudgeKeys(messages, {
           l1: {
             title: "Reflected trace",
             summary: "reflected trace summary",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
           },
           user: null
-        } as unknown as T;
+        }) as unknown as T;
       }
       if (options.operation === "l2.induction.v4") {
         const configuredResponse = Array.isArray(l2InductionResponse)

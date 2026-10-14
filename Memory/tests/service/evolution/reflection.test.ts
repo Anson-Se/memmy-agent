@@ -11,7 +11,8 @@ import {
 import {
   createBatchReflectionLlm,
   createMemoryServiceFixture,
-  runWorkerRounds
+  runWorkerRounds,
+  withTurnJudgeKeys
 } from "../../fixtures/memory-service-fixture.js";
 
 const {
@@ -65,14 +66,14 @@ function createUnusableReflectionLlm(): LlmClient {
       if (options.operation === "capture.summarize") {
         const payload = messages.find((message) => message.role === "user")?.content ?? "";
         const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
-        return {
+        return withTurnJudgeKeys(messages, {
           l1: {
             title: "Unusable reflection",
             summary: "unusable reflection summary",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
           },
           user: null
-        } as unknown as T;
+        }) as unknown as T;
       }
       return {
         summary: "unusable reflection summary",
@@ -118,14 +119,14 @@ function createCapturingReflectionLlm(calls: Array<{
       if (options.operation === "capture.summarize") {
         const payload = messages.find((message) => message.role === "user")?.content ?? "";
         const userQuote = payload.match(/\bUSER:\s*(.*?)\s+ASSISTANT:/)?.[1]?.trim() ?? "";
-        return {
+        return withTurnJudgeKeys(messages, {
           l1: {
             title: "Sqlite migration reflection",
             summary: "sqlite migration reflection summary",
             evidence: [{ quote: userQuote, role: "user", kind: "task_outcome" }]
           },
           user: null
-        } as unknown as T;
+        }) as unknown as T;
       }
       return {
         summary: "sqlite migration reflection summary",
