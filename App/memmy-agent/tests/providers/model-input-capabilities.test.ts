@@ -14,8 +14,8 @@ describe("model input capabilities", () => {
   it("contains only immutable, valid modality sets with text support", () => {
     const allowed = new Set<ModelInputModality>(["text", "image", "video"]);
 
-    expect(MODEL_INPUT_CAPABILITIES_REVIEWED_AT).toBe("2026-09-15");
-    expect(Object.keys(MODEL_INPUT_CAPABILITIES)).toHaveLength(244);
+    expect(MODEL_INPUT_CAPABILITIES_REVIEWED_AT).toBe("2026-10-14");
+    expect(Object.keys(MODEL_INPUT_CAPABILITIES)).toHaveLength(274);
     expect(Object.isFrozen(MODEL_INPUT_CAPABILITIES)).toBe(true);
     for (const [model, modalities] of Object.entries(MODEL_INPUT_CAPABILITIES)) {
       expect(model).toBeTruthy();
