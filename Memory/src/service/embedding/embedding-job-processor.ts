@@ -191,6 +191,7 @@ export interface EmbeddingJobProcessorDeps {
     relation: TurnJudgment["relation"];
     feedback: TurnJudgment["feedback"];
     reason: string;
+    filedByRule?: string;
     baseEpisodeId?: string;
     previousRawTurnId?: string;
     previousL1MemoryId?: string;
@@ -458,7 +459,7 @@ export class EmbeddingJobProcessor {
         relation: judged.snapshot.taskEmpty ? null : judged.judgment.relation,
         feedback: judged.snapshot.taskEmpty ? null : judged.judgment.feedback,
         reason: judged.judgment.reason,
-        ...(judged.snapshot.filedByRule ? {} : {
+        ...(judged.snapshot.filedByRule ? { filedByRule: judged.snapshot.filedByRule } : {
           baseEpisodeId: judged.snapshot.baseEpisodeId,
           previousRawTurnId: judged.snapshot.previousRawTurnId,
           previousL1MemoryId: judged.snapshot.previousL1MemoryId

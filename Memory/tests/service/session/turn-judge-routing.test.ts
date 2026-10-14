@@ -208,10 +208,10 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(episodeRow(db, first.episodeId).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
   });
 
-  it("reopens a closed task for a follow_up inside the merge window and closes the emptied provisional task", async () => {
-    const { llm } = createTurnJudgeLlm({ "第二轮": [judged("follow_up", "neutral", l1For("第二轮：接着做"))] });
+  it("starts a new task by rule when the previous turn's task is closed", async () => {
+    const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
-    const session = openSession(service, "route-reopen");
+    const session = openSession(service, "route-after-closed");
     const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" });
     await settle(service);
     db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'idle_timeout') WHERE id = ?`)
@@ -220,30 +220,37 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(second.episodeId).not.toBe(first.episodeId);
     await settle(service);
 
-    expect(episodeOf(db, second.rawTurnId)).toBe(first.episodeId);
-    expect(episodeRow(db, first.episodeId)).toMatchObject({ status: "open", rawTurnIds: [first.rawTurnId, second.rawTurnId] });
-    expect(episodeRow(db, second.episodeId)).toMatchObject({ status: "closed", rawTurnIds: [] });
-    expect(episodeRow(db, second.episodeId).meta.closeReason).toBe("emptied_by_turn_judge");
-  });
-
-  it("keeps a follow_up in the new task when the closed task is outside the merge window", async () => {
-    const { llm } = createTurnJudgeLlm({ "第二轮": [judged("follow_up", "neutral", l1For("第二轮：隔了很久接着做"))] });
-    const config = turnJudgeConfig();
-    config.algorithm.session = { ...config.algorithm.session, mergeMaxGapMs: 1 };
-    const { service, db } = createTestService({ llm, config });
-    const session = openSession(service, "route-outside-window");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" });
-    await settle(service);
-    db.db.prepare(`UPDATE raw_turns SET created_at = ?, message_payload_json = json_set(message_payload_json, '$.turn_complete.completed_at', ?) WHERE id = ?`)
-      .run("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", first.rawTurnId);
-    db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'idle_timeout') WHERE id = ?`)
-      .run(first.episodeId);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：隔了很久接着做", answer: "好。" });
-    await settle(service);
-
+    expect(judgeCalls.find((call) => call.user.startsWith("第二轮"))!.messages.at(-1)!.content)
+      .toContain("<first_user_message></first_user_message>");
     expect(episodeOf(db, second.rawTurnId)).toBe(second.episodeId);
     expect(episodeRow(db, first.episodeId).status).toBe("closed");
-    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.route).toMatchObject({ action: "keep_new_episode" });
+    expect(episodeRow(db, second.episodeId).meta).toMatchObject({ relation: "new_task", previousEpisodeId: first.episodeId });
+    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.route).toMatchObject({ action: "filed_by_rule", reason: "previous_task_closed" });
+    expect(feedbackRows(db, session.sessionId)).toHaveLength(0);
+  });
+
+  it("moves a turn out of the task its previous turn ended", async () => {
+    const { llm } = createTurnJudgeLlm({ "今天就到这": [judged("end_topic", "positive", null)] });
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
+    const session = openSession(service, "route-after-end-topic");
+    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
+    await settle(service);
+    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" });
+    const third = service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题：订机票", answer: "好。" });
+    expect(third.episodeId).toBe(first.episodeId);
+    await settle(service);
+
+    expect(episodeRow(db, first.episodeId)).toMatchObject({ status: "closed", rawTurnIds: [first.rawTurnId, second.rawTurnId] });
+    const moved = episodeOf(db, third.rawTurnId);
+    expect(moved).not.toBe(first.episodeId);
+    expect(episodeRow(db, moved)).toMatchObject({ status: "open", rawTurnIds: [third.rawTurnId], l1MemoryIds: [third.l1MemoryId] });
+    expect(rawTurnPayload(db, third.rawTurnId).turn_judge.route).toMatchObject({
+      action: "start_new_task_episode",
+      reason: "previous_task_closed",
+      fromEpisodeId: first.episodeId
+    });
+    // Only the end_topic turn's reaction is recorded; the turn after it has no previous result.
+    expect(feedbackRows(db, session.sessionId).map((row) => row.raw_payload.sourceRawTurnId)).toEqual([second.rawTurnId]);
   });
 
   it("files a turn without L1 by its relation too", async () => {

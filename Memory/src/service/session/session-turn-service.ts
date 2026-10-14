@@ -3286,6 +3286,7 @@ export class SessionTurnService {
     relation: "follow_up" | "new_task" | "end_topic" | null;
     feedback: "positive" | "negative" | "neutral" | null;
     reason: string;
+    filedByRule?: string;
     baseEpisodeId?: string;
     previousRawTurnId?: string;
     previousL1MemoryId?: string;
@@ -3301,7 +3302,9 @@ export class SessionTurnService {
       ? { relation: input.relation, reason: input.reason, signals: ["llm", TURN_JUDGE_PROMPT_VERSION] }
       : undefined;
     let route: Record<string, unknown> = { action: "filed_by_rule" };
-    if (decision && input.baseEpisodeId) {
+    if (input.filedByRule === "previous_task_closed") {
+      route = this.startTaskAfterClosedOne(session, rawTurn, input.at, affected);
+    } else if (decision && input.baseEpisodeId) {
       route = this.deps.repos.runtime.sessionHasJudgedTurnAfter(rawTurn.id)
         ? { action: "kept", reason: "later_turn_already_judged", episodeId: rawTurn.episodeId }
         : this.routeJudgedTurn(session, rawTurn, decision, input.baseEpisodeId, input.at, affected, jobs);
@@ -3341,12 +3344,11 @@ export class SessionTurnService {
     let target: EpisodeRecord = provisional;
     let action: string;
     if (decision.relation === "follow_up") {
+      // The judged task is open: a closed one leaves TASK SO FAR empty and the
+      // turn is filed by rule (startTaskAfterClosedOne).
       if (base.status === "open") {
         target = base;
         action = base.id === provisional.id ? "append" : "append_to_judged_task";
-      } else if (base.meta.closeReason !== "end_topic" && this.withinMergeWindow(base, rawTurn)) {
-        target = this.reopenForJudgedTurn(session, base, decision, at);
-        action = "reopen_previous_episode";
       } else {
         action = "keep_new_episode";
       }
@@ -3424,45 +3426,40 @@ export class SessionTurnService {
     return { action, fromEpisodeId: provisional.id, episodeId: target.id, baseEpisodeId: base.id };
   }
 
-  private withinMergeWindow(episode: EpisodeRecord, rawTurn: RawTurnRecord): boolean {
-    const maxGapMs = this.deps.config.algorithm.session.mergeMaxGapMs;
-    if (maxGapMs === 0) return true;
-    const lastCompletedAt = this.deps.repos.runtime.episodeRelationTexts(episode.id, episode.rawTurnIds).lastCompletedAt;
-    const lastMs = lastCompletedAt ? Date.parse(lastCompletedAt) : NaN;
-    const turnMs = Date.parse(rawTurn.createdAt);
-    if (!Number.isFinite(lastMs) || !Number.isFinite(turnMs)) return false;
-    return Math.max(0, turnMs - lastMs) <= maxGapMs;
-  }
-
-  private reopenForJudgedTurn(
+  // The previous turn's task was already closed when this turn was judged:
+  // the turn starts a new task by rule. It normally waits in a new provisional
+  // task already; if it was filed in the task that closed, it moves out.
+  private startTaskAfterClosedOne(
     session: SessionRecord,
-    episode: EpisodeRecord,
-    decision: TurnRelationDecision,
-    at: string
-  ): EpisodeRecord {
-    const reopened = this.deps.repos.runtime.reopenEpisode(episode.id, {
+    rawTurn: RawTurnRecord,
+    at: string,
+    affected: Set<string>
+  ): Record<string, unknown> {
+    const current: EpisodeRecord = this.deps.requireEpisode(rawTurn.episodeId);
+    const decision: TurnRelationDecision = {
+      relation: "new_task",
+      reason: "previous task closed",
+      signals: ["previous_task_closed"]
+    };
+    if (current.status === "open") {
+      this.deps.repos.runtime.updateEpisodeMeta(current.id, {
+        relation: decision.relation,
+        relationDecision: decision,
+        relationRouting: { action: "start_new_task_episode" }
+      }, at);
+      return { action: "filed_by_rule", reason: "previous_task_closed", episodeId: current.id };
+    }
+    const fresh = this.ensureEpisode(session, newId("episode"), at);
+    this.deps.repos.runtime.updateEpisodeMeta(fresh.id, {
       relation: decision.relation,
       relationDecision: decision,
-      reopenedAt: at,
-      reopenReason: "follow_up",
-      relationRouting: { action: "reopen_previous_episode" },
-      rewardDirty: { reason: "episode_reopened", reopenedFor: decision.relation, at }
+      previousEpisodeId: current.id,
+      relationRouting: { action: "start_new_task_episode" }
     }, at);
-    if (!reopened) throw new MemoryServiceError("conflict", "failed to reopen the judged episode");
-    this.deps.repos.runtime.appendChange({
-      memoryId: reopened.id,
-      namespaceId: this.deps.namespaceIdFromSession(session),
-      kind: "episode",
-      op: "updated",
-      entityId: reopened.id,
-      userId: reopened.userId,
-      changeType: "episode_reopened",
-      before: episode,
-      after: reopened,
-      source: "turn.judge",
-      createdAt: at
-    });
-    return reopened;
+    this.moveJudgedTurn(session, rawTurn, current.id, fresh.id, at);
+    affected.add(current.id);
+    affected.add(fresh.id);
+    return { action: "start_new_task_episode", reason: "previous_task_closed", fromEpisodeId: current.id, episodeId: fresh.id };
   }
 
   private closeForJudgedTurn(
