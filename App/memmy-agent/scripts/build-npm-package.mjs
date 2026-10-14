@@ -1,4 +1,5 @@
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { npmInvocation } from "../../../scripts/internal/shared/npm-invocation.mjs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -83,6 +84,7 @@ async function exists(path) {
 }
 
 function run(command, args, cwd) {
+  if (command === "npm") ({ command, args } = npmInvocation(args));
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "inherit"] });
     let stdout = "";

@@ -1,3 +1,4 @@
+import { requestTiming } from "../../utils/request-timing.js";
 import crypto from "node:crypto";
 import path from "node:path";
 import { LLMProvider, LLMResponse, ToolCallRequest } from "../../providers/base.js";
@@ -784,6 +785,7 @@ export class AgentRunner {
   }
 
   private async callProvider(provider: any, args: any, stream = false): Promise<LLMResponse> {
+    requestTiming("model.call_start");
     if (stream) {
       if (typeof provider.chatStreamWithRetry === "function") return provider.chatStreamWithRetry(args);
       if (typeof provider.chatStream === "function") return provider.chatStream(args);

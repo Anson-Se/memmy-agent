@@ -1,3 +1,4 @@
+import { requestTiming, withRequestTiming } from "../../utils/request-timing.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Config } from "../../config/schema.js";
@@ -224,6 +225,7 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
     sessionKey: args.sessionKey ?? args.session_key,
     channel: args.channel,
     chatId: args.chatId ?? args.chat_id,
+    metadata: args.metadata,
     onProgress: args.onProgress,
     onStream: args.onStream,
     onStreamEnd: args.onStreamEnd,
@@ -240,6 +242,7 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
         senderId: "api",
         content: args.content,
         media: args.media ?? [],
+        metadata: args.metadata,
         sessionKey: args.session_key ?? args.sessionKey,
       }),
     );
@@ -249,6 +252,10 @@ async function callAgent(ctx: ApiContext, args: Record<string, any>): Promise<an
 }
 
 export async function handleChatCompletions(request: Request, ctx?: ApiContext): Promise<Response> {
+  return withRequestTiming(request.headers.get("x-memmy-trace-id"), () => handleTimedChatCompletions(request, ctx));
+}
+
+async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): Promise<Response> {
   const context = ctx ?? {
     agentLoop: null,
     modelName: "memmy",
@@ -295,6 +302,9 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
     channel: "api",
     chat_id: API_CHAT_ID,
     chatId: API_CHAT_ID,
+    // An explicit API model selects this server's configured default, overriding a stale session binding.
+    ...(requestedModel && typeof context.agentLoop?.modelPreset === "string"
+      ? { metadata: { model_preset: context.agentLoop.modelPreset } } : {}),
   };
 
   if (stream) {
@@ -324,10 +334,12 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
         void (async () => {
           let failed = false;
           const onStream = async (token: string) => {
+            if (token) requestTiming("api.first_content", true);
             if (token) emitted = true;
             write(sseChunk(token, context.modelName, chunkId));
           };
           const onProgress = withProgressCapabilities(async (content: string, options: Record<string, any> = {}) => {
+            if (options.reasoning && content) requestTiming("api.first_reasoning", true);
             if (options.reasoning && content) write(sseMemmyEvent("thinking_delta", { text: content }, context.modelName, chunkId));
             if (options.reasoningEnd) write(sseMemmyEvent("thinking_end", {}, context.modelName, chunkId));
             for (const event of options.toolEvents ?? []) {
@@ -354,6 +366,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
           const onStreamEnd = async () => undefined;
           try {
             await withSessionLock(context, sessionKey, async () => {
+              requestTiming("api.session_lock_acquired");
               const response = await withTimeout(
                 Promise.resolve(
                   callAgent(context, {
@@ -370,13 +383,20 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
                 if (finalText.trim()) write(sseChunk(finalText, context.modelName, chunkId));
               }
             });
-          } catch {
+          } catch (error) {
+            requestTiming("api.error");
             failed = true;
+            const selectionUnavailable = error instanceof Error && error.message === "model_selection_unavailable";
+            write(`data: ${JSON.stringify({ error: {
+              code: selectionUnavailable ? "model_selection_unavailable" : "server_error",
+              message: selectionUnavailable ? "会话绑定的模型已不可用，请重新选择模型。" : "Memmy runtime failed while processing the request.",
+            } })}\n\n`);
           } finally {
             if (!failed) {
               write(sseChunk("", context.modelName, chunkId, "stop"));
               write(SSE_DONE);
             }
+            requestTiming("api.finished");
             close();
           }
         })();
