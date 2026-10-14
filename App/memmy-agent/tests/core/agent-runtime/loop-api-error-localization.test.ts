@@ -220,7 +220,7 @@ describe("AgentLoop WebUI API error localization", () => {
   });
 
   it("defaults image errors to English outside WebUI", async () => {
-    const agent = loopWithResponse(imageErrorResponse("image_input_unsupported"), { contextWindowTokens: 0 });
+    const agent = loopWithResponse(imageErrorResponse("image_input_unsupported"), { contextWindowTokens: 200_000 });
 
     const outbound = await agent.processDirect("describe it", { sessionKey: "cli:image-unsupported" });
 
