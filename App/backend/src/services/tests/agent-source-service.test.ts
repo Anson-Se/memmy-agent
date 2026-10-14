@@ -1451,12 +1451,12 @@ describe("agent source service", () => {
       status_before: "not_connected",
       status_after: "plugin_installed",
       install_type: "manual",
-      success: true,
+      success: 1,
     });
     expect(analytics.events[1]?.params).toMatchObject({
       source_id: "cursor",
       status_after: "not_connected",
-      success: true,
+      success: 1,
     });
     expect(analytics.events[2]?.params).toMatchObject({
       source_id: "openclaw",
@@ -1535,7 +1535,7 @@ describe("agent source service", () => {
         permission: "scan_only",
         status_before: "not_connected",
         status_after: "skill_installed",
-        success: true,
+        success: 1,
       },
     });
   });
@@ -1581,7 +1581,7 @@ describe("agent source service", () => {
         status_before: "not_connected",
         status_after: "not_connected",
         install_type: "auto_inject",
-        success: false,
+        success: 0,
         error_code: "install failed",
       },
     });
