@@ -114,6 +114,9 @@ try {
       $app = New-Object -ComObject Excel.Application
       Track-Com $app
       $app.Visible = $true
+      # This instance belongs to the user after authorization, even after our
+      # short-lived PowerShell process releases its final COM reference.
+      $app.UserControl = $true
     } elseif ($request.operation -eq 'status') {
       Emit-Result $status
       exit 0
@@ -127,7 +130,7 @@ try {
       Track-Com $app
     } catch {
       $failureCode = 'NOT_CONNECTED'
-      throw 'The running Excel application is not available for control. Finish any Excel dialog and try again.'
+      throw "The running Excel application is not available for control. HRESULT $($_.Exception.GetBaseException().HResult)"
     }
   }
   # Application.Hwnd can follow the active window in Excel's SDI interface.
@@ -302,7 +305,7 @@ const POWERSHELL_ARGUMENTS = [
   Buffer.from(WINDOWS_EXCEL_SCRIPT.split("\n").map(line => line.trimStart()).filter(line => line && !line.startsWith("#")).join("\n"), "utf16le").toString("base64"),
 ];
 
-async function request(operation: Operation, action?: NativeAction, run?: WindowsExcelRunner): Promise<unknown> {
+async function request(operation: Operation, action?: NativeAction, run?: WindowsExcelRunner, attachRetry = 0): Promise<unknown> {
   if (!run && process.platform !== "win32") throw new Error("Native Windows Excel control is supported on Windows only");
   const root = process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows";
   const powershell = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -319,7 +322,7 @@ async function request(operation: Operation, action?: NativeAction, run?: Window
     throw error;
   }
   if (Buffer.byteLength(output) > MAX_RESULT_BYTES) throw new Error("Excel response is too large; the result is unknown and was not replayed");
-  let response: { ok?: unknown; data?: unknown; error?: unknown; writeAttempted?: unknown };
+  let response: { ok?: unknown; data?: unknown; error?: unknown; code?: unknown; writeAttempted?: unknown };
   try { response = JSON.parse(output.trim()); } catch {
     throw new Error("Excel returned an invalid response; the result is unknown and was not replayed");
   }
@@ -328,6 +331,13 @@ async function request(operation: Operation, action?: NativeAction, run?: Window
   }
   if (!response.ok) {
     const detail = typeof response.error === "string" ? response.error.slice(0, 500) : "Windows Excel control failed";
+    // A newly started Excel process may not yet be registered in the ROT.
+    // Retry only connection probes with this exact pre-action failure.
+    if (operation !== "invoke" && response.code === "NOT_CONNECTED"
+      && detail.startsWith("The running Excel application is not available for control.") && attachRetry < 3) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return request(operation, action, run, attachRetry + 1);
+    }
     const message = EXCEL_BUSY_HRESULT.test(detail) ? EXCEL_BUSY : detail;
     throw new Error(response.writeAttempted === true
       ? `${message}; the result is unknown and was not replayed` : message);
