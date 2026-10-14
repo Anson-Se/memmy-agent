@@ -16587,6 +16587,102 @@ body:has(.sidebar-shell) .window-drag-region {
 .file-preview__media audio {
   width: min(520px, 100%);
 }
+.pptx-preview {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+  background: #f3f4f6;
+}
+.pptx-preview__toolbar {
+  z-index: 1;
+  display: flex;
+  min-height: 38px;
+  flex: none;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border-stone) 38%, transparent);
+  background: var(--color-background-paper);
+  color: var(--color-text-ink);
+  font-size: 12px;
+}
+.pptx-preview__toolbar button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-btn);
+}
+.pptx-preview__toolbar button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-action-sky) 12%, transparent);
+}
+.pptx-preview__toolbar button:disabled {
+  opacity: 0.35;
+}
+.pptx-preview__toolbar input {
+  width: 38px;
+  min-width: 0;
+  height: 26px;
+  padding: 2px 3px;
+  border: 1px solid var(--color-border-stone);
+  border-radius: 5px;
+  background: transparent;
+  font-size: 12px;
+  text-align: center;
+  appearance: textfield;
+}
+.pptx-preview__toolbar input::-webkit-inner-spin-button,
+.pptx-preview__toolbar input::-webkit-outer-spin-button {
+  appearance: none;
+}
+.pptx-preview__toolbar-spacer {
+  min-width: 4px;
+  flex: 1;
+}
+.pptx-preview__count {
+  min-width: 28px;
+  white-space: nowrap;
+}
+.pptx-preview__zoom {
+  min-width: 36px;
+  text-align: center;
+}
+.pptx-preview__scroll {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  padding: 20px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.pptx-preview__slides {
+  width: 100%;
+  min-width: 0;
+}
+.pptx-preview__status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  background: #f3f4f6;
+  color: color-mix(in srgb, var(--color-text-ink) 64%, transparent);
+  font-size: 13px;
+  text-align: center;
+}
 .pdf-preview {
   display: flex;
   height: 100%;

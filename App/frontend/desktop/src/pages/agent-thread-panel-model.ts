@@ -159,7 +159,7 @@ export function threadFileKind(name: string): ThreadFileKind {
 
 export function threadPreviewKind(name: string): ThreadPreviewKind {
   const extension = threadFileExtension(name);
-  if (extension === "docx" || extension === "xlsx") return "document";
+  if (extension === "docx" || extension === "xlsx" || extension === "pptx") return "document";
   if (extension === "csv" || extension === "tsv") return "csv";
   return PREVIEW_BY_KIND[threadFileKind(name)] ?? "unsupported";
 }

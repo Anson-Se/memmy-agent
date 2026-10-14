@@ -50,6 +50,11 @@ const PdfPreview = lazy(async () => {
   return { default: module.PdfPreview };
 });
 
+const PptxPreview = lazy(async () => {
+  const module = await import("./pptx-preview.js");
+  return { default: module.PptxPreview };
+});
+
 const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 const OFFICE_PREVIEW_MAX_BYTES = 25 * 1024 * 1024;
 const BINARY_PREVIEW_MAX_BYTES = 100 * 1024 * 1024;
@@ -141,6 +146,18 @@ export function FilePreview(props: FilePreviewProps): ReactNode {
   }
   if (loadedFileType.kind === "spreadsheet" && props.resource.name.toLowerCase().endsWith(".xlsx")) {
     return searchable(<OfficePreview kind="xlsx" blob={state.blob} />);
+  }
+  if (loadedFileType.kind === "presentation" && props.resource.name.toLowerCase().endsWith(".pptx")) {
+    return (
+      <Suspense fallback={<PreviewStatus label={t("filePreview.loading")} />}>
+        <PptxPreview
+          blob={state.blob}
+          resource={props.resource}
+          viewState={props.viewState}
+          onViewStateChange={props.onViewStateChange}
+        />
+      </Suspense>
+    );
   }
   if (
     loadedFileType.kind === "spreadsheet"
