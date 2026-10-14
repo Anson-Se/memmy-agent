@@ -15,6 +15,7 @@ import type {
 import { stableHash } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
 import { clip, firstLine } from "../../utils/text.js";
+import { turnJudgeJobFlags } from "../evolution/turn-judge.js";
 
 
 
@@ -131,6 +132,7 @@ export interface ImportJobProcessorDeps {
   };
   runtime: {
     appendChange(change: Record<string, unknown>): number;
+    latestJobForTarget(targetMemoryId: string, jobType: JobType): { payload: Record<string, unknown> } | undefined;
   };
 }
 
@@ -409,7 +411,10 @@ export class ImportJobProcessor {
       if (!latest || latest.state !== "failed" || !latest.stage) return latest ? { accepted: false, processing: latest } : undefined;
       const summaryJobType = memoryHasImportPipeline(memory) ? "import_summary" : "trace_summary";
       const job = d.enqueueJob({ jobType: latest.stage === "summary" ? summaryJobType : "embedding", userId: memory.userId,
-        sessionId: memory.sessionId, targetMemoryId: memory.id, payload: { source: "memory.processing.manual_retry", previousErrorCode: latest.errorCode ?? undefined, contentHash: memory.contentHash },
+        sessionId: memory.sessionId, targetMemoryId: memory.id, payload: { source: "memory.processing.manual_retry", previousErrorCode: latest.errorCode ?? undefined, contentHash: memory.contentHash,
+          ...(latest.stage === "summary" && summaryJobType === "trace_summary"
+            ? turnJudgeJobFlags(d.runtime.latestJobForTarget(memory.id, "trace_summary")?.payload)
+            : {}) },
         maxAttempts: latest.stage === "summary" ? 3 : 6, createdAt: at });
       const processing = d.processing.save({ ...latest, state: latest.stage === "summary" ? "summary_pending" : "embedding_pending", activeJobId: job.id,
         attemptCount: 0, manualRetryCount: latest.manualRetryCount + 1, retryAction: "retry", updatedAt: at });
