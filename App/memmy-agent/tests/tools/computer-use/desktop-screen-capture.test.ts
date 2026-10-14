@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DesktopScreenClient, DesktopScreenCaptureTool, desktopScreenClient, screenCaptureEnabled } from '../../../src/tools/computer-use/desktop-screen-capture.js';
 import { isManagedOcuConfig, managedOcuEnvironment, resolveOpenComputerUseCommand } from '../../../src/tools/computer-use/open-computer-use-binary.js';
@@ -122,10 +125,22 @@ it('exposes passive capture only to supported, enabled desktop presets', () => {
   expect(() => managedOcuEnvironment('open-computer-use', null)).toThrow(/missing/);
 });
 it.skipIf(process.platform !== 'darwin')('keeps the physical pointer fallback disabled by default', () => {
-  const binary = resolveOpenComputerUseCommand('open-computer-use');
-  expect(managedOcuEnvironment(binary, null).OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS).toBe('0');
-  expect(managedOcuEnvironment(binary, { OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS: '1' })
-    .OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS).toBe('1');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-ocu-runtime-'));
+  const app = path.join(root, 'Memmy Computer Use.app', 'Contents', 'MacOS');
+  const binary = path.join(app, 'MemmyComputerUse');
+  fs.mkdirSync(app, { recursive: true });
+  fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n');
+  fs.chmodSync(binary, 0o755);
+  vi.stubEnv('MEMMY_DEV_COMPUTER_USE_BINARY', binary);
+  try {
+    const resolved = resolveOpenComputerUseCommand('open-computer-use');
+    expect(resolved).toBe(binary);
+    expect(managedOcuEnvironment(resolved, null).OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS).toBe('0');
+    expect(managedOcuEnvironment(resolved, { OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS: '1' })
+      .OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS).toBe('1');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 it('handshakes and correlates replies on the private parent channel', async () => {
   const ipc = Object.assign(new EventEmitter(), { connected: true, send: vi.fn((message: any, cb: any) => {

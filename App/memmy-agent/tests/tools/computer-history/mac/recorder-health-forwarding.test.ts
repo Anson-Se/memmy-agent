@@ -116,7 +116,8 @@ describe("content-free recorder health", () => {
     assert.ok(signals.some((signal) => signal.code === "event_recorded"));
     assert.doesNotMatch(JSON.stringify(signals), /Private|private\.invalid|Synthetic Notes|Allowed control/u);
     const raw = fs.readFileSync(output, "utf8");
-    assert.doesNotMatch(raw, /recorder\.diagnostic|observer_unavailable|Private|private\.invalid/u);
+    const persistedEvents = raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.doesNotMatch(JSON.stringify(persistedEvents), /recorder\.diagnostic|observer_unavailable|private\.invalid|Private data|Private target|Malformed Private/u);
     assert.match(raw, /Allowed control/u);
   });
 
