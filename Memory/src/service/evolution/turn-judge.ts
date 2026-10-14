@@ -783,3 +783,20 @@ export function turnJudgeSnapshotFromPayload(value: unknown): TurnJudgeSnapshot 
     candidateIds: Array.isArray(value.candidateIds) ? value.candidateIds.filter((id): id is string => typeof id === "string") : []
   };
 }
+
+// A reaction with no attitude: turn.judge.v1 writes one every turn, and it
+// never stands in for an earlier positive or negative reaction when one
+// feedback is picked to represent a task.
+export function isNeutralFeedback(feedback: { polarity: string; magnitude: number }): boolean {
+  return feedback.polarity === "neutral" && feedback.magnitude <= 0;
+}
+
+// The one feedback that represents a task's reaction to its result when only
+// one is used (reward fallback, reward job payload): the latest explicit one,
+// else the latest, skipping neutral reactions.
+export function representativeEpisodeFeedback<T extends { channel: string; polarity: string; magnitude: number }>(
+  feedback: readonly T[]
+): T | undefined {
+  const withAttitude = feedback.filter((item) => !isNeutralFeedback(item));
+  return [...withAttitude].reverse().find((item) => item.channel === "explicit") ?? withAttitude[withAttitude.length - 1];
+}
