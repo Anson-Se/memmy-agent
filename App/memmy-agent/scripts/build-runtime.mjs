@@ -31,7 +31,12 @@ try {
   const packageRoot = join(source, "package");
   await mkdir(source, { recursive: true });
   await cp(join(agentRoot, "npm-packages", "memmy-agent"), packageRoot, { recursive: true });
-  run("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], packageRoot);
+  // Third-party lifecycle scripts are not needed to ship the runtime and some are POSIX-only
+  // (e.g. @tencent-connect/openclaw-qqbot runs `... 2>/dev/null || true`, which fails under
+  // Windows cmd.exe unless a `true` binary happens to be on PATH). Install without scripts,
+  // then run only the install script of the native module the runtime actually loads.
+  run("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], packageRoot);
+  run("npm", ["rebuild", "better-sqlite3", "--no-audit", "--no-fund"], packageRoot);
   const destination = join(temporaryRoot, "bundled");
   await bundleRuntime({ source, destination, packageDirectory: "package", kind: "agent", target: { platform: process.platform, arch: process.arch } });
   const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
@@ -50,7 +55,8 @@ try {
   });
   console.log(archive);
 } finally {
-  await rm(temporaryRoot, { recursive: true, force: true });
+  // Windows may briefly lock freshly installed files (antivirus/indexer), so retry on EBUSY/EPERM.
+  await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 }
 
 function run(command, args, cwd) {
