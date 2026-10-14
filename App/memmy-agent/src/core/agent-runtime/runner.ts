@@ -1338,9 +1338,7 @@ export class AgentRunner {
         : 4096;
     const budget = spec.contextBlockLimit
       ?? spec.contextWindowTokens - maxOutput - CONTEXT_SAFETY_BUFFER_TOKENS;
-    if (!Number.isFinite(budget)) return null;
-    if (budget <= 0 && spec.contextBlockLimit == null) return null;
-    return budget;
+    return Number.isFinite(budget) ? budget : null;
   }
 
   private prepareMessagesBeforeSnip(

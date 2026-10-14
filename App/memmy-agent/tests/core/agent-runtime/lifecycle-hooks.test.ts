@@ -293,7 +293,7 @@ describe("lifecycle hooks", () => {
       }
     }
     const hook = new VersionedPromptHook();
-    const loop = makeLoop([hook], { contextWindowTokens: 1_000 });
+    const loop = makeLoop([hook], { contextWindowTokens: 5_000 });
     const session = loop.sessions.getOrCreate("cli:versioned-cache");
     session.messages = [
       { role: "user", content: "old user message" },
