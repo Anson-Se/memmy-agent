@@ -61,6 +61,8 @@ export interface ManagedRuntimeServices {
   };
   /** Waits for a usable Agent gateway, or a repairable configuration issue. */
   startAgentGateway(): Promise<AgentGatewayStartupIssue | null>;
+  /** Read live ownership after startup/recovery; never exposed in renderer bootstrap. */
+  isAgentGatewayExternal(): boolean;
   /** Starts browser preparation once, independently of the first window. */
   startBrowserPreparation(): PackagedBrowserPreparation | null;
   restartMemory(): Promise<void>;
@@ -343,6 +345,7 @@ export async function startManagedRuntimeServices(
       },
       agentGateway,
       startAgentGateway,
+      isAgentGatewayExternal: () => gatewaySupervisor.ownership === "external",
       startBrowserPreparation,
       async restartMemory() {
         await restartMemoryRuntime();
@@ -1593,6 +1596,57 @@ export async function startAgentGatewayWithRecovery(
     onRecovery?.();
     return supervisor.waitForReady();
   }
+}
+
+/** A reused gateway must load the bridge URL/token written by this Desktop instance. */
+export async function waitForExternalAgentMcpConfig(options: {
+  reload: () => Promise<{ ok: boolean; message: string; requires_restart: boolean }>;
+  isCanceled: () => boolean;
+}): Promise<boolean> {
+  let failure = "MCP configuration was not accepted";
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (options.isCanceled()) return false;
+    try {
+      const outcome = await waitForStartupWorkWhileActive(Promise.resolve().then(options.reload), options.isCanceled);
+      if (!outcome) return false;
+      const result = outcome.value;
+      if (result.ok && !result.requires_restart) return true;
+      failure = result.message || (result.requires_restart ? "Agent gateway requires a restart" : failure);
+    } catch (error) {
+      if (options.isCanceled()) return false;
+      failure = errorMessage(error);
+    }
+    if (attempt < 3) {
+      if (!await waitForStartupWorkWhileActive(sleep(attempt * 1_000), options.isCanceled)) return false;
+    }
+  }
+  throw new Error(`Existing Agent gateway could not load the current local MCP bridge after 3 attempts: ${failure}. Stop the external gateway and reopen Memmy to start a new managed gateway.`);
+}
+
+function waitForStartupWorkWhileActive<T>(work: Promise<T>, isCanceled: () => boolean): Promise<{ value: T } | null> {
+  return new Promise((resolveWork, rejectWork) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (value: { value: T } | null, failed = false, error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (failed) rejectWork(error);
+      else resolveWork(value);
+    };
+    const checkCancellation = () => {
+      if (settled) return;
+      if (isCanceled()) { finish(null); return; }
+      timer = setTimeout(checkCancellation, 100);
+      timer.unref?.();
+    };
+    // Keep handlers attached after cancellation so a late timeout/rejection is consumed.
+    work.then(value => finish(isCanceled() ? null : { value }), error => {
+      if (isCanceled()) finish(null);
+      else finish(null, true, error);
+    });
+    checkCancellation();
+  });
 }
 
 export function resolveAgentGatewayStartupTimeout(config: unknown): number {

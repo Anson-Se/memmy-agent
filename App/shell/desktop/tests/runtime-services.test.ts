@@ -28,6 +28,7 @@ import {
   spawnNodeService,
   startAgentGatewayWithRecovery,
   startPackagedBrowserPreparation,
+  waitForExternalAgentMcpConfig,
   stopManagedChild,
   stopManagedChildrenForDesktopExit,
   syncBundledAgentSkills,
@@ -971,6 +972,55 @@ describe("packaged desktop runtime config", () => {
       attemptId: "failed-browser-attempt",
       error: expect.stringContaining("spawn failed"),
     });
+  });
+});
+
+describe("external Agent MCP startup", () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it("retries a timeout and a busy result before accepting a usable bridge", async () => {
+    vi.useFakeTimers();
+    const reload = vi.fn().mockRejectedValueOnce(new Error("request timeout"))
+      .mockResolvedValueOnce({ ok: false, message: "busy", requires_restart: false })
+      .mockResolvedValueOnce({ ok: true, message: "ready", requires_restart: false });
+    const pending = waitForExternalAgentMcpConfig({ reload, isCanceled: () => false });
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(pending).resolves.toBe(true);
+    expect(reload).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects a restart-required result even when the reload reports ok", async () => {
+    vi.useFakeTimers();
+    const reload = vi.fn(async () => ({ ok: true, message: "restart required", requires_restart: true }));
+    const pending = waitForExternalAgentMcpConfig({ reload, isCanceled: () => false });
+    const assertion = expect(pending).rejects.toThrow("after 3 attempts: restart required");
+    await vi.advanceTimersByTimeAsync(3_000);
+    await assertion;
+    expect(reload).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops during backoff when quit wins and consumes a late canceled request failure", async () => {
+    vi.useFakeTimers();
+    let canceled = false;
+    const reload = vi.fn(async () => ({ ok: false, message: "busy", requires_restart: false }));
+    const pending = waitForExternalAgentMcpConfig({ reload, isCanceled: () => canceled });
+    await vi.advanceTimersByTimeAsync(0);
+    canceled = true;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(pending).resolves.toBe(false);
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    let rejectLate!: (error: Error) => void;
+    canceled = false;
+    const late = waitForExternalAgentMcpConfig({
+      reload: () => new Promise((_resolve, reject) => { rejectLate = reject; }), isCanceled: () => canceled
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    canceled = true;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(late).resolves.toBe(false);
+    rejectLate(new Error("late request timeout"));
+    await vi.advanceTimersByTimeAsync(0);
   });
 });
 
