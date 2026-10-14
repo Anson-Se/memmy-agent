@@ -314,7 +314,6 @@ export function AgentThreadPanel(props: {
   const activeFileKey = activeTab?.type === "file" ? normalizeThreadPath(activeTab.path ?? activeTab.url ?? "") : null;
   const activeChangeKey = activeTab?.type === "change" ? activeTab.id.slice("change:".length) : null;
   const listVisible = !panel.hasContent || panel.pinned;
-  const popoverAllowed = panel.visible && panel.phase === 'open' && panel.hasContent && !panel.pinned;
   const triggerRef = useRef<HTMLDivElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const popoverTimerRef = useRef<number | null>(null);
@@ -331,6 +330,11 @@ export function AgentThreadPanel(props: {
   const browserSession = browserSessions.get(ownerKey) ?? EMPTY_BROWSER_SESSION;
   const { open: browserOpen, mounted: browserMounted, tabs: browserTabs,
     activeId: activeBrowserTabId, copiedId: copiedBrowserTabId } = browserSession;
+  // The overview list is hidden behind either a file preview or a browser tab.
+  // A pinned list is also hidden while the browser surface is selected.
+  const pinnedListVisible = panel.pinned && panel.hasContent && !browserOpen;
+  const popoverAllowed = panel.visible && panel.phase === 'open'
+    && (panel.hasContent || browserOpen) && !pinnedListVisible;
   const anyBrowserMounted = [...browserSessions.values()].some(session => session.mounted);
   const nextBrowserTabId = useRef(2);
   const backgroundBrowserOwners = useRef(new Set<string>());
@@ -619,15 +623,17 @@ export function AgentThreadPanel(props: {
           >
             <button
               type="button"
-              className={`thread-panel__icon-button thread-panel__overview-button${panel.pinned && panel.hasContent ? " thread-panel__overview-button--inactive" : ""}${popoverOpen ? " thread-panel__icon-button--active" : ""}`}
-              aria-label={t(panel.pinned && panel.hasContent ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
-              title={t(panel.pinned && panel.hasContent ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
+              className={`thread-panel__icon-button thread-panel__overview-button${pinnedListVisible ? " thread-panel__overview-button--inactive" : ""}${popoverOpen ? " thread-panel__icon-button--active" : ""}`}
+              aria-label={t(pinnedListVisible ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
+              title={t(pinnedListVisible ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
               aria-haspopup={popoverAllowed ? "dialog" : undefined}
               aria-expanded={popoverAllowed ? popoverOpen : undefined}
               onClick={() => {
                 if (!popoverAllowed) return;
                 cancelPopoverClose();
-                setPopoverOpen((current) => !current);
+                // Pointer-enter may already have opened the hover list before
+                // this click arrives; clicking must not immediately close it.
+                setPopoverOpen(true);
               }}
             >
               <ThreadListIcon />
