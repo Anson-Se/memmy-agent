@@ -199,9 +199,12 @@ export const MODEL_INPUT_CAPABILITIES = defineModelInputCapabilities([
   ["deepseek-v4-flash-vision-exp", TEXT_IMAGE],
   ["deepseek-v3.2", TEXT],
 
-  // Qwen / 百炼. Reviewed 2026-08-19.
+  // Qwen / 百炼. Reviewed 2026-10-14.
   // Source: https://help.aliyun.com/zh/model-studio/token-plan-team-overview
   // Source: https://help.aliyun.com/zh/model-studio/vision-model/
+  // Source: https://help.aliyun.com/zh/model-studio/qwen-plus
+  ["qwen-plus", TEXT],
+  ["qwen-plus-latest", TEXT],
   ["qwen3.7-max", TEXT],
   ["qwen3.7-max-preview", TEXT],
   ["qwen3.7-max-2026-05-20", TEXT],

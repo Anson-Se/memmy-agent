@@ -15,7 +15,7 @@ describe("model input capabilities", () => {
     const allowed = new Set<ModelInputModality>(["text", "image", "video"]);
 
     expect(MODEL_INPUT_CAPABILITIES_REVIEWED_AT).toBe("2026-10-14");
-    expect(Object.keys(MODEL_INPUT_CAPABILITIES)).toHaveLength(274);
+    expect(Object.keys(MODEL_INPUT_CAPABILITIES)).toHaveLength(276);
     expect(Object.isFrozen(MODEL_INPUT_CAPABILITIES)).toBe(true);
     for (const [model, modalities] of Object.entries(MODEL_INPUT_CAPABILITIES)) {
       expect(model).toBeTruthy();
@@ -41,6 +41,8 @@ describe("model input capabilities", () => {
     expect(getModelInputModalities("deepseek-v4-flash-vision-exp")).toEqual(["text", "image"]);
     expect(getModelInputModalities("kimi-k3")).toEqual(["text", "image", "video"]);
     expect(getModelInputModalities("glm-5v-turbo")).toEqual(["text", "image", "video"]);
+    expect(getModelInputModalities("qwen-plus")).toEqual(["text"]);
+    expect(getModelInputModalities("qwen-plus-latest")).toEqual(["text"]);
     expect(getModelInputModalities("qwen3.7-max-2026-05-20")).toEqual(["text"]);
     expect(getModelInputModalities("qwen3.7-max-2026-06-08")).toEqual(["text", "image", "video"]);
     expect(getModelInputModalities("Gpt-5.6")).toEqual(["text"]);

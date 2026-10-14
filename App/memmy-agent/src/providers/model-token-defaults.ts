@@ -316,6 +316,13 @@ export const MODEL_TOKEN_DEFAULTS = defineModelTokenDefaults([
   // Qwen / Model Studio. Reviewed 2026-10-14.
   // Sources: https://help.aliyun.com/zh/model-studio/text-generation-model
   //          https://help.aliyun.com/zh/model-studio/vision-model
+  //          https://help.aliyun.com/zh/model-studio/qwen-plus
+  // qwen-plus accepts max_tokens in [1, 32768]. Older dated snapshots differ and are not listed.
+  {
+    models: ["qwen-plus", "qwen-plus-latest"],
+    contextWindowTokens: 1_000_000,
+    maxTokens: 32_768,
+  },
   {
     models: ["qwen3.8-flash", "qwen3.8-max-0902", "qwen3.8-max-2026-09-02"],
     contextWindowTokens: 1_000_000,
