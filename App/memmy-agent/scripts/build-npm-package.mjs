@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -54,6 +54,7 @@ const packageManifest = {
 
 await writeFile(join(outputRoot, "package.json"), `${JSON.stringify(packageManifest, null, 2)}\n`);
 await cp(join(agentRoot, "dist"), join(outputRoot, "dist"), { recursive: true });
+await chmod(join(outputRoot, "dist", "main.js"), 0o755);
 await cp(join(agentRoot, ".env.example"), join(outputRoot, ".env.example"));
 await cp(join(agentRoot, "README.md"), join(outputRoot, "README.md"));
 
