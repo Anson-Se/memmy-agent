@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import YAML from "yaml";
+import { buildMemoryAll, verifyMemoryDownload } from "../scripts/internal/shared/build-memory-all.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const collector = join(root, "scripts/internal/shared/collect-runtime-artifacts.mjs");
@@ -38,6 +39,65 @@ it("collects all target artifacts and rejects corrupted downloads", async () => 
   const manifest = JSON.parse(await readFile(join(directory, "output/runtime-artifacts.json")));
   expect(Object.keys(manifest.runtimes.agent.assets)).toHaveLength(6);
   expect(Object.keys(manifest.runtimes.memory.assets)).toHaveLength(6);
+  for (const target of targets) {
+    const input = join(directory, "input", `runtimes-${target}`);
+    for (const name of await readdir(input)) if (name.includes("agent")) await rm(join(input, name));
+  }
+  const memoryOutput = join(directory, "memory-output");
+  const memoryArgs = [collector, join(directory, "input"), memoryOutput, "memory"];
+  execFileSync(process.execPath, memoryArgs, { env: { ...process.env, GITHUB_SHA: "test-commit" } });
+  expect(await readdir(memoryOutput)).toHaveLength(8);
+  await verifyMemoryDownload(memoryOutput, "test-commit");
+  await expect(verifyMemoryDownload(memoryOutput, "other-commit")).rejects.toThrow("requested commit");
+  await writeFile(join(memoryOutput, (await readdir(memoryOutput)).find((name) => name.endsWith("tar.gz"))), "corrupt download");
+  await expect(verifyMemoryDownload(memoryOutput, "test-commit")).rejects.toThrow("Checksum");
   await writeFile(corrupted, "corrupted");
-  expect(() => execFileSync(process.execPath, args, { stdio: "pipe" })).toThrow();
+  expect(() => execFileSync(process.execPath, memoryArgs, { stdio: "pipe" })).toThrow();
+});
+
+it("rejects local changes before uploading source", async () => {
+  await expect(buildMemoryAll({ run: () => " M package.json" })).rejects.toThrow("Commit your local changes");
+});
+
+it("tracks the pushed build and propagates failure before downloading", async () => {
+  let branch;
+  let watched = false;
+  const calls = [];
+  await expect(buildMemoryAll({
+    wait: async () => {},
+    run: (command, args) => {
+      calls.push([command, ...args]);
+      if (command === "git") {
+        if (args[0] === "status") return "";
+        if (args[0] === "rev-parse") return "sha";
+        if (args[0] === "remote") return "https://github.com/owner/repo.git";
+        if (args[0] === "push") {
+          expect(args[1]).toBe("origin");
+          expect(args[2]).toMatch(/^sha:refs\/heads\/zy_memory_runtime_/);
+          branch = args[2].split("/").at(-1);
+          return "";
+        }
+      }
+      if (args[0] === "repo") {
+        expect(args[2]).toBe("https://github.com/owner/repo.git");
+        return "owner/repo";
+      }
+      if (args[1] === "list") {
+        expect(args).toContain(branch);
+        expect(args).toContain("push");
+        return JSON.stringify([
+          { databaseId: 10, headSha: "other-sha" },
+          { databaseId: 11, headSha: "sha", url: "https://example.test/run/11" },
+        ]);
+      }
+      if (args[1] === "watch") {
+        expect(args[2]).toBe("11");
+        watched = true;
+        throw new Error("Windows build failed");
+      }
+      throw new Error("Unexpected command");
+    },
+  })).rejects.toThrow("Windows build failed");
+  expect(watched).toBe(true);
+  expect(calls.some((args) => args.includes("download"))).toBe(false);
 });
