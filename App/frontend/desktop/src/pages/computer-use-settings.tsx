@@ -219,6 +219,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   const excelApplicationScope = excelStatus?.scope === "application";
   const excelLegacyScope = excelStatus !== null && !excelApplicationScope;
   const excelEnabled = excelApplicationScope ? excelStatus.enabled ?? excelStatus.configured : excelStatus?.configured === true;
+  const excelInitialChecking = props.platform === "win32" && excelStatus === null;
   const excelFailureDetail = excelError?.message ?? (excelStatusError ? "" : excelStatus?.error ?? "");
   const excelAutomationError = props.platform === "darwin" && !excelLegacyScope
     ? excelAutomationFailure(excelFailureDetail) : null;
@@ -446,6 +447,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
             <small>{t(excelLegacyScope ? "settings.computerUse.excelDescription" : "settings.computerUse.excelApplicationDescription")}</small>
             {excelBusy && <small>{t(excelLegacyScope ? "settings.computerUse.excelPreparing"
               : excelRetryEnabled ? "settings.computerUse.excelConnecting" : "settings.computerUse.excelDisconnecting")}</small>}
+            {excelInitialChecking && !excelHasFailure && <small>{t("settings.computerUse.excelChecking")}</small>}
             {excelEnabled && excelStatus?.connected && (props.platform !== "win32" || !excelBusy) && !excelStatusError && !excelStatus.error
               && <small>{t("settings.computerUse.excelConnected")}</small>}
             {excelConnectionHint && !excelBusy && <small>{t(excelConnectionHint)}</small>}
@@ -462,7 +464,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
                 onClick={() => void setExcelEnabled(excelError ? excelRetryEnabled : true)}>{t("settings.computerUse.excelControlRetry")}</button>}
           </span>
           <input type="checkbox" role="switch" aria-label="Microsoft Excel"
-            checked={excelEnabled} disabled={excelBusy || !props.client}
+            checked={excelEnabled} disabled={excelBusy || excelInitialChecking || !props.client}
             onChange={event => void setExcelEnabled(event.target.checked)} className={styles.switch} />
         </div>
         {excelLegacyScope && excelStatus?.manualInstallPath && excelPermissionDismissed && <div className={styles.guide}>

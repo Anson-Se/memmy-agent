@@ -284,6 +284,37 @@ describe("computer use settings", () => {
     }
   });
 
+  it("shows a pending Windows Excel status before allowing the switch to be used", async () => {
+    let finishCheck!: (value: ExcelControlStatus) => void;
+    const pendingCheck = new Promise<ExcelControlStatus>(resolve => { finishCheck = resolve; });
+    const setExcelAddinEnabled = vi.fn();
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExcelAddinStatus: vi.fn().mockReturnValue(pendingCheck), setExcelAddinEnabled,
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    const render = (activeClient?: MemmyAgentClient) => <I18nProvider language="zh-CN">
+      <ComputerUseSettings client={activeClient} platform="win32" /></I18nProvider>;
+    await act(async () => { root.render(render()); });
+    const section = container.querySelector("#computer-use-excel");
+    const toggle = section?.querySelector('input[role="switch"]') as HTMLInputElement;
+    expect(section?.textContent).toContain("正在确认 Excel 连接");
+    expect(toggle.disabled).toBe(true);
+    await act(async () => { root.render(render(client)); });
+    expect(section?.textContent).toContain("正在确认 Excel 连接");
+    expect(toggle.disabled).toBe(true);
+    await act(async () => { toggle.click(); });
+    expect(setExcelAddinEnabled).not.toHaveBeenCalled();
+    await act(async () => {
+      finishCheck(applicationExcelStatus({ enabled: true, configured: true, connected: true }));
+      await pendingCheck;
+    });
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(false);
+    expect(section?.textContent).toContain("已连接");
+    expect(section?.textContent).not.toContain("正在确认 Excel 连接");
+  });
+
   it("confirms a Windows Excel grant before showing connected", async () => {
     const connected = applicationExcelStatus({ enabled: true, configured: true, connected: true,
       connectionCount: 1, workbooks: [{ id: "book1", name: "Book1" }], activeWorkbookId: "book1" });
