@@ -606,8 +606,8 @@ interface PendingPreset {
   endpointId: string;
   endpointApiBase: string | null;
   endpointProtocol: ModelEndpointProtocol | null;
-  endpointApiKey: string;
-  providerApiKey: string;
+  endpointApiKey?: string;
+  providerApiKey?: string;
   model: string;
   source: "account" | "byok";
   capabilities: ModelCapability[];
@@ -616,6 +616,8 @@ interface PendingPreset {
 function pendingPresets(input: ModelConfigInput): PendingPreset[] {
   return input.providers.flatMap((provider) => provider.models.flatMap((model) => {
     const endpoint = provider.endpoints.find((item) => item.endpointId === model.endpointId);
+    const endpointApiKey = trimNonEmpty(endpoint?.apiKey);
+    const providerApiKey = trimNonEmpty(provider.apiKey);
     return model.presetId?.startsWith(CLIENT_PRESET_ID_PREFIX)
       ? [{
           clientId: model.presetId,
@@ -623,8 +625,8 @@ function pendingPresets(input: ModelConfigInput): PendingPreset[] {
           endpointId: model.endpointId,
           endpointApiBase: endpoint?.apiBase ?? null,
           endpointProtocol: endpoint?.protocol ?? null,
-          endpointApiKey: endpoint?.apiKey ?? "",
-          providerApiKey: provider.apiKey ?? "",
+          ...(endpointApiKey ? { endpointApiKey } : {}),
+          ...(providerApiKey ? { providerApiKey } : {}),
           model: model.model,
           source: model.source,
           capabilities: [...model.capabilities]
@@ -693,8 +695,8 @@ function pendingEndpointMatches(
   ) {
     return false;
   }
-  const expectedApiKey = maskSecret(item.endpointApiKey || item.providerApiKey);
-  const actualApiKey = endpoint.hasApiKey ? endpoint.apiKeyMasked : provider.apiKeyMasked;
+  const expectedApiKey = maskSecret(item.endpointApiKey ?? item.providerApiKey);
+  const actualApiKey = trimNonEmpty(endpoint.hasApiKey ? endpoint.apiKeyMasked : provider.apiKeyMasked);
   return !expectedApiKey || expectedApiKey === actualApiKey;
 }
 
@@ -702,10 +704,16 @@ function normalizeApiBase(value: string): string {
   return value.trim().replace(/\/+$/u, "");
 }
 
-function maskSecret(value: string): string {
-  if (!value) return "";
-  if (value.length <= 8) return "••••••••";
-  return `${value.slice(0, 3)}••••${value.slice(-4)}`;
+function trimNonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+function maskSecret(value: string | undefined): string | undefined {
+  const secret = trimNonEmpty(value);
+  if (!secret) return undefined;
+  if (secret.length <= 8) return "••••••••";
+  return `${secret.slice(0, 3)}••••${secret.slice(-4)}`;
 }
 
 function assignmentPhaseInput(
