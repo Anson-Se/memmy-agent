@@ -98,6 +98,36 @@ describe("turn.judge.v1 capture (switch on)", () => {
     });
   });
 
+  it("keeps only the small fields of the stored input after a successful judgment", async () => {
+    const { llm } = createTurnJudgeLlm();
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
+    const session = openSession(service, "turn-judge-pruned-input");
+    const turn = service.completeTurn("t1", { sessionId: session.sessionId, query: "帮我写一个部署脚本", answer: "好的。" });
+    await service.runWorkerOnce(20);
+
+    const input = rawTurnPayload(db, turn.rawTurnId).turn_judge.input;
+    expect(input).toMatchObject({ promptVersion: "turn.judge.v1", taskEmpty: true, inputPruned: true });
+    expect(input.inputTokens).toBeGreaterThan(0);
+    expect(input).not.toHaveProperty("messages");
+    expect(input).not.toHaveProperty("visible");
+  });
+
+  it("keeps the full stored input without the system prompt when turnJudgeKeepInput is on", async () => {
+    const { llm, judgeCalls } = createTurnJudgeLlm();
+    const config = turnJudgeConfig();
+    config.algorithm.session = { ...config.algorithm.session, turnJudgeKeepInput: true };
+    const { service, db } = createTestService({ llm, config });
+    const session = openSession(service, "turn-judge-kept-input");
+    const turn = service.completeTurn("t1", { sessionId: session.sessionId, query: "帮我写一个部署脚本", answer: "好的。" });
+    await service.runWorkerOnce(20);
+
+    const input = rawTurnPayload(db, turn.rawTurnId).turn_judge.input;
+    expect(input).toMatchObject({ systemPromptOmitted: true, visible: { userText: "帮我写一个部署脚本" } });
+    expect(input).not.toHaveProperty("inputPruned");
+    expect(input.messages).toEqual(judgeCalls[0]!.messages.slice(1));
+    expect(JSON.stringify(input)).not.toContain("Judge L1 and User Memory");
+  });
+
   it("sends USER from the stored turn in full, not the 4000-character trace copy", async () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service } = createTestService({ llm, config: turnJudgeConfig() });

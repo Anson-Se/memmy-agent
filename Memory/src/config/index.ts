@@ -241,6 +241,9 @@ export interface AlgorithmConfig {
     // after each turn judges the task relation, feedback, L1 and User Memory. Off
     // keeps the start-of-turn relation call and the capture-only decision.
     turnJudge: boolean;
+    // Keep the full stored input of a judged turn (for checking what the model
+    // saw). Off: after a successful judgment only the small fields stay.
+    turnJudgeKeepInput: boolean;
   };
   retrieval: {
     tier1TopK: number;
@@ -500,7 +503,8 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     session: {
       followUpMode: "merge_follow_ups",
       mergeMaxGapMs: 2 * 60 * 60 * 1000,
-      turnJudge: false
+      turnJudge: false,
+      turnJudgeKeepInput: false
     },
     retrieval: {
       tier1TopK: 3,
@@ -1277,7 +1281,8 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
     session: {
       followUpMode: "merge_follow_ups",
       mergeMaxGapMs: numberValue(session.mergeMaxGapMs, DEFAULT_MEMMY_CONFIG.algorithm.session.mergeMaxGapMs),
-      turnJudge: booleanValue(session.turnJudge, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudge)
+      turnJudge: booleanValue(session.turnJudge, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudge),
+      turnJudgeKeepInput: booleanValue(session.turnJudgeKeepInput, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudgeKeepInput)
     },
     retrieval: {
       tier1TopK: numberValue(retrieval.tier1TopK, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.tier1TopK),

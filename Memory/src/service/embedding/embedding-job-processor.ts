@@ -16,6 +16,8 @@ import { clip,firstLine } from "../../utils/text.js";
  */
 import type { TraceCaptureSummary } from "../evolution/span-pipeline.js";
 import {
+  prunedTurnJudgeInput,
+  storedTurnJudgeInput,
   TURN_JUDGE_PROMPT_VERSION,
   turnJudgeSnapshotFromPayload,
   type TurnJudgeSnapshot,
@@ -197,6 +199,8 @@ export interface EmbeddingJobProcessorDeps {
     previousL1MemoryId?: string;
     at: string;
   }): { affectedEpisodeIds: string[]; jobs: EvolutionJobRecord[] };
+  // algorithm.session.turnJudgeKeepInput: keep the stored input after a successful judgment.
+  turnJudgeKeepInput?(): boolean;
 }
 
 export class EmbeddingJobProcessor {
@@ -658,7 +662,7 @@ export class EmbeddingJobProcessor {
         ...rawTurn,
         messagePayload: {
           ...rawTurn.messagePayload,
-          turn_judge: { ...stored, prompt_version: TURN_JUDGE_PROMPT_VERSION, status: "pending", input: snapshot }
+          turn_judge: { ...stored, prompt_version: TURN_JUDGE_PROMPT_VERSION, status: "pending", input: storedTurnJudgeInput(snapshot) }
         }
       });
     }
@@ -675,6 +679,7 @@ export class EmbeddingJobProcessor {
         ...rawTurn.messagePayload,
         turn_judge: {
           ...stored,
+          ...(this.deps.turnJudgeKeepInput?.() ? {} : { input: prunedTurnJudgeInput(stored.input) }),
           prompt_version: TURN_JUDGE_PROMPT_VERSION,
           status: "judged",
           judged_at: at,
