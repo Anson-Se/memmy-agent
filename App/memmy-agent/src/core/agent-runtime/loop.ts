@@ -119,6 +119,7 @@ import {
   type TokenCompactionStatus,
 } from "./memory.js";
 import { AgentHook, AgentHookContext, CompositeAgentHook } from "./hook.js";
+import { loadExternalAgentHooks } from "./external-hook-loader.js";
 import { SubagentManager } from "./subagent.js";
 import { AutoCompact } from "./autocompact.js";
 import { configuredModelPresets, defaultSelectionSignature, makePresetSnapshotLoader, normalizePresetName } from "./model-presets.js";
@@ -734,6 +735,9 @@ export class AgentLoop {
   unifiedSession: boolean;
   backgroundTasks: Array<Promise<any>> = [];
   extraHooks: AgentHook[] = [];
+  private externalHooks: AgentHook[] = [];
+  private externalHooksLoadPromise: Promise<void> | null = null;
+  private externalHooksShutdownPromise: Promise<void> | null = null;
   startTime: number;
   lastUsageBySession: Map<string, Record<string, number>>;
   goalRuntime: GoalRuntime;
@@ -1133,6 +1137,7 @@ export class AgentLoop {
   }
 
   async initializeRuntimeTools(): Promise<void> {
+    await this.ensureExternalHooksLoaded();
     await initializeDesktopScreenCapture();
     await this.connectMcp();
     await this.browserSessionManager.initialize();
@@ -1145,9 +1150,34 @@ export class AgentLoop {
   }
 
   async closeRuntimeTools(): Promise<void> {
-    await this.browserSessionManager.close();
-    await this.closeMcp();
-    await this.memmyMemoryIntegration.dispose?.();
+    try {
+      await this.browserSessionManager.close();
+      await this.closeMcp();
+      await this.memmyMemoryIntegration.dispose?.();
+    } finally {
+      await this.shutdownExternalHooks();
+    }
+  }
+
+  private ensureExternalHooksLoaded(): Promise<void> {
+    this.externalHooksLoadPromise ??= loadExternalAgentHooks(this.config.agentHooks)
+      .then((hooks) => {
+        this.externalHooks = hooks;
+        this.extraHooks.push(...hooks);
+      })
+      .catch((error) => {
+        console.error("Unable to initialize external agent hooks:", error);
+      });
+    return this.externalHooksLoadPromise;
+  }
+
+  private shutdownExternalHooks(): Promise<void> {
+    this.externalHooksShutdownPromise ??= new CompositeAgentHook(this.externalHooks)
+      .shutdown()
+      .catch((error) => {
+        console.error("Unable to shut down external agent hooks:", error);
+      });
+    return this.externalHooksShutdownPromise;
   }
 
   async closeBrowserSession(
@@ -1311,11 +1341,15 @@ export class AgentLoop {
     });
   }
 
-  registerHookTools(toolCtx: ToolContext, phase: string, registry: ToolRegistryInstance = this.tools): void {
+  registerHookTools(
+    toolCtx: ToolContext,
+    phase: string,
+    registry: ToolRegistryInstance = this.tools,
+  ): void {
     this.lifecycleHook().onRegisterTools({
       registry,
       toolContext: toolCtx,
-      workspace: this.workspace,
+      workspace: toolCtx.workspace ?? this.workspace,
       metadata: { phase },
     });
   }
@@ -1326,6 +1360,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
@@ -1337,6 +1374,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session?.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
