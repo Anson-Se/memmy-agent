@@ -1328,7 +1328,7 @@ export class AgentRunner {
   }
 
   private inputTokenBudget(spec: AgentRunSpec): number | null {
-    if (!spec.contextWindowTokens) return null;
+    if (!spec.contextWindowTokens || spec.contextWindowTokens <= CONTEXT_SAFETY_BUFFER_TOKENS) return null;
     const generation = ((spec.provider ?? this.provider) as any)?.generation;
     const providerMaxTokens = generation?.maxTokens ?? 4096;
     const maxOutput = Number.isInteger(spec.maxTokens)
@@ -1338,7 +1338,8 @@ export class AgentRunner {
         : 4096;
     const budget = spec.contextBlockLimit
       ?? spec.contextWindowTokens - maxOutput - CONTEXT_SAFETY_BUFFER_TOKENS;
-    return Number.isFinite(budget) ? budget : null;
+    if (!Number.isFinite(budget)) return null;
+    return budget > 0 ? budget : Math.max(128, Math.floor(spec.contextWindowTokens / 2));
   }
 
   private prepareMessagesBeforeSnip(

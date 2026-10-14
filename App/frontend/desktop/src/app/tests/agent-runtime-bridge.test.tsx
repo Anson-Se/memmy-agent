@@ -33,7 +33,7 @@ describe("AgentRuntimeBridge", () => {
     const acknowledgeCronDelivery = vi.fn();
     const connection = { getReadyGeneration: () => generation, acknowledgeCronDelivery };
     const acknowledged = new Set<string>();
-    const state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "ready", chat_id: "chat-1" } });
+    let state = agentReducer(initialAgentState, { type: "agent/wsEvent", event: { event: "ready", chat_id: "chat-1" } });
     state = agentReducer(state, { type: "agent/chatViewVisibilityChanged", visible: true });
     const event = { event: "message", chat_id: "chat-1", text: "暂无微信新消息",
       metadata: { proactiveDelivery: "cron", deliveryId: "delivery-1" } };
