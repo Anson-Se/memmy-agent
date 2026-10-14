@@ -512,9 +512,9 @@ async function boot(): Promise<void> {
     );
     const appDatabaseFile = join(app.getPath("userData"), "app.sqlite");
     runtimeServices = await startManagedRuntimeServices({
-      // The Windows renderer can show the local UI while the Agent process loads.
-      // Start its heavier work after the first window has painted.
-      deferAgentGatewayStartup: process.platform === "win32",
+      // Publish the service handles before waiting so quit can cancel gateway startup.
+      // The first window is created only after the gateway can accept tasks.
+      deferAgentGatewayStartup: true,
       deferBrowserPreparation: process.platform === "win32",
       onStartupStage: (stage, elapsedMs) => {
         bootStage = `runtime-services:${stage}`;
@@ -733,6 +733,8 @@ async function boot(): Promise<void> {
       runtimeServices = null;
       return;
     }
+    await runtimeServices.startAgentGateway();
+    if (isQuitting) return;
     const embeddedBrowserSession = session.fromPartition('persist:memmy-browser');
     const browserDataDirectory = dirname(runtimeServices.agentGateway.configPath);
     browserWebviewDownloads = new BrowserWebviewDownloads(embeddedBrowserSession, browserDataDirectory);
@@ -750,7 +752,7 @@ async function boot(): Promise<void> {
     const initialWindow = createInitialWindow();
     watchStartupRenderer(initialWindow);
     if (process.platform === "win32" && runtimeServices) {
-      startWindowsServicesAfterFirstWindow(initialWindow, runtimeServices);
+      startWindowsBrowserPreparationAfterFirstWindow(initialWindow, runtimeServices);
     }
     isBootReady = true;
     triggerAgentSourceAutoInject("boot");
@@ -3886,7 +3888,7 @@ function createInitialWindow(): BrowserWindow | null {
   return createMainWindow();
 }
 
-function startWindowsServicesAfterFirstWindow(
+function startWindowsBrowserPreparationAfterFirstWindow(
   targetWindow: BrowserWindow | null,
   services: ManagedRuntimeServices
 ): void {
@@ -3898,22 +3900,7 @@ function startWindowsServicesAfterFirstWindow(
     clearTimeout(fallback);
     if (isPetWindow) targetWindow?.removeListener("show", start);
     else targetWindow?.removeListener("ready-to-show", start);
-    void writePackagedStartupLog(`boot:deferred-gateway-start:${JSON.stringify({ elapsedMs: Date.now() - bootStartedAt })}`);
-    void services.startAgentGateway().then((issue) => {
-      if (isQuitting || runtimeServices !== services) return;
-      if (issue && runtimeConfig?.agentGateway) {
-        runtimeConfig.agentGateway.startupIssue = issue;
-        for (const window of [mainWindow, petWindow]) {
-          if (window && !window.isDestroyed()) {
-            window.webContents.send("memmy:agent-gateway-startup-issue", issue);
-          }
-        }
-      }
-      services.startBrowserPreparation();
-    }).catch((error: unknown) => {
-      console.warn("Deferred Agent gateway startup failed:", error);
-      if (!isQuitting && runtimeServices === services) services.startBrowserPreparation();
-    });
+    services.startBrowserPreparation();
   };
   // A hidden pet window may never receive its first layout. Keep the launch bounded.
   const fallback = setTimeout(start, 12_000);

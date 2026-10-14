@@ -15,7 +15,7 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main/
 const functionNames = new Set([
   "boot", "showSplashWindow", "showUpdateInstallSplashWindow", "showSplashHtml", "closeSplashWindow",
   "createInitialWindow", "createMainWindow", "showPetWindowAfterRendererLayout", "hideAppShellForQuit",
-  "startWindowsServicesAfterFirstWindow",
+  "startWindowsBrowserPreparationAfterFirstWindow",
   "watchStartupRenderer", "handleStartupFailure", "handleRendererLoadFailure"
 ]);
 const variableNames = new Set([
@@ -46,7 +46,7 @@ const code = ts.transpileModule([
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
 }).outputText;
 
-function setup(options: { delay?: number; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet"; gatewayIssue?: "model_config_invalid" } = {}) {
+function setup(options: { delay?: number; gatewayDelay?: number; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet"; gatewayIssue?: "model_config_invalid" } = {}) {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   const events: string[] = [];
@@ -83,8 +83,14 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     }
   }
   const services = {
-    agentGateway: { configPath: "test-user-data/agent-config.json" },
-    startAgentGateway: vi.fn(async () => { events.push("gateway-started"); return options.gatewayIssue ?? null; }),
+    agentGateway: { configPath: "test-user-data/agent-config.json", startupIssue: undefined as "model_config_invalid" | undefined },
+    startAgentGateway: vi.fn(async () => {
+      events.push("gateway-started");
+      if (options.gatewayDelay) await new Promise(resolve => setTimeout(resolve, options.gatewayDelay));
+      if (options.gatewayIssue) services.agentGateway.startupIssue = options.gatewayIssue;
+      events.push("gateway-settled");
+      return options.gatewayIssue ?? null;
+    }),
     startBrowserPreparation: vi.fn(() => { events.push("browser-preparation-started"); }),
     close: vi.fn(() => options.cleanupHangs ? new Promise<void>(() => {}) : Promise.resolve())
   };
@@ -123,7 +129,8 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     },
     startLocalApi: async () => {
       if (options.apiError) throw options.apiError;
-      return { agentGateway: {} };
+      events.push("local-api-started");
+      return { agentGateway: { ...services.agentGateway } };
     },
     triggerAgentSourceAutoInject: noop, getCurrentLogLevel: () => "info",
     setDevelopmentDockIcon: noop, startRequiredUpdateBackgroundChecks: noop,
@@ -146,7 +153,7 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     shouldQuitWhenAllWindowsClosed,
     hasSingleInstanceLock: true,
     readStopMemoryServiceOnExitSetting: () => false, armQuitCleanupForceExitTimer: noop,
-    cleanupBeforeQuit: async () => {}, clearQuitCleanupForceExitTimer: noop, relaunchAfterQuitCleanupIfRequested: noop
+    cleanupBeforeQuit: async () => { await services.close(); }, clearQuitCleanupForceExitTimer: noop, relaunchAfterQuitCleanupIfRequested: noop
   });
   runInContext(code, context);
   return {
@@ -162,11 +169,12 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
 afterEach(() => vi.useRealTimers());
 
 describe("desktop startup lifecycle", () => {
-  it("shows the Windows first window before starting its Agent and browser preparation", async () => {
+  it("waits for the Agent before creating the Windows first window and defers browser preparation", async () => {
     const test = setup();
     await test.start();
     expect(test.main()).not.toBeNull();
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+    expect(test.events.indexOf("gateway-settled")).toBeLessThan(test.events.indexOf("local-api-started"));
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     test.main()!.emit("ready-to-show");
     await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
@@ -174,44 +182,68 @@ describe("desktop startup lifecycle", () => {
     expect(test.splash()).toBeNull();
   });
 
-  it("publishes a deferred Agent configuration failure to the visible window", async () => {
+  it("passes a repairable Agent configuration failure into the first renderer bootstrap", async () => {
     const test = setup({ gatewayIssue: "model_config_invalid" });
     await test.start();
-    test.main()!.emit("ready-to-show");
-    await vi.waitFor(() => expect(test.main()!.webContents.send).toHaveBeenCalledWith(
-      "memmy:agent-gateway-startup-issue", "model_config_invalid"
-    ));
+    expect(test.main()).not.toBeNull();
     expect(test.run("runtimeConfig.agentGateway.startupIssue")).toBe("model_config_invalid");
   });
 
-  it("keeps deferred services idle after page load until the first paint", async () => {
+  it("keeps browser preparation idle after page load until the first paint", async () => {
     const test = setup();
     await test.start();
     test.main()!.webContents.emit("did-finish-load");
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     test.main()!.emit("ready-to-show");
     await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
     expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
   });
 
-  it("starts deferred services after a bounded wait when a hidden pet never paints", async () => {
+  it("starts browser preparation after a bounded wait when a hidden pet never paints", async () => {
     const test = setup({ mode: "pet" });
     await test.start();
     await vi.advanceTimersByTimeAsync(11_999);
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1);
   });
 
-  it("does not launch deferred services after the user quits", async () => {
+  it("does not launch browser preparation after the user quits", async () => {
     const test = setup();
     await test.start();
     test.app.quit();
     await vi.advanceTimersByTimeAsync(12_000);
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
+  });
+
+  it.each(["win32", "darwin"])("keeps the splash until the %s Agent can accept tasks", async platform => {
+    const test = setup({ platform, gatewayDelay: 45_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(test.main()).toBeNull();
+    expect(test.splash()?.isDestroyed()).toBe(false);
+    expect(test.events).not.toContain("local-api-started");
+    expect(test.quit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await boot;
+    expect(test.main()).not.toBeNull();
+    expect(test.events.indexOf("gateway-settled")).toBeLessThan(test.events.indexOf("local-api-started"));
+  });
+
+  it("owns service shutdown while waiting for the Agent without showing a late window", async () => {
+    const test = setup({ gatewayDelay: 45_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    test.splash()!.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(test.services.close).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(44_000);
+    await boot;
+    expect(test.main()).toBeNull();
+    expect(test.events).not.toContain("local-api-started");
   });
 
   it("keeps the startup splash and process alive while runtime startup takes 20 seconds", async () => {

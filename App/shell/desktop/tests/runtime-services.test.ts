@@ -19,6 +19,7 @@ import {
   readLiveMemoryServerLock,
   resolveDevelopmentRuntimeExecutable,
   resolveDevelopmentRuntimeEntryPaths,
+  resolveAgentGatewayStartupTimeout,
   resolvePackagedRuntimeMigrationTargets,
   resolveRuntimeEntryPaths,
   runPackagedMigrationCommand,
@@ -1010,7 +1011,8 @@ describe("AgentGatewaySupervisor", () => {
       ensureStarted: vi.fn(async () => {
         throw new Error("Failed to load config: providers current contract rejected legacy field");
       }),
-      startRecovery: vi.fn()
+      startRecovery: vi.fn(),
+      waitForReady: vi.fn()
     };
     const agentGateway: { startupIssue?: "model_config_invalid" } = {};
     const start = createAgentGatewayStarter(supervisor, agentGateway, {
@@ -1239,17 +1241,26 @@ describe("AgentGatewaySupervisor", () => {
     expect(harness.supervisor.restartTimer).toBeNull();
   });
 
-  it("contains the initial Agent failure and enables background recovery", async () => {
+  it("keeps startup pending until recovery makes the Agent ready", async () => {
     const failure = new Error("invalid runtime config");
+    let recovered!: (issue: null) => void;
     const supervisor = {
       ensureStarted: vi.fn(async () => {
         throw failure;
       }),
-      startRecovery: vi.fn()
+      startRecovery: vi.fn(),
+      waitForReady: vi.fn(() => new Promise<null>(resolve => { recovered = resolve; }))
     };
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    await expect(startAgentGatewayWithRecovery(supervisor)).resolves.toBeNull();
+    const settled = vi.fn();
+    const startup = startAgentGatewayWithRecovery(supervisor).then(settled);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).not.toHaveBeenCalled();
+    expect(supervisor.waitForReady).toHaveBeenCalledTimes(1);
+    recovered(null);
+    await startup;
+    expect(settled).toHaveBeenCalledWith(null);
 
     expect(supervisor.startRecovery).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
@@ -1264,12 +1275,153 @@ describe("AgentGatewaySupervisor", () => {
           "agent-gateway exited before it became ready (code 1). stderr: memmy: Failed to load config from C:/Memmy/config.yaml: providers current contract does not accept legacy field 'apiBase'"
         );
       }),
-      startRecovery: vi.fn()
+      startRecovery: vi.fn(),
+      waitForReady: vi.fn()
     };
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await expect(startAgentGatewayWithRecovery(supervisor)).resolves.toBe("model_config_invalid");
     expect(supervisor.startRecovery).toHaveBeenCalledTimes(1);
+    expect(supervisor.waitForReady).not.toHaveBeenCalled();
+  });
+
+  it("releases startup only after a replacement child reaches readiness", async () => {
+    vi.useFakeTimers();
+    let makeReady!: () => void;
+    const wait = vi.fn()
+      .mockRejectedValueOnce(new Error("initial import failed"))
+      .mockImplementationOnce(() => new Promise<void>(resolve => { makeReady = resolve; }));
+    const harness = createSupervisorHarness({ waitForHttpService: wait,
+      stopManagedChild: vi.fn(async child => { emitChildClose(child, 1); }) });
+    const settled = vi.fn();
+    const startup = startAgentGatewayWithRecovery(harness.supervisor).then(settled);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(harness.spawn).toHaveBeenCalledTimes(2);
+    expect(settled).not.toHaveBeenCalled();
+    makeReady();
+    await startup;
+    expect(settled).toHaveBeenCalledWith(null);
+    await harness.supervisor.close();
+  });
+
+  it("releases startup when a usable external gateway appears during recovery", async () => {
+    vi.useFakeTimers();
+    const harness = createSupervisorHarness({
+      probe: vi.fn().mockResolvedValueOnce("unreachable").mockResolvedValueOnce("ready"),
+      waitForHttpService: vi.fn().mockRejectedValueOnce(new Error("initial import failed")),
+      stopManagedChild: vi.fn(async child => { emitChildClose(child, 1); })
+    });
+    const startup = startAgentGatewayWithRecovery(harness.supervisor);
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(startup).resolves.toBeNull();
+    expect(harness.supervisor.hasReachedReady).toBe(true);
+    expect(harness.supervisor.ownership).toBe("external");
+    await harness.supervisor.close();
+  });
+
+  it("waits for a gateway already initializing without spawning a competing child", async () => {
+    vi.useFakeTimers();
+    const harness = createSupervisorHarness({ probe: vi.fn()
+      .mockResolvedValueOnce("starting").mockResolvedValueOnce("starting").mockResolvedValueOnce("ready") });
+    const settled = vi.fn();
+    const startup = startAgentGatewayWithRecovery(harness.supervisor).then(settled);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(harness.spawn).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await startup;
+    expect(settled).toHaveBeenCalledWith(null);
+    expect(harness.spawn).not.toHaveBeenCalled();
+    await harness.supervisor.close();
+  });
+
+  it("recognizes the real bootstrap 503 response while waiting for Agent initialization", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("agent_runtime_initializing", { status: 503 }))
+      .mockResolvedValueOnce(new Response("agent_runtime_initializing", { status: 503 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    const harness = createSupervisorHarness({ useRealProbe: true });
+    const settled = vi.fn();
+    const startup = startAgentGatewayWithRecovery(harness.supervisor).then(settled);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(harness.spawn).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await startup;
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(settled).toHaveBeenCalledWith(null);
+    expect(harness.spawn).not.toHaveBeenCalled();
+    await harness.supervisor.close();
+  });
+
+  it("continues replacement backoff when exit settles before the child's close event", async () => {
+    vi.useFakeTimers();
+    const harness = createSupervisorHarness({
+      waitForHttpService: vi.fn().mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("replacement startup failed")).mockResolvedValueOnce(undefined),
+      stopManagedChild: vi.fn(async child => { child.process.emit("exit", 1, null); })
+    });
+    await harness.supervisor.ensureStarted();
+    emitChildClose(harness.spawned[0]!, 1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(harness.spawn).toHaveBeenCalledTimes(2);
+    emitChildClose(harness.spawned[1]!, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(harness.spawn).toHaveBeenCalledTimes(3);
+    await harness.supervisor.close();
+  });
+
+  it("cancels the readiness wait and recovery when the splash is closed", async () => {
+    vi.useFakeTimers();
+    const harness = createSupervisorHarness({
+      waitForHttpService: vi.fn().mockRejectedValueOnce(new Error("initial import failed")),
+      stopManagedChild: vi.fn(async child => { emitChildClose(child, 1); })
+    });
+    const startup = startAgentGatewayWithRecovery(harness.supervisor);
+    await vi.advanceTimersByTimeAsync(0);
+    await harness.supervisor.close();
+    await expect(startup).resolves.toBeNull();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(harness.spawn).toHaveBeenCalledTimes(1);
+    expect(harness.supervisor.hasReachedReady).toBe(false);
+  });
+
+  it("opens the configuration repair entrypoint if a recovery attempt identifies model rejection", async () => {
+    vi.useFakeTimers();
+    const harness = createSupervisorHarness({
+      waitForHttpService: vi.fn().mockRejectedValueOnce(new Error("initial import failed"))
+        .mockRejectedValueOnce(new Error("Failed to load config: modelAssignments legacy format rejected")),
+      stopManagedChild: vi.fn(async child => { emitChildClose(child, 1); })
+    });
+    const startup = startAgentGatewayWithRecovery(harness.supervisor);
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(startup).resolves.toBe("model_config_invalid");
+    expect(harness.supervisor.hasReachedReady).toBe(false);
+    await harness.supervisor.close();
+  });
+
+  it("gives serial MCP discovery its configured budget instead of restarting at 30 seconds", async () => {
+    const root = await makeTempRoot();
+    const configPath = join(root, "config.yaml");
+    await writeFile(configPath, YAML.stringify({ tools: { mcpServers: {
+      legacy: { command: "legacy-mcp" }, http: { url: "${MCP_URL}", type: "${MCP_TYPE}" }
+    } } }));
+    const wait = vi.fn(async () => undefined);
+    const harness = createSupervisorHarness({ waitForHttpService: wait, configPath });
+    await harness.supervisor.ensureStarted();
+    expect(wait).toHaveBeenCalledWith("agent-gateway", expect.any(String), expect.any(Object),
+      { "x-memmy-agent-auth": "gateway-secret" }, 70_000, expect.any(Function));
+    await harness.supervisor.close();
+  });
+
+  it("handles empty and old MCP configuration without inventing work or truncating many servers", () => {
+    expect(resolveAgentGatewayStartupTimeout(null)).toBe(30_000);
+    expect(resolveAgentGatewayStartupTimeout({})).toBe(30_000);
+    expect(resolveAgentGatewayStartupTimeout({ tools: { mcpServers: {} } })).toBe(30_000);
+    const mcpServers = Object.fromEntries(Array.from({ length: 20 }, (_, index) =>
+      [`server${index}`, { command: "old-command", enabledTools: [] }]));
+    expect(resolveAgentGatewayStartupTimeout({ tools: { mcpServers } })).toBe(430_000);
   });
 
   it("restarts an owned gateway with bounded escalating delays and ignores old child callbacks", async () => {
@@ -1679,6 +1831,8 @@ describe("Memory lock owner identification", () => {
 });
 
 function createSupervisorHarness(overrides: {
+  configPath?: string;
+  useRealProbe?: boolean;
   probe?: ReturnType<typeof vi.fn>;
   waitForHttpService?: ReturnType<typeof vi.fn>;
   stopManagedChild?: ReturnType<typeof vi.fn>;
@@ -1688,7 +1842,7 @@ function createSupervisorHarness(overrides: {
     agentEntry: "/runtime/agent.js"
   };
   const runtimeConfig: PackagedRuntimeConfig = {
-    configPath: "/memmy/config.yaml",
+    configPath: overrides.configPath ?? "/memmy/config.yaml",
     appDatabaseFile: "/memmy/app.sqlite",
     agentWorkspace: "/memmy/workspace",
     memoryDatabasePath: "/memmy/memory.sqlite",
@@ -1716,7 +1870,7 @@ function createSupervisorHarness(overrides: {
     return child;
   });
   const supervisor = new AgentGatewaySupervisor(entries, runtimeConfig, children, options, {
-    probeHttpService: overrides.probe ?? vi.fn(async () => "unreachable" as const),
+    probeHttpService: overrides.probe ?? (overrides.useRealProbe ? undefined : vi.fn(async () => "unreachable" as const)),
     spawnNodeService: spawn,
     waitForHttpService: overrides.waitForHttpService ?? vi.fn(async () => undefined),
     stopManagedChild: overrides.stopManagedChild ?? vi.fn(async () => undefined)
