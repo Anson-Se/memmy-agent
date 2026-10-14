@@ -192,11 +192,15 @@ function DocumentSheet({
   formatLabel: string;
 }) {
   const compact = surface === "inline";
+  const card = surface === "card";
   return (
     <svg viewBox="0 0 36 40" aria-hidden="true" focusable="false">
-      <path className="file-type-icon__paper" d="M5.5 2.5h17l8 8v27H5.5Z" />
-      <path className="file-type-icon__fold" d="M22.5 2.5v8h8" />
-      <path className="file-type-icon__fold-edge" d="m22.5 2.5 8 8" />
+      <path
+        className="file-type-icon__paper"
+        d={card ? "M5 0h17l14 14v21a5 5 0 0 1-5 5H5a5 5 0 0 1-5-5V5a5 5 0 0 1 5-5Z" : "M5.5 2.5h17l8 8v27H5.5Z"}
+      />
+      <path className="file-type-icon__fold" d={card ? "M22 0v9a5 5 0 0 0 5 5h9Z" : "M22.5 2.5v8h8"} />
+      <path className="file-type-icon__fold-edge" d={card ? "m22 0 14 14" : "m22.5 2.5 8 8"} />
       <FileKindGlyph kind={kind} compact={compact} />
       {surface === "card" ? (
         <text className="file-type-icon__format-label" x="18" y="34.4" textAnchor="middle">{formatLabel}</text>
@@ -235,8 +239,9 @@ export function FileTypeIcon(props: {
 }) {
   const resolved = resolveFileType(props.name, props.mime);
   const surface = props.surface ?? "row";
-  const systemIcon = useSystemFileIcon(props.filePath);
-  const formatLabel = resolved.shortLabel;
+  // Cards use a consistent, legible mark regardless of the installed default app.
+  const systemIcon = useSystemFileIcon(surface === "card" ? undefined : props.filePath);
+  const formatLabel = surface === "card" && resolved.extension === ".sty" ? "STY" : resolved.shortLabel;
   return (
     <span
       className={[
@@ -248,6 +253,7 @@ export function FileTypeIcon(props: {
       ].filter(Boolean).join(" ")}
       aria-label={resolved.label}
       data-file-kind={resolved.kind}
+      data-file-extension={resolved.extension}
       data-testid={`file-type-icon-${resolved.kind}`}
     >
       {systemIcon ? (
