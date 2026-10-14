@@ -71,6 +71,7 @@ import type {
   SynthesizeDecisionRepairDraft
 } from "../feedback/feedback-experience.js";
 import { recordApiLog } from "../model-audit/model-call-audit.js";
+import { deduplicateCrossAccountMemoryCandidates } from "../retrieval/cross-account-candidate-dedup.js";
 import {
   namespaceForRawTurn,
   namespaceForSession,
@@ -2937,13 +2938,18 @@ export class SessionTurnService {
       : undefined;
     const query = buildRepairSuggestionQuery(input);
     const repairLayers = retrievalLayersForMode("decision_repair");
-    const candidates = this.deps.repos.memories.list(
+    const loadedCandidates = this.deps.repos.memories.list(
       {
         memoryLayer: repairLayers,
         status: ["activated", "resolving"]
       },
       500
     ).filter((memory) => this.deps.isMemoryReadyForRetrieval(memory));
+    const candidates = deduplicateCrossAccountMemoryCandidates({
+      memories: loadedCandidates,
+      repos: this.deps.repos,
+      preferredUserId: session.userId
+    }).memories;
     const retrieval = retrievePluginMemories({
       query,
       queryVector: await this.deps.queryVector(query),
