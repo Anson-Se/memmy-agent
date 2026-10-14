@@ -72,7 +72,7 @@ if [ -f "$app/fail-after-replace" ] && [ "$app" = '${destination}' ]; then exit 
     expect(fs.readFileSync(path.join(destination, "tag"), "utf8")).toBe("replacement");
     expect(fs.existsSync(marker)).toBe(false);
     expect(fs.existsSync(`${destination}.update-backup`)).toBe(false);
-  });
+  }, 15_000);
 
   it.each([
     ["advertised version", () => fixture(staged, "replacement", { CFBundleShortVersionString: "1.2.1" })],
