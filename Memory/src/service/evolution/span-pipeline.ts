@@ -29,6 +29,8 @@ import {
 import { summarizeTurn as sessionSummarizeTurn } from "../session/session-turn-service.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
 import {
+  CAPTURE_SUMMARY_MAX_CHARS,
+  CAPTURE_TITLE_MAX_CHARS,
   normalizeCaptureSummaryUserText,
   sanitizeCaptureSummary
 } from "./capture-summary.js";
@@ -51,8 +53,7 @@ export interface TurnMemoryCaptureDecision {
 }
 
 const pipelineLogger = createMemoryLogger("pipeline");
-export const CAPTURE_TITLE_MAX_CHARS = 30;
-export const CAPTURE_SUMMARY_MAX_CHARS = 180;
+export { CAPTURE_SUMMARY_MAX_CHARS, CAPTURE_TITLE_MAX_CHARS };
 
 export interface TraceCaptureSummary {
   title: string;
