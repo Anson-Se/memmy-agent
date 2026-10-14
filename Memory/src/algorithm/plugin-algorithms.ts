@@ -4521,7 +4521,7 @@ export function tracePolicySimilarity(
   };
 }
 
-function normalizeToolCalls(toolCalls: ToolCallPayload[], toolResults: unknown[]): ToolCallPayload[] {
+export function normalizeToolCalls(toolCalls: ToolCallPayload[], toolResults: unknown[]): ToolCallPayload[] {
   const resultIndices = matchToolResultIndices(toolCalls, toolResults);
   return toolCalls.map((call, index) => {
     const resultIndex = resultIndices[index];

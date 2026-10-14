@@ -66,6 +66,7 @@ import {
   isTaskLinkedUserFeedback,
   isUserMemoryQuestion
 } from "../user-memory/user-memory.js";
+import { TURN_JUDGE_PROMPT_VERSION } from "../evolution/turn-judge.js";
 import type {
   DecisionRepairLlmDraft,
   SynthesizeDecisionRepairDraft
@@ -320,7 +321,12 @@ function rawTurnIsExcludedFromL1(rawTurn: RawTurnRecord): boolean {
   return false;
 }
 
-function l1ObservationMetadata(rawTurn: RawTurnRecord, session: SessionRecord, at: string): {
+function l1ObservationMetadata(
+  rawTurn: RawTurnRecord,
+  session: SessionRecord,
+  at: string,
+  options: { modelJudgesUnverified?: boolean } = {}
+): {
   memoryKey?: string;
   info: Record<string, unknown>;
   internal: Record<string, unknown>;
@@ -371,7 +377,8 @@ function l1ObservationMetadata(rawTurn: RawTurnRecord, session: SessionRecord, a
       }
     };
   }
-  if (isQuestionLike(text) && !isTaskLinkedUserFeedback(text)) {
+  // With turn.judge.v1 the model decides whether an L1 is unverified.
+  if (!options.modelJudgesUnverified && isQuestionLike(text) && !isTaskLinkedUserFeedback(text)) {
     return {
       info: { observed_at: at, evidence_status: "provisional", policy_eligible: false },
       internal: {
@@ -1974,8 +1981,9 @@ export class SessionTurnService {
           ? rawTurn
           : this.deps.repos.runtime.getRawTurn(stepRawTurnId) ?? rawTurn;
         const modelDecidesCapture = this.deps.llm.isConfigured();
+        const turnJudge = modelDecidesCapture && this.deps.config.algorithm.session.turnJudge;
         const observation = modelDecidesCapture
-          ? pendingL1DecisionMetadata(l1ObservationMetadata(sourceRawTurn, session, at))
+          ? pendingL1DecisionMetadata(l1ObservationMetadata(sourceRawTurn, session, at, { modelJudgesUnverified: turnJudge }))
           : l1ObservationMetadata(sourceRawTurn, session, at);
         const signature = signatureFromTraceParts(step.tags, step.toolCalls, step.reflection.text ?? "");
         const l1Memory = this.deps.buildMemory({
@@ -2160,6 +2168,11 @@ export class SessionTurnService {
               source: "turn.complete.capture",
               contentHash: upsert.memory.contentHash,
               decideCapture: modelDecidesCapture,
+              ...(turnJudge ? {
+                turnJudge: true,
+                promptVersion: TURN_JUDGE_PROMPT_VERSION,
+                ...(stepRawTurnId !== rawTurn.id ? { turnJudgeCatchUp: true } : {})
+              } : {}),
               captureUserMemory: modelDecidesCapture && !request.userMemoryCorrection && step.stepIndex === 0,
               capturedUserMemoryIds: userMemoryCapture.memoryIds,
               ...(request.userMemoryCorrection ? {

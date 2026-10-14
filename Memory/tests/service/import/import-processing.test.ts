@@ -107,7 +107,7 @@ describe("MemoryService / import / processing", () => {
     expect(summaryCall?.options.thinkingMode).toBe("disabled");
     expect(summaryCall?.options.maxTokens).toBe(512);
     expect(summaryCall?.messages[0]?.content).toContain("at most 30 characters");
-    expect(summaryCall?.messages[0]?.content).toContain("at most 180 characters");
+    expect(summaryCall?.messages[0]?.content).toContain("at most 300 characters");
     expect(summaryCall?.messages[0]?.content).toContain("future retrieval");
     expect(summaryCall?.messages[0]?.content).toContain("concrete retrieval anchors");
     expect(summaryCall?.messages[0]?.content).toContain("atomic real-world facts");
@@ -998,13 +998,13 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("clips imported L1 summaries to 180 characters", async () => {
+  it("clips imported L1 summaries to 300 characters", async () => {
     const root = createTestRoot("mindock-memory-import-summary-cap-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
     });
     const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
-    const longSummary = "s".repeat(240);
+    const longSummary = "s".repeat(360);
     const service = createTestMemoryService({
       db,
       mode: "dev",
@@ -1033,9 +1033,9 @@ describe("MemoryService / import / processing", () => {
       };
     };
     expect(calls.find((call) => call.options.operation === "capture.summarize")?.messages[0]?.content)
-      .toContain("at most 180 characters");
-    expect(properties.internal_info.trace.summary).toHaveLength(180);
-    expect(properties.internal_info.trace.summary).toBe(`${"s".repeat(177)}...`);
+      .toContain("at most 300 characters");
+    expect(properties.internal_info.trace.summary).toHaveLength(300);
+    expect(properties.internal_info.trace.summary).toBe(`${"s".repeat(297)}...`);
     db.close();
   });
 
