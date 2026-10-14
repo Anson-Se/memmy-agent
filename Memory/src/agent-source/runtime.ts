@@ -105,13 +105,19 @@ export interface AgentSourceExecutor {
   pauseScan(): Promise<{ ok: true }>;
   cancelScan(): Promise<{ ok: true }>;
   scanResults?(jobId: string, cursor?: string, limit?: number): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null }>;
-  mutateConnection(sourceId: string, kind: "plugin" | "skill", method: "POST" | "DELETE"): Promise<unknown>;
+  mutateConnection(
+    sourceId: string,
+    kind: "plugin" | "skill",
+    method: "POST" | "DELETE",
+    installType?: "manual" | "auto_inject"
+  ): Promise<unknown>;
   startAutomation(): void;
   dispose(): void | Promise<void>;
 }
 
 interface PersistedSourceState {
   status: AgentConnectionStatus;
+  autoInjectSuppressed?: boolean;
   messageCount: number;
   lastScannedAt: string | null;
   latestSeenAt: string | null;
@@ -337,7 +343,9 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           sourceId,
           store,
           options.resolveAgentSkillRoot,
-          options.scheduleWorker
+          options.scheduleWorker,
+          options.memoryAddAnalytics,
+          persistentScanMode(mode)
         );
         const sourceErrorCount = stage.scanErrorCount + result.errorCount + skillResult.errorCount;
         failureCount += sourceErrorCount;
@@ -487,7 +495,8 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   async function mutateConnection(
     sourceId: string,
     kind: "plugin" | "skill",
-    method: "POST" | "DELETE"
+    method: "POST" | "DELETE",
+    installType: "manual" | "auto_inject" = "manual"
   ): Promise<unknown> {
     const adapter = registry.require(sourceId);
     if (!(await adapter.detect())) {
@@ -513,10 +522,16 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     }
     const state = await readState();
     const stored = state.sources[sourceId] ?? emptySourceState();
-    state.sources[sourceId] = {
+    const nextState: PersistedSourceState = {
       ...stored,
       status: method === "POST" ? connectionStatus(sourceId) : "not_connected"
     };
+    if (method === "DELETE") {
+      nextState.autoInjectSuppressed = true;
+    } else if (installType === "manual") {
+      delete nextState.autoInjectSuppressed;
+    }
+    state.sources[sourceId] = nextState;
     await persist(state);
     logger.info(method === "POST" ? "connection.installed" : "connection.removed", { sourceId, kind });
     return { ok: true, sourceId, status: state.sources[sourceId].status };
@@ -540,12 +555,18 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     if (disposed || scan.running) return;
     const config = loadMemmyConfig(configPath).config.agentAccess;
     if (config.autoInjectSkill) {
+      const state = await readState();
       const discovered = await list();
       for (const source of discovered.sources) {
         if (disposed) return;
-        if (!source.available || source.status !== "not_connected") continue;
+        if (!source.available || source.status !== "not_connected" || state.sources[source.sourceId]?.autoInjectSuppressed === true) continue;
         try {
-          await mutateConnection(source.sourceId, agentConnectionKind(source.sourceId), "POST");
+          const kind = agentConnectionKind(source.sourceId);
+          await mutateConnection(source.sourceId, kind, "POST", "auto_inject");
+          const currentState = await readState();
+          if (currentState.sources[source.sourceId]?.autoInjectSuppressed === true) {
+            await mutateConnection(source.sourceId, kind, "DELETE", "auto_inject");
+          }
         } catch (error) {
           logger.warn("connection.auto_install_failed", { sourceId: source.sourceId, ...memoryErrorFields(error) });
         }
@@ -829,6 +850,14 @@ async function ingestStagedMessages(
       continue;
     }
     if (hasStagedSourceTurn(turn.messages[0])) {
+      let addAnalyticsBase: {
+        adapterId: string;
+        conversationId: string;
+        turnId: string;
+        scanMode?: MemoryDesktopAddScanMode;
+      } | undefined;
+      let addStartedAt = 0;
+      let reportedAdd = false;
       try {
         const sourceTurn = sourceTurnFromMessages(turn.messages);
         if (!sourceTurn) {
@@ -840,6 +869,14 @@ async function ingestStagedMessages(
           continue;
         }
         const legacyImportTurnId = legacyImportTurnIdFromMessages(sourceId, turn.conversationId, turn.messages);
+        const resolvedScanMode = persistentScanMode(store.getSourceState(sourceId)?.mode ?? scanMode);
+        addAnalyticsBase = {
+          adapterId: `agent-source:${sourceId}`,
+          conversationId: turn.conversationId,
+          turnId: sourceTurn.turnId,
+          ...(resolvedScanMode ? { scanMode: resolvedScanMode } : {})
+        };
+        addStartedAt = Date.now();
         const result = service.completeSourceTurn({
           ...buildSourceTurnRequest(sourceTurn, "agent_source_scan"),
           ...(legacyImportTurnId ? { legacyImportTurnId } : {}),
@@ -861,7 +898,16 @@ async function ingestStagedMessages(
           continue;
         }
         const ids = result.result?.l1MemoryIds ?? [];
-        if (result.status === "stored") written += ids.length;
+        if (result.status === "stored") {
+          written += ids.length;
+          memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+          memoryAddAnalytics?.trackAddSucceeded({
+            ...addAnalyticsBase,
+            durationMs: Date.now() - addStartedAt,
+            storedCount: Math.max(ids.length, 1)
+          });
+          reportedAdd = true;
+        }
         if (ids.length === 0) store.saveResult({ sourceId, conversationId: turn.conversationId });
         for (const memoryId of ids) store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId });
         messageCount += turn.messages.length;
@@ -870,6 +916,14 @@ async function ingestStagedMessages(
         const reason = error instanceof Error ? error.message : "native turn ingestion failed";
         recordScanItemSkip(store, sourceId, turn.conversationId, reason);
         noteUncommittedSkip(reason);
+        if (addAnalyticsBase && !reportedAdd) {
+          memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+          memoryAddAnalytics?.trackAddFailed({
+            ...addAnalyticsBase,
+            durationMs: Date.now() - addStartedAt,
+            error
+          });
+        }
       }
       processed += turn.messages.length;
       onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
@@ -1064,7 +1118,12 @@ async function ingestAgentSkills(
   sourceId: string,
   store: MemoryAgentSourceScanStore,
   resolveAgentSkillRoot: (sourceId: string) => string | null = agentRootDirectory,
-  scheduleWorker?: () => void
+  scheduleWorker?: () => void,
+  memoryAddAnalytics?: Pick<
+    MemoryDesktopAddAnalytics,
+    "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed"
+  >,
+  scanMode?: MemoryDesktopAddScanMode
 ): Promise<{ written: number; memoryIdCount: number; errorCount: number; errors: string[] }> {
   const root = resolveAgentSkillRoot(sourceId);
   if (!root) return { written: 0, memoryIdCount: 0, errorCount: 0, errors: [] };
@@ -1085,6 +1144,15 @@ async function ingestAgentSkills(
     const sourceSkillId = relative(skillsRoot, dirname(filePath)).replaceAll("\\", "/");
     const requestId = `agent-source-skill:${sourceId}:${sourceSkillId}:${contentHash}`;
     const fileStat = await stat(filePath);
+    const turnId = `skill:${sourceSkillId}:${contentHash}`;
+    const addAnalyticsBase = {
+      adapterId: `agent-source:${sourceId}`,
+      conversationId: `skill:${sourceSkillId}`,
+      turnId,
+      layer: "Skill" as const,
+      ...(scanMode ? { scanMode } : {})
+    };
+    const addStartedAt = Date.now();
     try {
       const added = service.addMemory({
         requestId,
@@ -1094,7 +1162,7 @@ async function ingestAgentSkills(
         title: frontmatterValue(content, "name") ?? sourceSkillId,
         tags: ["agent-source", "cross-agent-skill", sourceId],
         source: sourceId,
-        turnId: `skill:${sourceSkillId}:${contentHash}`,
+        turnId,
         createdAt: fileStat.mtime.toISOString(),
         sourceAgentId: sourceId,
         sourceSkillId,
@@ -1103,6 +1171,14 @@ async function ingestAgentSkills(
         sourceContentHash: contentHash,
         deferProcessing: true
       });
+      if (added.duplicate !== true && added.status !== "deleted") {
+        memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+        memoryAddAnalytics?.trackAddSucceeded({
+          ...addAnalyticsBase,
+          durationMs: Date.now() - addStartedAt,
+          storedCount: 1
+        });
+      }
       written += 1;
       memoryIdCount += 1;
       store.saveResult({ sourceId, conversationId: `skill:${sourceSkillId}`, memoryId: added.id });
@@ -1117,6 +1193,12 @@ async function ingestAgentSkills(
         `skill:${sourceSkillId}`,
         error instanceof Error ? error.message : String(error)
       );
+      memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
+      memoryAddAnalytics?.trackAddFailed({
+        ...addAnalyticsBase,
+        durationMs: Date.now() - addStartedAt,
+        error
+      });
     }
   }
   flush(true);
@@ -1223,6 +1305,7 @@ async function loadState(path: string): Promise<PersistedState> {
       const status = source.status === "skill_installed" || source.status === "plugin_installed" ? source.status : "not_connected";
       return [sourceId, {
         status,
+        ...(source.autoInjectSuppressed === true ? { autoInjectSuppressed: true } : {}),
         messageCount: typeof source.messageCount === "number" && Number.isFinite(source.messageCount) ? Math.max(0, Math.floor(source.messageCount)) : 0,
         lastScannedAt: typeof source.lastScannedAt === "string" ? source.lastScannedAt : null,
         latestSeenAt: typeof source.latestSeenAt === "string" ? source.latestSeenAt : null,

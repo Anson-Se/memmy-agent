@@ -3895,7 +3895,7 @@ export class AgentLoop {
       session: ctx.session,
       sessionKey: ctx.sessionKey,
       reason: "system_prompt_build",
-      spec: { hostProjectId: ctx.sessionProjectId, workspace: sessionWorkspace },
+      spec: { hostProjectId: ctx.sessionProjectId, workspace: sessionWorkspace, turnId: ctx.turnId, abortSignal: ctx.abortSignal },
       metadata: { lifecycle: "system_prompt" },
     }));
     requestTiming("agent.prompt_hooks_end");
@@ -4274,6 +4274,7 @@ export class AgentLoop {
       sessionBindingOverride?: WebuiSessionBinding | null;
     } = {},
   ): Promise<OutboundMessage | null> {
+    turnId ??= firstString(msg.metadata?.turn_id, msg.metadata?.turnId) ?? cryptoRandomId();
     const rawChatId = String(msg.chatId ?? "");
     const separator = rawChatId.indexOf(":");
     const channel = separator >= 0 ? rawChatId.slice(0, separator) : "cli";
@@ -4338,7 +4339,7 @@ export class AgentLoop {
       session,
       sessionKey: key,
       reason: "system_prompt_build",
-      spec: { hostProjectId: sessionBinding.projectId, workspace: sessionWorkspace },
+      spec: { hostProjectId: sessionBinding.projectId, workspace: sessionWorkspace, turnId, abortSignal },
       metadata: { lifecycle: "system_prompt" },
     }));
     if (this.restoreRuntimeCheckpoint(session)) this.sessions.save(session);
@@ -4461,6 +4462,7 @@ export class AgentLoop {
       sessionKey: key,
       pendingQueue,
       abortSignal,
+      turnId,
       tools,
       sessionWorkspace,
       hostProjectId: sessionBinding.projectId,

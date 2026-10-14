@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { npmInvocation } from "../../../../scripts/internal/shared/npm-invocation.mjs";
+import { memoryRuntimeBuildIdentity } from "../../../../scripts/internal/shared/memory-runtime-build-identity.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -56,7 +57,9 @@ try {
     await verifyEmbeddingModel(runtimeRoot);
   }
   await verifyRuntimeDependencies(runtimeRoot, target, platform, arch, workspaceDependencies);
+  const buildIdentity = await memoryRuntimeBuildIdentity(repositoryRoot);
   await writeJson(join(runtimeRoot, "memory-runtime.json"), {
+    ...buildIdentity,
     name: "memmy-memory-runtime",
     version,
     protocolVersion: 1,
@@ -76,7 +79,7 @@ try {
   await mkdir(outputRoot, { recursive: true });
   const assetPath = join(outputRoot, assetName);
   run("tar", ["-czf", assetPath, "-C", bundledRoot, "."], repositoryRoot);
-  const descriptor = { name: assetName, sha256: await sha256File(assetPath), size: (await stat(assetPath)).size };
+  const descriptor = { ...buildIdentity, name: assetName, sha256: await sha256File(assetPath), size: (await stat(assetPath)).size };
   await updateReleaseManifest(outputRoot, version, target, descriptor);
   process.stdout.write(`${assetPath}\n`);
 } finally {
