@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserResult,
   formatEmbeddedBrowserTabMention, parseEmbeddedBrowserTabMention,
-  type EmbeddedBrowserCommand, type EmbeddedBrowserResult } from '@memmy/local-api-contracts';
+  type EmbeddedBrowserCommand } from '@memmy/local-api-contracts';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
 
 type Pending = { resolve: (value: unknown) => void; reject: (reason: Error) => void;

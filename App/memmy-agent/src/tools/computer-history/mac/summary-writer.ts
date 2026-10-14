@@ -2,7 +2,6 @@ import type { LLMRuntimeResolver } from "../../../utils/llm-runtime.js";
 import type { MemmyOutputLanguage } from "../../../memmy-memory/discovery.js";
 import { normalizeOutputLanguage } from "@memmy/local-api-contracts";
 import { redactSensitive } from "./summarize-history.js";
-import { SENSITIVE_MESSAGE_APP_BUNDLE_IDS } from "./observation-settings.js";
 import { estimatePromptTokens } from "../../../utils/helpers.js";
 
 // Codex writes each history entry as a short title plus two or three sentences
