@@ -1,6 +1,9 @@
 /* global chrome */
 "use strict";
 
+// Passive History recording runs independently from debugger-based execution.
+if (typeof importScripts === "function") importScripts("browser-history-background.js");
+
 // After installation the extension connects to Memmy and operates ordinary
 // http(s) pages. Internal browser pages stay out of reach. Keep BRIDGE_PORTS
 // aligned with EXTERNAL_BROWSER_BRIDGE_PORTS in external-browser-bridge.ts.
@@ -8,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.4";
+const EXTENSION_VERSION = "1.0.5";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -27,9 +30,9 @@ const DEBUGGER_IDLE_DETACH_MS = 15_000;
 // rescans wait this long before offering those pages again; the popup resumes at once.
 const USER_CANCEL_COOLDOWN_MS = 10_000;
 const USER_CANCELLED_REASON = "你关闭了浏览器顶部的“Memmy 已开始调试此浏览器”提示，Memmy 已停止操作这个网页。需要继续时，在 Memmy 里重新发起请求，或点击浏览器工具栏中的 Memmy 图标选择“重新连接”。";
-const COMMANDS_WITHOUT_DEBUGGER = new Set(["allowOrigin", "tabState", "open", "activate"]);
+const COMMANDS_WITHOUT_DEBUGGER = new Set(["allowOrigin", "tabState", "open", "activate", "playwrightEnd"]);
 // Reported in the handshake so Memmy can tell an outdated installed copy from a slow one.
-const EXTENSION_CAPABILITIES = ["openTab"];
+const EXTENSION_CAPABILITIES = ["openTab", "playwright", "browserHistory"];
 const OPEN_TAB_READY_MS = 10_000;
 // Chrome's openerTabId names the tab that was active, not a background tab whose
 // link opened the new tab. A Page.windowOpen is paired with a tab created within
@@ -62,6 +65,29 @@ let ready = null;
 let historyFocusSequence = 0;
 let historyFocusEpoch = 0;
 const HISTORY_FOCUS_REFRESH_MS = 2_000;
+const historyInputEvidence = new Map();
+const browserHistory = globalThis.installMemmyBrowserHistoryBackground?.({
+  chrome,
+  isConnected: () => sessionLive && socket?.readyState === WebSocket.OPEN,
+  send,
+  browserName,
+  isProtected: async tabId => {
+    await loadCredentialProtection();
+    const claim = claims.get(tabId);
+    return protectedCredentialTabs.has(tabId) || !!claim?.credentialProtected || !!claim?.protectedActivity;
+  },
+  activeCommand: (tabId, observedAt) => {
+    const evidence = historyInputEvidence.get(tabId);
+    return evidence && observedAt >= evidence.at - 100 && observedAt <= evidence.at + 1_500
+      ? { commandId: evidence.commandId } : undefined;
+  },
+});
+
+function recordHistoryInput(tabId, commandId) {
+  if (typeof commandId !== "string") return;
+  if (historyInputEvidence.size >= 128 && !historyInputEvidence.has(tabId)) historyInputEvidence.delete(historyInputEvidence.keys().next().value);
+  historyInputEvidence.set(tabId, { commandId, at: Date.now() });
+}
 
 function pageOrigin(url) {
   const parsed = new URL(url);
@@ -142,6 +168,7 @@ async function persistCredentialProtection() {
 }
 
 async function protectCredentialTab(tabId, site) {
+  browserHistory?.revoke(tabId);
   invalidateHistoryFocus();
   await loadCredentialProtection();
   protectedCredentialTabs.add(tabId);
@@ -235,6 +262,8 @@ function connectPort(port) {
         void refreshHistoryFocus();
         historyFocusRefresh = setInterval(() => void refreshHistoryFocus(), HISTORY_FOCUS_REFRESH_MS);
         resolve();
+      } else if (browserHistory?.receive(message)) {
+        // History configuration is metadata-only and never attaches a debugger.
       } else if (message.type === "command") {
         void handleCommand(message);
       } else if (message.type === "refresh_tabs" && typeof message.id === "string") {
@@ -252,6 +281,8 @@ function connectPort(port) {
       clearInterval(socketKeepalive);
       clearInterval(historyFocusRefresh);
       if (socket === ws) {
+        browserHistory?.disconnected();
+        historyInputEvidence.clear();
         socket = null;
         ready = null;
         for (const tabId of [...claims.keys()]) void unclaim(tabId, false);
@@ -342,6 +373,7 @@ function clearIdleDetach(tabId) {
 
 function markDebuggerDetached(claim) {
   claim.attached = false;
+  claim.playwrightLease = null;
   claim.cdpSessions?.clear();
   claim.cdpEpoch = (claim.cdpEpoch || 0) + 1;
   wakeCdpWaiters(claim);
@@ -805,6 +837,7 @@ chrome.tabs.onCreated?.addListener?.(tab => {
   matchOpenedTabs();
 });
 chrome.tabs.onRemoved.addListener(tabId => {
+  historyInputEvidence.delete(tabId);
   invalidateHistoryFocus();
   void refreshHistoryFocus();
   pausedTabs.delete(tabId); tabStatuses.delete(tabId); sourceTabs.delete(tabId); createdTabs.delete(tabId);
@@ -853,6 +886,12 @@ chrome.windows?.onFocusChanged?.addListener?.(() => {
 chrome.debugger.onEvent.addListener((source, method, data) => {
   const claim = claims.get(source.tabId);
   if (!claim) return;
+  const executorLease = claim.playwrightLease;
+  if (executorLease && executorLease.expiresAt > Date.now() && !claim.credentialProtected
+    && !claim.protectedActivity && !pausedTabs.has(source.tabId)) {
+    send({ type: 'playwright_event', tabId: source.tabId, leaseId: executorLease.id,
+      method, params: data || {}, ...(source.sessionId ? { sessionId: source.sessionId } : {}) });
+  }
   if (method === 'Page.windowOpen' && !source.sessionId && typeof data?.url === 'string') {
     pageOpens.push({ sourceTabId: source.tabId, url: data.url, at: Date.now() });
     matchOpenedTabs();
@@ -1100,7 +1139,7 @@ async function cdpRead(tabId, name, args, commandId) {
   const approvedOrigin = pageOrigin(String(args.approvedOrigin || ''));
   const check = async () => {
     if (!claims.has(tabId) || cancelledCommands.has(commandId)) throw new Error('CDP operation cancelled');
-    if (claims.get(tabId).credentialProtected || claims.get(tabId).protectedActivity) {
+    if (claims.get(tabId).credentialProtected || claims.get(tabId).protectedActivity || claims.get(tabId).playwrightLease) {
       throw new Error('Raw CDP is unavailable during browser credential protection or autofill');
     }
     const tab = await chrome.tabs.get(tabId);
@@ -1190,6 +1229,97 @@ async function cdpRead(tabId, name, args, commandId) {
   if (await check() !== claim || claim.cdpEpoch !== approvedEpoch) throw new Error('CDP claim changed');
   return { cursor: events.at(-1)?.sequence ?? Math.max(start, latest), events,
     hasMore: eligible.length > events.length, truncated: start < first - 1 };
+}
+
+// Only the fixed, local Playwright executor uses this channel. Model-provided
+// raw CDP continues through cdpRead and its separate approval policy.
+const PLAYWRIGHT_CDP_METHODS = new Set([
+  'Runtime.enable', 'Runtime.disable', 'Runtime.evaluate', 'Runtime.callFunctionOn',
+  'Runtime.getProperties', 'Runtime.releaseObject', 'Runtime.releaseObjectGroup',
+  'Runtime.addBinding', 'Runtime.runIfWaitingForDebugger',
+  'Page.enable', 'Page.disable', 'Page.getFrameTree', 'Page.getLayoutMetrics',
+  'Page.setLifecycleEventsEnabled', 'Page.addScriptToEvaluateOnNewDocument',
+  'Page.removeScriptToEvaluateOnNewDocument', 'Page.createIsolatedWorld',
+  'Page.captureScreenshot', 'Page.handleJavaScriptDialog',
+  'DOM.enable', 'DOM.getDocument', 'DOM.describeNode', 'DOM.resolveNode',
+  'DOM.getContentQuads', 'DOM.getBoxModel', 'DOM.scrollIntoViewIfNeeded',
+  'DOM.querySelector', 'DOM.querySelectorAll',
+  'Network.enable', 'Network.disable', 'Network.setCacheDisabled',
+  'Log.enable', 'Log.disable',
+  'Input.dispatchMouseEvent', 'Input.dispatchKeyEvent', 'Input.insertText',
+  'Emulation.setDeviceMetricsOverride', 'Emulation.clearDeviceMetricsOverride',
+  'Target.setAutoAttach', 'Target.getTargetInfo',
+]);
+
+async function playwrightControl(tabId, name, args, commandId) {
+  const claim = claims.get(tabId);
+  const current = async () => {
+    if (!claim || claims.get(tabId) !== claim || pausedTabs.has(tabId)
+      || cancelledCommands.has(commandId)) throw new Error('Browser executor cancelled');
+    if (claim.credentialProtected || claim.protectedActivity) throw new Error('Browser executor is unavailable during credential protection');
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.incognito || pageOrigin(tab.url || '') !== args.approvedOrigin) throw new Error('Browser executor site changed');
+    return tab;
+  };
+  if (name === 'playwrightEnd') {
+    if (claim?.playwrightLease?.id === args.leaseId) claim.playwrightLease = null;
+    if (args.detach === true && claim?.playwrightLastLeaseId === args.leaseId && !claim.playwrightLease) {
+      claim.playwrightLastLeaseId = null;
+      markDebuggerDetached(claim);
+      await chrome.debugger.detach({ tabId }).catch(() => undefined);
+    }
+    return { ok: true };
+  }
+  await current();
+  if (name === 'playwrightStart') {
+    if (typeof args.leaseId !== 'string' || !/^[a-f0-9]{32}$/.test(args.leaseId)) throw new Error('Invalid browser executor lease');
+    if (claim.playwrightLease && claim.playwrightLease.id !== args.leaseId
+      && claim.playwrightLease.expiresAt > Date.now()) throw new Error('Browser executor is already busy');
+    if (args.input === true) await assertUserIsNotUsingTab(tabId);
+    if (claim.cdpReadDepth || claim.cdpWriteDepth) throw new Error('Browser executor cannot overlap raw CDP');
+    if (args.uploadPaths !== undefined && (!Array.isArray(args.uploadPaths) || !args.uploadPaths.length
+      || args.uploadPaths.length > 20 || args.uploadPaths.some(file => typeof file !== 'string'
+        || !/^(?:\/|[A-Za-z]:[\\/])/.test(file)))) throw new Error('Invalid approved upload paths');
+    claim.playwrightLease = { id: args.leaseId, origin: args.approvedOrigin,
+      input: args.input === true, uploadPaths: args.uploadPaths,
+      documentEpoch: claim.documentEpoch || 0, expiresAt: Date.now() + 45_000 };
+    claim.playwrightLastLeaseId = args.leaseId;
+    const info = await command(tabId, 'Target.getTargetInfo');
+    const tree = await command(tabId, 'Page.getFrameTree');
+    if (args.fresh === true) {
+      await command(tabId, 'Runtime.disable');
+      await command(tabId, 'Target.setAutoAttach', { autoAttach: false, flatten: true,
+        waitForDebuggerOnStart: false });
+    }
+    await current();
+    return { targetInfo: info.targetInfo, frameTree: tree.frameTree,
+      childTargets: [...claim.cdpSessions.values()].map(child => ({ targetId: child.targetId, url: child.url })),
+      documentEpoch: claim.documentEpoch || 0, cdpEpoch: claim.cdpEpoch || 0 };
+  }
+  const lease = claim.playwrightLease;
+  if (!lease || lease.id !== args.leaseId || lease.expiresAt <= Date.now()
+    || lease.origin !== args.approvedOrigin) throw new Error('Browser executor lease expired');
+  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
+  const method = String(args.method || '');
+  if (method === 'DOM.setFileInputFiles') {
+    if (!lease.uploadPaths || !Array.isArray(args.params?.files)
+      || JSON.stringify(args.params.files) !== JSON.stringify(lease.uploadPaths)) throw new Error('Upload paths are not approved for this action');
+  } else if (!PLAYWRIGHT_CDP_METHODS.has(method)) throw new Error('Browser executor CDP method is unavailable');
+  if (method.startsWith('Input.')) {
+    if (!lease.input) throw new Error('Browser executor observation cannot send input');
+    await assertUserIsNotUsingTab(tabId);
+  }
+  const child = args.sessionId ? await resolveCdpTarget(tabId, claim, { sessionId: args.sessionId }) : null;
+  await current();
+  if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
+  if (method.startsWith('Input.')) recordHistoryInput(tabId, commandId);
+  const result = await command(tabId, method, args.params || {}, child?.sessionId);
+  await current();
+  if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
+  if (child && (claim.cdpSessions.get(child.sessionId) !== child.info
+    || child.info.revision !== child.revision)) throw new Error('Browser executor frame changed');
+  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
+  return result;
 }
 
 async function snapshot(tabId) {
@@ -1328,6 +1458,7 @@ async function withProtectedActivity(tabId, work) {
     throw new Error('Browser operation is unavailable during raw CDP');
   }
   claim.protectedActivity = (claim.protectedActivity || 0) + 1;
+  browserHistory?.revoke(tabId);
   try { return await work(); }
   finally { claim.protectedActivity--; }
 }
@@ -1440,6 +1571,7 @@ function keyboardEvent(key, modifiers) {
 }
 
 async function run(tabId, name, args, commandId) {
+  if (name === 'playwrightEnd') return playwrightControl(tabId, name, args, commandId);
   if (!claims.has(tabId)) throw new Error("Tab is not connected");
   if (claims.get(tabId).credentialProtected) {
     let sameOrigin = false;
@@ -1459,6 +1591,9 @@ async function run(tabId, name, args, commandId) {
   if (["navigate", "back", "forward", "reload", "click", "type", "selectOption",
     "pressKey", "scroll", "resize", "fillCredential", "fillContact", "cdpWrite"].includes(name)) await assertUserIsNotUsingTab(tabId);
   switch (name) {
+    case 'playwrightStart':
+    case 'playwrightCdp':
+    case 'playwrightEnd': return playwrightControl(tabId, name, args, commandId);
     case "allowOrigin": {
       const origin = pageOrigin(String(args.origin));
       claims.get(tabId).allowedOrigins.add(origin);

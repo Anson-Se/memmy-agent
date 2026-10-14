@@ -23,6 +23,7 @@ export const EMBEDDED_BROWSER_COMMANDS = [
   'authRequest',
   'upload',
   'cdpCall', 'cdpEvents', 'cdpWrite',
+  'playwrightStart', 'playwrightCdp', 'playwrightEvents', 'playwrightEnd',
 ] as const;
 
 export type EmbeddedBrowserTabMention = {
@@ -83,6 +84,7 @@ export function isEmbeddedBrowserRequest(value: unknown): value is EmbeddedBrows
     && EMBEDDED_BROWSER_COMMANDS.includes(input.command as EmbeddedBrowserCommand)
     && (input.tabId === undefined || (Number.isSafeInteger(input.tabId) && input.tabId! > 0))
     && (input.command !== 'closeTab' || input.tabId !== undefined)
+    && (!input.command?.startsWith('playwright') || input.tabId !== undefined)
     && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args));
 }
 

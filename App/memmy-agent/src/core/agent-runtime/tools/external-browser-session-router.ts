@@ -6,11 +6,13 @@ import { normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall, normalizeBro
   normalizeBrowserCdpCommandOptions,
   type ComputerUseSurfaceAction } from "@memmy/local-api-contracts";
 import { emitComputerUseSurface } from "../../../tools/computer-use/surface-preview.js";
-import { type ExternalBrowserClaim, type ExternalBrowserTabStatus } from "./external-browser-bridge.js";
+import { type ExternalBrowserClaim, type ExternalBrowserTabStatus, type ExternalBrowserPlaywrightEvent } from "./external-browser-bridge.js";
 import { formatExternalBrowserTabReference, parseExternalBrowserTabReference } from './external-browser-tab-reference.js';
 import { callExternalBrowserTool, emitExternalBrowserFrame, externalBrowserTargetId,
   EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED } from "./external-browser-tools.js";
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
+import { closeExternalBrowserPlaywrightScope, closeAllExternalBrowserPlaywright } from './external-browser-playwright.js';
+import type { BrowserCommandBridge } from './external-browser-tools.js';
 
 export type ClaimedBrowserBridge = {
   refresh?(): Promise<ExternalBrowserClaim | null>;
@@ -23,6 +25,8 @@ export type ClaimedBrowserBridge = {
   getClaim(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): ExternalBrowserClaim | null;
   command(claim: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
     command: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
+  subscribePlaywright?(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
+    listener: (event: ExternalBrowserPlaywrightEvent) => void): () => void;
 };
 
 type Binding = {
@@ -246,7 +250,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   private scopedBridge(scope: BrowserScope, binding: Binding,
-    turnRevision = binding.turnRevision): Pick<ClaimedBrowserBridge, 'getClaim' | 'command'> {
+    turnRevision = binding.turnRevision): BrowserCommandBridge {
     return {
       getClaim: identity => this.bridge.getClaim(identity),
       command: async (...args: Parameters<ClaimedBrowserBridge['command']>) => {
@@ -255,6 +259,18 @@ export class ExternalBrowserSessionRouter {
         this.assertBinding(scope, binding, turnRevision);
         return result;
       },
+      isFrameAllowed: url => this.sitePolicy.decision(url, 'access') !== 'block',
+      ...(this.bridge.subscribePlaywright ? {
+        subscribePlaywright: (identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
+          listener: (event: ExternalBrowserPlaywrightEvent) => void) => {
+          this.assertBinding(scope, binding, turnRevision);
+          if (claimKey(identity) !== claimKey(binding.identity)) throw new Error(this.changedMessage());
+          return this.bridge.subscribePlaywright!(identity, event => {
+            try { this.assertBinding(scope, binding, turnRevision); listener(event); }
+            catch { /* Events from a released task must not enter another executor. */ }
+          });
+        },
+      } : {}),
     };
   }
 
@@ -648,6 +664,7 @@ export class ExternalBrowserSessionRouter {
 
   /** Releases the chat's tabs to other chats and closes Agent-created in-app tabs nobody kept. */
   async finishTurn(scope: BrowserScope): Promise<void> {
+    await closeExternalBrowserPlaywrightScope(scope);
     const key = scopeKey(scope);
     const chat = this.chats.get(key);
     if (!chat) return;
@@ -693,6 +710,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   closeSession(scope: BrowserScope): void {
+    void closeExternalBrowserPlaywrightScope(scope);
     const key = scopeKey(scope);
     for (const binding of [...(this.chats.get(key)?.tabs.values() ?? [])]) this.release(key, binding);
   }
@@ -705,6 +723,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   closeAll(): void {
+    void closeAllExternalBrowserPlaywright();
     for (const key of [...this.chats.keys()]) {
       for (const binding of [...(this.chats.get(key)?.tabs.values() ?? [])]) this.release(key, binding);
     }

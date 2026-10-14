@@ -16,6 +16,7 @@ export * from "./desktop-runtime-manifest.js";
 export * from "./computer-use-surface.js";
 export * from "./browser-profile-control.js";
 export * from "./embedded-browser-control.js";
+export * from "./browser-playwright-control.js";
 export * from "./browser-access-approval.js";
 export * from "./native-app-approval.js";
 export * from "./browser-download-approval.js";

@@ -25,6 +25,7 @@ import { ComputerHistoryWeChatRiskConfirmation } from "./computer-history-wechat
 import { clearWeChatPermissionReturn, shouldReturnToWeChatSettings } from "./computer-history-wechat-permission-state.js";
 import { weChatConnectionError } from "./computer-history-wechat-error.js";
 import { ComputerHistorySources } from "./computer-history-sources.js";
+import { ComputerHistoryBrowserEnhancement } from "./computer-history-browser-enhancement.js";
 import { ComputerHistorySourceDialog } from "./computer-history-source-dialog.js";
 import {
   consumeComputerHistoryLaunchEnable,
@@ -518,6 +519,9 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
 
       {showIntroduction ? <div className="ch__intro">
         <HistoryLaunchCard onEnable={() => setPendingRecordingAction("start")} />
+        <div className="ch__browser-enhancement-card">
+          <ComputerHistoryBrowserEnhancement client={props.client} />
+        </div>
       </div> :
       <div className="ch__settings-card">
       <div className="ch__recording-setting flex items-center justify-between">
@@ -626,6 +630,7 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
           </button>
         </div>
       ) : null}
+      <ComputerHistoryBrowserEnhancement client={props.client} />
       <ComputerHistorySources key={sourcesRevision} client={props.client} syncStatus={snapshot?.memorySync}
         onChoose={() => setSourceSetupMode("edit")} />
       </div>}

@@ -64,6 +64,8 @@ const SYSTEM_PROMPT = [
   "",
   "`entered text` records input characters and `focused field value` records the current visible value. Neither alone proves a message was sent; confirm a submit action and resulting screen or message record.",
   "WeChat `on screen` and `interacted with` lines may be chat-list previews or UI labels. Only `wechat_message` events are canonical conversation messages.",
+  "Browser operation evidence explicitly identifies the actor as human, agent, or unknown. Preserve that attribution; an unknown actor is not proof the user performed the action. Before/after states establish observed changes, not a successful business submission.",
+  "Browser phase=attempt records an attempted input with no confirmed outcome. phase=observed supplies actual subsequent UI evidence. phase=context establishes a visible page URL/title, not successful navigation, submission, or causation by an earlier attempt. Correlate an attempt/observed pair only by its interactionId and preserve unresolved outcomes.",
   "BEFORE RETURNING",
   "Check every title, description, and body claim against a supplied source. Remove any guessed action, source, cause, personal trait, or completion state. A shorter accurate account is better than a detailed unsupported one.",
 ].join("\n");
@@ -433,7 +435,7 @@ export function compactEventEvidence(
   // complete extracted evidence while the model path keeps its existing budget.
   const retain = options.purpose === "retention";
   const retainedTypes = new Set(["recording_started", "recording_stopped", "application_changed", "accessibility_snapshot",
-    "mouse_click", "mouse_drag", "selection_changed", "scroll", "text_input", "key_press", "page_context", "wechat_message"]);
+    "mouse_click", "mouse_drag", "selection_changed", "scroll", "text_input", "key_press", "page_context", "wechat_message", "browser_action"]);
   const events: HistoryEvent[] = [];
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -510,6 +512,30 @@ export function compactEventEvidence(
     }
     const details = event.details;
     switch (event.eventType) {
+      case "browser_action": {
+        const actor = details?.actor === "human" || details?.actor === "agent" ? details.actor : "unknown";
+        const target = details?.target && typeof details.target === "object" ? details.target as Record<string, unknown> : {};
+        const label = [target.role, target.name].filter(value => typeof value === "string").join(" ");
+        const before = details?.before, after = details?.after;
+        const phase = details?.phase === "attempt" || details?.phase === "context" ? details.phase : "observed";
+        const line = `    browser ${phase === "context" ? "page context" : "operation"} (${actor} actor, ${phase} phase): ${redactSensitive(String(details?.action ?? "unknown"))}`
+          + (label ? `; target: ${redactSensitive(label)}` : "")
+          + (typeof details?.url === "string" ? `; page: ${redactSensitive(details.url)}` : "")
+          + (typeof details?.interactionId === "string" ? `; interactionId: ${redactSensitive(details.interactionId)}` : "")
+          + (phase === "attempt" ? "; attempted input only; outcome unconfirmed" : phase === "context" ? "; page observed; navigation causation unconfirmed" : "");
+        arc.retainedDetails.push(line);
+        for (const [phase, state] of [["before", before], ["after", after]] as const) {
+          if (!state || typeof state !== "object") continue;
+          const browserState = state as Record<string, unknown>;
+          // These are observations, never inferred business completion or replay instructions.
+          const stateEvidence: Record<string, unknown> = {};
+          for (const key of ["url", "title", "text", "target"] as const) {
+            if (browserState[key] !== undefined) stateEvidence[key] = browserState[key];
+          }
+          if (Object.keys(stateEvidence).length) arc.retainedDetails.push(`    ${phase} browser state: ${redactSensitive(JSON.stringify(stateEvidence))}`);
+        }
+        break;
+      }
       case "wechat_message": {
         const id = details?.messageId;
         const body = details?.text;
@@ -663,7 +689,7 @@ export function compactEventEvidence(
   const active = arcs
     // Reading is activity too: a window looked at without a click still counts.
     .filter((arc) => arc.clicks || arc.typedChars || arc.textEvidence.length || arc.keys.length || arc.urls.length
-      || arc.labels.length || arc.screen.length || arc.chatMessages.length || arc.wechat.length);
+      || arc.labels.length || arc.screen.length || arc.chatMessages.length || arc.wechat.length || arc.retainedDetails.length);
   const indexes = sampleIndexes(active.length, MAX_ARCS);
   const blocks = indexes.map((index) => {
     const arc = active[index];
@@ -679,6 +705,7 @@ export function compactEventEvidence(
       ...arc.urls.map((url) => `    page: ${url}`),
       ...arc.chatMessages,
       ...wechatTranscript(arc.wechat),
+      ...arc.retainedDetails,
     ];
     return { head, detail, screen: arc.screen };
   });

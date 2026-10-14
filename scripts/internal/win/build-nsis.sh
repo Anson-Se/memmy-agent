@@ -651,6 +651,9 @@ verify_packaged_windows_unpacked_artifacts() {
   local packaged_embedding_model="$DESKTOP_DIR/release/win-unpacked/resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/app.asar"
+  node "$ROOT_DIR/scripts/internal/shared/verify-browser-extension.mjs" \
+    "$(to_node_readable_path "$DESKTOP_DIR/extensions/memmy-browser")" \
+    "$(to_node_readable_path "$DESKTOP_DIR/release/win-unpacked/resources/browser-extension")"
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy-memory.cmd"
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy.cmd"
   require_packaged_runtime_file "$packaged_memory_runtime/dist/src/cli/index.js"

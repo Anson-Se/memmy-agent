@@ -354,7 +354,7 @@ describe("external browser page discovery", () => {
     try {
       const test = discoveryHarness({ browser, boot: true });
       await vi.advanceTimersByTimeAsync(0);
-      expect(test.sent).toContainEqual({ type: "hello", browser, capabilities: ["openTab"] });
+      expect(test.sent).toContainEqual({ type: "hello", browser, capabilities: ["openTab", "playwright", "browserHistory"] });
       expect(test.attaches).toEqual([]);
       expect(test.sent).toContainEqual(expect.objectContaining({ type: "claim", browser, tabId: 7 }));
       expect((await test.message({ action: "status" })).controllableTabCount).toBe(1);
@@ -656,7 +656,8 @@ describe("Chrome and Edge extension packaging", () => {
         from: "extensions/memmy-browser", to: "browser-extension", filter: ["**/*"],
       });
     }
-    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "auth.html", "auth.js"]) {
+    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "auth.html", "auth.js",
+      "browser-history-background.js", "history-content.js", "history-sensor.js"]) {
       expect(fs.existsSync(path.join(extension, file))).toBe(true);
     }
   });
@@ -664,14 +665,16 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
+    expect(manifest.version).toBe("1.0.5");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
     expect(id).toBe("mhodbgbbgalbhehapffidmdegokpoaom");
     expect(fs.readFileSync(path.join(extension, "background.js"), "utf8"))
       .toContain(`const EXTENSION_VERSION = "${manifest.version}";`);
-    expect(manifest.host_permissions).toEqual(["http://127.0.0.1/*"]);
+    expect(manifest.host_permissions).toEqual(["http://127.0.0.1/*", "http://*/*", "https://*/*"]);
     expect(manifest.permissions).toContain("alarms");
+    expect(manifest.permissions).toContain("scripting");
     expect(manifest.permissions).not.toContain("history");
     expect(manifest.permissions).not.toContain("cookies");
   });

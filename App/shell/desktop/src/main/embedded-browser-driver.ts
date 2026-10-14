@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { BrowserWindow, Session, WebContents } from 'electron';
 import { formatEmbeddedBrowserTabMention, normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall,
   normalizeBrowserCdpCommandOptions, type BrowserCdpTarget,
+  BROWSER_PLAYWRIGHT_CDP_METHODS,
   type EmbeddedBrowserCommand, type EmbeddedBrowserRequest } from '@memmy/local-api-contracts';
 import type { BrowserHistoryStore, BrowserVisitSource } from './browser-history-store.js';
 import { BrowserCdpEventBuffer } from './browser-cdp-event-buffer.js';
@@ -15,16 +16,21 @@ type Point = { x: number; y: number };
 type ClickGeometry = { width: number; height: number; quads: number[][] };
 type ClickAction = Point & { objectId?: string; backendNodeId?: number; geometry?: ClickGeometry; checkCurrent: () => void };
 type CdpSession = { targetId: string; url: string; revision: number; parentSessionId?: string };
+type PlaywrightLease = { id: string; origin: string; input: boolean; expiresAt: number;
+  documentEpoch: number; cdpEpoch: number; targetId: string;
+  uploadStamps?: ApprovedBrowserUpload['stamps']; uploadPaths?: string[] };
 type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<string>;
   console: Array<{ type: string; text: string }>; requests: Array<{ method: string; url: string }>;
   cdpEvents: BrowserCdpEventBuffer;
   cdpSessions: Map<string, CdpSession>;
   cdpOrigin: string | null;
   cdpEpoch: number;
+  playwrightLease: PlaywrightLease | null; playwrightLastLeaseId: string | null;
+  playwrightEvents: BrowserCdpEventBuffer;
   protectedActivity: number; cdpReadDepth: number; cdpWriteDepth: number;
   credentialProtected: boolean; credentialRecoveryOrigin: string | null;
   recoveryNavigationPending: boolean; documentEpoch: number;
-  attached: boolean; lastUserInputAt: number; agentInputDepth: number; lastStartedUrl: string;
+  attached: boolean; debuggerListenersInstalled: boolean; lastUserInputAt: number; agentInputDepth: number; lastStartedUrl: string;
   visitSource: BrowserVisitSource; visitSourceUntil: number; visitSourceMarkedAt: number;
   lastRecordedUrl: string; lastRecordedAt: number; lastRecordedSource: BrowserVisitSource;
   pendingNavigation: boolean; everSelected: boolean };
@@ -59,6 +65,7 @@ const NAVIGATION_ACTIONS = new Set<EmbeddedBrowserCommand>([
 const MODIFIER_KEYS = new Set(['Meta', 'Control', 'Alt', 'AltGraph', 'Shift', 'CapsLock', 'Fn', 'FnLock', 'OS']);
 const USER_ACTIVE_WINDOW_MS = 2_000;
 const USER_IDLE_WAIT_MS = 8_000;
+const PLAYWRIGHT_METHODS = new Set<string>(BROWSER_PLAYWRIGHT_CDP_METHODS);
 
 function origin(value: string): string {
   const url = new URL(value);
@@ -161,16 +168,18 @@ export class EmbeddedBrowserDriver {
   attach(guest: WebContents, host: BrowserWindow): void {
     const entry: Entry = { guest, host, allowedOrigins: new Set(), console: [], requests: [],
       cdpEvents: new BrowserCdpEventBuffer(), cdpSessions: new Map(), cdpOrigin: null, cdpEpoch: 0,
+      playwrightLease: null, playwrightLastLeaseId: null, playwrightEvents: new BrowserCdpEventBuffer(),
       protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: false,
       credentialRecoveryOrigin: null, recoveryNavigationPending: false,
       documentEpoch: 0,
-      attached: false, lastUserInputAt: 0, agentInputDepth: 0, lastStartedUrl: '',
+      attached: false, debuggerListenersInstalled: false, lastUserInputAt: 0, agentInputDepth: 0, lastStartedUrl: '',
       visitSource: 'other', visitSourceUntil: 0, visitSourceMarkedAt: 0,
       lastRecordedUrl: '', lastRecordedAt: 0, lastRecordedSource: 'other', pendingNavigation: false,
       everSelected: false };
     this.entries.set(guest.id, entry);
     guest.on('did-start-navigation', details => {
       if (details.isMainFrame) {
+        this.revokePlaywright(entry);
         try { this.ensureCdpOrigin(entry, origin(details.url)); }
         catch { entry.cdpEvents.clear(); entry.cdpOrigin = null; entry.cdpEpoch++; }
         entry.lastStartedUrl = details.url;
@@ -206,6 +215,7 @@ export class EmbeddedBrowserDriver {
     };
     guest.on('did-stop-loading', recordNavigation);
     guest.on('did-navigate', () => {
+      this.revokePlaywright(entry);
       entry.documentEpoch++;
       let recovered = false;
       try { recovered = entry.recoveryNavigationPending
@@ -227,6 +237,7 @@ export class EmbeddedBrowserDriver {
       catch { /* A history title update must not interrupt the browser. */ }
     });
     guest.once('destroyed', () => {
+      this.revokePlaywright(entry);
       this.historyStore?.finishSession(String(guest.id));
       if (this.entries.get(guest.id) !== entry) return;
       this.entries.delete(guest.id);
@@ -242,6 +253,7 @@ export class EmbeddedBrowserDriver {
 
   private ensureCdpOrigin(entry: Entry, current: string = origin(entry.guest.getURL())): void {
     if (entry.cdpOrigin !== current) {
+      this.revokePlaywright(entry);
       entry.cdpEvents.clear();
       entry.cdpSessions.clear();
       entry.cdpOrigin = current;
@@ -494,51 +506,57 @@ export class EmbeddedBrowserDriver {
     if (!entry.attached) {
       entry.guest.debugger.attach('1.3');
       entry.attached = true;
-      entry.guest.debugger.on('detach', () => {
-        entry.attached = false; entry.cdpSessions.clear(); entry.cdpEvents.clear();
-      });
-      entry.guest.debugger.on('message', (_event, name, data: any, sourceSessionId?: string) => {
-        try {
-          this.ensureCdpOrigin(entry);
-          if (name === 'Target.attachedToTarget' && typeof data?.sessionId === 'string'
-            && data.targetInfo?.type === 'iframe' && typeof data.targetInfo.targetId === 'string') {
-            const childUrl = String(data.targetInfo.url ?? '');
-            entry.cdpSessions.set(data.sessionId,
-              { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
-                ...(sourceSessionId ? { parentSessionId: sourceSessionId } : {}) });
-          } else if (name === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
-            entry.cdpSessions.delete(data.sessionId);
-          } else if (name === 'Page.frameNavigated' && sourceSessionId && entry.cdpSessions.has(sourceSessionId)) {
-            entry.cdpSessions.get(sourceSessionId)!.revision++;
-          } else if (name === 'Target.targetInfoChanged' && typeof data?.targetInfo?.targetId === 'string') {
-            for (const session of entry.cdpSessions.values()) {
-              if (session.targetId === data.targetInfo.targetId) {
-                const nextUrl = String(data.targetInfo.url ?? '');
-                session.url = nextUrl; session.revision++;
+      if (!entry.debuggerListenersInstalled) {
+        entry.debuggerListenersInstalled = true;
+        entry.guest.debugger.on('detach', () => {
+          this.revokePlaywright(entry);
+          entry.attached = false; entry.cdpSessions.clear(); entry.cdpEvents.clear();
+        });
+        entry.guest.debugger.on('message', (_event, name, data: any, sourceSessionId?: string) => {
+          try {
+            this.ensureCdpOrigin(entry);
+            if (name === 'Target.attachedToTarget' && typeof data?.sessionId === 'string'
+              && data.targetInfo?.type === 'iframe' && typeof data.targetInfo.targetId === 'string') {
+              const childUrl = String(data.targetInfo.url ?? '');
+              entry.cdpSessions.set(data.sessionId,
+                { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
+                  ...(sourceSessionId ? { parentSessionId: sourceSessionId } : {}) });
+            } else if (name === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
+              entry.cdpSessions.delete(data.sessionId);
+            } else if (name === 'Page.frameNavigated' && sourceSessionId && entry.cdpSessions.has(sourceSessionId)) {
+              entry.cdpSessions.get(sourceSessionId)!.revision++;
+            } else if (name === 'Target.targetInfoChanged' && typeof data?.targetInfo?.targetId === 'string') {
+              for (const session of entry.cdpSessions.values()) {
+                if (session.targetId === data.targetInfo.targetId) {
+                  const nextUrl = String(data.targetInfo.url ?? '');
+                  session.url = nextUrl; session.revision++;
+                }
               }
             }
-          }
-          const child = sourceSessionId ? entry.cdpSessions.get(sourceSessionId) : undefined;
-          const eventTarget = data?.targetInfo?.type === 'iframe' ? data.targetInfo : null;
-          const safePage = (url: string) => { try { origin(url); return true; } catch { return false; } };
-          if ((!eventTarget || safePage(String(eventTarget.url ?? '')))
-            && (!sourceSessionId || (child && safePage(child.url)))) {
-            if (!entry.credentialProtected && !entry.protectedActivity) {
-              entry.cdpEvents.record(name, data, { tabId: entry.guest.id,
-                ...(child ? { sessionId: sourceSessionId, targetId: child.targetId } : {}) });
+            const child = sourceSessionId ? entry.cdpSessions.get(sourceSessionId) : undefined;
+            const eventTarget = data?.targetInfo?.type === 'iframe' ? data.targetInfo : null;
+            const safePage = (url: string) => { try { origin(url); return true; } catch { return false; } };
+            if ((!eventTarget || safePage(String(eventTarget.url ?? '')))
+              && (!sourceSessionId || (child && safePage(child.url)))) {
+              if (!entry.credentialProtected && !entry.protectedActivity) {
+                entry.cdpEvents.record(name, data, { tabId: entry.guest.id,
+                  ...(child ? { sessionId: sourceSessionId, targetId: child.targetId } : {}) });
+                if (entry.playwrightLease) entry.playwrightEvents.record(name, data, { tabId: entry.guest.id,
+                  ...(child ? { sessionId: sourceSessionId, targetId: child.targetId } : {}) });
+              }
             }
+          } catch { this.revokePlaywright(entry); entry.cdpEvents.clear(); entry.cdpSessions.clear(); entry.cdpOrigin = null; }
+          if (entry.credentialProtected || entry.protectedActivity) return;
+          if (name === 'Runtime.consoleAPICalled') {
+            entry.console.push({ type: String(data.type ?? ''), text: (data.args ?? []).map((arg: any) =>
+              String(arg.value ?? arg.description ?? '')).join(' ').slice(0, 1000) });
+            if (entry.console.length > 100) entry.console.shift();
+          } else if (name === 'Network.requestWillBeSent') {
+            entry.requests.push({ method: String(data.request?.method ?? ''), url: String(data.request?.url ?? '') });
+            if (entry.requests.length > 100) entry.requests.shift();
           }
-        } catch { entry.cdpEvents.clear(); entry.cdpSessions.clear(); entry.cdpOrigin = null; }
-        if (entry.credentialProtected || entry.protectedActivity) return;
-        if (name === 'Runtime.consoleAPICalled') {
-          entry.console.push({ type: String(data.type ?? ''), text: (data.args ?? []).map((arg: any) =>
-            String(arg.value ?? arg.description ?? '')).join(' ').slice(0, 1000) });
-          if (entry.console.length > 100) entry.console.shift();
-        } else if (name === 'Network.requestWillBeSent') {
-          entry.requests.push({ method: String(data.request?.method ?? ''), url: String(data.request?.url ?? '') });
-          if (entry.requests.length > 100) entry.requests.shift();
-        }
-      });
+        });
+      }
       await Promise.all([
         entry.guest.debugger.sendCommand('Page.enable'),
         entry.guest.debugger.sendCommand('Runtime.enable'),
@@ -560,6 +578,152 @@ export class EmbeddedBrowserDriver {
       ? await entry.guest.debugger.sendCommand(method, params, sessionId)
       : await entry.guest.debugger.sendCommand(method, params); }
     finally { entry.agentInputDepth--; }
+  }
+
+  private revokePlaywright(entry: Entry): void {
+    entry.playwrightLease = null;
+    entry.playwrightEvents.clear();
+  }
+
+  private async playwrightControl(entry: Entry, request: EmbeddedBrowserRequest, upload: ApprovedBrowserUpload | undefined,
+    approval: ApprovedBrowserCdpRead | undefined, isCurrent?: () => boolean): Promise<unknown> {
+    const args = request.args, id = args.leaseId;
+    if (typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id) || request.tabId !== entry.guest.id) {
+      throw new Error('Invalid browser executor lease');
+    }
+    if (request.command === 'playwrightEnd') {
+      if (entry.playwrightLease?.id === id) this.revokePlaywright(entry);
+      // Old cleanup cannot detach a replacement owner's debugger or leave the
+      // current lease alive. Cleanup remains possible after Stop/navigation.
+      if (args.detach === true && entry.playwrightLastLeaseId === id && !entry.playwrightLease) {
+        entry.playwrightLastLeaseId = null;
+        if (!entry.guest.isDestroyed() && entry.attached) {
+          try { entry.guest.debugger.detach(); } catch { /* Guest is already detaching. */ }
+          entry.attached = false; entry.cdpSessions.clear(); entry.cdpEvents.clear();
+        }
+      }
+      return { ok: true };
+    }
+    const current = (lease?: PlaywrightLease) => {
+      if (this.entries.get(entry.guest.id) !== entry || entry.guest.isDestroyed() || entry.host.isDestroyed()
+        || (isCurrent && !isCurrent()) || !approval?.isCurrentChild() || !approval.isAllowed()) {
+        throw new Error('Browser executor was cancelled or its site permission was revoked');
+      }
+      if (typeof args.approvedOrigin !== 'string' || origin(args.approvedOrigin) !== args.approvedOrigin
+        || approval.origin !== args.approvedOrigin || origin(entry.guest.getURL()) !== args.approvedOrigin
+        || !entry.allowedOrigins.has(args.approvedOrigin) || entry.pendingNavigation) {
+        throw new Error('Browser executor page changed; take a new snapshot');
+      }
+      if (entry.credentialProtected || entry.protectedActivity || entry.cdpReadDepth || entry.cdpWriteDepth) {
+        throw new Error('Browser executor is unavailable during credential protection or raw CDP');
+      }
+      if (lease && (entry.playwrightLease !== lease || lease.id !== id || lease.origin !== args.approvedOrigin
+        || lease.expiresAt <= Date.now() || lease.documentEpoch !== entry.documentEpoch || lease.cdpEpoch !== entry.cdpEpoch)) {
+        throw new Error('Browser executor lease expired or page changed; take a new snapshot');
+      }
+    };
+    current();
+    if (request.command === 'playwrightStart') {
+      if (typeof args.input !== 'boolean' || typeof args.fresh !== 'boolean') throw new Error('Invalid browser executor configuration');
+      if (entry.playwrightLease && entry.playwrightLease.id !== id && entry.playwrightLease.expiresAt > Date.now()) {
+        throw new Error('Browser executor is already busy');
+      }
+      if (args.input) {
+        await this.waitForUserIdle(entry.guest.id, isCurrent ?? approval?.isCurrentChild);
+        current(); if (this.userActive(entry)) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
+      }
+      let uploadPaths: string[] | undefined;
+      if (args.uploadPaths !== undefined) {
+        if (!args.input || !Array.isArray(args.uploadPaths) || !args.uploadPaths.length || args.uploadPaths.length > 20
+          || args.uploadPaths.some(file => typeof file !== 'string' || !path.isAbsolute(file))
+          || !upload || !upload.isCurrentChild() || upload.origin !== args.approvedOrigin
+          || upload.stamps.length !== args.uploadPaths.length || args.uploadPaths.some((file, index) => upload.stamps[index]?.path !== file)
+          || this.uploadOrigin(entry.guest.id) !== args.approvedOrigin) throw new Error('Browser upload was not approved for this executor action');
+        uploadPaths = [...args.uploadPaths] as string[];
+      }
+      this.ensureCdpOrigin(entry);
+      this.revokePlaywright(entry);
+      entry.playwrightEvents = new BrowserCdpEventBuffer();
+      const lease: PlaywrightLease = { id, origin: args.approvedOrigin as string, input: args.input,
+        documentEpoch: entry.documentEpoch, cdpEpoch: entry.cdpEpoch, expiresAt: Date.now() + 45_000, targetId: '',
+        ...(uploadPaths && upload ? { uploadPaths, uploadStamps: upload.stamps.map(stamp => ({ ...stamp })) } : {}) };
+      entry.playwrightLease = lease; entry.playwrightLastLeaseId = id;
+      try {
+        const info = await this.command(entry, 'Target.getTargetInfo', {}, () => current(lease));
+        if (typeof info.targetInfo?.targetId !== 'string' || !info.targetInfo.targetId) throw new Error('Browser executor target is unavailable');
+        lease.targetId = info.targetInfo.targetId;
+        const tree = await this.command(entry, 'Page.getFrameTree', {}, () => current(lease));
+        if (!tree.frameTree?.frame?.id) throw new Error('Browser executor document is unavailable');
+        const childTargets = [...entry.cdpSessions.values()].flatMap(child => {
+          try { origin(child.url); return [{ targetId: child.targetId, url: child.url }]; } catch { return []; }
+        });
+        if (args.fresh) {
+          await this.command(entry, 'Runtime.disable', {}, () => current(lease));
+          await this.command(entry, 'Target.setAutoAttach', { autoAttach: false, flatten: true,
+            waitForDebuggerOnStart: false }, () => current(lease));
+        }
+        current(lease);
+        return { targetInfo: { ...info.targetInfo, type: 'page' }, frameTree: tree.frameTree, childTargets,
+          documentEpoch: entry.documentEpoch, cdpEpoch: entry.cdpEpoch };
+      } catch (error) { if (entry.playwrightLease === lease) this.revokePlaywright(entry); throw error; }
+    }
+    const lease = entry.playwrightLease;
+    if (!lease) throw new Error('Browser executor lease expired; take a new snapshot');
+    current(lease);
+    if (request.command === 'playwrightEvents') {
+      if (!Number.isSafeInteger(args.afterSequence) || (args.afterSequence as number) < 0
+        || !Number.isFinite(args.waitMs) || (args.waitMs as number) < 0 || (args.waitMs as number) > 500) throw new Error('Invalid browser executor event query');
+      const result = await entry.playwrightEvents.wait({ afterSequence: args.afterSequence, timeoutMs: args.waitMs, limit: 500 }, () => {
+        try { current(lease); return true; } catch { return false; }
+      });
+      current(lease);
+      if (result.truncated) throw new Error('Browser executor event stream was interrupted; take a new snapshot');
+      return { events: result.events.map(event => ({ sequence: event.sequence, leaseId: id, method: event.method,
+        params: event.params ?? {}, ...(event.source.sessionId ? { sessionId: event.source.sessionId } : {}) })) };
+    }
+    const method = typeof args.method === 'string' ? args.method : '';
+    if (request.command !== 'playwrightCdp' || (!PLAYWRIGHT_METHODS.has(method) && method !== 'DOM.setFileInputFiles')
+      || !args.params || typeof args.params !== 'object' || Array.isArray(args.params)) throw new Error('Browser executor CDP method is unavailable');
+    const params = { ...args.params as Record<string, unknown> };
+    if (JSON.stringify(params).length > 512_000) throw new Error('Browser executor parameters are too large');
+    if (args.sessionId !== undefined && (typeof args.sessionId !== 'string' || !args.sessionId || args.sessionId.length > 200)) {
+      throw new Error('Invalid browser executor child session');
+    }
+    const child = typeof args.sessionId === 'string' ? await this.resolveCdpTarget(entry, { sessionId: args.sessionId }) : undefined;
+    if (method === 'Target.getTargetInfo' && params.targetId !== undefined && params.targetId !== lease.targetId
+      && ![...entry.cdpSessions.values()].some(session => session.targetId === params.targetId)) {
+      throw new Error('Browser executor target is outside this tab');
+    }
+    if (method === 'Target.setAutoAttach') params.filter = [{ type: 'iframe', exclude: false }];
+    const beforeSend = () => {
+      current(lease);
+      if (child && (entry.cdpSessions.get(child.sessionId) !== child.info || child.info.revision !== child.revision)) {
+        throw new Error('Browser executor frame changed; take a new snapshot');
+      }
+      if (method.startsWith('Input.') || method === 'DOM.setFileInputFiles') {
+        if (!lease.input) throw new Error('Browser executor observation cannot send input');
+        if (this.userActive(entry)) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
+      }
+      if (method === 'DOM.setFileInputFiles') {
+        if (!lease.uploadPaths || !lease.uploadStamps || JSON.stringify(params.files) !== JSON.stringify(lease.uploadPaths)
+          || this.uploadOrigin(entry.guest.id) !== lease.origin) throw new Error('Upload paths are not approved for this executor action');
+        for (const stamp of lease.uploadStamps) {
+          const stat = lstatSync(stamp.path);
+          if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(stamp.path) !== stamp.realPath
+            || stat.dev !== stamp.dev || stat.ino !== stamp.ino || stat.size !== stamp.size || stat.mtimeMs !== stamp.mtimeMs) {
+            throw new Error('Approved browser upload file changed');
+          }
+        }
+      }
+    };
+    beforeSend();
+    if (method.startsWith('Input.') || method === 'DOM.setFileInputFiles') this.markVisitSource(entry, 'agent');
+    const result = await this.command(entry, method, params, beforeSend, child?.sessionId);
+    current(lease);
+    if (child && (entry.cdpSessions.get(child.sessionId) !== child.info || child.info.revision !== child.revision)) {
+      throw new Error('Browser executor frame changed; take a new snapshot');
+    }
+    return result;
   }
 
   private async resolveCdpTarget(entry: Entry, target: BrowserCdpTarget | undefined): Promise<{
@@ -613,6 +777,7 @@ export class EmbeddedBrowserDriver {
   private async withProtectedActivity<T>(entry: Entry, work: () => Promise<T>): Promise<T> {
     if (entry.cdpReadDepth || entry.cdpWriteDepth || entry.protectedActivity)
       throw new Error('Browser operation is unavailable during raw CDP or another protected operation');
+    this.revokePlaywright(entry);
     entry.protectedActivity++;
     try { return await work(); }
     finally { entry.protectedActivity--; }
@@ -842,8 +1007,12 @@ export class EmbeddedBrowserDriver {
 
   async handle(request: EmbeddedBrowserRequest, approvedUpload?: ApprovedBrowserUpload,
     approvedCdp?: ApprovedBrowserCdpRead, isCurrent?: () => boolean): Promise<unknown> {
+    if (request.command === 'playwrightEnd') {
+      const entry = this.entries.get(request.tabId ?? -1);
+      return entry ? this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent) : { ok: true };
+    }
     if (request.command === 'screenshot'
-      || (request.command === 'cdpCall' && request.args.method === 'Page.captureScreenshot')) {
+      || ((request.command === 'cdpCall' || request.command === 'playwrightCdp') && request.args.method === 'Page.captureScreenshot')) {
       throw new Error('Screenshots are not supported by the embedded browser. Use a text snapshot instead.');
     }
     if (WRITES.has(request.command)) {
@@ -962,6 +1131,10 @@ export class EmbeddedBrowserDriver {
       throw new Error('This site needs Memmy access approval first');
     }
     if (NAVIGATION_ACTIONS.has(request.command)) this.markVisitSource(entry, 'agent');
+    if (request.command.startsWith('playwright')) return this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent);
+    if (entry.playwrightLease && ['cdpCall', 'cdpWrite', 'cdpEvents', 'upload', 'authRequest', 'fillCredential', 'fillContact'].includes(request.command)) {
+      throw new Error('Browser operation cannot overlap the current browser executor lease');
+    }
     switch (request.command) {
       case 'allowOrigin': {
         const allowed = origin(String(args.origin ?? ''));
@@ -1233,6 +1406,7 @@ export class EmbeddedBrowserDriver {
 
   dispose(): void {
     for (const entry of this.entries.values()) {
+      this.revokePlaywright(entry);
       if (!entry.guest.isDestroyed() && entry.attached) {
         try { entry.guest.debugger.detach(); } catch { /* Guest may be closing. */ }
       }

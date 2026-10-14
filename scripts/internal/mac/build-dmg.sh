@@ -775,6 +775,8 @@ verify_packaged_mac_unpacked_artifacts() {
   local packaged_embedding_model="$app_path/Contents/Resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$app_path/Contents/Resources/app.asar"
+  node "$ROOT_DIR/scripts/internal/shared/verify-browser-extension.mjs" \
+    "$DESKTOP_DIR/extensions/memmy-browser" "$app_path/Contents/Resources/browser-extension"
   local cpu="$target_cpu"
   if [ "$cpu" = "x64" ]; then cpu=x86_64; fi
   for addon in memmy-pip menu-bar-appearance; do

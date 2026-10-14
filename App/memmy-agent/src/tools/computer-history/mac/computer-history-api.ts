@@ -52,6 +52,9 @@ import { physicalRuntimeAsset } from "./native-helper.js";
 import { resolveMacWeChatPython } from "./wechat-python.js";
 import { resolveWindowsWeChatPython } from "../win/python-runtime.js";
 import { buildBrowserAuthoritySnapshot, writeBrowserAuthority, type BrowserFocusObservation } from "../browser-privacy.js";
+import { appendBrowserHistoryEvent, prepareBrowserHistoryEvent,
+  type BrowserHistoryCaptureIntent, type BrowserHistoryTrustedContext } from "../browser-semantic-history.js";
+import { connectBrowserHistoryBridge } from "../browser-history-bridge.js";
 
 /** The authority sidecar is a recording too: excluded page identity never goes to disk. */
 export function filterHistoryAuthorityObservations(settings: ObservationSettings,
@@ -425,6 +428,8 @@ export class ComputerHistoryDemoService {
   private browserAuthoritySuspended = true;
   private browserAuthorityCleared = false;
   private publishBrowserAuthority: (() => void) | null = null;
+  private readonly browserEventIds = new Set<string>();
+  private browserHistoryBridge: ReturnType<typeof connectBrowserHistoryBridge> | null = null;
   private readonly liveSummaryIntervalMs: number;
   private segment: SegmentState | null = null;
   private observationState: ObservationState = "stopped";
@@ -551,6 +556,11 @@ export class ComputerHistoryDemoService {
       this.browserAuthorityEnabled = true;
       this.startBrowserAuthorityPublisher();
     }
+    // DOM semantics use the same History consent on both platforms and need no Agent claim.
+    void import("../../../core/agent-runtime/tools/external-browser-bridge.js").then(({ externalBrowserBridge }) => {
+      if (this.shuttingDown) return;
+      this.browserHistoryBridge = connectBrowserHistoryBridge(this, externalBrowserBridge);
+    }).catch(() => { /* A missing browser connection must not interrupt native History recording. */ });
   }
 
   /** Clear page identity immediately, including while an async stop is draining. */
@@ -563,6 +573,35 @@ export class ComputerHistoryDemoService {
       // A failed replacement must not leave a previously authorized URL alive.
       try { fs.rmSync(this.browserAuthorityPath, { force: true }); this.browserAuthorityCleared = true; } catch { /* Unreadable authority cannot authorize native-unknown capture. */ }
     }
+  }
+
+  /** Passive browser observation follows the ordinary History switch, independent of Agent chats. */
+  getBrowserCaptureIntent(): BrowserHistoryCaptureIntent {
+    const disabled = { enabled: false, generation: null, settings: null, captureText: false } as const;
+    if (this.shuttingDown || this.browserAuthoritySuspended || this.recorderTransition
+      || this.observationState !== "running" || !this.segment) return disabled;
+    try {
+      // Capture cannot use the settings store's UI-friendly fallback on a missing/corrupt file.
+      const settings = parseObservationSettings(JSON.parse(fs.readFileSync(this.observationSettings.filePath, "utf8")));
+      const policy = crypto.createHash("sha256").update(JSON.stringify(settings)).digest("hex").slice(0, 20);
+      return { enabled: true, generation: `${this.segment.id}:${this.captureHealthGeneration}:${policy}`,
+        settings, captureText: true };
+    } catch { return disabled; }
+  }
+
+  /** The bridge supplies browser-owned context; DOM messages supply observations only. */
+  ingestBrowserSemanticEvent(payload: unknown, context: BrowserHistoryTrustedContext): boolean {
+    const intent = this.getBrowserCaptureIntent();
+    const segment = this.segment;
+    const prepared = prepareBrowserHistoryEvent(payload, context, intent);
+    if (!prepared || !segment || this.browserEventIds.has(prepared.deduplicationKey)) return false;
+    // Validation and commit are synchronous, so Stop/Pause/policy transitions cannot interleave.
+    appendBrowserHistoryEvent(segment.eventsFile, prepared);
+    this.browserEventIds.add(prepared.deduplicationKey);
+    if (this.browserEventIds.size > 4096) this.browserEventIds.delete(this.browserEventIds.values().next().value!);
+    if (!this.captureLastEventAt || prepared.event.timestamp > this.captureLastEventAt) this.captureLastEventAt = prepared.event.timestamp;
+    this.invalidateSummary(segment.historyFile);
+    return true;
   }
 
   // This sidecar obeys the same recording intent and strict policy as raw
@@ -2405,6 +2444,8 @@ export class ComputerHistoryDemoService {
   async shutdown(): Promise<void> {
     ++this.permissionStartVersion;
     this.shuttingDown = true;
+    this.browserHistoryBridge?.close();
+    this.browserHistoryBridge = null;
     this.browserAuthoritySuspended = true;
     this.clearBrowserAuthority();
     if (this.browserAuthorityTimer) clearInterval(this.browserAuthorityTimer);
@@ -3236,18 +3277,22 @@ function queryTerms(value: string): string[] {
   return [...terms].slice(0, 32);
 }
 
-function buildRecordedExperienceWorkflow(input: {
+export function buildRecordedExperienceWorkflow(input: {
   history: ComputerHistoryEntry;
   request: string;
   steps: string[];
 }): string {
+  const isBrowserStep = (step: string) => /^Recorded browser operation \(/u.test(step);
+  const browserSteps = input.steps.filter(isBrowserStep).length;
   const gateSections = input.steps.map((step, index) => [
     `### Gate ${index + 1} of ${input.steps.length}`,
     "",
     `Recorded semantic action: ${step}`,
     "",
-    "- Read the target application's current window state immediately before acting.",
-    "- Locate the target from current Accessibility text, role, value, or visible UI; never use a recorded coordinate.",
+    isBrowserStep(step) ? "- Execution surface: browser. Resolve the intended Chrome/Edge tab with browser_list_tabs, then read browser_snapshot immediately before acting."
+      : "- Execution surface: desktop. Read the target application's current window state immediately before acting.",
+    isBrowserStep(step) ? "- Locate the current page control using its role/name and current state; use browser actions and verify the returned or refreshed browser state. Never replay a recorded reference or coordinate."
+      : "- Locate the target from current Accessibility text, role, value, or visible UI; never use a recorded coordinate.",
     "- Perform this gate at most once, then read state again and record concrete evidence that its intended effect occurred.",
     `- Gate ${index + 2} is locked until this evidence exists. If the target or evidence is unavailable, stop and report this gate as blocked.`,
   ].join("\n")).join("\n\n");
@@ -3269,15 +3314,21 @@ function buildRecordedExperienceWorkflow(input: {
     "",
     `> ${input.request}`,
     "",
-    "This Workflow was distilled from an explicit human demonstration. It is a semantic state machine, not a macro: raw coordinates and exact scroll distances are deliberately excluded.",
+    browserSteps ? "This Workflow was distilled from observed operation evidence. Browser steps preserve their human/unknown actor attribution; an unknown actor is not a confirmed human demonstration. Follow semantic targets and state transitions rather than recorded coordinates."
+      : "This Workflow was distilled from an explicit human demonstration. It is a semantic state machine, not a macro: raw coordinates and exact scroll distances are deliberately excluded.",
     "",
     "## Execution contract",
     "",
     "1. Start by stating the current request, the source History title, and the safety boundary inferred from the request.",
-    "2. Use only the Memmy Computer Use MCP tools `mcp_memmy_computer_use_list_apps`, `mcp_memmy_computer_use_get_app_state`, `mcp_memmy_computer_use_click`, `mcp_memmy_computer_use_type_text`, `mcp_memmy_computer_use_press_key`, and `mcp_memmy_computer_use_scroll`. If these tools are unavailable, stop and report the workflow as blocked; never substitute another desktop executor.",
+    browserSteps ? "2. Browser gates use Memmy browser tools: browser_list_tabs, browser_snapshot, browser_click, browser_type, browser_select_option, browser_press_key, and browser_wait_for. Preserve the selected tab and verify every state transition."
+      + (browserSteps < input.steps.length ? " Desktop gates use only Memmy Computer Use MCP list_apps/get_app_state/click/type_text/press_key/scroll. Choose the executor from each gate's surface." : "")
+      + " If a required tool or target is unavailable, stop at that gate and report it as blocked."
+      : "2. Use only the Memmy Computer Use MCP tools `mcp_memmy_computer_use_list_apps`, `mcp_memmy_computer_use_get_app_state`, `mcp_memmy_computer_use_click`, `mcp_memmy_computer_use_type_text`, `mcp_memmy_computer_use_press_key`, and `mcp_memmy_computer_use_scroll`. If these tools are unavailable, stop and report the workflow as blocked; never substitute another desktop executor.",
     "3. Execute the gates below strictly in order. Maintain a visible checklist such as `G1 verified / G2 pending`; never search for a later action while an earlier gate is unresolved.",
-    "4. Start with `list_apps` and `get_app_state`. Memmy Computer Use action tools return refreshed post-action state; use that result as verification evidence instead of immediately calling `get_app_state` again. Read state again only after an out-of-band UI change or when the action result lacks the evidence needed for the next gate.",
-    "5. Element indexes are state-scoped. Use only an `element_index` from the latest returned state, and never reuse an index after a click, key action, scroll, navigation, modal change, or page reload.",
+    browserSteps ? "4. For browser gates, begin with browser_list_tabs/browser_snapshot and verify the actual state after each action. For desktop gates, use list_apps/get_app_state and the refreshed state returned by the action."
+      : "4. Start with `list_apps` and `get_app_state`. Memmy Computer Use action tools return refreshed post-action state; use that result as verification evidence instead of immediately calling `get_app_state` again. Read state again only after an out-of-band UI change or when the action result lacks the evidence needed for the next gate.",
+    browserSteps ? "5. Browser element references and desktop element indexes belong to the current observation. Re-observe after navigation, modal changes or stale targets, and locate each gate from live semantics."
+      : "5. Element indexes are state-scoped. Use only an `element_index` from the latest returned state, and never reuse an index after a click, key action, scroll, navigation, modal change, or page reload.",
     "6. Recorded scrolls are navigation hints, not workflow gates. If a target is absent, scroll at most one viewport and inspect the state returned by that scroll; stop as soon as the target or its section anchor appears.",
     "7. If the live UI differs from the demonstration, adapt semantic localization but preserve the demonstrated intent and order. Do not guess missing values or choose approximate alternatives.",
     "",

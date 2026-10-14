@@ -20,6 +20,7 @@ import { BrowserWebviewDownloads } from './browser-webview-downloads.js';
 import { attachBrowserWebviewPermissions } from './browser-webview-permissions.js';
 import { BrowserAccessStore } from './browser-access-store.js';
 import { BrowserUseSitePolicyStore } from './browser-use-site-policy-store.js';
+import { rememberBrowserCdpGrant } from './browser-cdp-remembered-grant.js';
 import { showBrowserAuthForm } from './browser-auth-form.js';
 import { resolveExternalBrowserExtensionDirectory } from './external-browser-extension-directory.js';
 import { createExternalBrowserExtensionDragHandler, EXTERNAL_BROWSER_EXTENSION_DRAG_CHANNEL } from './external-browser-extension-drag.js';
@@ -233,15 +234,16 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
   if (decision === 'block') return false;
   if (decision === 'allow') return true;
   const chinese = app.getLocale().toLowerCase().startsWith('zh');
+  const isDebug = capability === 'debug' || capability === 'debug-write';
   const direction = capability === 'upload'
     ? (chinese ? '上传' : 'upload') : capability === 'download'
       ? (chinese ? '下载' : 'download') : (chinese ? '读取 CDP 信息' : 'read CDP data');
   const detail = capability === 'debug-write'
-    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n此操作可修改当前网页或浏览器状态，仅本次有效。`
-      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation can modify the current page or browser state. Applies once.`)
+    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n此操作可修改当前网页或浏览器状态。始终允许可在浏览器设置的「网站权限」中撤销。`
+      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation can modify the current page or browser state. Revoke a saved grant in Browser settings → Website permissions.`)
     : capability === 'debug'
-    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n仅本次只读 CDP 操作有效。`
-      : `Site: ${origin}\nMethods: ${names.join(', ')}\nApplies only to this read-only CDP operation.`)
+    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n本次操作为只读。始终允许将保存此网站的 Debug / CDP 权限，可在浏览器设置中撤销。`
+      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation is read-only. Always allow saves this site's Debug / CDP permission; revoke it in Browser settings.`)
     : (chinese ? `站点：${origin}\n文件：${names.join('、')}\n仅本次${direction}有效。`
       : `Site: ${origin}\nFiles: ${names.join(', ')}\nApplies only to this ${direction}.`);
   const message = capability === 'debug-write'
@@ -260,12 +262,16 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
       : capability === 'debug'
         ? (chinese ? '浏览器调试读取审批' : 'Browser debug read approval')
       : (chinese ? '浏览器文件操作审批' : 'Browser file approval'),
-    message, detail, buttons: chinese ? ['阻止', '仅本次允许'] : ['Block', 'Allow this operation'],
+    message, detail, buttons: isDebug
+      ? (chinese ? ['阻止', '仅本次允许', '始终允许此网站'] : ['Block', 'Allow this operation', 'Always allow this site'])
+      : (chinese ? ['阻止', '仅本次允许'] : ['Block', 'Allow this operation']),
     defaultId: 0, cancelId: 0, noLink: true,
   });
-  if (approvalWindow.isDestroyed() || choice.response !== 1) return false;
+  if (approvalWindow.isDestroyed() || (choice.response !== 1 && !(isDebug && choice.response === 2))) return false;
   try {
-    const currentRules = new BrowserUseSitePolicyStore(dirname(configPath)).list();
+    const store = new BrowserUseSitePolicyStore(dirname(configPath));
+    if (isDebug && choice.response === 2) return rememberBrowserCdpGrant(store, origin);
+    const currentRules = store.list();
     return evaluateBrowserUseSiteRule(currentRules, origin,
       capability === 'download' ? 'downloads' : capability === 'upload' ? 'uploads' : 'fullCdp') !== 'block';
   } catch { return false; }
@@ -560,6 +566,27 @@ async function boot(): Promise<void> {
           if (!workspace) throw new Error('Browser upload workspace is unavailable');
           return runApprovedEmbeddedUpload(request, workspace, embeddedBrowserDriver,
             (site, names) => approveBrowserCapabilityOperation('upload', site, names), isCurrentChild);
+        }
+        if (['playwrightStart', 'playwrightCdp', 'playwrightEnd', 'playwrightEvents'].includes(request.command)) {
+          const configPath = runtimeServices?.agentGateway.configPath;
+          if (!configPath) throw new Error('Browser page policy is unavailable');
+          const approvedOrigin = String(request.args.approvedOrigin ?? '');
+          const approvedPage = { origin: approvedOrigin, isCurrentChild, isAllowed: () => {
+            try {
+              return isCurrentChild() && evaluateBrowserUseSiteRule(
+                new BrowserUseSitePolicyStore(dirname(configPath)).list(), approvedOrigin, 'access') !== 'block';
+            } catch { return false; }
+          } };
+          if (request.command === 'playwrightStart' && request.args.uploadPaths !== undefined) {
+            const workspace = runtimeServices?.agentGateway.workspace;
+            if (!workspace) throw new Error('Browser upload workspace is unavailable');
+            return runApprovedEmbeddedUpload({ ...request, command: 'upload',
+              args: { ...request.args, paths: request.args.uploadPaths } }, workspace, {
+              uploadOrigin: tabId => embeddedBrowserDriver.uploadOrigin(tabId),
+              handle: (_uploadRequest, approval) => embeddedBrowserDriver.handle(request, approval, approvedPage, isCurrentChild),
+            }, (site, names) => approveBrowserCapabilityOperation('upload', site, names), isCurrentChild);
+          }
+          return embeddedBrowserDriver.handle(request, undefined, approvedPage, isCurrentChild);
         }
         if (request.command === 'cdpCall' || request.command === 'cdpEvents'
           || request.command === 'cdpWrite') {

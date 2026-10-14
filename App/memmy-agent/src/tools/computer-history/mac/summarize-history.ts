@@ -472,6 +472,19 @@ function reusableHumanAction(record: JsonRecord, { navigationHint = "" }: { navi
   const application = record.application?.name ?? record.application?.bundleId ?? "unknown application";
   const bundleId = record.application?.bundleId ?? "unknown";
   const details = record.details ?? {};
+  if (record.eventType === "browser_action") {
+    if (details.actor === "agent" || details.phase === "context") return null;
+    const target = [details.target?.role, details.target?.name].filter((value) => typeof value === "string" && value).join(" ");
+    const action = cleanInline(details.action, 80);
+    const after = details.after?.target;
+    const expected = after && typeof after === "object"
+      ? ["checked", "selected", "expanded", "value"].filter((key) => after[key] !== undefined)
+        .map((key) => `${key}=${cleanInline(JSON.stringify(after[key]), 240)}`).join(", ") : "";
+    return `Recorded browser operation (${details.actor === "human" ? "human" : "unknown"} actor${details.phase === "attempt" ? "; attempt, outcome unconfirmed" : ""}) in ${application}: ${action}`
+      + (target ? ` on ${cleanInline(target, 300)}` : "; target label unavailable")
+      + (expected ? `; observed subsequent state: ${expected}` : "; subsequent outcome is not established")
+      + ". Locate the matching live control with browser tools and verify its current state; never replay recorded coordinates or assume a business submission succeeded.";
+  }
   if (record.eventType === "application_changed") {
     return `Activate ${application} (\`${bundleId}\`) and verify its main content window is visible.`;
   }
@@ -516,6 +529,10 @@ function compressedScrollHint(scrolls: JsonRecord[]): string {
 
 export function reusableHumanActions(events: JsonRecord[]): string[] {
   const actions: string[] = [];
+  const observedInteractions = new Set(events.filter(event => event.eventType === "browser_action" && event.details?.phase !== "attempt"
+    && event.details?.phase !== "context" && typeof event.details?.interactionId === "string")
+    .map(event => `${event.application?.bundleId}:${event.details.documentId}:${event.details.interactionId}`));
+  const includedInteractions = new Set<string>();
   let pendingScrolls: JsonRecord[] = [];
   const flushPendingScrolls = () => {
     if (!pendingScrolls.length) return;
@@ -524,6 +541,11 @@ export function reusableHumanActions(events: JsonRecord[]): string[] {
     pendingScrolls = [];
   };
   for (const event of events) {
+    if (event.eventType === "browser_action" && typeof event.details?.interactionId === "string") {
+      const key = `${event.application?.bundleId}:${event.details.documentId}:${event.details.interactionId}`;
+      if ((event.details.phase === "attempt" && observedInteractions.has(key)) || includedInteractions.has(key)) continue;
+      if (event.details.actor !== "agent" && event.details.phase !== "context") includedInteractions.add(key);
+    }
     if (event.eventType === "scroll") {
       pendingScrolls.push(event);
       continue;

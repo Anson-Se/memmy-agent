@@ -16,6 +16,8 @@ function harness(selected = true) {
   const browserSession = { partition: 'persist:memmy-browser' };
   const debuggerEvents = new EventEmitter();
   const sendCommand = vi.fn(async (method: string, args?: Record<string, any>) => {
+    if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: 'target-27', type: 'page', url } };
+    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-27', url } } };
     if (method === 'Accessibility.getFullAXTree') return { nodes: [
       { backendDOMNodeId: 7, role: { value: 'link' }, name: { value: 'Learn more' }, ignored: false },
     ] };
@@ -1136,4 +1138,129 @@ it('issues an exact current tab mention and closes the addressed webview', async
   expect(host.webContents.send).toHaveBeenCalledWith('memmy:browser:close-tab', 27);
   await expect(driver.handle(request('snapshot'))).rejects.toThrow(/no longer open/);
   driver.dispose();
+});
+
+function playwrightHarness() {
+  const test = harness();
+  let allowed = true, current = true;
+  const approval = { origin: 'https://example.com', isAllowed: () => allowed, isCurrentChild: () => current };
+  const id = 'a'.repeat(32);
+  const run = (command: EmbeddedBrowserRequest['command'], args: Record<string, unknown> = {}, upload?: any) =>
+    test.driver.handle(test.request(command, { approvedOrigin: 'https://example.com', leaseId: id, ...args }), upload, approval, () => current);
+  return { ...test, id, run, approval, start: (input = false, args: Record<string, unknown> = {}, upload?: any) =>
+    run('playwrightStart', { input, fresh: true, ...args }, upload),
+    setAllowed: (value: boolean) => { allowed = value; }, setCurrent: (value: boolean) => { current = value; } };
+}
+
+it('starts the built-in executor only with current site access and a fixed explicit tab', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await expect(test.driver.handle(test.request('playwrightStart', { leaseId: test.id, approvedOrigin: 'https://example.com', input: false, fresh: true })))
+      .rejects.toThrow(/cancelled|permission/);
+    expect(test.guest.debugger.attach).not.toHaveBeenCalled();
+    expect(await test.start()).toMatchObject({ targetInfo: { targetId: 'target-27', type: 'page' },
+      frameTree: { frame: { id: 'frame-27' } }, childTargets: [], documentEpoch: 0 });
+    expect(test.sendCommand).toHaveBeenCalledWith('Runtime.disable', {});
+    await expect(test.run('playwrightCdp', { method: 'Page.captureScreenshot', params: {} }))
+      .rejects.toThrow(/Screenshots are not supported/);
+  } finally { test.driver.dispose(); }
+});
+
+it('limits observation leases, rejects browser-wide/foreign targets and cancels before sending input', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.sendCommand.mockClear();
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'forbidden' } })).rejects.toThrow(/observation cannot send input/);
+    for (const method of ['Browser.close', 'Storage.getCookies', 'Target.createTarget', 'Target.attachToTarget']) {
+      await expect(test.run('playwrightCdp', { method, params: {} })).rejects.toThrow(/method is unavailable/);
+    }
+    await expect(test.run('playwrightCdp', { method: 'Target.getTargetInfo', params: { targetId: 'another-browser-tab' } }))
+      .rejects.toThrow(/outside this tab/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await test.run('playwrightEnd'); await test.start(true); test.sendCommand.mockClear();
+    test.setAllowed(false);
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never-sent' } })).rejects.toThrow(/revoked/);
+    test.setAllowed(true); test.setCurrent(false);
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never-sent' } })).rejects.toThrow(/cancelled/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('revokes same-site old documents, protects the current owner from stale End and avoids duplicate debugger listeners', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.guest.emit('did-navigate');
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: 'document.title' } }))
+      .rejects.toThrow(/lease expired/);
+    await test.start(); await test.run('playwrightEnd');
+    const replacement = 'b'.repeat(32);
+    await test.run('playwrightStart', { leaseId: replacement, input: false, fresh: true });
+    await test.run('playwrightEnd', { detach: true });
+    expect(test.guest.debugger.detach).not.toHaveBeenCalled();
+    test.setCurrent(false);
+    await expect(test.run('playwrightEnd', { leaseId: replacement, detach: true })).resolves.toEqual({ ok: true });
+    expect(test.guest.debugger.detach).toHaveBeenCalledTimes(1);
+    test.setCurrent(true); await test.start();
+    expect(test.guest.debugger.listenerCount('message')).toBe(1);
+    expect(test.guest.debugger.listenerCount('detach')).toBe(1);
+  } finally { test.driver.dispose(); }
+});
+
+it('streams only scoped executor events and fails closed when its bounded event history loses events', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.guest.debugger.emit('message', {}, 'Runtime.executionContextCreated', { context: { id: 4 } });
+    const result = await test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 });
+    expect(result).toMatchObject({ events: [{ sequence: 1, leaseId: test.id, method: 'Runtime.executionContextCreated', params: { context: { id: 4 } } }] });
+    for (let index = 0; index < 501; index++) test.guest.debugger.emit('message', {}, 'Page.lifecycleEvent', { name: 'load', frameId: 'frame-27' });
+    await expect(test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 })).rejects.toThrow(/interrupted/);
+    await test.run('playwrightEnd'); await test.start();
+    test.guest.emit('did-start-navigation', { isMainFrame: true, url: 'https://example.com/reloaded' });
+    await expect(test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 })).rejects.toThrow(/page changed/);
+  } finally { test.driver.dispose(); }
+});
+
+it('permits only an existing iframe session and detects frame replacement after an asynchronous CDP call', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: '1' }, sessionId: 'foreign-session' }))
+      .rejects.toThrow(/not attached to this tab/);
+    const info = { targetId: 'iframe-1', type: 'iframe', url: 'https://frame.test/form' };
+    test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1', targetInfo: info });
+    const initial = test.sendCommand.getMockImplementation()!;
+    test.sendCommand.mockImplementation(async (method, args) => {
+      if (method === 'Target.getTargetInfo' && args?.targetId === 'iframe-1') return { targetInfo: info } as any;
+      if (method === 'Runtime.evaluate') {
+        test.guest.debugger.emit('message', {}, 'Page.frameNavigated', { frame: { id: 'iframe-1' } }, 'session-1');
+        return { result: { value: 1 } };
+      }
+      return initial(method, args);
+    });
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: '1' }, sessionId: 'session-1' }))
+      .rejects.toThrow(/frame changed/);
+  } finally { test.driver.dispose(); }
+});
+
+it('retains typed upload permission only for matching stamped files and refuses mutation or ordinary leases', async () => {
+  const test = playwrightHarness(), directory = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-pw-upload-'));
+  const file = path.join(directory, 'approved.txt'); fs.writeFileSync(file, 'approved');
+  const stat = fs.lstatSync(file), upload = { origin: 'https://example.com', isCurrentChild: () => true, stamps: [{
+    path: file, realPath: fs.realpathSync(file), dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }] };
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start(true);
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } }))
+      .rejects.toThrow(/not approved/);
+    await test.run('playwrightEnd');
+    await expect(test.start(true, { uploadPaths: [file] })).rejects.toThrow(/not approved/);
+    await test.start(true, { uploadPaths: [file] }, upload);
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } })).resolves.toEqual({});
+    fs.writeFileSync(file, 'file changed after approval'); test.sendCommand.mockClear();
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } })).rejects.toThrow(/file changed/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); fs.rmSync(directory, { recursive: true, force: true }); }
 });

@@ -204,13 +204,13 @@ function narrowBrowserToolDefinition(tool: any): BrowserToolDefinition {
     delete definition.inputSchema.properties.tabDisposition;
   }
   if (definition.name === 'browser_snapshot' || definition.name === 'browser_find') {
-    definition.description += ' Memmy in-app tabs return page text and ax-N element references only; screenshots, image previews and snapshot boxes are unavailable. Use the returned reference for element actions; the client obtains current DOM layout when clicking.';
+    definition.description += ' Connected Memmy, Chrome and Edge pages return current semantic controls, visible text, state and element references. Use the exact returned reference for the next element action. Memmy in-app tabs have no screenshots, image previews or snapshot boxes.';
   }
   if (definition.name === 'browser_press_key') {
     definition.description += ' In a Chrome/Edge tab, keys reach only the page; browser shortcuts such as switching tabs or Back do nothing. Use browser_select_tab to show another tab.';
   }
   if (['browser_click', 'browser_type', 'browser_select_option'].includes(definition.name)) {
-    definition.description += ' For Memmy in-app tabs, prefer the exact ax-N or [ax-N] reference from the latest snapshot. Unique CSS selectors, text=substring and CSS selectors ending in :has-text("substring") are also supported. Multiple matches require a more precise target or an explicit >> nth=N suffix. A stale, hidden or covered target requires a fresh snapshot; do not infer the selected-tab state from a locator error.';
+    definition.description += ' For connected Memmy, Chrome and Edge pages, prefer the exact element reference from the latest snapshot. Unique CSS selectors, text=substring and CSS selectors ending in :has-text("substring") are supported. Multiple matches require a more precise target or an explicit >> nth=N suffix. Actions wait for the target to be usable and return a fresh observation for verifying the result. A stale, hidden or covered target requires a fresh snapshot; do not infer the selected-tab state from a locator error.';
   }
   if (definition.name === "browser_navigate") {
     const localPathDescription =

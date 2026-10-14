@@ -3,6 +3,8 @@ import { emitComputerUseSurface } from "../../../tools/computer-use/surface-prev
 import { browserAppKey } from "../../../tools/computer-use/native-app-key.js";
 import { ExternalBrowserBridge, type ExternalBrowserClaim } from "./external-browser-bridge.js";
 import { OcuUserIntervened } from "../../../tools/computer-use/mac-focus-guard.js";
+import { executeExternalBrowserPlaywright } from './external-browser-playwright.js';
+import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
 
 type ExternalResult = Record<string, any>;
 type ToolContent = Array<Record<string, any>>;
@@ -10,7 +12,9 @@ type ToolContent = Array<Record<string, any>>;
 export const EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED =
   'Screenshots are not supported for Memmy in-app browser tabs. Use browser_snapshot to read the page text and element references. Do not switch to another tab or a desktop screenshot to capture this tab.';
 
-export type BrowserCommandBridge = Pick<ExternalBrowserBridge, 'command' | 'getClaim'>;
+export type BrowserCommandBridge = Pick<ExternalBrowserBridge, 'command' | 'getClaim'>
+  & Partial<Pick<ExternalBrowserBridge, 'subscribePlaywright'>>
+  & { isFrameAllowed?: (url: string) => boolean };
 
 export function externalBrowserTargetId(claim: ExternalBrowserClaim): string {
   return `${claim.browser === 'memmy' ? 'embedded' : 'external'}:${claim.connectionId}:${claim.tabId}`;
@@ -22,7 +26,12 @@ export async function emitExternalBrowserFrame(
 ): Promise<void> {
   if (claim.browser === 'memmy') return;
   try {
-    const frame = screenshot ?? await bridge.command(claim, "screenshot", { type: "jpeg" }) as ExternalResult;
+    const policy = new BrowserUseSitePolicyReader();
+    const frame = screenshot ?? (bridge.subscribePlaywright
+      ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+        subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'screenshot', { type: 'jpeg' },
+        bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'))
+      : await bridge.command(claim, "screenshot", { type: "jpeg" }) as ExternalResult);
     if (typeof frame.data !== "string" || !["png", "jpeg"].includes(frame.format)) return;
     const history = await bridge.command(claim, "historyState") as ExternalResult;
     const latest = bridge.getClaim(claim) ?? claim;
@@ -35,12 +44,22 @@ export async function emitExternalBrowserFrame(
   } catch { /* Preview errors must not fail the browser action. */ }
 }
 
-function formatNodes(nodes: unknown): string {
+function formatNodes(nodes: unknown, truncated = false): string {
   if (!Array.isArray(nodes)) return "No accessible elements.";
-  return nodes.map((node: any) => {
+  const rendered = nodes.map((node: any) => {
     const label = [node.name, node.value].filter(Boolean).map((value: string) => JSON.stringify(value)).join(" ");
-    return `${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label ? ` ${label}` : ""}`;
-  }).join("\n").slice(0, 150_000);
+    const state = node.state && typeof node.state === 'object' ? ` state=${JSON.stringify(node.state)}` : '';
+    return `${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label ? ` ${label}` : ""}${state}`;
+  }).join("\n");
+  return (truncated || rendered.length > 150_000
+    ? '[Observation truncated by the page budget. Use a narrow browser_find query or a unique locator for more detail.]\n' : '')
+    + rendered.slice(0, 150_000);
+}
+
+function formatActionResult(result: ExternalResult): string {
+  const { observation, ...status } = result ?? {};
+  return JSON.stringify(status) + (observation?.nodes
+    ? `\n\nObserved page after action:\n${formatNodes(observation.nodes, observation.truncated === true)}` : '');
 }
 
 /** Translate the existing browser tool vocabulary to a user-claimed Chrome/Edge tab. */
@@ -57,9 +76,14 @@ export async function callExternalBrowserTool(
     throw new Error(EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED);
   }
   if (name === 'browser_file_upload') {
-    const result = await bridge.command(claim, 'upload', params, abortSignal ?? undefined) as ExternalResult;
+    const policy = new BrowserUseSitePolicyReader();
+    const result = bridge.subscribePlaywright
+      ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+        subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'upload', params,
+        bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), abortSignal ?? undefined)
+      : await bridge.command(claim, 'upload', params, abortSignal ?? undefined) as ExternalResult;
     await emitExternalBrowserFrame(bridge, claim, scope);
-    return [{ type: 'text', text: JSON.stringify(result ?? {}) }];
+    return [{ type: 'text', text: formatActionResult(result) }];
   }
   const toolCommands: Record<BrowserToolName, string> = {
     browser_navigate: "navigate", browser_snapshot: "snapshot", browser_find: "find",
@@ -78,7 +102,19 @@ export async function callExternalBrowserTool(
     }
   }
   let result: ExternalResult;
-  try { result = await bridge.command(claim, toolCommands[name], params) as ExternalResult; }
+  try {
+    const action = toolCommands[name];
+    if (bridge.subscribePlaywright
+      && ['snapshot', 'find', 'click', 'type', 'selectOption', 'pressKey', 'scroll', 'waitFor', 'screenshot',
+        'consoleMessages', 'networkRequests'].includes(action)) {
+      const policy = new BrowserUseSitePolicyReader();
+      result = await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+        subscribePlaywright: bridge.subscribePlaywright.bind(bridge) },
+        claim, scope, action, params, bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'),
+        abortSignal ?? undefined);
+    } else result = await (abortSignal ? bridge.command(claim, action, params, abortSignal)
+      : bridge.command(claim, action, params)) as ExternalResult;
+  }
   catch (error) {
     if ((error as Error).message === "USER_ACTIVE_ON_TARGET_TAB") {
       throw new OcuUserIntervened(claim.browser === "memmy"
@@ -99,8 +135,8 @@ export async function callExternalBrowserTool(
   }
   if (name === "browser_snapshot" || name === "browser_find") {
     await emitExternalBrowserFrame(bridge, claim, scope);
-    return [{ type: "text", text: formatNodes(result?.nodes) }];
+    return [{ type: "text", text: formatNodes(result?.nodes, result?.truncated === true) }];
   }
   await emitExternalBrowserFrame(bridge, claim, scope);
-  return [{ type: "text", text: JSON.stringify(result ?? {}) }];
+  return [{ type: "text", text: formatActionResult(result) }];
 }
