@@ -13865,10 +13865,81 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 .file-preview__spreadsheet {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .file-preview__spreadsheet .file-preview__table-scroll {
   flex: 1;
+  min-height: 0;
+}
+
+.file-preview__sheet-notice {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.file-preview__spreadsheet .file-preview__sheet-grid {
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: #fff;
+  color: #000;
+  font-size: 11pt;
+  line-height: 1.35;
+}
+
+.file-preview__sheet-grid td,
+.file-preview__sheet-grid th {
+  box-sizing: border-box;
+  border: 0;
+  border-right: 1px solid #ddd;
+  border-bottom: 1px solid #ddd;
+  padding: 0;
+  font-weight: normal;
+  vertical-align: bottom;
+}
+
+.file-preview__sheet-grid td {
+  overflow: hidden;
+}
+
+.file-preview__sheet-cell {
+  overflow: hidden;
+  padding: 0 3px;
+  white-space: inherit;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.file-preview__spreadsheet .file-preview__sheet-grid thead {
+  z-index: 3;
+  background: #f3f4f5;
+}
+
+.file-preview__sheet-grid thead th,
+.file-preview__sheet-grid .file-preview__sheet-row-number {
+  background: #f3f4f5;
+  color: #62676f;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  text-align: center;
+  vertical-align: middle;
+}
+
+.file-preview__sheet-grid thead th {
+  height: 26px;
+}
+
+.file-preview__sheet-grid .file-preview__sheet-row-number,
+.file-preview__sheet-grid .file-preview__sheet-corner {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+}
+
+.file-preview__sheet-grid .file-preview__sheet-spacer td {
+  border: 0;
+  padding: 0;
 }
 
 .file-preview__spreadsheet thead {

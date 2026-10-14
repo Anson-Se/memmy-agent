@@ -42,6 +42,7 @@ import {
   type DocxTextSpan,
   type XlsxSheet
 } from "../../lib/office-preview.js";
+import { XlsxPreview } from "./xlsx-preview.js";
 import type { FilePreviewResource, FilePreviewViewState } from "./file-preview-types.js";
 
 const PdfPreview = lazy(async () => {
@@ -869,24 +870,6 @@ function DocxTable(props: { block: Extract<DocxBlock, { kind: "table" }> }) {
 function DocxSpan(props: { span: DocxTextSpan }) {
   if (!props.span.bold && !props.span.italic) return <>{props.span.text}</>;
   return <span className={`${props.span.bold ? "font-semibold" : ""} ${props.span.italic ? "italic" : ""}`.trim()}>{props.span.text}</span>;
-}
-
-function XlsxPreview(props: { sheets: XlsxSheet[] }) {
-  const [activeIndex, setActiveIndex] = useState(0);
-  const sheet = props.sheets[Math.min(activeIndex, props.sheets.length - 1)];
-  if (!sheet) return null;
-  const [header, ...body] = sheet.rows;
-  return (
-    <div className="file-preview__spreadsheet">
-      {props.sheets.length > 1 ? <div className="file-preview__sheet-tabs">{props.sheets.map((item, index) => <button key={`${item.name}:${index}`} type="button" className={index === activeIndex ? "is-active" : ""} onClick={() => setActiveIndex(index)}>{item.name}</button>)}</div> : null}
-      <div className="file-preview__table-scroll">
-        <table>
-          {header ? <thead><tr>{header.map((cell, index) => <th key={index}>{cell}</th>)}</tr></thead> : null}
-          <tbody>{body.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody>
-        </table>
-      </div>
-    </div>
-  );
 }
 
 function useObjectUrl(blob: Blob): string | null {
