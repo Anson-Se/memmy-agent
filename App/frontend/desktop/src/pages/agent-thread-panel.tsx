@@ -314,7 +314,6 @@ export function AgentThreadPanel(props: {
   const activeFileKey = activeTab?.type === "file" ? normalizeThreadPath(activeTab.path ?? activeTab.url ?? "") : null;
   const activeChangeKey = activeTab?.type === "change" ? activeTab.id.slice("change:".length) : null;
   const listVisible = !panel.hasContent || panel.pinned;
-  const popoverAllowed = panel.visible && panel.phase === 'open' && panel.hasContent && !panel.pinned;
   const triggerRef = useRef<HTMLDivElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const popoverTimerRef = useRef<number | null>(null);
@@ -331,6 +330,11 @@ export function AgentThreadPanel(props: {
   const browserSession = browserSessions.get(ownerKey) ?? EMPTY_BROWSER_SESSION;
   const { open: browserOpen, mounted: browserMounted, tabs: browserTabs,
     activeId: activeBrowserTabId, copiedId: copiedBrowserTabId } = browserSession;
+  // The overview list is hidden behind either a file preview or a browser tab.
+  // A pinned list is also hidden while the browser surface is selected.
+  const pinnedListVisible = panel.pinned && panel.hasContent && !browserOpen;
+  const popoverAllowed = panel.visible && panel.phase === 'open'
+    && (panel.hasContent || browserOpen) && !pinnedListVisible;
   const anyBrowserMounted = [...browserSessions.values()].some(session => session.mounted);
   const nextBrowserTabId = useRef(2);
   const backgroundBrowserOwners = useRef(new Set<string>());
@@ -619,15 +623,17 @@ export function AgentThreadPanel(props: {
           >
             <button
               type="button"
-              className={`thread-panel__icon-button thread-panel__overview-button${panel.pinned && panel.hasContent ? " thread-panel__overview-button--inactive" : ""}${popoverOpen ? " thread-panel__icon-button--active" : ""}`}
-              aria-label={t(panel.pinned && panel.hasContent ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
-              title={t(panel.pinned && panel.hasContent ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
+              className={`thread-panel__icon-button thread-panel__overview-button${pinnedListVisible ? " thread-panel__overview-button--inactive" : ""}${popoverOpen ? " thread-panel__icon-button--active" : ""}`}
+              aria-label={t(pinnedListVisible ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
+              title={t(pinnedListVisible ? "home.threadPanel.alreadyPinned" : "home.threadPanel.overview")}
               aria-haspopup={popoverAllowed ? "dialog" : undefined}
               aria-expanded={popoverAllowed ? popoverOpen : undefined}
               onClick={() => {
                 if (!popoverAllowed) return;
                 cancelPopoverClose();
-                setPopoverOpen((current) => !current);
+                // Pointer-enter may already have opened the hover list before
+                // this click arrives; clicking must not immediately close it.
+                setPopoverOpen(true);
               }}
             >
               <ThreadListIcon />
@@ -799,7 +805,7 @@ function ThreadOverviewPopover(props: {
   onPointerLeave: () => void;
 }) {
   const { t } = useTranslation();
-  const [position, setPosition] = useState<{ top: number; left: number; height: number } | null>(null);
+  const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
   const { anchor } = props;
 
   useLayoutEffect(() => {
@@ -807,8 +813,8 @@ function ThreadOverviewPopover(props: {
     const update = () => {
       const rect = anchor.getBoundingClientRect();
       const left = Math.max(POPOVER_VIEWPORT_PADDING, Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - POPOVER_VIEWPORT_PADDING));
-      const height = Math.max(160, Math.min(POPOVER_HEIGHT, window.innerHeight - rect.bottom - POPOVER_VIEWPORT_PADDING));
-      setPosition({ top: rect.bottom, left, height });
+      const maxHeight = Math.max(0, Math.min(POPOVER_HEIGHT, window.innerHeight - rect.bottom - POPOVER_VIEWPORT_PADDING));
+      setPosition({ top: rect.bottom, left, maxHeight });
     };
     update();
     window.addEventListener("resize", update);
@@ -822,7 +828,7 @@ function ThreadOverviewPopover(props: {
       className="thread-popover"
       role="dialog"
       aria-label={t("home.threadPanel.overview")}
-      style={position ? { top: position.top, left: position.left, height: position.height } : { visibility: "hidden" }}
+      style={position ? { top: position.top, left: position.left, maxHeight: position.maxHeight } : { visibility: "hidden" }}
       onPointerEnter={props.onPointerEnter}
       onPointerLeave={props.onPointerLeave}
     >

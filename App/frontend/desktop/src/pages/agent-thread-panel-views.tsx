@@ -17,7 +17,6 @@ import { ThreadFileIcon, ThreadFolderIcon } from "./agent-thread-file-icon.js";
 import {
   normalizeThreadPath,
   sumThreadFileChanges,
-  THREAD_OVERVIEW_ARTIFACT_LIMIT,
   type ThreadArtifact,
   type ThreadFileChange,
   type ThreadPanelView,
@@ -145,9 +144,6 @@ export function ThreadOverviewView(props: {
   onSelect: (artifact: ThreadArtifact) => void;
 }) {
   const { t } = useTranslation();
-  const [showAll, setShowAll] = useState(false);
-  const visible = showAll ? props.artifacts : props.artifacts.slice(0, THREAD_OVERVIEW_ARTIFACT_LIMIT);
-  const hidden = props.artifacts.length - visible.length;
 
   return (
     <div className={`thread-overview thread-overview--${props.variant}`}>
@@ -165,7 +161,7 @@ export function ThreadOverviewView(props: {
         </button>
         {props.collapsed ? null : props.artifacts.length ? (
           <div className="thread-overview__items" role="list">
-            {visible.map((artifact) => (
+            {props.artifacts.map((artifact) => (
               <ThreadListItem
                 key={artifact.key}
                 name={artifact.name}
@@ -176,11 +172,6 @@ export function ThreadOverviewView(props: {
                 onSelect={() => props.onSelect(artifact)}
               />
             ))}
-            {hidden > 0 ? (
-              <button type="button" className="thread-overview__more" onClick={() => setShowAll(true)}>
-                +{hidden}
-              </button>
-            ) : null}
           </div>
         ) : (
           <p className="thread-panel-empty">{t("home.threadPanel.empty")}</p>
