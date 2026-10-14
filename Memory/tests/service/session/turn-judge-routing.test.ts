@@ -262,8 +262,11 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "好的，现在聊点别的", answer: "好。" });
     await settle(service);
 
-    expect(memoryProperties(db, second.l1MemoryId).internal_info.capture_decision.status).toBe("rejected");
+    const rejected = memoryProperties(db, second.l1MemoryId);
+    expect(rejected.internal_info.capture_decision.status).toBe("rejected");
     expect(episodeOf(db, second.rawTurnId)).not.toBe(first.episodeId);
+    expect(rejected.info.episode_id).toBe(episodeOf(db, second.rawTurnId));
+    expect(rejected.internal_info.trace.episode_id).toBe(episodeOf(db, second.rawTurnId));
     expect(episodeRow(db, first.episodeId).status).toBe("closed");
     expect(feedbackRows(db, session.sessionId)[0]).toMatchObject({ episode_id: first.episodeId, polarity: "positive", magnitude: 1 });
   });

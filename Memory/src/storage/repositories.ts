@@ -2471,6 +2471,24 @@ export class RuntimeRepository {
         .run(toEpisodeId, fromEpisodeId, rawTurnId);
       this.db.prepare(`UPDATE skill_trials SET episode_id = ? WHERE episode_id = ? AND (raw_turn_id = ? OR l1_memory_id ${inL1})`)
         .run(toEpisodeId, fromEpisodeId, rawTurnId, ...l1Ids);
+      // Soft-deleted (rejected) L1 rows of the turn: live rows are rewritten by
+      // the caller through the memory repository, which only reads live rows.
+      this.db.prepare(
+        `UPDATE memories
+         SET info_json = json_set(info_json, '$.episode_id', @to),
+             properties_json = json_set(
+               CASE WHEN json_type(properties_json, '$.info') = 'object'
+                 THEN json_set(properties_json, '$.info.episode_id', @to) ELSE properties_json END,
+               '$.internal_info.trace.episode_id', @to,
+               '$.internal_info.trace.key',
+               CASE WHEN substr(json_extract(properties_json, '$.internal_info.trace.key'), 1, length(@from) + 1) = @from || ':'
+                 THEN @to || substr(json_extract(properties_json, '$.internal_info.trace.key'), length(@from) + 1)
+                 ELSE json_extract(properties_json, '$.internal_info.trace.key') END
+             )
+         WHERE deleted_at IS NOT NULL
+           AND json_type(properties_json, '$.internal_info.trace') = 'object'
+           AND id ${inL1}`
+      ).run({ to: toEpisodeId, from: fromEpisodeId }, ...l1Ids);
       this.db.prepare(`UPDATE l3_world_model_input_traces SET episode_id = ? WHERE raw_turn_id = ?`)
         .run(toEpisodeId, rawTurnId);
       this.db.prepare(`UPDATE source_turn_captures SET episode_id = ? WHERE raw_turn_id = ?`)

@@ -3505,6 +3505,7 @@ export class SessionTurnService {
       toEpisodeId,
       at
     });
+    // Soft-deleted (rejected) L1 rows are moved by moveTurnLinks.
     for (const memory of l1Memories) {
       if (memory.deletedAt) continue;
       const internal = memory.properties.internal_info;
