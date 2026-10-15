@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SSE_DONE, sseChunk, sseMemmyEvent, createApp } from "../../../src/entrypoints/openai-like-api/server.js";
 
 function request(body: unknown): Request {
@@ -307,3 +307,33 @@ describe("SSE chat completions", () => {
     expect(body).not.toContain("[DONE]");
   });
 });
+
+for (const stream of [true, false]) {
+  it(`keeps a silent long-running task alive (stream=${stream})`, async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const app = createApp({ processDirect: async () => {
+        started();
+        await gate;
+        return "long tool finished";
+      } }, "m", 600);
+      let settled = false;
+      const result = app.fetch(request({ messages: [{ role: "user", content: "long tool" }], stream }))
+        .then((response) => response.text());
+      void result.then(() => { settled = true; });
+      await entered;
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+      expect(settled).toBe(false);
+      release();
+      expect(await result).toContain("long tool finished");
+      expect(app.context.sessionLocks.size).toBe(0);
+    } finally {
+      release?.();
+      vi.useRealTimers();
+    }
+  });
+}

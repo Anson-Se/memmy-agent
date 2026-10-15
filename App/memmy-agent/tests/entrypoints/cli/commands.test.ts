@@ -531,7 +531,7 @@ describe("CLI command helpers", () => {
       .toThrow("unsupported config key");
   });
 
-  it("serve uses api.timeout from config when no CLI timeout override is supplied", async () => {
+  it("serve ignores legacy api.timeout while a task is still executing", async () => {
     const root = tempRoot("memmy-serve-timeout-");
     const workspace = path.join(root, "workspace");
     const configPath = writeConfig(root, {
@@ -561,8 +561,8 @@ describe("CLI command helpers", () => {
       });
       const body = await response.json() as any;
 
-      expect(response.status).toBe(504);
-      expect(body.error.message).toContain("Request timed out after 0.01s");
+      expect(response.status).toBe(200);
+      expect(body.choices[0].message.content).toBe("late");
       expect(fs.existsSync(path.join(workspace, "AGENTS.md"))).toBe(true);
     } finally {
       await closeServer(server);

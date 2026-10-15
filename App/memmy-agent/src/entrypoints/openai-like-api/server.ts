@@ -24,7 +24,6 @@ export class RequestBodyTooLarge extends Error {
 type ApiContext = {
   agentLoop: any;
   modelName: string;
-  requestTimeout: number;
   sessionLocks: Map<string, Promise<void>>;
 };
 
@@ -188,33 +187,20 @@ async function parseMultipart(request: Request): Promise<[string, string[], stri
   return [text, mediaPaths, sessionId, model];
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutS: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((resolve, reject) => {
-    void resolve;
-    timer = setTimeout(() => reject(new Error(`Request timed out after ${timeoutS}s`)), timeoutS * 1000);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 async function withSessionLock<T>(ctx: ApiContext, sessionKey: string, fn: () => Promise<T>): Promise<T> {
   const previous = ctx.sessionLocks.get(sessionKey) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  ctx.sessionLocks.set(sessionKey, previous.then(() => current, () => current));
+  const queued = previous.then(() => current, () => current);
+  ctx.sessionLocks.set(sessionKey, queued);
   await previous.catch(() => undefined);
   try {
     return await fn();
   } finally {
     release();
-    if (ctx.sessionLocks.get(sessionKey) === current) ctx.sessionLocks.delete(sessionKey);
+    if (ctx.sessionLocks.get(sessionKey) === queued) ctx.sessionLocks.delete(sessionKey);
   }
 }
 
@@ -259,7 +245,6 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
   const context = ctx ?? {
     agentLoop: null,
     modelName: "memmy",
-    requestTimeout: 120,
     sessionLocks: new Map<string, Promise<void>>(),
   };
   const contentType = request.headers.get("content-type") ?? "";
@@ -367,17 +352,13 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
           try {
             await withSessionLock(context, sessionKey, async () => {
               requestTiming("api.session_lock_acquired");
-              const response = await withTimeout(
-                Promise.resolve(
-                  callAgent(context, {
-                    ...baseArgs,
-                    onProgress,
-                    onStream,
-                    onStreamEnd,
-                  }),
-                ),
-                context.requestTimeout,
-              );
+              // Model and tool calls own their deadlines; a whole turn has none.
+              const response = await callAgent(context, {
+                ...baseArgs,
+                onProgress,
+                onStream,
+                onStreamEnd,
+              });
               if (!emitted) {
                 const finalText = responseText(response);
                 if (finalText.trim()) write(sseChunk(finalText, context.modelName, chunkId));
@@ -417,11 +398,11 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
 
   try {
     const reply = await withSessionLock(context, sessionKey, async () => {
-      const first = await withTimeout(Promise.resolve(callAgent(context, baseArgs)), context.requestTimeout);
+      const first = await callAgent(context, baseArgs);
       let textResponse = responseText(first);
       let usage = responseUsage(first);
       if (!textResponse.trim()) {
-        const retry = await withTimeout(Promise.resolve(callAgent(context, baseArgs)), context.requestTimeout);
+        const retry = await callAgent(context, baseArgs);
         textResponse = responseText(retry);
         usage = mergeUsageRecords(usage, responseUsage(retry));
         if (!textResponse.trim()) textResponse = EMPTY_FINAL_RESPONSE_MESSAGE;
@@ -430,8 +411,6 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
     });
     return Response.json(chatCompletionResponse(reply.text, context.modelName, reply.usage));
   } catch (err) {
-    const message = (err as Error).message ?? "";
-    if (message.startsWith("Request timed out")) return errorJson(504, message);
     return errorJson(500, "Internal server error", "server_error");
   }
 }
@@ -487,13 +466,13 @@ export async function handleHealth(): Promise<Response> {
 export function createApp(
   agentLoopOrConfig: any = null,
   modelName = "memmy",
-  requestTimeout = 120,
+  // Accepted for callers built against older runtimes; never limits a turn.
+  _legacyRequestTimeout?: number,
 ): { fetch: (request: Request) => Promise<Response>; context: ApiContext } {
   const agentLoop = agentLoopOrConfig instanceof Config || agentLoopOrConfig == null ? null : agentLoopOrConfig;
   const ctx: ApiContext = {
     agentLoop,
     modelName,
-    requestTimeout,
     sessionLocks: new Map<string, Promise<void>>(),
   };
   return {
