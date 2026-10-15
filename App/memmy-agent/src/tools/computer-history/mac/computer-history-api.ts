@@ -79,6 +79,24 @@ export interface WeChatReaderPreparation {
   error: string | null;
 }
 
+const WECHAT_DATA_ACCESS_OPERATIONS = new Set(["lstat", "readlink", "scandir", "scandir_next", "open", "clone", "unknown"]);
+const WECHAT_DATA_ACCESS_SOURCES = new Set(["container", "group_container", "state", "unknown"]);
+
+function weChatDataAccessDiagnostic(category: string, value: unknown): {
+  operation: string; source: string; errno?: number;
+} | undefined {
+  if (category !== "wechat_data_access_interrupted" && category !== "wechat_data_access_timeout") return;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const diagnostic = value as Record<string, unknown>;
+  if (Object.keys(diagnostic).some((key) => !["operation", "source", "errno"].includes(key))
+    || typeof diagnostic.operation !== "string" || !WECHAT_DATA_ACCESS_OPERATIONS.has(diagnostic.operation)
+    || typeof diagnostic.source !== "string" || !WECHAT_DATA_ACCESS_SOURCES.has(diagnostic.source)
+    || ("errno" in diagnostic && (typeof diagnostic.errno !== "number"
+      || !Number.isInteger(diagnostic.errno) || diagnostic.errno < 0 || diagnostic.errno > 4095))) return;
+  return { operation: diagnostic.operation, source: diagnostic.source,
+    ...(typeof diagnostic.errno === "number" ? { errno: diagnostic.errno } : {}) };
+}
+
 export interface ComputerHistoryReplayPlan {
   sourcePath: string;
   sourceHash: string;
@@ -796,9 +814,10 @@ export class ComputerHistoryDemoService {
     return this.weChatPreparation;
   }
 
-  /** Retain categories and phases only; never log key manifests or reader stdout. */
-  private saveWeChatFailure(category: string, phase: string | null): void {
+  /** Retain bounded diagnostics only; never log paths, key manifests or reader stdout. */
+  private saveWeChatFailure(category: string, phase: string | null, diagnostic?: unknown): void {
     if (!/^[a-zA-Z_][a-zA-Z_:0-9-]{0,127}$/u.test(category)) return;
+    const safeDiagnostic = process.platform === "darwin" ? weChatDataAccessDiagnostic(category, diagnostic) : undefined;
     const file = path.join(this.weChatStateDirectory, "last-connection-error.json");
     const temporary = `${file}.${crypto.randomUUID()}.tmp`;
     try {
@@ -808,7 +827,8 @@ export class ComputerHistoryDemoService {
       if (!info.isDirectory() || info.isSymbolicLink()) return;
       // Windows privacy comes from the NTFS ACL set up with consent; POSIX owner and mode bits do not apply.
       if (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077))) return;
-      fs.writeFileSync(temporary, JSON.stringify({ category, phase, failedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+      fs.writeFileSync(temporary, JSON.stringify({ category, phase, failedAt: new Date().toISOString(),
+        ...(safeDiagnostic ? { diagnostic: safeDiagnostic } : {}) }), { mode: 0o600, flag: "wx" });
       fs.renameSync(temporary, file);
     } catch { /* Diagnostics must not change connection or consent behavior. */ }
     finally { fs.rmSync(temporary, { force: true }); }
@@ -954,7 +974,7 @@ export class ComputerHistoryDemoService {
     let pending = "";
     const readStatus = (line: string) => {
       try {
-        const status = JSON.parse(line) as { event?: unknown; category?: unknown };
+        const status = JSON.parse(line) as { event?: unknown; category?: unknown; diagnostic?: unknown };
         const failedPhase = this.weChatPhase;
         if (typeof status.event === "string" && /^[a-z_]+$/u.test(status.event)
           && status.event !== "connection_error" && status.event !== "capture_error") {
@@ -967,7 +987,7 @@ export class ComputerHistoryDemoService {
           if (status.category !== this.weChatError
             && (status.category !== "key_capture_failed" || !this.weChatError)) {
             this.weChatError = status.category;
-            this.saveWeChatFailure(status.category, failedPhase);
+            this.saveWeChatFailure(status.category, failedPhase, status.diagnostic);
           }
         }
       } catch { /* Status output contains no chat content; ignore malformed lines. */ }

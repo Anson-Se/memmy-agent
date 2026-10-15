@@ -1,5 +1,6 @@
 """Connection preflight and cleanup behavior; never launches any application."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -402,6 +403,70 @@ class ConnectPermissionTests(unittest.TestCase):
         self.assertFalse(self.session.exists())
         self.assertNotIn("original_opened", self.order)
         self.assertNotIn("quitting_original", self.order)
+
+    def test_metadata_interruption_reports_safe_diagnostics_without_disturbing_wechat(self):
+        error = RuntimeError("wechat_data_access_interrupted")
+        error.diagnostic = {"operation": "scandir_next", "errno": errno.EINTR, "source": "container"}
+        self.storage_module.preflight_private_storage.side_effect = error
+        with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
+                                             "--library", str(self.library)]):
+            self.assertEqual(connect.run(), 2)
+        self.assertEqual(self.events[-1], ("connection_error", {
+            "category": "wechat_data_access_interrupted", "diagnostic": error.diagnostic}))
+        self.assert_not_disturbed()
+        self.storage_module.preflight_private_storage.assert_called_once()
+        self.storage_module.cleanup.assert_not_called()
+        self.assertEqual(self.order.count("connection_error"), 1)
+
+    def test_metadata_timeout_after_quit_cleans_session_and_restores_original_once(self):
+        self.patched["running_wechat"].side_effect = [True, False, False, False]
+        error = RuntimeError("wechat_data_access_timeout")
+        error.diagnostic = {"operation": "lstat", "errno": errno.ETIMEDOUT, "source": "group_container"}
+
+        def fail_snapshot(state, *, consent_id):
+            self.prepare_storage(state, consent_id=consent_id)
+            shutil.rmtree(self.session)
+            raise error
+
+        self.storage_module.create_private_storage.side_effect = fail_snapshot
+        with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
+                                             "--library", str(self.library)]):
+            self.assertEqual(connect.run(), 2)
+        self.assertEqual(self.events[-1], ("connection_error", {
+            "category": "wechat_data_access_timeout", "diagnostic": error.diagnostic}))
+        self.assertTrue(all(fields == {"category": "wechat_data_access_timeout", "diagnostic": error.diagnostic}
+                            for event, fields in self.events if event == "connection_error"))
+        self.assertEqual(self.order.count("quit_requested"), 1)
+        self.assertEqual(self.order.count("original_opened"), 1)
+        self.storage_module.create_private_storage.assert_called_once()
+        self.patched["Popen"].assert_not_called()
+        self.assertFalse(self.session.exists())
+        self.assertEqual(self.original.read_bytes(), b"unchanged-original")
+
+    def test_connection_diagnostics_reject_path_text_and_unrecognized_values(self):
+        for diagnostic in (
+            {"operation": "lstat", "source": "container", "path": "/private/chat.db"},
+            {"operation": "/private/chat.db", "source": "container"},
+            {"operation": [], "source": "container"},
+            {"operation": "lstat", "source": {}},
+            {"operation": "lstat", "source": "/private/chat.db"},
+            {"operation": "lstat", "source": "container", "errno": True},
+            {"operation": "lstat", "source": "container", "errno": -1},
+            {"operation": "lstat", "source": "container", "errno": 4096},
+            {"operation": "lstat", "source": "container", "errno": "4: /private/chat.db"},
+            {"operation": "lstat"},
+            [],
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                error = RuntimeError("wechat_data_access_interrupted")
+                error.diagnostic = diagnostic
+                self.assertEqual(connect.connection_error_fields(error), {
+                    "category": "wechat_data_access_interrupted"})
+        self.assertEqual(connect.connection_error_fields(RuntimeError("/private/chat.db")), {
+            "category": "connection_process_failed"})
+        error = RuntimeError("wechat_consent_revoked")
+        error.diagnostic = {"operation": "lstat", "source": "container"}
+        self.assertEqual(connect.connection_error_fields(error), {"category": "wechat_consent_revoked"})
 
     def test_final_source_change_is_rejected_after_quit_and_restores_original(self):
         self.patched["running_wechat"].side_effect = [True, False, False, False]

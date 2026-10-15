@@ -89,6 +89,76 @@ describe("WeChat connection process diagnostics", () => {
       .toMatchObject({ category: "wechat_private_storage_unsafe_path", phase: "preparing_wechat_data" });
   });
 
+  it.each(["wechat_data_access_interrupted", "wechat_data_access_timeout"])(
+    "retains the helper-reported %s and bounded metadata without retrying", (category) => {
+      const child = connect();
+      const diagnostic = { operation: "scandir_next", source: "container", errno: category.endsWith("timeout") ? 60 : 4 };
+      child.stdout.write(JSON.stringify({ event: "preparing_wechat_data" }) + "\n");
+      child.stdout.write(JSON.stringify({ event: "connection_error", category, diagnostic }) + "\n");
+      // A duplicate parent error must not overwrite the original diagnostic or phase.
+      child.stdout.write(JSON.stringify({ event: "connection_error", category }) + "\n");
+      child.emit("close", 2, null);
+      for (let i = 0; i < 3; i++) expect(service.snapshot().wechat?.error).toBe(category);
+      expect(state.children).toEqual([child]);
+      const file = path.join(root, "wechat", "last-connection-error.json");
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(saved).toEqual({ category, phase: "preparing_wechat_data", diagnostic, failedAt: expect.any(String) });
+      expect(fs.statSync(file).mode & 0o077).toBe(0);
+    },
+  );
+
+  it("permits a bounded metadata diagnostic without an errno", () => {
+    const child = connect();
+    child.stdout.write(JSON.stringify({ event: "connection_error", category: "wechat_data_access_timeout",
+      diagnostic: { operation: "open", source: "state" } }) + "\n");
+    child.emit("close", 2, null);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8")))
+      .toMatchObject({ diagnostic: { operation: "open", source: "state" } });
+  });
+
+  it.each([
+    { label: "an extra filename", diagnostic: { operation: "lstat", source: "container", filename: "private.db" } },
+    { label: "an extra path", diagnostic: { operation: "lstat", source: "container", path: "/private/chat.db" } },
+    { label: "a raw error message", diagnostic: { operation: "open", source: "container", message: "denied /private/chat.db" } },
+    { label: "a path as operation", diagnostic: { operation: "/private/chat.db", source: "container" } },
+    { label: "a path as source", diagnostic: { operation: "lstat", source: "/private/chat.db" } },
+    { label: "an unknown operation", diagnostic: { operation: "read_chat", source: "container" } },
+    { label: "an unknown source", diagnostic: { operation: "lstat", source: "other_app" } },
+    { label: "a nonnumeric errno", diagnostic: { operation: "lstat", source: "container", errno: "EINTR: private.db" } },
+    { label: "a negative errno", diagnostic: { operation: "lstat", source: "container", errno: -1 } },
+    { label: "an excessive errno", diagnostic: { operation: "lstat", source: "container", errno: 4096 } },
+    { label: "a fractional errno", diagnostic: { operation: "lstat", source: "container", errno: 4.5 } },
+    { label: "a missing source", diagnostic: { operation: "lstat" } },
+    { label: "a missing operation", diagnostic: { source: "container" } },
+    { label: "an array", diagnostic: ["lstat", "container"] },
+    { label: "a raw string", diagnostic: "/private/chat.db" },
+  ])("drops diagnostics containing $label while retaining the failure category", ({ diagnostic }) => {
+    const child = connect();
+    child.stdout.write(JSON.stringify({ event: "connection_error", category: "wechat_data_access_interrupted", diagnostic }) + "\n");
+    child.emit("close", 2, null);
+    const saved = JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8"));
+    expect(saved.category).toBe("wechat_data_access_interrupted");
+    expect(saved).not.toHaveProperty("diagnostic");
+    expect(JSON.stringify(saved)).not.toMatch(/private[.]db|chat[.]db|other_app|read_chat/u);
+  });
+
+  it("does not attach metadata diagnostics to unrelated helper failures", () => {
+    const child = connect();
+    child.stdout.write(JSON.stringify({ event: "connection_error", category: "wechat_login_required",
+      diagnostic: { operation: "lstat", source: "container", errno: 4 } }) + "\n");
+    child.emit("close", 2, null);
+    expect(JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8")))
+      .not.toHaveProperty("diagnostic");
+  });
+
+  it("does not infer a data access category from a Python process interruption", () => {
+    const child = connect();
+    child.emit("close", null, "SIGINT");
+    expect(service.snapshot().wechat?.error).toBe("connection_process_crashed");
+    expect(JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8")))
+      .toMatchObject({ category: "connection_process_crashed" });
+  });
+
   it("rejects Windows consent with a friendly 503 before enabling an unavailable local reader", () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     vi.spyOn(os, "release").mockReturnValue("10.0.26100");

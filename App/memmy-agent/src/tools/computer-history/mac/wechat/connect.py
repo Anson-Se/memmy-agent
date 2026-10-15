@@ -23,6 +23,29 @@ def emit(event, **fields):
     print(json.dumps({"event": event, **fields}), flush=True)
 
 
+def connection_error_fields(error):
+    """Expose fixed diagnostic values, never exception text containing source paths."""
+    category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z_:0-9-]{0,127}", category):
+        category = "connection_process_failed"
+    result = {"category": category}
+    if category not in ("wechat_data_access_interrupted", "wechat_data_access_timeout"):
+        return result
+    diagnostic = getattr(error, "diagnostic", None)
+    if (not isinstance(diagnostic, dict) or not diagnostic
+            or set(diagnostic) - {"operation", "errno", "source"}
+            or not isinstance(diagnostic.get("operation"), str)
+            or diagnostic.get("operation") not in {
+                "lstat", "readlink", "scandir", "scandir_next", "open", "clone", "unknown"}
+            or not isinstance(diagnostic.get("source"), str)
+            or diagnostic.get("source") not in {"container", "group_container", "state", "unknown"}
+            or ("errno" in diagnostic and (type(diagnostic["errno"]) is not int
+                or not 0 <= diagnostic["errno"] <= 4095))):
+        return result
+    result["diagnostic"] = dict(diagnostic)
+    return result
+
+
 def command(arguments, *, env=None):
     result = subprocess.run(arguments, capture_output=True, text=True, env=env)
     if result.returncode:
@@ -399,7 +422,7 @@ def main():
         return 0
     except Exception as error:
         # Report the cause before restoration updates the observable phase.
-        emit("connection_error", category=str(error) if isinstance(error, RuntimeError) else type(error).__name__)
+        emit("connection_error", **connection_error_fields(error))
         raise
     finally:
         if "process" in locals() and process.poll() is None:
@@ -445,9 +468,13 @@ def main():
             raise RuntimeError("wechat_private_storage_cleanup_failed") from cleanup_error
 
 
-if __name__ == "__main__":
+def run():
     try:
-        raise SystemExit(main())
+        return main()
     except Exception as error:
-        emit("connection_error", category=str(error) if isinstance(error, RuntimeError) else type(error).__name__)
-        raise SystemExit(2)
+        emit("connection_error", **connection_error_fields(error))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

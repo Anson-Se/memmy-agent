@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -11,6 +12,41 @@ from unittest import mock
 
 
 SOURCE = Path(__file__).resolve().parents[4] / "src/tools/computer-history/mac/wechat/private_storage.py"
+
+
+class CloseOnInterruptedScandir:
+    """Model CPython closing its iterator when readdir fails after one entry."""
+
+    def __init__(self, entries, before_interrupt=None):
+        self.entries = entries
+        self.before_interrupt = before_interrupt
+        self.closed = False
+        self.yielded = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *arguments):
+        self.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.closed:
+            raise StopIteration
+        if self.yielded == 1:
+            self.close()
+            if self.before_interrupt:
+                self.before_interrupt()
+            raise InterruptedError(errno.EINTR, "synthetic private source detail")
+        entry = next(self.entries)
+        self.yielded += 1
+        return entry
+
+    def close(self):
+        self.closed = True
+        self.entries.close()
 
 
 class PrivateStorageTests(unittest.TestCase):
@@ -52,7 +88,7 @@ class PrivateStorageTests(unittest.TestCase):
                                        "consentedAt": "fixture-time", "consentId": identifier}))
         consent.chmod(mode)
 
-    def copy_fixture(self, source, destination):
+    def copy_fixture(self, source, destination, metadata=None, root=None):
         if source.is_relative_to(self.state):
             self.assertEqual(source.parent.parent, self.state)
             self.assertTrue(source.parent.name.startswith("clone-preflight-"))
@@ -141,7 +177,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.clone.assert_not_called()
 
     def test_revocation_during_clone_cleans_partial_session(self):
-        def revoke(source, destination):
+        def revoke(source, destination, **options):
             self.copy_fixture(source, destination)
             self.write_consent(enabled=False)
         self.clone.side_effect = revoke
@@ -151,7 +187,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
 
     def test_consent_id_change_during_clone_cleans_partial_session(self):
-        def replace_consent(source, destination):
+        def replace_consent(source, destination, **options):
             self.copy_fixture(source, destination)
             self.write_consent(identifier="new-authorization")
         self.clone.side_effect = replace_consent
@@ -292,10 +328,10 @@ class PrivateStorageTests(unittest.TestCase):
         disappearing.mkdir(mode=0o700)
         original_item = self.helper._source_item
 
-        def remove_cache(path, root, home):
+        def remove_cache(path, root, home, metadata=None):
             if path == disappearing:
                 path.rmdir()
-            return original_item(path, root, home)
+            return original_item(path, root, home, metadata)
 
         with mock.patch.object(self.helper, "_source_item", side_effect=remove_cache):
             self.helper.preflight_private_storage(self.state, consent_id="authorized")
@@ -311,13 +347,391 @@ class PrivateStorageTests(unittest.TestCase):
     def test_preflight_does_not_swallow_permission_errors_on_live_children(self):
         original_item = self.helper._source_item
 
-        def deny(path, root, home):
+        def deny(path, root, home, metadata=None):
             if path == self.file:
                 raise PermissionError("synthetic permission denial")
-            return original_item(path, root, home)
+            return original_item(path, root, home, metadata)
 
         with mock.patch.object(self.helper, "_source_item", side_effect=deny), self.assertRaises(PermissionError):
             self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+
+    def test_interrupted_source_lstat_recovers_in_preflight_and_snapshot(self):
+        original_lstat = Path.lstat
+        for stage in ("preflight", "snapshot"):
+            with self.subTest(stage=stage):
+                attempts = 0
+
+                def interrupted_once(path, *arguments, **options):
+                    nonlocal attempts
+                    if path == self.file:
+                        attempts += 1
+                        if attempts == 1:
+                            raise InterruptedError(errno.EINTR, "synthetic private source detail")
+                    return original_lstat(path, *arguments, **options)
+
+                with mock.patch.object(Path, "lstat", interrupted_once):
+                    if stage == "preflight":
+                        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+                    else:
+                        result = self.create()
+                self.assertEqual(attempts, 2)
+                if stage == "snapshot":
+                    self.assertEqual((Path(result["containerPath"]) / "Data/Documents/fixture.db").read_bytes(),
+                                     b"only synthetic fixture bytes")
+                    self.helper.cleanup(result["sessionPath"], self.state)
+                self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_repeated_source_interruption_is_bounded_private_and_cleans_snapshot(self):
+        original_lstat = Path.lstat
+        for stage in ("preflight", "snapshot"):
+            with self.subTest(stage=stage):
+                attempts = 0
+                self.clone.reset_mock()
+
+                def interrupted(path, *arguments, **options):
+                    nonlocal attempts
+                    if path == self.file:
+                        attempts += 1
+                        raise InterruptedError(errno.EINTR, "synthetic private source detail")
+                    return original_lstat(path, *arguments, **options)
+
+                with mock.patch.object(Path, "lstat", interrupted):
+                    with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                        if stage == "preflight":
+                            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+                        else:
+                            self.create()
+                self.assertEqual(attempts, 2)
+                self.assertEqual(str(failure.exception), "wechat_data_access_interrupted")
+                self.assertEqual(failure.exception.diagnostic,
+                                 {"operation": "lstat", "errno": errno.EINTR, "source": "container"})
+                self.assertNotIn("synthetic private", json.dumps(failure.exception.diagnostic))
+                self.assertEqual(self.sessions(), [])
+                self.clone.assert_not_called()
+                self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_interrupted_readlink_recovers_without_changing_alias_validation(self):
+        link = self.data / "internal-link"
+        link.symlink_to("fixture.db")
+        original_readlink = os.readlink
+        attempts = 0
+
+        def interrupted_once(path, *arguments, **options):
+            nonlocal attempts
+            if Path(path) == link:
+                attempts += 1
+                if attempts == 1:
+                    raise InterruptedError(errno.EINTR, "synthetic private source detail")
+            return original_readlink(path, *arguments, **options)
+
+        with mock.patch.object(self.helper.os, "readlink", interrupted_once):
+            result = self.create()
+        self.assertGreaterEqual(attempts, 2)
+        self.assertEqual(os.readlink(Path(result["containerPath"]) / "Data/Documents/internal-link"), "fixture.db")
+        self.assertEqual(os.readlink(link), "fixture.db")
+        self.helper.cleanup(result["sessionPath"], self.state)
+
+    def test_interrupted_scandir_acquisition_recovers_before_processing_entries(self):
+        original_scandir = os.scandir
+        attempts = 0
+
+        def interrupted_once(path):
+            nonlocal attempts
+            if path == self.data:
+                attempts += 1
+                if attempts == 1:
+                    raise InterruptedError(errno.EINTR, "synthetic private source detail")
+            return original_scandir(path)
+
+        with mock.patch.object(self.helper.os, "scandir", interrupted_once):
+            result = self.create()
+        self.assertEqual(attempts, 2)
+        self.assertEqual([call.args[0] for call in self.clone.call_args_list], [self.file])
+        self.helper.cleanup(result["sessionPath"], self.state)
+
+    def test_closed_interrupted_iterator_is_reopened_without_lost_or_duplicate_entries(self):
+        expected = {self.file, self.data / "second.db", self.data / "third.db"}
+        for path in expected - {self.file}:
+            path.write_bytes(b"synthetic extra source")
+        original_scandir = os.scandir
+        original_item = self.helper._source_item
+        for stage in ("preflight", "snapshot"):
+            with self.subTest(stage=stage):
+                attempts = 0
+                closed_iterators = []
+                validated = []
+                self.clone.reset_mock()
+
+                def interrupted_once(path):
+                    nonlocal attempts
+                    entries = original_scandir(path)
+                    if path == self.data:
+                        attempts += 1
+                        if attempts == 1:
+                            interrupted = CloseOnInterruptedScandir(entries)
+                            closed_iterators.append(interrupted)
+                            return interrupted
+                    return entries
+
+                def track(path, root, home, metadata=None):
+                    if path in expected:
+                        validated.append(path)
+                    return original_item(path, root, home, metadata)
+
+                with mock.patch.object(self.helper.os, "scandir", interrupted_once), \
+                        mock.patch.object(self.helper, "_source_item", side_effect=track):
+                    if stage == "preflight":
+                        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+                    else:
+                        result = self.create()
+                self.assertEqual(attempts, 2)
+                self.assertTrue(closed_iterators[0].closed)
+                self.assertCountEqual(validated, expected)
+                if stage == "snapshot":
+                    self.assertCountEqual([call.args[0] for call in self.clone.call_args_list], expected)
+                    copied = Path(result["containerPath"]) / "Data/Documents"
+                    self.assertEqual({item.name for item in copied.iterdir()}, {item.name for item in expected})
+                    self.helper.cleanup(result["sessionPath"], self.state)
+                self.assertEqual(self.sessions(), [])
+
+    def test_repeated_iterator_interruption_fails_without_partial_copy(self):
+        original_scandir = os.scandir
+        attempts = 0
+
+        def interrupted(path):
+            nonlocal attempts
+            entries = original_scandir(path)
+            if path == self.data:
+                attempts += 1
+                return CloseOnInterruptedScandir(entries)
+            return entries
+
+        with mock.patch.object(self.helper.os, "scandir", interrupted):
+            with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                self.create()
+        self.assertEqual(attempts, 2)
+        self.assertEqual(str(failure.exception), "wechat_data_access_interrupted")
+        self.assertEqual(failure.exception.diagnostic,
+                         {"operation": "scandir_next", "errno": errno.EINTR, "source": "container"})
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_iterator_reopen_checks_consent_and_replaced_source_before_access(self):
+        original_scandir = os.scandir
+        for change in ("revoke", "replace"):
+            with self.subTest(change=change):
+                self.write_consent()
+                attempts = 0
+                moved = self.data.with_name("Documents-original")
+                outside = self.root / "outside"
+                outside.mkdir(exist_ok=True)
+
+                def interrupt_action():
+                    if change == "revoke":
+                        self.write_consent(enabled=False)
+                    else:
+                        self.data.rename(moved)
+                        self.data.symlink_to(outside, target_is_directory=True)
+
+                def interrupted(path):
+                    nonlocal attempts
+                    entries = original_scandir(path)
+                    if path == self.data:
+                        attempts += 1
+                        return CloseOnInterruptedScandir(entries, interrupt_action)
+                    return entries
+
+                category = "wechat_consent_revoked" if change == "revoke" else "wechat_private_storage_unsafe_path"
+                with mock.patch.object(self.helper.os, "scandir", interrupted):
+                    with self.assertRaisesRegex(RuntimeError, "^" + category + "$"):
+                        self.create()
+                self.assertEqual(attempts, 1)
+                self.clone.assert_not_called()
+                self.assertEqual(self.sessions(), [])
+                if change == "replace":
+                    self.data.unlink()
+                    moved.rename(self.data)
+                self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_consent_revocation_stops_before_retrying_interrupted_metadata(self):
+        original_lstat = Path.lstat
+        attempts = 0
+
+        def revoke_then_interrupt(path, *arguments, **options):
+            nonlocal attempts
+            if path == self.file:
+                attempts += 1
+                self.write_consent(enabled=False)
+                raise InterruptedError(errno.EINTR, "synthetic private source detail")
+            return original_lstat(path, *arguments, **options)
+
+        with mock.patch.object(Path, "lstat", revoke_then_interrupt):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_consent_revoked$"):
+                self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(attempts, 1)
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+
+    def test_source_directory_batch_revalidates_all_ancestors_and_consent_on_retry(self):
+        original_lstat = Path.lstat
+        for revoke in (False, True):
+            with self.subTest(revoke=revoke):
+                self.write_consent()
+                attempted_leaf = 0
+                checked_root = 0
+
+                def interrupt_after_root_checks(path, *arguments, **options):
+                    nonlocal attempted_leaf, checked_root
+                    if path == self.container:
+                        checked_root += 1
+                    if path == self.data:
+                        attempted_leaf += 1
+                        if attempted_leaf == 1:
+                            if revoke:
+                                self.write_consent(enabled=False)
+                            raise InterruptedError(errno.EINTR, "synthetic private source detail")
+                    return original_lstat(path, *arguments, **options)
+
+                metadata = self.helper._SourceMetadata(
+                    lambda: self.helper._consent(self.state, "authorized"), self.home)
+                with mock.patch.object(Path, "lstat", interrupt_after_root_checks):
+                    if revoke:
+                        with self.assertRaisesRegex(RuntimeError, "^wechat_consent_revoked$"):
+                            self.helper._source_directory(self.data, self.container, metadata)
+                    else:
+                        result = self.helper._source_directory(self.data, self.container, metadata)
+                        self.assertTrue(stat.S_ISDIR(result.st_mode))
+                # The first attempt completed both root checks before the leaf
+                # failed. A permitted retry repeats both; revoked consent stops
+                # before any second root/leaf validation.
+                self.assertEqual(checked_root, 2 if revoke else 4)
+                self.assertEqual(attempted_leaf, 1 if revoke else 3)
+                self.clone.assert_not_called()
+                self.assertEqual(self.sessions(), [])
+
+    def test_metadata_deadline_stops_after_slow_call_without_retry_or_copy(self):
+        original_lstat = Path.lstat
+        now = [0]
+        attempts = 0
+
+        def slow_metadata(path, *arguments, **options):
+            nonlocal attempts
+            if path == self.file:
+                attempts += 1
+                now[0] += self.helper._METADATA_SECONDS
+            return original_lstat(path, *arguments, **options)
+
+        with mock.patch.object(self.helper.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(Path, "lstat", slow_metadata):
+            with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                self.create()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(str(failure.exception), "wechat_data_access_timeout")
+        self.assertEqual(failure.exception.diagnostic,
+                         {"operation": "lstat", "errno": errno.ETIMEDOUT, "source": "container"})
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_long_clone_duration_does_not_consume_source_metadata_budget(self):
+        now = [0]
+
+        def slow_clone(source, destination, **options):
+            now[0] += self.helper._METADATA_SECONDS * 10
+            self.copy_fixture(source, destination)
+
+        self.clone.side_effect = slow_clone
+        with mock.patch.object(self.helper.time, "monotonic", side_effect=lambda: now[0]):
+            result = self.create()
+        self.assertEqual(self.clone.call_count, 1)
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+        self.helper.cleanup(result["sessionPath"], self.state)
+
+    def test_metadata_time_is_bounded_across_container_and_group_traversals(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        group_file = self.group / "fixture.plist"
+        group_file.write_text("synthetic group")
+        original_lstat = Path.lstat
+        now = [0]
+
+        def slow_metadata(path, *arguments, **options):
+            if path in (self.file, group_file):
+                now[0] += self.helper._METADATA_SECONDS * 0.6
+            return original_lstat(path, *arguments, **options)
+
+        with mock.patch.object(self.helper.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(Path, "lstat", slow_metadata):
+            with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(str(failure.exception), "wechat_data_access_timeout")
+        self.assertEqual(failure.exception.diagnostic,
+                         {"operation": "lstat", "errno": errno.ETIMEDOUT, "source": "group_container"})
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+
+    def test_metadata_timeout_closes_newly_acquired_directory_iterator(self):
+        original_scandir = os.scandir
+        now = [0]
+        acquired = []
+
+        def slow_scandir(path):
+            entries = original_scandir(path)
+            if path == self.data:
+                acquired.append(entries)
+                now[0] += self.helper._METADATA_SECONDS
+            return entries
+
+        with mock.patch.object(self.helper.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(self.helper.os, "scandir", slow_scandir):
+            with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                self.create()
+        self.assertEqual(failure.exception.diagnostic["operation"], "scandir")
+        self.assertEqual(len(acquired), 1)
+        with self.assertRaises(StopIteration):
+            next(acquired[0])
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+
+    def test_other_source_os_errors_and_clone_interruption_are_not_retried(self):
+        original_lstat = Path.lstat
+        attempts = 0
+
+        def denied(path, *arguments, **options):
+            nonlocal attempts
+            if path == self.file:
+                attempts += 1
+                raise PermissionError(errno.EACCES, "synthetic private source detail")
+            return original_lstat(path, *arguments, **options)
+
+        with mock.patch.object(Path, "lstat", denied), self.assertRaises(PermissionError):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(attempts, 1)
+        self.clone.assert_not_called()
+        self.clone.side_effect = InterruptedError(errno.EINTR, "synthetic clone interruption")
+        with self.assertRaises(InterruptedError):
+            self.create()
+        self.assertEqual(self.clone.call_count, 1)
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_group_source_interruption_reports_only_fixed_group_category(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        group_file = self.group / "fixture.plist"
+        group_file.write_text("synthetic group")
+        original_lstat = Path.lstat
+
+        def interrupted(path, *arguments, **options):
+            if path == group_file:
+                raise InterruptedError(errno.EINTR, "synthetic private source detail")
+            return original_lstat(path, *arguments, **options)
+
+        with mock.patch.object(Path, "lstat", interrupted):
+            with self.assertRaises(self.helper.WeChatMetadataAccessError) as failure:
+                self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(failure.exception.diagnostic,
+                         {"operation": "lstat", "errno": errno.EINTR, "source": "group_container"})
         self.clone.assert_not_called()
 
     def test_preflight_requires_each_fixed_source_on_the_state_volume(self):
@@ -325,8 +739,8 @@ class PrivateStorageTests(unittest.TestCase):
         original_directory = self.helper._directory
         for other_volume in (self.container, self.group):
             with self.subTest(source=other_volume):
-                def directory(path, private=False):
-                    info = original_directory(path, private=private)
+                def directory(path, private=False, **options):
+                    info = original_directory(path, private=private, **options)
                     return mock.Mock(st_dev=info.st_dev + 1) if path == other_volume else info
 
                 with mock.patch.object(self.helper, "_directory", side_effect=directory):
@@ -355,7 +769,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(self.sessions(), [])
 
     def test_final_snapshot_source_change_is_rejected_and_partial_session_removed(self):
-        def change(source, destination):
+        def change(source, destination, **options):
             self.copy_fixture(source, destination)
             # This synthetic new entry exercises the strict directory check.
             (source.parent / "later-cache-entry").write_bytes(b"synthetic cache write")
@@ -382,6 +796,29 @@ class PrivateStorageTests(unittest.TestCase):
             with self.subTest(candidate=candidate), self.assertRaisesRegex(RuntimeError, "unsafe_path"):
                 self.helper.cleanup(candidate, self.state)
         self.assertTrue(self.file.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clone_retries_only_source_metadata_before_single_clone(self):
+        destination = self.state / "clone-fixture.db"
+        original_lstat = Path.lstat
+        attempts = 0
+
+        def interrupted_once(path, *arguments, **options):
+            nonlocal attempts
+            if path == self.file:
+                attempts += 1
+                if attempts == 1:
+                    raise InterruptedError(errno.EINTR, "synthetic private source detail")
+            return original_lstat(path, *arguments, **options)
+
+        metadata = self.helper._SourceMetadata(lambda: self.helper._consent(self.state, "authorized"), self.home)
+        with mock.patch.object(Path, "lstat", interrupted_once), \
+                mock.patch.object(self.helper.ctypes, "CDLL", wraps=self.helper.ctypes.CDLL) as library:
+            self.native_clone(self.file, destination, metadata=metadata, root=self.container)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(library.call_count, 1)
+        self.assertEqual(destination.read_bytes(), b"only synthetic fixture bytes")
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
 
     @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
     def test_native_preflight_clone_uses_only_its_own_synthetic_fixture(self):
