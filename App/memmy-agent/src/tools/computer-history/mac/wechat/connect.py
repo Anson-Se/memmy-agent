@@ -109,6 +109,26 @@ def capture_failure_category(code, output_exists, helper_category=None):
     return None
 
 
+def wechat_application():
+    # Resolve by bundle id through LaunchServices so a non-/Applications or App
+    # Store install still connects. This only reads the registration; it does not
+    # launch WeChat. Fall back to the conventional location.
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'POSIX path of (path to application id "com.tencent.xinWeChat")'],
+            capture_output=True, text=True, timeout=10)
+        candidate = Path(result.stdout.strip())
+        if (result.returncode == 0 and candidate.is_absolute()
+                and candidate.suffix == ".app" and candidate.is_dir() and not candidate.is_symlink()):
+            return candidate.resolve(strict=True)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    fallback = Path("/Applications/WeChat.app")
+    if fallback.is_dir() and not fallback.is_symlink():
+        return fallback.resolve(strict=True)
+    raise RuntimeError("wechat_application_missing")
+
+
 def running_wechat():
     result = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True)
     return bool(result.stdout.strip())
@@ -252,7 +272,7 @@ def main():
     state = Path(os.path.abspath(args.state))
     if args.prepare_only:
         try:
-            result = prepare_permission_helper(state, Path("/Applications/WeChat.app"))
+            result = prepare_permission_helper(state, wechat_application())
         except RuntimeError as error:
             category = str(error)
             if not re.fullmatch(r"[a-z_]+", category):
@@ -268,7 +288,7 @@ def main():
     if args.library is None:
         raise RuntimeError("sqlcipher_library_unavailable")
     library = args.library.resolve(strict=True)
-    app = Path("/Applications/WeChat.app").resolve(strict=True)
+    app = wechat_application()
     original = app / "Contents/MacOS/WeChat"
     if not original.is_file():
         raise RuntimeError("wechat_application_missing")
@@ -392,7 +412,7 @@ def main():
                     cleanup_error = error
             # Retain only the inert connection executable; session data is gone.
             if restore_original and not running_wechat():
-                reopened = subprocess.run(["open", "-a", "/Applications/WeChat.app"], capture_output=True)
+                reopened = subprocess.run(["open", str(app)], capture_output=True)
                 emit("original_reopened", success=reopened.returncode == 0)
         next_keys.unlink(missing_ok=True)
         next_keys.with_suffix(".pending").unlink(missing_ok=True)

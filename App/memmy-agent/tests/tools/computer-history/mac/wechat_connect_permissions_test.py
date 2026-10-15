@@ -75,6 +75,7 @@ class ConnectPermissionTests(unittest.TestCase):
             mock.patch.object(connect.os, "geteuid", return_value=501),
             mock.patch.object(connect.os, "umask"),
             mock.patch.object(Path, "resolve", resolve),
+            mock.patch.object(connect, "wechat_application", return_value=self.app),
             mock.patch.object(connect, "consent_id", side_effect=lambda state: self.consent),
             mock.patch.object(connect, "current_database_root", return_value=self.root),
             mock.patch.object(connect, "prepare_permission_helper", side_effect=self.prepare),
@@ -141,7 +142,7 @@ class ConnectPermissionTests(unittest.TestCase):
     def run_subprocess(self, arguments, **options):
         if arguments[0] == "osascript":
             self.order.append("quit_requested")
-        elif arguments == ["open", "-a", "/Applications/WeChat.app"]:
+        elif arguments == ["open", str(self.app)]:
             self.order.append("original_opened")
         else:
             raise AssertionError("unexpected subprocess: " + repr(arguments))
@@ -582,6 +583,27 @@ class ReaderErrorPropagationTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 2, "", stderr)):
                 with self.assertRaisesRegex(RuntimeError, "^command_failed:python3$"):
                     connect.command([sys.executable, "read_messages.py", "baseline"])
+
+
+class WeChatApplicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.app = Path(temporary.name).resolve() / "Custom Place/WeChat.app"
+        (self.app / "Contents/MacOS").mkdir(parents=True)
+
+    def test_resolves_a_non_default_install_through_launch_services(self):
+        with mock.patch.object(connect.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, str(self.app) + "/\n", "")) as run:
+            self.assertEqual(connect.wechat_application(), self.app)
+        self.assertEqual(run.call_args.args[0][0], "osascript")
+
+    def test_missing_registration_and_default_location_reports_missing(self):
+        with mock.patch.object(connect.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 1, "", "not found")), \
+                mock.patch.object(Path, "is_dir", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_application_missing$"):
+                connect.wechat_application()
 
 
 class DatabaseRootInterruptionTests(unittest.TestCase):
