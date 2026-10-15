@@ -192,6 +192,72 @@ describe("local api", () => {
     }
   });
 
+  it("can prepare the current bridge before Agent startup without requesting a premature MCP reload", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "memmy-backend-mcp-prepare-"));
+    const memmyConfigPath = join(tempDir, "config.yaml");
+    const legacyCustom = { type: "stdio", command: "legacy-tool", args: ["--existing"] };
+    writeFileSync(memmyConfigPath, YAML.stringify({
+      tools: {
+        mcpServers: {
+          legacyCustom,
+          composio: {
+            type: "streamableHttp",
+            url: "http://127.0.0.1:1/old-bridge",
+            headers: { "x-memmy-mcp-token": "old-token" }
+          }
+        }
+      }
+    }), "utf8");
+    const reload = vi.fn(async () => ({ ok: true, message: "reloaded", requires_restart: false }));
+    backend = await createLocalBackend({
+      databasePath: join(tempDir, "app.sqlite"),
+      runtimeConfigPath: join(tempDir, "runtime.json"),
+      localToken: "test-token",
+      memoryClient: createMockMemoryClient(),
+      cloudClient: createMockCloudClient(),
+      memmyConfigPath,
+      memmyAgentAdminClient: createMockMemmyAgentAdminClient(reload),
+      skipAgentMcpReload: true
+    });
+
+    const config = YAML.parse(readFileSync(memmyConfigPath, "utf8"));
+    const bridge = config.tools.mcpServers.composio;
+    expect(config.tools.mcpServers.legacyCustom).toEqual(legacyCustom);
+    expect(bridge).toMatchObject({
+      type: "streamableHttp",
+      url: `${backend.runtimeConfig.baseUrl}/mcp/composio`,
+      headers: { "x-memmy-mcp-token": expect.stringMatching(/^mmt_/) },
+      toolTimeout: 60
+    });
+    expect(bridge.headers["x-memmy-mcp-token"]).not.toBe("old-token");
+    const bootstrap = await fetch(`${backend.runtimeConfig.baseUrl}/api/app/bootstrap`, {
+      headers: { "x-memmy-local-token": "test-token" }
+    });
+    expect(bootstrap.status).toBe(200);
+    expect(AppBootstrapResponseSchema.safeParse(await bootstrap.json()).success).toBe(true);
+    const initialize = await fetch(bridge.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...bridge.headers
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "startup-prepare-test", version: "1.0" }
+        }
+      })
+    });
+    expect(initialize.status).toBe(200);
+    await initialize.body?.cancel();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   it.each(["not-ok", "rejected", "thrown"] as const)("logs %s Agent MCP reload failures without rejecting startup or leaving an unhandled rejection", async (failure) => {
     tempDir = mkdtempSync(join(tmpdir(), "memmy-backend-mcp-startup-failure-"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);

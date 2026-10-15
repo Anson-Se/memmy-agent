@@ -1135,12 +1135,21 @@ export async function gateway({
   config?: string | null;
   verbose?: boolean;
 } = {}): Promise<GatewayRuntime> {
+  // Apply the configured level before startup diagnostics or config loading can log.
+  installConsoleLevelGate();
+  const startedAt = Date.now();
+  const reportStartupStage = (stage: string) => {
+    if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return;
+    try {
+      console.info(`[gateway-startup] ${JSON.stringify({ stage, elapsedMs: Date.now() - startedAt })}`);
+    } catch { /* Diagnostics cannot interrupt startup. */ }
+  };
   const loaded = loadRuntimeConfig(config, workspace);
+  reportStartupStage("config-ready");
   const workspacePath = syncRuntimeWorkspaceTemplates(loaded);
   setCliRuntimeLogs(Boolean(verbose));
-  // Gateway daemon mode: filter console output by the MEMMY_LOG_LEVEL injected by the desktop app.
-  installConsoleLevelGate();
   const canonicalWorkspace = fs.realpathSync(workspacePath);
+  reportStartupStage("workspace-ready");
   const bus = new MessageBus();
   const cron = new CronService(path.join(workspacePath, "cron", "jobs.json"));
   const projectStore = new ProjectStore();
@@ -1148,6 +1157,7 @@ export async function gateway({
     cronService: cron,
     projectStore,
   });
+  reportStartupStage("agent-loop-created");
   if (loop.sessions instanceof SessionManager) {
     loop.guiTranscriptMirror = new GuiTranscriptMirror(loop.sessions, canonicalWorkspace);
   }
@@ -1175,6 +1185,7 @@ export async function gateway({
       }
     },
     webuiRuntimeToolNames: () => loop.toolNames,
+    webuiRuntimeReady: () => loop.isReady,
     webuiModelSelectionResolver: (input) => loop.resolveTurnModelSelection(input),
     cancelActiveTasks: cancelSessionTasks,
     stopCurrentTurn: async (sessionKey, expectedTurnId) => {
@@ -1211,6 +1222,7 @@ export async function gateway({
       return true;
     },
   });
+  reportStartupStage("channels-created");
   loop.setChannelCapabilitiesResolver?.((channel) => manager.channelCapabilities(channel));
   const webuiChannel = manager.getChannel("websocket");
   let transcriptMonitor: GatewayTranscriptMonitor | null = null;
@@ -1261,6 +1273,7 @@ export async function gateway({
   const bindHost = host ?? loaded.gateway.host;
   const bindPort = port == null ? loaded.gateway.port : Number(port);
   const healthServer = await startGatewayHealthServer(bindHost, bindPort);
+  reportStartupStage("health-listening");
 
   const deliverToChannelNow = async (
     msg: OutboundMessage,

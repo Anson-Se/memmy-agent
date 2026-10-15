@@ -14,7 +14,11 @@ try {
     const { runBrowserPreparationCommand } = await import("./entrypoints/cli/browser-preparation-command.js");
     await runBrowserPreparationCommand();
   } else {
+    const gatewayImportStartedAt = Date.now();
     const { main } = await import("./entrypoints/cli/commands.js");
+    if (process.argv[2] === "gateway" && process.env.MEMMY_DESKTOP_MANAGED_GATEWAY === "1") {
+      console.info(`[gateway-startup] ${JSON.stringify({ stage: "cli-import-ready", elapsedMs: Date.now() - gatewayImportStartedAt })}`);
+    }
     await main();
   }
 } catch (error) {

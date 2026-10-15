@@ -83,6 +83,7 @@ import {
   resolveDevelopmentRuntimeEntryPaths,
   resolveDevelopmentRuntimeExecutable,
   startManagedRuntimeServices,
+  waitForExternalAgentMcpConfig,
   type ManagedRuntimeServices
 } from "./runtime-services.js";
 import { resolveRendererContextMenuCommands, resolveRendererContextMenuMaxLabelWidth, type RendererContextMenuCommand } from "./renderer-context-menu.js";
@@ -512,9 +513,9 @@ async function boot(): Promise<void> {
     );
     const appDatabaseFile = join(app.getPath("userData"), "app.sqlite");
     runtimeServices = await startManagedRuntimeServices({
-      // The Windows renderer can show the local UI while the Agent process loads.
-      // Start its heavier work after the first window has painted.
-      deferAgentGatewayStartup: process.platform === "win32",
+      // Publish the service handles before waiting so quit can cancel gateway startup.
+      // The first window is created only after the gateway can accept tasks.
+      deferAgentGatewayStartup: true,
       deferBrowserPreparation: process.platform === "win32",
       onStartupStage: (stage, elapsedMs) => {
         bootStage = `runtime-services:${stage}`;
@@ -745,12 +746,30 @@ async function boot(): Promise<void> {
       localBackend = null;
       return;
     }
+    // The local API writes its current MCP bridge URL/token before the Agent reads config.
+    const gatewayStartupIssue = await runtimeServices.startAgentGateway();
+    if (isQuitting) return;
+    if (gatewayStartupIssue && runtimeConfig.agentGateway) {
+      runtimeConfig.agentGateway.startupIssue = gatewayStartupIssue;
+    }
+    if (!gatewayStartupIssue && runtimeServices.isAgentGatewayExternal()) {
+      bootStage = "runtime-services:external-mcp";
+      void writePackagedStartupLog(`boot:stage:${JSON.stringify({ stage: bootStage, elapsedMs: Date.now() - bootStartedAt })}`);
+      const gatewayAdmin = createHttpMemmyAgentAdminClient({
+        baseUrl: runtimeServices.agentGateway.baseUrl,
+        bootstrapSecret: runtimeServices.agentGateway.bootstrapSecret
+      });
+      if (!await waitForExternalAgentMcpConfig({
+        reload: () => gatewayAdmin.reloadMcpConfig(),
+        isCanceled: () => isQuitting
+      }) || isQuitting) return;
+    }
     bootStage = "renderer";
     void writePackagedStartupLog(`boot:stage:${JSON.stringify({ stage: bootStage, elapsedMs: Date.now() - bootStartedAt })}`);
     const initialWindow = createInitialWindow();
     watchStartupRenderer(initialWindow);
     if (process.platform === "win32" && runtimeServices) {
-      startWindowsServicesAfterFirstWindow(initialWindow, runtimeServices);
+      startWindowsBrowserPreparationAfterFirstWindow(initialWindow, runtimeServices);
     }
     isBootReady = true;
     triggerAgentSourceAutoInject("boot");
@@ -1215,6 +1234,7 @@ async function startLocalApi(services: ManagedRuntimeServices | null): Promise<D
     memmyConfigPath: process.env.MEMMY_CONFIG,
     memoryBaseUrl: memoryControl.baseUrl,
     memoryReady: services?.memory.ready,
+    skipAgentMcpReload: Boolean(services),
     runtimeConfigPath: process.env.MEMMY_HOME ? join(process.env.MEMMY_HOME, "runtime.json") : undefined
   });
   const agentGateway: NonNullable<DesktopRuntimeConfig["agentGateway"]> =
@@ -3886,7 +3906,7 @@ function createInitialWindow(): BrowserWindow | null {
   return createMainWindow();
 }
 
-function startWindowsServicesAfterFirstWindow(
+function startWindowsBrowserPreparationAfterFirstWindow(
   targetWindow: BrowserWindow | null,
   services: ManagedRuntimeServices
 ): void {
@@ -3898,22 +3918,7 @@ function startWindowsServicesAfterFirstWindow(
     clearTimeout(fallback);
     if (isPetWindow) targetWindow?.removeListener("show", start);
     else targetWindow?.removeListener("ready-to-show", start);
-    void writePackagedStartupLog(`boot:deferred-gateway-start:${JSON.stringify({ elapsedMs: Date.now() - bootStartedAt })}`);
-    void services.startAgentGateway().then((issue) => {
-      if (isQuitting || runtimeServices !== services) return;
-      if (issue && runtimeConfig?.agentGateway) {
-        runtimeConfig.agentGateway.startupIssue = issue;
-        for (const window of [mainWindow, petWindow]) {
-          if (window && !window.isDestroyed()) {
-            window.webContents.send("memmy:agent-gateway-startup-issue", issue);
-          }
-        }
-      }
-      services.startBrowserPreparation();
-    }).catch((error: unknown) => {
-      console.warn("Deferred Agent gateway startup failed:", error);
-      if (!isQuitting && runtimeServices === services) services.startBrowserPreparation();
-    });
+    services.startBrowserPreparation();
   };
   // A hidden pet window may never receive its first layout. Keep the launch bounded.
   const fallback = setTimeout(start, 12_000);

@@ -25,6 +25,9 @@ const SUPPORTED_MEMORY_PROTOCOL_VERSION = 1;
 const DEFAULT_AGENT_GATEWAY_HEALTH_PORT = 18970;
 const DEFAULT_AGENT_WEBSOCKET_PORT = 18980;
 const STARTUP_TIMEOUT_MS = 30_000;
+// MCP discovery is serial: HTTP probe (3s), discovery (15s), failed cleanup (2s).
+// Keep the bootstrap deadline outside that work instead of killing a healthy child at 30s.
+const MCP_SERVER_STARTUP_BUDGET_MS = 20_000;
 const MEMORY_STARTUP_TIMEOUT_MS = 120_000;
 const POLL_INTERVAL_MS = 250;
 const HTTP_TIMEOUT_MS = 1_000;
@@ -56,8 +59,10 @@ export interface ManagedRuntimeServices {
     workspace: string;
     startupIssue?: AgentGatewayStartupIssue;
   };
-  /** Starts the Agent gateway once. An initial failure starts background recovery. */
+  /** Waits for a usable Agent gateway, or a repairable configuration issue. */
   startAgentGateway(): Promise<AgentGatewayStartupIssue | null>;
+  /** Read live ownership after startup/recovery; never exposed in renderer bootstrap. */
+  isAgentGatewayExternal(): boolean;
   /** Starts browser preparation once, independently of the first window. */
   startBrowserPreparation(): PackagedBrowserPreparation | null;
   restartMemory(): Promise<void>;
@@ -77,8 +82,8 @@ export interface StartPackagedRuntimeServicesOptions {
 
 export interface StartManagedRuntimeServicesOptions extends StartPackagedRuntimeServicesOptions {
   /** Privacy-safe progress for startup diagnostics; never contains runtime paths or config values. */
-  onStartupStage?: (stage: "migration-start" | "migration-ready" | "config-ready" | "data-ready" | "skills-ready" | "gateway-start" | "gateway-settled", elapsedMs: number) => void;
-  /** Let the first window load before starting the Agent child. Defaults to false. */
+  onStartupStage?: (stage: "migration-start" | "migration-ready" | "config-ready" | "data-ready" | "skills-ready" | "gateway-start" | "gateway-recovery" | "gateway-settled", elapsedMs: number) => void;
+  /** Publish lifecycle handles before the caller starts/waits for the Agent. Defaults to false. */
   deferAgentGatewayStartup?: boolean;
   /** Let the first window load before preparing Playwright's browser. Defaults to false. */
   deferBrowserPreparation?: boolean;
@@ -191,7 +196,7 @@ interface DesktopManagedRestartNotice {
   metadata: Record<string, unknown>;
 }
 
-type HttpProbeResult = "ready" | "unreachable" | "unexpected";
+type HttpProbeResult = "ready" | "starting" | "unreachable" | "unexpected";
 
 export interface MemoryServerLock {
   pid: number;
@@ -271,6 +276,7 @@ export async function startManagedRuntimeServices(
   const startAgentGateway = createAgentGatewayStarter(gatewaySupervisor, agentGateway, {
     isClosing: () => closing,
     onStart: () => reportStartupStage("gateway-start"),
+    onRecovery: () => reportStartupStage("gateway-recovery"),
     onSettled: () => reportStartupStage("gateway-settled")
   });
 
@@ -339,6 +345,7 @@ export async function startManagedRuntimeServices(
       },
       agentGateway,
       startAgentGateway,
+      isAgentGatewayExternal: () => gatewaySupervisor.ownership === "external",
       startBrowserPreparation,
       async restartMemory() {
         await restartMemoryRuntime();
@@ -1550,11 +1557,12 @@ export interface AgentGatewaySupervisorDependencies {
 
 /** Shares one explicitly requested startup, including while the first attempt is in flight. */
 export function createAgentGatewayStarter(
-  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery">,
+  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery" | "waitForReady">,
   agentGateway: { startupIssue?: AgentGatewayStartupIssue },
   lifecycle: {
     isClosing: () => boolean;
     onStart?: () => void;
+    onRecovery?: () => void;
     onSettled?: () => void;
   }
 ): () => Promise<AgentGatewayStartupIssue | null> {
@@ -1563,7 +1571,7 @@ export function createAgentGatewayStarter(
     if (lifecycle.isClosing()) return Promise.resolve(null);
     if (startup) return startup;
     lifecycle.onStart?.();
-    startup = startAgentGatewayWithRecovery(supervisor).then((issue) => {
+    startup = startAgentGatewayWithRecovery(supervisor, lifecycle.onRecovery).then((issue) => {
       lifecycle.onSettled?.();
       if (lifecycle.isClosing()) return null;
       if (issue) agentGateway.startupIssue = issue;
@@ -1574,7 +1582,8 @@ export function createAgentGatewayStarter(
 }
 
 export async function startAgentGatewayWithRecovery(
-  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery">
+  supervisor: Pick<AgentGatewaySupervisor, "ensureStarted" | "startRecovery" | "waitForReady">,
+  onRecovery?: () => void
 ): Promise<AgentGatewayStartupIssue | null> {
   try {
     await supervisor.ensureStarted();
@@ -1582,7 +1591,76 @@ export async function startAgentGatewayWithRecovery(
   } catch (error) {
     console.warn(`Agent gateway unavailable during desktop startup: ${errorMessage(error)}`);
     supervisor.startRecovery();
-    return classifyAgentGatewayStartupIssue(error);
+    const issue = classifyAgentGatewayStartupIssue(error);
+    if (issue) return issue;
+    onRecovery?.();
+    return supervisor.waitForReady();
+  }
+}
+
+/** A reused gateway must load the bridge URL/token written by this Desktop instance. */
+export async function waitForExternalAgentMcpConfig(options: {
+  reload: () => Promise<{ ok: boolean; message: string; requires_restart: boolean }>;
+  isCanceled: () => boolean;
+}): Promise<boolean> {
+  let failure = "MCP configuration was not accepted";
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (options.isCanceled()) return false;
+    try {
+      const outcome = await waitForStartupWorkWhileActive(Promise.resolve().then(options.reload), options.isCanceled);
+      if (!outcome) return false;
+      const result = outcome.value;
+      if (result.ok && !result.requires_restart) return true;
+      failure = result.message || (result.requires_restart ? "Agent gateway requires a restart" : failure);
+    } catch (error) {
+      if (options.isCanceled()) return false;
+      failure = errorMessage(error);
+    }
+    if (attempt < 3) {
+      if (!await waitForStartupWorkWhileActive(sleep(attempt * 1_000), options.isCanceled)) return false;
+    }
+  }
+  throw new Error(`Existing Agent gateway could not load the current local MCP bridge after 3 attempts: ${failure}. Stop the external gateway and reopen Memmy to start a new managed gateway.`);
+}
+
+function waitForStartupWorkWhileActive<T>(work: Promise<T>, isCanceled: () => boolean): Promise<{ value: T } | null> {
+  return new Promise((resolveWork, rejectWork) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (value: { value: T } | null, failed = false, error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (failed) rejectWork(error);
+      else resolveWork(value);
+    };
+    const checkCancellation = () => {
+      if (settled) return;
+      if (isCanceled()) { finish(null); return; }
+      timer = setTimeout(checkCancellation, 100);
+      timer.unref?.();
+    };
+    // Keep handlers attached after cancellation so a late timeout/rejection is consumed.
+    work.then(value => finish(isCanceled() ? null : { value }), error => {
+      if (isCanceled()) finish(null);
+      else finish(null, true, error);
+    });
+    checkCancellation();
+  });
+}
+
+export function resolveAgentGatewayStartupTimeout(config: unknown): number {
+  const tools = isRecord(config) && isRecord(config.tools) ? config.tools : {};
+  const servers = isRecord(tools.mcpServers) ? tools.mcpServers : {};
+  return STARTUP_TIMEOUT_MS + Object.keys(servers).length * MCP_SERVER_STARTUP_BUDGET_MS;
+}
+
+function readAgentGatewayStartupTimeout(configPath: string): number {
+  try {
+    return resolveAgentGatewayStartupTimeout(YAML.parse(readFileSync(configPath, "utf8")));
+  } catch {
+    // Config rejection is reported by the Agent and exposes the repair entrypoint.
+    return STARTUP_TIMEOUT_MS;
   }
 }
 
@@ -1606,6 +1684,8 @@ export class AgentGatewaySupervisor {
   hasReachedReady = false;
 
   private replacementNotice: DesktopManagedRestartNotice | null = null;
+  private readonly readyWaiters = new Set<(issue: AgentGatewayStartupIssue | null) => void>();
+  private repairableStartupIssue: AgentGatewayStartupIssue | null = null;
   private readonly bootstrapUrl: string;
   private readonly bootstrapHeaders: Record<string, string>;
   private readonly dependencies: Required<AgentGatewaySupervisorDependencies>;
@@ -1639,6 +1719,25 @@ export class AgentGatewaySupervisor {
       this.startPromise = null;
     });
     return this.startPromise;
+  }
+
+  /** Initial failures keep startup pending across replacement attempts; quit releases waiters. */
+  waitForReady(): Promise<AgentGatewayStartupIssue | null> {
+    if (this.stopping || this.hasReachedReady) return Promise.resolve(null);
+    if (this.repairableStartupIssue) return Promise.resolve(this.repairableStartupIssue);
+    return new Promise((resolveReady) => { this.readyWaiters.add(resolveReady); });
+  }
+
+  private resolveReadyWaiters(issue: AgentGatewayStartupIssue | null = null): void {
+    for (const resolveReady of this.readyWaiters) resolveReady(issue);
+    this.readyWaiters.clear();
+  }
+
+  private markReady(): void {
+    if (this.stopping) return;
+    this.hasReachedReady = true;
+    this.repairableStartupIssue = null;
+    this.resolveReadyWaiters();
   }
 
   sendSurfaceAction(action: ComputerUseSurfaceAction): boolean {
@@ -1694,6 +1793,7 @@ export class AgentGatewaySupervisor {
 
   async close(): Promise<void> {
     this.stopping = true;
+    this.resolveReadyWaiters();
     this.clearTimers();
     const child = this.ownedChild;
     this.ownedChild = null;
@@ -1706,6 +1806,7 @@ export class AgentGatewaySupervisor {
 
   terminateSync(): void {
     this.stopping = true;
+    this.resolveReadyWaiters();
     this.clearTimers();
     const child = this.ownedChild;
     this.ownedChild = null;
@@ -1721,9 +1822,14 @@ export class AgentGatewaySupervisor {
       return;
     }
     const probe = await this.dependencies.probeHttpService(this.bootstrapUrl, this.bootstrapHeaders);
+    if (this.stopping) return;
     if (probe === "ready") {
       this.ownership = "external";
+      this.markReady();
       return;
+    }
+    if (probe === "starting") {
+      throw new Error("Agent gateway is still initializing");
     }
     if (probe === "unexpected") {
       throw new Error(`Agent gateway endpoint is occupied by an unexpected service: ${this.bootstrapUrl}`);
@@ -1785,16 +1891,31 @@ export class AgentGatewaySupervisor {
     this.bindOwnedChild(child, generation);
 
     try {
-      await this.dependencies.waitForHttpService("agent-gateway", this.bootstrapUrl, child, this.bootstrapHeaders);
+      await this.dependencies.waitForHttpService("agent-gateway", this.bootstrapUrl, child, this.bootstrapHeaders,
+        readAgentGatewayStartupTimeout(this.runtimeConfig.configPath), () => this.stopping);
       if (this.stopping || this.ownedChild !== child || this.childGeneration !== generation) return;
-      this.hasReachedReady = true;
+      this.markReady();
       this.replacementNotice = null;
       this.startStableTimer(child, generation);
     } catch (error) {
       if (this.ownedChild === child) {
         await this.dependencies.stopManagedChild(child).catch(() => undefined);
+        if (this.ownedChild === child) {
+          this.ownedChild = null;
+          this.removeChild(child);
+          child.logWriter?.close();
+        }
       }
+      if (this.stopping) return;
       if (initialStartup) throw error;
+      const issue = classifyAgentGatewayStartupIssue(error);
+      if (issue) {
+        this.repairableStartupIssue = issue;
+        this.resolveReadyWaiters(issue);
+      }
+      // stopManagedChild can settle on exit before close; retry without relying
+      // on that later callback or on a previous generation having reached ready.
+      this.scheduleReplacement();
     }
   }
 
@@ -1976,13 +2097,15 @@ export class AgentGatewaySupervisor {
   private async startReplacement(): Promise<void> {
     if (this.stopping) return;
     const probe = await this.dependencies.probeHttpService(this.bootstrapUrl, this.bootstrapHeaders);
+    if (this.stopping) return;
     if (probe === "ready") {
       this.ownership = "external";
       this.pendingRestartNotice = null;
       this.replacementNotice = null;
+      this.markReady();
       return;
     }
-    if (probe === "unexpected") {
+    if (probe === "starting" || probe === "unexpected") {
       this.scheduleReplacement();
       return;
     }
@@ -2149,7 +2272,12 @@ async function probeHttpService(url: string, headers: Record<string, string> = {
       headers,
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
     });
-    return response.ok ? "ready" : "unexpected";
+    if (response.ok) return "ready";
+    if (response.status === 503 && url.endsWith("/webui/bootstrap")) {
+      const body = await response.text();
+      if (body.trim() === "agent_runtime_initializing") return "starting";
+    }
+    return "unexpected";
   } catch {
     return "unreachable";
   }
@@ -2569,12 +2697,14 @@ async function waitForHttpService(
   url: string,
   child: ManagedChild,
   headers: Record<string, string> = {},
-  timeoutMs = STARTUP_TIMEOUT_MS
+  timeoutMs = STARTUP_TIMEOUT_MS,
+  isCanceled: () => boolean = () => false
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
 
   while (Date.now() < deadline) {
+    if (isCanceled()) throw new Error(`${name} startup was canceled`);
     if (child.exitDescription) {
       throw new Error(`${name} exited before it became ready (${child.exitDescription}). ${formatChildTail(child)}`);
     }

@@ -8,14 +8,15 @@ import {
   resolveUpdateSplashHtml,
   shouldQuitWhenAllWindowsClosed,
 } from "../src/main/startup-splash.js";
+import { waitForExternalAgentMcpConfig } from "../src/main/runtime-services.js";
 
-// Execute the real startup/window callbacks without importing Electron or starting user services.
+// Execute the real startup/window callbacks without launching Electron or user services.
 // The AST extraction keeps the race tests tied to main.ts rather than a copy of its implementation.
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const functionNames = new Set([
   "boot", "showSplashWindow", "showUpdateInstallSplashWindow", "showSplashHtml", "closeSplashWindow",
   "createInitialWindow", "createMainWindow", "showPetWindowAfterRendererLayout", "hideAppShellForQuit",
-  "startWindowsServicesAfterFirstWindow",
+  "startWindowsBrowserPreparationAfterFirstWindow",
   "watchStartupRenderer", "handleStartupFailure", "handleRendererLoadFailure"
 ]);
 const variableNames = new Set([
@@ -46,12 +47,13 @@ const code = ts.transpileModule([
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
 }).outputText;
 
-function setup(options: { delay?: number; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet"; gatewayIssue?: "model_config_invalid" } = {}) {
+function setup(options: { delay?: number; gatewayDelay?: number; apiDelay?: number; externalGateway?: boolean; reload?: () => Promise<{ ok: boolean; message: string; requires_restart: boolean }>; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet"; gatewayIssue?: "model_config_invalid" } = {}) {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   const events: string[] = [];
   const windows = new Set<FakeWindow>();
   const app = new EventEmitter() as EventEmitter & Record<string, any>;
+  let externalGateway = false;
   let context: ReturnType<typeof createContext>;
   class FakeWindow extends EventEmitter {
     destroyed = false;
@@ -83,11 +85,20 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     }
   }
   const services = {
-    agentGateway: { configPath: "test-user-data/agent-config.json" },
-    startAgentGateway: vi.fn(async () => { events.push("gateway-started"); return options.gatewayIssue ?? null; }),
+    agentGateway: { configPath: "test-user-data/agent-config.json", startupIssue: undefined as "model_config_invalid" | undefined },
+    startAgentGateway: vi.fn(async () => {
+      events.push("gateway-started");
+      if (options.gatewayDelay) await new Promise(resolve => setTimeout(resolve, options.gatewayDelay));
+      if (options.gatewayIssue) services.agentGateway.startupIssue = options.gatewayIssue;
+      externalGateway = options.externalGateway ?? false;
+      events.push("gateway-settled");
+      return options.gatewayIssue ?? null;
+    }),
+    isAgentGatewayExternal: () => externalGateway,
     startBrowserPreparation: vi.fn(() => { events.push("browser-preparation-started"); }),
     close: vi.fn(() => options.cleanupHangs ? new Promise<void>(() => {}) : Promise.resolve())
   };
+  const reload = vi.fn(options.reload ?? (async () => ({ ok: true, message: "ready", requires_restart: false })));
   const quit = vi.fn(() => {
     events.push("quit");
     const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
@@ -102,6 +113,8 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     dirname: (path: string) => path.slice(0, path.lastIndexOf("/")),
     writePackagedStartupLog: async (message: string) => { events.push(message); },
     formatStartupError: (error: Error) => error.message,
+    createHttpMemmyAgentAdminClient: () => ({ reloadMcpConfig: reload }),
+    waitForExternalAgentMcpConfig,
     showPackagedStartupError: () => { events.push("error-dialog"); },
     resolveCurrentDesktopEdition: () => "cn", initLogger: noop, forceLightWindowChrome: noop,
     installPreparedRequiredUpdateBeforeBoot: async () => false,
@@ -122,8 +135,11 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
       return services;
     },
     startLocalApi: async () => {
+      events.push("local-api-started");
+      if (options.apiDelay) await new Promise(resolve => setTimeout(resolve, options.apiDelay));
       if (options.apiError) throw options.apiError;
-      return { agentGateway: {} };
+      events.push("bridge-config-ready");
+      return { agentGateway: { ...services.agentGateway } };
     },
     triggerAgentSourceAutoInject: noop, getCurrentLogLevel: () => "info",
     setDevelopmentDockIcon: noop, startRequiredUpdateBackgroundChecks: noop,
@@ -146,11 +162,11 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     shouldQuitWhenAllWindowsClosed,
     hasSingleInstanceLock: true,
     readStopMemoryServiceOnExitSetting: () => false, armQuitCleanupForceExitTimer: noop,
-    cleanupBeforeQuit: async () => {}, clearQuitCleanupForceExitTimer: noop, relaunchAfterQuitCleanupIfRequested: noop
+    cleanupBeforeQuit: async () => { await services.close(); }, clearQuitCleanupForceExitTimer: noop, relaunchAfterQuitCleanupIfRequested: noop
   });
   runInContext(code, context);
   return {
-    events, app, quit, services,
+    events, app, quit, services, reload,
     start: () => context.start() as Promise<void>,
     run: (code: string) => runInContext(code, context),
     splash: () => runInContext("splashWindow", context) as FakeWindow | null,
@@ -162,11 +178,13 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
 afterEach(() => vi.useRealTimers());
 
 describe("desktop startup lifecycle", () => {
-  it("shows the Windows first window before starting its Agent and browser preparation", async () => {
+  it("waits for the Agent before creating the Windows first window and defers browser preparation", async () => {
     const test = setup();
     await test.start();
     expect(test.main()).not.toBeNull();
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+    expect(test.events.indexOf("bridge-config-ready")).toBeLessThan(test.events.indexOf("gateway-started"));
+    expect(test.reload).not.toHaveBeenCalled();
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     test.main()!.emit("ready-to-show");
     await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
@@ -174,44 +192,147 @@ describe("desktop startup lifecycle", () => {
     expect(test.splash()).toBeNull();
   });
 
-  it("publishes a deferred Agent configuration failure to the visible window", async () => {
+  it("awaits the local MCP bridge configuration before starting the Agent and waits again before showing a window", async () => {
+    const test = setup({ apiDelay: 2_000, gatewayDelay: 3_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.main()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(test.events).toContain("bridge-config-ready");
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+    expect(test.main()).toBeNull();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await boot;
+    expect(test.main()).not.toBeNull();
+    expect(test.events.indexOf("bridge-config-ready")).toBeLessThan(test.events.indexOf("gateway-started"));
+  });
+
+  it("passes a repairable Agent configuration failure into the first renderer bootstrap", async () => {
     const test = setup({ gatewayIssue: "model_config_invalid" });
     await test.start();
-    test.main()!.emit("ready-to-show");
-    await vi.waitFor(() => expect(test.main()!.webContents.send).toHaveBeenCalledWith(
-      "memmy:agent-gateway-startup-issue", "model_config_invalid"
-    ));
+    expect(test.main()).not.toBeNull();
     expect(test.run("runtimeConfig.agentGateway.startupIssue")).toBe("model_config_invalid");
   });
 
-  it("keeps deferred services idle after page load until the first paint", async () => {
+  it("waits for an external gateway to reload this Desktop's bridge before showing the first window", async () => {
+    const test = setup({ externalGateway: true, reload: () => new Promise(resolve => {
+      setTimeout(() => resolve({ ok: true, message: "updated", requires_restart: false }), 4_000);
+    }) });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(test.reload).toHaveBeenCalledTimes(1);
+    expect(test.main()).toBeNull();
+    await vi.advanceTimersByTimeAsync(4_000);
+    await boot;
+    expect(test.main()).not.toBeNull();
+  });
+
+  it("uses live ownership when an initializing gateway becomes external during the readiness wait", async () => {
+    const test = setup({ externalGateway: true, gatewayDelay: 1_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(test.services.isAgentGatewayExternal()).toBe(false);
+    expect(test.reload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await boot;
+    expect(test.services.isAgentGatewayExternal()).toBe(true);
+    expect(test.reload).toHaveBeenCalledTimes(1);
+    expect(test.main()).not.toBeNull();
+  });
+
+  it("keeps the repair entrypoint available without external reload after a model config issue", async () => {
+    const test = setup({ externalGateway: true, gatewayIssue: "model_config_invalid" });
+    await test.start();
+    expect(test.reload).not.toHaveBeenCalled();
+    expect(test.main()).not.toBeNull();
+    expect(test.run("runtimeConfig.agentGateway.startupIssue")).toBe("model_config_invalid");
+  });
+
+  it("reports an external reload that stays busy after three attempts without showing the main window", async () => {
+    const test = setup({ externalGateway: true,
+      reload: async () => ({ ok: false, message: "Agent is busy", requires_restart: false }) });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(test.reload).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(test.reload).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await boot;
+    expect(test.reload).toHaveBeenCalledTimes(3);
+    expect(test.main()).toBeNull();
+    expect(test.events.some(event => event.startsWith("boot:error\n") && event.includes("after 3 attempts"))).toBe(true);
+    expect(test.quit).toHaveBeenCalled();
+  });
+
+  it("cancels a pending external reload when the user closes the splash", async () => {
+    const test = setup({ externalGateway: true, reload: () => new Promise(() => {}) });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(test.reload).toHaveBeenCalledTimes(1);
+    test.splash()!.close();
+    await vi.advanceTimersByTimeAsync(100);
+    await boot;
+    expect(test.main()).toBeNull();
+    expect(test.reload).toHaveBeenCalledTimes(1);
+    expect(test.events.some(event => event.startsWith("boot:error\n"))).toBe(false);
+  });
+
+  it("keeps browser preparation idle after page load until the first paint", async () => {
     const test = setup();
     await test.start();
     test.main()!.webContents.emit("did-finish-load");
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     test.main()!.emit("ready-to-show");
     await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
     expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
   });
 
-  it("starts deferred services after a bounded wait when a hidden pet never paints", async () => {
+  it("starts browser preparation after a bounded wait when a hidden pet never paints", async () => {
     const test = setup({ mode: "pet" });
     await test.start();
     await vi.advanceTimersByTimeAsync(11_999);
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1);
   });
 
-  it("does not launch deferred services after the user quits", async () => {
+  it("does not launch browser preparation after the user quits", async () => {
     const test = setup();
     await test.start();
     test.app.quit();
     await vi.advanceTimersByTimeAsync(12_000);
-    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
     expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
+  });
+
+  it.each(["win32", "darwin"])("keeps the splash until the %s Agent can accept tasks", async platform => {
+    const test = setup({ platform, gatewayDelay: 45_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(test.main()).toBeNull();
+    expect(test.splash()?.isDestroyed()).toBe(false);
+    expect(test.events).toContain("local-api-started");
+    expect(test.quit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    await boot;
+    expect(test.main()).not.toBeNull();
+    expect(test.events.indexOf("local-api-started")).toBeLessThan(test.events.indexOf("gateway-started"));
+  });
+
+  it("owns service shutdown while waiting for the Agent without showing a late window", async () => {
+    const test = setup({ gatewayDelay: 45_000 });
+    const boot = test.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    test.splash()!.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(test.services.close).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(44_000);
+    await boot;
+    expect(test.main()).toBeNull();
+    expect(test.events).toContain("local-api-started");
   });
 
   it("keeps the startup splash and process alive while runtime startup takes 20 seconds", async () => {
@@ -301,6 +422,7 @@ describe("desktop startup lifecycle", () => {
     expect(test.events).toContain("boot:error\nlocal API failed");
     expect(test.events).toContain("error-dialog");
     expect(test.quit).toHaveBeenCalled();
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
   });
 
   it("starts the renderer deadline only after slow runtime startup has finished", async () => {

@@ -811,6 +811,7 @@ export class AgentLoop {
   private browserRegistryInitialized = false;
   private runtimeToolsInitialization: Promise<void> | null = null;
   private runtimeToolsClosed = false;
+  private messageLoopReady = false;
   private readonly memmyMemoryIntegration: MemmyMemoryIntegration;
   subagentPendingWaitMs = 300_000;
   static readonly RUNTIME_CHECKPOINT_KEY = "runtimeCheckpoint";
@@ -1194,15 +1195,34 @@ export class AgentLoop {
     await connectMissingServers(this as any, this.tools);
   }
 
+  /** True only once startup recovery is complete and inbound messages can be consumed. */
+  get isReady(): boolean {
+    return this.messageLoopReady && this.running && !this.runtimeToolsClosed;
+  }
+
+  private reportStartupStage(stage: string, startedAt: number): void {
+    if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return;
+    try {
+      console.info(`[agent-startup] ${JSON.stringify({ stage, elapsedMs: Date.now() - startedAt })}`);
+    } catch { /* Diagnostics cannot interrupt startup. */ }
+  }
+
   initializeRuntimeTools(): Promise<void> {
     if (this.runtimeToolsClosed) return Promise.reject(new Error("Agent runtime tools are closed"));
     if (this.runtimeToolsInitialization) return this.runtimeToolsInitialization;
     // Cron/direct turns can arrive while run() is initializing MCP. They must
     // await the same connection attempt before building or using the registry.
+    const startedAt = Date.now();
+    const reportStage = (stage: string) => {
+      if (!this.messageLoopReady) this.reportStartupStage(stage, startedAt);
+    };
     const initialization = (async () => {
       await initializeDesktopScreenCapture();
+      reportStage("screen-capture-ready");
       await this.connectMcp();
+      reportStage("mcp-settled");
       await this.browserSessionManager.initialize();
+      reportStage("browser-tools-ready");
       if (!this.browserRegistryInitialized) {
         this.tools = this.createToolRegistry("runtime-init", this.workspace, {
           includeConnectedMcp: true,
@@ -1219,6 +1239,7 @@ export class AgentLoop {
   }
 
   async closeRuntimeTools(): Promise<void> {
+    this.messageLoopReady = false;
     this.runtimeToolsClosed = true;
     // A failed attempt may still have opened some resources; clean those up too.
     await this.runtimeToolsInitialization?.catch(() => undefined);
@@ -5422,11 +5443,32 @@ export class AgentLoop {
   }
 
   async run(): Promise<void> {
+    const startedAt = Date.now();
+    this.messageLoopReady = false;
     this.running = true;
+    try {
+      await this.runMessageLoop(startedAt);
+    } catch (error) {
+      this.reportStartupStage("message-loop-failed", startedAt);
+      throw error;
+    } finally {
+      this.messageLoopReady = false;
+      this.running = false;
+    }
+  }
+
+  private async runMessageLoop(startedAt: number): Promise<void> {
     await this.initializeRuntimeTools();
-    if (!this.running) return;
+    this.reportStartupStage("runtime-tools-ready", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
     await this.recoverQueueSteerTransfers();
+    this.reportStartupStage("queue-steer-recovered", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
     await this.recoverGoalWork();
+    this.reportStartupStage("goals-recovered", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
+    this.messageLoopReady = true;
+    this.reportStartupStage("message-loop-ready", startedAt);
     while (this.running) {
       const inbound = this.bus.inbound.getNowait();
       if (!inbound) {
@@ -5639,6 +5681,7 @@ export class AgentLoop {
   }
 
   stop(): void {
+    this.messageLoopReady = false;
     this.running = false;
   }
 
