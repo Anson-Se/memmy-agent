@@ -401,7 +401,7 @@ function newClaim(tabId, origin) {
     cdpSessions: new Map(), cdpWaiters: new Set(), protectedActivity: 0,
     cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: protectedCredentialTabs.has(tabId),
     credentialRecoveryOrigin: protectedCredentialOrigins.get(tabId) || origin,
-    recoveryNavigationPending: false, documentEpoch: 0 };
+    recoveryNavigationPending: false, documentEpoch: 0, frameEpoch: 0 };
 }
 
 async function discoverTab(tabId) {
@@ -711,8 +711,7 @@ async function authFrame(tabId, claim, selectors) {
       info.targetId === frameId && info.parentSessionId === sessionId);
     if (child) {
       const [childSessionId, info] = child;
-      const live = await command(tabId, 'Target.getTargetInfo',
-        { targetId: info.targetId }, sessionId);
+      const live = await attachedChildMetadata(tabId, claim, childSessionId, info);
       url = String(live.targetInfo?.url || '');
       if (live.targetInfo?.targetId !== info.targetId || pageOrigin(url) !== pageOrigin(info.url))
         throw Error('Auth frame site changed');
@@ -910,6 +909,11 @@ chrome.windows?.onFocusChanged?.addListener?.(() => {
 chrome.debugger.onEvent.addListener((source, method, data) => {
   const claim = claims.get(source.tabId);
   if (!claim) return;
+  // A lease intentionally stops forwarding events while idle. Preserve frame
+  // changes as metadata so the next action can invalidate its cached worlds.
+  if (['Page.frameNavigated', 'Page.frameAttached', 'Page.frameDetached'].includes(method)) {
+    claim.frameEpoch = (claim.frameEpoch || 0) + 1;
+  }
   const executorLease = claim.playwrightLease;
   if (executorLease && executorLease.expiresAt > Date.now() && !claim.credentialProtected
     && !claim.protectedActivity && !pausedTabs.has(source.tabId)) {
@@ -1017,13 +1021,30 @@ async function withCdpTimeout(work, timeoutMs) {
   } finally { if (timer) clearTimeout(timer); }
 }
 
+async function attachedChildMetadata(tabId, claim, sessionId, info) {
+  const revision = info.revision;
+  const current = () => {
+    if (claims.get(tabId) !== claim || claim.cdpSessions.get(sessionId) !== info
+      || info.revision !== revision) throw new Error('CDP child target site changed');
+  };
+  current();
+  // Chrome's extension debugger API permits metadata for this session's own
+  // target, not a foreign targetId queried through its parent session.
+  const live = await command(tabId, 'Target.getTargetInfo', {}, sessionId);
+  current();
+  if (live?.targetInfo?.targetId !== info.targetId || live.targetInfo.type !== 'iframe'
+    || !String(live.targetInfo.url || '')) throw new Error('CDP child target site changed');
+  pageOrigin(String(live.targetInfo.url));
+  return live;
+}
+
 async function resolveCdpTarget(tabId, claim, target) {
   if (!target) return undefined;
   const found = [...claim.cdpSessions.entries()].find(([sessionId, info]) =>
     target.sessionId ? sessionId === target.sessionId : info.targetId === target.targetId);
   if (!found) throw new Error('CDP child target is not attached to this tab');
   const [sessionId, info] = found;
-  const live = await command(tabId, 'Target.getTargetInfo', { targetId: info.targetId });
+  const live = await attachedChildMetadata(tabId, claim, sessionId, info);
   if (claim.cdpSessions.get(sessionId) !== info || live?.targetInfo?.targetId !== info.targetId
     || live.targetInfo.type !== 'iframe' || !String(live.targetInfo.url || '')) {
     throw new Error('CDP child target site changed');
@@ -1246,7 +1267,7 @@ async function cdpRead(tabId, name, args, commandId) {
     }
     const result = await command(tabId, method, params, sessionId);
     if (child) {
-      const live = await command(tabId, 'Target.getTargetInfo', { targetId: child.info.targetId });
+      const live = await attachedChildMetadata(tabId, claim, sessionId, child.info);
       if (claim.cdpSessions.get(sessionId) !== child.info || child.info.revision !== child.revision
         || live?.targetInfo?.targetId !== child.info.targetId
         || String(live.targetInfo.url || '') !== args.approvedTarget.url
@@ -1374,7 +1395,8 @@ async function playwrightControl(tabId, name, args, commandId) {
     await current();
     return { targetInfo: info.targetInfo, frameTree: tree.frameTree,
       childTargets: [...claim.cdpSessions.values()].map(child => ({ targetId: child.targetId, url: child.url })),
-      documentEpoch: claim.documentEpoch || 0, cdpEpoch: claim.cdpEpoch || 0 };
+      documentEpoch: claim.documentEpoch || 0, cdpEpoch: claim.cdpEpoch || 0,
+      frameEpoch: claim.frameEpoch || 0 };
   }
   const lease = claim.playwrightLease;
   if (!lease || lease.id !== args.leaseId || lease.expiresAt <= Date.now()
@@ -1394,6 +1416,8 @@ async function playwrightControl(tabId, name, args, commandId) {
   if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
   if (lease.expiresAt <= Date.now()) throw new Error('Browser executor lease expired');
   if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
+  if (child && (claim.cdpSessions.get(child.sessionId) !== child.info
+    || child.info.revision !== child.revision)) throw new Error('Browser executor frame changed');
   if (method.startsWith('Input.')) recordHistoryInput(tabId, commandId);
   const result = await command(tabId, method, args.params || {}, child?.sessionId);
   await current();

@@ -22,7 +22,7 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
   const saved: Record<string, unknown> = {};
   let detached: (source: { tabId: number }, reason: string) => void = () => undefined;
   let message: (value: any, sender: any, respond: (result: any) => void) => unknown = () => undefined;
-  let debuggerEvent: (source: { tabId: number }, method: string, data: Record<string, unknown>) => void = () => undefined;
+  let debuggerEvent: (source: { tabId: number; sessionId?: string }, method: string, data: Record<string, unknown>) => void = () => undefined;
   let tabCreated: (tab: Record<string, unknown>) => void = () => undefined;
   const chrome: any = {
     runtime: { id: "extension-id", onMessage: { addListener(listener: typeof message) { message = listener; } } },
@@ -73,7 +73,8 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
   let commandCount = 0;
   return { context, tabs, sent, attaches, detaches, updates, created, saved,
     detach: (tabId: number, reason: string) => detached({ tabId }, reason),
-    debuggerEvent: (tabId: number, method: string, data: Record<string, unknown>) => debuggerEvent({ tabId }, method, data),
+    debuggerEvent: (tabId: number, method: string, data: Record<string, unknown>, sessionId?: string) =>
+      debuggerEvent({ tabId, ...(sessionId ? { sessionId } : {}) }, method, data),
     createTab: (tab: Record<string, unknown>) => tabCreated(tab),
     message: (value: any) => new Promise<any>(resolve => message(value, { id: "extension-id" }, resolve)),
     command: async (name: string, args: Record<string, unknown> = {}) => {
@@ -871,11 +872,12 @@ describe("Chrome and Edge extension packaging", () => {
     const chrome = {
       runtime: { onMessage: { addListener() {} } },
       debugger: { onDetach: { addListener() {} }, onEvent: { addListener(listener: typeof onEvent) { onEvent = listener; } },
-        sendCommand: async (target: { tabId: number; sessionId?: string }, method: string) => {
+        sendCommand: async (target: { tabId: number; sessionId?: string }, method: string, params: Record<string, unknown>) => {
           sent.push({ target, method });
-          if (method === 'Target.getTargetInfo') return { targetInfo: {
-            type: 'iframe', targetId: 'child-1', url: childUrl,
-          } };
+          if (method === 'Target.getTargetInfo') {
+            expect(target).toEqual({ tabId: 7, sessionId: 'session-1' }); expect(params).toEqual({});
+            return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+          }
           return {};
         } },
       tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
@@ -1128,8 +1130,10 @@ it('validates a connected cross-origin child before external auth, including aft
         if (method === 'Runtime.evaluate' && args.expression.includes('const found=doc?.querySelectorAll'))
           return { result: { objectId: 'frame-node' } };
         if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', frameId: 'frame-1' } };
-        if (method === 'Target.getTargetInfo') return { targetInfo: {
-          targetId: 'frame-1', url: 'https://identity.test/login' } };
+        if (method === 'Target.getTargetInfo') {
+          expect(target).toEqual({ tabId: 7, sessionId: 'child-1' }); expect(args).toEqual({});
+          return { targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' } };
+        }
         if (method === 'Runtime.evaluate' && args.expression.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
           return { result: { value: { url: 'https://identity.test/login', timeOrigin: 123 } } };
         if (method === 'Runtime.evaluate') return { result: { value:
@@ -1252,4 +1256,99 @@ it.each(['cancel', 'replacement'])('does not install a late Start lease after us
   resume(); await checked;
   expect(methods).toEqual([]);
   expect(vm.runInContext('claims.get(7).playwrightLease?.id', test.context)).toBe(change === 'cancel' ? undefined : 'b'.repeat(32));
+});
+
+it.each(['target-id', 'target-type', 'url', 'revision', 'detached'])('rejects changed external child metadata (%s) on its own registered session', async change => {
+  const test = discoveryHarness();
+  try {
+    await vm.runInContext('discoverTab(7)', test.context);
+    const info = { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' };
+    test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'bound-child', targetInfo: info });
+    const sendCommand = vi.fn(async (target: { tabId: number; sessionId?: string }, method: string, params: any) => {
+      expect(target).toEqual({ tabId: 7, sessionId: 'bound-child' }); expect(method).toBe('Target.getTargetInfo'); expect(params).toEqual({});
+      if (change === 'revision') test.debuggerEvent(7, 'Target.targetInfoChanged', { targetInfo: info });
+      if (change === 'detached') test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'bound-child' });
+      return { targetInfo: { ...info, ...(change === 'target-id' ? { targetId: 'foreign-target' }
+        : change === 'target-type' ? { type: 'page' } : change === 'url' ? { url: 'chrome://settings/' } : {}) } };
+    });
+    (test.context as any).chrome.debugger.sendCommand = sendCommand;
+    await expect(vm.runInContext("resolveCdpTarget(7, claims.get(7), {sessionId:'bound-child'})", test.context)).rejects.toThrow();
+    expect(sendCommand).toHaveBeenCalledTimes(1);
+    sendCommand.mockClear();
+    await expect(vm.runInContext("resolveCdpTarget(7, claims.get(7), {sessionId:'unregistered-child'})", test.context)).rejects.toThrow(/not attached/);
+    expect(sendCommand).not.toHaveBeenCalled();
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it.each(['navigate', 'detach'])('does not send a child command after %s during the final tab identity read', async change => {
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const methods: string[] = [];
+  let resume!: (value: unknown) => void, reads = 0;
+  const tab = { id: 7, incognito: false, active: false, windowId: 1, url: origin + '/' };
+  (test.context as any).chrome.tabs.get = async () => ++reads === 2
+    ? await new Promise(resolve => { resume = resolve; }) : tab;
+  (test.context as any).chrome.debugger.sendCommand = async (target: any, method: string, params: any) => {
+    methods.push(method);
+    expect(target).toEqual({ tabId: 7, sessionId: 'child-session' });
+    if (method === 'Target.getTargetInfo') {
+      expect(params).toEqual({});
+      return { targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } };
+    }
+    return {};
+  };
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false,
+      documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+    targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } });
+  const pending = vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+    leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
+    method:'Runtime.evaluate', params:{expression:'1'} }, 'child-boundary')`, test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/frame changed/);
+  try {
+    await vi.waitFor(() => expect(reads).toBe(2));
+    if (change === 'navigate') test.debuggerEvent(7, 'Page.frameNavigated', {
+      frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/form' },
+    }, 'child-session');
+    else test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
+    resume(tab); await checked;
+    expect(methods).toEqual(['Target.getTargetInfo']);
+  } finally { resume?.(tab); await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it.each([
+  { label: 'main document reload', method: 'Page.frameNavigated', params: { frame: { id: 'main', url: 'https://example.test/form' } }, main: true },
+  { label: 'same-process iframe reload', method: 'Page.frameNavigated', params: { frame: { id: 'child', parentId: 'main', url: 'https://example.test/frame' } } },
+  { label: 'OOPIF reload', method: 'Page.frameNavigated', params: { frame: { id: 'child', parentId: 'main', url: 'https://example.test/frame' } }, sessionId: 'child-session' },
+  { label: 'iframe attachment', method: 'Page.frameAttached', params: { frameId: 'child', parentFrameId: 'main' } },
+  { label: 'iframe removal', method: 'Page.frameDetached', params: { frameId: 'child', reason: 'remove' } },
+])('reports idle $label in the next frame generation without streaming old events', async event => {
+  const origin = 'https://example.test';
+  const test = discoveryHarness({ command: async method => method === 'Target.getTargetInfo'
+    ? { targetInfo: { targetId: 'main', type: 'page', url: origin + '/form' } }
+    : method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'main', url: origin + '/form' } } } : {} });
+  test.tabs.get(7)!.url = origin + '/form';
+  try {
+    await vm.runInContext('discoverTab(7)', test.context);
+    test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+      targetInfo: { targetId: 'child', type: 'iframe', url: origin + '/frame' } });
+    const firstId = 'a'.repeat(32), secondId = 'b'.repeat(32);
+    const first = await test.command('playwrightStart', { leaseId: firstId, approvedOrigin: origin, input: false, fresh: false });
+    expect(first).toMatchObject({ ok: true, result: { frameEpoch: 0 } });
+    await test.command('playwrightEnd', { leaseId: firstId });
+    const streamed = test.sent.filter(message => message.type === 'playwright_event').length;
+    test.debuggerEvent(7, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    expect(test.sent.filter(message => message.type === 'playwright_event')).toHaveLength(streamed);
+    const second = await test.command('playwrightStart', { leaseId: secondId, approvedOrigin: origin, input: false, fresh: false });
+    expect(second).toMatchObject({ ok: true, result: { frameEpoch: 1,
+      documentEpoch: 'main' in event && event.main ? 1 : 0, cdpEpoch: 0 } });
+    expect(second?.result.frameTree).toEqual(first?.result.frameTree);
+    expect(second?.result.childTargets).toEqual(first?.result.childTargets);
+    if (!('main' in event)) {
+      test.debuggerEvent(7, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+      expect(await test.command('playwrightCdp', { leaseId: secondId, approvedOrigin: origin,
+        method: 'Page.getLayoutMetrics', params: {} })).toMatchObject({ ok: true });
+    }
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });

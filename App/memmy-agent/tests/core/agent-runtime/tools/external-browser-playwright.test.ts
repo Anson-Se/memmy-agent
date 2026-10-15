@@ -6,7 +6,7 @@ import path from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { WebSocket } from 'ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { executeExternalBrowserPlaywright, closeAllExternalBrowserPlaywright, EXTERNAL_BROWSER_SNAPSHOT_BUDGET } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
+import { executeExternalBrowserPlaywright, closeExternalBrowserPlaywrightScope, closeAllExternalBrowserPlaywright, EXTERNAL_BROWSER_SNAPSHOT_BUDGET } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
 import { ExternalBrowserPlaywrightRelay, type PlaywrightCommandBridge } from '../../../../src/core/agent-runtime/tools/external-browser-playwright-relay.js';
 import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
 import { BROWSER_PLAYWRIGHT_CDP_METHODS } from '@memmy/local-api-contracts';
@@ -21,12 +21,33 @@ const FIXTURE = `<body><button id="replace">Replace</button><button id="action">
  <input id="file" type="file" aria-label="Attachment"><div id="result"></div>
  <script>document.querySelector('#action').onclick=()=>document.querySelector('#result').textContent='Done';
  document.querySelector('#replace').onclick=()=>{const el=document.querySelector('#action');const copy=el.cloneNode(true);copy.onclick=el.onclick;el.replaceWith(copy);};</script>`;
+const JOURNEY_FORM = `<body><h1>New request</h1><form action="/journey/receipt">
+ <label>Applicant<input name="applicant" required></label>
+ <label>Category<select name="category"><option value="regular">Regular</option><option value="priority">Priority</option></select></label>
+ <button type="button" role="combobox" aria-label="Delivery" aria-expanded="false" id="delivery">Choose delivery</button>
+ <div id="choices" hidden><button type="button" role="option">Courier</button></div><input name="delivery" type="hidden">
+ <div id="contact"></div><input type="hidden" name="contact">
+ <div contenteditable="true" role="textbox" aria-label="Notes"></div><input type="hidden" name="notes">
+ <label><input type="checkbox" name="accepted" required>I agree</label>
+ <label>Evidence<input type="file" name="evidence" required></label>
+ <div style="height:1500px">Review the request before sending.</div><button>Send request</button></form>
+ <script>
+ const host=document.querySelector('#contact').attachShadow({mode:'open'});
+ host.innerHTML='<label>Contact<input aria-label="Contact"></label>';
+ host.querySelector('input').oninput=e=>document.querySelector('[name=contact]').value=e.target.value;
+ document.querySelector('[contenteditable]').oninput=e=>document.querySelector('[name=notes]').value=e.target.textContent;
+ document.querySelector('#delivery').onclick=()=>{document.querySelector('#choices').hidden=false;document.querySelector('#delivery').setAttribute('aria-expanded','true');};
+ document.querySelector('[role=option]').onclick=()=>{document.querySelector('[name=delivery]').value='courier';document.querySelector('#choices').hidden=true;
+  const before=document.querySelector('#delivery'),copy=before.cloneNode(true);copy.textContent='Courier';copy.setAttribute('aria-expanded','false');before.replaceWith(copy);};
+ document.querySelector('form').onsubmit=()=>{console.log('fixture request sent');fetch('/journey/audit');};
+ </script>`;
 
 class FixtureBridge implements PlaywrightCommandBridge {
   private static nextConnectionId = 0;
   claim: ExternalBrowserClaim;
   leaseId = '';
   documentEpoch = 0;
+  frameEpoch = 0;
   private nextId = 0;
   private root: WebSocket;
   private sessionId = '';
@@ -64,6 +85,7 @@ class FixtureBridge implements PlaywrightCommandBridge {
       if (message.method === 'Page.frameNavigated' && message.sessionId === this.sessionId && !message.params.frame.parentId) {
         this.claim.url = message.params.frame.url; this.documentEpoch++;
       }
+      if (['Page.frameNavigated', 'Page.frameAttached', 'Page.frameDetached'].includes(message.method)) this.frameEpoch++;
       if (message.method === 'Runtime.executionContextCreated') this.contexts.push({
         child: message.sessionId !== this.sessionId, isDefault: message.params.context.auxData?.isDefault === true,
         origin: message.params.context.origin, frameId: message.params.context.auxData?.frameId,
@@ -103,7 +125,7 @@ class FixtureBridge implements PlaywrightCommandBridge {
       const info = await this.send('Target.getTargetInfo', {}, this.sessionId);
       const tree = await this.send('Page.getFrameTree', {}, this.sessionId);
       return { ...info, ...tree, childTargets: [...this.childTargets.values()].map(child => ({ targetId: child.targetId, url: child.url })),
-        documentEpoch: this.documentEpoch, cdpEpoch: 0 };
+        documentEpoch: this.documentEpoch, frameEpoch: this.frameEpoch, cdpEpoch: 0 };
     }
     if (name !== 'playwrightCdp' || args.leaseId !== this.leaseId) throw new Error('Invalid action lease');
     if (this.rejectObservation && JSON.stringify(args.params).includes('const nonce=')) throw new Error('Fixture observation failed');
@@ -134,17 +156,21 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
   let bridge: FixtureBridge;
   let server: http.Server;
   let origin: string;
+  let debugPort: number;
   beforeEach(async () => {
     server = http.createServer((request, response) => {
       response.setHeader('content-type', 'text/html');
-      response.end(request.url?.startsWith('/frame') ? '<label>Frame name<input id="inside"></label><button>Frame action</button>'
+      const route = new URL(request.url || '/', 'http://fixture');
+      response.end(route.pathname === '/journey' ? JOURNEY_FORM
+        : route.pathname === '/journey/receipt' ? `<h1>Request recorded</h1><output>${JSON.stringify(Object.fromEntries(route.searchParams)).replaceAll('<', '&lt;')}</output>`
+        : request.url?.startsWith('/frame') ? '<label>Frame name<input id="inside"></label><button>Frame action</button>'
         : request.url?.startsWith('/blocked') ? '<div>PRIVATE BLOCKED CONTENT</div><input id="private">' : FIXTURE);
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     origin = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
     const portServer = net.createServer();
     await new Promise<void>(resolve => portServer.listen(0, '127.0.0.1', resolve));
-    const port = (portServer.address() as net.AddressInfo).port;
+    const port = debugPort = (portServer.address() as net.AddressInfo).port;
     await new Promise<void>(resolve => portServer.close(() => resolve()));
     browser = await chromium.launch({ executablePath: executable, headless: true,
       args: [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'] });
@@ -313,6 +339,93 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     expect(await page.locator('iframe').contentFrame().locator('#private').inputValue()).toBe('');
   });
 
+  it('keeps observed refs after an optional preview is denied, but rejects them after navigation', async () => {
+    await page.evaluate(`const frame=document.createElement('iframe');frame.src=${JSON.stringify(origin + '/blocked')};document.body.append(frame)`);
+    await page.locator('iframe').contentFrame().locator('#private').waitFor();
+    const allow = (url: string) => !url.includes('/blocked');
+    const snapshot = await run('snapshot', {}, allow);
+    const reference = snapshot.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue');
+    expect(reference).toBeTruthy();
+    await emitExternalBrowserFrame({ command: bridge.command, getClaim: bridge.getClaim,
+      subscribePlaywright: bridge.subscribePlaywright, isFrameAllowed: allow }, bridge.claim, scope);
+    expect(bridge.methods).not.toContain('Page.captureScreenshot');
+    const clicked = await run('click', { target: reference.ref }, allow);
+    expect(clicked.observation.nodes.some((node: any) => node.name === 'Done')).toBe(true);
+    const currentRef = clicked.observation.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue').ref;
+    await page.reload();
+    const inputCount = bridge.methods.filter(method => method.startsWith('Input.')).length;
+    await expect(run('click', { target: currentRef }, allow)).rejects.toThrow(/document changed/);
+    expect(bridge.methods.filter(method => method.startsWith('Input.'))).toHaveLength(inputCount);
+    expect(await page.locator('#result').textContent()).toBe('');
+  });
+
+  it('keeps observed refs after an idle transport detach, but rejects them after navigation', async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const idleTimers: Array<() => void> = [];
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void,
+      milliseconds?: number, ...args: any[]) => {
+      const timer = originalSetTimeout(callback, milliseconds, ...args);
+      if (milliseconds === 15_000) idleTimers.push(() => { clearTimeout(timer); callback(...args); });
+      return timer;
+    }) as typeof setTimeout);
+    let snapshot: any;
+    try {
+      snapshot = await run('snapshot');
+      // The last 15-second timer is installed only after the completed operation releases its lease.
+      expect(idleTimers.length).toBeGreaterThan(0);
+      idleTimers.at(-1)!();
+      await new Promise<void>(resolve => originalSetTimeout(resolve, 30));
+    } finally { timerSpy.mockRestore(); }
+    const reference = snapshot.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue');
+    expect(reference).toBeTruthy();
+    const clicked = await run('click', { target: reference.ref });
+    expect(clicked.observation.nodes.some((node: any) => node.name === 'Done')).toBe(true);
+    const currentRef = clicked.observation.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue').ref;
+    await page.reload();
+    const inputCount = bridge.methods.filter(method => method.startsWith('Input.')).length;
+    await expect(run('click', { target: currentRef })).rejects.toThrow(/document changed/);
+    expect(bridge.methods.filter(method => method.startsWith('Input.'))).toHaveLength(inputCount);
+    expect(await page.locator('#result').textContent()).toBe('');
+  });
+
+  it.each(['scope', 'all'] as const)('revokes %s work while an old connection is recycling, before a new lease or input', async close => {
+    await run('snapshot');
+    await page.reload();
+    const originalCommand = bridge.command;
+    let release!: () => void, entered = false, held = false, starts = 0;
+    const cleanup = new Promise<void>(resolve => { release = resolve; });
+    bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
+      if (args[1] === 'playwrightStart') starts++;
+      if (args[1] === 'playwrightEnd' && args[2]?.detach && !held) {
+        held = true; entered = true;
+        await cleanup;
+      }
+      return originalCommand(...args);
+    };
+    const waiting = run('click', { target: '#action' }).then(
+      value => ({ kind: 'result' as const, value }), error => ({ kind: 'error' as const, error }));
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true), { timeout: 2000 });
+      // Recycling has removed the old session before its asynchronous detach
+      // finishes. Revocation must still cover the old work in this empty gap.
+      if (close === 'scope') await closeExternalBrowserPlaywrightScope(scope);
+      else await closeAllExternalBrowserPlaywright();
+      const startsAtClose = starts;
+      const inputsAtClose = bridge.methods.filter(method => method.startsWith('Input.')).length;
+      release();
+      const outcome = await waiting;
+      expect.soft(outcome).toMatchObject({ kind: 'error', error: { noActionDispatched: true } });
+      expect.soft(starts).toBe(startsAtClose);
+      expect.soft(bridge.methods.filter(method => method.startsWith('Input.'))).toHaveLength(inputsAtClose);
+      expect.soft(await page.locator('#result').textContent()).toBe('');
+      const recovered = await run('snapshot');
+      const reference = recovered.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue');
+      await page.evaluate("document.querySelector('#result').textContent=''");
+      const completed = await run('click', { target: reference.ref });
+      expect(completed.observation.nodes.some((node: any) => node.name === 'Done')).toBe(true);
+    } finally { release(); await waiting; bridge.command = originalCommand; }
+  }, 15_000);
+
   it('cancels waiting input, revokes user-stopped claims and accepts approved uploads by ref', async () => {
     const controller = new AbortController();
     const pending = run('click', { target: '#missing' }, undefined, controller.signal);
@@ -330,6 +443,80 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     bridge.stop();
     await expect(run('click', { target: '#action' })).rejects.toThrow(/changed|cancelled/);
   });
+
+  it('completes a request through native and custom controls, shadow DOM, keyboard, scroll, upload and navigation', async () => {
+    await page.goto(origin + '/journey');
+    let observation = await run('snapshot');
+    const reference = (name: string, role?: string) => {
+      const matches = observation.nodes.filter((node: any) => node.name.startsWith(name) && (!role || node.role === role));
+      expect(matches).toHaveLength(1);
+      return matches[0].ref;
+    };
+    const act = async (action: string, args: Record<string, any>) => {
+      const result = await run(action, args);
+      expect(result.ok).not.toBe(false);
+      if (result.observation) observation = result.observation;
+      return result;
+    };
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-browser-journey-'));
+    const file = path.join(temporary, 'evidence.txt'); fs.writeFileSync(file, 'isolated fixture evidence');
+    try {
+      await act('type', { target: reference('Applicant'), text: 'Fixture Applicant' });
+      await act('selectOption', { target: reference('Category', 'combobox'), values: ['priority'] });
+      await act('click', { target: reference('Delivery') });
+      await act('click', { target: reference('Courier', 'option') });
+      expect(observation.nodes.find((node: any) => node.name === 'Delivery').state.expanded).toBe(false);
+      await act('type', { target: reference('Contact'), text: 'fixture@example.invalid' });
+      await act('type', { target: reference('Notes'), text: 'Review' });
+      await act('pressKey', { key: 'End' });
+      await act('pressKey', { key: 'Space' });
+      await act('pressKey', { key: 'A' });
+      await act('click', { target: reference('I agree') });
+      expect(observation.nodes.find((node: any) => node.name === 'I agree').state.checked).toBe(true);
+      await act('upload', { target: reference('Evidence'), paths: [file] });
+      await act('scroll', { deltaY: 700 });
+      await page.waitForFunction(() => (globalThis as any).scrollY > 0);
+      await act('click', { target: reference('Send request') });
+      expect(page.url()).toContain('/journey/receipt?');
+      const receipt = JSON.parse((await page.locator('output').textContent())!);
+      expect(receipt).toMatchObject({ applicant: 'Fixture Applicant', category: 'priority', delivery: 'courier',
+        contact: 'fixture@example.invalid', notes: 'Review A', accepted: 'on', evidence: 'evidence.txt' });
+      expect(observation.nodes.some((node: any) => node.name === 'Request recorded')).toBe(true);
+      const consoleResult = await run('consoleMessages');
+      const network = await run('networkRequests');
+      expect.soft(consoleResult.messages.some((message: any) => message.text === 'fixture request sent')).toBe(true);
+      expect.soft(network.requests.some((request: any) => request.url.includes('/journey/receipt?'))).toBe(true);
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+  }, 20_000);
+
+  it('keeps two task tabs separate while one task is cancelled and stopped and the other completes', async () => {
+    const otherPage = await browser.newPage(); await otherPage.goto(origin + '/?other-task');
+    const other = await FixtureBridge.create(debugPort, otherPage);
+    const otherScope = { sessionKey: 'other-fixture', channel: 'test', chatId: 'other-fixture' };
+    const runOther = (action: string, args: Record<string, any> = {}) =>
+      executeExternalBrowserPlaywright(other, other.claim, otherScope, action, args, () => true);
+    const controller = new AbortController();
+    try {
+      const snapshots = await Promise.all([run('snapshot'), runOther('snapshot')]);
+      const otherName = snapshots[1].nodes.find((node: any) => node.name === 'Name').ref;
+      const inputCount = bridge.methods.filter(method => method.startsWith('Input.')).length;
+      await expect(run('type', { target: otherName, text: 'wrong tab' })).rejects.toThrow(/stale/);
+      expect(bridge.methods.filter(method => method.startsWith('Input.'))).toHaveLength(inputCount);
+      const waiting = run('click', { target: '#missing-control' }, () => true, controller.signal);
+      const outcome = waiting.then(() => null, error => error);
+      const typed = await runOther('type', { target: otherName, text: 'Other task continued' });
+      controller.abort();
+      expect((await outcome)?.message).toMatch(/cancelled/);
+      expect(await page.locator('#name').inputValue()).toBe('');
+      expect(await otherPage.locator('#name').inputValue()).toBe('Other task continued');
+      bridge.stop(); await closeExternalBrowserPlaywrightScope(scope);
+      await expect(run('click', { target: '#action' })).rejects.toThrow(/changed|cancelled/);
+      const nextRef = typed.observation.nodes.find((node: any) => node.role === 'button' && node.name === 'Continue').ref;
+      const completed = await runOther('click', { target: nextRef });
+      expect(completed.observation.nodes.some((node: any) => node.name === 'Done')).toBe(true);
+      expect(await page.locator('#result').textContent()).toBe('');
+    } finally { controller.abort(); await closeExternalBrowserPlaywrightScope(otherScope); other.close(); await otherPage.close(); }
+  }, 15_000);
 
   it('denies browser-wide CDP and other targets even during an active action', async () => {
     const relay = new ExternalBrowserPlaywrightRelay(bridge.claim, () => true);

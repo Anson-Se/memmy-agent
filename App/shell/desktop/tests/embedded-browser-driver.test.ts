@@ -279,12 +279,14 @@ it('binds secure auth to an attached cross-origin iframe and rejects a changed c
   guest.debugger.emit('message', {}, 'Target.attachedToTarget', {
     sessionId: 'child-1', targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' },
   });
-  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>) => {
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
     if (method === 'Runtime.evaluate' && args?.expression?.includes('const found=doc?.querySelectorAll'))
       return { result: { objectId: 'frame-node' } };
     if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', frameId: 'frame-1' } };
-    if (method === 'Target.getTargetInfo') return { targetInfo: {
-      targetId: 'frame-1', url: 'https://identity.test/login' } };
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('child-1');
+      return { targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' } };
+    }
     if (method === 'Runtime.evaluate' && args?.expression?.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
       return { result: { value: { url: 'https://identity.test/login', timeOrigin: 123 } } };
     if (method === 'Runtime.evaluate') return { result: { value:
@@ -331,8 +333,11 @@ it('follows a bounded two-level cross-origin iframe chain without exposing crede
       return { result: { objectId: sessionId === 'child-1' ? 'node-2' : 'node-1' } };
     if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME',
       frameId: args?.objectId === 'node-2' ? 'frame-2' : 'frame-1' } };
-    if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: args?.targetId,
-      url: args?.targetId === 'frame-1' ? 'https://identity.test/' : 'https://challenge.test/' } };
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(['child-1', 'child-2']).toContain(sessionId);
+      return { targetInfo: { type: 'iframe', targetId: sessionId === 'child-1' ? 'frame-1' : 'frame-2',
+        url: sessionId === 'child-1' ? 'https://identity.test/' : 'https://challenge.test/' } };
+    }
     if (method === 'Runtime.evaluate' && args?.expression?.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
       return { result: { value: { url: sessionId === 'child-1'
         ? 'https://identity.test/' : 'https://challenge.test/', timeOrigin: sessionId === 'child-1' ? 123 : 456 } } };
@@ -576,8 +581,13 @@ it('sends child CDP commands only to the approved attached iframe and rejects pr
   guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1',
     targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.com/frame' } });
   let childUrl = 'https://example.com/frame';
-  sendCommand.mockImplementation(async (method: string) => method === 'Target.getTargetInfo'
-    ? { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } } : {});
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('session-1');
+      return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+    }
+    return {};
+  });
   let approvedTarget = await driver.cdpTarget(27, { targetId: 'child-1' });
   await driver.handle(request('cdpWrite', { method: 'Input.dispatchMouseEvent',
     params: { type: 'mouseMoved', x: 1, y: 2 }, target: { targetId: 'child-1' } }), undefined,
@@ -604,10 +614,11 @@ it('sends child CDP commands only to the approved attached iframe and rejects pr
     .resolves.toEqual({});
   expect(sendCommand.mock.calls.find(([method]) => method === 'Page.getLayoutMetrics')?.[2])
     .toBe('session-1');
-  sendCommand.mockImplementation(async (method: string) => {
-    if (method === 'Target.getTargetInfo') return { targetInfo: {
-      type: 'iframe', targetId: 'child-1', url: childUrl,
-    } };
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('session-1');
+      return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+    }
     if (method === 'Page.getLayoutMetrics') {
       guest.debugger.emit('message', {}, 'Target.targetInfoChanged', {
         targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.com/frame' },
@@ -626,6 +637,29 @@ it('sends child CDP commands only to the approved attached iframe and rejects pr
     target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .rejects.toThrow(/not attached/);
   driver.dispose();
+});
+
+it.each(['target-id', 'target-type', 'url', 'revision', 'detached'])('rejects changed child metadata (%s) on its own registered session', async change => {
+  const { driver, request, guest, sendCommand } = harness();
+  try {
+    await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
+    await driver.handle(request('viewport'));
+    const info = { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' };
+    guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'bound-child', targetInfo: info });
+    sendCommand.mockImplementation(async (method: string, params?: Record<string, any>, sessionId?: string) => {
+      expect(method).toBe('Target.getTargetInfo'); expect(params).toEqual({}); expect(sessionId).toBe('bound-child');
+      if (change === 'revision') guest.debugger.emit('message', {}, 'Target.targetInfoChanged', { targetInfo: info });
+      if (change === 'detached') guest.debugger.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'bound-child' });
+      return { targetInfo: { ...info, ...(change === 'target-id' ? { targetId: 'foreign-target' }
+        : change === 'target-type' ? { type: 'page' } : change === 'url' ? { url: 'chrome://settings/' } : {}) } } as any;
+    });
+    sendCommand.mockClear();
+    await expect(driver.cdpTarget(27, { sessionId: 'bound-child' })).rejects.toThrow();
+    expect(sendCommand).toHaveBeenCalledTimes(1);
+    sendCommand.mockClear();
+    await expect(driver.cdpTarget(27, { sessionId: 'unregistered-child' })).rejects.toThrow(/not attached/);
+    expect(sendCommand).not.toHaveBeenCalled();
+  } finally { driver.dispose(); }
 });
 
 it('rechecks selection and origin after attaching CDP but before sending autofill values', async () => {
@@ -1222,6 +1256,58 @@ it('revokes same-site old documents, protects the current owner from stale End a
   } finally { test.driver.dispose(); }
 });
 
+it.each([
+  { label: 'main frame navigation', method: 'Page.frameNavigated', params: { frame: { id: 'frame-27', url: 'https://example.com/' } } },
+  { label: 'same-process iframe reload', method: 'Page.frameNavigated', params: { frame: { id: 'iframe-1', parentId: 'frame-27', url: 'https://frame.test/form' } } },
+  { label: 'OOPIF reload', method: 'Page.frameNavigated', params: { frame: { id: 'iframe-1', parentId: 'frame-27', url: 'https://frame.test/form' } }, sessionId: 'session-1' },
+  { label: 'iframe attachment', method: 'Page.frameAttached', params: { frameId: 'iframe-1', parentFrameId: 'frame-27' } },
+  { label: 'iframe removal', method: 'Page.frameDetached', params: { frameId: 'iframe-1', reason: 'remove' } },
+])('versions idle $label without revoking an active executor for frame metadata', async event => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.driver.handle(test.request('viewport'));
+    test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1',
+      targetInfo: { type: 'iframe', targetId: 'iframe-1', url: 'https://frame.test/form' } });
+    const first = await test.start(false, { fresh: false }) as any;
+    await test.run('playwrightEnd');
+    test.guest.debugger.emit('message', {}, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    const second = await test.start(false, { fresh: false }) as any;
+    expect(second.frameEpoch).toBe(first.frameEpoch + 1);
+    expect(second.documentEpoch).toBe(first.documentEpoch);
+    expect(second.cdpEpoch).toBe(first.cdpEpoch);
+    expect(second.frameTree).toEqual(first.frameTree);
+    expect(second.childTargets).toEqual(first.childTargets);
+    const events = await test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 });
+    expect(events).toEqual({ events: [] });
+    test.guest.debugger.emit('message', {}, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    await expect(test.run('playwrightCdp', { method: 'Page.getLayoutMetrics', params: {} }))
+      .resolves.toMatchObject({ cssVisualViewport: { clientWidth: 800 } });
+  } finally { test.driver.dispose(); }
+});
+
+it('does not replace a new executor owner after an older Start finishes waiting for user idle', async () => {
+  const test = playwrightHarness();
+  let resume!: () => void, entered = false;
+  const idle = vi.spyOn(test.driver as any, 'waitForUserIdle').mockImplementationOnce(async () => {
+    entered = true;
+    await new Promise<void>(resolve => { resume = resolve; });
+  });
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    const waiting = test.start(true);
+    const checked = expect(waiting).rejects.toThrow(/already busy/);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const replacement = 'b'.repeat(32);
+    await test.run('playwrightStart', { leaseId: replacement, input: false, fresh: false });
+    test.sendCommand.mockClear();
+    resume(); await checked;
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await expect(test.run('playwrightCdp', { leaseId: replacement, method: 'Page.getLayoutMetrics', params: {} }))
+      .resolves.toMatchObject({ cssVisualViewport: { clientWidth: 800 } });
+  } finally { resume?.(); idle.mockRestore(); test.driver.dispose(); }
+});
+
 it('streams only scoped executor events and fails closed when its bounded event history loses events', async () => {
   const test = playwrightHarness();
   try {
@@ -1246,8 +1332,11 @@ it('permits only an existing iframe session and detects frame replacement after 
     const info = { targetId: 'iframe-1', type: 'iframe', url: 'https://frame.test/form' };
     test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1', targetInfo: info });
     const initial = test.sendCommand.getMockImplementation()!;
-    test.sendCommand.mockImplementation(async (method, args) => {
-      if (method === 'Target.getTargetInfo' && args?.targetId === 'iframe-1') return { targetInfo: info } as any;
+    test.sendCommand.mockImplementation(async (method, args, sessionId?: string) => {
+      if (method === 'Target.getTargetInfo') {
+        expect(args).toEqual({}); expect(sessionId).toBe('session-1');
+        return { targetInfo: info } as any;
+      }
       if (method === 'Runtime.evaluate') {
         test.guest.debugger.emit('message', {}, 'Page.frameNavigated', { frame: { id: 'iframe-1' } }, 'session-1');
         return { result: { value: 1 } };

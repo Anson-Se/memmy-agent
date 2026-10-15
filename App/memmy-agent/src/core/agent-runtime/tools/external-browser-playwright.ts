@@ -2,17 +2,24 @@ import { randomBytes } from 'node:crypto';
 import type { Browser, Frame, Locator, Page } from 'playwright';
 import type { BrowserScope } from './browser.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
-import { ExternalBrowserPlaywrightRelay, type PlaywrightCommandBridge } from './external-browser-playwright-relay.js';
+import { ExternalBrowserPlaywrightRelay, type BrowserExecutionDiagnostics, type PlaywrightCommandBridge } from './external-browser-playwright-relay.js';
 
 type NodeInfo = { ref: string; role: string; name: string; value: string; state?: Record<string, unknown> };
 export const EXTERNAL_BROWSER_SNAPSHOT_BUDGET = { nodes: 800, characters: 60_000, frames: 32 } as const;
 type Reference = NodeInfo & { framePath: number[]; url: string; timeOrigin: number };
+// Observations belong to the task, while a CDP connection can be recycled
+// between any two actions (idle detach, preview failure, or reconnect).
+type ScopeState = {
+  observations: Map<string, Map<string, Reference>>;
+  diagnostics: Map<string, BrowserExecutionDiagnostics>;
+};
 type Session = {
   key: string; scopeKey: string; relay: ExternalBrowserPlaywrightRelay; browser: Browser | null;
-  page: Page | null; epoch: string; refs: Map<string, Reference>; idleTimer?: NodeJS.Timeout;
+  page: Page | null; epoch: string; refs: Map<string, Reference>; state: ScopeState; idleTimer?: NodeJS.Timeout;
 };
 const sessions = new Map<string, Session>();
 const queues = new Map<string, Promise<unknown>>();
+const scopes = new Map<string, ScopeState>();
 const scopeKey = (scope: BrowserScope) => JSON.stringify([scope.sessionKey, scope.channel, scope.chatId]);
 const sessionKey = (scope: BrowserScope, claim: ExternalBrowserClaim) => `${scopeKey(scope)}:${claim.connectionId}:${claim.tabId}`;
 const INPUT_ACTIONS = new Set(['click', 'type', 'selectOption', 'pressKey', 'scroll', 'upload']);
@@ -111,7 +118,11 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
     for (const [index, child] of frame.childFrames().entries()) await visit(child, [...framePath, index]);
   };
   await visit(session.page!.mainFrame(), []);
+  if (scopes.get(session.scopeKey) !== session.state || session.relay.actionError) {
+    throw session.relay.actionError ?? new Error('Browser observation belongs to an ended task');
+  }
   session.refs = refs;
+  session.state.observations.set(session.key, refs);
   return { nodes, truncated };
 }
 
@@ -154,10 +165,13 @@ async function dispose(session: Session): Promise<void> {
 
 export async function closeExternalBrowserPlaywrightScope(scope: BrowserScope): Promise<void> {
   const key = scopeKey(scope);
+  // Revoke queued work synchronously, before awaiting connection cleanup.
+  scopes.delete(key);
   await Promise.allSettled([...sessions.values()].filter(session => session.scopeKey === key).map(dispose));
 }
 
 export async function closeAllExternalBrowserPlaywright(): Promise<void> {
+  scopes.clear();
   await Promise.allSettled([...sessions.values()].map(dispose));
 }
 
@@ -166,10 +180,15 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
   claim: ExternalBrowserClaim, scope: BrowserScope, action: string, args: Record<string, any>,
   allowFrame: (url: string) => boolean, signal?: AbortSignal): Promise<Record<string, any>> {
   const key = sessionKey(scope, claim);
+  const ownerKey = scopeKey(scope);
+  const owner: ScopeState = scopes.get(ownerKey) ?? { observations: new Map(), diagnostics: new Map() };
+  scopes.set(ownerKey, owner);
+  const diagnostics = owner.diagnostics.get(key) ?? { consoleRecords: [], networkRecords: [] };
+  owner.diagnostics.set(key, diagnostics);
   const tabKey = `${claim.connectionId}:${claim.tabId}`;
   const previous = queues.get(tabKey) ?? Promise.resolve();
   const work = previous.catch(() => undefined).then(async () => {
-    if (signal?.aborted) throw new Error('Browser executor cancelled');
+    if (signal?.aborted || scopes.get(ownerKey) !== owner) throw new Error('Browser executor cancelled');
     const operationId = randomBytes(6).toString('hex');
     const startedAt = Date.now();
     const diagnostic = (outcome: string, error?: Error & { stage?: string; code?: string }) => {
@@ -181,8 +200,8 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
     let outcome = 'completed';
     let session = sessions.get(key);
     if (!session) {
-      session = { key, scopeKey: scopeKey(scope), relay: new ExternalBrowserPlaywrightRelay(claim, allowFrame),
-        browser: null, page: null, epoch: '', refs: new Map() };
+      session = { key, scopeKey: ownerKey, state: owner, relay: new ExternalBrowserPlaywrightRelay(claim, allowFrame, diagnostics),
+        browser: null, page: null, epoch: '', refs: owner.observations.get(key) ?? new Map() };
       sessions.set(key, session);
     }
     clearTimeout(session.idleTimer);
@@ -194,11 +213,16 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       if (claim.browser === 'memmy' && action === 'screenshot') throw new Error('Screenshots are not supported for Memmy in-app browser tabs');
       const uploadPaths = action === 'upload' ? args.paths as string[] : undefined;
       let state = await session.relay.begin(bridge, origin, INPUT_ACTIONS.has(action), !session.browser, signal, uploadPaths);
-      const epoch = `${state.documentEpoch}:${state.cdpEpoch}:${state.frameVersion}`;
-      if (session.browser && session.epoch !== epoch) {
+      const epoch = `${state.documentEpoch}:${state.cdpEpoch}:${state.frameEpoch}:${state.frameVersion}`;
+      // Older peers do not provide a complete frame-lifecycle generation. A
+      // fresh connection preserves correctness until their automatic update.
+      if (session.browser && (state.frameEpoch === null || session.epoch !== epoch)) {
         const refs = session.refs;
         await dispose(session);
-        session = { key, scopeKey: scopeKey(scope), relay: new ExternalBrowserPlaywrightRelay(claim, allowFrame),
+        // The old connection is absent from sessions while native cleanup is
+        // pending. Task revocation during that gap must prevent reacquisition.
+        if (signal?.aborted || scopes.get(ownerKey) !== owner) throw new Error('Browser executor cancelled');
+        session = { key, scopeKey: ownerKey, state: owner, relay: new ExternalBrowserPlaywrightRelay(claim, allowFrame, diagnostics),
           browser: null, page: null, epoch: '', refs };
         sessions.set(key, session);
         state = await session.relay.begin(bridge, origin, INPUT_ACTIONS.has(action), true, signal, uploadPaths);
@@ -213,7 +237,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         session.page = pages[0];
         session.page.setDefaultTimeout(8_000);
       }
-      session.epoch = `${state.documentEpoch}:${state.cdpEpoch}:${session.relay.frameVersion()}`;
+      session.epoch = `${state.documentEpoch}:${state.cdpEpoch}:${state.frameEpoch}:${session.relay.frameVersion()}`;
       const page = session.page!;
       const observed = async (result: Record<string, unknown>) => ({ ...result,
         observation: await capture(session!, allowFrame) });

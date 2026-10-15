@@ -37,7 +37,7 @@ it.each(['website', 'computer'] as const)('applies live %s allow-all to iframe C
       context: { id: 17, origin: 'https://frame.example', auxData: { frameId: 'child-frame' } },
     } });
     onEvent!({ leaseId, method: 'Target.attachedToTarget', params: { sessionId: 'child-session',
-      targetInfo: { targetId: 'child-target', type: 'iframe', url: 'https://frame.example/private' } } });
+      targetInfo: { targetId: 'child-frame', parentFrameId: 'main-frame', type: 'iframe', url: 'https://frame.example/private' } } });
     expect(relay.hasBlockedFrames()).toBe(true);
     await expect(relay.send('Runtime.evaluate', { expression: 'document.title', contextId: 17 })).rejects.toThrow(/blocked/);
     await expect(relay.send('DOM.getDocument', { depth: -1, pierce: true })).rejects.toThrow(/blocked/);

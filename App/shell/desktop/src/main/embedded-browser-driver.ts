@@ -30,7 +30,7 @@ type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<stri
   playwrightEvents: BrowserCdpEventBuffer;
   protectedActivity: number; cdpReadDepth: number; cdpWriteDepth: number;
   credentialProtected: boolean; credentialRecoveryOrigin: string | null;
-  recoveryNavigationPending: boolean; documentEpoch: number;
+  recoveryNavigationPending: boolean; documentEpoch: number; frameEpoch: number;
   attached: boolean; debuggerListenersInstalled: boolean; lastUserInputAt: number; agentInputDepth: number; lastStartedUrl: string;
   visitSource: BrowserVisitSource; visitSourceUntil: number; visitSourceMarkedAt: number;
   lastRecordedUrl: string; lastRecordedAt: number; lastRecordedSource: BrowserVisitSource;
@@ -195,7 +195,7 @@ export class EmbeddedBrowserDriver {
       playwrightLease: null, playwrightLastLeaseId: null, playwrightEvents: new BrowserCdpEventBuffer(),
       protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: false,
       credentialRecoveryOrigin: null, recoveryNavigationPending: false,
-      documentEpoch: 0,
+      documentEpoch: 0, frameEpoch: 0,
       attached: false, debuggerListenersInstalled: false, lastUserInputAt: 0, agentInputDepth: 0, lastStartedUrl: '',
       visitSource: 'other', visitSourceUntil: 0, visitSourceMarkedAt: 0,
       lastRecordedUrl: '', lastRecordedAt: 0, lastRecordedSource: 'other', pendingNavigation: false,
@@ -366,8 +366,7 @@ export class EmbeddedBrowserDriver {
         info.targetId === frameId && info.parentSessionId === sessionId);
       if (child) {
         const [childSessionId, info] = child;
-        const live = await this.command(entry, 'Target.getTargetInfo',
-          { targetId: info.targetId }, undefined, sessionId);
+        const live = await this.attachedChildMetadata(entry, childSessionId, info);
         url = String(live.targetInfo?.url ?? '');
         if (live.targetInfo?.targetId !== info.targetId || origin(url) !== origin(info.url))
           throw new Error('Auth frame site changed');
@@ -568,6 +567,11 @@ export class EmbeddedBrowserDriver {
         entry.guest.debugger.on('message', (_event, name, data: any, sourceSessionId?: string) => {
           try {
             this.ensureCdpOrigin(entry);
+            // Idle leases do not forward CDP events. Keep a content-free frame
+            // generation for the next action without revoking the active lease.
+            if (['Page.frameNavigated', 'Page.frameAttached', 'Page.frameDetached'].includes(name)) {
+              entry.frameEpoch++;
+            }
             if (name === 'Target.attachedToTarget' && typeof data?.sessionId === 'string'
               && data.targetInfo?.type === 'iframe' && typeof data.targetInfo.targetId === 'string') {
               const childUrl = String(data.targetInfo.url ?? '');
@@ -678,12 +682,12 @@ export class EmbeddedBrowserDriver {
     current();
     if (request.command === 'playwrightStart') {
       if (typeof args.input !== 'boolean' || typeof args.fresh !== 'boolean') throw new Error('Invalid browser executor configuration');
-      if (entry.playwrightLease && entry.playwrightLease.id !== id && entry.playwrightLease.expiresAt > Date.now()) {
-        throw new Error('Browser executor is already busy');
-      }
       if (args.input) {
         await this.waitForUserIdle(entry.guest.id, isCurrent ?? approval?.isCurrentChild);
         current(); if (this.userActive(entry)) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
+      }
+      if (entry.playwrightLease && entry.playwrightLease.id !== id && entry.playwrightLease.expiresAt > Date.now()) {
+        throw new Error('Browser executor is already busy');
       }
       let uploadPaths: string[] | undefined;
       if (args.uploadPaths !== undefined) {
@@ -717,7 +721,7 @@ export class EmbeddedBrowserDriver {
         }
         current(lease);
         return { targetInfo: { ...info.targetInfo, type: 'page' }, frameTree: tree.frameTree, childTargets,
-          documentEpoch: entry.documentEpoch, cdpEpoch: entry.cdpEpoch };
+          documentEpoch: entry.documentEpoch, cdpEpoch: entry.cdpEpoch, frameEpoch: entry.frameEpoch };
       } catch (error) { if (entry.playwrightLease === lease) this.revokePlaywright(entry); throw error; }
     }
     const lease = entry.playwrightLease;
@@ -779,13 +783,32 @@ export class EmbeddedBrowserDriver {
     return result;
   }
 
+  private async attachedChildMetadata(entry: Entry, sessionId: string, info: CdpSession): Promise<any> {
+    const revision = info.revision;
+    const current = () => {
+      if (this.entries.get(entry.guest.id) !== entry || entry.guest.isDestroyed()
+        || entry.cdpSessions.get(sessionId) !== info || info.revision !== revision) {
+        throw new Error('CDP child target site changed');
+      }
+    };
+    current();
+    // Use the already attached child session to query its own metadata. Native
+    // Chrome debugging rejects parent-session queries for a foreign targetId.
+    const live = await this.command(entry, 'Target.getTargetInfo', {}, current, sessionId);
+    current();
+    if (live?.targetInfo?.targetId !== info.targetId || live.targetInfo.type !== 'iframe'
+      || !String(live.targetInfo.url ?? '')) throw new Error('CDP child target site changed');
+    origin(String(live.targetInfo.url));
+    return live;
+  }
+
   private async resolveCdpTarget(entry: Entry, target: BrowserCdpTarget | undefined): Promise<ResolvedCdpTarget | undefined> {
     if (!target) return undefined;
     const found = [...entry.cdpSessions.entries()].find(([sessionId, info]) =>
       'sessionId' in target ? sessionId === target.sessionId : info.targetId === target.targetId);
     if (!found) throw new Error('CDP child target is not attached to this tab');
     const [sessionId, info] = found;
-    const live = await entry.guest.debugger.sendCommand('Target.getTargetInfo', { targetId: info.targetId });
+    const live = await this.attachedChildMetadata(entry, sessionId, info);
     if (entry.cdpSessions.get(sessionId) !== info || live?.targetInfo?.targetId !== info.targetId
       || live.targetInfo.type !== 'iframe' || !String(live.targetInfo.url ?? '')) {
       throw new Error('CDP child target site changed');
@@ -1376,7 +1399,7 @@ export class EmbeddedBrowserDriver {
           }
         }, sessionId);
         if (child) {
-          const live = await entry.guest.debugger.sendCommand('Target.getTargetInfo', { targetId: child.info.targetId });
+          const live = await this.attachedChildMetadata(entry, child.sessionId, child.info);
           if (entry.cdpSessions.get(child.sessionId) !== child.info
             || child.info.revision !== child.revision
             || live?.targetInfo?.targetId !== child.info.targetId

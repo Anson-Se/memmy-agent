@@ -18,6 +18,12 @@ type Operation = { bridge: PlaywrightCommandBridge; leaseId: string; origin: str
   endPromise?: Promise<void>; detachPromise?: Promise<void> };
 type CdpMessage = { id: number; method: string; params?: Record<string, any>; sessionId?: string };
 type FrameTreeReply = { promise: Promise<void>; resolve: () => void };
+type RemoteObjectScope = { url: string; sessionId: string; frameId: string; contextKey?: string };
+type FrameEvent = Pick<ExternalBrowserPlaywrightEvent, 'method' | 'params' | 'sessionId'>;
+export type BrowserExecutionDiagnostics = {
+  consoleRecords: Array<{ frameUrl: string; type: string; text: string }>;
+  networkRecords: Array<{ frameUrl: string; method: string; url: string }>;
+};
 
 /** A deliberately single-page CDP transport, using only public Playwright APIs. */
 export class ExternalBrowserPlaywrightRelay {
@@ -30,13 +36,23 @@ export class ExternalBrowserPlaywrightRelay {
   private unsubscribe: (() => void) | null = null;
   private targetInfo: Record<string, any> = {};
   private frameUrls = new Map<string, string>();
+  private frameParents = new Map<string, string | undefined>();
+  private mainFrameId = '';
   private childUrls = new Map<string, string>();
   private childIds = new Map<string, string>();
   private childDescriptions = new Map<string, string>();
   private versionFrames: Array<[string, string]> = [];
   private contextUrls = new Map<string, string>();
   private contextFrames = new Map<string, string>();
-  private objectUrls = new Map<string, string>();
+  private objectScopes = new Map<string, RemoteObjectScope>();
+  // The physical tree includes denied frames. Only this sanitized view is
+  // published to Playwright, so it never waits for a deliberately hidden world.
+  private visibleFrames = new Set<string>();
+  private visibleSessions = new Set<string>();
+  private pendingAttachments = new Map<string, FrameEvent>();
+  private pendingNavigations = new Map<string, FrameEvent>();
+  private pendingContexts = new Map<string, FrameEvent>();
+  private childAttachments = new Map<string, FrameEvent>();
   private autoAttached = false;
   private inputState: 'none' | 'confirmed' | 'unknown' = 'none';
   private consoleRecords: Array<{ frameUrl: string; type: string; text: string }> = [];
@@ -53,10 +69,12 @@ export class ExternalBrowserPlaywrightRelay {
   get actionError(): Error | null { return this.failure; }
   get deadlineError(): Error | null { return (this.failure as any)?.code === 'BROWSER_ACTION_DEADLINE' ? this.failure : null; }
   waitForInterruption(): Promise<never> { return this.interruption; }
-  hasBlockedFrames(): boolean { return [...this.frameUrls.values(), ...this.childUrls.values()].some(url => !this.permitted(url)); }
+  hasBlockedFrames(): boolean { return [...this.frameParents.keys()].some(id => !this.frameAllowed(id))
+    || [...this.childUrls.values()].some(url => !this.permitted(url)); }
   dispatchState(): 'none' | 'confirmed' | 'unknown' { return this.inputState; }
   frameVersion(): string { return JSON.stringify({ frames: this.versionFrames,
-    children: [...this.childDescriptions.entries()].sort(([a], [b]) => a.localeCompare(b)) }); }
+    children: [...this.childDescriptions.entries()].sort(([a], [b]) => a.localeCompare(b)),
+    admittedFrames: [...this.frameParents.keys()].filter(id => this.frameAllowed(id)).sort() }); }
   consoleMessages(): Array<{ type: string; text: string }> {
     return this.consoleRecords.filter(record => this.permitted(record.frameUrl)).map(({ frameUrl: _url, ...record }) => record);
   }
@@ -65,7 +83,10 @@ export class ExternalBrowserPlaywrightRelay {
   }
 
   constructor(readonly identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
-    private allowFrame: (url: string) => boolean) {
+    private allowFrame: (url: string) => boolean,
+    diagnostics: BrowserExecutionDiagnostics = { consoleRecords: [], networkRecords: [] }) {
+    this.consoleRecords = diagnostics.consoleRecords;
+    this.networkRecords = diagnostics.networkRecords;
     this.server.on('upgrade', (request, socket, head) => {
       if (this.closed || request.socket.remoteAddress !== '127.0.0.1' || request.url !== this.path || this.socket) {
         socket.destroy(); return;
@@ -82,7 +103,7 @@ export class ExternalBrowserPlaywrightRelay {
           void this.handle(input).then(result => {
             try {
               if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId, result });
-            } finally { if (frameTreeReply) this.finishFrameTreeReply(sessionId, frameTreeReply); }
+            } finally { if (frameTreeReply) { this.finishFrameTreeReply(sessionId, frameTreeReply); this.publishFrames(); } }
           }, error => {
             try {
               if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId,
@@ -133,7 +154,7 @@ export class ExternalBrowserPlaywrightRelay {
   }
 
   async begin(bridge: PlaywrightCommandBridge, origin: string, input: boolean,
-    fresh: boolean, signal?: AbortSignal, uploadPaths?: string[]): Promise<{ documentEpoch: number; cdpEpoch: number; frameVersion: string }> {
+    fresh: boolean, signal?: AbortSignal, uploadPaths?: string[]): Promise<{ documentEpoch: number; cdpEpoch: number; frameEpoch: number | null; frameVersion: string }> {
     if (this.closed) throw this.failure ?? new Error('Browser executor relay closed');
     if (this.operation) throw new Error('Browser executor action is already active');
     this.inputState = 'none';
@@ -161,19 +182,26 @@ export class ExternalBrowserPlaywrightRelay {
     }, ACTION_DEADLINE_MS);
     signal?.addEventListener('abort', operation.parentAbort, { once: true });
     try {
+      if (fresh) { this.frameUrls.clear(); this.frameParents.clear(); }
       this.unsubscribe = bridge.subscribePlaywright(this.identity, event => this.onEvent(event));
       const state = await Promise.race([bridge.command(this.identity, 'playwrightStart',
         { leaseId, approvedOrigin: origin, input, fresh, ...(uploadPaths ? { uploadPaths } : {}) }, operation.signal),
       this.interruption]) as Record<string, any>;
       if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
       this.targetInfo = { ...state.targetInfo, browserContextId: 'memmy-selected-context', type: 'page', attached: true };
-      this.frameUrls.clear();
+      // A root FrameTree omits out-of-process children. Their authenticated
+      // sessions and contexts remain live on a warm connection; replacing the
+      // map with only the root tree would invalidate those cached contexts.
+      this.mainFrameId = String(state.frameTree?.frame?.id || '');
       this.readFrameTree(state.frameTree);
-      this.versionFrames = [...this.frameUrls.entries()];
+      const versionFrames = (tree: any): Array<[string, string]> => !tree?.frame?.id ? []
+        : [[String(tree.frame.id), String(tree.frame.url || '')], ...(tree.childFrames ?? []).flatMap(versionFrames)];
+      this.versionFrames = versionFrames(state.frameTree);
       this.childDescriptions.clear();
       for (const child of state.childTargets ?? []) this.childDescriptions.set(child.targetId, child.url);
       this.assertActive();
       return { documentEpoch: Number(state.documentEpoch), cdpEpoch: Number(state.cdpEpoch),
+        frameEpoch: Number.isSafeInteger(state.frameEpoch) && state.frameEpoch >= 0 ? state.frameEpoch : null,
         frameVersion: this.frameVersion() };
     } catch (error) { await this.end(); throw this.failure ?? error; }
   }
@@ -255,14 +283,132 @@ export class ExternalBrowserPlaywrightRelay {
     catch { return false; }
   }
 
-  private readFrameTree(tree: any): void {
+  private readFrameTree(tree: any, parentId?: string): void {
     if (!tree?.frame?.id) return;
     this.frameUrls.set(tree.frame.id, String(tree.frame.url || ''));
-    for (const child of tree.childFrames ?? []) this.readFrameTree(child);
+    this.frameParents.set(tree.frame.id, tree.frame.parentId || parentId || this.frameParents.get(tree.frame.id));
+    for (const child of tree.childFrames ?? []) this.readFrameTree(child, tree.frame.id);
+  }
+
+  private affectedFrames(frameId: string): Set<string> {
+    const frames = new Set([frameId]);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [id, parent] of this.frameParents) if (parent && frames.has(parent) && !frames.has(id)) {
+        frames.add(id); changed = true;
+      }
+    }
+    return frames;
+  }
+
+  private invalidateFrame(frameId: string, remove = false): void {
+    const frames = this.affectedFrames(frameId);
+    for (const [key, frame] of this.contextFrames) if (frames.has(frame)) {
+      this.contextFrames.delete(key); this.contextUrls.delete(key);
+    }
+    for (const [key, scope] of this.objectScopes) if (frames.has(scope.frameId)) this.objectScopes.delete(key);
+    if (remove) for (const frame of frames) {
+      this.frameUrls.delete(frame); this.frameParents.delete(frame); this.visibleFrames.delete(frame);
+      this.pendingAttachments.delete(frame); this.pendingNavigations.delete(frame);
+      for (const [key, event] of this.pendingContexts) if ((event.params as any)?.context?.auxData?.frameId === frame) this.pendingContexts.delete(key);
+    }
+  }
+
+  private frameAllowed(frameId: string): boolean {
+    const seen = new Set<string>();
+    for (let id: string | undefined = frameId; id; id = this.frameParents.get(id)) {
+      if (seen.has(id) || !this.permitted(this.frameUrls.get(id))) return false;
+      seen.add(id);
+      if (id === this.mainFrameId) return true;
+    }
+    return false;
+  }
+
+  private forward(event: FrameEvent): void {
+    this.emit({ sessionId: event.sessionId || this.mainSessionId, method: event.method, params: event.params });
+  }
+
+  private checkPendingBound(): void {
+    if (this.pendingAttachments.size + this.pendingNavigations.size + this.pendingContexts.size <= 512) return;
+    const operation = this.operation;
+    if (operation) {
+      this.interrupt(operation, Object.assign(new Error('Browser frame lifecycle buffer exceeded its limit'),
+        { code: 'BROWSER_FRAME_LIFECYCLE_LIMIT' }));
+      void this.close();
+    }
+  }
+
+  private publishFrames(): void {
+    // A child is released only after its trusted URL and complete parent chain
+    // are permitted. Structural events must precede its execution contexts.
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [id, navigation] of this.pendingNavigations) {
+        if (!this.frameAllowed(id)) continue;
+        const parent = this.frameParents.get(id);
+        if (id !== this.mainFrameId && (!parent || !this.visibleFrames.has(parent))) continue;
+        if (!this.visibleFrames.has(id)) {
+          const attachment = this.pendingAttachments.get(id) ?? { method: 'Page.frameAttached',
+            sessionId: navigation.sessionId, params: { frameId: id, parentFrameId: parent } };
+          this.forward(attachment); this.visibleFrames.add(id);
+        }
+        this.pendingAttachments.delete(id); this.pendingNavigations.delete(id);
+        this.forward(navigation); changed = true;
+      }
+    }
+    for (const [key, event] of this.pendingContexts) {
+      const context = (event.params as any)?.context;
+      const frameId = context?.auxData?.frameId;
+      if (!this.visibleFrames.has(frameId) || !this.frameAllowed(frameId)) continue;
+      this.pendingContexts.delete(key);
+      this.contextUrls.set(key, this.frameUrls.get(frameId)!); this.contextFrames.set(key, frameId);
+      this.forward(event);
+    }
+    this.publishChildSessions();
+  }
+
+  private publishChildSessions(): void {
+    for (const [sessionId, event] of this.childAttachments) {
+      const frameId = this.childIds.get(sessionId)!;
+      if (this.visibleSessions.has(sessionId) || !this.frameAllowed(frameId)) continue;
+      const parent = this.frameParents.get(frameId);
+      if (!parent || !this.visibleFrames.has(parent)) continue;
+      if (!this.visibleFrames.has(frameId)) {
+        this.forward(this.pendingAttachments.get(frameId) ?? { method: 'Page.frameAttached',
+          sessionId: event.sessionId, params: { frameId, parentFrameId: parent } });
+        this.pendingAttachments.delete(frameId); this.visibleFrames.add(frameId);
+      }
+      this.visibleSessions.add(sessionId); this.forward(event);
+    }
+  }
+
+  private hideFrame(frameId: string, sessionId?: string): boolean {
+    const frames = this.affectedFrames(frameId);
+    if ([...this.childIds].some(([session, id]) => frames.has(id) && this.visibleSessions.has(session))) {
+      // Playwright owns a FrameSession for an exposed OOPIF. Removing only its
+      // Page frame leaves a context waiter; revoke the view at this boundary.
+      const operation = this.operation;
+      if (operation) {
+        this.interrupt(operation, Object.assign(new Error('Browser frame access changed; take a fresh observation'),
+          { code: 'BROWSER_FRAME_ACCESS_CHANGED' }));
+        void this.close();
+      }
+      return true;
+    }
+    if (this.visibleFrames.has(frameId)) this.forward({ method: 'Page.frameDetached', sessionId,
+      params: { frameId, reason: 'remove' } });
+    for (const id of frames) this.visibleFrames.delete(id);
+    return false;
+  }
+
+  private objectScope(objectId: string, sessionId: string): RemoteObjectScope | undefined {
+    const scope = this.objectScopes.get(`${sessionId}:${objectId}`);
+    return scope && this.permitted(scope.url) && this.frameAllowed(scope.frameId) ? scope : undefined;
   }
 
   private pruneFrameTree(tree: any): any {
-    if (!tree?.frame || !this.permitted(tree.frame.url)) return undefined;
+    if (!tree?.frame || !this.frameAllowed(tree.frame.id)) return undefined;
+    this.visibleFrames.add(tree.frame.id);
     return { ...tree, childFrames: (tree.childFrames ?? []).map((child: any) => this.pruneFrameTree(child)).filter(Boolean) };
   }
 
@@ -281,51 +427,112 @@ export class ExternalBrowserPlaywrightRelay {
     }
     const params = event.params as Record<string, any>;
     if (event.method === 'Target.attachedToTarget') {
-      const url = String(params.targetInfo?.url || '');
       if (params.targetInfo?.type !== 'iframe') return;
-      this.childUrls.set(params.sessionId, url);
-      this.childIds.set(params.sessionId, params.targetInfo.targetId);
-      this.childDescriptions.set(params.targetInfo.targetId, url);
-      if (!this.permitted(url)) return;
+      const url = String(params.targetInfo.url || '');
+      const frameId = String(params.targetInfo.targetId);
+      this.childUrls.set(params.sessionId, url); this.childIds.set(params.sessionId, frameId);
+      this.childDescriptions.set(frameId, url); this.frameUrls.set(frameId, url);
+      this.frameParents.set(frameId, params.targetInfo.parentFrameId || this.frameParents.get(frameId));
+      this.childAttachments.set(params.sessionId, event);
+      this.publishChildSessions(); return;
     }
-    if (event.method === 'Target.targetInfoChanged' && this.childDescriptions.has(params.targetInfo?.targetId)) {
-      this.childDescriptions.set(params.targetInfo.targetId, params.targetInfo.url);
-      for (const [sessionId, targetId] of this.childIds) if (targetId === params.targetInfo.targetId) {
-        this.childUrls.set(sessionId, params.targetInfo.url);
+    if (event.method === 'Target.targetInfoChanged') {
+      const frameId = params.targetInfo?.targetId;
+      if (!this.childDescriptions.has(frameId)) return;
+      const url = String(params.targetInfo.url || '');
+      this.childDescriptions.set(frameId, url); this.frameUrls.set(frameId, url);
+      for (const [sessionId, targetId] of this.childIds) if (targetId === frameId) {
+        this.childUrls.set(sessionId, url);
+        const attachment = this.childAttachments.get(sessionId);
+        if (attachment) this.childAttachments.set(sessionId, { ...attachment,
+          params: { ...(attachment.params as any), targetInfo: params.targetInfo } });
       }
+      if (!this.frameAllowed(frameId)) { this.hideFrame(frameId, event.sessionId); return; }
+      this.publishChildSessions();
+      if (!event.sessionId || this.visibleSessions.has(event.sessionId)) this.forward(event);
+      return;
     }
-    if (event.sessionId && !this.permitted(this.childUrls.get(event.sessionId))) return;
+    if (event.method === 'Target.detachedFromTarget') {
+      const visible = this.visibleSessions.delete(params.sessionId);
+      const frameId = this.childIds.get(params.sessionId);
+      const prefix = `${params.sessionId}:`;
+      for (const key of this.contextUrls.keys()) if (key.startsWith(prefix)) { this.contextUrls.delete(key); this.contextFrames.delete(key); }
+      for (const [key, scope] of this.objectScopes) if (scope.sessionId === params.sessionId) this.objectScopes.delete(key);
+      for (const key of this.pendingContexts.keys()) if (key.startsWith(prefix)) this.pendingContexts.delete(key);
+      this.childDescriptions.delete(frameId || ''); this.childAttachments.delete(params.sessionId);
+      this.childIds.delete(params.sessionId); this.childUrls.delete(params.sessionId);
+      if (visible) this.forward(event);
+      // Target detach can be a process swap. Only Page.frameDetached(remove)
+      // removes the physical frame and its descendants.
+      return;
+    }
+    if (event.method === 'Page.frameAttached') {
+      this.frameParents.set(params.frameId, params.parentFrameId);
+      // An existing OOPIF can swap back into its parent renderer. Playwright
+      // needs this structural notification to retire the old FrameSession.
+      if (this.visibleFrames.has(params.frameId) && this.frameAllowed(params.frameId)) { this.forward(event); return; }
+      this.pendingAttachments.set(params.frameId, event);
+      this.checkPendingBound(); this.publishFrames(); return;
+    }
+    if (event.method === 'Page.frameDetached') {
+      if (params.reason === 'swap') {
+        if (this.visibleFrames.has(params.frameId)) this.forward(event);
+      } else {
+        const visible = this.visibleFrames.has(params.frameId);
+        this.invalidateFrame(params.frameId, true);
+        if (visible) this.forward(event);
+      }
+      return;
+    }
     if (event.method === 'Page.frameNavigated') {
-      this.objectUrls.clear();
-      for (const [key, frameId] of this.contextFrames) if (frameId === params.frame?.id) {
-        this.contextFrames.delete(key); this.contextUrls.delete(key);
-      }
-      this.frameUrls.set(params.frame?.id, String(params.frame?.url || ''));
-      if (!this.permitted(params.frame?.url)) return;
+      const frame = params.frame;
+      if (!frame?.id) return;
+      this.invalidateFrame(frame.id);
+      this.frameParents.set(frame.id, frame.parentId || this.frameParents.get(frame.id));
+      this.frameUrls.set(frame.id, String(frame.url || ''));
+      for (const [sessionId, id] of this.childIds) if (id === frame.id) this.childUrls.set(sessionId, String(frame.url || ''));
+      if (!this.frameAllowed(frame.id)) { this.pendingNavigations.delete(frame.id); this.hideFrame(frame.id, event.sessionId); return; }
+      this.pendingNavigations.set(frame.id, event);
+      this.checkPendingBound(); this.publishFrames(); return;
     }
     if (event.method === 'Runtime.executionContextCreated') {
       const context = params.context;
-      const url = this.frameUrls.get(context?.auxData?.frameId) || context?.origin;
+      const frameId = context?.auxData?.frameId;
+      if (!frameId) return;
       const key = `${event.sessionId || this.mainSessionId}:${context?.id}`;
-      this.contextUrls.set(key, url);
-      this.contextFrames.set(key, context?.auxData?.frameId);
-      if (!this.permitted(url)) return;
+      // Keep authenticated identity metadata even for a denied document. It is
+      // never published to Playwright while denied, and every later command
+      // rechecks the live policy. A permission change must not freeze admission.
+      const url = this.frameUrls.get(frameId);
+      if (url) { this.contextUrls.set(key, url); this.contextFrames.set(key, frameId); }
+      // context.origin alone is not a trustworthy document URL for site policy.
+      if (!this.visibleFrames.has(frameId) || !this.frameAllowed(frameId)) {
+        if (!this.frameUrls.has(frameId) || this.frameAllowed(frameId)) {
+          this.pendingContexts.set(key, event); this.checkPendingBound();
+        }
+        return;
+      }
     }
     if (event.method === 'Runtime.executionContextsCleared') {
       const prefix = `${event.sessionId || this.mainSessionId}:`;
       for (const key of this.contextUrls.keys()) if (key.startsWith(prefix)) {
         this.contextUrls.delete(key); this.contextFrames.delete(key);
       }
-      this.objectUrls.clear();
+      for (const key of this.pendingContexts.keys()) if (key.startsWith(prefix)) this.pendingContexts.delete(key);
+      for (const [key, scope] of this.objectScopes) if (scope.sessionId === (event.sessionId || this.mainSessionId)) this.objectScopes.delete(key);
     }
     if (event.method === 'Runtime.executionContextDestroyed') {
       const key = `${event.sessionId || this.mainSessionId}:${params.executionContextId}`;
-      this.contextUrls.delete(key); this.contextFrames.delete(key); this.objectUrls.clear();
+      this.contextUrls.delete(key); this.contextFrames.delete(key); this.pendingContexts.delete(key);
+      for (const [id, scope] of this.objectScopes) if (scope.contextKey === key) this.objectScopes.delete(id);
     }
-    if (params.frameId && !this.permitted(this.frameUrls.get(params.frameId))) return;
+    if (event.sessionId && !this.visibleSessions.has(event.sessionId)) return;
+    if (params.frameId && (!this.visibleFrames.has(params.frameId) || !this.frameAllowed(params.frameId))) return;
     if (event.method === 'Runtime.consoleAPICalled') {
-      const url = this.contextUrls.get(`${event.sessionId || this.mainSessionId}:${params.executionContextId}`);
-      if (!this.permitted(url)) return;
+      const key = `${event.sessionId || this.mainSessionId}:${params.executionContextId}`;
+      const url = this.contextUrls.get(key);
+      const frameId = this.contextFrames.get(key);
+      if (!frameId || !this.visibleFrames.has(frameId) || !this.frameAllowed(frameId)) return;
       {
         this.consoleRecords.push({ frameUrl: url!, type: String(params.type || 'log'), text: (params.args ?? [])
           .map((value: any) => String(value.value ?? value.description ?? '')).join(' ').slice(0, 3000) });
@@ -334,7 +541,8 @@ export class ExternalBrowserPlaywrightRelay {
     }
     if (event.method === 'Runtime.exceptionThrown' || event.method === 'Runtime.bindingCalled') {
       const id = params.executionContextId ?? params.exceptionDetails?.executionContextId;
-      if (!this.permitted(this.contextUrls.get(`${event.sessionId || this.mainSessionId}:${id}`))) return;
+      const frameId = this.contextFrames.get(`${event.sessionId || this.mainSessionId}:${id}`);
+      if (!frameId || !this.visibleFrames.has(frameId) || !this.frameAllowed(frameId)) return;
     }
     if (event.method === 'Log.entryAdded') return;
     if (event.method === 'Network.requestWillBeSent') {
@@ -345,10 +553,7 @@ export class ExternalBrowserPlaywrightRelay {
       }
     }
     this.emit({ sessionId: event.sessionId || this.mainSessionId, method: event.method, params });
-    if (event.method === 'Target.detachedFromTarget') {
-      this.childDescriptions.delete(this.childIds.get(params.sessionId) || '');
-      this.childIds.delete(params.sessionId); this.childUrls.delete(params.sessionId);
-    }
+
   }
 
   async send(method: string, params: Record<string, any> = {}, sessionId = this.mainSessionId): Promise<any> {
@@ -358,23 +563,31 @@ export class ExternalBrowserPlaywrightRelay {
       if (replies.length) await Promise.race([Promise.all(replies.map(reply => reply.promise)), this.interruption]);
       if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
     }
-    if (sessionId !== this.mainSessionId && !this.permitted(this.childUrls.get(sessionId))) {
+    if (sessionId !== this.mainSessionId && (!this.permitted(this.childUrls.get(sessionId))
+      || !this.frameAllowed(this.childIds.get(sessionId) || ''))) {
       throw new Error('Browser executor frame is unavailable or blocked');
     }
     const contextId = params.contextId ?? params.executionContextId;
+    const contextKey = contextId !== undefined ? `${sessionId}:${contextId}` : undefined;
+    const objectScope = params.objectId ? this.objectScope(params.objectId, sessionId) : undefined;
     const frameUrl = params.frameId ? this.frameUrls.get(params.frameId)
       : contextId !== undefined ? this.contextUrls.get(`${sessionId}:${contextId}`)
-        : params.objectId ? this.objectUrls.get(params.objectId) : undefined;
+        : objectScope?.url;
     if ((params.frameId || contextId !== undefined || params.objectId) && !this.permitted(frameUrl)) {
       throw new Error('Browser executor frame identity is unavailable or blocked');
     }
-    if ((params.arguments ?? []).some((argument: any) => argument.objectId && !this.permitted(this.objectUrls.get(argument.objectId)))) {
+    const scopedFrameId = params.frameId || (contextKey ? this.contextFrames.get(contextKey) : undefined) || objectScope?.frameId;
+    if (scopedFrameId && !this.frameAllowed(scopedFrameId)) throw new Error('Browser executor frame ancestry is unavailable or blocked');
+    if ((params.arguments ?? []).some((argument: any) => argument.objectId && !this.objectScope(argument.objectId, sessionId))) {
       throw new Error('Browser executor argument belongs to an unavailable or blocked frame');
     }
     if (method === 'DOM.getDocument' && this.hasBlockedFrames() && (params.pierce || params.depth === -1)) {
       throw new Error('Browser executor cannot traverse blocked frame documents');
     }
     const resolvedUrl = frameUrl ?? (sessionId === this.mainSessionId ? operation.origin : this.childUrls.get(sessionId));
+    const resolvedFrameId = params.frameId || (contextKey ? this.contextFrames.get(contextKey) : undefined)
+      || objectScope?.frameId || (sessionId === this.mainSessionId ? this.mainFrameId : this.childIds.get(sessionId));
+    const resolvedContextKey = contextKey || objectScope?.contextKey;
     const commandParams = method === 'Target.setAutoAttach' ? { ...params, waitForDebuggerOnStart: false,
       filter: [{ type: 'iframe', exclude: false }] } : params;
     const mutation = method === 'Input.insertText' || method === 'DOM.setFileInputFiles'
@@ -396,10 +609,12 @@ export class ExternalBrowserPlaywrightRelay {
       throw error;
     }
     if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
-    if (resolvedUrl) {
+    if (method === 'Runtime.releaseObject' && params.objectId) this.objectScopes.delete(`${sessionId}:${params.objectId}`);
+    if (resolvedUrl && resolvedFrameId) {
       for (const value of [result?.result, result?.object, ...(Array.isArray(result?.result)
         ? result.result.flatMap((property: any) => [property.value, property.get, property.set]) : [])]) {
-        if (value?.objectId) this.objectUrls.set(value.objectId, resolvedUrl);
+        if (value?.objectId) this.objectScopes.set(`${sessionId}:${value.objectId}`,
+          { url: resolvedUrl, sessionId, frameId: resolvedFrameId, ...(resolvedContextKey ? { contextKey: resolvedContextKey } : {}) });
       }
     }
     if (method === 'DOM.describeNode' && result.node?.frameId && !this.permitted(this.frameUrls.get(result.node.frameId))) {
