@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { InstalledPlugin } from "@memmy/local-api-contracts";
 import { useApiClients } from "../app/providers.js";
-import { usePluginUi, type PluginInvocationContext, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { normalizePluginConversationId, usePluginUi, type PluginInvocationContext, type PluginUiCall } from "../app/plugin-ui-context.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { appActions } from "../state/app-actions.js";
 import { useAppState } from "../state/app-state.js";
@@ -30,9 +30,10 @@ export function PluginSurfacePage() {
     return <AppFrame title={t("plugin.surface.title")}><div className="p-8 text-sm text-text-ink/50">{t("plugin.surface.unavailable")}</div></AppFrame>;
   }
   const plugin = plugins.find((item) => item.id === activeSurface.pluginId);
+  const conversationId = normalizePluginConversationId(activeSurface.conversationId);
   const visibleCalls = calls.filter((call) => call.pluginId === activeSurface.pluginId
     && call.capabilityId === activeSurface.capabilityId
-    && call.conversationId === activeSurface.conversationId);
+    && normalizePluginConversationId(call.conversationId) === conversationId);
   const surface = plugin?.manifest.ui?.surface;
   const supportsCapability = !surface?.capabilities || surface.capabilities.includes(activeSurface.capabilityId);
 

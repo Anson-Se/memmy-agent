@@ -2162,8 +2162,8 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .app-frame-main--windo
 }
 
 .agent-workspace-layout--preview-open > .workspace-artifact-preview-pane .workspace-artifact-preview-toolbar {
-  /* Refresh + panel toggle share the trailing action strip. */
-  padding-right: 76px;
+  /* The trailing action strip lays itself out inside the row. */
+  padding-right: 8px;
 }
 
 /*
@@ -2607,6 +2607,50 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .app-frame-main--windo
 .agent-message-content--streaming > .agent-message-content__p:has(+ .agent-streaming-cursor) {
   display: inline;
   margin-bottom: 0;
+}
+
+/*
+ * Stalled-output signal: after a few quiet seconds a highlight sweeps left to
+ * right across the bottom line of the running answer. `useStalledOutputShimmer`
+ * picks the line and measures it, so only that line lights up even inside a
+ * multi-line paragraph. The rest of the text keeps the element's own colour,
+ * painted by the second layer; children follow it while the sweep runs.
+ */
+.agent-stall-shimmer {
+  background-image:
+    linear-gradient(90deg, transparent, var(--color-action-sky-hover), transparent),
+    linear-gradient(var(--agent-stall-ink), var(--agent-stall-ink));
+  background-repeat: no-repeat;
+  background-size: var(--agent-stall-band) var(--agent-stall-height), 100% 100%;
+  background-position: var(--agent-stall-from) var(--agent-stall-y), 0 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: agent-stall-sweep 1.8s linear infinite;
+}
+
+/* Boxed or coloured pieces paint their own background over the clipped text,
+   so they stay readable as they are and the band passes behind them. */
+.agent-stall-shimmer :where(code, .agent-activity-diff, .agent-activity-diff *) {
+  -webkit-text-fill-color: currentColor;
+}
+
+@keyframes agent-stall-sweep {
+  0% {
+    background-position: var(--agent-stall-from) var(--agent-stall-y), 0 0;
+  }
+
+  100% {
+    background-position: var(--agent-stall-to) var(--agent-stall-y), 0 0;
+  }
+}
+
+/* Without the sweep, hold the band mid-line so the signal is still there. */
+@media (prefers-reduced-motion: reduce) {
+  .agent-stall-shimmer {
+    animation: none;
+    background-position: calc((var(--agent-stall-from) + var(--agent-stall-to)) / 2) var(--agent-stall-y), 0 0;
+  }
 }
 
 .agent-thinking-pulse {
@@ -3337,6 +3381,11 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .app-frame-main--windo
 .plugin-capability-region--pinned {
   max-height: min(42vh, 380px);
   overflow-y: auto;
+  /* Reference `.legal-active-card`: the scroll box would otherwise clip the
+     card's outer border and corners. */
+  padding: 1px;
+  /* Matches the reference dock gap between the open card and its shortcuts. */
+  margin-bottom: 12px;
 }
 
 .agent-queue-panel {
@@ -12972,6 +13021,14 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   -webkit-app-region: no-drag;
 }
 
+/*
+  The trailing actions are a flex item, not an overlay.
+  They used to be absolutely positioned with the toolbar reserving a fixed 76px
+  for them — a number that only matched two buttons. Adding the recording
+  toggle made the strip three buttons wide, so the last file tab was painted
+  underneath it. Laying the strip out in the row instead lets the tab list
+  shrink and scroll, which stays correct however many buttons appear.
+*/
 .workspace-artifact-preview-toolbar {
   position: relative;
   display: flex;
@@ -12980,7 +13037,7 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   flex: none;
   height: var(--codex-toolbar-height);
   min-height: var(--codex-toolbar-height);
-  padding: 0 76px 0 8px;
+  padding: 0 8px;
   overflow: hidden;
   border-bottom: 1px solid color-mix(in srgb, var(--color-border-stone) 40%, transparent);
   background: var(--color-background-paper);
@@ -12988,14 +13045,11 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 }
 
 .workspace-artifact-preview-toolbar__actions {
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  z-index: 5;
   display: flex;
   align-items: center;
   gap: 2px;
-  transform: translateY(-50%);
+  flex: none;
+  margin-left: auto;
   -webkit-app-region: no-drag;
   pointer-events: auto;
   isolation: isolate;
@@ -13060,7 +13114,7 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 }
 
 .workspace-artifact-preview-pane--plugin .workspace-artifact-preview-toolbar {
-  padding-right: 80px;
+  padding-right: 8px;
 }
 
 .workspace-artifact-file-tabs {
@@ -14229,12 +14283,6 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   white-space: nowrap;
 }
 
-.recording-page__footer {
-  display: flex;
-  justify-content: flex-end;
-  margin: 12px 12px 0;
-}
-
 /* The 录音列表 view: the page's home, as the design has it. */
 .recording-page__back {
   display: inline-flex;
@@ -14355,6 +14403,16 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
 .recording-page__list-action:hover {
   background: color-mix(in srgb, var(--color-action-sky) 10%, transparent);
   color: var(--color-action-sky-hover);
+}
+
+/* A failed row keeps its audio, so retrying is the row's whole purpose. It is
+   drawn as a bordered button rather than a quiet text action: it is the one
+   thing the user came to that row to do. */
+.recording-page__list-action--retry {
+  border: 1px solid var(--color-border-stone);
+  background: var(--color-background-paper);
+  color: var(--color-action-sky-hover);
+  font-weight: 500;
 }
 
 /* Recording bar above the composer, and the panel it transcribes into. */
@@ -15443,26 +15501,74 @@ body.memmy-platform-windows:not(.memmy-window-fullscreen) .memmy-notification-st
   padding: 10px 14px;
   border-bottom: 1px solid color-mix(in srgb, var(--color-border-stone) 40%, transparent);
 }
-.diagnostic-guidance-card__templates { gap: 0; padding: 4px 8px; }
-.diagnostic-guidance-card__template {
-  width: 100%; min-height: 64px; padding: 12px;
-  grid-template-columns: 32px minmax(0, 1fr) auto;
-  gap: 12px; text-align: left; border-radius: 8px; cursor: pointer;
+/* Reference `.litrev-wizard-card.legal-template-card` and `.legal-template-row`. */
+.diagnostic-guidance-card { border-color: color-mix(in srgb, var(--color-border-stone) 50%, transparent); }
+.diagnostic-guidance-card__header { min-height: 0; padding: var(--space-3) var(--space-4); }
+.diagnostic-guidance-card__close {
+  align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 7px;
+  color: color-mix(in srgb, var(--color-text-ink) 50%, transparent);
 }
-.diagnostic-guidance-card__template:hover:not(:disabled) { background: color-mix(in srgb, var(--color-action-sky) 6%, transparent); }
-.diagnostic-guidance-card__file-icon { width: 32px; height: 36px; border: 0; background: transparent; }
-.diagnostic-guidance-card__file-name { font-size: var(--codex-text-base, 14px); line-height: 1.5; }
-.diagnostic-guidance-card__file-name span { color: color-mix(in srgb, var(--color-text-ink) 60%, transparent); }
-.diagnostic-guidance-card__description { color: color-mix(in srgb, var(--color-text-ink) 65%, transparent); font-size: 12px; line-height: 1.6; }
-.diagnostic-guidance-card__download { min-height: 30px; padding: 0 12px; border-color: color-mix(in srgb, var(--color-border-stone) 60%, transparent); color: var(--color-action-sky-hover); }
+.diagnostic-guidance-card__close:hover { background: color-mix(in srgb, var(--color-canvas-oat) 70%, transparent); color: var(--color-text-ink); }
+.diagnostic-guidance-card__templates { gap: var(--space-1); padding: var(--space-2); }
+.diagnostic-guidance-card__template {
+  box-sizing: border-box; width: 100%; min-height: 64px; padding: var(--space-3);
+  grid-template-columns: var(--file-icon-card-size) minmax(0, 1fr) auto;
+  gap: var(--space-3); text-align: left; border-radius: var(--radius-btn); cursor: pointer;
+  transition: background-color var(--duration-fast) ease;
+}
+.diagnostic-guidance-card__template:hover:not(:disabled),
+.diagnostic-guidance-card__template:focus-visible { background: color-mix(in srgb, var(--color-action-sky) 8%, transparent); }
+.diagnostic-guidance-card .diagnostic-guidance-card__template:focus-visible { outline: 2px solid var(--color-action-sky); outline-offset: -2px; }
+.diagnostic-guidance-card__file-icon { width: var(--file-icon-card-size); height: var(--file-icon-card-size); border: 0; background: transparent; }
+.diagnostic-guidance-card__file-icon .file-type-icon { --file-icon-inline-size: var(--space-6); }
+.diagnostic-guidance-card__file-name { font-size: var(--codex-text-base); line-height: var(--codex-leading-base); font-weight: 600; }
+.diagnostic-guidance-card__file-name span { color: color-mix(in srgb, var(--color-text-ink) 60%, transparent); font-size: var(--codex-text-sm); font-weight: 400; }
+.diagnostic-guidance-card__description {
+  margin: var(--space-1) 0 0; color: color-mix(in srgb, var(--color-text-ink) 65%, transparent);
+  font-size: var(--codex-text-xs); line-height: var(--codex-leading-xs);
+}
+.diagnostic-guidance-card__download {
+  gap: 6px; min-height: 30px; padding: 0 var(--space-3);
+  border-color: color-mix(in srgb, var(--color-border-stone) 60%, transparent); border-radius: var(--radius-btn);
+  background: var(--color-background-paper); color: var(--color-action-sky-hover);
+  font-size: var(--codex-text-sm); line-height: var(--codex-leading-base);
+  transition: background-color var(--duration-fast) ease;
+}
+.diagnostic-guidance-card__template:hover:not(:disabled) .diagnostic-guidance-card__download,
+.diagnostic-guidance-card__template:focus-visible .diagnostic-guidance-card__download {
+  background: color-mix(in srgb, var(--color-action-sky) 12%, var(--color-background-paper));
+}
 .diagnostic-guidance-card__footer, .diagnostic-upload-card__footer { padding: 10px 14px; border-top-color: color-mix(in srgb, var(--color-border-stone) 40%, transparent); gap: 8px; }
 .diagnostic-guidance-card__footer .button, .diagnostic-upload-card__footer .button { flex-shrink: 0; }
+/* Reference `.litrev-wizard-card__foot .button`: compact, flat, product colours.
+   The shared `__action` class would otherwise paint ink text on the primary. */
+.diagnostic-guidance-card__footer { min-height: 58px; align-items: center; padding: 12px 16px; }
+.diagnostic-guidance-card__footer .button { min-height: 31px; padding: 0 11px; gap: 6px; font-size: 12px; font-weight: 600; line-height: 1; box-shadow: none; }
+.diagnostic-guidance-card__footer .button > svg { width: 13px; height: 13px; }
+.diagnostic-guidance-card__footer .button:hover:not(:disabled) { transform: none; }
+.diagnostic-guidance-card__footer .button-primary { border-color: transparent; background: var(--color-action-sky); color: #fff; }
+.diagnostic-guidance-card__footer .button-primary:hover:not(:disabled) { background: var(--color-action-sky-hover); }
+.diagnostic-guidance-card__footer .button-secondary { border-color: var(--color-border-stone); background: var(--color-background-paper); color: color-mix(in srgb, var(--color-text-ink) 75%, transparent); }
+.diagnostic-guidance-card__footer .button-secondary:hover:not(:disabled) { color: var(--color-action-sky); }
+/* Legal delivery: the guidance card's rows without actions; a click opens the side panel. */
+/* The finished engagement's files, wrapping a row at a time like attachments. */
+.legal-delivery-card {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .diagnostic-upload-card__body { padding: 12px 14px; }
 .diagnostic-upload-card__description { font-size: 12px; color: color-mix(in srgb, var(--color-text-ink) 65%, transparent); line-height: 1.7; margin-bottom: 12px; }
 .diagnostic-upload-card__count { font-size: 11px; color: color-mix(in srgb, var(--color-text-ink) 45%, transparent); }
 .diagnostic-upload-card__file { min-height: 44px; gap: 10px; padding: 8px 10px; }
 .diagnostic-upload-card__file-info p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
 .diagnostic-upload-card__file-info .diagnostic-upload-card__error { white-space: normal; }
+/* A staged recording still being transcribed stays listed and submittable. */
+.diagnostic-upload-card__file-info .diagnostic-upload-card__transcription { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 2px 0 0; white-space: normal; font-size: 12px; line-height: 1.5; color: color-mix(in srgb, var(--color-text-ink) 55%, transparent); }
+.diagnostic-upload-card__transcription--failed { color: var(--color-status-error); }
+.diagnostic-upload-card__transcription button { padding: 2px 8px; border: 1px solid var(--color-border-stone); border-radius: 6px; background: var(--color-background-paper); color: var(--color-action-sky-hover); font-size: 12px; cursor: pointer; }
+.diagnostic-upload-card__transcription button:hover { background: color-mix(in srgb, var(--color-action-sky) 8%, var(--color-background-paper)); }
+.diagnostic-upload-card__waiting { margin: 8px 0 0; font-size: 12px; color: var(--color-action-sky-hover); }
 .diagnostic-upload-card__file-icon { width: 24px; flex-shrink: 0; }
 .diagnostic-upload-card__file-size { font-size: 11px; color: color-mix(in srgb, var(--color-text-ink) 45%, transparent); }
 .diagnostic-upload-card__files { border-color: color-mix(in srgb, var(--color-border-stone) 50%, transparent); }

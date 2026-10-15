@@ -11,7 +11,7 @@ import { PluginUiProvider, usePluginUi, type PluginUiCall } from "../../app/plug
 import type { RecordingPanelSession } from "../interview-recording-panel.js";
 
 const mock = vi.hoisted(() => ({ status: "idle", isRecording: false, isStarting: false, isTranscribing: false,
-  error: null, start: vi.fn(), pause: vi.fn(), resume: vi.fn(), cancel: vi.fn(), finishAndTranscribe: vi.fn() }));
+  error: null, start: vi.fn(), pause: vi.fn(), resume: vi.fn(), cancel: vi.fn(), stop: vi.fn(), finishAndTranscribe: vi.fn() }));
 vi.mock("../asr-recorder.js", async (original) => ({ ...await original<typeof import("../asr-recorder.js")>(), useAsrRecorder: () => mock }));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
@@ -25,10 +25,12 @@ it("archives a guidance recording before its card disappears, reopens it from th
   const container=document.createElement("div");document.body.append(container);const root=createRoot(container);
   let controller!: RecordingEntryController;let panel: RecordingPanelSession | null=null;
   const scope=`recording-integration-${crypto.randomUUID()}`;
-  const upload=vi.fn(async () => [
-    { kind: "audio" as const, path: "/media/interview.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "http://127.0.0.1/api/media/initial/audio" },
-    { kind: "file" as const, path: "/media/interview.txt", name: "访谈转写.txt", mime: "text/plain" as const, bytes: 10, url: "http://127.0.0.1/api/media/initial/text" }
-  ]);
+  // The audio is stored the moment the interview stops, the transcript file
+  // once ASR has finished — two separate uploads.
+  const upload=vi.fn(async (files: Array<{ kind: string }>) => files.map((file) => file.kind === "audio"
+    ? { kind: "audio" as const, path: "/media/interview.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "http://127.0.0.1/api/media/initial/audio" }
+    : { kind: "file" as const, path: "/media/interview.txt", name: "访谈转写.txt", mime: "text/plain" as const, bytes: 10, url: "http://127.0.0.1/api/media/initial/text" }));
+  const asr={ transcribe: vi.fn(async () => ({ text:"录音测试",segments:[],transcribedAt:"2026-10-12T06:58:14Z",modelId:"asr",provider:"memmy_account" as const,source:"account" as const })) };
   const resolveAudio=vi.fn(async () => "http://127.0.0.1/api/media/renewed/audio");
   const respond=vi.fn(async () => {});
   const plugin=InstalledPluginSchema.parse({ id:"legal-labor",version:"1.0.0",state:"active",config:{},approvedPermissions:[],lastError:null,
@@ -38,7 +40,7 @@ it("archives a guidance recording before its card disappears, reopens it from th
   const call: PluginUiCall={ pluginId: "legal-labor", capabilityId: "session-start", callId: "interview-call", conversationId: "chat-test", origin: "agent",
     events: [{ type: "interaction", request: { interactionId: "interview-question", type: "audio-record", payload: { title: "访谈录音" } } }] };
   function Page() {
-    controller=useRecordingEntry({} as never,upload,undefined,{ scope,sessionKey:"websocket:chat-test",resolveAudio });
+    controller=useRecordingEntry({} as never,upload as never,undefined,{ scope,sessionKey:"websocket:chat-test",resolveAudio });
     const [calls,setCalls]=useState([call]);
     const ui=usePluginUi();
     const client={ respond: async (_plugin: string, _call: string, interactionId: string) => {
@@ -49,31 +51,36 @@ it("archives a guidance recording before its card disappears, reopens it from th
       } }] }] : []);
     } };
     return <>
-      <PluginCapabilityHost region="panel" calls={calls} plugins={[plugin]} client={client as never} asrClient={{} as never} uploadFiles={upload}
+      <PluginCapabilityHost region="panel" calls={calls} plugins={[plugin]} client={client as never} asrClient={asr as never} uploadFiles={upload as never}
         onRecordingArchived={(entry) => {
           controller.archive(entry);
-          ui.addRecordingMaterials("legal-labor", entry.sessionKey!, (entry.files ?? []).map((file) => ({...file,collected:entry.collected === true})));
+          // As selectRecordingMaterialFiles does: a handed-over recording is already its own row.
+          if (!entry.handedOver) ui.addRecordingMaterials("legal-labor", entry.sessionKey!, (entry.files ?? []).map((file) => ({...file,collected:entry.collected === true})));
         }} onRecordingSession={(value) => { panel=value; }} />
-      <PluginCapabilityHost region="pinned" calls={calls} plugins={[plugin]} client={client as never} uploadFiles={upload} />
+      <PluginCapabilityHost region="pinned" calls={calls} plugins={[plugin]} client={client as never} uploadFiles={upload as never} />
       <button data-testid="back" onClick={() => controller.toggle()}>返回</button>
       {controller.open ? <RecordingEntryPage session={controller.session} /> : null}
     </>;
   }
   mock.status="idle";mock.isRecording=false;
   mock.start.mockImplementation(async () => { mock.status="recording";mock.isRecording=true; });
-  mock.finishAndTranscribe.mockImplementation(async () => { mock.status="idle";mock.isRecording=false;
-    return { recording:new Blob(["audio"]),recordingMimeType:"audio/webm",durationMs:4000,text:"录音测试",segments:[],transcribedAt:"2026-10-12T06:58:14Z" }; });
+  mock.stop.mockImplementation(async () => { mock.status="idle";mock.isRecording=false;
+    return { recording:new Blob(["audio"],{ type:"audio/webm" }),recordingMimeType:"audio/webm",durationMs:4000 }; });
   const render=async (shown=true) => act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN">{shown ? <Page /> : <span>设置</span>}</I18nProvider></PluginUiProvider>));
   try {
     await render();
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-bar__button--primary")!.click());
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-bar__button--primary")!.click());
+    // Answered straight away, before the transcript exists: the upload card
+    // lists the interview itself and can be submitted.
     expect(respond).toHaveBeenCalledTimes(1);
-    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(2);
-    expect(container.querySelector(".diagnostic-upload-card")?.textContent).toContain("访谈转写.txt");
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(1);
+    expect(container.querySelector(".diagnostic-upload-card")?.textContent).toContain("访谈转写-");
+    expect(container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.disabled).toBe(false);
     await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
     expect(respond).toHaveBeenCalledTimes(2);
-    expect(upload).toHaveBeenCalledTimes(1);
+    expect(asr.transcribe).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(2);
     expect(panel!.audioUrl).toBe("http://127.0.0.1/api/media/initial/audio");
     await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="back"]')!.click());
     expect(container.querySelectorAll(".recording-page__list-row")).toHaveLength(1);

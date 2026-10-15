@@ -178,7 +178,15 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
     accountSessionRepository: options.appStateStore.repositories.accountSession,
     cloudBaseUrl: resolveCloudClientConfig(process.env).baseUrl
   });
-  const pluginFileInputRoots = [join(resolveAgentDataRoot(process.env), "media")];
+  const agentWorkspace = resolveAgentWorkspace(process.env);
+  const uploadedMediaRoot = join(resolveAgentDataRoot(process.env), "media");
+  // Plugins may read user-provided inputs anywhere in the default workspace,
+  // including recordings and future Host-owned input folders. Writes remain
+  // confined to plugin-data and the artifact-host publishing service.
+  const pluginFileInputRoots = [uploadedMediaRoot, agentWorkspace];
+  // ASR only needs audio upload locations; do not let it turn an arbitrary
+  // workspace file into a base64 cloud request merely because it has a path.
+  const pluginAudioRoots = [uploadedMediaRoot, join(agentWorkspace, "recordings")];
   const pluginModelInference = createPluginModelInferenceService({
     resolveModel: (pluginId, requestedPreset) => resolvePluginModelSelection({
       accountOnly: pluginRepository.get(pluginId)?.manifest.modelPolicy?.requiredSource === "account",
@@ -201,7 +209,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
     }) },
     {
       services: ["asr"],
-      invoker: createPluginAsrService({ asr: asrService, audioRoots: pluginFileInputRoots })
+      invoker: createPluginAsrService({ asr: asrService, audioRoots: pluginAudioRoots })
     }
   ]);
   const memmyAgentAdminClient =

@@ -207,6 +207,13 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
         if (session.config.outputMode === "ndjson") {
           let bytes = 0;
           let hostServiceRequests = 0;
+          // Host-service requests are dispatched as they arrive rather than one
+          // at a time. A plugin whose capability fans out — the legal
+          // diagnosis judges sections in parallel — would otherwise queue
+          // behind itself and get nothing from the concurrency it asked for.
+          // Each is bounded by the per-call request cap below, and the plugin
+          // decides how many to have in flight.
+          const inFlight = new Set<Promise<void>>();
           const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
           for await (const line of lines) {
             bytes += Buffer.byteLength(line) + 1;
@@ -218,8 +225,13 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
               const raw = JSON.parse(line);
               const hostRequest = PluginHostServiceRequestSchema.safeParse(raw);
               if (hostRequest.success) {
+                // Counted synchronously, so concurrent requests cannot share a
+                // slot and slip past the cap.
                 hostServiceRequests += 1;
-                await respondToHostServiceRequest(child, session, call, hostRequest.data, options.hostServices, hostServiceRequests);
+                const dispatched = respondToHostServiceRequest(child, session, call, hostRequest.data, options.hostServices, hostServiceRequests)
+                  .catch(() => undefined)
+                  .finally(() => inFlight.delete(dispatched));
+                inFlight.add(dispatched);
                 continue;
               }
               const event = CapabilityEventSchema.parse(raw);
@@ -238,6 +250,10 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
               }
             }
           }
+          // Everything the plugin asked for while the stream was open must be
+          // answered before the call is treated as finished, or a request still
+          // in flight would find its response written to a closed pipe.
+          await Promise.all(inFlight);
         } else {
           const chunks: Buffer[] = [];
           let bytes = 0;

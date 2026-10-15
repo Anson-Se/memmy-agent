@@ -373,6 +373,102 @@ it.each([false, true])("automatically lists saved recording files, scopes them t
   } finally { await act(async () => root.unmount()); container.remove(); }
 });
 
+it("lets the user submit while a staged recording is still transcribing, then continues with its transcript", async () => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  let ui!: ReturnType<typeof usePluginUi>;
+  const respond = vi.fn(async () => undefined);
+  const audio = { kind: "audio" as const, path: "/media/interview.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio" };
+  const transcriptFile = { kind: "file" as const, path: "/media/interview.txt", name: "访谈转写-2026-10-15T00-00-00-000Z.txt", mime: "text/plain" as const, bytes: 20, url: "/text" };
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "pending-upload", conversationId: "chat-pending", origin: "agent",
+    events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
+  let finish!: () => void;
+  function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[plugin]} region="pinned"
+    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} />; }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
+    await act(async () => {
+      ui.startTranscription(audio.path, () => new Promise((resolve) => {
+        finish = () => resolve({ text: "现场访谈内容", segments: [], transcribedAt: "2026-10-14T00:00:00Z", transcriptFile });
+      }));
+      // The row stands for the transcript ASR is still writing, not the audio.
+      ui.addRecordingMaterials(plugin.id, "chat-pending", [{
+        kind: "file", path: audio.path, url: audio.url, name: transcriptFile.name, mime: "text/plain", bytes: 0,
+        collected: false, pending: true, pendingAudio: audio
+      }]);
+    });
+    // Listed and submittable while ASR is still running.
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(1);
+    expect(container.textContent).toContain(transcriptFile.name);
+    expect(container.textContent).toContain("正在转写");
+    const submit = container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!;
+    expect(submit.disabled).toBe(false);
+    await act(async () => submit.click());
+    // Pressing it does not send a gap where the interview should be.
+    expect(respond).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("完成后会自动继续");
+    await act(async () => finish());
+    // The plugin never saw this recording, so its transcript arrives as the
+    // file itself — not also as attached text, which would double it.
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", { files: [transcriptFile] });
+  } finally { await act(async () => root.unmount()); container.remove(); }
+});
+
+it("attaches a staged recording's transcript to the recording the plugin already holds", async () => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  let ui!: ReturnType<typeof usePluginUi>;
+  const respond = vi.fn(async () => undefined);
+  const audio = { kind: "audio" as const, path: "/media/handed.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio" };
+  const transcriptFile = { kind: "file" as const, path: "/media/handed.txt", name: "访谈转写-2026-10-15T00-00-00-000Z.txt", mime: "text/plain" as const, bytes: 20, url: "/text" };
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "collected-upload", conversationId: "chat-collected", origin: "agent",
+    events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
+  function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[plugin]} region="pinned"
+    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} />; }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
+    await act(async () => {
+      ui.startTranscription(audio.path, async () => ({ text: "现场访谈内容", segments: [], transcribedAt: "2026-10-14T00:00:00Z", transcriptFile }));
+      ui.addRecordingMaterials(plugin.id, "chat-collected", [{
+        kind: "file", path: audio.path, url: audio.url, name: transcriptFile.name, mime: "text/plain", bytes: 0,
+        collected: true, pending: true, pendingAudio: audio
+      }]);
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", {
+      files: [], transcripts: { [audio.path]: { text: "现场访谈内容", segments: [] } }
+    });
+  } finally { await act(async () => root.unmount()); container.remove(); }
+});
+
+it("asks the user once a staged recording's automatic retries are spent, and can go on without it", async () => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  let ui!: ReturnType<typeof usePluginUi>;
+  const respond = vi.fn(async () => undefined);
+  const audio = { kind: "audio" as const, path: "/media/broken.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio" };
+  const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "failed-upload", conversationId: "chat-failed", origin: "agent",
+    events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
+  const attempt = vi.fn(async () => { throw new Error("ASR down"); });
+  function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[plugin]} region="pinned"
+    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} />; }
+  try {
+    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
+    await act(async () => {
+      ui.startTranscription(audio.path, attempt);
+      ui.addRecordingMaterials(plugin.id, "chat-failed", [{ ...audio, collected: true, pending: true }]);
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(attempt).toHaveBeenCalledTimes(3);
+    expect(container.textContent).toContain("转写失败（已自动重试 3 次）");
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
+    expect(respond).not.toHaveBeenCalled();
+    // The choice stays live while the submission waits on it.
+    const skip = [...container.querySelectorAll<HTMLButtonElement>(".diagnostic-upload-card__transcription button")].find((button) => button.textContent === "不等了，直接继续")!;
+    expect(skip.disabled).toBe(false);
+    await act(async () => skip.click());
+    // The plugin already holds a collected recording; with no text, nothing more is sent for it.
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", { files: [] });
+  } finally { await act(async () => root.unmount()); container.remove(); }
+});
+
 it("keeps the microphone owner mounted while its composer bar is occluded", async () => {
   const { RecordingBarPortalContext } = await import("../plugin-capability-host.js");
   vi.clearAllMocks();
@@ -395,4 +491,90 @@ it("keeps the microphone owner mounted while its composer bar is occluded", asyn
     expect(recorder.unmount).not.toHaveBeenCalled(); expect(recorder.cancel).not.toHaveBeenCalled();
     expect(client.cancel).not.toHaveBeenCalled(); expect(client.respond).not.toHaveBeenCalled();
   } finally { act(() => root.unmount()); container.remove(); dock.remove(); }
+});
+
+it("holds the delivery back while the plugin is still working on the report", async () => {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const finished: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
+    { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx } },
+    { type: "result", output: {} }
+  ] };
+  // Memmy paused between two of its own turns, but the plugin is mid-revision.
+  const running: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-again", conversationId: "chat-1", origin: "agent", events: [
+    { type: "progress", message: "正在重写第三章" }
+  ] };
+  const render = (calls: PluginUiCall[]) => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
+    <PluginCapabilityHost region="flow" calls={calls} plugins={[plugin]} client={{ getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() }} legalDelivery={{ ready: true, recordings: [] }} />
+  </I18nProvider></PluginUiProvider>);
+  try {
+    await act(async () => render([finished, running]));
+    expect(container.querySelector(".legal-delivery-card")).toBeNull();
+    // Nothing to preview of a report that is being rewritten.
+    expect(container.textContent).not.toContain(".docx");
+    await act(async () => render([finished]));
+    expect(container.querySelector(".legal-delivery-card")).not.toBeNull();
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+  }
+});
+
+it("delivers the finished report with the recordings only once the Agent is done", async () => {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
+  const open = vi.fn();
+  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const calls: PluginUiCall[] = [
+    { pluginId: plugin.id, capabilityId: "workbook-compose", callId: "workbook", conversationId: "chat-1", origin: "agent", events: [
+      { type: "artifact", artifact: { id: "xlsx", name: "企业-诊断表.xlsx", role: "deliverable", uri: "plugin-artifact://legal-labor/xlsx", mediaType: "application/vnd.ms-excel" } },
+      { type: "result", output: {} }
+    ] },
+    { pluginId: plugin.id, capabilityId: "report-render", callId: "report-draft", conversationId: "chat-1", origin: "agent", events: [
+      { type: "artifact", artifact: { id: "draft", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/draft", mediaType: docx } },
+      { type: "result", output: {} }
+    ] },
+    { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
+      { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx, path: "/ws/report.docx" } },
+      { type: "result", output: {} }
+    ] }
+  ];
+  const recordings = [
+    { id: "recording:/ws/recordings/a.webm", name: "访谈录音.webm", mediaType: "audio/webm", uri: "/a", path: "/ws/recordings/a.webm" },
+    { id: "recording:/ws/recordings/a.txt", name: "访谈转写.txt", mediaType: "text/plain", uri: "/t", path: "/ws/recordings/a.txt" }
+  ];
+  const render = (ready: boolean) => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
+    <PluginCapabilityHost region="flow" calls={calls} plugins={[plugin]} client={client} onOpenArtifact={open} legalDelivery={{ ready, recordings }} />
+  </I18nProvider></PluginUiProvider>);
+  // The two finished calls are the empty shells the delivery card replaces:
+  // their only artifacts are deliverables, which are not drawn here.
+  const shellOf = (capabilityId: string) => [...container.querySelectorAll<HTMLElement>("div")]
+    .find((node) => node.className.includes("rounded-card") && node.textContent?.trim() === "Legal");
+  try {
+    await act(async () => render(false));
+    expect(container.querySelector(".legal-delivery-card")).toBeNull();
+    expect(container.textContent).not.toContain(".docx");
+    expect(container.textContent).not.toContain(".xlsx");
+
+    await act(async () => render(true));
+    const card = container.querySelector(".legal-delivery-card")!;
+    const chips = [...card.querySelectorAll<HTMLButtonElement>(".agent-attachment-card")];
+    expect(chips.map((chip) => chip.querySelector(".agent-attachment-card__name")?.textContent))
+      .toEqual(["企业-诊断报告", "访谈录音", "访谈转写"]);
+    expect(card.querySelectorAll("button")).toHaveLength(3);
+    // The workbook is the report's working sheet, so it is not delivered.
+    expect(container.textContent).not.toContain(".xlsx");
+    // And the finished calls no longer leave a titled card with an empty body.
+    expect(shellOf("workbook-compose")).toBeUndefined();
+    expect(shellOf("report-render")).toBeUndefined();
+    await act(async () => chips[0]!.click());
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: "final", path: "/ws/report.docx" }));
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+  }
 });

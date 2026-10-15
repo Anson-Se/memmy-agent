@@ -106,6 +106,8 @@ export interface WorkspaceArtifactPanelProps {
   sharedRowReservedWidth?: number;
   /** Hides the pane without unmounting it, preserving open tabs and view state. */
   hidden?: boolean;
+  /** Controls rendered ahead of the refresh button in the toolbar actions. */
+  toolbarStart?: ReactNode;
   /** Controls rendered at the far right of the native file-tab toolbar. */
   toolbarEnd?: ReactNode;
   emptyLabel?: string;
@@ -627,6 +629,7 @@ export function WorkspaceArtifactPanel(props: WorkspaceArtifactPanelProps): Reac
             })}
           </div>
           <div className="workspace-artifact-preview-toolbar__actions">
+            {props.toolbarStart}
             {!extraTabOpen ? (
               <button
                 type="button"

@@ -1,6 +1,7 @@
 import { createPortal } from "react-dom";
 import { Button } from "../components/button.js";
 import { FileTypeIcon } from "../components/file-type-icon.js";
+import { AgentAttachmentCard } from "./agent-file-attachment-chip.js";
 import type { RecordingArchiveEntry } from "./recording-entry.js";
 import {
   createContext,
@@ -42,7 +43,9 @@ import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { PluginsClient } from "../api/plugins-client.js";
 import { asrRecordingTimeRemainingMs, isLiveAsrTimeout, useAsrRecorder } from "./asr-recorder.js";
-import { usePluginChatFeedback, usePluginQuestionDrafts, usePluginRecordingMaterials, type PluginChatFeedback, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { normalizePluginConversationId, usePluginChatFeedback, usePluginQuestionDrafts, usePluginRecordingMaterials, usePluginTranscriptions, type PluginChatFeedback, type PluginRecordingMaterial, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { handOverRecording } from "../lib/recording-handover.js";
+import { PLUGIN_TRANSCRIPTION_ATTEMPTS, type PluginRecordingTranscript, type PluginTranscriptionJob, type PluginTranscriptionState } from "../lib/plugin-transcription-jobs.js";
 import type { MessageKey } from "../i18n/messages.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { classifyAgentAttachmentFile } from "../lib/agent-attachment.js";
@@ -87,6 +90,14 @@ interface PluginCapabilityHostProps {
   asrClient?: AsrClient;
   onAddArtifact?: (artifact: PluginArtifactRef) => void;
   onOpenArtifact?: (artifact: PluginArtifactRef) => void;
+  /**
+   * What the legal diagnosis hands over at the end, beside the report.
+   *
+   * `ready` stays false while the Agent is still working: the report can be
+   * rewritten chapter by chapter, and a card shown early would let the user
+   * open a preview that reloads under them with every pass.
+   */
+  legalDelivery?: { ready: boolean; recordings: PluginArtifactRef[] };
   /** Starts an explicitly requested report after user-raised material collection completes. */
   onRequestDiagnosis?: (call: PluginUiCall) => Promise<void>;
   /**
@@ -236,7 +247,16 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const orderedCalls = useMemo(() => orderPluginCallsForDisplay(deduplicateLegalInteractions(calls))
     .filter((call) => !(flowActive && call.pluginId === "legal-labor" && guidanceQuestion(call.events))), [calls, flowActive]);
   const currentRetries = [...diagnosisRetries.values()].filter((retry) => props.calls.some((call) => call.callId === retry.callId));
-  if (orderedCalls.length === 0 && currentRetries.length === 0) return null;
+  // A run of the Agent pausing is not the diagnosis being finished: Memmy may
+  // be mid-revision, with the report about to be rewritten. The delivery waits
+  // for the plugin too — with no legal call still running, the report on screen
+  // is the final one rather than a draft the user should not be reading yet.
+  const legalCallActive = props.calls.some((call) => call.pluginId === "legal-labor"
+    && !call.events.some((event) => event.type === "result" || event.type === "error"));
+  const deliveryReport = region === "flow" && props.legalDelivery?.ready && !legalCallActive
+    ? selectLegalDeliveryReport(props.calls) : null;
+  const deliveryFiles = deliveryReport ? [deliveryReport, ...props.legalDelivery!.recordings] : [];
+  if (orderedCalls.length === 0 && currentRetries.length === 0 && deliveryFiles.length === 0) return null;
 
   return (
     <section
@@ -327,6 +347,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             origin={call.origin}
             guidance={call.pluginId === "legal-labor" && call.capabilityId === "session-start"}
             diagnosticUpload={call.pluginId === "legal-labor" && ["session-start", "material-collect"].includes(call.capabilityId)}
+            hideDeliverables={call.pluginId === "legal-labor"}
             onGenerateDiagnosis={call.origin === "user" && props.onRequestDiagnosis
               ? () => setPendingDiagnoses((current) => new Set(current).add(call.callId)) : undefined}
             onRespond={respond}
@@ -384,8 +405,42 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
           </div>
         );
       })}
+      {deliveryFiles.length > 0 ? <LegalDeliveryCard files={deliveryFiles} onOpen={props.onOpenArtifact} /> : null}
     </section>
   );
+}
+
+/**
+ * The finished report from the latest successful `report-render` run.
+ *
+ * Only the report is handed over: the workbook is the report's working sheet,
+ * not something the client reads, so it never reaches the delivery card.
+ */
+export function selectLegalDeliveryReport(calls: readonly PluginUiCall[]): PluginArtifactRef | null {
+  for (const call of [...calls].reverse()) {
+    if (call.pluginId !== "legal-labor" || call.capabilityId !== "report-render") continue;
+    if (!call.events.some((event) => event.type === "result")) continue;
+    const artifact = [...call.events].reverse().find((event) => event.type === "artifact" && event.artifact.role === "deliverable");
+    if (artifact?.type === "artifact") return artifact.artifact;
+  }
+  return null;
+}
+
+/**
+ * The finished engagement's files, as a row of the same chips the composer
+ * uses for attachments.
+ *
+ * Deliverables are few and short — a report, a recording, its transcript — so
+ * one card per file made a handful of files read as a wall of cards. Chips wrap
+ * a row at a time, which is what the file already looks like everywhere else.
+ */
+function LegalDeliveryCard(props: { files: PluginArtifactRef[]; onOpen?: (artifact: PluginArtifactRef) => void }) {
+  const { t } = useTranslation();
+  const title = t("plugin.ui.artifactCollection", { count: props.files.length });
+  return <article className="legal-delivery-card" aria-label={title}>
+    {props.files.map((file) => <AgentAttachmentCard key={file.id} kind="file" name={file.name} mime={file.mediaType}
+      onClick={props.onOpen ? () => props.onOpen?.(file) : undefined} />)}
+  </article>;
 }
 
 function GenericPluginCards(props: {
@@ -394,6 +449,8 @@ function GenericPluginCards(props: {
   origin?: PluginInvocationOrigin;
   guidance?: boolean;
   diagnosticUpload?: boolean;
+  /** Deliverables are collected into the delivery card instead of each call's own. */
+  hideDeliverables?: boolean;
   onGenerateDiagnosis?: () => void;
   events: CapabilityEvent[];
   onRespond(interactionId: string, response: unknown): Promise<void>;
@@ -415,7 +472,7 @@ function GenericPluginCards(props: {
   // list called 交付文件 made a card full of blank templates read as a finished
   // engagement.
   const setupEvents = artifactEvents.filter((event) => event.artifact.role === "setup");
-  const deliverableEvents = artifactEvents.filter((event) => event.artifact.role !== "setup");
+  const deliverableEvents = props.hideDeliverables ? [] : artifactEvents.filter((event) => event.artifact.role !== "setup");
   // Template events remain in the call's history after the guide is answered.
   // A bare audio step belongs to the recorder, where those files are unrelated.
   const liveEvents = props.events.filter((event) => event.type !== "artifact");
@@ -503,7 +560,7 @@ export function DiagnosticGuidanceCard(props: {
     <header className="diagnostic-guidance-card__header">
       <h3>{firstString(payload, ["title"]) ?? t("plugin.ui.question")}</h3>
       {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
-        title={t("plugin.ui.dismissCard")} disabled={status === "submitting"} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={18} /></button> : null}
+        title={t("plugin.ui.dismissCard")} disabled={status === "submitting"} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={15} /></button> : null}
     </header>
     <div className="diagnostic-guidance-card__templates">
       {props.templates.map((event) => {
@@ -516,7 +573,7 @@ export function DiagnosticGuidanceCard(props: {
       {options.map((option) => <Button key={String(option.value)} type="button" size="sm" className="diagnostic-guidance-card__action"
         variant={option.value === "record" ? "primary" : "secondary"}
         disabled={status === "submitting" || status === "answered"} onClick={() => void submit(option.value)}>
-        {option.value === "record" ? <Mic size={16} aria-hidden="true" /> : <Upload size={16} aria-hidden="true" />}{option.label}
+        {option.value === "record" ? <Mic size={13} aria-hidden="true" /> : <Upload size={13} aria-hidden="true" />}{option.label}
       </Button>)}
       {status === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
     </footer>
@@ -779,10 +836,75 @@ function AudioRecordCard(props: {
     if (audioUrl?.startsWith("blob:")) URL.revokeObjectURL(audioUrl);
   }, [audioUrl]);
 
+  const transcriptionJobs = usePluginTranscriptions();
   const finish = async () => {
     if (submitting.current || busy || answered) return;
     submitting.current = true;
     props.onStatus("submitting");
+    const sessionKey = props.conversationId
+      ? (props.conversationId.startsWith("websocket:") ? props.conversationId : `websocket:${props.conversationId}`)
+      : undefined;
+    // An interview is handed over the moment it stops. Transcribing half an
+    // hour of audio takes minutes, and the upload card that follows must be
+    // usable straight away; the transcription carries on at page level and
+    // the upload card waits for it when the user submits.
+    if (props.interview && props.asrClient && props.uploadFiles && transcriptionJobs && props.conversationId) {
+      try {
+        const stopped = await recorder.stop();
+        const durationMs = stopped.durationMs ?? elapsedMs;
+        const blobUrl = URL.createObjectURL(stopped.recording);
+        setAudioUrl(blobUrl);
+        const { audio, job, transcriptName } = await handOverRecording({
+          stopped, asrClient: props.asrClient, uploadFiles: props.uploadFiles,
+          startTranscription: transcriptionJobs.startTranscription, t, diarization
+        });
+        // The row stands for the transcript — that is what the interview adds to
+        // the diagnosis — and it is named for the file ASR is still writing.
+        // The plugin already receives the recording on the response below, so
+        // the row is staged as collected: only its text still has to travel.
+        const pendingRow: PluginRecordingMaterial = {
+          kind: "file", path: audio.path, url: audio.url, name: transcriptName, mime: "text/plain", bytes: 0,
+          collected: true, pending: true, pendingAudio: audio
+        };
+        transcriptionJobs.addRecordingMaterials("legal-labor", props.conversationId, [pendingRow]);
+        finishedRef.current = true;
+        const panel = (status: RecordingPanelSession["status"], text: RecordingPanelTranscript | null) => props.onRecordingSession?.({
+          title: props.title, status, elapsedMs: durationMs, lines, transcript: text, audioUrl: audio.url,
+          onPause: () => undefined, onResume: () => undefined, onFinish: () => undefined,
+          onClose: () => props.onRecordingSession?.(null)
+        });
+        panel("transcribing", null);
+        // Archived before the card can disappear, so the interview is in the
+        // recording list even while its transcript is still being produced;
+        // the list follows the job until the finished entry replaces this one.
+        const pendingEntry: RecordingArchiveEntry = {
+          id: `plugin:${audio.path}`, title: props.title, recordedAt: new Date().toISOString(), durationMs,
+          speakerCount: 0, transcript: { text: "", segments: [] }, audioUrl: audio.url, audioPath: audio.path,
+          status: "transcribing", ...(sessionKey ? { sessionKey } : {}), collected: true, handedOver: true, files: []
+        };
+        props.onRecordingArchived?.(pendingEntry);
+        await props.onRespond(props.request.interactionId, {
+          text: "", segments: [], durationMs, audio, transcriptPending: true
+        });
+        props.onStatus("answered");
+        // This card is gone by now; the closures below still reach the page.
+        void job.wait().then((result) => {
+          if (!result) return;
+          const transcriptText = { text: result.text, segments: result.segments };
+          panel("done", transcriptText);
+          props.onRecordingArchived?.({
+            ...pendingEntry, recordedAt: result.transcribedAt,
+            speakerCount: new Set(result.segments.map((segment) => segment.speakerId ?? 0)).size || 1,
+            transcript: transcriptText, status: "ready",
+            files: [audio, result.transcriptFile].filter((file): file is UploadedAgentMedia => file !== undefined)
+          });
+        });
+      } catch {
+        submitting.current = false;
+        props.onStatus("error");
+      }
+      return;
+    }
     try {
       const result = await recorder.finishAndTranscribe({ diarization });
       const blobUrl = URL.createObjectURL(result.recording);
@@ -858,6 +980,7 @@ function AudioRecordCard(props: {
     setLevels([]);
     setTranscript(null);
     setLiveError(null);
+    finishedRef.current = false;
     void recorder.start().catch(() => undefined).finally(() => { starting.current = false; });
   };
 
@@ -876,7 +999,8 @@ function AudioRecordCard(props: {
   // card. Read through a ref because the unmount below sees only the first
   // render's closure.
   const finishedRef = useRef(false);
-  finishedRef.current = transcript !== null;
+  // Sticky: a handed-over interview finishes before its transcript exists.
+  if (transcript !== null) finishedRef.current = true;
   useEffect(() => {
     if (!publish) return;
     publish({
@@ -993,6 +1117,36 @@ function formatUploadFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Only responses that carry a handed-over recording's text grow the extra field. */
+function transcriptField(transcripts: Record<string, unknown>): { transcripts?: Record<string, unknown> } {
+  return Object.keys(transcripts).length ? { transcripts } : {};
+}
+
+/**
+ * How a staged recording's transcription is doing, under its file name.
+ *
+ * Failure only shows once the automatic retries are spent, and then it asks:
+ * the user decides between another attempt and going on without the text.
+ * Those two buttons stay live while the card is submitting, because a
+ * submission waiting on this recording can only move once they are pressed.
+ */
+function StagedTranscriptionStatus(props: { state?: PluginTranscriptionState; job?: PluginTranscriptionJob }) {
+  const { t } = useTranslation();
+  const state = props.state;
+  if (!state || state.status === "ready") return null;
+  if (state.status === "transcribing") {
+    return <p className="diagnostic-upload-card__transcription" role="status">
+      {state.attempt > 1 ? t("plugin.ui.audio.retryingRow", { attempt: state.attempt - 1 }) : t("plugin.ui.audio.transcribingRow")}
+    </p>;
+  }
+  if (state.status === "skipped") return <p className="diagnostic-upload-card__transcription">{t("plugin.ui.audio.skippedRow")}</p>;
+  return <div className="diagnostic-upload-card__transcription diagnostic-upload-card__transcription--failed" role="alert">
+    <span>{t("plugin.ui.audio.transcriptionFailedRow", { attempts: PLUGIN_TRANSCRIPTION_ATTEMPTS })}</span>
+    <button type="button" onClick={() => props.job?.retry()}>{t("plugin.ui.audio.retryTranscription")}</button>
+    <button type="button" onClick={() => props.job?.skip()}>{t("plugin.ui.audio.skipTranscription")}</button>
+  </div>;
+}
+
 export function FileInputCard(props: {
   conversationId?: string;
   pluginId?: string;
@@ -1047,6 +1201,56 @@ export function FileInputCard(props: {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const transcriptionJobs = usePluginTranscriptions();
+  const [waitingForTranscripts, setWaitingForTranscripts] = useState(false);
+  /**
+   * Resolves the staged recordings into what the plugin receives.
+   *
+   * A recording that is still being transcribed is listed and submittable, so
+   * the user is never held at this card. What is sent still has to be the
+   * transcript, not a gap where the interview should be — so submitting waits
+   * here for any transcription in flight, and the card carries on by itself
+   * once it lands. The plugin already holds a collected recording, so only its
+   * text travels; one it has not seen goes as the transcript file.
+   */
+  const collectStaged = async (keepPending = false) => {
+    const transcripts: Record<string, { text: string; segments: PluginRecordingTranscript["segments"] }> = {};
+    const jobs = stagedFiles.map((file) => transcriptionJobs?.transcriptionJob(file.path));
+    if (jobs.some((job) => job && job.state.status !== "ready")) setWaitingForTranscripts(true);
+    try {
+      const results = await Promise.all(jobs.map((job) => job?.wait()));
+      const files: UploadedAgentMedia[] = [];
+      const retained: PluginRecordingMaterial[] = [];
+      stagedFiles.forEach((file, index) => {
+        const { collected, pending: _pending, pendingAudio: _audio, ...media } = file;
+        if (!file.pending) {
+          if (!collected) files.push(media);
+          return;
+        }
+        const result = results[index];
+        if (result) {
+          // A recording the plugin already holds gets its text attached to that
+          // material, keyed by the recording's path. One it never saw arrives
+          // as the transcript file instead. Sending both would put the same
+          // interview into the session twice.
+          if (collected) transcripts[file.path] = { text: result.text, segments: result.segments };
+          else if (result.transcriptFile) files.push(result.transcriptFile);
+          return;
+        }
+        // No transcript. Closing the card is not a decision about the
+        // recording, so the row stays for the next round rather than being
+        // resolved by a submission the user never made.
+        if (keepPending) { retained.push(file); return; }
+        // The user chose to go on without the text: hand the audio over so the
+        // plugin can read it itself. A recording the plugin already holds
+        // needs nothing, which is the case once its text has been delivered.
+        if (!collected && file.pendingAudio) files.push(file.pendingAudio);
+      });
+      return { transcripts, files, retained };
+    } finally {
+      setWaitingForTranscripts(false);
+    }
+  };
   const close = async () => {
     if (submitting.current || props.disabled) return;
     submitting.current = true;
@@ -1054,9 +1258,11 @@ export function FileInputCard(props: {
     fileDrafts?.set(fileDraftKey, files);
     try {
       // Closing skips this collection round; selected files stay in the draft.
-      const receipts = stagedFiles.filter((file) => !file.collected).map(({ collected: _collected, ...file }) => file);
-      await props.onRespond(props.request.interactionId, { action: "skip", files: receipts });
-      recordingMaterials.update([]);
+      // A recording still being transcribed keeps its row, so its text travels
+      // with the next card instead of being lost with this one.
+      const staged = await collectStaged(true);
+      await props.onRespond(props.request.interactionId, { action: "skip", files: staged.files, ...transcriptField(staged.transcripts) });
+      recordingMaterials.update(staged.retained);
       props.onStatus("answered");
       props.onGenerateDiagnosis?.();
     } catch { submitting.current = false; props.onStatus("error"); }
@@ -1111,16 +1317,17 @@ export function FileInputCard(props: {
         const classification = classifyAgentAttachmentFile(file, { allowAudio: true })!;
         return { blob: file, name: file.name, kind: classification.kind, mime: classification.mime };
       })) : [];
-      const submitted = [...stagedFiles.filter((file) => !file.collected).map(({ collected: _collected, ...file }) => file), ...uploaded];
+      const staged = await collectStaged();
+      const submitted = [...staged.files, ...uploaded];
       const feedback = pendingFeedback.current;
       if (feedback) {
         pendingFeedback.current = null;
         fileDrafts?.set(fileDraftKey, files);
         await props.onRespond(props.request.interactionId, { action: "chat-feedback", ...feedback, files: [],
-          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: submitted } });
+          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: submitted }, ...transcriptField(staged.transcripts) });
       } else {
-        await props.onRespond(props.request.interactionId, { files: submitted });
-        recordingMaterials.update([]);
+        await props.onRespond(props.request.interactionId, { files: submitted, ...transcriptField(staged.transcripts) });
+        recordingMaterials.update(staged.retained);
         fileDrafts?.delete(fileDraftKey);
       }
       props.onStatus("answered");
@@ -1157,7 +1364,8 @@ export function FileInputCard(props: {
       {fileStates.length || stagedFiles.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
         {stagedFiles.map((file) => <li key={file.path} className="diagnostic-upload-card__file">
           <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={file.name} mime={file.mime} surface="row" /></span>
-          <div className="diagnostic-upload-card__file-info"><button type="button" disabled={!props.onOpenArtifact} title={file.name} onClick={() => props.onOpenArtifact?.({ id: file.path, path: file.path, uri: file.path, name: file.name, mediaType: file.mime })}>{file.name}</button></div>
+          <div className="diagnostic-upload-card__file-info"><button type="button" disabled={!props.onOpenArtifact} title={file.name} onClick={() => props.onOpenArtifact?.({ id: file.path, path: file.path, uri: file.path, name: file.name, mediaType: file.mime })}>{file.name}</button>
+            <StagedTranscriptionStatus state={transcriptionJobs?.transcriptions.get(file.path)} job={transcriptionJobs?.transcriptionJob(file.path)} /></div>
           <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(file.bytes)}</span>
           <button type="button" className="diagnostic-upload-card__remove" disabled={props.disabled}
             aria-label={t("plugin.ui.removeFile", { name: file.name })}
@@ -1189,6 +1397,7 @@ export function FileInputCard(props: {
       {validationError ? <p className="diagnostic-upload-card__error" role="alert">{validationError}</p> : null}
       {props.status === "error" ? <p className="diagnostic-upload-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
       {props.status === "answered" ? <p role="status">{t("plugin.ui.answered")}</p> : null}
+      {waitingForTranscripts ? <p className="diagnostic-upload-card__waiting" role="status">{t("plugin.ui.audio.waitingForTranscription")}</p> : null}
     </div>
     <footer className="diagnostic-upload-card__footer">
       {accept ? <p>{t("plugin.ui.acceptedFormats", { formats: summarizeAcceptedFormats(accept, t) })}</p> : null}
@@ -1443,7 +1652,7 @@ function ArtifactCard(props: {
         {props.guidanceDescription ? <p className="diagnostic-guidance-card__description">{props.guidanceDescription}</p> : null}
       </div>
       <span className="diagnostic-guidance-card__download">
-        <Download size={17} aria-hidden="true" />{t("plugin.ui.download")}
+        <Download size={16} strokeWidth={1.5} aria-hidden="true" />{t("plugin.ui.download")}
       </span>
       {downloadState === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.downloadFailed")}</p> : null}
     </button>;
@@ -1614,7 +1823,7 @@ export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): Plugin
   const groups = new Map<string, { live: PluginUiCall[]; finished?: PluginUiCall }>();
   const order: string[] = [];
   for (const call of calls) {
-    const key = `${call.conversationId}:${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
+    const key = `${normalizePluginConversationId(call.conversationId) ?? call.conversationId}:${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
     let group = groups.get(key);
     if (!group) {
       group = { live: [] };
@@ -1666,7 +1875,15 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
       && candidate.conversationId === call.conversationId
       && candidate.events.some((event) => event.type === "result")
     ));
-    if (hasDeliverableArtifact) return true;
+    // The legal plugin's deliverables are collected into the delivery card
+    // rather than the call's own, so a finished call whose only artifacts are
+    // deliverables has nothing left to draw. Keeping it rendered a card with a
+    // title and an empty body.
+    if (hasDeliverableArtifact) {
+      return !(call.pluginId === "legal-labor" && terminal && !hasError
+        && !artifactEvents.some((event) => event.artifact.role === "setup")
+        && !call.events.some((event) => event.type === "interaction"));
+    }
     // A setup-only call that finished (result or dismissed) is history:
     // the templates were handed over and the card has nothing left to offer.
     if (hasArtifact && terminal && !hasError) return false;

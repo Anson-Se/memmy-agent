@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import type { AgentGatewayStartupIssue, InstalledPlugin, PluginArtifactRef, PluginCommandContribution, PluginScenarioContribution } from "@memmy/local-api-contracts";
 import { hydrateAgentThreadInBackground, refreshAgentTaskList, useAgentRuntimeBridge, type AgentTaskStateCoordinator } from "../app/agent-runtime-bridge.js";
 import { useApiClients } from "../app/providers.js";
-import { usePluginUi, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { normalizePluginConversationId, usePluginUi, type PluginRecordingMaterial, type PluginUiCall } from "../app/plugin-ui-context.js";
 import { FOCUSED_AGENT_CHAT_STORAGE_KEY, clearFocusedAgentTarget, isAccountTokenQuotaExhausted, normalizeAgentChatId, readLaunchAgentChatId, removeLaunchAgentChatIdFromUrl } from "../app/routes.js";
 import {
   MemmyAgentRequestError,
@@ -80,6 +80,7 @@ import { AgentEnvironmentPanel } from "./agent-environment-panel.js";
 import { AgentGoalBar, type AgentGoalControlRequest } from "./agent-goal-bar.js";
 import { AgentQueuedMessageList } from "./agent-queued-message-list.js";
 import { AgentTaskPlanBar } from "./agent-task-plan-bar.js";
+import { agentOutputSignature, useStalledOutputShimmer } from "./agent-stall-shimmer.js";
 import { AgentThreadMessages, ChatImageLightbox } from "./agent-thread-messages.js";
 import {
   type AgentQuestionCardPayload,
@@ -703,6 +704,55 @@ export function hasActiveAgentConversation(currentChatId: string | null, message
   return Boolean(currentChatId) && messageCount > 0;
 }
 
+/**
+ * The files a finished recording contributes to the diagnosis materials card.
+ *
+ * Only the transcript goes in: the diagnosis reads text, and the audio stays
+ * in the recording archive for playback.
+ */
+export function selectRecordingMaterialFiles(entry: RecordingArchiveEntry): PluginRecordingMaterial[] {
+  // A handed-over recording is already on the upload card as its own row.
+  if (entry.handedOver) return [];
+  return (entry.files ?? [])
+    .filter((file) => file.kind !== "audio")
+    .map((file) => ({ ...file, collected: entry.collected === true }));
+}
+
+/**
+ * The recording and transcript files a conversation hands over with its report.
+ *
+ * Oldest first, each recording's audio before its transcript, matching the
+ * order the interviews happened in.
+ */
+export function selectRecordingDeliveryFiles(recordings: readonly RecordingArchiveEntry[], conversationId: string | null): PluginArtifactRef[] {
+  const normalized = normalizePluginConversationId(conversationId);
+  if (!normalized) return [];
+  return recordings
+    .filter((entry) => entry.status !== "transcribing" && entry.status !== "failed"
+      && normalizePluginConversationId(entry.sessionKey) === normalized)
+    .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
+    .flatMap((entry) => (entry.files ?? []).map((file) => ({
+      id: `recording:${file.path}`, name: file.name, mediaType: file.mime, uri: file.url, path: file.path
+    })));
+}
+
+/** Keeps the global plugin event stream scoped to the conversation on screen. */
+export function selectPluginCallsForConversation(
+  calls: readonly PluginUiCall[],
+  currentChatId: string | null,
+  currentSessionKey: string | null,
+  draftScopeKey: string
+): PluginUiCall[] {
+  // Once a chat exists its public id is authoritative.  The session key is an
+  // alternate spelling of that same id for Agent-originated events; accepting
+  // an old session key during navigation can briefly render another chat's
+  // pending card.
+  const activeConversationId = currentChatId ?? currentSessionKey ?? draftScopeKey;
+  const normalizedActiveId = normalizePluginConversationId(activeConversationId);
+  if (!normalizedActiveId) return [];
+  return calls.filter((call) => normalizePluginConversationId(call.conversationId) === normalizedActiveId);
+}
+
 export function shouldAcceptAgentStatusResult(input: {
   pendingStatusChatId: string | null;
   subscribedChatId: string | null;
@@ -1317,6 +1367,7 @@ export function HomePage() {
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const conversationPanelRef = useRef<HTMLElement | null>(null);
+  const conversationContentRef = useRef<HTMLDivElement | null>(null);
   const composerOverlayRef = useRef<HTMLDivElement | null>(null);
   // The row the chat and the side preview share, so the preview can cap itself
   // to leave the chat visible instead of covering it.
@@ -1375,14 +1426,24 @@ export function HomePage() {
   const deliverRecordingRef = useRef<RecordingDeliverFn | undefined>(undefined);
   const normalRecordingReadyRef = useRef<(entry: RecordingArchiveEntry) => void>(() => undefined);
   const stageRecordingMaterials = useCallback((entry: RecordingArchiveEntry) => {
-    if (entry.sessionKey && entry.files?.length) addRecordingMaterials("legal-labor", entry.sessionKey,
-      entry.files.map((file) => ({ ...file, collected: entry.collected === true })));
+    const files = selectRecordingMaterialFiles(entry);
+    if (entry.sessionKey && files.length) addRecordingMaterials("legal-labor", entry.sessionKey, files);
   }, [addRecordingMaterials]);
   const recordingEntry = useRecordingEntry(
     clients?.asr,
     clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined,
     (transcript, mode) => deliverRecordingRef.current?.(transcript, mode),
     { scope: String(state.account.userId ?? "local"), onArchived: (entry) => { stageRecordingMaterials(entry); normalRecordingReadyRef.current(entry); },
+      // Staged as soon as it stops, as the row for its transcript: the upload
+      // card can be submitted while ASR is still running, and waits for it then.
+      onHandedOver: ({ audio, transcriptName }) => {
+        const sessionKey = state.agent.currentSessionKey ?? (state.agent.currentChatId ? `websocket:${state.agent.currentChatId}` : null);
+        if (!sessionKey) return;
+        addRecordingMaterials("legal-labor", sessionKey, [{
+          kind: "file", path: audio.path, url: audio.url, name: transcriptName, mime: "text/plain", bytes: 0,
+          collected: false, pending: true, pendingAudio: audio
+        }]);
+      },
       ...((state.agent.currentSessionKey ?? state.agent.currentChatId) ? { sessionKey: state.agent.currentSessionKey ?? `websocket:${state.agent.currentChatId}` } : {}),
       resolveAudio: async (entry) => {
         if (!clients || !entry.audioPath) return entry.audioUrl;
@@ -1398,11 +1459,10 @@ export function HomePage() {
   }, [recordingEntry.archive, stageRecordingMaterials]);
   const chatScopeKey = agentChatScopeKey(state.agent.currentChatId, state.agent.newChatRequestId);
   const pluginUiPluginKey = useMemo(() => [...new Set(pluginUiCalls.map((call) => call.pluginId))].sort().join("\n"), [pluginUiCalls]);
-  const visiblePluginCalls = useMemo(() => pluginUiCalls.filter((call) => (
-    call.conversationId === state.agent.currentChatId
-    || call.conversationId === state.agent.currentSessionKey
-    || call.conversationId === chatScopeKey
-  )), [chatScopeKey, pluginUiCalls, state.agent.currentChatId, state.agent.currentSessionKey]);
+  const visiblePluginCalls = useMemo(
+    () => selectPluginCallsForConversation(pluginUiCalls, state.agent.currentChatId, state.agent.currentSessionKey, chatScopeKey),
+    [chatScopeKey, pluginUiCalls, state.agent.currentChatId, state.agent.currentSessionKey]
+  );
   const pinnedPluginCapabilities = useMemo(
     () => new Set(installedPlugins.flatMap((plugin) => (plugin.manifest.commands ?? [])
       .filter((command) => command.pinned === true)
@@ -1413,6 +1473,10 @@ export function HomePage() {
     () => selectVisiblePluginCalls(visiblePluginCalls, answeredPluginInteractions),
     [visiblePluginCalls, answeredPluginInteractions]
   );
+  const waitingForPluginInteraction = preparedPluginCalls.some((call) => (
+    call.events.some((event) => event.type === "interaction")
+    && !call.events.some((event) => event.type === "result" || event.type === "error")
+  ));
   useEffect(() => {
     setHiddenPluginCalls((current) => {
       return reconcileHiddenPluginCalls(current, hiddenPluginSteps, preparedPluginCalls);
@@ -1692,6 +1756,17 @@ export function HomePage() {
       state.agent.runStartedAtByChatId[state.agent.currentChatId] ||
       state.agent.optimisticSendingByChatId[state.agent.currentChatId]
     )
+  );
+  // The same condition the sidebar spinner uses, so the thread and the
+  // spinner never disagree about whether Memmy is working.
+  const isAgentWorking = isCurrentAgentRunning || isCurrentGoalActive;
+  // After a few quiet seconds, the shimmer sweeps the last line whether the
+  // Agent is writing an answer, running a tool, or waiting on the user to
+  // act — the common thread is "no new text yet, but still working".
+  useStalledOutputShimmer(
+    conversationContentRef,
+    isAgentWorking,
+    agentOutputSignature(state.agent.messages)
   );
   const workspaceEnvironment = useWorkspaceEnvironment(
     clients?.memmyAgent ?? null,
@@ -3923,6 +3998,25 @@ export function HomePage() {
       <PanelRight size={15} aria-hidden="true" />
     </button>
   ) : null;
+  // Shared by the title bar and the preview toolbar so the recordings stay one
+  // click away whichever of the two is showing. While the recording tab is
+  // open, the tab's own close button is the control.
+  const recordingToggle = topbarPluginCommand && !recordingEntry.open ? (
+    <button
+      type="button"
+      className="agent-preview-toggle"
+      aria-label={topbarPluginCommand.command.name}
+      aria-pressed={false}
+      title={topbarPluginCommand.command.name}
+      data-recording-toggle
+      onClick={toggleRecordingEntry}
+    >
+      {(() => {
+        const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
+        return <Icon size={15} aria-hidden="true" />;
+      })()}
+    </button>
+  ) : null;
 
   const workspacePreviewPanel = previewScope ? (
     <WorkspaceArtifactPanel
@@ -3959,6 +4053,7 @@ export function HomePage() {
       onWidthChange={setPreviewPanelWidth}
       sharedRowWidth={workspaceLayoutWidth}
       sharedRowReservedWidth={SHARED_ROW_PRIMARY_RESERVE}
+      toolbarStart={recordingToggle}
       toolbarEnd={previewToggle}
       emptyLabel={t("workspaceArtifact.noFiles")}
       emptyDetail={previewRootLabel}
@@ -4052,22 +4147,7 @@ export function HomePage() {
                 the close action while open; this title-bar button is rendered
                 only while the panel is closed so two audio controls cannot
                 overlap while the pane width is settling. */}
-            {topbarPluginCommand && !sidePreviewOpen ? (
-              <button
-                type="button"
-                className="agent-preview-toggle"
-                aria-label={topbarPluginCommand.command.name}
-                aria-pressed={false}
-                title={topbarPluginCommand.command.name}
-                data-recording-toggle
-                onClick={toggleRecordingEntry}
-              >
-                {(() => {
-                  const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
-                  return <Icon size={15} aria-hidden="true" />;
-                })()}
-              </button>
-            ) : null}
+            {!sidePreviewOpen ? recordingToggle : null}
             {!sidePreviewOpen ? previewToggle : null}
           </div>
       ) : null}
@@ -4307,7 +4387,7 @@ export function HomePage() {
             onWheel={markAgentConversationUserScrollIntent}
             onTouchMove={markAgentConversationUserScrollIntent}
           >
-            <div className="agent-conversation-content max-w-3xl mx-auto space-y-3">
+            <div ref={conversationContentRef} className="agent-conversation-content max-w-3xl mx-auto space-y-3">
               {displayConnectionStatus !== "connected" && (
                 <div className="text-center">
                   <span className="inline-flex text-[11px] px-3 py-1 rounded-tag bg-background-paper text-text-ink/55 border border-border-stone/30">
@@ -4325,7 +4405,7 @@ export function HomePage() {
                 forceMessageActionsForMessageId={firstEncounterRelayAnswerMessageId}
                 retryWaitStatus={state.agent.currentChatId ? state.agent.retryWaitStatusByChatId[state.agent.currentChatId] ?? null : null}
                 isSending={state.agent.isSending}
-                waitingForPluginInteraction={preparedPluginCalls.some((call) => call.events.some((event) => event.type === "interaction") && !call.events.some((event) => event.type === "result" || event.type === "error"))}
+                waitingForPluginInteraction={waitingForPluginInteraction}
                 sanitizePlatformApiErrors={sanitizePlatformApiErrors}
                 artifactClient={sessionArtifactClient}
                 memoryRuntimeClient={clients?.memoryRuntime ?? null}
@@ -4334,6 +4414,10 @@ export function HomePage() {
               <PluginCapabilityHost
                 region="flow"
                 calls={visiblePluginCalls}
+                legalDelivery={{
+                  ready: !isCurrentAgentRunning,
+                  recordings: selectRecordingDeliveryFiles(recordingEntry.session.recordings, state.agent.currentChatId ?? state.agent.currentSessionKey)
+                }}
                 plugins={installedPlugins}
                 client={clients?.plugins ?? null}
                 uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
