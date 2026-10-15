@@ -123,7 +123,10 @@ try {
           # points IconLocation at the real app executable. If it does not,
           # the Shell can still resolve the local shortcut's chosen icon.
           $iconPath = ([string]$link.IconLocation) -replace ',\s*-?\d+\s*$', ''
-          if ([IO.Path]::GetFileNameWithoutExtension($iconPath) -ieq $processName -and
+          # Remember accepts executables and shortcuts, not .ico/.dll files.
+          # Let the Shell resolve those through the shortcut's IconLocation.
+          if ([IO.Path]::GetExtension($iconPath) -ieq '.exe' -and
+              [IO.Path]::GetFileNameWithoutExtension($iconPath) -ieq $processName -and
               (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
             Remember $shortcutCandidates (AppId $processName) $iconPath
           } else {

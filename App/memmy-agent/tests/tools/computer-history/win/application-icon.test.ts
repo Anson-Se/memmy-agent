@@ -1,5 +1,8 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { WindowsApplicationIconReader } from "../../../../src/tools/computer-history/win/application-icon.js";
 
@@ -17,6 +20,18 @@ function requestedIds(args: string[]): string[] {
 }
 
 describe("Windows Computer History application icons", () => {
+  it.runIf(process.platform === "win32")("resolves Squirrel shortcut icons with real Windows PowerShell and Shell APIs", async () => {
+    const powershell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const harness = fileURLToPath(new URL("./application-icon-shortcuts.ps1", import.meta.url));
+    const source = fileURLToPath(new URL("../../../../src/tools/computer-history/win/app-icon.ps1", import.meta.url));
+    const { stdout } = await promisify(execFile)(powershell, [
+      "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-File", harness, "-HelperPath", source,
+    ], { timeout: 20_000, maxBuffer: 1024 * 1024, windowsHide: true });
+    expect(JSON.parse(stdout.trim())).toMatchObject({
+      sameNameIco: true, sameNameExe: true, differentNameIco: true, customIconPixels: true,
+    });
+  }, 25_000);
+
   it("coalesces timeline and picker requests, validates PNGs, and caches successes", async () => {
     const run = vi.fn(async (_binary: string, args: string[], _options: unknown) => {
       const ids = requestedIds(args);
