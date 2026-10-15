@@ -40,7 +40,7 @@ async function harness(browser: "chrome" | "edge" = "chrome") {
   resources.push(() => socket.terminate());
   await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
   const messages: any[] = []; socket.on("message", value => messages.push(JSON.parse(String(value))));
-  socket.send(JSON.stringify({ type: "hello", browser, capabilities: ["browserHistory"] }));
+  socket.send(JSON.stringify({ type: "hello", browser, capabilities: ["browserHistory", "playwright"] }));
   await vi.waitFor(() => expect(messages.some(message => message.type === "ready")).toBe(true));
   const connectionId = messages.find(message => message.type === "ready").connectionId;
   const started = service.startObservation(); connection.refresh();

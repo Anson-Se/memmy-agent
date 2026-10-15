@@ -1,7 +1,7 @@
 import type { BrowserToolName, BrowserScope } from "./browser.js";
 import { emitComputerUseSurface } from "../../../tools/computer-use/surface-preview.js";
 import { browserAppKey } from "../../../tools/computer-use/native-app-key.js";
-import { ExternalBrowserBridge, type ExternalBrowserClaim } from "./external-browser-bridge.js";
+import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED, type ExternalBrowserClaim } from "./external-browser-bridge.js";
 import { OcuUserIntervened } from "../../../tools/computer-use/mac-focus-guard.js";
 import { executeExternalBrowserPlaywright } from './external-browser-playwright.js';
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
@@ -62,6 +62,13 @@ function formatActionResult(result: ExternalResult): string {
     ? `\n\nObserved page after action:\n${formatNodes(observation.nodes, observation.truncated === true)}` : '');
 }
 
+function extensionUpdateFailure(error: unknown): ToolContent | null {
+  if ((error as { code?: string } | null)?.code !== EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED) return null;
+  return [{ type: 'text', text: JSON.stringify({ ok: false, code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED,
+    retryable: false, requiresUserAction: true, noActionDispatched: true, inputDispatched: false,
+    error: String((error as { recoveryInstructions?: string }).recoveryInstructions ?? (error as Error).message) }) }];
+}
+
 /** Translate the existing browser tool vocabulary to a user-claimed Chrome/Edge tab. */
 export async function callExternalBrowserTool(
   bridge: BrowserCommandBridge,
@@ -77,11 +84,18 @@ export async function callExternalBrowserTool(
   }
   if (name === 'browser_file_upload') {
     const policy = new BrowserUseSitePolicyReader();
-    const result = bridge.subscribePlaywright
-      ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
-        subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'upload', params,
-        bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), abortSignal ?? undefined)
-      : await bridge.command(claim, 'upload', params, abortSignal ?? undefined) as ExternalResult;
+    let result: ExternalResult;
+    try {
+      result = bridge.subscribePlaywright
+        ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+          subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'upload', params,
+          bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), abortSignal ?? undefined)
+        : await bridge.command(claim, 'upload', params, abortSignal ?? undefined) as ExternalResult;
+    } catch (error) {
+      const failure = extensionUpdateFailure(error);
+      if (failure) return failure;
+      throw error;
+    }
     await emitExternalBrowserFrame(bridge, claim, scope);
     return [{ type: 'text', text: formatActionResult(result) }];
   }
@@ -116,6 +130,8 @@ export async function callExternalBrowserTool(
       : bridge.command(claim, action, params)) as ExternalResult;
   }
   catch (error) {
+    const failure = extensionUpdateFailure(error);
+    if (failure) return failure;
     if ((error as Error).message === "USER_ACTIVE_ON_TARGET_TAB") {
       throw new OcuUserIntervened(claim.browser === "memmy"
         ? "你正在操作 Memmy 内置浏览器里的这个页面，我先暂停了。你操作完后发条消息，我再接着做。"

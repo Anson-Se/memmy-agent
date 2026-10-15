@@ -80,6 +80,8 @@ export type ExternalBrowserPlaywrightEvent = {
 };
 
 export const EXTERNAL_BROWSER_EXTENSION_OUTDATED = 'The installed Memmy browser extension is too old to open tabs. Ask the user to reload it in the browser\'s extensions page or restart the browser after updating Memmy (setup: memmy://settings/browser-extension), or use a tab that is already open.';
+export const EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED = 'external_browser_extension_update_required';
+const PLAYWRIGHT_EXTENSION_UPDATE_MESSAGE = 'The browser is connected through an older Memmy extension. Update or reload the Memmy extension to version 1.0.5 or later in the browser extensions page, confirm the new website-reading permission if requested, then reconnect (setup: memmy://settings/browser-extension). No browser action was dispatched. Do not retry browser actions or switch to desktop control until the updated extension reconnects.';
 
 function isSafePageUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 4096) return false;
@@ -321,8 +323,16 @@ export class ExternalBrowserBridge {
       || client.socket.readyState !== WebSocket.OPEN) {
       throw new Error("External browser tab is no longer connected or claimed");
     }
-    const id = `${claim.connectionId}:${this.nextId++}`;
     if (signal?.aborted) throw new Error("External browser command cancelled");
+    if (["playwrightStart", "playwrightCdp", "playwrightEnd"].includes(command)
+      && !client.capabilities.has("playwright")) {
+      throw Object.assign(new Error(PLAYWRIGHT_EXTENSION_UPDATE_MESSAGE), {
+        code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED, retryable: false, requiresUserAction: true,
+        dispatchState: "none", noActionDispatched: true, inputDispatched: false,
+        recoveryInstructions: PLAYWRIGHT_EXTENSION_UPDATE_MESSAGE,
+      });
+    }
+    const id = `${claim.connectionId}:${this.nextId++}`;
     const input = ["click", "type", "selectOption", "pressKey", "scroll"].includes(command)
       || (command === "playwrightCdp" && typeof args.method === "string" && args.method.startsWith("Input."));
     if (input) {
