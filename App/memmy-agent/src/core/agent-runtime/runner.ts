@@ -29,6 +29,7 @@ import {
   extractReasoning,
   IncrementalThinkExtractor,
   maybePersistToolResult,
+  persistToolResult,
   stripThink,
   truncateText,
 } from "../../utils/helpers.js";
@@ -1136,6 +1137,22 @@ export class AgentRunner {
             changed: outcome.changed,
           });
         },
+        ...(spec.workspace ? {
+          persistOutput: (content, options = {}) => persistToolResult(
+            spec.workspace,
+            spec.sessionKey ?? "default",
+            call.id ?? "tool",
+            content,
+            {
+              maxChars: resolveToolResultMaxChars(
+                call.name,
+                spec.maxToolResultChars,
+                spec.toolResultMaxCharsByName,
+              ),
+              ...options,
+            },
+          ),
+        } : {}),
       };
       const run = tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
