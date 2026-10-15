@@ -1949,6 +1949,9 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1"');
     expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1"');
     expect(source).toContain('"Windows 11 Computer History observer"');
+    expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/app-icon.ps1"');
+    expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/app-icon.ps1"');
+    expect(source).toContain('"Windows Computer History application icons"');
     expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe"');
     expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe"');
     expect(source).toContain('build-memmy-computer-history.sh');

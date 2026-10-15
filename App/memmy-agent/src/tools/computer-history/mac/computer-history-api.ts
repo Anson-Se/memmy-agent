@@ -39,6 +39,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApplicationIconReader } from "./application-icon.js";
+import { WindowsApplicationIconReader } from "../win/application-icon.js";
 import { isPersonalWeChatHistorySupported } from "../platform.js";
 import { isWindows11, listWindowsApplications } from "../win/win11.js";
 import { HistoryMemoryAdapter, type HistoryEvidence, type HistorySkillGroup } from "../memory-adapter.js";
@@ -460,6 +461,7 @@ export class ComputerHistoryDemoService {
   private readonly memoryAdapter: HistoryMemoryAdapter;
   private readonly skillGroupCache = new Map<string, { revision: string; group: HistorySkillGroup | null }>();
   private readonly applicationIcons: ApplicationIconReader;
+  private readonly windowsApplicationIcons: WindowsApplicationIconReader;
   private llmRuntime: LLMRuntimeResolver | null = null;
   private readonly summaryLanguage: () => MemmyOutputLanguage | undefined;
   /** Coalesce only an active pass, so failures remain eligible for retry. */
@@ -535,6 +537,7 @@ export class ComputerHistoryDemoService {
     this.observationSettings = new ObservationSettingsStore(input.observationSettingsFile);
     this.weChatConsent = new WeChatHistoryConsentStore(input.weChatConsentFile ?? defaultWeChatConsentFile());
     this.applicationIcons = new ApplicationIconReader();
+    this.windowsApplicationIcons = new WindowsApplicationIconReader();
     this.permissionReader = input.permissionReader ?? readHistoryPermissions;
     this.summaryLanguage = input.summaryLanguage ?? discoverMemmyOutputLanguage;
     this.liveSummaryIntervalMs = boundedInterval(
@@ -1104,7 +1107,9 @@ export class ComputerHistoryDemoService {
 
   /** An application's icon for the timeline, as a data URL. */
   applicationIcon(bundleId: string): Promise<string | null> {
-    return this.applicationIcons.iconFor(bundleId);
+    return isWindows11()
+      ? this.windowsApplicationIcons.iconFor(bundleId)
+      : this.applicationIcons.iconFor(bundleId);
   }
 
   listApplications(): Promise<Array<{ bundleId: string; name: string }>> {
