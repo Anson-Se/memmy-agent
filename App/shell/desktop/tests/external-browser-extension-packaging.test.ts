@@ -666,7 +666,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.8");
+    expect(manifest.version).toBe("1.0.9");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
