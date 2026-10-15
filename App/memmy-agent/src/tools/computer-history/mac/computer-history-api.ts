@@ -1108,7 +1108,7 @@ export class ComputerHistoryDemoService {
 
   private assertPersonalWeChatHistorySupported(): void {
     if (!isPersonalWeChatHistorySupported()) {
-      throw new ComputerHistoryApiError(400, "Personal WeChat History is available on Apple silicon macOS only");
+      throw new ComputerHistoryApiError(400, "Personal WeChat History is available on Apple silicon macOS and Windows 11 only");
     }
   }
 
