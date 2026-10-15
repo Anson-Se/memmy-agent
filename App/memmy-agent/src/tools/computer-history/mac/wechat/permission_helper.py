@@ -196,7 +196,7 @@ def _build_copy(app, destination, probe_source):
     _install_library(_BRIDGE_NAME, bridge, ["-arch", "arm64", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
                      str(_BRIDGE_SOURCE)])
     capture = library.with_name(_KEYCAPTURE_NAME)
-    _install_library(_KEYCAPTURE_NAME, capture, ["-arch", "arm64", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
+    _install_library(_KEYCAPTURE_NAME, capture, ["-arch", "arm64", "-dynamiclib", "-O2", "-Wall", "-Wextra", "-Werror",
                      str(_KEYCAPTURE_SOURCE)])
     _run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(destination)])
     _run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(destination)])
