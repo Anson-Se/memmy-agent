@@ -65,7 +65,6 @@ export function filterHistoryAuthorityObservations(settings: ObservationSettings
     const allowed = evaluateObservation(settings, {
       bundleId: entry.browser === "edge" ? "win32.msedge" : "win32.chrome",
       browser: true, url: entry.url,
-      privateBrowsing: entry.mode === "private", privateBrowsingUnknown: entry.mode !== "normal",
     }).observe;
     return allowed ? { ...entry, title: "" }
       : { ...entry, mode: "unknown", title: "", url: "" };
@@ -219,7 +218,7 @@ const CAPTURE_ISSUE_RECOVERY_MS = 30_000;
 const RECORDER_HEALTH_PREFIX = "[recorder-health] ";
 const CAPTURE_ISSUE_CODES = new Set([
   "observer_unavailable", "observer_notifications_unavailable", "ax_snapshot_budget_exceeded",
-  "enrichment_backlog", "privacy_unknown", "helper_parse_error", "event_processing_error", "input_monitoring_unavailable",
+  "enrichment_backlog", "helper_parse_error", "event_processing_error", "input_monitoring_unavailable",
 ]);
 
 interface RetainedSegmentEvidence {
@@ -1781,7 +1780,7 @@ export class ComputerHistoryDemoService {
     return { status, lastEventAt: this.captureLastEventAt, lastHeartbeatAt: this.captureLastHeartbeatAt,
       issues: status === "inactive" ? [] : issues,
       limitations: [windows ? "foreground_events_and_accessibility_only" : "foreground_accessibility_only",
-        "private_and_unverifiable_browsers_excluded", "screenshots_and_audio_not_recorded"] };
+        "screenshots_and_audio_not_recorded"] };
   }
 
   private cancelRecorderReconnect(): void {

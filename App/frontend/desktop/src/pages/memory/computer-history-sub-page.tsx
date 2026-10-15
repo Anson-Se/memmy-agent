@@ -333,8 +333,6 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
   const observationState = snapshot?.observation.state ?? "stopped";
   const recording = observationState === "running" || observationState === "stopping";
   const paused = observationState === "paused";
-  const browserPrivacyUnknown = observationState === "running"
-    && snapshot?.observation.captureHealth?.issues.some((issue) => issue.code === "privacy_unknown");
   const showIntroduction = !!snapshot && observationState === "stopped"
     && snapshot.histories.length === 0 && !permissionSetup && !weChatPermissionReturned;
 
@@ -525,11 +523,6 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
         <div className="flex-1 pr-4">
           <div id="computer-history-record-label" className="ch__setting-label">{t("computerHistory.record")}</div>
           <p id="computer-history-record-description" className="ch__setting-description">{t("computerHistory.recordDescription")}</p>
-          {browserPrivacyUnknown ? (
-            <p className="ch__browser-privacy-notice mt-1 text-xs text-text-ink/60" role="status">
-              {t("computerHistory.browserPrivacyUnknown")}
-            </p>
-          ) : null}
         </div>
         <div className="ch__head-actions">
           {quotaExhausted || recording || paused ? (

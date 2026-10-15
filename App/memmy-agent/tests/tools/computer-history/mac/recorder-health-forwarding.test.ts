@@ -63,7 +63,8 @@ describe("content-free recorder health", () => {
     for (const value of [null, [], { type: "recorder.diagnostic", code: "event_recorded", timestamp: "2026-10-09T12:00:00Z" },
       { type: "recorder.diagnostic", code: "Private data", timestamp: "2026-10-09T12:00:00Z" },
       { type: "recorder.diagnostic", code: "heartbeat", timestamp: "invalid" },
-      { type: "recorder.diagnostic", code: "privacy_unknown", timestamp: "2026-10-09T12:00:00Z", count: 0 }]) {
+      { type: "recorder.diagnostic", code: "privacy_unknown", timestamp: "2026-10-09T12:00:00Z", count: 1 },
+      { type: "recorder.diagnostic", code: "enrichment_backlog", timestamp: "2026-10-09T12:00:00Z", count: 0 }]) {
       assert.equal(nativeRecorderDiagnostic(value), null);
     }
   });
@@ -89,16 +90,11 @@ describe("content-free recorder health", () => {
     assert.equal(vi.getTimerCount(), 0);
   });
 
-  test("forwards native health without writing it to history and exposes unknown coverage without private content", async () => {
+  test("forwards native health without writing it to history or carrying captured content", async () => {
     const app = { name: "Synthetic Notes", bundleIdentifier: "com.example.Notes" };
     fixture.lines = [
       JSON.stringify({ type: "recorder.diagnostic", code: "heartbeat", timestamp: "2026-10-09T12:00:00Z", text: "Private diagnostic" }),
       JSON.stringify({ type: "recorder.diagnostic", code: "observer_unavailable", timestamp: "2026-10-09T12:00:00Z", count: 2, url: "https://private.invalid" }),
-      JSON.stringify({ kind: "mouse.click", app: { bundleIdentifier: "com.google.Chrome" },
-        window: { browser: true, privateBrowsingUnknown: true, url: "https://private.invalid" },
-        mouse: { target: { title: "Private target" } } }),
-      JSON.stringify({ kind: "mouse.click", app: { bundleIdentifier: "com.google.Chrome" },
-        window: { browser: true, privateBrowsing: true }, mouse: { target: { title: "Private target" } } }),
       "Malformed Private helper data",
       JSON.stringify({ kind: "mouse.click", app, mouse: { target: { role: "AXButton", title: "Allowed control" } } }),
     ];
@@ -111,7 +107,6 @@ describe("content-free recorder health", () => {
     assert.deepEqual(signals.find((signal) => signal.code === "observer_unavailable"), {
       code: "observer_unavailable", timestamp: "2026-10-09T12:00:00.000Z", count: 2,
     });
-    assert.equal(signals.filter((signal) => signal.code === "privacy_unknown").length, 1);
     assert.ok(signals.some((signal) => signal.code === "helper_parse_error"));
     assert.ok(signals.some((signal) => signal.code === "event_recorded"));
     assert.doesNotMatch(JSON.stringify(signals), /Private|private\.invalid|Synthetic Notes|Allowed control/u);
@@ -124,7 +119,7 @@ describe("content-free recorder health", () => {
   test("policy exclusions alone do not claim a capture fault or successful event write", async () => {
     fixture.lines = [JSON.stringify({ kind: "mouse.click", app: { bundleIdentifier: "com.example.Excluded" },
       mouse: { target: { title: "Excluded" } } }), JSON.stringify({ kind: "mouse.click", app: { bundleIdentifier: "com.example.Excluded" },
-      window: { browser: true, privateBrowsingUnknown: true }, mouse: { target: { title: "Excluded private state" } } })];
+      window: { browser: true }, mouse: { target: { title: "Excluded browser window" } } })];
     const settings = path.join(directory, "settings.json");
     fs.writeFileSync(settings, JSON.stringify({ observation: { defaultApplicationBehavior: "observe", defaultURLBehavior: "observe",
       rules: [{ scope: "app", bundleID: "com.example.Excluded", behavior: "do_not_observe" }] } }));

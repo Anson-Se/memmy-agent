@@ -133,7 +133,7 @@ func observe(parent int, consent string) error {
 		return err
 	}
 	// EOF is a lifetime signal as well as an explicit stop. No untrusted stdin
-	// instruction can disable native privacy checks or introduce typed text.
+	// instruction can disable native consent checks or introduce typed text.
 	go func() {
 		s := bufio.NewScanner(os.Stdin)
 		s.Buffer(make([]byte, 4096), 65536)
@@ -243,9 +243,6 @@ func observe(parent int, consent string) error {
 			if result.Skipped {
 				if len(result.Reason) >= 13 && result.Reason[:13] == "action_origin" {
 					schedule.add(action{Kind: "sampling.changed"}, time.Now())
-				}
-				if result.Reason == "privacy_unknown" {
-					diagnostic("privacy_unknown")
 				}
 				if result.Reason != "unchanged" {
 					verifiedOrigin.Store(nil)

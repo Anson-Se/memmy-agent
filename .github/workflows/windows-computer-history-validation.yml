@@ -96,15 +96,24 @@ jobs:
           }
           Write-Host "Validated $(@($apps).Count) installed or running app entries"
       - name: Verify agent History platform contracts
-        run: >-
-          node node_modules/vitest/vitest.mjs run
-          App/memmy-agent/tests/tools/computer-history/win/win11.test.ts
-          App/memmy-agent/tests/tools/computer-history/platform.test.ts
-          App/memmy-agent/tests/tools/computer-history/mac/summary-writer.test.ts
-          App/memmy-agent/tests/tools/computer-history/browser-privacy.test.ts
-          App/memmy-agent/tests/tools/computer-history/win/native-event-adapter.test.ts
-          App/memmy-agent/tests/tools/computer-history/win/native-recording-privacy.test.ts
-          App/memmy-agent/tests/tools/computer-history/win/browser-authority-publisher.test.ts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = @(
+            'App/memmy-agent/tests/tools/computer-history/win/win11.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/platform.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/mac/summary-writer.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/browser-privacy.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/browser-semantic-history.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/browser-history-bridge.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/win/native-event-adapter.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/win/native-recording-privacy.test.ts'
+            'App/memmy-agent/tests/tools/computer-history/win/browser-authority-publisher.test.ts'
+          )
+          foreach ($test in $tests) {
+            if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { throw "Missing History test: $test" }
+          }
+          node node_modules/vitest/vitest.mjs run @tests
+          if ($LASTEXITCODE -ne 0) { throw 'History platform contracts failed' }
       # On Windows, Vitest's Vite runner raises a collection-time SyntaxError for
       # this valid ESM test; the Node ESM runner executes the same assertions.
       - name: Verify packaged History assets

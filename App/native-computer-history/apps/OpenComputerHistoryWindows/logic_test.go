@@ -117,21 +117,39 @@ func encoded(t *testing.T, value any) []byte {
 	return raw
 }
 
-func TestWorkerPrivacyCannotBeBypassedByMissingOrPartialEvidence(t *testing.T) {
+func TestBrowserEventsAreKeptWhateverTheirBrowsingMode(t *testing.T) {
 	for _, mode := range []string{"private", "unknown", "", "normal"} {
-		_, err := parseResult(encoded(t, sampleEnvelope(mode, false)), 1)
-		if err == nil {
-			t.Fatalf("accepted partial privacy: %s", mode)
+		for _, complete := range []bool{false, true} {
+			if _, err := parseResult(encoded(t, sampleEnvelope(mode, complete)), 1); err != nil {
+				t.Fatalf("mode %q complete %v rejected: %v", mode, complete, err)
+			}
 		}
 	}
-	for _, mode := range []string{"private", "unknown", ""} {
-		_, err := parseResult(encoded(t, sampleEnvelope(mode, true)), 1)
-		if err == nil {
-			t.Fatalf("accepted unsafe privacy: %s", mode)
-		}
+	value := sampleEnvelope("unknown", false)
+	context := value["event"].(map[string]any)["window"].(map[string]any)["browserContext"].(map[string]any)
+	context["url"], context["documentUrl"] = "", ""
+	if _, err := parseResult(encoded(t, value), 1); err != nil {
+		t.Fatalf("event without a page address rejected: %v", err)
 	}
-	if _, err := parseResult(encoded(t, sampleEnvelope("normal", true)), 1); err != nil {
-		t.Fatalf("normal rejected: %v", err)
+}
+
+func TestBrowserAddressMustBeTheCommittedWebURIOfTheForegroundWindow(t *testing.T) {
+	for name, change := range map[string]func(map[string]any, map[string]any){
+		"missing context": func(window, _ map[string]any) { delete(window, "browserContext") },
+		"other window":    func(_, context map[string]any) { context["windowId"] = "200" },
+		"other process":   func(_, context map[string]any) { context["processId"] = 11 },
+		"non-web address": func(_, context map[string]any) {
+			context["url"], context["documentUrl"] = "chrome://settings", "chrome://settings"
+		},
+		"uncommitted value": func(_, context map[string]any) { context["documentUrl"] = "https://other.example/" },
+		"missing address":   func(_, context map[string]any) { delete(context, "url") },
+	} {
+		value := sampleEnvelope("unknown", true)
+		window := value["event"].(map[string]any)["window"].(map[string]any)
+		change(window, window["browserContext"].(map[string]any))
+		if _, err := parseResult(encoded(t, value), 1); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
 	}
 }
 
@@ -171,7 +189,7 @@ func TestEmbeddedWorkerHasNoScreenshotOrRawKeyboardConversion(t *testing.T) {
 			t.Fatalf("unexpected screenshot/input API %s", word)
 		}
 	}
-	for _, required := range []string{"120000", "$visited -lt 400", "private_browsing", "privacy_unknown", "wechat_consent_required", "secure_input", "foreground_changed", "focus_changed", "selection=@", "'typing'", "$SelfTest"} {
+	for _, required := range []string{"120000", "$visited -lt 400", "navigation_changed", "wechat_consent_required", "secure_input", "foreground_changed", "focus_changed", "selection=@", "'typing'", "$SelfTest"} {
 		if !strings.Contains(content, required) {
 			t.Fatalf("worker contract lost: %s", required)
 		}

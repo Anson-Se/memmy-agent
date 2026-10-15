@@ -203,17 +203,6 @@ function isPasswordTarget(accessibility: unknown): boolean {
   return isPasswordNode(outer) || isPasswordNode(focused);
 }
 
-// When accessibility cannot identify the focused control, a key tap cannot
-// establish that it was outside a password field. Keep the activity count but
-// withhold its characters until the focused target is known.
-function isReadableTextTarget(accessibility: unknown): boolean {
-  const node = focusedTarget(accessibility);
-  if (!node || isPasswordTarget(accessibility)) return false;
-  const role = typeof node.role === "string" ? node.role : "";
-  const subrole = typeof node.subrole === "string" ? node.subrole : "";
-  return Boolean((role && role !== "AXUnknown") || (subrole && subrole !== "AXUnknown"));
-}
-
 const SEARCH_INPUT_ROLES = new Set(["AXSearchField"]);
 const SEARCHABLE_TEXT_INPUT_ROLES = new Set(["AXTextField", "AXComboBox"]);
 const SEARCH_INPUT_HINT = /(?:\bsearch\b|\bquery\b|\bfind\b|address and search|搜索|检索|查找)/iu;
@@ -372,8 +361,6 @@ function observationSubject(event: HelperEvent): ObservationSubject {
     bundleId: appFrom(event).bundleId,
     browser: event.window?.browser === true,
     url: typeof event.window?.url === "string" ? event.window.url : null,
-    privateBrowsing: event.window?.privateBrowsing === true,
-    privateBrowsingUnknown: event.window?.privateBrowsingUnknown === true,
   };
 }
 
@@ -402,9 +389,8 @@ export function normalizeKeyBurst(
     && events.every((event) => event.inputContext?.purpose === "search_query")
     ? events.at(-1)!.inputContext
     : null;
-  const readableTargets = events.every((event) =>
-    !isSecureInput(event) && isReadableTextTarget(event.keyboard?.target));
-  const retainText = readableTargets && textAllowedInApplication(application, options.allowApps)
+  const retainText = events.every((event) => !isSecureInput(event))
+    && textAllowedInApplication(application, options.allowApps)
     && (options.captureText || (options.captureSearchText && searchInput));
   if (rawText && events.every(printableKey)) {
     return {
@@ -571,7 +557,7 @@ export async function run(
     captureScopeApplications: args.onlyApps,
     ...(contextUrl && shouldObserve(loadObservationSettings(args.observationSettings), { browser: true, url: contextUrl })
       ? { contextUrl } : {}),
-    privacy: "Text is retained from observed applications when enabled and the focused control is known not to be a password field. An explicit allow-app narrows text capture. Private windows, excluded applications and sites are skipped; credential patterns are redacted.",
+    privacy: "Text is retained from observed applications when enabled, except in password fields. An explicit allow-app narrows text capture. Excluded applications and sites are skipped; credential patterns are redacted.",
   });
 
   let sequence = 0;
@@ -709,8 +695,6 @@ export async function run(
       args.browserAuthority ? readBrowserAuthority(args.browserAuthority) : null);
     const subjects = [observationSubject(event)];
     if (!canObserve(subjects[0])) {
-      if (subjects[0].privateBrowsingUnknown && !subjects[0].privateBrowsing
-        && canObserve({ ...subjects[0], privateBrowsingUnknown: false })) health.report("privacy_unknown");
       pendingKeys = pendingKeys.filter((pending) => canObserve(observationSubject(pending)));
       return;
     }
@@ -856,8 +840,7 @@ export async function run(
       const selectedText = event.selection?.selectedText;
       if (typeof selectedText !== "string" || !selectedText) return;
       if (isSecureInput(event)) return;
-      const retain = args.captureText && textAllowedInApplication(application, args.allowApps)
-        && isReadableTextTarget(event.selection?.target);
+      const retain = args.captureText && textAllowedInApplication(application, args.allowApps);
       await appendEvent({
         eventType: "selection_changed",
         timestamp: event.timestamp,

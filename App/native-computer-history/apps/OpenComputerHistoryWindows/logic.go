@@ -255,17 +255,23 @@ func parseResult(raw []byte, expected uint64) (workerResult, error) {
 	}
 	if browser {
 		context, ok := window["browserContext"].(map[string]any)
-		if !ok || context["mode"] != "normal" || context["complete"] != true {
-			return r, fmt.Errorf("worker browser privacy")
+		if !ok {
+			return r, fmt.Errorf("worker browser context")
 		}
 		if context["windowId"] != windowID || context["processId"] != appPID {
 			return r, fmt.Errorf("worker browser foreground identity")
 		}
-		if url, ok := context["url"].(string); !ok || (!strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://")) {
+		// A page address is optional (the omnibox may be focused or the page
+		// loading), but one that is present must be the committed web URI.
+		if url, ok := context["url"].(string); !ok {
 			return r, fmt.Errorf("worker browser URL")
-		}
-		if context["documentUrl"] != context["url"] {
-			return r, fmt.Errorf("worker browser committed URI")
+		} else if url != "" {
+			if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+				return r, fmt.Errorf("worker browser URL")
+			}
+			if context["documentUrl"] != url {
+				return r, fmt.Errorf("worker browser committed URI")
+			}
 		}
 	}
 	if ax, ok := r.Event["ax"].(map[string]any); ok {

@@ -85,10 +85,6 @@ function ConsentAllowed([string]$file) {
     return $state.version -eq 1 -and $state.enabled -eq $true -and [bool]$state.consentId
   } catch { return $false }
 }
-function PrivateSignal([string]$text) {
-  $lower=$text.ToLowerInvariant()
-  return $lower -match 'incognito|inprivate|private browsing|private window|guest|无痕|無痕|隐私浏览|隱私瀏覽|私密浏览|私密瀏覽|访客|訪客|隐身|隱身|navigation privée|privates fenster|privévenster|匿名|シークレット|ゲスト|프라이빗|게스트'
-}
 function Url([string]$raw) {
   if (-not $raw) { return '' }; $raw=$raw.Trim()
   if ($raw -notmatch '^[a-z][a-z0-9+.-]*://') { if ($raw -match '^[a-z0-9.-]+\.[a-z]{2,}([/:?#].*)?$') { $raw='https://'+$raw } else {return ''} }
@@ -149,13 +145,12 @@ function CachedClickTarget($cache,[string]$key,[long]$expected,[long]$current,[s
 
 # The browser chrome is checked before any Document content is read. It is
 # enumerated separately, excluding the complete Document subtree. A normal
-# page title or absence of an incognito button is never positive evidence.
+# page title is never evidence of the committed page address.
 function BrowserContext($root,[string]$title,[string]$windowId,[int]$processId,[DateTime]$deadline) {
   $context=@{url='';mode='unknown';complete=$false;windowId=$windowId;processId=$processId}
-  if (PrivateSignal $title) {$context.mode='private';return $context}
   $queue=New-Object System.Collections.Queue; $queue.Enqueue(@{node=$root;toolbarId=0;visible=$true})
   $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
-  $private=$false;$failed=$false;$seen=0;$toolbarSequence=0;$toolbars=@{};$addressFocused=$false;$loading=$false
+  $failed=$false;$seen=0;$toolbarSequence=0;$toolbars=@{};$addressFocused=$false;$loading=$false
   $documents=New-Object 'System.Collections.Generic.HashSet[string]';$documentUnknown=$false
   $focused=[System.Windows.Automation.AutomationElement]::FocusedElement
   while ($queue.Count -gt 0 -and $seen -lt 200) {
@@ -180,7 +175,6 @@ function BrowserContext($root,[string]$title,[string]$windowId,[int]$processId,[
       }
       if ($current.IsPassword -or ($current.NativeWindowHandle -ne 0 -and [HistoryNative]::PasswordWindow([IntPtr]$current.NativeWindowHandle))) {continue}
       $name=Clean $current.Name 320;$id=Clean $current.AutomationId 160;$class=Clean $current.ClassName 160
-      if (PrivateSignal ($name+' '+$id+' '+$class)) {$private=$true}
       if ($toolbarId -gt 0 -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
           ($name -match '^(Stop|Stop loading|Stop loading this page|停止|停止加载|停止載入|停止加载此网页|停止載入此網頁)$' -or $id -match '^(stop-loading|stopButton)$')) {$loading=$true}
       # Browser-owned concrete profile controls in a toolbar. Page buttons,
@@ -197,14 +191,13 @@ function BrowserContext($root,[string]$title,[string]$windowId,[int]$processId,[
     } catch {$failed=$true}
   }
   if ($queue.Count -gt 0) {$failed=$true}
-  if ($private) {$context.mode='private';return $context}
   if ($addressFocused -or $loading) {return $context}
   $context.complete=-not $failed
   # URL and explicit normal-profile proof must come from the same concrete
   # toolbar. A bookmark toolbar cannot grant another toolbar's address bar.
   $documentUrl=if (-not $documentUnknown -and $documents.Count -eq 1) {@($documents)[0]} else {''}
   $proved=ChromeProof $toolbars (-not $failed) $documentUrl
-  if ($proved) {$context.url=$proved;$context.documentUrl=$documentUrl;$context.mode='normal'}
+  if ($proved) {$context.url=$proved;$context.documentUrl=$documentUrl;$context.mode='normal'} elseif ($documentUrl) {$context.url=$documentUrl;$context.documentUrl=$documentUrl}
   return $context
 }
 
@@ -259,8 +252,6 @@ function Snapshot($root,[DateTime]$deadline) {
 if ($SelfTest) {
   # Compile the same native/UIA API declarations, then test only pure helpers.
   # No AutomationElement, desktop window, hooks or listener is created here.
-  if (-not (PrivateSignal 'Guest') -or -not (PrivateSignal 'InPrivate') -or -not (PrivateSignal '无痕')) {throw 'Private markers failed'}
-  if (PrivateSignal 'Example - Google Chrome') {throw 'Normal title falsely private'}
   if ((Url 'https://user:secret@example.com/path?token=secret#fragment') -ne 'https://example.com/path') {throw 'URL sanitization failed'}
   if (Url 'chrome://settings') {throw 'Non-web URL accepted'}
   if (ConsentAllowed '') {throw 'Missing consent accepted'}
@@ -317,7 +308,6 @@ function Capture($request) {
   if ((IsWeChatProcess $id) -and -not (ConsentAllowed $request.consentPath)) {return Skip 'wechat_consent_required'}
   $titleBuffer=New-Object System.Text.StringBuilder 1024;[void][HistoryNative]::GetWindowText($hwnd,$titleBuffer,$titleBuffer.Capacity);$title=Clean $titleBuffer.ToString() 500
   $browser=$name -match '^(msedge|chrome|firefox|brave|vivaldi|opera|chromium|arc|quark)$'
-  if ($browser -and (PrivateSignal $title)) {return Skip 'private_browsing'}
   $deadline=[DateTime]::UtcNow.AddMilliseconds(2000)
   $root=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
   if ($null -eq $root) {return @{ok=$false;skipped=$true;readFailures=1}}
@@ -326,8 +316,6 @@ function Capture($request) {
   $context=$null
   if ($browser) {
     $context=BrowserContext $root $title $windowId $processId ([DateTime]::UtcNow.AddMilliseconds(500))
-    if ($context.mode -eq 'private') {return Skip 'private_browsing'}
-    if ($context.mode -ne 'normal') {return Skip 'privacy_unknown'}
     if ($isAction -and $act.expectedURL -ne $context.url) {return Skip 'action_origin_changed'}
   }
   $focus=[System.Windows.Automation.AutomationElement]::FocusedElement
@@ -393,7 +381,7 @@ function Capture($request) {
   if ($browser) {
     $latestBuffer=New-Object System.Text.StringBuilder 1024;[void][HistoryNative]::GetWindowText($hwnd,$latestBuffer,$latestBuffer.Capacity)
     $latest=BrowserContext $root (Clean $latestBuffer.ToString() 500) $windowId $processId ([DateTime]::UtcNow.AddMilliseconds(500))
-    if ($latest.mode -ne 'normal' -or $latest.url -ne $context.url -or -not $latest.complete) {return Skip 'privacy_unknown'}
+    if ($latest.url -ne $context.url) {return Skip 'navigation_changed'}
   }
   if ((IsWeChatProcess $id) -and -not (ConsentAllowed $request.consentPath)) {return Skip 'wechat_consent_required'}
   if ($isAction -and $act.expectedScope -ne [HistorySignals]::ScopeGeneration) {return Skip 'action_origin_changed'}

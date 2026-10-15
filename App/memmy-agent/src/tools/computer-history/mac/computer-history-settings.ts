@@ -77,7 +77,6 @@ export class ComputerHistoryStatusTool extends Tool {
         screenshots: snapshot.privacy.screenshots,
         audio: snapshot.privacy.audio,
         raw_retention_hours: snapshot.privacy.rawRetentionHours,
-        private_browsing: "A browser window is excluded whenever its private state cannot be verified. Private windows and unverifiable browser windows are not recorded.",
         separate_sources: "Personal WeChat requires its own explicit source permission and connection. It has an independent reader status; a running screen recorder does not establish WeChat coverage.",
         system_surfaces: "The login window and screen saver are never recorded.",
         capture_scope: "Foreground applications and the controls/text they expose to accessibility only. Images, audio, unreadable controls, and content beyond the sampled window are not complete activity evidence.",

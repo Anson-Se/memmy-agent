@@ -20,16 +20,15 @@ Keyboard output records an action category/count, never raw typed characters.
 Current safe UIA field values remain visible-content evidence and follow the
 common History retention policy.
 
-Every browser read requires complete, visible native chrome evidence: an
-explicit supported ordinary-profile label on a known profile control and an
-address bar in the same toolbar. The top-level Document's committed URI must
-also match that address bar; Document text/children cannot grant profile proof.
-Providers that omit committed URI metadata are excluded. Private,
-Guest, incomplete/unknown chrome, address-bar editing and loading are excluded
-before Document content is read. Unsupported profile names/locales/providers
-are deliberately classified unknown. HWND, process, URL and browser mode are
+Browser windows are read whatever their browsing mode; the user's website
+exclusions decide what is kept. A page address is recorded only when it is the
+top-level Document's committed URI. While the address bar is being edited or
+the page is loading, the event carries no address. HWND, process and URL are
 verified before and after reads. WeChat consent is re-read before and after
-each observation; passwords and their descendants are never read.
+each observation; passwords and their descendants are never read. The
+Windows browser authority sidecar remains available to corroborate normal
+Chrome/Edge addresses and keeps excluded URLs and titles out of its file.
+Extension DOM History retains its separate private-tab protections.
 
 Actions must carry a recent verified window/URL/focus/navigation origin and
 remain fresh. Stale or mismatched actions are dropped and replaced with a new
@@ -53,7 +52,7 @@ GOOS=windows GOARCH=arm64 go build .
 ```
 
 On Windows, `powershell -NoProfile -MTA -File worker.ps1 -SelfTest` compiles the
-real UIA API declarations and exercises synthetic privacy/consent/sanitization
+real UIA API declarations and exercises synthetic consent/sanitization
 fixtures without accessing the desktop. These checks do not prove installed
 runtime/GUI behavior, browser profile coverage, latency, CPU usage or battery
 impact. User-run Windows acceptance is required for those claims.

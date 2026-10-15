@@ -2,7 +2,7 @@
 export const RECORDER_HEALTH_CODES = [
   "heartbeat", "observer_ready", "event_recorded", "observer_unavailable",
   "observer_notifications_unavailable", "ax_snapshot_budget_exceeded",
-  "enrichment_backlog", "privacy_unknown", "helper_parse_error", "event_processing_error",
+  "enrichment_backlog", "helper_parse_error", "event_processing_error",
   "input_monitoring_unavailable", "input_monitoring_ready",
 ] as const;
 export type RecorderHealthCode = typeof RECORDER_HEALTH_CODES[number];

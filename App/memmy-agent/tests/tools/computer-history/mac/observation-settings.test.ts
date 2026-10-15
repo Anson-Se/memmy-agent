@@ -50,12 +50,11 @@ describe("observation settings", () => {
     })).toEqual({ observe: true, reason: "observed" });
   });
 
-  it("still excludes private browsing under the permissive default", () => {
+  it("records a browser page under the permissive default", () => {
     expect(evaluateObservation(DEFAULT_OBSERVATION_SETTINGS, {
       bundleId: "com.google.Chrome",
       url: "https://example.com/a",
-      privateBrowsing: true,
-    })).toEqual({ observe: false, reason: "private_browsing" });
+    })).toEqual({ observe: true, reason: "observed" });
   });
 
   it("keeps personal WeChat outside broad screen consent even if an app rule allows it", () => {
@@ -69,13 +68,16 @@ describe("observation settings", () => {
     }
   });
 
-  it("excludes private browsing whatever the rules say", () => {
-    const permissive = settings("observe", "observe");
-    expect(evaluateObservation(permissive, {
-      bundleId: "com.google.Chrome",
-      url: "https://example.com/page",
-      privateBrowsing: true,
-    })).toEqual({ observe: false, reason: "private_browsing" });
+  it("decides a browser page, private window or not, only by the user's website rules", () => {
+    const excludeShop = settings("observe", "observe", [
+      { scope: "url", urlDomain: "shop.example", behavior: "do_not_observe" },
+    ]);
+    expect(evaluateObservation(excludeShop, { bundleId: "com.google.Chrome", url: "https://example.com/page",
+      privateBrowsing: true })).toEqual({ observe: true, reason: "observed" });
+    expect(evaluateObservation(excludeShop, { bundleId: "com.google.Chrome", url: "https://example.com/page",
+      privateBrowsingUnknown: true })).toEqual({ observe: true, reason: "observed" });
+    expect(evaluateObservation(excludeShop, { bundleId: "com.google.Chrome", url: "https://shop.example/cart" }))
+      .toEqual({ observe: false, reason: "url_blocked" });
   });
 
   it("judges a record without a usable URL by its application alone", () => {
