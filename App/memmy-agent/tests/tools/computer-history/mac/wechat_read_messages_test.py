@@ -82,6 +82,28 @@ class WeChatReadMessagesTests(unittest.TestCase):
         self.assertEqual(decoded["nextCursor"], {f"message_0.db:{TABLE}": 4})
         self.assertEqual(decoded["databaseCount"], 1)
 
+    def test_unrelated_search_and_resource_databases_need_no_key(self):
+        self.write_messages([1, 2])
+        for name in ("message_fts.db", "message_resource.db", "message_1_backup.db"):
+            (self.database.parent / name).write_bytes(b"unrelated encrypted index")
+        batch = reader.scan(self.root, self.keys, self.sqlcipher, {}, 200, False)
+        self.assertEqual([row["localId"] for row in batch["messages"]], [1, 2])
+        self.assertEqual(batch["databaseCount"], 1)
+
+    def test_missing_numbered_shard_key_fails_without_advancing_the_input_cursor(self):
+        self.write_messages([1, 2])
+        (self.database.parent / "message_1.db").write_bytes(self.database.read_bytes())
+        cursor = {f"message_0.db:{TABLE}": 1}
+        for baseline in (False, True):
+            with self.assertRaisesRegex(RuntimeError, "database_key_missing"):
+                reader.scan(self.root, self.keys, self.sqlcipher, cursor, 200, baseline)
+            self.assertEqual(cursor, {f"message_0.db:{TABLE}": 1})
+
+    def test_no_numbered_shards_cannot_establish_a_successful_empty_baseline(self):
+        (self.database.parent / "message_fts.db").touch()
+        with self.assertRaisesRegex(RuntimeError, "no_message_databases"):
+            reader.scan(self.root, self.keys, self.sqlcipher, {}, 200, True)
+
     def open_wal_writer(self):
         self.write_messages([1])
         writer = sqlite3.connect(self.database, isolation_level=None)
@@ -535,6 +557,13 @@ class EncryptedNativeSnapshotTests(unittest.TestCase):
                 self.assertEqual([row["localId"] for row in batch["messages"]], [2])
                 self.assertEqual(bytes.fromhex(batch["messages"][0]["bodyHex"]), b"committed encrypted WAL")
                 self.assertEqual(batch["nextCursor"], {f"message_0.db:{TABLE}": 2})
+                # Exercise Windows' production codec and connection verification
+                # against the same encrypted DB plus committed WAL, not a mock.
+                windows_batch = reader.scan(root, {"keys": {"message/message_0.db": KEY}},
+                                            reader.SqlCipher("builtin"), {f"message_0.db:{TABLE}": 1}, 200, False)
+                self.assertEqual(windows_batch, batch)
+                reader.windows_page_codec().verify_message_databases(root,
+                    {"message/message_0.db": {"enc_key": KEY}})
                 self.assertEqual(state(), before)
             finally:
                 cipher.lib.sqlite3_close(handle)

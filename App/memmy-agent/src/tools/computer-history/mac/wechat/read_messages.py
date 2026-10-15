@@ -25,6 +25,7 @@ import time
 
 
 TABLE_NAME = re.compile(r"Msg_[0-9a-f]{32}\Z")
+MESSAGE_DATABASE = re.compile(r"message_[0-9]+\.db\Z")
 
 
 class SnapshotChanged(Exception):
@@ -411,7 +412,12 @@ def scan(root, keys, sqlcipher, cursor, limit, baseline, since=None):
     message_streams = []
     next_cursor = dict(cursor)
     database_count = 0
-    for db_path in sorted((root / "message").glob("message_*.db")):
+    # Search/resource indexes are not chat shards and need no key to read text.
+    databases = sorted(path for path in (root / "message").glob("message_*.db")
+                       if MESSAGE_DATABASE.fullmatch(path.name))
+    if not databases:
+        raise RuntimeError("no_message_databases")
+    for db_path in databases:
         with sqlcipher.open(db_path, key_for(keys, root, db_path)) as db:
             database_count += 1
             try:
