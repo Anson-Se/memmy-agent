@@ -22,6 +22,7 @@ FIXTURE = r'''
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,13 @@ int main(int argc, char **argv) {
     if (!strcmp(action, "main")) {
         const char *status = getenv("MEMMY_WECHAT_STORAGE_BRIDGE_STATUS");
         printf("MAIN:%s\n", status ? status : "inert"); return 0;
+    }
+    if (!strcmp(action, "locale")) {
+        // setlocale opens its locale data while holding libc's locale lock.
+        // The interposed open must not call printf-family functions here.
+        if (!setlocale(LC_ALL, "en_US.UTF-8")) return 71;
+        if (!setlocale(LC_ALL, "zh_CN.UTF-8")) return 72;
+        return read_fd(open(path, O_RDONLY));
     }
     if (!strcmp(action, "read")) return read_fd(open(path, O_RDONLY));
     if (!strcmp(action, "nocancel")) return read_fd(open_nocancel(path, O_RDONLY));
@@ -211,6 +219,10 @@ class PrivateStorageBridgeNativeTests(unittest.TestCase):
         for action in ("read", "nocancel", "fopen", "freopen", "mmap"):
             with self.subTest(action=action):
                 self.assertEqual(self.run_fixture(action).stdout.strip(), "PRIVATE_CLONE")
+        self.assert_original_unchanged()
+
+    def test_setlocale_can_open_its_data_without_recursively_locking_libc(self):
+        self.assertEqual(self.run_fixture("locale").stdout.strip(), "PRIVATE_CLONE")
         self.assert_original_unchanged()
 
     def test_at_relative_and_chdir_paths_read_clone(self):

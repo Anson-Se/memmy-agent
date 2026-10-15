@@ -43,9 +43,14 @@ static bool prefix(const char *path, const char *root) {
     return strncmp(path, root, length) == 0 && (path[length] == '\0' || path[length] == '/');
 }
 
+// Locale-free: the printf family locks the global locale, and these interposed
+// file calls can run while libc already holds that lock (e.g. setlocale opening
+// its locale file), which would recursively lock an os_unfair_lock and abort.
 static bool append(char output[PATH_MAX], const char *first, const char *second) {
-    int length = snprintf(output, PATH_MAX, "%s%s", first, second);
-    if (length < 0 || length >= PATH_MAX) { errno = ENAMETOOLONG; return false; }
+    size_t first_length = strlen(first), second_length = strlen(second);
+    if (first_length + second_length >= PATH_MAX) { errno = ENAMETOOLONG; return false; }
+    memcpy(output, first, first_length);
+    memcpy(output + first_length, second, second_length + 1);
     return true;
 }
 
@@ -200,8 +205,14 @@ static bool safe_copy_path_inner(const char *path, const char *root, bool follow
             char *component_last = item;
             while (component_last > part && component_last[-1] != '/') --component_last;
             size_t parent_length = component_last > part ? (size_t)(component_last - part - 1) : 0;
-            int count = snprintf(combined, sizeof(combined), "%.*s/%s%s", (int)parent_length, part, target, item);
-            if (count < 0 || (size_t)count >= sizeof(combined)) { errno = ENAMETOOLONG; return false; }
+            size_t target_length = strlen(target), item_length = strlen(item);
+            if (parent_length + 1 + target_length + item_length >= sizeof(combined)) {
+                errno = ENAMETOOLONG; return false;
+            }
+            memcpy(combined, part, parent_length);
+            combined[parent_length] = '/';
+            memcpy(combined + parent_length + 1, target, target_length);
+            memcpy(combined + parent_length + 1 + target_length, item, item_length + 1);
             if (!normalize(combined, normalized) || !prefix(normalized, root)) { errno = EACCES; return false; }
             return safe_copy_path_inner(normalized, root, follow_final, links + 1);
         }
@@ -238,8 +249,11 @@ static const char *mapped_at(int dirfd, const char *path, char output[PATH_MAX],
             resolving_base = false;
             if (result != 0) return NULL;
         }
-        int length = snprintf(absolute, sizeof(absolute), "%s/%s", base, path);
-        if (length < 0 || (size_t)length >= sizeof(absolute)) { errno = ENAMETOOLONG; return NULL; }
+        size_t base_length = strlen(base), path_length = strlen(path);
+        if (base_length + 1 + path_length >= sizeof(absolute)) { errno = ENAMETOOLONG; return NULL; }
+        memcpy(absolute, base, base_length);
+        absolute[base_length] = '/';
+        memcpy(absolute + base_length + 1, path, path_length + 1);
     }
     if (!normalize(absolute, normalized)) return NULL;
     if (unavailable_group[0] != '\0'
@@ -404,8 +418,11 @@ static bool safe_link_target(const char *target, const char *destination) {
     if (target == NULL || target[0] == '/') { errno = EACCES; return false; }
     const char *last = strrchr(destination, '/');
     char combined[PATH_MAX], normalized[PATH_MAX];
-    int length = snprintf(combined, sizeof(combined), "%.*s/%s", (int)(last - destination), destination, target);
-    if (length < 0 || (size_t)length >= sizeof(combined)) { errno = ENAMETOOLONG; return false; }
+    size_t prefix_length = (size_t)(last - destination), target_length = strlen(target);
+    if (prefix_length + 1 + target_length >= sizeof(combined)) { errno = ENAMETOOLONG; return false; }
+    memcpy(combined, destination, prefix_length);
+    combined[prefix_length] = '/';
+    memcpy(combined + prefix_length + 1, target, target_length + 1);
     if (!normalize(combined, normalized) || !prefix(normalized, root)) { errno = EACCES; return false; }
     return safe_copy_path(normalized, root, true);
 }
