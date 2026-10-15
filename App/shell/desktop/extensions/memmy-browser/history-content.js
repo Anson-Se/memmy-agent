@@ -35,17 +35,27 @@
         .catch(() => { if (configuration?.leaseId === dispatchedLease) stop(); });
     });
   };
+  // A recording frame renews its short lease. An idle one waits: the worker
+  // wakes frames when History turns on, a tab or window gains focus, or a page
+  // finishes loading.
+  const scheduleRecheck = idle => {
+    if (closed) return;
+    if (configuration) refreshTimer = setTimeout(refresh, 600);
+    else if (!idle) refreshTimer = setTimeout(refresh, 3_000);
+  };
   const refresh = async () => {
     const current = ++revision;
+    let idle = false;
     try {
       const value = await chrome.runtime.sendMessage({ type: "memmy_history_config" });
+      idle = value?.idle === true;
       if (current === revision && !closed) apply(value);
     } catch { if (current === revision) stop(); }
-    if (!closed && current === revision) refreshTimer = setTimeout(refresh, configuration ? 600 : 3_000);
+    if (current === revision) scheduleRecheck(idle);
   };
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
     if (sender.id !== chrome.runtime.id) return;
-    if (message?.type === "memmy_history_revoke") { ++revision; clearTimeout(refreshTimer); stop(); if (!closed) refreshTimer = setTimeout(refresh, 3_000); }
+    if (message?.type === "memmy_history_revoke") { ++revision; clearTimeout(refreshTimer); stop(); scheduleRecheck(false); }
     if (message?.type === "memmy_history_refresh" && !closed) { ++revision; clearTimeout(refreshTimer); void refresh(); }
     if (message?.type === "memmy_history_probe") { respond({ active: !closed, documentId: configuration?.documentId ?? null }); }
   });

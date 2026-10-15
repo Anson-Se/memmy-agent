@@ -117,9 +117,12 @@
       });
     };
     const configure = async sender => {
+      // While History is off or Memmy is away, and in background tabs, frames
+      // wait to be woken instead of rechecking.
+      if (!currentIntent()) return { enabled: false, idle: true };
       const context = await contextFor(sender);
       const disabled = { enabled: false };
-      if (!context) return disabled;
+      if (!context) return { enabled: false, idle: sender?.tab?.active !== true };
       const authorization = await requestAuthorization(context);
       const fresh = await contextFor(sender);
       if (!fresh || fresh.epoch !== context.epoch || fresh.topUrl !== context.topUrl || fresh.frameUrl !== context.frameUrl

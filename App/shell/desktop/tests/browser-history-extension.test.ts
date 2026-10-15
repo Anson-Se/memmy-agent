@@ -60,7 +60,7 @@ afterEach(() => vi.useRealTimers());
 describe("isolated passive browser History transport", () => {
   it("is dormant until live History consent and never uses the debugger even with no Agent claim", async () => {
     const test = harness();
-    expect(await test.configure()).toEqual({ enabled: false }); expect(test.authorizations()).toBe(0);
+    expect(await test.configure()).toMatchObject({ enabled: false }); expect(test.authorizations()).toBe(0);
     test.permit();
     const configuration = await test.configure(); expect(configuration.enabled).toBe(true);
     expect(await test.emit(configuration)).toEqual({ accepted: true });
@@ -73,15 +73,15 @@ describe("isolated passive browser History transport", () => {
     const test = harness(); test.permit();
     for (const overrides of [{ id: "another-extension" }, { tab: undefined }, { frameId: -1 }, { documentId: "" },
       { documentLifecycle: "cached" }, { url: "chrome://settings" }, { url: "https://different.test/" }]) {
-      expect(await test.configure(sender(overrides))).toEqual({ enabled: false });
+      expect(await test.configure(sender(overrides))).toMatchObject({ enabled: false });
     }
     for (const overrides of [{ incognito: true }, { incognito: undefined }, { active: false }, { pendingUrl: "https://next.test/" }, { status: "loading" }]) {
       const original = { ...test.tab }; Object.assign(test.tab, overrides);
-      expect(await test.configure()).toEqual({ enabled: false }); Object.assign(test.tab, original);
+      expect(await test.configure()).toMatchObject({ enabled: false }); Object.assign(test.tab, original);
     }
-    test.window.focused = false; expect(await test.configure()).toEqual({ enabled: false });
-    test.window.focused = true; test.setProtected(true); expect(await test.configure()).toEqual({ enabled: false });
-    test.setProtected(false); test.setAllowed(false); expect(await test.configure()).toEqual({ enabled: false });
+    test.window.focused = false; expect(await test.configure()).toMatchObject({ enabled: false });
+    test.window.focused = true; test.setProtected(true); expect(await test.configure()).toMatchObject({ enabled: false });
+    test.setProtected(false); test.setAllowed(false); expect(await test.configure()).toMatchObject({ enabled: false });
   });
 
   it("rejects old iframe documents, stale URL/focus and config replies completing after navigation", async () => {
@@ -99,7 +99,7 @@ describe("isolated passive browser History transport", () => {
     await vi.waitFor(() => expect(authorizationStarted).toBe(true));
     test.handlers.update(7, { status: "loading" });
     resolveAuthorization({ enabled: true, generation: "recording-1", expiresAt: Date.now() + 1500, captureText: true });
-    expect(await work).toEqual({ enabled: false });
+    expect(await work).toMatchObject({ enabled: false });
   });
 
   it("ignores page actor/identity and labels only worker-owned input evidence as agent", async () => {
@@ -127,7 +127,7 @@ describe("isolated passive browser History transport", () => {
     expect(await test.emit(configuration)).toEqual({ accepted: false }); expect(test.sent).toHaveLength(0);
     test.permit(); const next = await test.configure();
     test.setConnected(false); test.background.disconnected();
-    expect(await test.emit(next)).toEqual({ accepted: false }); expect(await test.configure()).toEqual({ enabled: false });
+    expect(await test.emit(next)).toEqual({ accepted: false }); expect(await test.configure()).toMatchObject({ enabled: false });
   });
 
   it("uses a request/response bridge policy when no direct authorizer is supplied", async () => {
@@ -210,5 +210,30 @@ describe("isolated passive browser History transport", () => {
     expect(stop.mock.calls.length).toBeGreaterThan(beforeExpiry);
     listener({ type: "memmy_history_revoke" }, { id: "extension-id" }, vi.fn());
     expect(stop.mock.calls.length).toBeGreaterThan(beforeExpiry + 1);
+  });
+
+  it("stops rechecking while the worker reports History idle and resumes when woken", async () => {
+    vi.useFakeTimers();
+    let reply: any = { enabled: false, idle: true }, listener: any;
+    const request = vi.fn(() => Promise.resolve(reply));
+    const chrome = { runtime: { id: "extension-id", sendMessage: request,
+      onMessage: { addListener: (value: any) => { listener = value; } } } };
+    const sandbox = vm.createContext({ chrome, Date, setTimeout, clearTimeout, addEventListener: vi.fn(),
+      __memmyInstallBrowserHistorySensor: vi.fn(), __memmyBrowserHistorySensor: { stop: vi.fn() } });
+    vm.runInContext(fs.readFileSync(path.join(extension, "history-content.js"), "utf8"), sandbox);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(request).toHaveBeenCalledTimes(1);
+    reply = { enabled: false };
+    listener({ type: "memmy_history_refresh" }, { id: "extension-id" }, vi.fn());
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(request).toHaveBeenCalledTimes(3);
+    vi.useRealTimers();
+  });
+
+  it("tells frames to wait while History is off or their tab is in the background", async () => {
+    const test = harness();
+    expect(await test.configure()).toEqual({ enabled: false, idle: true });
+    test.permit();
+    expect(await test.configure(sender({ tab: { id: 8, active: false, windowId: 1 } }))).toEqual({ enabled: false, idle: true });
   });
 });
