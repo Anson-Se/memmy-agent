@@ -733,9 +733,8 @@ describe("Chrome and Edge extension packaging", () => {
       if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') {
         const token = vm.runInContext('claims.get(7).inputObserverToken', context);
         delayedAgentInput = JSON.stringify([token, 'pointerdown', Number(params.timestamp) * 1000]);
-        onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
-          name: '__memmyUserInput', payload: delayedAgentInput,
-        });
+        // Deliver this notification after the command reply, as slow VMs can.
+
       }
       return { nodes: [] };
     };
@@ -777,9 +776,12 @@ describe("Chrome and Edge extension packaging", () => {
     });
     await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
       .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
-    vm.runInContext('markDebuggerDetached(claims.get(7))', context);
+    const lastPhysicalInput = vm.runInContext('claims.get(7).lastUserInputAt', context);
+    vm.runInContext('markDebuggerDetached(claims.get(7)); claims.get(7).attached = true', context);
     onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
-    expect(vm.runInContext('claims.get(7).lastUserInputAt', context)).toBe(0);
+    expect(vm.runInContext('claims.get(7).lastUserInputAt', context)).toBe(lastPhysicalInput);
+    await expect(vm.runInContext('assertUserIsNotUsingTab(7)', context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
   });
 
   it("stops slow typing when the user starts typing between characters", async () => {
@@ -890,7 +892,7 @@ describe("Chrome and Edge extension packaging", () => {
     const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: 'Chrome' },
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
-    vm.runInContext("claims.set(7, { allowedOrigins: new Set(['https://example.test']) })", context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test'))", context);
     const args = { target: 'ax-3', paths: ['/tmp/approved.txt'], approvedOrigin: 'https://example.test' };
     (context as Record<string, unknown>).args = args;
     await expect(vm.runInContext('run(7, "upload", args, "operation-1")', context)).resolves.toEqual({ uploaded: 1 });
@@ -1031,6 +1033,8 @@ describe("Chrome and Edge extension packaging", () => {
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), console: [], requests: [], cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set()})", context);
     onEvent({ tabId: 7 }, 'Target.attachedToTarget', { sessionId: 'session-1',
       targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.test/frame' } });
+    // This fixture exercises child identity after input-observer attachment.
+    vm.runInContext("claims.get(7).cdpSessions.get('session-1').inputObserverState = 'ready'", context);
     let approvedTarget = await vm.runInContext("run(7, 'cdpTarget', {approvedOrigin: 'https://example.test', target: {targetId: 'child-1'}}, 'probe-1')", context);
     expect(approvedTarget).toMatchObject({ sessionId: 'session-1', targetId: 'child-1',
       url: childUrl, origin: 'https://example.test', revision: 0 });
@@ -1573,4 +1577,91 @@ it.each([
         method: 'Page.getLayoutMetrics', params: {} })).toMatchObject({ ok: true });
     }
   } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+
+it.each([0, 20])('does not reuse an Agent event exemption for a physical click %sms later', async delta => {
+  let timestamp = 0;
+  const test = discoveryHarness({ command: async (method, params) => {
+    if (method === 'Input.dispatchMouseEvent') timestamp = Number(params.timestamp) * 1000;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'one-shot'});`, test.context);
+  await vm.runInContext("command(7,'Input.dispatchMouseEvent',{type:'mousePressed',x:1,y:1})", test.context);
+  const input = (at: number) => test.debuggerEvent(7, 'Runtime.bindingCalled', {
+    name: '__memmyUserInput', payload: JSON.stringify(['one-shot', 'pointerdown', at]),
+  });
+  input(timestamp);
+  expect(vm.runInContext('claims.get(7).lastUserInputAt', test.context)).toBe(0);
+  input(timestamp + delta);
+  await expect(vm.runInContext('assertUserIsNotUsingTab(7)', test.context))
+    .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+});
+
+it('does not treat a nearby physical click as Agent input before its delayed notification', async () => {
+  let timestamp = 0;
+  const test = discoveryHarness({ command: async (method, params) => {
+    if (method === 'Input.dispatchMouseEvent') timestamp = Number(params.timestamp) * 1000;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'delayed'});`, test.context);
+  await vm.runInContext("command(7,'Input.dispatchMouseEvent',{type:'mousePressed',x:1,y:1})", test.context);
+  test.debuggerEvent(7, 'Runtime.bindingCalled', { name: '__memmyUserInput',
+    payload: JSON.stringify(['delayed', 'pointerdown', timestamp + 20]) });
+  await expect(vm.runInContext('assertUserIsNotUsingTab(7)', test.context))
+    .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+});
+
+it('blocks writes while a cross-origin iframe observer is still installing', async () => {
+  let finishInstall: () => void = () => undefined;
+  const installed = new Promise<void>(resolve => { finishInstall = resolve; });
+  const commands: string[] = [];
+  const test = discoveryHarness({ command: async (method, _params, target) => {
+    commands.push(method);
+    if (target.sessionId === 'oop-child' && method === 'Page.addScriptToEvaluateOnNewDocument') await installed;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'child-install'});`, test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'oop-child',
+    targetInfo: { type: 'iframe', targetId: 'cross-origin', url: 'https://other.test/frame' } });
+  await expect(vm.runInContext("run(7,'click',{x:1,y:1})", test.context))
+    .rejects.toThrow('USER_INPUT_OBSERVER_NOT_READY');
+  expect(commands).not.toContain('Input.dispatchMouseEvent');
+  finishInstall();
+  await vi.waitFor(() => expect(vm.runInContext(
+    "claims.get(7).cdpSessions.get('oop-child').inputObserverState", test.context)).toBe('ready'));
+  await expect(vm.runInContext("run(7,'click',{x:1,y:1})", test.context)).resolves.toEqual({ x: 1, y: 1 });
+});
+
+it.each(['pending', 'failed'])('blocks executor input while any iframe observer is %s', async state => {
+  const commands: string[] = [];
+  const test = discoveryHarness({ command: async method => { commands.push(method); return {}; } });
+  const leaseId = 'c'.repeat(32);
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'child-guard',
+      playwrightLease:{id:'${leaseId}',origin:'https://example.test',input:true,documentEpoch:0,expiresAt:Date.now()+45000}});
+    claims.get(7).cdpSessions.set('child',{targetId:'frame',url:'https://other.test/frame',revision:0,inputObserverState:'${state}'});`, test.context);
+  await expect(vm.runInContext(`playwrightControl(7,'playwrightCdp',{
+    leaseId:'${leaseId}',approvedOrigin:'https://example.test',method:'Input.insertText',params:{text:'A'}},'iframe-write')`, test.context))
+    .rejects.toThrow('USER_INPUT_OBSERVER_NOT_READY');
+  expect(commands).not.toContain('Input.insertText');
+});
+
+it.each(['Runtime.removeBinding', 'Runtime.disable', 'Page.removeScriptToEvaluateOnNewDocument',
+  'Input.synthesizeTapGesture', 'Input.synthesizeScrollGesture'])('rejects raw CDP that cannot preserve input observation: %s', method => {
+  const test = discoveryHarness();
+  (test.context as any).observerMethod = method;
+  expect(() => vm.runInContext("normalizeCdpWrite(observerMethod,{name:'__memmyUserInput'})", test.context))
+    .toThrow('CDP write method is unavailable');
+});
+
+it('reserves the observer binding while allowing unrelated runtime bindings', () => {
+  const test = discoveryHarness();
+  expect(() => vm.runInContext("normalizeCdpWrite('Runtime.addBinding',{name:'__memmyUserInput'})", test.context))
+    .toThrow('CDP input observer is reserved');
+  expect(vm.runInContext("normalizeCdpWrite('Runtime.addBinding',{name:'otherBinding'})", test.context))
+    .toEqual({ name: 'otherBinding' });
 });

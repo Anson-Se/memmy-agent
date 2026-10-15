@@ -401,7 +401,7 @@ async function command(tabId, method, params = {}, sessionId) {
   // CDP input also creates trusted DOM events. Keep its type and event time so
   // delayed binding notifications do not look like later physical input.
   const generated = claim && types.length ? {
-    types, startedAt: Date.now(), endedAt: Infinity,
+    types: new Set(types), sessionId, endedAt: Infinity,
     eventAt: supportsTimestamp && Number.isFinite(sentParams.timestamp)
       ? sentParams.timestamp * 1000 : null,
   } : null;
@@ -461,13 +461,14 @@ async function installChildInputObserver(tabId, claim, sessionId) {
         command(tabId, 'Runtime.enable', {}, sessionId),
       ]);
       await installInputObserver(tabId, sessionId);
-      return;
+      return true;
     } catch {
       // A child frame can navigate as it is attached. Its replacement session
       // gets another installation attempt; retry this one while it remains live.
       if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
     }
   }
+  return false;
 }
 
 function wakeCdpWaiters(claim) {
@@ -498,7 +499,8 @@ function clearIdleDetach(tabId) {
 function markDebuggerDetached(claim) {
   claim.attached = false;
   claim.playwrightLease = null;
-  claim.lastUserInputAt = 0;
+  // Detaching the debugger does not make recent physical input disappear.
+  claim.inputObserverToken = "";
   claim.generatedInput = [];
   claim.cdpSessions?.clear();
   claim.cdpEpoch = (claim.cdpEpoch || 0) + 1;
@@ -1051,10 +1053,13 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
       || (source.sessionId && !claim.cdpSessions.has(source.sessionId))) return;
     const [,, occurredAt] = input;
     pruneGeneratedInput(claim);
-    const generated = claim.generatedInput.some(entry => entry.types.includes(input[1])
-      && (entry.eventAt !== null
-        ? Math.abs(occurredAt - entry.eventAt) <= 50
-        : occurredAt >= entry.startedAt - 50 && occurredAt <= entry.endedAt + 50));
+    // CDP supplies the event timestamp. Allow only clock rounding, and consume
+    // each expected event once: a nearby second physical click is never covered
+    // by the same Agent input. Root input may be routed into an OOP iframe.
+    const generated = claim.generatedInput.find(entry => entry.types.has(input[1])
+      && (!entry.sessionId || entry.sessionId === source.sessionId)
+      && entry.eventAt !== null && Math.abs(occurredAt - entry.eventAt) <= 1);
+    if (generated) generated.types.delete(input[1]);
     if (!generated && occurredAt <= Date.now() + 1_000) {
       claim.lastUserInputAt = Math.max(claim.lastUserInputAt, occurredAt);
       refreshUserActivity();
@@ -1103,11 +1108,16 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
     if (method === 'Target.attachedToTarget' && typeof data?.sessionId === 'string'
       && data.targetInfo?.type === 'iframe' && typeof data.targetInfo.targetId === 'string') {
       const childUrl = String(data.targetInfo.url || '');
-      claim.cdpSessions.set(data.sessionId,
-        { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
-          ...(source.sessionId ? { parentSessionId: source.sessionId } : {}) });
+      const child = { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
+        inputObserverState: "pending",
+        ...(source.sessionId ? { parentSessionId: source.sessionId } : {}) };
+      claim.cdpSessions.set(data.sessionId, child);
       if (claim.inputObserverToken && (claim.attached || debuggerTasks.has(source.tabId))) {
-        void installChildInputObserver(source.tabId, claim, data.sessionId);
+        void installChildInputObserver(source.tabId, claim, data.sessionId).then(ready => {
+          if (claims.get(source.tabId) === claim && claim.cdpSessions.get(data.sessionId) === child) {
+            child.inputObserverState = ready ? "ready" : "failed";
+          }
+        });
       }
     } else if (method === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
       claim.cdpSessions.delete(data.sessionId);
@@ -1294,9 +1304,15 @@ function normalizeCdpWrite(method, params) {
     'Page.setRPHRegistrationMode', 'Page.setSPCTransactionMode', 'Tracing.requestMemoryDump',
     'Fetch.disable', 'Input.dispatchDragEvent', 'Network.continueInterceptedRequest',
     'Network.getCertificate', 'Network.loadNetworkResource', 'Network.replayXHR',
-    'Page.navigate', 'Page.navigateToHistoryEntry']);
+    'Page.navigate', 'Page.navigateToHistoryEntry', 'Runtime.disable', 'Runtime.removeBinding',
+    'Page.removeScriptToEvaluateOnNewDocument', 'Input.synthesizeTapGesture',
+    'Input.synthesizeScrollGesture', 'Input.synthesizePinchGesture']);
   if (!/^[A-Za-z]+\.[A-Za-z]+$/.test(method) || !allowed.has(domain) || denied.has(method)) {
     throw new Error('CDP write method is unavailable');
+  }
+  if (method === 'Runtime.addBinding' && params.name === INPUT_OBSERVER_BINDING
+    || method === 'Page.createIsolatedWorld' && params.worldName === INPUT_OBSERVER_WORLD) {
+    throw new Error('CDP input observer is reserved');
   }
   if ((method === 'Fetch.continueResponse' || method === 'Fetch.fulfillRequest')
     && params.binaryResponseHeaders != null
@@ -1582,6 +1598,7 @@ function dispatchPlaywrightCdp(tabId, claim, args, commandId) {
   if (input) {
     if (!lease.input) throw new Error('Browser executor observation cannot send input');
     if (claim.userActiveOnTab) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
+    assertInputObserversReady(claim);
   }
   const sessionId = args.sessionId === undefined ? undefined : String(args.sessionId);
   const child = sessionId === undefined ? undefined : claim.cdpSessions.get(sessionId);
@@ -1707,8 +1724,18 @@ async function history(tabId, direction) {
   return { url: entry.url };
 }
 
+function assertInputObserversReady(claim) {
+  // Child attachment is asynchronous. A write into any part of the tab must
+  // wait for all its input observers, including when root CDP routes to a child.
+  if (claim && [...claim.cdpSessions.values()].some(child =>
+    child.inputObserverState === "pending" || child.inputObserverState === "failed")) {
+    throw new Error("USER_INPUT_OBSERVER_NOT_READY");
+  }
+}
+
 async function assertUserIsNotUsingTab(tabId) {
   const claim = claims.get(tabId);
+  assertInputObserversReady(claim);
   if (!claim || !Number.isFinite(claim.lastUserInputAt)
     || Date.now() - claim.lastUserInputAt >= USER_ACTIVE_WINDOW_MS) return;
   // The event came from this claimed page. Focus may already have moved by the
