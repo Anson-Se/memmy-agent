@@ -24,26 +24,15 @@ def emit(event, **fields):
 
 
 def connection_error_fields(error):
-    """Expose fixed diagnostic values, never exception text containing source paths."""
+    """The category the UI explains, plus where it happened when the helper knows."""
     category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z_:0-9-]{0,127}", category):
         category = "connection_process_failed"
-    result = {"category": category}
-    if category not in ("wechat_data_access_interrupted", "wechat_data_access_timeout"):
-        return result
-    diagnostic = getattr(error, "diagnostic", None)
-    if (not isinstance(diagnostic, dict) or not diagnostic
-            or set(diagnostic) - {"operation", "errno", "source"}
-            or not isinstance(diagnostic.get("operation"), str)
-            or diagnostic.get("operation") not in {
-                "lstat", "readlink", "scandir", "scandir_next", "open", "clone", "unknown"}
-            or not isinstance(diagnostic.get("source"), str)
-            or diagnostic.get("source") not in {"container", "group_container", "state", "unknown"}
-            or ("errno" in diagnostic and (type(diagnostic["errno"]) is not int
-                or not 0 <= diagnostic["errno"] <= 4095))):
-        return result
-    result["diagnostic"] = dict(diagnostic)
-    return result
+    detail = getattr(error, "detail", None)
+    if isinstance(detail, dict) and detail and all(
+            isinstance(key, str) and isinstance(value, str) for key, value in detail.items()):
+        return {"category": category, "detail": dict(detail)}
+    return {"category": category}
 
 
 def command(arguments, *, env=None):
@@ -194,6 +183,17 @@ def temporary_copy_running(shadow):
 
 
 def current_database_root():
+    # Listing WeChat's container can wait for macOS approval, and a lost approval
+    # interrupts the call; listing again requests it again.
+    for attempt in range(3):
+        try:
+            return _current_database_root()
+        except InterruptedError:
+            if attempt == 2:
+                raise RuntimeError("wechat_data_access_interrupted") from None
+
+
+def _current_database_root():
     home = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
     roots = []
     for candidate in home.glob("*/db_storage"):

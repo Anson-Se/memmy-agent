@@ -61,16 +61,23 @@ def _check_host_data_access():
     """The non-GUI Memmy child checks Memmy's existing access, never the copy's FDA."""
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     documents = home / "Library/Containers/com.tencent.xinWeChat/Data/Documents"
-    try:
-        descriptor = os.open(documents, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        os.close(descriptor)
-        for config in documents.glob("app_data/net*/config.ini"):
-            descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW)
+    # The first access waits for macOS to approve this process; a lost approval
+    # interrupts the call, and checking again requests approval again.
+    for attempt in range(3):
+        try:
+            descriptor = os.open(documents, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             os.close(descriptor)
-    except PermissionError:
-        raise RuntimeError("wechat_data_access_required") from None
-    except OSError:
-        raise RuntimeError("wechat_data_access_unavailable") from None
+            for config in documents.glob("app_data/net*/config.ini"):
+                descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW)
+                os.close(descriptor)
+            return
+        except InterruptedError:
+            if attempt == 2:
+                raise RuntimeError("wechat_data_access_interrupted") from None
+        except PermissionError:
+            raise RuntimeError("wechat_data_access_required") from None
+        except OSError:
+            raise RuntimeError("wechat_data_access_unavailable") from None
 
 
 def _private(path, directory=False):
@@ -329,7 +336,7 @@ def _probe_copy(shadow, state, lldb_path):
 
 def _public_result(result):
     error = result["error"]
-    if error in ("wechat_data_access_required", "wechat_data_access_unavailable"):
+    if error in ("wechat_data_access_required", "wechat_data_access_unavailable", "wechat_data_access_interrupted"):
         pass
     elif error in ("wechat_private_storage_probe_failed", "wechat_copy_permission_probe_failed", "wechat_copy_permission_probe_timeout",
                    "wechat_copy_permission_probe_unavailable"):

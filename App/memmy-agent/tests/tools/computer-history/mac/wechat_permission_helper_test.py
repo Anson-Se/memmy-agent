@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import importlib.util
 import json
@@ -199,6 +200,14 @@ class PermissionHelperTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["error"], "wechat_data_access_unavailable")
         self.assertIsNone(result["appPath"])
+        self.build.assert_not_called()
+        self.probe.assert_not_called()
+
+    def test_unapproved_host_access_keeps_its_own_category(self):
+        self.host_access.side_effect = RuntimeError("wechat_data_access_interrupted")
+        result = self.prepare()
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["error"], "wechat_data_access_interrupted")
         self.build.assert_not_called()
         self.probe.assert_not_called()
 
@@ -503,6 +512,46 @@ class PermissionHelperTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 sleep.assert_called_once_with(0.025)
 
+
+
+class HostDataAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = load_helper()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        home = Path(temporary.name).resolve()
+        configuration = home / "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/config.ini"
+        configuration.parent.mkdir(parents=True)
+        configuration.write_text("synthetic")
+        patch = mock.patch.object(self.helper.pwd, "getpwuid", return_value=types.SimpleNamespace(pw_dir=str(home)))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_interrupted_listing_is_repeated(self):
+        original = Path.glob
+        calls = []
+
+        def glob(path, pattern):
+            calls.append(pattern)
+            if len(calls) == 1:
+                raise InterruptedError(errno.EINTR, "approval wait interrupted")
+            return original(path, pattern)
+
+        with mock.patch.object(Path, "glob", glob):
+            self.helper._check_host_data_access()
+        self.assertEqual(calls, ["app_data/net*/config.ini"] * 2)
+
+    def test_repeated_interruption_is_reported_as_unapproved_data_access(self):
+        with mock.patch.object(Path, "glob", side_effect=InterruptedError(errno.EINTR, "approval wait interrupted")) as glob:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$"):
+                self.helper._check_host_data_access()
+        self.assertEqual(glob.call_count, 3)
+
+    def test_denied_access_still_asks_for_disk_access(self):
+        with mock.patch.object(Path, "glob", side_effect=PermissionError(errno.EPERM, "denied")) as glob:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_required$"):
+                self.helper._check_host_data_access()
+        glob.assert_called_once()
 
 
 class PackagedLibraryTests(unittest.TestCase):

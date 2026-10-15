@@ -540,5 +540,33 @@ class EncryptedNativeSnapshotTests(unittest.TestCase):
                 cipher.lib.sqlite3_close(handle)
 
 
+class InterruptedScanTests(unittest.TestCase):
+    def run_main(self, scan):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "wxid_fixture_1234/db_storage"
+            root.mkdir(parents=True)
+            keys = Path(directory) / "keys.json"
+            keys.write_text("{}")
+            keys.chmod(0o600)
+            arguments = ["read_messages.py", "poll", "--root", str(root), "--keys", str(keys), "--library", "builtin"]
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(reader, "scan", scan), \
+                    mock.patch("builtins.print") as printed:
+                reader.main()
+            return printed
+
+    def test_interrupted_read_only_scan_is_repeated(self):
+        result = {"messages": [], "nextCursor": {}, "databaseCount": 1, "names": {}}
+        scan = mock.Mock(side_effect=[InterruptedError(4, "approval wait interrupted"), result])
+        printed = self.run_main(scan)
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(json.loads(printed.call_args.args[0]), result)
+
+    def test_repeated_interruption_still_fails_the_poll(self):
+        scan = mock.Mock(side_effect=InterruptedError(4, "approval wait interrupted"))
+        with self.assertRaises(InterruptedError):
+            self.run_main(scan)
+        self.assertEqual(scan.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

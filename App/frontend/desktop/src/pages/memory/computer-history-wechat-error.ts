@@ -18,7 +18,6 @@ const errorMessages: Record<string, MessageKey> = {
   key_capture_output_missing: "computerHistory.wechat.errorCaptureFailed",
   wechat_data_access_required: "computerHistory.wechat.errorDataAccess",
   wechat_data_access_interrupted: "computerHistory.wechat.errorDataAccessInterrupted",
-  wechat_data_access_timeout: "computerHistory.wechat.errorDataAccessTimeout",
   wechat_data_access_probe_failed: "computerHistory.wechat.guidePreparationFailedBody",
   wechat_permission_helper_unavailable: "computerHistory.wechat.guidePreparationFailedBody",
   current_account_ambiguous: "computerHistory.wechat.errorAccountAmbiguous",

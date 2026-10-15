@@ -498,7 +498,17 @@ def main():
     cursor = private_json(args.cursor) if args.cursor else {}
     if not isinstance(cursor, dict) or any(not isinstance(value, int) for value in cursor.values()):
         raise RuntimeError("invalid_cursor")
-    result = scan(root, keys, SqlCipher(args.library), cursor, args.limit, args.mode == "baseline", args.since)
+    sqlcipher = SqlCipher(args.library)
+    for attempt in range(3):
+        try:
+            result = scan(root, keys, sqlcipher, cursor, args.limit, args.mode == "baseline", args.since)
+            break
+        except InterruptedError:
+            # Each poll is a new process whose first access to WeChat's container
+            # waits for macOS approval. A lost approval interrupts the read; a
+            # repeated read-only scan requests approval again.
+            if attempt == 2:
+                raise
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
 

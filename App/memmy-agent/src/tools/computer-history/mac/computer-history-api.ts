@@ -79,22 +79,13 @@ export interface WeChatReaderPreparation {
   error: string | null;
 }
 
-const WECHAT_DATA_ACCESS_OPERATIONS = new Set(["lstat", "readlink", "scandir", "scandir_next", "open", "clone", "unknown"]);
-const WECHAT_DATA_ACCESS_SOURCES = new Set(["container", "group_container", "state", "unknown"]);
-
-function weChatDataAccessDiagnostic(category: string, value: unknown): {
-  operation: string; source: string; errno?: number;
-} | undefined {
-  if (category !== "wechat_data_access_interrupted" && category !== "wechat_data_access_timeout") return;
+/** Where a Mac connection step failed (path, check or call, errno), as the helper reported it. */
+function weChatFailureDetail(value: unknown): Record<string, string> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
-  const diagnostic = value as Record<string, unknown>;
-  if (Object.keys(diagnostic).some((key) => !["operation", "source", "errno"].includes(key))
-    || typeof diagnostic.operation !== "string" || !WECHAT_DATA_ACCESS_OPERATIONS.has(diagnostic.operation)
-    || typeof diagnostic.source !== "string" || !WECHAT_DATA_ACCESS_SOURCES.has(diagnostic.source)
-    || ("errno" in diagnostic && (typeof diagnostic.errno !== "number"
-      || !Number.isInteger(diagnostic.errno) || diagnostic.errno < 0 || diagnostic.errno > 4095))) return;
-  return { operation: diagnostic.operation, source: diagnostic.source,
-    ...(typeof diagnostic.errno === "number" ? { errno: diagnostic.errno } : {}) };
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.length || entries.length > 8
+    || entries.some(([key, field]) => !/^[a-z_]{1,32}$/u.test(key) || typeof field !== "string" || field.length > 4096)) return;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 export interface ComputerHistoryReplayPlan {
@@ -814,10 +805,10 @@ export class ComputerHistoryDemoService {
     return this.weChatPreparation;
   }
 
-  /** Retain bounded diagnostics only; never log paths, key manifests or reader stdout. */
-  private saveWeChatFailure(category: string, phase: string | null, diagnostic?: unknown): void {
+  /** Keep the latest failure and where it happened; never key manifests or reader stdout. */
+  private saveWeChatFailure(category: string, phase: string | null, detail?: unknown): void {
     if (!/^[a-zA-Z_][a-zA-Z_:0-9-]{0,127}$/u.test(category)) return;
-    const safeDiagnostic = process.platform === "darwin" ? weChatDataAccessDiagnostic(category, diagnostic) : undefined;
+    const failureDetail = weChatFailureDetail(detail);
     const file = path.join(this.weChatStateDirectory, "last-connection-error.json");
     const temporary = `${file}.${crypto.randomUUID()}.tmp`;
     try {
@@ -828,7 +819,7 @@ export class ComputerHistoryDemoService {
       // Windows privacy comes from the NTFS ACL set up with consent; POSIX owner and mode bits do not apply.
       if (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077))) return;
       fs.writeFileSync(temporary, JSON.stringify({ category, phase, failedAt: new Date().toISOString(),
-        ...(safeDiagnostic ? { diagnostic: safeDiagnostic } : {}) }), { mode: 0o600, flag: "wx" });
+        ...(failureDetail ? { detail: failureDetail } : {}) }), { mode: 0o600, flag: "wx" });
       fs.renameSync(temporary, file);
     } catch { /* Diagnostics must not change connection or consent behavior. */ }
     finally { fs.rmSync(temporary, { force: true }); }
@@ -974,7 +965,7 @@ export class ComputerHistoryDemoService {
     let pending = "";
     const readStatus = (line: string) => {
       try {
-        const status = JSON.parse(line) as { event?: unknown; category?: unknown; diagnostic?: unknown };
+        const status = JSON.parse(line) as { event?: unknown; category?: unknown; detail?: unknown };
         const failedPhase = this.weChatPhase;
         if (typeof status.event === "string" && /^[a-z_]+$/u.test(status.event)
           && status.event !== "connection_error" && status.event !== "capture_error") {
@@ -987,7 +978,7 @@ export class ComputerHistoryDemoService {
           if (status.category !== this.weChatError
             && (status.category !== "key_capture_failed" || !this.weChatError)) {
             this.weChatError = status.category;
-            this.saveWeChatFailure(status.category, failedPhase, status.diagnostic);
+            this.saveWeChatFailure(status.category, failedPhase, status.detail);
           }
         }
       } catch { /* Status output contains no chat content; ignore malformed lines. */ }

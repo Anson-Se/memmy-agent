@@ -404,24 +404,26 @@ class ConnectPermissionTests(unittest.TestCase):
         self.assertNotIn("original_opened", self.order)
         self.assertNotIn("quitting_original", self.order)
 
-    def test_metadata_interruption_reports_safe_diagnostics_without_disturbing_wechat(self):
+    def test_data_access_interruption_before_quit_reports_where_without_disturbing_wechat(self):
         error = RuntimeError("wechat_data_access_interrupted")
-        error.diagnostic = {"operation": "scandir_next", "errno": errno.EINTR, "source": "container"}
+        error.detail = {"path": "/synthetic/Containers/com.tencent.xinWeChat/Data", "operation": "listdir",
+                        "errno": "EINTR"}
         self.storage_module.preflight_private_storage.side_effect = error
         with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
                                              "--library", str(self.library)]):
             self.assertEqual(connect.run(), 2)
         self.assertEqual(self.events[-1], ("connection_error", {
-            "category": "wechat_data_access_interrupted", "diagnostic": error.diagnostic}))
+            "category": "wechat_data_access_interrupted", "detail": error.detail}))
         self.assert_not_disturbed()
         self.storage_module.preflight_private_storage.assert_called_once()
         self.storage_module.cleanup.assert_not_called()
         self.assertEqual(self.order.count("connection_error"), 1)
 
-    def test_metadata_timeout_after_quit_cleans_session_and_restores_original_once(self):
+    def test_snapshot_clone_failure_reports_where_cleans_session_and_restores_original_once(self):
         self.patched["running_wechat"].side_effect = [True, False, False, False]
-        error = RuntimeError("wechat_data_access_timeout")
-        error.diagnostic = {"operation": "lstat", "errno": errno.ETIMEDOUT, "source": "group_container"}
+        error = RuntimeError("wechat_private_storage_clone_failed")
+        error.detail = {"path": "/synthetic/Containers/com.tencent.xinWeChat/Data/Documents/a.db",
+                        "operation": "open", "errno": "EPERM"}
 
         def fail_snapshot(state, *, consent_id):
             self.prepare_storage(state, consent_id=consent_id)
@@ -432,10 +434,9 @@ class ConnectPermissionTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
                                              "--library", str(self.library)]):
             self.assertEqual(connect.run(), 2)
-        self.assertEqual(self.events[-1], ("connection_error", {
-            "category": "wechat_data_access_timeout", "diagnostic": error.diagnostic}))
-        self.assertTrue(all(fields == {"category": "wechat_data_access_timeout", "diagnostic": error.diagnostic}
-                            for event, fields in self.events if event == "connection_error"))
+        expected = {"category": "wechat_private_storage_clone_failed", "detail": error.detail}
+        self.assertEqual(self.events[-1], ("connection_error", expected))
+        self.assertTrue(all(fields == expected for event, fields in self.events if event == "connection_error"))
         self.assertEqual(self.order.count("quit_requested"), 1)
         self.assertEqual(self.order.count("original_opened"), 1)
         self.storage_module.create_private_storage.assert_called_once()
@@ -443,30 +444,21 @@ class ConnectPermissionTests(unittest.TestCase):
         self.assertFalse(self.session.exists())
         self.assertEqual(self.original.read_bytes(), b"unchanged-original")
 
-    def test_connection_diagnostics_reject_path_text_and_unrecognized_values(self):
-        for diagnostic in (
-            {"operation": "lstat", "source": "container", "path": "/private/chat.db"},
-            {"operation": "/private/chat.db", "source": "container"},
-            {"operation": [], "source": "container"},
-            {"operation": "lstat", "source": {}},
-            {"operation": "lstat", "source": "/private/chat.db"},
-            {"operation": "lstat", "source": "container", "errno": True},
-            {"operation": "lstat", "source": "container", "errno": -1},
-            {"operation": "lstat", "source": "container", "errno": 4096},
-            {"operation": "lstat", "source": "container", "errno": "4: /private/chat.db"},
-            {"operation": "lstat"},
-            [],
-        ):
-            with self.subTest(diagnostic=diagnostic):
+    def test_connection_error_fields_keep_string_detail_and_a_safe_category(self):
+        error = RuntimeError("wechat_private_storage_unsafe_path")
+        error.detail = {"path": "/synthetic/Data/link", "reason": "symlink"}
+        self.assertEqual(connect.connection_error_fields(error), {
+            "category": "wechat_private_storage_unsafe_path", "detail": error.detail})
+        for detail in ({}, [], {"path": 1}, {"errno": errno.EINTR}, "path"):
+            with self.subTest(detail=detail):
                 error = RuntimeError("wechat_data_access_interrupted")
-                error.diagnostic = diagnostic
+                error.detail = detail
                 self.assertEqual(connect.connection_error_fields(error), {
                     "category": "wechat_data_access_interrupted"})
-        self.assertEqual(connect.connection_error_fields(RuntimeError("/private/chat.db")), {
+        self.assertEqual(connect.connection_error_fields(RuntimeError("free text: /private/chat.db")), {
             "category": "connection_process_failed"})
-        error = RuntimeError("wechat_consent_revoked")
-        error.diagnostic = {"operation": "lstat", "source": "container"}
-        self.assertEqual(connect.connection_error_fields(error), {"category": "wechat_consent_revoked"})
+        self.assertEqual(connect.connection_error_fields(InterruptedError(errno.EINTR, "interrupted")), {
+            "category": "InterruptedError"})
 
     def test_final_source_change_is_rejected_after_quit_and_restores_original(self):
         self.patched["running_wechat"].side_effect = [True, False, False, False]
@@ -592,6 +584,29 @@ class ReaderErrorPropagationTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 2, "", stderr)):
                 with self.assertRaisesRegex(RuntimeError, "^command_failed:python3$"):
                     connect.command([sys.executable, "read_messages.py", "baseline"])
+
+
+class DatabaseRootInterruptionTests(unittest.TestCase):
+    def test_interrupted_account_listing_is_repeated(self):
+        root = Path("/synthetic/xwechat_files/account/db_storage")
+        interrupted = InterruptedError(errno.EINTR, "approval wait interrupted")
+        with mock.patch.object(connect, "_current_database_root", side_effect=[interrupted, root]) as listing:
+            self.assertEqual(connect.current_database_root(), root)
+        self.assertEqual(listing.call_count, 2)
+
+    def test_repeated_interruption_is_reported_as_unapproved_data_access(self):
+        interrupted = InterruptedError(errno.EINTR, "approval wait interrupted")
+        with mock.patch.object(connect, "_current_database_root", side_effect=interrupted) as listing:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$"):
+                connect.current_database_root()
+        self.assertEqual(listing.call_count, 3)
+
+    def test_other_account_errors_are_not_repeated(self):
+        with mock.patch.object(connect, "_current_database_root",
+                               side_effect=RuntimeError("wechat_login_required")) as listing:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_login_required$"):
+                connect.current_database_root()
+        listing.assert_called_once()
 
 
 if __name__ == "__main__":
