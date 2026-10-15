@@ -86,11 +86,13 @@ function RuntimeApp() {
   const translationRef = useRef(t);
   const agentStateRef = useRef(state.agent);
   const isScanningRef = useRef(false);
+  const scanUnavailableRef = useRef(false);
   const rendererReadyReportedRef = useRef(false);
   const [bootKey, setBootKey] = useState(0);
   translationRef.current = t;
   agentStateRef.current = state.agent;
   isScanningRef.current = state.agentSources.isScanning;
+  scanUnavailableRef.current = Boolean(state.agentSources.scanUnavailable);
   const taskStateCoordinator = useMemo(() => (
     clients?.memmyAgent
       ? createAgentTaskStateCoordinator(
@@ -184,6 +186,8 @@ function RuntimeApp() {
       try {
         const status = await agentSourceClient.getScanStatus();
         if (!isActive) return;
+        dispatch(appActions.agentSourceScanAvailability(status.unavailable ?? null));
+        if (status.unavailable) return;
         if (status.progress) {
           dispatch(appActions.agentSourceScanProgressReceived(status.progress));
           return;
@@ -266,6 +270,7 @@ function RuntimeApp() {
           });
         }
         dispatch(appActions.agentSourcesLoaded(sources));
+        dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
         if (scanStatus.progress) {
           dispatch(appActions.agentSourceScanProgressReceived(scanStatus.progress));
         } else if (scanStatus.completion) {
@@ -298,7 +303,7 @@ function RuntimeApp() {
         });
         events.addEventListener("app.heartbeat", () => {
           dispatch(appActions.eventStatusChanged("heartbeat"));
-          if (isScanningRef.current) {
+          if (isScanningRef.current || scanUnavailableRef.current) {
             void reconcileAgentSourceScanStatus(clients.agentSources);
           }
         });

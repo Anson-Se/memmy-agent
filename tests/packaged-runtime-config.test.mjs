@@ -219,7 +219,7 @@ describe("packaged desktop runtime configuration", () => {
     seedMemoryBuildInputs(root);
     const memoryDir = join(root, "Memory");
     const runtimeDir = join(root, "runtime");
-    const coreDir = join(root, "AgentSourceCore");
+    const coreDir = join(root, "Memory", "AgentSourceCore");
     const buildScript = readFileSync(join(
       dirname(fileURLToPath(import.meta.url)),
       "..", "scripts", "internal", "mac", "build-dmg.sh",
@@ -232,8 +232,8 @@ describe("packaged desktop runtime configuration", () => {
       lockfileVersion: 3,
       requires: true,
       packages: {
-        "node_modules/@memmy/agent-source-core": { resolved: "AgentSourceCore", link: true },
-        AgentSourceCore: { name: "@memmy/agent-source-core", version: "0.0.0" },
+        "node_modules/@memmy/agent-source-core": { resolved: "Memory/AgentSourceCore", link: true },
+        "Memory/AgentSourceCore": { name: "@memmy/agent-source-core", version: "0.0.0" },
         "node_modules/zod": { version: "4.4.3" },
       },
     });
@@ -250,12 +250,12 @@ describe("packaged desktop runtime configuration", () => {
       buildId: expect.stringMatching(/^[a-f0-9]{64}$/), schemaVersion: 9
     });
     expect(JSON.parse(readFileSync(join(runtimeDir, "package.json"), "utf8")).dependencies).toEqual({
-      "@memmy/agent-source-core": "file:../../../../../../AgentSourceCore",
+      "@memmy/agent-source-core": "file:../../../../../../Memory/AgentSourceCore",
       zod: "4.4.3",
     });
     const lock = JSON.parse(readFileSync(join(runtimeDir, "package-lock.json"), "utf8"));
     expect(lock.packages[""].dependencies).toEqual({
-      "@memmy/agent-source-core": "file:../../../../../../AgentSourceCore",
+      "@memmy/agent-source-core": "file:../../../../../../Memory/AgentSourceCore",
       zod: "4.4.3",
     });
     expect(lock.packages["node_modules/@memmy/agent-source-core"]).toBeUndefined();
@@ -642,7 +642,7 @@ await import(pathToFileURL(process.argv[1]).href);
       "..", "scripts", "internal", "win", "build-nsis.sh",
     ), "utf8");
 
-    expect(buildScript).toContain('AGENT_SOURCE_CORE_DIR="$ROOT_DIR/AgentSourceCore"');
+    expect(buildScript).toContain('AGENT_SOURCE_CORE_DIR="$ROOT_DIR/Memory/AgentSourceCore"');
     expect(buildScript).toContain(
       'node "$ROOT_DIR/scripts/internal/win/create-memory-runtime-manifest.mjs"',
     );
@@ -830,11 +830,11 @@ function fixtureRoot() {
 }
 
 function seedMemoryBuildInputs(root) {
-  for (const path of ["Memory/src/storage", "Memory/viewer/src", "Memory/viewer/public", "Memory/adapters", "AgentSourceCore/src"]) {
+  for (const path of ["Memory/src/storage", "Memory/viewer/src", "Memory/viewer/public", "Memory/adapters", "Memory/AgentSourceCore/src"]) {
     mkdirSync(join(root, path), { recursive: true });
   }
   for (const path of ["Memory/package.json", "Memory/tsconfig.json", "Memory/tsconfig.base.json",
-    "Memory/viewer/package.json", "AgentSourceCore/package.json", "AgentSourceCore/tsconfig.json",
+    "Memory/viewer/package.json", "Memory/AgentSourceCore/package.json", "Memory/AgentSourceCore/tsconfig.json",
     "tsconfig.base.json", "package-lock.json"]) writeFixtureJson(join(root, path), {});
   writeFileSync(join(root, "Memory/src/storage/schema.ts"), "export const SCHEMA_VERSION = 9;\n");
   writeFileSync(join(root, "Memory/viewer/vite.config.ts"), "export default {};\n");

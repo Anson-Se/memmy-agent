@@ -366,6 +366,9 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
         const health = await monitor.refresh();
         if (!isCurrent()) return;
         if (health.ready) {
+          const scanStatus = await clients.agentSources.getScanStatus();
+          if (!isCurrent()) return;
+          dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
           setMemoryServiceMessage(t("memory.restartServiceDone"));
         } else {
           setMemoryServiceError(health.error
@@ -891,6 +894,10 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
         </div>
       )}
 
+      {state.agentSources.scanUnavailable && <Banner tone="danger">{
+        t(state.agentSources.scanUnavailable.code === "memory_scan_upgrade_required"
+          ? "memory.scanUpgradeRequired" : "memory.scanServiceUnavailable")
+      }</Banner>}
       {state.agentSources.error && <Banner tone="danger">{state.agentSources.error}</Banner>}
 
       <div data-tour-anchor={PRODUCT_TOUR_MEMORY_AGENTS_LIST_ANCHOR}>
