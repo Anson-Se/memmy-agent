@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { Session } from 'electron';
 import { afterEach, expect, it } from 'vitest';
 import { BrowserSitePermissions } from '../src/main/browser-site-permissions.js';
+import { BrowserTaskSitePermissions } from '../src/main/browser-task-site-permissions.js';
 import { attachBrowserWebviewPermissions } from '../src/main/browser-webview-permissions.js';
 
 const roots: string[] = [];
@@ -20,7 +21,7 @@ it('applies current per-origin device grants to the embedded browser', () => {
     setPermissionCheckHandler: (handler: Check | null) => { check = handler; },
     setPermissionRequestHandler: (handler: Request | null) => { request = handler; },
   } as unknown as Session;
-  const dispose = attachBrowserWebviewPermissions(session, root);
+  const dispose = attachBrowserWebviewPermissions(session, root, new BrowserTaskSitePermissions());
   const site = new BrowserSitePermissions(root);
   const requestMedia = (types: Array<'video' | 'audio'>, url = 'https://example.com/page') => {
     let decision: boolean | null = null;
@@ -53,7 +54,7 @@ it('enforces additional Electron session permissions only for an explicitly gran
     setPermissionCheckHandler: (handler: Check | null) => { check = handler; },
     setPermissionRequestHandler: (handler: Request | null) => { request = handler; },
   } as unknown as Session;
-  attachBrowserWebviewPermissions(session, root);
+  attachBrowserWebviewPermissions(session, root, new BrowserTaskSitePermissions());
   const site = new BrowserSitePermissions(root);
   const origin = 'https://permissions.test';
   const checkPermission = (permission: Parameters<Check>[1], requestedOrigin = origin) =>
@@ -89,4 +90,42 @@ it('enforces additional Electron session permissions only for an explicitly gran
   expect(checkPermission('usb')).toBe(false);
   expect(checkPermission('hid')).toBe(false);
   expect(requestPermission('display-capture')).toBe(false);
+});
+
+it('lets a live Agent task choice override saved grants only on its tab and origin', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-webview-permissions-'));
+  roots.push(root);
+  type Check = NonNullable<Parameters<Session['setPermissionCheckHandler']>[0]>;
+  type Request = NonNullable<Parameters<Session['setPermissionRequestHandler']>[0]>;
+  let check: Check | null = null;
+  let request: Request | null = null;
+  const session = {
+    setPermissionCheckHandler: (handler: Check | null) => { check = handler; },
+    setPermissionRequestHandler: (handler: Request | null) => { request = handler; },
+  } as unknown as Session;
+  const tasks = new BrowserTaskSitePermissions();
+  attachBrowserWebviewPermissions(session, root, tasks);
+  const site = new BrowserSitePermissions(root);
+  const origin = 'https://meeting.example';
+  const taskTab = { id: 7 } as Electron.WebContents, otherTab = { id: 8 } as Electron.WebContents;
+  const requestMedia = (contents: Electron.WebContents, types: Array<'video' | 'audio'>, url = `${origin}/room`) => {
+    let decision: boolean | null = null;
+    request!(contents, 'media', allowed => { decision = allowed; },
+      { requestingUrl: url, securityOrigin: new URL(url).origin, mediaTypes: types, isMainFrame: true });
+    return decision;
+  };
+  site.set(origin, 'microphone', true);
+  tasks.set(7, origin, 'camera', true, () => true);
+  tasks.set(7, origin, 'microphone', false, () => true);
+  expect(check!(taskTab, 'media', origin, { mediaType: 'video', isMainFrame: true })).toBe(true);
+  expect(requestMedia(taskTab, ['video'])).toBe(true);
+  expect(requestMedia(taskTab, ['audio'])).toBe(false);
+  expect(requestMedia(taskTab, ['video'], 'https://frame.example/embed')).toBe(false);
+  expect(requestMedia(otherTab, ['video'])).toBe(false);
+  expect(requestMedia(otherTab, ['audio'])).toBe(true);
+  expect(check!(null, 'media', origin, { mediaType: 'video', isMainFrame: true })).toBe(false);
+  expect(site.list()).toEqual([{ origin, permissions: ['microphone'] }]);
+  tasks.end(7);
+  expect(requestMedia(taskTab, ['video'])).toBe(false);
+  expect(requestMedia(taskTab, ['audio'])).toBe(true);
 });

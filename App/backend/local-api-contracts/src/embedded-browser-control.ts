@@ -20,7 +20,7 @@ export const EMBEDDED_BROWSER_COMMANDS = [
   'click', 'type', 'selectOption', 'pressKey', 'scroll', 'waitFor', 'screenshot',
   'consoleMessages', 'networkRequests', 'viewport', 'historyState', 'resize', 'open',
   'fillCredential', 'fillContact',
-  'authRequest', 'setSitePermission', 'setDownloadDestination', 'waitDownloadDestination',
+  'authRequest', 'setSitePermission', 'endSitePermissions', 'setDownloadDestination', 'waitDownloadDestination',
   'upload',
   'cdpCall', 'cdpEvents', 'cdpWrite',
   'playwrightStart', 'playwrightCdp', 'playwrightEnd',
@@ -104,7 +104,7 @@ export function isEmbeddedBrowserRequest(value: unknown): value is EmbeddedBrows
     && typeof input.requestId === 'string' && /^[a-zA-Z0-9:-]{1,100}$/.test(input.requestId)
     && EMBEDDED_BROWSER_COMMANDS.includes(input.command as EmbeddedBrowserCommand)
     && (input.tabId === undefined || (Number.isSafeInteger(input.tabId) && input.tabId! > 0))
-    && (input.command !== 'closeTab' || input.tabId !== undefined)
+    && ((input.command !== 'closeTab' && input.command !== 'endSitePermissions') || input.tabId !== undefined)
     && (!input.command?.startsWith('playwright') || input.tabId !== undefined)
     && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args));
 }

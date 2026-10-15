@@ -560,7 +560,7 @@ export class BrowserSessionManager {
         ?? (this.managedTaskPermissionStore ??= new BrowserSitePermissionStore());
       await permissions.setForContext(session.context, request, current);
       return JSON.stringify({ status: request.allow ? 'granted' : 'revoked', origin: request.origin,
-        permission: request.permission, allowed: request.allow });
+        permission: request.permission, allowed: request.allow, lasts: 'task' });
     });
   }
   private readonly surfaceActionListener = (raw: unknown) => {
@@ -2018,7 +2018,7 @@ export class BrowserSitePermissionTool extends BrowserCdpReadTool {
   static enabled(ctx: any): boolean { return ctx.browserSessionManager?.supportsSitePermissions() === true; }
   get name(): string { return 'browser_site_permission'; }
   get description(): string {
-    return 'Grant or revoke camera or microphone permission for the HTTP(S) origin in the current task browser tab. Memmy changes its per-site grant; managed Chromium changes this task context. Chrome/Edge returns the browser UI step for the Agent to complete with Computer Use. A granted result describes site configuration: perform the page action and verify its result.';
+    return 'Grant or revoke camera or microphone permission for the HTTP(S) origin in the current task browser tab. In Memmy and managed Chromium the choice applies only to this task tab or context and origin (lasts: "task"), ends with the task, and leaves the user\'s saved site settings unchanged. Chrome/Edge returns the browser UI step for the Agent to complete with Computer Use. A granted result describes site configuration: perform the page action and verify its result.';
   }
   override get readOnly(): boolean { return false; }
   get parameters(): Record<string, any> { return { type: 'object', properties: {

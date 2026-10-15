@@ -18,7 +18,6 @@ import { BrowserDownloadCatalog } from './browser-download-catalog.js';
 import { BrowserDownloadSettings } from './browser-download-settings.js';
 import { BrowserWebviewDownloads } from './browser-webview-downloads.js';
 import { attachBrowserWebviewPermissions } from './browser-webview-permissions.js';
-import { BrowserSitePermissions } from './browser-site-permissions.js';
 import { BrowserAccessStore } from './browser-access-store.js';
 import { BrowserUseSitePolicyStore } from './browser-use-site-policy-store.js';
 import { BrowserAllowAll } from './browser-allow-all.js';
@@ -587,16 +586,21 @@ async function boot(): Promise<void> {
       handleEmbeddedBrowserRequest: async (request, isCurrentChild, emitEvent) => {
         if (request.command === 'setSitePermission') {
           const choice = parseBrowserTaskSitePermission(request.args);
-          const configPath = runtimeServices?.agentGateway.configPath;
-          if (!choice || !configPath || !Number.isSafeInteger(request.tabId) || !isCurrentChild()
+          if (!choice || !Number.isSafeInteger(request.tabId) || !isCurrentChild()
             || embeddedBrowserDriver.uploadOrigin(request.tabId!) !== choice.origin
             || (choice.allow && (browserSiteDecision(choice.origin, 'access') === 'block'
               || browserAllowAllStore()?.siteRuleDecision(choice.origin, 'access') === 'block'))) {
             throw new Error('Browser permission target is no longer current');
           }
-          new BrowserSitePermissions(dirname(configPath)).set(choice.origin, choice.permission, choice.allow);
+          // An Agent choice must never become one of the user's saved site permissions.
+          embeddedBrowserDriver.taskSitePermissions.set(request.tabId!, choice.origin, choice.permission,
+            choice.allow, isCurrentChild);
           return { status: choice.allow ? 'granted' : 'revoked', origin: choice.origin,
-            permission: choice.permission, allowed: choice.allow };
+            permission: choice.permission, allowed: choice.allow, lasts: 'task' };
+        }
+        if (request.command === 'endSitePermissions') {
+          embeddedBrowserDriver.taskSitePermissions.end(request.tabId!);
+          return { ended: true };
         }
         if (request.command === 'authRequest') {
           if (!mainWindow || mainWindow.isDestroyed() || !Number.isSafeInteger(request.tabId))
@@ -834,7 +838,8 @@ async function boot(): Promise<void> {
     const embeddedBrowserSession = session.fromPartition('persist:memmy-browser');
     const browserDataDirectory = dirname(runtimeServices.agentGateway.configPath);
     browserWebviewDownloads = new BrowserWebviewDownloads(embeddedBrowserSession, browserDataDirectory);
-    disposeBrowserWebviewPermissions = attachBrowserWebviewPermissions(embeddedBrowserSession, browserDataDirectory);
+    disposeBrowserWebviewPermissions = attachBrowserWebviewPermissions(embeddedBrowserSession, browserDataDirectory,
+      embeddedBrowserDriver.taskSitePermissions);
     bootStage = "local-api";
     void writePackagedStartupLog(`boot:stage:${JSON.stringify({ stage: bootStage, elapsedMs: Date.now() - bootStartedAt })}`);
     runtimeConfig = await startLocalApi(runtimeServices);

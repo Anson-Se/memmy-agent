@@ -8,6 +8,7 @@ import { formatEmbeddedBrowserTabMention, normalizeBrowserCdpReadCall, normalize
   type EmbeddedBrowserCommand, type EmbeddedBrowserRequest } from '@memmy/local-api-contracts';
 import type { BrowserHistoryStore, BrowserVisitSource } from './browser-history-store.js';
 import { BrowserCdpEventBuffer } from './browser-cdp-event-buffer.js';
+import { BrowserTaskSitePermissions } from './browser-task-site-permissions.js';
 import { collectMissingBrowserAuth, parseBrowserAuthRequest, type BrowserAuthRequest, type BrowserAuthResult } from './browser-auth-request.js';
 import type { BrowserAuthFormResult } from './browser-auth-form.js';
 
@@ -163,6 +164,7 @@ export class EmbeddedBrowserDriver {
   private readonly entries = new Map<number, Entry>();
   private selectedTabId: number | null = null;
   private historyStore: BrowserHistoryStore | null = null;
+  readonly taskSitePermissions = new BrowserTaskSitePermissions();
 
   constructor(private readonly getHost: () => BrowserWindow | null = () => null) {}
 
@@ -206,6 +208,7 @@ export class EmbeddedBrowserDriver {
     guest.on('did-start-navigation', details => {
       if (details.isMainFrame) {
         this.revokePlaywright(entry, details.isSameDocument ? undefined : 'navigation');
+        this.taskSitePermissions.end(guest.id, details.url);
         try { this.ensureCdpOrigin(entry, origin(details.url)); }
         catch { entry.cdpEvents.clear(); entry.cdpOrigin = null; entry.cdpEpoch++; }
         entry.lastStartedUrl = details.url;
@@ -242,6 +245,8 @@ export class EmbeddedBrowserDriver {
     guest.on('did-stop-loading', recordNavigation);
     guest.on('did-navigate', () => {
       this.revokePlaywright(entry, 'navigation');
+      // A redirect can commit another origin after the navigation started on this one.
+      this.taskSitePermissions.end(guest.id, guest.getURL());
       entry.documentEpoch++;
       let recovered = false;
       try { recovered = entry.recoveryNavigationPending
@@ -263,6 +268,7 @@ export class EmbeddedBrowserDriver {
       catch { /* A history title update must not interrupt the browser. */ }
     });
     guest.once('destroyed', () => {
+      this.taskSitePermissions.end(guest.id);
       this.revokePlaywright(entry);
       this.historyStore?.finishSession(String(guest.id));
       if (this.entries.get(guest.id) !== entry) return;

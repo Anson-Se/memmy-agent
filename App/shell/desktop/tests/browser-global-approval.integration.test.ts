@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
@@ -15,6 +15,7 @@ import { BrowserHistoryStore } from '../src/main/browser-history-store.js';
 import { BrowserUseSitePolicyStore } from '../src/main/browser-use-site-policy-store.js';
 import { NativeAppAllowAll } from '../src/main/native-app-allow-all.js';
 import { BrowserSitePermissions } from '../src/main/browser-site-permissions.js';
+import { BrowserTaskSitePermissions } from '../src/main/browser-task-site-permissions.js';
 
 // Run the actual desktop approval functions, runtime callbacks and settings IPC handlers.
 // Only Electron windows/dialogs and the final page driver are replaced; permission stores
@@ -74,6 +75,7 @@ function setup(platform: 'darwin' | 'win32' = 'darwin') {
   const presentApprovalWindow = vi.fn(() => mainWindow);
   const showMessageBox = vi.fn(async (...args: unknown[]) => ({ response: (args.at(-1) as Prompt).cancelId ?? 0, checkboxChecked: false }));
   const driver = {
+    taskSitePermissions: new BrowserTaskSitePermissions(),
     uploadOrigin: vi.fn(() => origin),
     handle: vi.fn(async (_request: EmbeddedBrowserRequest, _upload?: unknown, approval?: Approval) => {
       if (approval?.isAllowed && !approval.isAllowed()) throw new Error('Page policy no longer allows this operation');
@@ -109,37 +111,57 @@ function historyRequest() {
     to: new Date(Date.now() - 1000).toISOString(), keyword: 'example', limit: 10 });
 }
 
-it('keeps device grants separate and applies an explicit task choice only to the current website', async () => {
+it('keeps an Agent device grant to the task tab and current website and never saves it under allow-all', async () => {
   const test = setup();
   const permissions = new BrowserSitePermissions(test.agentData);
+  const tasks = test.driver.taskSitePermissions;
+  let agentCurrent = true;
   test.setGlobal('computer', true);
-  expect(permissions.list()).toEqual([]);
-  expect(await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
+  const granted = await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
     origin, permission: 'camera', allow: true,
-  }), () => true)).toEqual({ status: 'granted', origin, permission: 'camera', allowed: true });
-  expect(permissions.list()).toEqual([{ origin, permissions: ['camera'] }]);
+  }), () => agentCurrent);
+  expect(existsSync(permissions.filePath)).toBe(false);
+  expect(tasks.decision(27, origin, 'camera')).toBe(true);
+  expect(tasks.decision(28, origin, 'camera')).toBeUndefined();
+  expect(granted).toEqual({ status: 'granted', origin, permission: 'camera', allowed: true, lasts: 'task' });
   await expect(test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
     origin: 'https://another.example', permission: 'microphone', allow: true,
   }), () => true)).rejects.toThrow('no longer current');
+  expect(await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('endSitePermissions'), () => true))
+    .toEqual({ ended: true });
+  expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+  await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
+    origin, permission: 'camera', allow: true,
+  }), () => agentCurrent);
+  agentCurrent = false;
+  expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+  test.setGlobal('computer', false);
+  expect(permissions.list()).toEqual([]);
 });
 
-it('rejects stale device grants and permits revoking a grant after the site becomes blocked', async () => {
+it('rejects stale or blocked device grants and lets a task revocation override a saved grant without editing it', async () => {
   const test = setup();
   const permissions = new BrowserSitePermissions(test.agentData);
+  const tasks = test.driver.taskSitePermissions;
   test.setGlobal('websites', true);
   await expect(test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
     origin, permission: 'microphone', allow: true,
   }), () => false)).rejects.toThrow('no longer current');
   permissions.set(origin, 'microphone', true);
   test.policies.upsert(blockedRule());
-  test.setGlobal('websites', false);
-  await expect(test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
-    origin, permission: 'camera', allow: true,
-  }), () => true)).rejects.toThrow('no longer current');
-  expect(await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
+  for (const enabled of [true, false]) {
+    test.setGlobal('websites', enabled);
+    await expect(test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
+      origin, permission: 'camera', allow: true,
+    }), () => true)).rejects.toThrow('no longer current');
+  }
+  expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+  const revoked = await test.runtimeCallbacks.handleEmbeddedBrowserRequest(request('setSitePermission', {
     origin, permission: 'microphone', allow: false,
-  }), () => true)).toEqual({ status: 'revoked', origin, permission: 'microphone', allowed: false });
-  expect(permissions.list()).toEqual([]);
+  }), () => true);
+  expect(permissions.list()).toEqual([{ origin, permissions: ['microphone'] }]);
+  expect(tasks.decision(27, origin, 'microphone')).toBe(false);
+  expect(revoked).toEqual({ status: 'revoked', origin, permission: 'microphone', allowed: false, lasts: 'task' });
 });
 
 it.each(['darwin', 'win32'] as const)('gives either global setting priority over remembered and site denials on %s', async platform => {

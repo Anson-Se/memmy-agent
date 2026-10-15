@@ -46,12 +46,12 @@ it('keeps media grants scoped to this task context and origin, independent of br
       .rejects.toThrow(/already bound to this task/);
     expect(f.context.grantPermissions).not.toHaveBeenCalled();
     expect(JSON.parse(await f.manager.setBrowserSitePermission(scope, request)))
-      .toEqual({ status: 'granted', origin: request.origin, permission: 'camera', allowed: true });
+      .toEqual({ status: 'granted', origin: request.origin, permission: 'camera', allowed: true, lasts: 'task' });
     expect(f.grants.get(request.origin)).toEqual(['camera']);
     expect([...f.grants.keys()]).toEqual([request.origin]);
     expect(fs.existsSync(f.store.filePath)).toBe(false);
     expect(JSON.parse(await f.manager.setBrowserSitePermission(scope, { ...request, allow: false })))
-      .toEqual({ status: 'revoked', origin: request.origin, permission: 'camera', allowed: false });
+      .toEqual({ status: 'revoked', origin: request.origin, permission: 'camera', allowed: false, lasts: 'task' });
     expect(f.grants.has(request.origin)).toBe(false);
     const other = { clearPermissions: vi.fn(async () => undefined), grantPermissions: vi.fn(async () => undefined) };
     await f.store.apply(other as any);
@@ -102,6 +102,39 @@ it('binds embedded media grants and revocations to the task tab and permits revo
     live = { ...live, url: 'https://other.example/room' };
     await expect(router.setSitePermission(scope, claim, request)).rejects.toThrow(/origin changed/);
     expect(command.mock.calls.filter(call => call[1] === 'setSitePermission')).toHaveLength(2);
+  } finally { router.closeAll(); }
+});
+
+it('ends in-app media grants with the turn before cleanup yields and when the chat releases the tab', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-media-permission-turn-')); roots.push(root);
+  const claim: ExternalBrowserClaim = { connectionId: 'embedded', tabId: 7, browser: 'memmy', title: 'Meeting',
+    url: `${request.origin}/room`, claimedAt: 1 };
+  const command = vi.fn(async (_claim: unknown, name: string, args?: Record<string, unknown>) => {
+    if (name === 'setSitePermission') return { status: args?.allow ? 'granted' : 'revoked',
+      origin: args?.origin, permission: args?.permission, allowed: args?.allow, lasts: 'task' };
+    return {};
+  });
+  const refresh = vi.fn(async () => claim);
+  const router = new ExternalBrowserSessionRouter({ listClaims: () => [claim], getClaim: () => claim, command, refresh },
+    async () => true, 'embedded', new BrowserUseSitePolicyReader(path.join(root, 'site-policy.json')));
+  const ended = () => command.mock.calls.filter(call => call[1] === 'endSitePermissions');
+  router.selectClaim(scope, claim);
+  try {
+    await router.finishTurn(scope);
+    expect(ended()).toEqual([]);
+    router.selectClaim(scope, claim);
+    expect(JSON.parse(await router.setSitePermission(scope, claim, request))).toMatchObject({ status: 'granted', lasts: 'task' });
+    refresh.mockClear();
+    const finishing = router.finishTurn(scope);
+    expect(ended()).toEqual([[{ connectionId: 'embedded', tabId: 7 }, 'endSitePermissions']]);
+    expect(refresh).not.toHaveBeenCalled();
+    await finishing;
+    await router.finishTurn(scope);
+    expect(ended()).toHaveLength(1);
+    router.selectClaim(scope, claim);
+    await router.setSitePermission(scope, claim, { ...request, allow: false });
+    router.closeSession(scope);
+    expect(ended()).toHaveLength(2);
   } finally { router.closeAll(); }
 });
 

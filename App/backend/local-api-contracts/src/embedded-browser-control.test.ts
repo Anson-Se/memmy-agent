@@ -11,9 +11,8 @@ it('round trips the exact browser, tab, title, and URL snapshot', () => {
   expect(parseEmbeddedBrowserTabMention(mention.replace('browser@memmy', 'browser@other'))).toBeNull();
 });
 
-it('requires an exact tab ID for a close request', () => {
-  const close = { type: EMBEDDED_BROWSER_REQUEST, requestId: 'test',
-    command: 'closeTab', args: {} };
+it.each(['closeTab', 'endSitePermissions'])('requires an exact tab ID for a %s request', command => {
+  const close = { type: EMBEDDED_BROWSER_REQUEST, requestId: 'test', command, args: {} };
   expect(isEmbeddedBrowserRequest(close)).toBe(false);
   expect(isEmbeddedBrowserRequest({ ...close, tabId: 27 })).toBe(true);
 });

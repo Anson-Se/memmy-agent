@@ -42,6 +42,7 @@ type Binding = {
   agentCreated: boolean;
   retainedUnseen: boolean;
   disposition: 'deliverable' | 'handoff' | null;
+  sitePermissions: boolean;
   usedInTurn: boolean;
   turnRevision: number;
   activityRevision: number;
@@ -307,7 +308,7 @@ export class ExternalBrowserSessionRouter {
       browser: claim.browser, targetId: externalBrowserTargetId(claim), title: claim.title,
       allowedOrigins: options.allowedOrigins ?? new Set(),
       outputDir: fs.mkdtempSync(path.join(os.tmpdir(), "memmy-external-browser-session-")),
-      agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null,
+      agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null, sitePermissions: false,
       usedInTurn: true, turnRevision: 0, activityRevision: 0, inFlight: 0, lastUsed: 0 };
     chat.tabs.set(claimKey(claim), binding);
     this.touch(key, binding);
@@ -421,6 +422,7 @@ export class ExternalBrowserSessionRouter {
           tabMention: formatExternalBrowserTabReference({ ...latest, browser: claim.browser }),
           agentAction: 'Select this task tab, then use Computer Use on this browser to complete its normal permission prompt or change this exact site permission in the browser site controls. Continue the task and verify the page result.' });
       }
+      binding.sitePermissions = true;
       const result = await this.scopedBridge(scope, binding, revision)
         .command(claim, 'setSitePermission', request, signal ?? undefined);
       current();
@@ -761,6 +763,9 @@ export class ExternalBrowserSessionRouter {
       return { binding, usedInTurn, turnRevision: binding.turnRevision,
         activityRevision: binding.activityRevision, lastUsed: binding.lastUsed };
     });
+    // Sent before cleanup yields, so the end reaches the desktop ahead of a next turn's grant.
+    const endedPermissions = ending.filter(({ binding }) => binding.sitePermissions)
+      .map(({ binding }) => this.endSitePermissions(binding));
     this.closeSurfacesForTurn(scope);
     await closeExternalBrowserPlaywrightScope(scope);
     if (!chat) return;
@@ -785,18 +790,26 @@ export class ExternalBrowserSessionRouter {
         binding.retainedUnseen = true;
       } else closing.push(binding);
     }
-    await Promise.allSettled(closing.map(async binding => {
+    await Promise.allSettled([...endedPermissions, ...closing.map(async binding => {
       try {
         const claim = this.bridge.getClaim(binding.identity);
         if (claim) await this.bridge.command(claim, 'closeTab');
       } finally { this.release(key, binding); }
-    }));
+    })]);
+  }
+
+  /** In-app device choices last only for the task that made them on this tab. */
+  private async endSitePermissions(binding: Binding): Promise<void> {
+    binding.sitePermissions = false;
+    try { await this.bridge.command(binding.identity, 'endSitePermissions'); }
+    catch { /* A closed tab or stopped desktop has already ended its choices. */ }
   }
 
   private release(key: string, binding: Binding): void {
     const chat = this.chats.get(key);
     const tabKey = claimKey(binding.identity);
     if (!chat || chat.tabs.get(tabKey) !== binding) return;
+    if (binding.sitePermissions) void this.endSitePermissions(binding);
     chat.tabs.delete(tabKey);
     if (chat.current === tabKey) chat.current = null;
     if (chat.tabs.size === 0) this.chats.delete(key);

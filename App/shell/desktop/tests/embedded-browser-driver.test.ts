@@ -1058,6 +1058,31 @@ it('records only navigations from the attached in-app webview', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+it('ends Agent task device choices when the tab moves to another origin or closes', () => {
+  const { driver, guest, navigate } = harness();
+  const tasks = driver.taskSitePermissions;
+  const origin = 'https://example.com';
+  try {
+    tasks.set(27, origin, 'camera', true, () => true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: `${origin}/room` });
+    navigate(`${origin}/room`);
+    guest.emit('did-navigate');
+    guest.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false, url: 'https://frame.test/' });
+    expect(tasks.decision(27, origin, 'camera')).toBe(true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: 'https://other.test/' });
+    expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+    tasks.set(27, origin, 'camera', true, () => true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: `${origin}/redirect` });
+    navigate('https://other.test/landing');
+    guest.emit('did-navigate');
+    navigate(`${origin}/room`);
+    expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+    tasks.set(27, origin, 'microphone', true, () => true);
+    guest.emit('destroyed');
+    expect(tasks.decision(27, origin, 'microphone')).toBeUndefined();
+  } finally { driver.dispose(); }
+});
+
 it('marks Agent navigations separately from user address-bar navigation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-webview-sources-'));
   try {
