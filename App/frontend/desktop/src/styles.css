@@ -194,7 +194,13 @@ body.memmy-window-fullscreen {
 }
 
 .home-empty-screen {
-  padding-bottom: 8%;
+  padding-block: 24px;
+  overflow-y: auto;
+  justify-content: safe center;
+}
+
+.home-empty-screen > * {
+  flex-shrink: 0;
 }
 
 .home-empty-composer,
@@ -1444,6 +1450,8 @@ body.memmy-window-fullscreen {
 
 .home-empty-status-area {
   min-height: 4.5rem;
+  padding-top: 12px;
+  text-align: center;
 }
 
 .window-drag-region {
@@ -15103,12 +15111,6 @@ body:has(.agent-workspace-layout--preview-open) {
 .home-prompt-suggestions button > span:nth-child(2) {
   min-width: 0;
   flex: 1;
-}
-.home-empty-below {
-  grid-row: 3;
-  align-self: start;
-  width: min(100%, 42rem);
-  padding: 12px 0 28px;
 }
 .home-empty-composer--menu-open {
   z-index: 60;

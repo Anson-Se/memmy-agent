@@ -4233,210 +4233,185 @@ export function HomePage() {
           <div className="home-empty-column">
             <AgentOperationErrorSlot message={agentError} />
             <div className="home-empty-composer-stack">
-                <div ref={setRecordingBarTarget} className="legal-recording-bar-slot" />
-                <PluginCapabilityHost
-                  region="pinned"
-                  onRequestDiagnosis={generateLegalDiagnosis}
-                  onOpenArtifact={openLegalArtifact}
-                  calls={visiblePluginCalls}
-                  plugins={installedPlugins}
-                  client={clients?.plugins ?? null}
-                  uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
-                  asrClient={clients?.asr}
-                  onRecordingSession={setRecordingSession}
-                  onRecordingArchived={archivePluginRecording}
-                  dismissedCallIds={dismissedPluginCalls}
-                  hiddenCallIds={hiddenPluginCalls}
-                  onCallHidden={hidePluginCall}
-                  onRegionWheelOverflow={scrollAgentConversationBy}
-                  onCallDismissed={dismissPluginCall}
-                  answeredInteractions={answeredPluginInteractions}
-                  onInteractionAnswered={rememberPluginInteraction}
-                />
+              <div ref={setRecordingBarTarget} className="legal-recording-bar-slot" />
+              <PluginCapabilityHost
+                region="pinned"
+                onRequestDiagnosis={generateLegalDiagnosis}
+                onOpenArtifact={openLegalArtifact}
+                calls={visiblePluginCalls}
+                plugins={installedPlugins}
+                client={clients?.plugins ?? null}
+                uploadFiles={clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined}
+                asrClient={clients?.asr}
+                onRecordingSession={setRecordingSession}
+                onRecordingArchived={archivePluginRecording}
+                dismissedCallIds={dismissedPluginCalls}
+                hiddenCallIds={hiddenPluginCalls}
+                onCallHidden={hidePluginCall}
+                onRegionWheelOverflow={scrollAgentConversationBy}
+                onCallDismissed={dismissPluginCall}
+                answeredInteractions={answeredPluginInteractions}
+                onInteractionAnswered={rememberPluginInteraction}
+              />
               <div
-                className="relative home-empty-composer agent-composer-shell rounded-card-lg"
+                ref={composerShellRef}
+                className={`relative home-empty-composer agent-composer-shell rounded-card-lg${slashMenuOpen ? " home-empty-composer--menu-open" : ""}`}
                 onDragOver={handleComposerDragOver}
                 onDrop={handleComposerDrop}
               >
-                {slashMenuOpen && (
-                  <div className="absolute left-0 bottom-full mb-3 z-40" style={{ width: "min(448px, 100%)" }}>
-                    <AgentCommandPalette commands={filteredSlashCommands} heading={t("home.commandPalette.commands")} selectedIndex={selectedCommandIndex} onSelect={selectSlashCommand} />
-                  </div>
-                )}
                 {lastCompactionPanel.open && !slashMenuOpen && (
                   <div className="absolute left-0 bottom-full mb-3 z-30 w-full" style={{ right: 0 }}>
                     <AgentStatusPanel state={lastCompactionPanel} closeLabel={t("common.close")} loadingLabel={t("home.agent.connecting")} onClose={closeLastCompactionPanel} />
                   </div>
                 )}
-                <ComposerMediaPreviewStrip
-                  items={pendingAttachments}
-                  onRemove={removePendingMedia}
-                  removeLabel={t("common.remove")}
-                  selectedLabel={t("home.media.addPhotoFile")}
-                  t={t}
+                {pendingAttachments.length || contextChips.length ? (
+                  <div className="composer-context-attachments">
+                    <ComposerMediaPreviewStrip
+                      items={pendingAttachments}
+                      onRemove={removePendingMedia}
+                      removeLabel={t("common.remove")}
+                      selectedLabel={t("home.media.addPhotoFile")}
+                      t={t}
+                    />
+                    <HomeContextChips chips={contextChips} onRemove={removeComposerContextChip} />
+                  </div>
+                ) : null}
+                <ComposerHighlightedTextarea
+                  textareaRef={inputRef}
+                  value={composerInput}
+                  highlightedCommands={slashCommandsWithLocal.map((command) => command.command)}
+                  placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}
+                  rows={3}
+                  onChange={(event) => {
+                    updateComposerInput(
+                      event.target.value,
+                      event.target.selectionStart,
+                      event.target.selectionEnd
+                    );
+                    resizeComposerInput(event.target);
+                  }}
+                  onKeyDown={handleComposerKeyDown}
+                  onPaste={handleComposerPaste}
+                  className="w-full px-5 pt-4 pb-12 text-sm resize-none focus:outline-none rounded-card-lg bg-background-paper placeholder:text-text-ink/40"
                 />
-                <div
-                  ref={composerShellRef}
-                  className={`relative home-empty-composer agent-composer-shell rounded-card-lg${slashMenuOpen ? " home-empty-composer--menu-open" : ""}`}
-                  onDragOver={handleComposerDragOver}
-                  onDrop={handleComposerDrop}
-                >
-                  {lastCompactionPanel.open && !slashMenuOpen && (
-                    <div className="absolute left-0 bottom-full mb-3 z-30 w-full" style={{ right: 0 }}>
-                      <AgentStatusPanel state={lastCompactionPanel} closeLabel={t("common.close")} loadingLabel={t("home.agent.connecting")} onClose={closeLastCompactionPanel} />
-                    </div>
-                  )}
-                  {pendingAttachments.length || contextChips.length ? (
-                    <div className="composer-context-attachments">
-                      <ComposerMediaPreviewStrip
-                        items={pendingAttachments}
-                        onRemove={removePendingMedia}
-                        removeLabel={t("common.remove")}
-                        selectedLabel={t("home.media.addPhotoFile")}
-                        t={t}
-                      />
-                      <HomeContextChips chips={contextChips} onRemove={removeComposerContextChip} />
-                    </div>
-                  ) : null}
-                  <ComposerHighlightedTextarea
-                    textareaRef={inputRef}
-                    value={composerInput}
-                    highlightedCommands={slashCommandsWithLocal.map((command) => command.command)}
-                    placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}
-                    rows={3}
-                    onChange={(event) => {
-                      updateComposerInput(
-                        event.target.value,
-                        event.target.selectionStart,
-                        event.target.selectionEnd
-                      );
-                      resizeComposerInput(event.target);
-                    }}
-                    onKeyDown={handleComposerKeyDown}
-                    onPaste={handleComposerPaste}
-                    className="w-full px-5 pt-4 pb-12 text-sm resize-none focus:outline-none rounded-card-lg bg-background-paper placeholder:text-text-ink/40"
-                  />
-                  {slashMenuOpen && !slashPickerOpen ? (
-                    <ComposerCaretMenu textareaRef={inputRef} containerRef={composerShellRef} value={composerInput}>
-                      <AgentCommandPalette
-                        commands={filteredSlashCommands}
-                        heading={t("home.commandPalette.commands")}
-                        selectedIndex={selectedCommandIndex}
-                        onSelect={selectSlashCommand}
-                      />
-                    </ComposerCaretMenu>
-                  ) : null}
-                  <div className="composer-actions absolute bottom-3 left-4 z-50">
-                    {renderComposerLeadingActions()}
-                  </div>
-                  <div className="composer-actions absolute bottom-3 right-4 z-50">
-                    <AgentModelSelector
-                      mode={modelWorkspaceMode}
-                      scopeKey={modelSelectionScopeKey}
-                      disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}
-                      seedConfig={state.modelConfig}
-                      onDefaultModelSelected={persistDefaultModel}
+                {slashMenuOpen && !slashPickerOpen ? (
+                  <ComposerCaretMenu textareaRef={inputRef} containerRef={composerShellRef} value={composerInput}>
+                    <AgentCommandPalette
+                      commands={filteredSlashCommands}
+                      heading={t("home.commandPalette.commands")}
+                      selectedIndex={selectedCommandIndex}
+                      onSelect={selectSlashCommand}
                     />
-                    <button
-                      type="button"
-                      aria-label={t("home.voiceInput")}
-                      title={t("home.voiceInput")}
-                      disabled={asrRecorder.isTranscribing || asrRecorder.isStarting}
-                      onClick={toggleVoiceInput}
-                      className={`composer-action-btn${asrRecorder.isRecording ? " composer-action-btn--active" : ""}`}
-                    >
-                      {asrRecorder.isRecording ? <Pause size={15} strokeWidth={2} /> : <Mic size={15} strokeWidth={2} />}
-                    </button>
-                    <ComposerSubmitButton
-                      isSending={composerPrimaryAction === "stop"}
-                      disabled={composerSubmitDisabled}
-                      sendLabel={t("home.send")}
-                      stopLabel={t("home.stop")}
-                      onClick={composerPrimaryAction === "stop" ? stopCurrentTurn : () => void sendMessage()}
-                    />
-                  </div>
+                  </ComposerCaretMenu>
+                ) : null}
+                <div className="composer-actions absolute bottom-3 left-4 z-50">
+                  {renderComposerLeadingActions()}
                 </div>
-                <div className="home-composer-toolbar">
-                  <ProjectTargetPicker
-                    open={projectPickerOpen}
-                    target={draftTarget}
-                    selectedProject={selectedDraftProject}
-                    projects={state.agent.projects}
-                    sessions={state.agent.sessions}
-                    registryState={state.agent.projectRegistryState}
-                    disabled={messageSendInFlight || projectPickerOperationId != null}
-                    onToggle={() => setProjectPickerOpen((open) => !open)}
-                    onClose={() => setProjectPickerOpen(false)}
-                    onSelect={selectDraftTarget}
-                    onChooseOther={() => void selectOtherProjectFolder()}
+                <div className="composer-actions absolute bottom-3 right-4 z-50">
+                  <AgentModelSelector
+                    mode={modelWorkspaceMode}
+                    scopeKey={modelSelectionScopeKey}
+                    disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}
+                    seedConfig={state.modelConfig}
+                    onDefaultModelSelected={persistDefaultModel}
                   />
-                  <AgentWorkspaceContext
-                    snapshot={workspaceEnvironment.data?.snapshot ?? null}
-                    branches={workspaceEnvironment.data?.branches ?? []}
-                    loading={workspaceEnvironment.loading}
-                    error={workspaceEnvironment.error}
-                    onSwitchBranch={workspaceEnvironment.switchBranch}
-                    onCreateOrCheckoutBranch={workspaceEnvironment.createOrCheckoutBranch}
+                  <button
+                    type="button"
+                    aria-label={t("home.voiceInput")}
+                    title={t("home.voiceInput")}
+                    disabled={asrRecorder.isTranscribing || asrRecorder.isStarting}
+                    onClick={toggleVoiceInput}
+                    className={`composer-action-btn${asrRecorder.isRecording ? " composer-action-btn--active" : ""}`}
+                  >
+                    {asrRecorder.isRecording ? <Pause size={15} strokeWidth={2} /> : <Mic size={15} strokeWidth={2} />}
+                  </button>
+                  <ComposerSubmitButton
+                    isSending={composerPrimaryAction === "stop"}
+                    disabled={composerSubmitDisabled}
+                    sendLabel={t("home.send")}
+                    stopLabel={t("home.stop")}
+                    onClick={composerPrimaryAction === "stop" ? stopCurrentTurn : () => void sendMessage()}
                   />
                 </div>
               </div>
-              {pluginScenarios.length > 0 ? (
-                /*
-                  An installed plugin replaces the generic starters rather than
-                  queueing behind them: someone who has the plugin installed is
-                  here for its scenarios, and stacking both sets buries them.
-                */
-                <div className="home-scenario-cards" aria-label={t("home.empty")}>
-                  {pluginScenarios.map((scenario) => {
-                    const Icon = resolveContributionIcon(scenario.icon);
-                    return (
-                      <button
-                        key={`${scenario.pluginId}:${scenario.id}`}
-                        type="button"
-                        className="home-scenario-card"
-                        onClick={() => selectHomeSuggestion(scenario.prompt)}
-                      >
-                        <span className="home-scenario-card__icon" aria-hidden="true"><Icon size={16} /></span>
-                        <span className="home-scenario-card__body">
-                          <span className="home-scenario-card__title">{scenario.name}</span>
-                          <span className="home-scenario-card__description">{scenario.description}</span>
-                        </span>
-                        <span className="home-scenario-card__cta" aria-hidden="true">
-                          {t("home.scenario.try")}
-                          <ArrowRight size={12} />
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="home-prompt-suggestions" aria-label={t("home.empty")}>
-                  <button
-                    type="button"
-                    onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.one"))}
-                  >
-                    <span className="home-prompt-suggestions__icon" aria-hidden="true"><BookOpenText size={15} /></span>
-                    <span>{t("home.suggestion.one")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.two"))}
-                  >
-                    <span className="home-prompt-suggestions__icon" aria-hidden="true"><CalendarCheck2 size={15} /></span>
-                    <span>{t("home.suggestion.two")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.three"))}
-                  >
-                    <span className="home-prompt-suggestions__icon" aria-hidden="true"><History size={15} /></span>
-                    <span>{t("home.suggestion.three")}</span>
-                  </button>
-                </div>
-              )}
+              <div className="home-composer-toolbar">
+                <ProjectTargetPicker
+                  open={projectPickerOpen}
+                  target={draftTarget}
+                  selectedProject={selectedDraftProject}
+                  projects={state.agent.projects}
+                  sessions={state.agent.sessions}
+                  registryState={state.agent.projectRegistryState}
+                  disabled={messageSendInFlight || projectPickerOperationId != null}
+                  onToggle={() => setProjectPickerOpen((open) => !open)}
+                  onClose={() => setProjectPickerOpen(false)}
+                  onSelect={selectDraftTarget}
+                  onChooseOther={() => void selectOtherProjectFolder()}
+                />
+                <AgentWorkspaceContext
+                  snapshot={workspaceEnvironment.data?.snapshot ?? null}
+                  branches={workspaceEnvironment.data?.branches ?? []}
+                  loading={workspaceEnvironment.loading}
+                  error={workspaceEnvironment.error}
+                  onSwitchBranch={workspaceEnvironment.switchBranch}
+                  onCreateOrCheckoutBranch={workspaceEnvironment.createOrCheckoutBranch}
+                />
+              </div>
             </div>
-          </div>
-          <div className="home-empty-below">
+            {pluginScenarios.length > 0 ? (
+              /*
+                An installed plugin replaces the generic starters rather than
+                queueing behind them: someone who has the plugin installed is
+                here for its scenarios, and stacking both sets buries them.
+              */
+              <div className="home-scenario-cards" aria-label={t("home.empty")}>
+                {pluginScenarios.map((scenario) => {
+                  const Icon = resolveContributionIcon(scenario.icon);
+                  return (
+                    <button
+                      key={`${scenario.pluginId}:${scenario.id}`}
+                      type="button"
+                      className="home-scenario-card"
+                      onClick={() => selectHomeSuggestion(scenario.prompt)}
+                    >
+                      <span className="home-scenario-card__icon" aria-hidden="true"><Icon size={16} /></span>
+                      <span className="home-scenario-card__body">
+                        <span className="home-scenario-card__title">{scenario.name}</span>
+                        <span className="home-scenario-card__description">{scenario.description}</span>
+                      </span>
+                      <span className="home-scenario-card__cta" aria-hidden="true">
+                        {t("home.scenario.try")}
+                        <ArrowRight size={12} />
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="home-prompt-suggestions" aria-label={t("home.empty")}>
+                <button
+                  type="button"
+                  onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.one"))}
+                >
+                  <span className="home-prompt-suggestions__icon" aria-hidden="true"><BookOpenText size={15} /></span>
+                  <span>{t("home.suggestion.one")}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.two"))}
+                >
+                  <span className="home-prompt-suggestions__icon" aria-hidden="true"><CalendarCheck2 size={15} /></span>
+                  <span>{t("home.suggestion.two")}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => selectHomeSuggestion(t("home.suggestionPrompt.three"))}
+                >
+                  <span className="home-prompt-suggestions__icon" aria-hidden="true"><History size={15} /></span>
+                  <span>{t("home.suggestion.three")}</span>
+                </button>
+              </div>
+            )}
             <div className="home-empty-status-area">
               {statusText && <p className="text-center text-xs text-text-ink/45 mt-3">{statusText}</p>}
               <p className="text-center text-[11px] text-text-ink/40 mt-3">{t("home.notice")}</p>
