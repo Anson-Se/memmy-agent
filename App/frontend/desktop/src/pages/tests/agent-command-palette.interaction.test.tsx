@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
-import { AgentCommandPalette, filterSlashCommands } from "../agent-command-palette.js";
+import { AgentCommandPalette, defaultSlashCommandIndex, filterSlashCommands } from "../agent-command-palette.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -30,6 +30,19 @@ it("scrolls to and selects commands beyond the initial visible rows", () => {
     expect(scrollIntoView.mock.contexts[0]).toBe(selected);
     act(() => selected.click());
     expect(onSelect).toHaveBeenCalledWith(commands[8]);
+
+    const goalMatches = filterSlashCommands(commands, "goal", []);
+    scrollIntoView.mockClear();
+    act(() => root.render(<AgentCommandPalette commands={goalMatches} heading="Commands" selectedIndex={defaultSlashCommandIndex("goal", goalMatches.length)} onSelect={onSelect} />));
+    const goalOptions = container.querySelectorAll<HTMLButtonElement>('[role="option"]');
+    const closest = goalOptions[goalOptions.length - 1]!;
+    expect(goalOptions).toHaveLength(9);
+    expect(closest.getAttribute("aria-selected")).toBe("true");
+    expect(closest.querySelector(".font-mono")?.textContent).toBe("/goal");
+    expect(scrollIntoView.mock.contexts[0]).toBe(closest);
+    expect(container.textContent).toContain("/goal pause");
+    act(() => closest.click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ command: "/goal" }));
   } finally {
     act(() => root.unmount());
     container.remove();

@@ -4,6 +4,7 @@ import { enUSMessages, zhCNMessages } from "../../i18n/messages.js";
 import {
   AgentCommandPalette,
   buildVisibleSlashCommands,
+  defaultSlashCommandIndex,
   filterSlashCommands,
   localizeSlashCommands,
   readRecentSlashCommands,
@@ -60,9 +61,9 @@ describe("AgentCommandPalette", () => {
       "/goal budget ": ["none"]
     };
     for (const [prefix, suffixes] of Object.entries(expected)) {
-      expect(match(prefix).map((item) => item.command)).toEqual(suffixes.map((suffix) => prefix + suffix));
+      expect(match(prefix).map((item) => item.command)).toEqual(suffixes.map((suffix) => prefix + suffix).sort((a, b) => b.length - a.length));
       for (const suffix of suffixes) {
-        expect(match(prefix + suffix).map((item) => item.command)).toEqual([prefix + suffix]);
+        expect(match(prefix + suffix).at(-1)?.command).toBe(prefix + suffix);
         expect(match(prefix + suffix[0]).map((item) => item.command)).toContain(prefix + suffix);
       }
     }
@@ -76,12 +77,41 @@ describe("AgentCommandPalette", () => {
     expect(filterSlashCommands([], "goal p", [])).toEqual([]);
   });
 
+  it("expands exact parent commands without a space and places exact matches last", () => {
+    const available = ["/goal", "/pairing", "/model"].map((command) => ({
+      command, title: command, description: "", icon: "activity", argHint: ""
+    }));
+    const match = (query: string) => filterSlashCommands(available, query, []).map((item) => item.command);
+    expect(match("goal")).toEqual([
+      "/goal status", "/goal create", "/goal resume", "/goal budget",
+      "/goal pause", "/goal clear", "/goal help", "/goal edit", "/goal"
+    ]);
+    expect(match("goal ")).not.toContain("/goal");
+    expect(match("goal budget")).toEqual(["/goal budget none", "/goal budget"]);
+    expect(match("goal budget ")).toEqual(["/goal budget none"]);
+    expect(match("pairing")).toEqual(["/pairing approve", "/pairing revoke", "/pairing list", "/pairing deny", "/pairing"]);
+    expect(match("model")).toEqual(["/model list", "/model"]);
+  });
+
+  it("places closer prefix matches nearest the input and selects the bottom result", () => {
+    const available = ["/history", "/history-dag"].map((command) => ({
+      command, title: command, description: "", icon: "activity", argHint: ""
+    }));
+    for (const query of ["h", "history"]) {
+      const matches = filterSlashCommands(available, query, []);
+      expect(matches.map((item) => item.command)).toEqual(["/history-dag", "/history"]);
+      expect(matches[defaultSlashCommandIndex(query, matches.length)]?.command).toBe("/history");
+    }
+    expect(defaultSlashCommandIndex("", 5)).toBe(0);
+    expect(defaultSlashCommandIndex("missing", 0)).toBe(0);
+  });
+
   it("matches available model preset names without changing their case", () => {
     const presets = [
       { name: "FastModel", available: true },
       { name: "unavailable", available: false }
     ];
-    expect(filterSlashCommands(commands, "model ", [], presets).map((item) => item.command)).toEqual(["/model list", "/model FastModel"]);
+    expect(filterSlashCommands(commands, "model ", [], presets).map((item) => item.command)).toEqual(["/model FastModel", "/model list"]);
     expect(filterSlashCommands(commands, "model fa", [], presets)[0]).toMatchObject({ command: "/model FastModel", argHint: "" });
     expect(filterSlashCommands(commands, "model un", [], presets)).toEqual([]);
     expect(filterSlashCommands(commands, "model FastModel ", [], presets)).toEqual([]);
@@ -122,7 +152,7 @@ describe("AgentCommandPalette", () => {
       { command: "/new", title: "New chat", description: "Stop the current task and start a fresh conversation.", icon: "square-pen", argHint: "" }
     ];
     for (const isSending of [false, true]) {
-      for (const [input, expected] of [["/s", ["/stop", "/status"]], ["/stop", ["/stop"]]] as const) {
+      for (const [input, expected] of [["/s", ["/status", "/stop"]], ["/stop", ["/stop"]]] as const) {
         const query = slashQueryFromInput(input)!;
         const visible = buildVisibleSlashCommands(available, isSending, stopCommand, query);
         expect(filterSlashCommands(visible, query, []).map((command) => command.command)).toEqual(expected);

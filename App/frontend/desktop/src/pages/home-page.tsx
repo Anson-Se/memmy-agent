@@ -55,6 +55,7 @@ import { createModelWorkspace, defaultModelSelectionInput, resolveModelSelection
 import {
   AgentCommandPalette,
   buildVisibleSlashCommands,
+  defaultSlashCommandIndex,
   filterSlashCommands,
   localizeSlashCommands,
   readRecentSlashCommands,
@@ -1587,10 +1588,8 @@ export function HomePage() {
   const composerSubmitDisabled = composerPrimaryAction === "stop" ? composerStopDisabled : composerSendDisabled;
 
   useEffect(() => {
-    if (selectedCommandIndex >= filteredSlashCommands.length) {
-      setSelectedCommandIndex(0);
-    }
-  }, [filteredSlashCommands.length, selectedCommandIndex]);
+    setSelectedCommandIndex(defaultSlashCommandIndex(slashQuery, filteredSlashCommands.length));
+  }, [slashQuery, filteredSlashCommands.length]);
 
   useEffect(() => {
     composerDraftsRef.current = composerDrafts;
@@ -2122,7 +2121,6 @@ export function HomePage() {
   function updateComposerInput(value: string) {
     setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, value));
     setSlashMenuDismissed(false);
-    setSelectedCommandIndex(0);
     if (
       slashQueryFromInput(value) != null &&
       clients?.memmyAgent &&

@@ -227,28 +227,39 @@ export function filterSlashCommands(
   modelPresets: ReadonlyArray<{ name: string; available: boolean }> = []
 ): SlashCommandPaletteItem[] {
   const normalizedQuery = query.toLowerCase().replace(/[\t ]+/g, " ");
-  if (normalizedQuery.includes(" ")) {
-    const [root] = normalizedQuery.split(" ");
-    const parent = commands.find((command) => command.command.toLowerCase() === `/${root}`);
-    if (!parent) return [];
-    const suffixes = [...(SUBCOMMANDS[parent.command.toLowerCase()] ?? [])];
-    if (parent.command === "/model") {
-      for (const preset of modelPresets) {
-        if (preset.available && !/\s/.test(preset.name) && preset.name.toLowerCase() !== "list") {
-          suffixes.push([preset.name, ""]);
-        }
+  if (!normalizedQuery) return sortByRecent(commands, recentCommands);
+
+  const [root] = normalizedQuery.split(" ");
+  const parent = commands.find((command) => command.command.toLowerCase() === `/${root}`);
+  const suffixes = [...(SUBCOMMANDS[parent?.command.toLowerCase() ?? ""] ?? [])];
+  if (parent?.command === "/model") {
+    for (const preset of modelPresets) {
+      if (preset.available && !/\s/.test(preset.name) && preset.name.toLowerCase() !== "list") {
+        suffixes.push([preset.name, ""]);
       }
     }
-    const depth = normalizedQuery.split(" ").length - 1;
-    return suffixes
-      .filter(([suffix]) => suffix.split(" ").length === depth)
-      .map(([suffix, argHint]) => ({ ...parent, command: `${parent.command} ${suffix}`, argHint }))
-      .filter((command) => commandMatchesQuery(command, normalizedQuery));
   }
-  const matched = normalizedQuery
-    ? commands.filter((command) => commandMatchesQuery(command, normalizedQuery))
-    : sortByRecent(commands, recentCommands);
-  return matched;
+  const descendants = parent ? suffixes.map(([suffix, argHint]) => ({
+    ...parent, command: `${parent.command} ${suffix}`, argHint
+  })) : [];
+  const depth = normalizedQuery.split(" ").length;
+  const candidates = depth === 1 ? commands : descendants.filter((command) => command.command.split(" ").length === depth);
+  const matched = candidates.filter((command) => commandMatchesQuery(command, normalizedQuery));
+
+  // Expand a complete command immediately, without requiring a trailing space.
+  if (matched.some((command) => command.command.toLowerCase() === `/${normalizedQuery}`)) {
+    matched.push(...descendants.filter((command) =>
+      command.command.split(" ").length === depth + 1
+      && command.command.toLowerCase().startsWith(`/${normalizedQuery} `)
+    ));
+  }
+
+  // Suggestions open above the input: the shortest remaining completion is closest.
+  return matched.sort((left, right) => right.command.length - left.command.length);
+}
+
+export function defaultSlashCommandIndex(query: string | null, count: number): number {
+  return query ? Math.max(0, count - 1) : 0;
 }
 
 export function readRecentSlashCommands(storage: SlashCommandStorageLike | null = browserStorage()): string[] {
