@@ -108,9 +108,9 @@ describe("isolated passive browser History transport", () => {
     for (const ancestorOrigins of [undefined, [], "https://work.test", ["https://bank.test"], ["https://work.test", "https://bank.test"],
       ["null", "https://work.test"], ["chrome-extension://bank", "https://work.test"], ["https://bank.test/", "https://work.test"],
       [7, "https://work.test"], Array(33).fill("https://work.test")]) {
-      expect(await test.invoke({ type: "memmy_history_config", ancestorOrigins }, nested)).toMatchObject({ enabled: false });
+      expect(await test.invoke({ type: "memmy_history_config", ancestorOrigins }, nested)).toEqual({ enabled: false, idle: true });
     }
-    expect(await test.configure(sender(), ["https://work.test"])).toMatchObject({ enabled: false });
+    expect(await test.configure(sender(), ["https://work.test"])).toEqual({ enabled: false, idle: true });
     expect(test.authorizations()).toBe(0);
     expect(await test.configure(nested, ["https://bank.test", "https://work.test"])).toMatchObject({ enabled: true });
   });

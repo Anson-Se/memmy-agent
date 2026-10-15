@@ -130,7 +130,8 @@
       const disabled = { enabled: false };
       if (!context) return { enabled: false, idle: sender?.tab?.active !== true };
       context.ancestorOrigins = ancestry(ancestorOrigins, context.frameId, context.topUrl);
-      if (!context.ancestorOrigins) return disabled;
+      // A document's ancestry does not change, so rechecking would not help.
+      if (!context.ancestorOrigins) return { enabled: false, idle: true };
       const authorization = await requestAuthorization(context);
       const fresh = await contextFor(sender);
       if (!fresh || fresh.epoch !== context.epoch || fresh.topUrl !== context.topUrl || fresh.frameUrl !== context.frameUrl
