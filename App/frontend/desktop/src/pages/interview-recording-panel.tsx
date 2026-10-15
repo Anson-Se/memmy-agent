@@ -26,13 +26,14 @@ export interface RecordingPanelTranscript {
 /** Everything the panel needs to render, published by the recording card. */
 export interface RecordingPanelSession {
   title: string;
-  status: "recording" | "paused" | "transcribing" | "done";
+  status: "idle" | "starting" | "recording" | "paused" | "transcribing" | "done";
   elapsedMs: number;
   /** Provisional lines from the in-progress recording, ordered by offset. */
   lines: AsrLiveLine[];
   transcript: RecordingPanelTranscript | null;
   /** Object URL of the finished recording, for playback. */
   audioUrl: string | null;
+  onStart?(): void;
   onPause(): void;
   onResume(): void;
   onFinish(): void;
@@ -72,6 +73,7 @@ export interface InterviewRecordingPanelProps {
 export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): ReactNode {
   const { t } = useTranslation();
   const session = props.session;
+  const [seek, setSeek] = useState<{ ms: number; sequence: number } | undefined>();
   const recording = session !== null && (session.status === "recording" || session.status === "paused");
   const heading = props.title ?? session?.title ?? t("recording.page.title");
   const close = props.onClose ?? session?.onClose;
@@ -86,8 +88,11 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
   });
 
   useEffect(() => {
+    // The hidden recorder outlives its interview; only the visible pane owns
+    // the width used to place the conversation controls beside the divider.
+    if (props.hidden) return;
     props.onWidthChange?.(resize.appliedWidth);
-  }, [resize.appliedWidth, props.onWidthChange]);
+  }, [resize.appliedWidth, props.onWidthChange, props.hidden]);
 
   return (
     <>
@@ -101,12 +106,12 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
         onResizeBy={resize.resizeBy}
       />}
       <aside
-        className="workspace-artifact-preview-pane workspace-artifact-preview-pane--lifted"
+        className="workspace-artifact-preview-pane workspace-artifact-preview-pane--lifted workspace-artifact-preview-pane--recording"
         hidden={props.hidden}
         style={{ ...resize.sidebarStyle, ...(props.hidden ? { display: "none" } : {}) }}
         aria-label={heading}
       >
-      <header className="workspace-artifact-preview-toolbar">
+      <header className="recording-panel__toolbar">
         <button
           type="button"
           className="workspace-artifact-file-browser__toggle"
@@ -117,9 +122,9 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
           <ChevronLeft size={16} aria-hidden="true" />
         </button>
         <p className="recording-panel__heading">{heading}</p>
-        <div className="workspace-artifact-preview-toolbar__actions">
+        <div className="recording-panel__toolbar-actions">
           {recording && session ? (
-            <>
+            <div className="recording-panel__controls">
               <button type="button" className="recording-panel__action" onClick={() => (session.status === "paused" ? session.onResume() : session.onPause())}>
                 {session.status === "paused" ? <Play size={13} aria-hidden="true" /> : <Pause size={13} aria-hidden="true" />}
                 <span>{session.status === "paused" ? t("plugin.ui.audio.resume") : t("plugin.ui.audio.pause")}</span>
@@ -128,9 +133,9 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
                 <Square size={12} aria-hidden="true" />
                 <span>{t("plugin.ui.audio.stop")}</span>
               </button>
-            </>
+            </div>
           ) : null}
-          {props.toolbarEnd}
+          {props.toolbarEnd ? <div className="recording-panel__toolbar-end">{props.toolbarEnd}</div> : null}
         </div>
       </header>
 
@@ -151,12 +156,12 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
           </div>
         ) : null}
 
-        {session?.audioUrl ? <RecordingPlayer src={session.audioUrl} durationMs={session.elapsedMs} /> : null}
+        {session?.audioUrl ? <RecordingPlayer src={session.audioUrl} durationMs={session.elapsedMs} seek={seek} /> : null}
 
         {session?.transcript ? (
           <>
             <p className="recording-panel__section">{t("plugin.ui.audio.transcript")}</p>
-            <TranscriptTurns transcript={session.transcript} />
+            <TranscriptTurns transcript={session.transcript} onSeek={session.audioUrl ? (ms) => setSeek((current) => ({ ms, sequence: (current?.sequence ?? 0) + 1 })) : undefined} />
           </>
         ) : session ? (
           <LiveLines lines={session.lines} pending={session.status === "transcribing"} pendingLabel={t("plugin.ui.audio.transcribing")} />
@@ -196,7 +201,7 @@ function LiveLines(props: { lines: AsrLiveLine[]; pending: boolean; pendingLabel
 }
 
 /** The finished transcript, grouped into speaker turns. */
-function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): ReactNode {
+export function TranscriptTurns(props: { transcript: RecordingPanelTranscript; onSeek?: (ms: number) => void }): ReactNode {
   const { t } = useTranslation();
   const turns = useMemo(() => groupSpeakerTurns(props.transcript.segments), [props.transcript.segments]);
 
@@ -216,7 +221,7 @@ function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): React
               {t("plugin.ui.audio.speakerLabel", { index: (turn.speakerId ?? 0) + 1 })}
             </span>
             {turn.startMs === undefined ? null : (
-              <span className="recording-panel__turn-time">{formatClock(turn.startMs)}</span>
+              <button type="button" className="recording-panel__turn-time" disabled={!props.onSeek} onClick={() => props.onSeek?.(turn.startMs!)}>{formatClock(turn.startMs)}</button>
             )}
           </div>
           <p className="recording-panel__turn-text">{turn.text}</p>
@@ -227,13 +232,22 @@ function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): React
 }
 
 /** Playback control for the finished recording. */
-export function RecordingPlayer(props: { src: string; durationMs?: number }): ReactNode {
+export function RecordingPlayer(props: { src: string; durationMs?: number; seek?: { ms: number; sequence: number } }): ReactNode {
   const { t } = useTranslation();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
   const [durationMs, setDurationMs] = useState(props.durationMs ?? 0);
   useEffect(() => { setPlaying(false); setCurrentMs(0); setDurationMs(props.durationMs ?? 0); }, [props.src, props.durationMs]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !props.seek) return;
+    const nextMs = Math.min(Math.max(0, props.seek.ms), durationMs || props.seek.ms);
+    audio.currentTime = nextMs / 1000;
+    setCurrentMs(nextMs);
+    void audio.play().catch(() => setPlaying(false));
+  }, [props.seek]);
 
   return (
     <div className="recording-panel__player">
@@ -261,7 +275,7 @@ export function RecordingPlayer(props: { src: string; durationMs?: number }): Re
           const audio = audioRef.current;
           if (!audio) return;
           if (playing) audio.pause();
-          else void audio.play();
+          else void audio.play().catch(() => setPlaying(false));
         }}
       >
         {playing ? <Pause size={14} aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
@@ -274,6 +288,7 @@ export function RecordingPlayer(props: { src: string; durationMs?: number }): Re
         max={Math.max(durationMs, 1)}
         value={Math.min(currentMs, durationMs)}
         aria-label={t("plugin.ui.audio.seek")}
+        style={{ background: `linear-gradient(to right, var(--color-action-sky) ${durationMs ? currentMs / durationMs * 100 : 0}%, var(--color-border-stone) 0%)` }}
         onChange={(event) => {
           const audio = audioRef.current;
           const nextMs = Number(event.target.value);

@@ -123,7 +123,9 @@ describe("independent interview recording entries", () => {
     // Silent recording uses actual zero levels, never the decorative idle wave.
     expect(Array.from(container.querySelectorAll<HTMLElement>(".recording-waveform__bar"))
       .every((bar) => bar.style.height === "8%")).toBe(true);
-    await click('[data-testid="topbar"]');
+    expect(current.open).toBe(true);
+    expect(current.session.view).toBe("live");
+    await act(async () => current.session.back());
     expect(current.session.view).toBe("list");
     expect(container.querySelector(".recording-page__list-row--active")).not.toBeNull();
     await act(async () => current.session.showLive());
@@ -150,12 +152,31 @@ describe("independent interview recording entries", () => {
       await click('.recording-entry-card .recording-bar__button--primary');
     }
     expect(current.session.recordings).toHaveLength(2);
-    await click('[data-testid="topbar"]');
+    await act(async () => current.session.back());
     expect(container.querySelectorAll(".recording-page__list-row")).toHaveLength(2);
     expect(container.textContent).not.toContain("补充诊断材料");
     expect(invokePlugin).not.toHaveBeenCalled();
     expect(deliver).not.toHaveBeenCalled();
     expect(recorder.start).toHaveBeenCalledTimes(2);
+  });
+
+  it("renames a recording and keeps the title in its list and detail view", async () => {
+    await click(pinned);
+    await click('.recording-entry-card .recording-bar__button--primary');
+    await click('.recording-entry-card .recording-bar__button--primary');
+    await act(async () => current.session.back());
+    await click('.recording-page__rename-trigger');
+    const field = container.querySelector<HTMLInputElement>('.recording-page__rename input')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(field, "企业现场访谈");
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => field.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" })));
+    expect(current.session.recordings[0]!.title).toBe("企业现场访谈");
+    await click('.recording-page__list-open');
+    expect(container.querySelector('.recording-page__title')?.textContent).toBe("企业现场访谈");
+    await act(async () => current.session.back());
+    expect(container.querySelector('.recording-page__list-title')?.textContent).toBe("企业现场访谈");
   });
 
   it("still invokes a material command that shares the capability but has no recording entry", async () => {

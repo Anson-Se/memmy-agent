@@ -13,7 +13,7 @@
  * on its row. Agent-requested recording cards remain separate inputs.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronLeft, Mic, Pause, Play, Plus, Sparkles, Square, Upload, X } from "lucide-react";
+import { ChevronLeft, Check, Pencil, Mic, Pause, Play, Plus, Sparkles, Square, Upload, X } from "lucide-react";
 import type { AsrTranscriptSegment } from "@memmy/local-api-contracts";
 import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
@@ -21,7 +21,7 @@ import type { I18nContextValue } from "../i18n/i18n-provider.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { mergeLiveLines, type AsrLiveLine } from "../lib/asr-live-transcription.js";
 import type { RecordingPanelTranscript } from "./interview-recording-panel.js";
-import { formatClock, groupSpeakerTurns, RecordingPlayer } from "./interview-recording-panel.js";
+import { formatClock, RecordingPlayer, TranscriptTurns } from "./interview-recording-panel.js";
 import { blobToAudioBase64, isLiveAsrTimeout, useAsrRecorder } from "./asr-recorder.js";
 import { pushWaveformLevel } from "../lib/audio-pcm-tap.js";
 import { persistRecording } from "../lib/recording-deliverables.js";
@@ -54,6 +54,8 @@ export interface RecordingArchiveEntry {
   audioPath?: string;
   sessionKey?: string;
   files?: UploadedAgentMedia[];
+  /** The plugin acknowledged these files as diagnostic materials. */
+  collected?: boolean;
   /** The row can exist before ASR has finished, or when ASR failed. */
   status?: "transcribing" | "ready" | "failed";
 }
@@ -91,6 +93,7 @@ export interface RecordingEntrySession {
   deliver(entry: RecordingArchiveEntry, mode: RecordingDelivery): void;
   /** Forgets the recording that just finished, ready for the next one. */
   reset(): void;
+  rename?(entry: RecordingArchiveEntry, title: string): void;
 }
 
 export interface RecordingEntryController {
@@ -127,7 +130,7 @@ export function useRecordingEntry(
   asrClient: AsrClient | undefined,
   uploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>,
   deliver?: RecordingDeliverFn,
-  archiveOptions?: { scope: string; sessionKey?: string; resolveAudio(entry: RecordingArchiveEntry): Promise<string | null> }
+  archiveOptions?: { scope: string; sessionKey?: string; onArchived?(entry: RecordingArchiveEntry): void; resolveAudio(entry: RecordingArchiveEntry): Promise<string | null> }
 ): RecordingEntryController {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -239,6 +242,7 @@ export function useRecordingEntry(
           ...(archiveOptions?.sessionKey ? { sessionKey: archiveOptions.sessionKey } : {}) };
         setLive(kept);
         archive(kept);
+        archiveOptions?.onArchived?.(kept);
       } catch (caught) {
         // The recorder surfaces its own message through `recorder.error`, which
         // the page shows. Keep the stopped audio in the list so returning to
@@ -252,11 +256,12 @@ export function useRecordingEntry(
         finishInFlight.current = false;
       }
     })();
-  }, [elapsedMs, recorder, t, uploadFiles, archive, archiveOptions?.sessionKey]);
+  }, [elapsedMs, recorder, t, uploadFiles, archive, archiveOptions?.sessionKey, archiveOptions?.onArchived]);
 
   const start = useCallback(() => {
     if (!asrClient || startInFlight.current || finishInFlight.current || recorder.isRecording || recorder.isStarting || recorder.isTranscribing) return;
     startInFlight.current = true;
+    setOpen(true);
     setLevels([]);
     setError(null);
     setLive(null);
@@ -308,7 +313,7 @@ export function useRecordingEntry(
         const kept = { ...entry, audioUrl: files.audio?.url ?? audioUrl, files: keptFiles,
           ...(files.audio ? { audioPath: files.audio.path } : {}),
           ...(archiveOptions?.sessionKey ? { sessionKey: archiveOptions.sessionKey } : {}) };
-        setLive(kept); setDeliverables(keptFiles); archive(kept);
+        setLive(kept); setDeliverables(keptFiles); archive(kept); archiveOptions?.onArchived?.(kept);
         if (viewRef.current === "live") {
           viewRef.current = "transcript";
           setView("transcript");
@@ -319,7 +324,7 @@ export function useRecordingEntry(
         setView("list");
       }
     })();
-  }, [asrClient, t, uploadFiles, archive, archiveOptions?.sessionKey]);
+  }, [asrClient, t, uploadFiles, archive, archiveOptions?.sessionKey, archiveOptions?.onArchived]);
 
   const reset = useCallback(() => {
     setLive(null);
@@ -392,6 +397,15 @@ export function useRecordingEntry(
       setView("transcript");
     },
     upload,
+    rename: (entry, title) => {
+      const cleaned = title.trim().slice(0, 80);
+      if (!cleaned || cleaned === entry.title) return;
+      const updated = { ...entry, title: cleaned };
+      archive(updated);
+      setRecordings((current) => current.map((row) => row.id === entry.id ? updated : row));
+      setLive((current) => current?.id === entry.id ? { ...current, title: cleaned } : current);
+      setOpened((current) => current?.id === entry.id ? { ...current, title: cleaned } : current);
+    },
     deliver: (entry, mode) => {
       // The file is written with the speaker labels the UI shows, so it reads
       // the same in the conversation as it did on the page.
@@ -400,7 +414,7 @@ export function useRecordingEntry(
     reset
   }), [
     asrClient, deliverables, elapsedMs, error, finish, lines, levels, live, opened, recorder, allRecordings, archiveOptions,
-    reset, start, status, t, upload, deliver, view
+    reset, start, status, t, upload, deliver, view, archive
   ]);
 
   return {
@@ -456,10 +470,18 @@ export function RecordingEntryCard(props: {
  * @param props The live session and the panel chrome it shares with the preview.
  * @returns The page.
  */
-export function RecordingEntryPage(props: { session: RecordingEntrySession }): ReactNode {
+export function RecordingEntryPage(props: {
+  session: RecordingEntrySession;
+  onStart?: () => void;
+  externalRecording?: { title: string; elapsedMs: number; status: string; onOpen(): void };
+  uploadBlocked?: boolean;
+}): ReactNode {
   const { t } = useTranslation();
   const session = props.session;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const finishRename = (entry: RecordingArchiveEntry) => { session.rename?.(entry, renameValue); setRenaming(null); };
   // While ASR is pending, the active row above is the single source of truth.
   // Hide its archive copy until the final transcript replaces it, so returning
   // to the list never produces two rows for the same recording.
@@ -476,15 +498,15 @@ export function RecordingEntryPage(props: { session: RecordingEntrySession }): R
           <span>{t("recording.page.list")}</span>
         </div>
         <div className="recording-page__controls">
-          <button type="button" className="recording-panel__action" disabled={session.status !== "idle"} onClick={() => fileInputRef.current?.click()}>
+          <button type="button" className="recording-panel__action" disabled={session.status !== "idle" || props.uploadBlocked || Boolean(props.externalRecording)} onClick={() => fileInputRef.current?.click()}>
             <Upload size={13} aria-hidden="true" />
             <span>{t("recording.page.upload")}</span>
           </button>
           <button
             type="button"
             className="recording-panel__action recording-panel__action--primary"
-            disabled={session.status !== "idle"}
-            onClick={session.start}
+            disabled={session.status !== "idle" || Boolean(props.externalRecording)}
+            onClick={props.onStart ?? session.start}
           >
             <Mic size={13} aria-hidden="true" />
             <span>{t("plugin.ui.audio.start")}</span>
@@ -503,6 +525,14 @@ export function RecordingEntryPage(props: { session: RecordingEntrySession }): R
         }}
       />
       {session.error ? <p className="recording-page__error" role="alert">{session.error}</p> : null}
+      {props.externalRecording ? <ul className="recording-page__list"><li className="recording-page__list-row recording-page__list-row--active">
+        <button type="button" className="recording-page__list-open" onClick={props.externalRecording.onOpen}>
+          <span className="recording-page__list-icon"><Mic size={15} /></span>
+          <span className="recording-page__list-body"><span className="recording-page__list-title">{props.externalRecording.title}</span>
+            <span className="recording-page__list-meta">{t(props.externalRecording.status === "paused" ? "plugin.ui.audio.paused" : props.externalRecording.status === "transcribing" ? "plugin.ui.audio.transcribing" : "plugin.ui.audio.recording")} · {formatClock(props.externalRecording.elapsedMs)}</span>
+          </span>
+        </button>
+      </li></ul> : null}
       {session.status !== "idle" ? (
         <ul className="recording-page__list" aria-label={t("recording.page.title")}>
           <li className="recording-page__list-row recording-page__list-row--active">
@@ -525,8 +555,8 @@ export function RecordingEntryPage(props: { session: RecordingEntrySession }): R
           </li>
         </ul>
       ) : null}
-      {session.status === "idle" && archiveRows.length === 0 ? (
-        <p className="recording-page__hint">{t("recording.page.hint")}</p>
+      {session.status === "idle" && !props.externalRecording && archiveRows.length === 0 ? (
+        <div className="recording-page__empty"><Mic size={28} aria-hidden="true" /><strong>{t("recording.page.list")}</strong><p className="recording-page__hint">{t("recording.page.hint")}</p></div>
       ) : archiveRows.length > 0 ? (
         <ul className="recording-page__list">
           {archiveRows.map((row) => {
@@ -535,9 +565,9 @@ export function RecordingEntryPage(props: { session: RecordingEntrySession }): R
             return (
               <li key={row.id} className="recording-page__list-row">
                 <button type="button" className="recording-page__list-open" onClick={() => session.open(row)}>
-                  <span className="recording-page__list-icon" aria-hidden="true"><Mic size={15} /></span>
+                  <span className="recording-page__list-icon" aria-hidden="true"><Play size={15} /></span>
                   <span className="recording-page__list-body">
-                    <span className="recording-page__list-title">{row.title}</span>
+                    <span className="recording-page__list-title">{renaming === row.id ? renameValue : row.title}</span>
                     <span className="recording-page__list-meta">
                       <span>{pending ? t("plugin.ui.audio.transcribing") : failed ? t("recording.page.transcriptionFailed") : formatRecordedAt(row.recordedAt)}</span>
                       <span>{t("recording.page.duration", { time: formatClock(row.durationMs) })}</span>
@@ -545,8 +575,15 @@ export function RecordingEntryPage(props: { session: RecordingEntrySession }): R
                     </span>
                   </span>
                 </button>
+                {renaming === row.id ? <div className="recording-page__rename">
+                  <input autoFocus maxLength={80} aria-label={t("common.rename")} value={renameValue} onChange={(event) => setRenameValue(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === "Enter") finishRename(row); if (event.key === "Escape") setRenaming(null); }} />
+                  <button type="button" aria-label={t("plugin.ui.submit")} onClick={() => finishRename(row)}><Check size={14} /></button>
+                  <button type="button" aria-label={t("common.close")} onClick={() => setRenaming(null)}><X size={14} /></button>
+                </div> : null}
                 {!pending && !failed ? (
                   <div className="recording-page__list-actions">
+                    {session.rename ? <button type="button" className="recording-page__list-action recording-page__rename-trigger" aria-label={`${t("common.rename")} ${row.title}`} onClick={() => { setRenaming(row.id); setRenameValue(row.title); }}><Pencil size={13} /></button> : null}
                     <button type="button" className="recording-page__list-action" onClick={() => session.deliver(row, "summarize")}>
                       <Sparkles size={13} aria-hidden="true" />
                       <span>{t("recording.page.summarize")}</span>
@@ -624,13 +661,14 @@ function LiveView(props: { session: RecordingEntrySession }): ReactNode {
 
 function TranscriptView(props: { session: RecordingEntrySession; entry: RecordingArchiveEntry }): ReactNode {
   const { t } = useTranslation();
+  const [seek, setSeek] = useState<{ ms: number; sequence: number } | undefined>();
   return (
     <div className="recording-page">
       <header className="recording-page__bar">
         <button type="button" className="recording-page__back" aria-label={t("recording.page.backToList")} onClick={props.session.back}>
           <ChevronLeft size={16} aria-hidden="true" />
         </button>
-        <div className="recording-page__title"><span>{t("recording.page.title")}</span></div>
+        <div className="recording-page__title"><span>{props.entry.title}</span></div>
         <div className="recording-page__controls">
           <button
             type="button"
@@ -642,9 +680,9 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
           </button>
         </div>
       </header>
-      {props.entry.audioUrl ? <RecordingPlayer src={props.entry.audioUrl} durationMs={props.entry.durationMs} /> : null}
+      {props.entry.audioUrl ? <RecordingPlayer src={props.entry.audioUrl} durationMs={props.entry.durationMs} seek={seek} /> : null}
       <p className="recording-panel__section">{t("plugin.ui.audio.transcript")}</p>
-      <TranscriptTurns transcript={props.entry.transcript} />
+      <TranscriptTurns transcript={props.entry.transcript} onSeek={props.entry.audioUrl ? (ms) => setSeek((current) => ({ ms, sequence: (current?.sequence ?? 0) + 1 })) : undefined} />
       <div className="recording-page__footer">
         <button type="button" className="recording-panel__action" onClick={() => props.session.deliver(props.entry, "attach")}>
           <Plus size={13} aria-hidden="true" />
@@ -654,41 +692,7 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
           {t("recording.page.newRecording")}
         </button>
       </div>
-      {(props.entry.files?.length ?? 0) > 0 ? (
-        <div className="recording-page__deliverables">
-          <p className="recording-panel__section">{t("recording.page.deliverables")}</p>
-          <ul>
-            {props.entry.files?.map((item) => (
-              <li key={item.path}>
-                <Upload size={13} aria-hidden="true" />
-                <span title={item.name}>{item.name}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
-function TranscriptTurns(props: { transcript: RecordingPanelTranscript }): ReactNode {
-  const { t } = useTranslation();
-  const turns = useMemo(() => groupSpeakerTurns(props.transcript.segments), [props.transcript.segments]);
-  if (turns.length === 0) return <p className="recording-panel__flat-text">{props.transcript.text}</p>;
-  return (
-    <div className="recording-panel__turns">
-      {turns.map((turn, index) => (
-        <div key={`${turn.speakerId ?? "?"}:${turn.startMs ?? index}`} className="recording-panel__turn">
-          <div className="recording-panel__turn-head">
-            <span className="recording-panel__speaker-badge" data-speaker={(turn.speakerId ?? 0) % 6}>
-              {(turn.speakerId ?? 0) + 1}
-            </span>
-            <span className="recording-panel__speaker-name">{t("plugin.ui.audio.speakerLabel", { index: (turn.speakerId ?? 0) + 1 })}</span>
-            {turn.startMs === undefined ? null : <span className="recording-panel__turn-time">{formatClock(turn.startMs)}</span>}
-          </div>
-          <p className="recording-panel__turn-text">{turn.text}</p>
-        </div>
-      ))}
     </div>
   );
 }

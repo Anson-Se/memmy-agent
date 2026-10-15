@@ -1,5 +1,10 @@
+import { createPortal } from "react-dom";
+import { Button } from "../components/button.js";
+import { FileTypeIcon } from "../components/file-type-icon.js";
 import type { RecordingArchiveEntry } from "./recording-entry.js";
 import {
+  createContext,
+  useContext,
   useCallback,
   useEffect,
   useMemo,
@@ -16,7 +21,6 @@ import {
   ChevronRight,
   Download,
   FileOutput,
-  FileSpreadsheet,
   FileText,
   Folder,
   Plus,
@@ -38,7 +42,7 @@ import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { PluginsClient } from "../api/plugins-client.js";
 import { asrRecordingTimeRemainingMs, isLiveAsrTimeout, useAsrRecorder } from "./asr-recorder.js";
-import { usePluginChatFeedback, type PluginChatFeedback, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { usePluginChatFeedback, usePluginQuestionDrafts, usePluginRecordingMaterials, type PluginChatFeedback, type PluginUiCall } from "../app/plugin-ui-context.js";
 import type { MessageKey } from "../i18n/messages.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { classifyAgentAttachmentFile } from "../lib/agent-attachment.js";
@@ -53,6 +57,19 @@ import {
 import { materializePluginUploadFile } from "../lib/plugin-upload-file.js";
 import { startBrowserDownload } from "./agent-message-content.js";
 import { RecordingWaveform } from "./recording-waveform.js";
+
+/** Moving only the bar leaves its microphone owner mounted in the side pane. */
+export const RecordingBarPortalContext = createContext<{ target: HTMLElement | null; hidden: boolean } | null>(null);
+
+/** The PoC's model-requested cards take precedence over fixed shortcuts. */
+export function isLegalFlowInteraction(call: PluginUiCall): boolean {
+  return call.pluginId === "legal-labor"
+    && !call.events.some((event) => event.type === "result" || event.type === "error")
+    && call.events.some((event) => event.type === "interaction" && (
+      event.request.type === "file-input"
+      || (event.request.type === "question" && readQuestions(asRecord(event.request.payload).questions).length > 0)
+    ));
+}
 
 const TASK_STATUS_KEYS = {
   pending: "plugin.ui.task.pending",
@@ -125,10 +142,9 @@ interface PluginCapabilityHostProps {
 /**
  * Where a plugin card is rendered.
  *
- * `panel` is the column beside the conversation: the interview recorder lives
- * there, directly above the transcript it is producing. A recording runs for an
- * hour while the chat keeps moving, so the recorder needs a place of its own
- * rather than a bar parked over the conversation.
+ * `panel` keeps the interview microphone owner mounted independently of the
+ * cards in the dock. Its bar is portalled above the composer and its transcript
+ * is mirrored into the side pane, so hiding a fixed card cannot stop recording.
  */
 export type PluginCardRegion = "flow" | "pinned" | "panel";
 
@@ -216,9 +232,11 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
     ),
     [answeredInteractions, dismissedCalls, pinnedCapabilities, props.calls, props.dismissedCallIds, region]
   );
-  const orderedCalls = useMemo(() => orderPluginCallsForDisplay(calls), [calls]);
+  const flowActive = selectVisiblePluginCalls(props.calls, answeredInteractions).some(isLegalFlowInteraction);
+  const orderedCalls = useMemo(() => orderPluginCallsForDisplay(deduplicateLegalInteractions(calls))
+    .filter((call) => !(flowActive && call.pluginId === "legal-labor" && guidanceQuestion(call.events))), [calls, flowActive]);
   const currentRetries = [...diagnosisRetries.values()].filter((retry) => props.calls.some((call) => call.callId === retry.callId));
-  if (calls.length === 0 && currentRetries.length === 0) return null;
+  if (orderedCalls.length === 0 && currentRetries.length === 0) return null;
 
   return (
     <section
@@ -257,17 +275,21 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         );
         const respond = async (interactionId: string, response: unknown) => {
           if (!props.client) return Promise.reject(new Error("Plugin client unavailable"));
-          const key = interactionKey(call, interactionId);
-          if (answeredInteractions.has(key)) return;
-          const existing = responseFlights.current.get(key);
-          if (existing) return existing;
-          const flight = props.client.respond(call.pluginId, call.callId, interactionId, response);
-          responseFlights.current.set(key, flight);
-          try { await flight; } finally { responseFlights.current.delete(key); }
-          // A refresh is an intermediate action in a multi-step card. Keep the
-          // renderer mounted until its next authoritative interaction arrives.
-          if (asRecord(response).action === "refresh") return;
-          rememberAnswered(interactionKey(call, interactionId));
+          const peers = matchingLegalInteractionCalls(call, selectVisiblePluginCalls(props.calls, answeredInteractions));
+          const targets = peers.length ? peers : [call];
+          await Promise.all(targets.map(async (target) => {
+            const request = target === call ? null : [...target.events].reverse().find((event) => event.type === "interaction");
+            const targetId = request?.type === "interaction" ? request.request.interactionId : interactionId;
+            const key = interactionKey(target, targetId);
+            if (answeredInteractions.has(key)) return;
+            const existing = responseFlights.current.get(key);
+            if (existing) return existing;
+            const flight = props.client!.respond(target.pluginId, target.callId, targetId, response).then(() => {
+              if (asRecord(response).action !== "refresh") rememberAnswered(key);
+            });
+            responseFlights.current.set(key, flight);
+            try { await flight; } finally { responseFlights.current.delete(key); }
+          }));
         };
         const cancel = () => {
           if (!props.client) return Promise.reject(new Error("Plugin client unavailable"));
@@ -277,8 +299,15 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         // Pinned cards can reopen the same interaction. Other dismissals
         // explicitly retire the call and hide its cancellation report.
         const dismiss = async () => {
+          if (isLegalFlowInteraction(call)) {
+            const event = [...call.events].reverse().find((item) => item.type === "interaction");
+            if (event?.type === "interaction") await respond(event.request.interactionId,
+              event.request.type === "file-input" ? { action: "skip", files: [] } : { action: "skip", answers: {} });
+            return;
+          }
           if (autoPinned && props.onCallHidden) {
-            props.onCallHidden(call.callId);
+            const peers = matchingLegalInteractionCalls(call, selectVisiblePluginCalls(props.calls, answeredInteractions));
+            for (const peer of peers.length ? peers : [call]) props.onCallHidden(peer.callId);
             return;
           }
           setDismissedCalls((current) => new Set(current).add(`${call.pluginId}:${call.callId}`));
@@ -287,7 +316,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         };
         const hidden = props.hiddenCallIds?.has(call.callId)
           && !call.events.some((event) => event.type === "result" || event.type === "error");
-        const dismissable = (call.origin === "user" || (region === "pinned" && autoPinned))
+        const dismissable = (isLegalFlowInteraction(call) || call.origin === "user" || (region === "pinned" && autoPinned))
           && call.events.some((event) => event.type === "interaction")
           && !call.events.some((event) => event.type === "result" || event.type === "error");
         const cards = (
@@ -303,7 +332,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             onRespond={respond}
             onCancel={cancel}
             onUploadFiles={props.uploadFiles}
-            onDismiss={dismissable ? () => void dismiss() : undefined}
+            onDismiss={dismissable ? dismiss : undefined}
             onRecordingSession={props.onRecordingSession} onRecordingArchived={props.onRecordingArchived}
             asrClient={props.asrClient}
             onAddArtifact={props.onAddArtifact}
@@ -318,6 +347,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         // cards. Keep them in the chat flow as text so a job cannot take over
         // the conversation with a second progress panel.
         if (isBarePresentation(call) || isStatusOnlyPresentation(call)
+          || isLegalFlowInteraction(call)
           || (call.pluginId === "legal-labor" && ((call.capabilityId === "session-start" && guidanceQuestion(call.events))
             || (["session-start", "material-collect"].includes(call.capabilityId) && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input"))))) return <div key={call.callId} hidden={hidden}>{cards}</div>;
         return (
@@ -369,7 +399,7 @@ function GenericPluginCards(props: {
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onCancel(): Promise<void>;
   onUploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
-  onDismiss?: () => void;
+  onDismiss?: () => void | Promise<void>;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
   onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
@@ -395,7 +425,7 @@ function GenericPluginCards(props: {
     ? props.events.find((event) => event.type === "interaction" && event.request.type === "file-input") : undefined;
   if (uploadInteraction?.type === "interaction") return <InteractionCard
     request={uploadInteraction.request} conversationId={props.conversationId} pluginId={props.pluginId}
-    diagnosticUpload onGenerateDiagnosis={props.onGenerateDiagnosis} onDismiss={props.onDismiss}
+    diagnosticUpload onGenerateDiagnosis={props.onGenerateDiagnosis} onDismiss={props.onDismiss} onOpenArtifact={props.onOpenArtifact}
     onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
   const guide = props.guidance && !terminal ? guidanceQuestion(props.events) : undefined;
   if (guide && setupEvents.length > 0) return <DiagnosticGuidanceCard
@@ -483,11 +513,11 @@ export function DiagnosticGuidanceCard(props: {
       })}
     </div>
     <footer className="diagnostic-guidance-card__footer">
-      {options.map((option) => <button key={String(option.value)} type="button"
-        className={`diagnostic-guidance-card__action${option.value === "record" ? " diagnostic-guidance-card__action--primary" : ""}`}
+      {options.map((option) => <Button key={String(option.value)} type="button" size="sm" className="diagnostic-guidance-card__action"
+        variant={option.value === "record" ? "primary" : "secondary"}
         disabled={status === "submitting" || status === "answered"} onClick={() => void submit(option.value)}>
         {option.value === "record" ? <Mic size={16} aria-hidden="true" /> : <Upload size={16} aria-hidden="true" />}{option.label}
-      </button>)}
+      </Button>)}
       {status === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
     </footer>
   </article>;
@@ -552,10 +582,11 @@ function InteractionCard(props: {
   pluginId?: string;
   request: PluginInteractionRequest;
   diagnosticUpload?: boolean;
+  onOpenArtifact?: (artifact: PluginArtifactRef) => void;
   onGenerateDiagnosis?: () => void;
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onUploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
-  onDismiss?: () => void;
+  onDismiss?: () => void | Promise<void>;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
   onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
@@ -593,7 +624,7 @@ function InteractionCard(props: {
   };
 
   if (props.request.type === "file-input") {
-    return <FileInputCard diagnosticUpload={props.diagnosticUpload} onGenerateDiagnosis={props.onGenerateDiagnosis} onClose={props.onDismiss} conversationId={props.conversationId} pluginId={props.pluginId} request={props.request} title={title} description={description} disabled={disabled} status={status} onStatus={setStatus} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
+    return <FileInputCard onOpenArtifact={props.onOpenArtifact} diagnosticUpload={props.diagnosticUpload} onGenerateDiagnosis={props.onGenerateDiagnosis} onClose={props.onDismiss} conversationId={props.conversationId} pluginId={props.pluginId} request={props.request} title={title} description={description} disabled={disabled} status={status} onStatus={setStatus} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
   }
 
   if (props.request.type === "audio-record") {
@@ -614,6 +645,12 @@ function InteractionCard(props: {
       />
     );
   }
+
+  if (props.pluginId === "legal-labor" && questions.length > 0) return <QuestionFields
+    legal draftKey={JSON.stringify([props.pluginId, props.conversationId, props.request.interactionId])} title={title} description={description} questions={questions} disabled={disabled}
+    error={status === "error" ? t("plugin.ui.responseFailed") : null}
+    onSubmit={(answers) => void submit({ answers })}
+    onSkip={(answers) => void submit({ action: "skip", answers })} />;
 
   return (
     <div className="rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3">
@@ -694,7 +731,7 @@ function AudioRecordCard(props: {
   status: "idle" | "submitting" | "answered" | "error";
   onStatus(value: "idle" | "submitting" | "answered" | "error"): void;
   onRespond(interactionId: string, response: unknown): Promise<void>;
-  onDismiss?: () => void;
+  onDismiss?: () => void | Promise<void>;
   onRecordingSession?: (session: RecordingPanelSession | null) => void;
   onRecordingArchived?: (entry: RecordingArchiveEntry) => void;
   asrClient?: AsrClient;
@@ -702,6 +739,7 @@ function AudioRecordCard(props: {
 }) {
   const { t } = useTranslation();
   const payload = asRecord(props.request.payload);
+  const portal = useContext(RecordingBarPortalContext);
   const diarization = payload.diarization === true;
   const allowSkip = payload.allowSkip === true;
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -755,7 +793,7 @@ function AudioRecordCard(props: {
       // receives audio bytes, only a Host-owned path.
       const files = await persistRecording(result, t, props.uploadFiles);
       if (files.audio) setAudioUrl(files.audio.url);
-      props.onRecordingArchived?.({
+      const archived: RecordingArchiveEntry = {
         id: `plugin:${files.audio?.path ?? props.request.interactionId}`, title: props.title,
         recordedAt: result.transcribedAt, durationMs: result.durationMs ?? elapsedMs,
         speakerCount: new Set((result.segments ?? []).map((segment) => segment.speakerId ?? 0)).size || 1,
@@ -765,7 +803,8 @@ function AudioRecordCard(props: {
         ...(props.conversationId ? { sessionKey: props.conversationId.startsWith("websocket:")
           ? props.conversationId : `websocket:${props.conversationId}` } : {}),
         files: [files.audio, files.transcript].filter((file): file is UploadedAgentMedia => file !== undefined)
-      });
+      };
+      props.onRecordingArchived?.(archived);
       // Responding may immediately unmount this card. Publish the durable URL
       // synchronously instead of waiting for a React effect that might never run.
       finishedRef.current = true;
@@ -783,6 +822,7 @@ function AudioRecordCard(props: {
         transcribedAt: result.transcribedAt,
         ...files
       });
+      props.onRecordingArchived?.({ ...archived, collected: true });
       props.onStatus("answered");
     } catch {
       submitting.current = false;
@@ -829,8 +869,7 @@ function AudioRecordCard(props: {
       ? "transcribing"
       : recorder.isRecording
         ? "recording"
-        : "done";
-  const panelOpen = recorder.isRecording || recorder.isTranscribing || transcript !== null;
+        : recorder.isStarting ? "starting" : transcript ? "done" : "idle";
   const publish = props.onRecordingSession;
   // A finished transcript is the recording's deliverable and the design keeps
   // it on screen next to the upload card that follows, so it outlives this
@@ -840,10 +879,6 @@ function AudioRecordCard(props: {
   finishedRef.current = transcript !== null;
   useEffect(() => {
     if (!publish) return;
-    if (!panelOpen) {
-      publish(null);
-      return;
-    }
     publish({
       title: props.title,
       status: panelStatus,
@@ -851,12 +886,13 @@ function AudioRecordCard(props: {
       lines,
       transcript,
       audioUrl,
+      onStart: start,
       onPause: () => recorder.pause(),
       onResume: () => recorder.resume(),
       onFinish: () => void finish(),
       onClose: () => publish(null)
     });
-  }, [publish, panelOpen, panelStatus, elapsedMs, lines, transcript, audioUrl, props.title]);
+  }, [publish, panelStatus, elapsedMs, lines, transcript, audioUrl, props.title]);
   useEffect(() => () => {
     // Retracting a half-finished recording is right — there is nothing to show
     // and the microphone should not be left open. A finished one stays until
@@ -875,7 +911,7 @@ function AudioRecordCard(props: {
           ? t("plugin.ui.responseFailed")
           : null;
 
-  return (
+  const bar = (
     <div className={`recording-bar${props.interview ? " recording-bar--interview" : ""}${recorder.isRecording ? " recording-bar--live" : ""}`}>
       <span className="recording-bar__icon" aria-hidden="true"><Mic size={props.interview ? 18 : 14} /></span>
       <p className="recording-bar__title">
@@ -942,6 +978,7 @@ function AudioRecordCard(props: {
       {error ? <span className="recording-bar__note recording-bar__note--warning" role="alert">{error}</span> : null}
     </div>
   );
+  return portal ? (portal.target ? createPortal(<div hidden={portal.hidden}>{bar}</div>, portal.target) : null) : bar;
 }
 
 /** Point at which the recording card starts counting down to the hard stop. */
@@ -961,8 +998,9 @@ export function FileInputCard(props: {
   pluginId?: string;
   request: PluginInteractionRequest;
   diagnosticUpload?: boolean;
+  onOpenArtifact?: (artifact: PluginArtifactRef) => void;
   onGenerateDiagnosis?: () => void;
-  onClose?: () => void;
+  onClose?: () => void | Promise<void>;
   title: string;
   description: string | null;
   disabled: boolean;
@@ -973,7 +1011,16 @@ export function FileInputCard(props: {
 }) {
   const { t } = useTranslation();
   const payload = asRecord(props.request.payload);
+  const recordingMaterials = usePluginRecordingMaterials(props.diagnosticUpload ? props.pluginId : undefined, props.conversationId);
+  const stagedFiles = recordingMaterials.files;
   const [files, setFiles] = useState<File[]>([]);
+  const localPreviewUrls = useRef<string[]>([]);
+  useEffect(() => () => { for (const uri of localPreviewUrls.current) URL.revokeObjectURL(uri); }, []);
+  const openSelected = (file: File) => {
+    const uri = URL.createObjectURL(file);
+    localPreviewUrls.current.push(uri);
+    props.onOpenArtifact?.({ id: uri, uri, name: file.name, mediaType: file.type || "application/octet-stream" });
+  };
   const submitting = useRef(false);
   const pendingFeedback = useRef<PluginChatFeedback | null>(null);
   const fileDraftKey = JSON.stringify([props.pluginId, props.conversationId, payload.taskId, payload.cardType, payload.targetPaperId]);
@@ -998,6 +1045,22 @@ export function FileInputCard(props: {
     } catch { submitting.current = false; props.onStatus("error"); }
   }
 
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  const close = async () => {
+    if (submitting.current || props.disabled) return;
+    submitting.current = true;
+    props.onStatus("submitting");
+    fileDrafts?.set(fileDraftKey, files);
+    try {
+      // Closing skips this collection round; selected files stay in the draft.
+      const receipts = stagedFiles.filter((file) => !file.collected).map(({ collected: _collected, ...file }) => file);
+      await props.onRespond(props.request.interactionId, { action: "skip", files: receipts });
+      recordingMaterials.update([]);
+      props.onStatus("answered");
+      props.onGenerateDiagnosis?.();
+    } catch { submitting.current = false; props.onStatus("error"); }
+  };
   const [validationError, setValidationError] = useState<string | null>(null);
   const accept = readStrings(payload.accept).join(",");
   const fileRules = readFileRules(payload.fileRules);
@@ -1006,20 +1069,22 @@ export function FileInputCard(props: {
   const maxBytes = positiveInteger(payload.maxBytes);
   const fileStates = files.map((file) => classifyPluginInputFile(file, accept, maxBytes, fileRules, t));
   const readyFiles = fileStates.filter((item) => item.status === "ready").map((item) => item.file);
-  const choose = (event: ChangeEvent<HTMLInputElement>) => {
+  const addFiles = (picked: File[]) => {
     if (submitting.current || props.disabled) return;
     // Picking again adds to the selection instead of replacing it. A lawyer
     // assembling a case pulls together a transcript, a workbook and a handful
     // of scans; replacing meant each new file pushed the last one out, so the
     // only way to send several was to hand over a whole folder. A single-file
     // card keeps replacing, where the second pick is a new choice.
-    const picked = Array.from(event.target.files ?? []);
     const next = payload.multiple === true ? appendUniqueFiles(files, picked) : picked;
-    event.target.value = "";
     setFiles(next);
     if (fileDrafts?.has(fileDraftKey)) fileDrafts.set(fileDraftKey, next);
     const nextReady = next.filter((file) => classifyPluginInputFile(file, accept, maxBytes, fileRules, t).status === "ready");
-    setValidationError(validateReadyFileCount(nextReady, maxFiles, minFiles, t));
+    setValidationError(validateReadyFileCount([...nextReady, ...stagedFiles], maxFiles, minFiles, t));
+  };
+  const choose = (event: ChangeEvent<HTMLInputElement>) => {
+    addFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
   };
   const remove = (index: number) => {
     if (submitting.current || props.disabled) return;
@@ -1030,11 +1095,11 @@ export function FileInputCard(props: {
       else fileDrafts.delete(fileDraftKey);
     }
     const nextReady = next.filter((file) => classifyPluginInputFile(file, accept, maxBytes, fileRules, t).status === "ready");
-    setValidationError(validateReadyFileCount(nextReady, maxFiles, minFiles, t));
+    setValidationError(validateReadyFileCount([...nextReady, ...stagedFiles], maxFiles, minFiles, t));
   };
   const upload = async () => {
     if (submitting.current || props.disabled) return;
-    const error = validateReadyFileCount(readyFiles, maxFiles, minFiles, t);
+    const error = validateReadyFileCount([...readyFiles, ...stagedFiles], maxFiles, minFiles, t);
     if (error || !props.onUploadFiles) {
       setValidationError(error ?? t("plugin.ui.responseFailed"));
       return;
@@ -1042,18 +1107,20 @@ export function FileInputCard(props: {
     submitting.current = true;
     props.onStatus("submitting");
     try {
-      const uploaded = await props.onUploadFiles(readyFiles.map((file) => {
+      const uploaded = readyFiles.length ? await props.onUploadFiles(readyFiles.map((file) => {
         const classification = classifyAgentAttachmentFile(file, { allowAudio: true })!;
         return { blob: file, name: file.name, kind: classification.kind, mime: classification.mime };
-      }));
+      })) : [];
+      const submitted = [...stagedFiles.filter((file) => !file.collected).map(({ collected: _collected, ...file }) => file), ...uploaded];
       const feedback = pendingFeedback.current;
       if (feedback) {
         pendingFeedback.current = null;
         fileDrafts?.set(fileDraftKey, files);
         await props.onRespond(props.request.interactionId, { action: "chat-feedback", ...feedback, files: [],
-          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: uploaded } });
+          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: submitted } });
       } else {
-        await props.onRespond(props.request.interactionId, { files: uploaded });
+        await props.onRespond(props.request.interactionId, { files: submitted });
+        recordingMaterials.update([]);
         fileDrafts?.delete(fileDraftKey);
       }
       props.onStatus("answered");
@@ -1078,20 +1145,29 @@ export function FileInputCard(props: {
   if (props.diagnosticUpload) return <article className="diagnostic-upload-card" aria-label={props.title}>
     <header className="diagnostic-upload-card__header">
       <h3>{props.title}</h3>
-      <span className="diagnostic-upload-card__count">{t("plugin.ui.fileCount", { count: files.length })}</span>
+      {files.length + stagedFiles.length > 0 ? <span className="diagnostic-upload-card__count">{t("plugin.ui.fileCount", { count: files.length + stagedFiles.length })}</span> : null}
       {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
-        disabled={props.disabled} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={18} /></button> : null}
+        disabled={props.disabled} onClick={() => { void close(); }}><X size={18} /></button> : null}
     </header>
-    <div className="diagnostic-upload-card__body">
+    <div className={`diagnostic-upload-card__body${dragging ? " diagnostic-upload-card__body--dragging" : ""}`}
+      onDragOver={(event) => { if (!props.disabled) { event.preventDefault(); event.stopPropagation(); setDragging(true); } }}
+      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
+      onDrop={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)); }}>
       {props.description ? <p className="diagnostic-upload-card__description">{props.description}</p> : null}
-      {fileStates.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
+      {fileStates.length || stagedFiles.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
+        {stagedFiles.map((file) => <li key={file.path} className="diagnostic-upload-card__file">
+          <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={file.name} mime={file.mime} surface="row" /></span>
+          <div className="diagnostic-upload-card__file-info"><button type="button" disabled={!props.onOpenArtifact} title={file.name} onClick={() => props.onOpenArtifact?.({ id: file.path, path: file.path, uri: file.path, name: file.name, mediaType: file.mime })}>{file.name}</button></div>
+          <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(file.bytes)}</span>
+          <button type="button" className="diagnostic-upload-card__remove" disabled={props.disabled}
+            aria-label={t("plugin.ui.removeFile", { name: file.name })}
+            onClick={() => recordingMaterials.update(stagedFiles.filter((item) => item.path !== file.path))}><X size={17} /></button>
+        </li>)}
         {fileStates.map((item, index) => {
-          const spreadsheet = /\.(xlsx?|csv)$/i.test(item.file.name);
-          const Icon = spreadsheet ? FileSpreadsheet : FileText;
           return <li key={`${item.file.name}:${item.file.size}:${index}`} className="diagnostic-upload-card__file">
-            <span className={`diagnostic-upload-card__file-icon${spreadsheet ? " diagnostic-upload-card__file-icon--sheet" : ""}`} aria-hidden="true"><Icon size={21} /></span>
+            <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={item.file.name} mime={item.file.type} surface="row" /></span>
             <div className="diagnostic-upload-card__file-info">
-              <p>{item.file.webkitRelativePath || item.file.name}</p>
+              <button type="button" disabled={!props.onOpenArtifact} title={item.file.webkitRelativePath || item.file.name} onClick={() => openSelected(item.file)}>{item.file.webkitRelativePath || item.file.name}</button>
               {item.status === "blocked" ? <p className="diagnostic-upload-card__error" role="alert">{item.message}</p> : null}
             </div>
             <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(item.file.size)}</span>
@@ -1099,10 +1175,10 @@ export function FileInputCard(props: {
               aria-label={t("plugin.ui.removeFile", { name: item.file.name })} onClick={() => remove(index)}><X size={17} /></button>
           </li>;
         })}
-      </ul> : <p className="diagnostic-upload-card__empty">{t("plugin.ui.noFiles")}</p>}
+      </ul> : <button type="button" className="diagnostic-upload-card__dropzone" disabled={props.disabled} onClick={() => fileInputRef.current?.click()}><Upload size={20} aria-hidden="true" /><span>{t("plugin.ui.dropFiles")}</span></button>}
       <div className="diagnostic-upload-card__pickers">
         <label className="diagnostic-upload-card__picker"><Plus size={16} aria-hidden="true" />{t("plugin.ui.uploadFiles")}
-          <input className="sr-only" type="file" aria-label={t("plugin.ui.uploadFiles")} accept={accept || undefined}
+          <input ref={fileInputRef} className="sr-only" type="file" aria-label={t("plugin.ui.uploadFiles")} accept={accept || undefined}
             multiple={payload.multiple === true} disabled={props.disabled} onChange={choose} />
         </label>
         {payload.allowDirectory === true ? <label className="diagnostic-upload-card__picker"><Folder size={16} aria-hidden="true" />{t("plugin.ui.chooseFolder")}
@@ -1116,9 +1192,9 @@ export function FileInputCard(props: {
     </div>
     <footer className="diagnostic-upload-card__footer">
       {accept ? <p>{t("plugin.ui.acceptedFormats", { formats: summarizeAcceptedFormats(accept, t) })}</p> : null}
-      <button type="button" className="diagnostic-guidance-card__action diagnostic-guidance-card__action--primary"
-        disabled={props.disabled || readyFiles.length === 0 || Boolean(validationError) || !props.onUploadFiles}
-        onClick={() => void upload()}>{t("plugin.ui.generateDiagnosis")}</button>
+      <Button type="button" variant="primary" size="sm"
+        disabled={props.disabled || readyFiles.length + stagedFiles.length === 0 || Boolean(validationError) || !props.onUploadFiles}
+        onClick={() => void upload()}>{t("plugin.ui.generateDiagnosis")}</Button>
     </footer>
   </article>;
   return (
@@ -1209,20 +1285,54 @@ export function FileInputCard(props: {
  * statements, and the plugin marks the skipped ones as unverified.
  */
 function QuestionFields(props: {
+  legal?: boolean;
+  draftKey?: string;
+  title?: string;
+  description?: string | null;
+  error?: string | null;
+  onSkip?: (answers: Record<string, string>) => void;
   questions: PluginQuestionField[];
   disabled: boolean;
   onSubmit: (answers: Record<string, string>) => void;
 }) {
   const { t } = useTranslation();
-  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const drafts = usePluginQuestionDrafts();
+  const [answers, setAnswers] = useState<Record<string, string>>(() => (props.draftKey ? drafts?.get(props.draftKey) : undefined) ?? {});
   const filled = props.questions.filter((question) => (answers[question.id] ?? "").trim());
   const incomplete = props.questions.some((question) => question.required && !(answers[question.id] ?? "").trim());
-  const set = (id: string, value: string) => setAnswers((current) => ({ ...current, [id]: value }));
+  const set = (id: string, value: string) => setAnswers((current) => {
+    const next = { ...current, [id]: value };
+    if (props.draftKey) drafts?.set(props.draftKey, next);
+    return next;
+  });
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     props.onSubmit(Object.fromEntries(filled.map((question) => [question.id, answers[question.id]!.trim()])));
   };
+
+  if (props.legal) return <article className="legal-question-card" aria-label={props.title}>
+    <header className="legal-question-card__header"><h3>{props.title}</h3>
+      <span>{t("plugin.ui.answerCount", { filled: filled.length, total: props.questions.length })}</span>
+      <button type="button" className="diagnostic-guidance-card__close" disabled={props.disabled}
+        aria-label={t("plugin.ui.dismissCard")} onClick={() => props.onSkip?.(Object.fromEntries(filled.map((q) => [q.id, answers[q.id]!.trim()])))}><X size={18} /></button>
+    </header>
+    <form onSubmit={submit}>
+      {props.description ? <p className="legal-question-card__description">{props.description}</p> : null}
+      <div className="legal-question-card__list">{props.questions.map((question) => <fieldset key={question.id} className="legal-question-card__item" disabled={props.disabled}>
+        <legend><span>{question.label}</span><span className={question.required ? "legal-question-card__required" : "legal-question-card__optional"}>{t(question.required ? "plugin.ui.fieldRequired" : "plugin.ui.fieldOptional")}</span></legend>
+        {question.options.length > 0 ? <div className="legal-question-card__options">{question.options.map((option, index) => <label key={option} className="legal-question-card__option" data-selected={answers[question.id] === option}>
+          <input type="radio" name={`${question.id}-option`} value={option} checked={answers[question.id] === option} onChange={() => set(question.id, option)} />
+          <span className="legal-question-card__number" aria-hidden="true">{index + 1}</span><span>{option}</span>{answers[question.id] === option ? <Check size={14} aria-hidden="true" /> : null}
+        </label>)}</div> : null}
+        <input aria-label={question.label} className="legal-question-card__input" value={answers[question.id] ?? ""}
+          onChange={(event) => set(question.id, event.target.value)} placeholder={t(question.required ? "plugin.ui.requiredPlaceholder" : "plugin.ui.optionalPlaceholder")} />
+      </fieldset>)}</div>
+      <footer className="legal-question-card__footer">{props.error ? <p role="alert">{props.error}</p> : null}
+        <Button type="submit" size="sm" variant="primary" disabled={props.disabled || incomplete}>{t("plugin.ui.submit")}</Button>
+      </footer>
+    </form>
+  </article>;
 
   return (
     <form className="flex w-full flex-col gap-2" onSubmit={submit}>
@@ -1326,25 +1436,24 @@ function ArtifactCard(props: {
   if (props.guidanceDescription !== undefined) {
     const extension = artifact.name.match(/\.[^.]+$/)?.[0] ?? "";
     const name = extension ? artifact.name.slice(0, -extension.length) : artifact.name;
-    return <div className="diagnostic-guidance-card__template">
-      <span className="diagnostic-guidance-card__file-icon" aria-hidden="true"><FileSpreadsheet size={25} strokeWidth={1.5} /></span>
+    return <button type="button" className="diagnostic-guidance-card__template" disabled={downloadState === "pending"} onClick={() => void download()} aria-label={`${t("plugin.ui.download")} ${artifact.name}`}>
+      <span className="diagnostic-guidance-card__file-icon"><FileTypeIcon name={artifact.name} mime={artifact.mediaType} surface="card" /></span>
       <div className="diagnostic-guidance-card__file-info">
         <p className="diagnostic-guidance-card__file-name">{name}<span>{extension}</span></p>
         {props.guidanceDescription ? <p className="diagnostic-guidance-card__description">{props.guidanceDescription}</p> : null}
       </div>
-      <button type="button" className="diagnostic-guidance-card__download" disabled={downloadState === "pending"}
-        aria-label={`${t("plugin.ui.download")} ${artifact.name}`} onClick={() => void download()}>
+      <span className="diagnostic-guidance-card__download">
         <Download size={17} aria-hidden="true" />{t("plugin.ui.download")}
-      </button>
+      </span>
       {downloadState === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.downloadFailed")}</p> : null}
-    </div>;
+    </button>;
   }
   return (
     <div className="flex items-center gap-3 rounded-card border border-border-stone/30 px-3 py-2.5">
-      <FileOutput size={18} className="shrink-0 text-action-sky" aria-hidden="true" />
+      <FileTypeIcon name={artifact.name} mime={artifact.mediaType} surface="row" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-text-ink/75">{props.event.artifact.name}</p>
-        <p className="truncate text-[11px] text-text-ink/40">{props.event.artifact.mediaType}</p>
+        <p className="truncate text-[11px] text-text-ink/40">{artifact.name.match(/\.([^.]*)$/)?.[1]?.toUpperCase() ?? t("plugin.ui.artifactCollection", { count: 1 })}</p>
       </div>
       {props.onOpen ? (
         <button type="button" className="inline-flex items-center gap-1 text-xs text-action-sky hover:underline" onClick={() => props.onOpen?.(artifact)}>
@@ -1457,6 +1566,33 @@ function interactionKey(call: Pick<PluginUiCall, "pluginId" | "callId">, interac
   return `${call.pluginId}:${call.callId}:${interactionId}`;
 }
 
+function legalInteractionKey(call: PluginUiCall): string | null {
+  if (!call.conversationId || call.pluginId !== "legal-labor" || !["session-start", "material-collect"].includes(call.capabilityId)
+    || call.events.some((event) => event.type === "result" || event.type === "error")) return null;
+  const event = [...call.events].reverse().find((item) => item.type === "interaction");
+  if (event?.type !== "interaction") return null;
+  const kind = event.request.type;
+  const phase = kind === "question" && guidanceQuestion([event]) ? "guide"
+    : kind === "file-input" ? "upload" : kind === "audio-record" ? "recording" : null;
+  return phase ? JSON.stringify([call.pluginId, call.conversationId.replace(/^websocket:/, ""), phase]) : null;
+}
+
+function matchingLegalInteractionCalls(call: PluginUiCall, calls: readonly PluginUiCall[]): PluginUiCall[] {
+  const key = legalInteractionKey(call);
+  return key ? calls.filter((candidate) => legalInteractionKey(candidate) === key) : [];
+}
+
+/** One visible step answers both a manual opener and the Agent waiting on it. */
+function deduplicateLegalInteractions(calls: PluginUiCall[]): PluginUiCall[] {
+  const chosen = new Map<string, PluginUiCall>();
+  for (const call of calls) {
+    const key = legalInteractionKey(call) ?? call.callId;
+    const previous = chosen.get(key);
+    if (!previous || call.origin === "agent" || previous.origin !== "agent") chosen.set(key, call);
+  }
+  return calls.filter((call) => [...chosen.values()].includes(call));
+}
+
 /**
  * Reduces the calls of one capability to the ones worth a card.
  *
@@ -1478,7 +1614,7 @@ export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): Plugin
   const groups = new Map<string, { live: PluginUiCall[]; finished?: PluginUiCall }>();
   const order: string[] = [];
   for (const call of calls) {
-    const key = `${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
+    const key = `${call.conversationId}:${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
     let group = groups.get(key);
     if (!group) {
       group = { live: [] };
@@ -1494,7 +1630,7 @@ export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): Plugin
       if (group.live.length) {
         // A second invocation cannot hide a tool that still needs an answer.
         const waiting = group.live.filter((call) => call.events.some((event) => event.type === "interaction"));
-        return waiting.length ? waiting : group.live.slice(-1);
+        return waiting.length ? deduplicateLegalInteractions(waiting) : group.live.slice(-1);
       }
       if (group.finished?.events.some((event) => event.type === "artifact")) return [group.finished];
       return [];
@@ -1632,6 +1768,7 @@ export function selectRegionPluginCalls(
   );
   return calls.filter((call) => {
     const live = isLiveUserCall(call);
+    if (isLegalFlowInteraction(call)) return region === "pinned";
     if (region === "panel") return live && isBarePresentation(call);
     if (region === "pinned") return live && !isBarePresentation(call);
     return !live;
@@ -2003,7 +2140,7 @@ function classifyPluginInputFile(
   return { file, status: "ready", code: null, message: null };
 }
 
-function validateReadyFileCount(files: File[], maxFiles: number | null, minFiles: number, t: ReturnType<typeof useTranslation>["t"]): string | null {
+function validateReadyFileCount(files: readonly unknown[], maxFiles: number | null, minFiles: number, t: ReturnType<typeof useTranslation>["t"]): string | null {
   if (files.length < minFiles) return t("plugin.ui.fileCountBelowMinimum", { count: minFiles });
   if (maxFiles && files.length > maxFiles) return t("plugin.ui.fileCountExceeded");
   return null;

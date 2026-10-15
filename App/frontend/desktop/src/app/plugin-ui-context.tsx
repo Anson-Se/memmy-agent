@@ -10,6 +10,7 @@ import {
   type Dispatch,
   type SetStateAction
 } from "react";
+import type { UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { CapabilityEvent, PluginCapabilityEventPayload, PluginInvocationOrigin } from "@memmy/local-api-contracts";
 
 export interface PluginUiCall {
@@ -38,6 +39,10 @@ interface PluginUiContextValue {
   registerChatFeedback(conversationId: string, handler: (feedback: PluginChatFeedback) => boolean): () => void;
   routeChatFeedback(chatId: string, feedback: PluginChatFeedback): boolean;
   fileDrafts: Map<string, File[]>;
+  questionDrafts: Map<string, Record<string, string>>;
+  recordingMaterials: Map<string, PluginRecordingMaterial[]>;
+  setRecordingMaterials: Dispatch<SetStateAction<Map<string, PluginRecordingMaterial[]>>>;
+  addRecordingMaterials(pluginId: string, conversationId: string, files: PluginRecordingMaterial[]): void;
   /** Card decisions outlive route pages, just like the calls they belong to. */
   hiddenCallIds: Set<string>;
   setHiddenCallIds: Dispatch<SetStateAction<Set<string>>>;
@@ -54,12 +59,31 @@ interface PluginUiContextValue {
   receive(payload: PluginCapabilityEventPayload): void;
 }
 
+export type PluginRecordingMaterial = UploadedAgentMedia & { collected?: boolean };
+const EMPTY_RECORDING_MATERIALS: PluginRecordingMaterial[] = [];
+function recordingMaterialKey(pluginId: string, conversationId: string) {
+  return JSON.stringify([pluginId, conversationId.replace(/^websocket:/, "")]);
+}
+
 const MAX_PLUGIN_CALLS = 50;
 const PluginUiContext = createContext<PluginUiContextValue | null>(null);
 
 export function PluginUiProvider(props: { children: ReactNode }) {
   const feedbackHandlers = useRef(new Map<symbol, { conversationId: string; handler: (feedback: PluginChatFeedback) => boolean }>());
   const fileDrafts = useRef(new Map<string, File[]>()).current;
+  const questionDrafts = useRef(new Map<string, Record<string, string>>()).current;
+  const [recordingMaterials, setRecordingMaterials] = useState(new Map<string, PluginRecordingMaterial[]>());
+  const addRecordingMaterials = useCallback((pluginId: string, conversationId: string, files: PluginRecordingMaterial[]) => {
+    if (!files.length) return;
+    const key = recordingMaterialKey(pluginId, conversationId);
+    setRecordingMaterials((current) => {
+      const next = new Map(current);
+      const merged = new Map((current.get(key) ?? []).map((file) => [file.path, file]));
+      for (const file of files) merged.set(file.path, file);
+      next.set(key, [...merged.values()]);
+      return next;
+    });
+  }, []);
   const [hiddenCallIds, setHiddenCallIds] = useState<Set<string>>(() => new Set());
   const hiddenInteractionSteps = useRef(new Map<string, string>()).current;
   const [dismissedCallIds, setDismissedCallIds] = useState<Set<string>>(() => new Set());
@@ -86,11 +110,11 @@ export function PluginUiProvider(props: { children: ReactNode }) {
   }, []);
   const openSurface = useCallback((context: PluginInvocationContext) => setActiveSurface(context), []);
   const closeSurface = useCallback(() => setActiveSurface(null), []);
-  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts,
+  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
     hiddenCallIds, setHiddenCallIds, hiddenInteractionSteps, dismissedCallIds, setDismissedCallIds,
-    answeredInteractions, setAnsweredInteractions, openingCommands
-  }), [activeSurface, calls, closeSurface, openSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts,
-    hiddenCallIds, hiddenInteractionSteps, dismissedCallIds, answeredInteractions, openingCommands]);
+    answeredInteractions, setAnsweredInteractions, openingCommands, recordingMaterials, setRecordingMaterials, addRecordingMaterials
+  }), [activeSurface, calls, closeSurface, openSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
+    hiddenCallIds, hiddenInteractionSteps, dismissedCallIds, answeredInteractions, openingCommands, recordingMaterials, addRecordingMaterials]);
   return <PluginUiContext.Provider value={value}>{props.children}</PluginUiContext.Provider>;
 }
 
@@ -152,3 +176,19 @@ export function usePluginChatFeedback(conversationId: string | undefined, handle
   }, [register, conversationId]);
   return context?.fileDrafts;
 }
+
+/** Uploaded recordings can arrive before or after the material card mounts. */
+export function usePluginRecordingMaterials(pluginId?: string, conversationId?: string) {
+  const context = useContext(PluginUiContext);
+  const key = pluginId && conversationId ? recordingMaterialKey(pluginId, conversationId) : null;
+  const files = key ? context?.recordingMaterials.get(key) ?? EMPTY_RECORDING_MATERIALS : EMPTY_RECORDING_MATERIALS;
+  const setter = context?.setRecordingMaterials;
+  const update = useCallback((nextFiles: PluginRecordingMaterial[]) => {
+    if (!key || !setter) return;
+    setter((current) => { const next = new Map(current); next.set(key, nextFiles); return next; });
+  }, [key, setter]);
+  return { files, update };
+}
+
+/** Keep typed legal answers when a settings route temporarily unmounts the chat. */
+export function usePluginQuestionDrafts() { return useContext(PluginUiContext)?.questionDrafts; }
