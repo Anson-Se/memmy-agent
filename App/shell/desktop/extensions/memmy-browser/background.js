@@ -11,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.6";
+const EXTENSION_VERSION = "1.0.7";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -1324,11 +1324,17 @@ const PLAYWRIGHT_CDP_METHODS = new Set([
 
 async function playwrightControl(tabId, name, args, commandId) {
   const claim = claims.get(tabId);
-  const current = async () => {
+  const assertCurrent = () => {
     if (!claim || claims.get(tabId) !== claim || pausedTabs.has(tabId)
       || cancelledCommands.has(commandId)) throw new Error('Browser executor cancelled');
     if (claim.credentialProtected || claim.protectedActivity) throw new Error('Browser executor is unavailable during credential protection');
+  };
+  const current = async () => {
+    assertCurrent();
     const tab = await chrome.tabs.get(tabId);
+    // Stop/timeout may arrive while Chrome is resolving the tab. Recheck at
+    // the dispatch boundary, before creating a lease or sending any input.
+    assertCurrent();
     if (tab.incognito || pageOrigin(tab.url || '') !== args.approvedOrigin) throw new Error('Browser executor site changed');
     return tab;
   };
@@ -1344,9 +1350,12 @@ async function playwrightControl(tabId, name, args, commandId) {
   await current();
   if (name === 'playwrightStart') {
     if (typeof args.leaseId !== 'string' || !/^[a-f0-9]{32}$/.test(args.leaseId)) throw new Error('Invalid browser executor lease');
+    if (args.input === true) { await assertUserIsNotUsingTab(tabId); await current(); }
+    // The user-activity check yields: another action may acquire the tab, or
+    // Stop may revoke this request, before this Start can install its lease.
+    assertCurrent();
     if (claim.playwrightLease && claim.playwrightLease.id !== args.leaseId
       && claim.playwrightLease.expiresAt > Date.now()) throw new Error('Browser executor is already busy');
-    if (args.input === true) await assertUserIsNotUsingTab(tabId);
     if (claim.cdpReadDepth || claim.cdpWriteDepth) throw new Error('Browser executor cannot overlap raw CDP');
     if (args.uploadPaths !== undefined && (!Array.isArray(args.uploadPaths) || !args.uploadPaths.length
       || args.uploadPaths.length > 20 || args.uploadPaths.some(file => typeof file !== 'string'
@@ -1383,6 +1392,8 @@ async function playwrightControl(tabId, name, args, commandId) {
   const child = args.sessionId ? await resolveCdpTarget(tabId, claim, { sessionId: args.sessionId }) : null;
   await current();
   if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
+  if (lease.expiresAt <= Date.now()) throw new Error('Browser executor lease expired');
+  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
   if (method.startsWith('Input.')) recordHistoryInput(tabId, commandId);
   const result = await command(tabId, method, args.params || {}, child?.sessionId);
   await current();

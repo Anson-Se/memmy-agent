@@ -665,7 +665,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.6");
+    expect(manifest.version).toBe("1.0.7");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
@@ -1206,4 +1206,50 @@ it.each([true, false])('fills external required auth inputs (already known = %s)
   expect(code.value).toBe(known ? 'provided-code-246810' : 'collected-code');
   expect(optional.value).toBe('keep this optional value');
   expect(JSON.stringify(result)).not.toContain(code.value);
+});
+
+
+it.each([['playwrightStart', 'cancel'], ['playwrightCdp', 'cancel'], ['playwrightCdp', 'navigate'], ['playwrightCdp', 'expire']])('rechecks the %s boundary after a delayed tab read and %s', async (name, change) => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  const origin = 'https://example.test';
+  vm.runInContext(`assertUserIsNotUsingTab = async () => undefined;
+    claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map(),
+      playwrightLease: {id: '${'a'.repeat(32)}', origin: '${origin}', input: true, expiresAt: Date.now()+45000, documentEpoch: 0} });`, test.context);
+  let reads = 0, resolveTab!: (value: unknown) => void;
+  const delayedRead = name === 'playwrightStart' ? 1 : 2;
+  const tab = { id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 };
+  (test.context as any).chrome.tabs.get = async () => ++reads === delayedRead
+    ? await new Promise(resolve => { resolveTab = resolve; }) : tab;
+  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32), input: true, fresh: false,
+    method: 'Input.insertText', params: { text: 'never-sent' } };
+  (test.context as any).operationName = name;
+  const pending = vm.runInContext("playwrightControl(7, operationName, controlArgs, 'cancel-race')", test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/cancelled|document changed|lease expired/);
+  await vi.waitFor(() => expect(reads).toBe(delayedRead));
+  vm.runInContext(change === 'navigate' ? 'claims.get(7).documentEpoch++'
+    : change === 'expire' ? 'claims.get(7).playwrightLease.expiresAt = 0' : "cancelledCommands.add('cancel-race')", test.context);
+  resolveTab(tab);
+  await checked;
+  expect(methods).toEqual([]);
+});
+
+
+it.each(['cancel', 'replacement'])('does not install a late Start lease after user-activity wait and %s', async change => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  let resume!: () => void, entered = false;
+  (test.context as any).userActivityWait = async () => { entered = true; await new Promise<void>(done => { resume = done; }); };
+  (test.context as any).chrome.tabs.get = async () => ({ id: 7, incognito: false, url: 'https://example.test/', active: false });
+  vm.runInContext(`assertUserIsNotUsingTab = userActivityWait;
+    claims.set(7, {origin: 'https://example.test', documentEpoch: 0, cdpSessions: new Map()});`, test.context);
+  const pending = vm.runInContext(`playwrightControl(7, 'playwrightStart', {
+    leaseId: '${'a'.repeat(32)}', approvedOrigin: 'https://example.test', input: true, fresh: false }, 'late-start')`, test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/cancelled|already busy/);
+  await vi.waitFor(() => expect(entered).toBe(true));
+  vm.runInContext(change === 'cancel' ? "cancelledCommands.add('late-start')"
+    : `claims.get(7).playwrightLease = {id:'${'b'.repeat(32)}', expiresAt: Date.now()+45000}`, test.context);
+  resume(); await checked;
+  expect(methods).toEqual([]);
+  expect(vm.runInContext('claims.get(7).playwrightLease?.id', test.context)).toBe(change === 'cancel' ? undefined : 'b'.repeat(32));
 });

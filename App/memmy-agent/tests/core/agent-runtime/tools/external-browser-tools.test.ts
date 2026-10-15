@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { callExternalBrowserTool } from "../../../../src/core/agent-runtime/tools/external-browser-tools.js";
+import { callExternalBrowserTool, emitExternalBrowserFrame } from "../../../../src/core/agent-runtime/tools/external-browser-tools.js";
 import type { ExternalBrowserBridge, ExternalBrowserClaim } from "../../../../src/core/agent-runtime/tools/external-browser-bridge.js";
 import * as surfaces from '../../../../src/tools/computer-use/surface-preview.js';
 
@@ -10,6 +10,41 @@ const claim: ExternalBrowserClaim = {
 const scope = { sessionKey: "s", channel: "projected-session", chatId: "s" };
 
 describe("external browser tool adapter", () => {
+  it('returns the completed observation when its optional preview never responds', async () => {
+    vi.useFakeTimers();
+    try {
+      let previewSignal: AbortSignal | undefined;
+      const command = vi.fn(async (_claim, operation, _args, signal) => {
+        if (operation === 'snapshot') return { nodes: [{ ref: 'pw-1', role: 'button', name: 'Continue' }] };
+        previewSignal = signal;
+        return await new Promise(() => undefined);
+      });
+      const pending = callExternalBrowserTool({ command } as unknown as ExternalBrowserBridge,
+        claim, scope, 'browser_snapshot', {}, async () => true);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await pending).toEqual([{ type: 'text', text: '[pw-1] button "Continue"' }]);
+      expect(previewSignal?.aborted).toBe(true);
+      expect(command.mock.calls.map(call => call[1])).toEqual(['snapshot', 'screenshot']);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('cancels a pending preview with the turn and never publishes its late response', async () => {
+    const controller = new AbortController();
+    let resolve!: (value: unknown) => void;
+    const command = vi.fn(() => new Promise<unknown>(done => { resolve = done; }));
+    const publish = vi.spyOn(surfaces, 'emitComputerUseSurface');
+    try {
+      const pending = emitExternalBrowserFrame({ command } as unknown as ExternalBrowserBridge,
+        claim, scope, undefined, controller.signal);
+      controller.abort();
+      await pending;
+      resolve({ format: 'jpeg', data: 'AAA' });
+      await Promise.resolve();
+      expect(command).toHaveBeenCalledTimes(1);
+      expect(publish).not.toHaveBeenCalled();
+    } finally { publish.mockRestore(); }
+  });
+
   it('keeps in-app text and DOM actions without requesting screenshots or publishing image previews', async () => {
     const embedded = { ...claim, browser: 'memmy' as const };
     const command = vi.fn(async (_claim, operation) => operation === 'snapshot'

@@ -23,25 +23,39 @@ export function externalBrowserTargetId(claim: ExternalBrowserClaim): string {
 export async function emitExternalBrowserFrame(
   bridge: BrowserCommandBridge, claim: ExternalBrowserClaim, scope: BrowserScope,
   screenshot?: ExternalResult,
+  signal?: AbortSignal | null,
 ): Promise<void> {
-  if (claim.browser === 'memmy') return;
+  if (claim.browser === 'memmy' || signal?.aborted) return;
+  // A presentation-only preview must not hold up the tool result or a stopped
+  // turn. Some pages never finish screenshot preparation (fonts/animations).
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, 3_000);
+  const interrupted = new Promise<void>(resolve => {
+    controller.signal.addEventListener('abort', () => resolve(), { once: true });
+  });
   try {
-    const policy = new BrowserUseSitePolicyReader();
-    const frame = screenshot ?? (bridge.subscribePlaywright
-      ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
-        subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'screenshot', { type: 'jpeg' },
-        bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'))
-      : await bridge.command(claim, "screenshot", { type: "jpeg" }) as ExternalResult);
-    if (typeof frame.data !== "string" || !["png", "jpeg"].includes(frame.format)) return;
-    const history = await bridge.command(claim, "historyState") as ExternalResult;
-    const latest = bridge.getClaim(claim) ?? claim;
-    emitComputerUseSurface({ surface: "browser", ...scope,
-      targetId: externalBrowserTargetId(latest), appKey: browserAppKey(latest.browser as 'chrome' | 'edge'),
-      title: latest.title.slice(0, 256),
-      url: latest.url.slice(0, 4096),
-      canGoBack: history.canGoBack === true, canGoForward: history.canGoForward === true,
-      imageDataUrl: `data:image/${frame.format};base64,${frame.data}` });
+    await Promise.race([(async () => {
+      const policy = new BrowserUseSitePolicyReader();
+      const frame = screenshot ?? (bridge.subscribePlaywright
+        ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+          subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'screenshot', { type: 'jpeg' },
+          bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), controller.signal)
+        : await bridge.command(claim, "screenshot", { type: "jpeg" }, controller.signal) as ExternalResult);
+      if (controller.signal.aborted || typeof frame.data !== "string" || !["png", "jpeg"].includes(frame.format)) return;
+      const history = await bridge.command(claim, "historyState", {}, controller.signal) as ExternalResult;
+      if (controller.signal.aborted) return;
+      const latest = bridge.getClaim(claim) ?? claim;
+      emitComputerUseSurface({ surface: "browser", ...scope,
+        targetId: externalBrowserTargetId(latest), appKey: browserAppKey(latest.browser as 'chrome' | 'edge'),
+        title: latest.title.slice(0, 256),
+        url: latest.url.slice(0, 4096),
+        canGoBack: history.canGoBack === true, canGoForward: history.canGoForward === true,
+        imageDataUrl: `data:image/${frame.format};base64,${frame.data}` });
+    })(), interrupted]);
   } catch { /* Preview errors must not fail the browser action. */ }
+  finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
 }
 
 function formatNodes(nodes: unknown, truncated = false): string {
@@ -96,7 +110,7 @@ export async function callExternalBrowserTool(
       if (failure) return failure;
       throw error;
     }
-    await emitExternalBrowserFrame(bridge, claim, scope);
+    await emitExternalBrowserFrame(bridge, claim, scope, undefined, abortSignal);
     return [{ type: 'text', text: formatActionResult(result) }];
   }
   const toolCommands: Record<BrowserToolName, string> = {
@@ -143,16 +157,16 @@ export async function callExternalBrowserTool(
     if (typeof result?.data !== "string" || !["png", "jpeg"].includes(result.format)) {
       throw new Error("External browser returned an invalid screenshot");
     }
-    await emitExternalBrowserFrame(bridge, claim, scope, result);
+    await emitExternalBrowserFrame(bridge, claim, scope, result, abortSignal);
     return [
       { type: "text", text: "Screenshot of the claimed external browser tab." },
       { type: "image", mimeType: `image/${result.format}`, data: result.data },
     ];
   }
   if (name === "browser_snapshot" || name === "browser_find") {
-    await emitExternalBrowserFrame(bridge, claim, scope);
+    await emitExternalBrowserFrame(bridge, claim, scope, undefined, abortSignal);
     return [{ type: "text", text: formatNodes(result?.nodes, result?.truncated === true) }];
   }
-  await emitExternalBrowserFrame(bridge, claim, scope);
+  await emitExternalBrowserFrame(bridge, claim, scope, undefined, abortSignal);
   return [{ type: "text", text: formatActionResult(result) }];
 }

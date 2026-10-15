@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { WebSocket } from 'ws';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { executeExternalBrowserPlaywright, closeAllExternalBrowserPlaywright, EXTERNAL_BROWSER_SNAPSHOT_BUDGET } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
 import { ExternalBrowserPlaywrightRelay, type PlaywrightCommandBridge } from '../../../../src/core/agent-runtime/tools/external-browser-playwright-relay.js';
 import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
@@ -23,6 +23,7 @@ const FIXTURE = `<body><button id="replace">Replace</button><button id="action">
  document.querySelector('#replace').onclick=()=>{const el=document.querySelector('#action');const copy=el.cloneNode(true);copy.onclick=el.onclick;el.replaceWith(copy);};</script>`;
 
 class FixtureBridge implements PlaywrightCommandBridge {
+  private static nextConnectionId = 0;
   claim: ExternalBrowserClaim;
   leaseId = '';
   documentEpoch = 0;
@@ -37,11 +38,14 @@ class FixtureBridge implements PlaywrightCommandBridge {
   private input = false;
   private uploadPaths?: string[];
   readonly methods: string[] = [];
+  readonly contexts: Array<{ child: boolean; isDefault: boolean; origin: string; frameId?: string }> = [];
+  dropDefaultContexts = false;
   rejectObservation = false;
 
   private constructor(root: WebSocket, url: string) {
     this.root = root;
-    this.claim = { connectionId: 'fixture', tabId: 1, browser: 'chrome', title: 'fixture', url, claimedAt: Date.now() };
+    this.claim = { connectionId: `fixture-${++FixtureBridge.nextConnectionId}`, tabId: 1,
+      browser: 'chrome', title: 'fixture', url, claimedAt: Date.now() };
     root.on('message', raw => {
       const message = JSON.parse(String(raw));
       if (message.id) {
@@ -60,6 +64,12 @@ class FixtureBridge implements PlaywrightCommandBridge {
       if (message.method === 'Page.frameNavigated' && message.sessionId === this.sessionId && !message.params.frame.parentId) {
         this.claim.url = message.params.frame.url; this.documentEpoch++;
       }
+      if (message.method === 'Runtime.executionContextCreated') this.contexts.push({
+        child: message.sessionId !== this.sessionId, isDefault: message.params.context.auxData?.isDefault === true,
+        origin: message.params.context.origin, frameId: message.params.context.auxData?.frameId,
+      });
+      if (this.dropDefaultContexts && message.method === 'Runtime.executionContextCreated'
+        && message.params.context.auxData?.isDefault === true) return;
       if (this.leaseId) for (const listener of this.listeners) listener({ leaseId: this.leaseId,
         method: message.method, params: message.params,
         ...(message.sessionId !== this.sessionId ? { sessionId: message.sessionId } : {}) });
@@ -114,6 +124,7 @@ class FixtureBridge implements PlaywrightCommandBridge {
     return result;
   }
   stop(): void { this.stopped = true; }
+  get pendingCount(): number { return this.pending.size; }
   close(): void { this.root.terminate(); }
 }
 
@@ -169,6 +180,109 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     expect(bridge.methods.some(method => method.startsWith('Storage.') || method === 'Network.getCookies')).toBe(false);
     process.stdout.write(`External browser fixture timing: cold snapshot ${Math.round(coldMs)}ms; warm click+observation ${Math.round(warmMs)}ms\n`);
   });
+
+  it('captures a cold sandboxed cross-origin iframe with opaque execution context origins', async () => {
+    const frameUrl = origin.replace('127.0.0.1', 'localhost') + '/frame';
+    await page.evaluate((url: string) => {
+      const document = (globalThis as any).document;
+      const frame = document.createElement('iframe'); frame.id = 'sandbox';
+      frame.setAttribute('sandbox', 'allow-scripts'); frame.src = url; document.body.append(frame);
+    }, frameUrl);
+    await page.locator('#sandbox').contentFrame().locator('#inside').waitFor();
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const snapshot = await Promise.race([run('snapshot', { includeBoxes: true }, () => true, controller.signal),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Cold sandboxed OOPIF snapshot did not settle')), 4000); })]);
+      expect(snapshot.nodes.some((node: any) => node.name === 'Frame name')).toBe(true);
+      expect(bridge.contexts.some(context => context.child && context.isDefault && !/^https?:/u.test(context.origin))).toBe(true);
+    } finally { clearTimeout(timer); controller.abort(); }
+  }, 15_000);
+
+  it('captures a fresh page again after a real actionability failure disposes the executor', async () => {
+    const before = await run('snapshot');
+    expect(before.nodes.length).toBeGreaterThan(0);
+    await expect(run('click', { target: '#missing-control' })).rejects.toThrow(/Timeout|waiting for locator/);
+    const after = await run('snapshot', { includeBoxes: true });
+    expect(after.nodes.some((node: any) => node.role === 'button' && node.name === 'Continue')).toBe(true);
+  }, 20_000);
+
+  it('preserves the default context when Runtime.enable overtakes the frame-tree reply', async () => {
+    const originalCommand = bridge.command;
+    bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
+      const result = await originalCommand(...args);
+      // Model the ordinary asynchronous extension/IPC response ordering, without changing the page.
+      if (args[1] === 'playwrightCdp' && args[2]?.method === 'Page.getFrameTree') {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+      return result;
+    };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const snapshot = await Promise.race([run('snapshot', {}, () => true, controller.signal),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Default execution context was lost during frame-tree bootstrap')), 4000); })]);
+      expect(snapshot.nodes.some((node: any) => node.role === 'button' && node.name === 'Continue')).toBe(true);
+    } finally { clearTimeout(timer); controller.abort(); }
+  }, 15_000);
+
+  it('preserves an opaque OOPIF context emitted before its child frame-tree reply', async () => {
+    const frameUrl = origin.replace('127.0.0.1', 'localhost') + '/frame';
+    await page.evaluate((url: string) => {
+      const document = (globalThis as any).document;
+      const frame = document.createElement('iframe'); frame.id = 'sandbox';
+      frame.setAttribute('sandbox', 'allow-scripts'); frame.src = url; document.body.append(frame);
+    }, frameUrl);
+    await page.locator('#sandbox').contentFrame().locator('#inside').waitFor();
+    const originalCommand = bridge.command;
+    bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
+      const result = await originalCommand(...args);
+      if (args[1] === 'playwrightCdp' && args[2]?.method === 'Page.getFrameTree' && args[2].sessionId) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+      return result;
+    };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const snapshot = await Promise.race([run('snapshot', {}, () => true, controller.signal),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Opaque OOPIF execution context was filtered before frame-tree bootstrap')), 4000); })]);
+      expect(snapshot.nodes.some((node: any) => node.name === 'Frame name')).toBe(true);
+      expect(bridge.contexts.some(context => context.child && context.isDefault && !/^https?:/u.test(context.origin))).toBe(true);
+    } finally { clearTimeout(timer); controller.abort(); }
+  }, 15_000);
+
+  it('bounds a contextless snapshot and releases the tab queue for a fresh observation', async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const deadlines: Array<() => void> = [];
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void,
+      milliseconds?: number, ...args: any[]) => {
+      const timer = originalSetTimeout(callback, milliseconds, ...args);
+      if (milliseconds === 30_000) deadlines.push(() => { clearTimeout(timer); callback(...args); });
+      return timer;
+    }) as typeof setTimeout);
+    const controller = new AbortController();
+    bridge.dropDefaultContexts = true;
+    const stalled = run('snapshot', {}, () => true, controller.signal).then(
+      value => ({ kind: 'result' as const, value }), error => ({ kind: 'error' as const, error }));
+    try {
+      // Chrome bootstrap completes, but the frame has no default context and no CDP request is outstanding.
+      await vi.waitFor(() => {
+        expect(bridge.contexts.some(context => context.isDefault)).toBe(true);
+        expect(bridge.methods).toContain('Page.createIsolatedWorld');
+        expect(bridge.pendingCount).toBe(0);
+      }, { timeout: 3000 });
+      expect(deadlines.length).toBeGreaterThan(0);
+      deadlines[0]();
+      const outcome = await Promise.race([stalled, new Promise<never>((_resolve, reject) =>
+        originalSetTimeout(() => reject(new Error('Expired contextless snapshot retained the tab queue')), 3000))]);
+      expect(outcome).toMatchObject({ kind: 'error', error: { code: 'BROWSER_ACTION_DEADLINE', noActionDispatched: true } });
+      timerSpy.mockRestore();
+      bridge.dropDefaultContexts = false;
+      const recovered = await run('snapshot');
+      expect(recovered.nodes.some((node: any) => node.role === 'button' && node.name === 'Continue')).toBe(true);
+    } finally { timerSpy.mockRestore(); controller.abort(); }
+  }, 15_000);
 
   it('waits for an overlay to clear and handles cross-origin iframe refs', async () => {
     await page.evaluate("const overlay=document.createElement('div');overlay.id='overlay';overlay.style='position:fixed;inset:0;z-index:1000;background:white';document.body.append(overlay);setTimeout(()=>overlay.remove(),350)");

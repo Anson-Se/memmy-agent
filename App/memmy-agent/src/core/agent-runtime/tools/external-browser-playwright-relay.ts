@@ -10,8 +10,14 @@ export type PlaywrightCommandBridge = {
   subscribePlaywright(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
     listener: (event: ExternalBrowserPlaywrightEvent) => void): () => void;
 };
-type Operation = { bridge: PlaywrightCommandBridge; leaseId: string; origin: string; signal?: AbortSignal };
+const ACTION_DEADLINE_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 2_000;
+type Operation = { bridge: PlaywrightCommandBridge; leaseId: string; origin: string; signal: AbortSignal;
+  controller: AbortController; parentSignal?: AbortSignal; parentAbort: () => void;
+  timer?: ReturnType<typeof setTimeout>; startedAt: number; rejectInterruption: (error: Error) => void;
+  endPromise?: Promise<void>; detachPromise?: Promise<void> };
 type CdpMessage = { id: number; method: string; params?: Record<string, any>; sessionId?: string };
+type FrameTreeReply = { promise: Promise<void>; resolve: () => void };
 
 /** A deliberately single-page CDP transport, using only public Playwright APIs. */
 export class ExternalBrowserPlaywrightRelay {
@@ -36,7 +42,17 @@ export class ExternalBrowserPlaywrightRelay {
   private consoleRecords: Array<{ frameUrl: string; type: string; text: string }> = [];
   private networkRecords: Array<{ frameUrl: string; method: string; url: string }> = [];
   private endpoint = '';
+  private closed = false;
+  private closePromise: Promise<void> | null = null;
+  private stage = 'idle';
+  private failure: Error | null = null;
+  private interruption: Promise<never> = new Promise(() => undefined);
+  private readonly frameTreeReplies = new Map<string, Set<FrameTreeReply>>();
   readonly mainSessionId = 'memmy-page';
+  setStage(stage: string): void { this.stage = /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(stage) ? stage : 'action'; }
+  get actionError(): Error | null { return this.failure; }
+  get deadlineError(): Error | null { return (this.failure as any)?.code === 'BROWSER_ACTION_DEADLINE' ? this.failure : null; }
+  waitForInterruption(): Promise<never> { return this.interruption; }
   hasBlockedFrames(): boolean { return [...this.frameUrls.values(), ...this.childUrls.values()].some(url => !this.permitted(url)); }
   dispatchState(): 'none' | 'confirmed' | 'unknown' { return this.inputState; }
   frameVersion(): string { return JSON.stringify({ frames: this.versionFrames,
@@ -51,7 +67,7 @@ export class ExternalBrowserPlaywrightRelay {
   constructor(readonly identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
     private allowFrame: (url: string) => boolean) {
     this.server.on('upgrade', (request, socket, head) => {
-      if (request.socket.remoteAddress !== '127.0.0.1' || request.url !== this.path || this.socket) {
+      if (this.closed || request.socket.remoteAddress !== '127.0.0.1' || request.url !== this.path || this.socket) {
         socket.destroy(); return;
       }
       this.sockets.handleUpgrade(request, socket, head, ws => {
@@ -59,22 +75,57 @@ export class ExternalBrowserPlaywrightRelay {
         ws.on('message', raw => {
           let input: CdpMessage;
           try { input = JSON.parse(String(raw)); } catch { ws.close(1003); return; }
-          void this.handle(input).then(result => this.emit({ id: input.id, sessionId: input.sessionId, result }),
-            error => this.emit({ id: input.id, sessionId: input.sessionId,
-              error: { code: -32000, message: String(error?.message || error) } }));
+          // Playwright installs world/context listeners after the frame-tree reply.
+          // Record this synchronously, before another incoming Runtime.enable can run.
+          const sessionId = input.sessionId || this.mainSessionId;
+          const frameTreeReply = input.method === 'Page.getFrameTree' ? this.beginFrameTreeReply(sessionId) : null;
+          void this.handle(input).then(result => {
+            try {
+              if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId, result });
+            } finally { if (frameTreeReply) this.finishFrameTreeReply(sessionId, frameTreeReply); }
+          }, error => {
+            try {
+              if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId,
+                error: { code: -32000, message: String(error?.message || error) } });
+            } finally { if (frameTreeReply) this.finishFrameTreeReply(sessionId, frameTreeReply); }
+          });
         });
-        ws.on('close', () => { if (this.socket === ws) this.socket = null; });
+        ws.on('close', () => {
+          if (this.socket !== ws) return;
+          this.socket = null;
+          if (this.operation) this.interrupt(this.operation,
+            Object.assign(new Error('Browser executor transport disconnected'), { code: 'BROWSER_TRANSPORT_CLOSED' }));
+          void this.close();
+        });
       });
     });
   }
   setFramePolicy(policy: (url: string) => boolean): void { this.allowFrame = policy; }
 
+  private beginFrameTreeReply(sessionId: string): FrameTreeReply {
+    let resolve!: () => void;
+    const promise = new Promise<void>(complete => { resolve = complete; });
+    const reply = { promise, resolve };
+    const pending = this.frameTreeReplies.get(sessionId) ?? new Set<FrameTreeReply>();
+    pending.add(reply); this.frameTreeReplies.set(sessionId, pending);
+    return reply;
+  }
+
+  private finishFrameTreeReply(sessionId: string, reply: FrameTreeReply): void {
+    const pending = this.frameTreeReplies.get(sessionId);
+    pending?.delete(reply);
+    if (!pending?.size) this.frameTreeReplies.delete(sessionId);
+    reply.resolve();
+  }
+
   async start(): Promise<string> {
+    if (this.closed) throw this.failure ?? new Error('Browser executor relay closed');
     if (this.endpoint) return this.endpoint;
     await new Promise<void>((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(0, '127.0.0.1', () => { this.server.off('error', reject); resolve(); });
     });
+    if (this.closed) { this.server.close(); throw this.failure ?? new Error('Browser executor relay closed'); }
     const address = this.server.address();
     if (!address || typeof address === 'string') throw new Error('Browser executor relay unavailable');
     this.endpoint = `ws://127.0.0.1:${address.port}${this.path}`;
@@ -83,15 +134,38 @@ export class ExternalBrowserPlaywrightRelay {
 
   async begin(bridge: PlaywrightCommandBridge, origin: string, input: boolean,
     fresh: boolean, signal?: AbortSignal, uploadPaths?: string[]): Promise<{ documentEpoch: number; cdpEpoch: number; frameVersion: string }> {
+    if (this.closed) throw this.failure ?? new Error('Browser executor relay closed');
+    if (this.operation) throw new Error('Browser executor action is already active');
     this.inputState = 'none';
+    this.failure = null;
+    this.stage = 'lease-start';
     this.assertClaim(bridge, origin, signal);
     const leaseId = randomBytes(16).toString('hex');
-    this.operation = { bridge, origin, leaseId, signal };
-    this.lastOperation = this.operation;
-    this.unsubscribe = bridge.subscribePlaywright(this.identity, event => this.onEvent(event));
+    const controller = new AbortController();
+    let rejectInterruption!: (error: Error) => void;
+    this.interruption = new Promise<never>((_resolve, reject) => { rejectInterruption = reject; });
+    // A caller can subscribe after begin; a synchronous revocation must still be handled.
+    void this.interruption.catch(() => undefined);
+    const operation: Operation = { bridge, origin, leaseId, controller, signal: controller.signal,
+      parentSignal: signal, startedAt: Date.now(), rejectInterruption,
+      parentAbort: () => { this.interrupt(operation, this.cancelledError()); void this.close(); } };
+    this.operation = operation;
+    this.lastOperation = operation;
+    operation.timer = setTimeout(() => {
+      const error = Object.assign(new Error('Browser action exceeded its 30 second deadline'), {
+        code: 'BROWSER_ACTION_DEADLINE', stage: this.stage,
+        elapsedMs: Math.max(0, Date.now() - operation.startedAt), tabId: this.identity.tabId,
+      });
+      this.interrupt(operation, error);
+      void this.close();
+    }, ACTION_DEADLINE_MS);
+    signal?.addEventListener('abort', operation.parentAbort, { once: true });
     try {
-      const state = await bridge.command(this.identity, 'playwrightStart',
-        { leaseId, approvedOrigin: origin, input, fresh, ...(uploadPaths ? { uploadPaths } : {}) }, signal) as Record<string, any>;
+      this.unsubscribe = bridge.subscribePlaywright(this.identity, event => this.onEvent(event));
+      const state = await Promise.race([bridge.command(this.identity, 'playwrightStart',
+        { leaseId, approvedOrigin: origin, input, fresh, ...(uploadPaths ? { uploadPaths } : {}) }, operation.signal),
+      this.interruption]) as Record<string, any>;
+      if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
       this.targetInfo = { ...state.targetInfo, browserContextId: 'memmy-selected-context', type: 'page', attached: true };
       this.frameUrls.clear();
       this.readFrameTree(state.frameTree);
@@ -101,16 +175,64 @@ export class ExternalBrowserPlaywrightRelay {
       this.assertActive();
       return { documentEpoch: Number(state.documentEpoch), cdpEpoch: Number(state.cdpEpoch),
         frameVersion: this.frameVersion() };
-    } catch (error) { await this.end(); throw error; }
+    } catch (error) { await this.end(); throw this.failure ?? error; }
   }
 
   async end(detach = false): Promise<void> {
     const operation = this.operation ?? (detach ? this.lastOperation : null);
+    if (this.operation === operation && operation) this.release(operation);
+    if (detach && this.lastOperation === operation) this.lastOperation = null;
+    if (operation) await this.cleanup(operation, detach);
+  }
+
+  private cancelledError(): Error {
+    return Object.assign(new Error('Browser executor cancelled'), { name: 'AbortError', code: 'BROWSER_ACTION_CANCELLED' });
+  }
+
+  private release(operation: Operation): void {
+    if (this.operation !== operation) return;
     this.operation = null;
+    clearTimeout(operation.timer);
+    operation.parentSignal?.removeEventListener('abort', operation.parentAbort);
     this.unsubscribe?.(); this.unsubscribe = null;
-    if (operation) await operation.bridge.command(this.identity, 'playwrightEnd',
-      { leaseId: operation.leaseId, approvedOrigin: operation.origin, ...(detach ? { detach: true } : {}) }).catch(() => undefined);
-    if (detach) this.lastOperation = null;
+    operation.controller.abort(this.failure ?? this.cancelledError());
+    for (const pending of this.frameTreeReplies.values()) for (const reply of pending) reply.resolve();
+    this.frameTreeReplies.clear();
+  }
+
+  private interrupt(operation: Operation, error: Error): void {
+    if (this.operation !== operation) return;
+    this.failure = error;
+    // Revoke before disconnecting so no queued CDP input can acquire the old lease.
+    operation.rejectInterruption(error);
+    this.release(operation);
+    this.disconnect();
+  }
+
+  private disconnect(): void {
+    const socket = this.socket; this.socket = null;
+    socket?.terminate();
+    for (const client of this.sockets.clients) client.terminate();
+  }
+
+  private cleanup(operation: Operation, detach: boolean): Promise<void> {
+    const key = detach ? 'detachPromise' : 'endPromise';
+    if (operation[key]) return operation[key]!;
+    operation[key] = (async () => {
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<void>(resolve => {
+        timer = setTimeout(() => { controller.abort(); resolve(); }, CLEANUP_TIMEOUT_MS);
+      });
+      try {
+        // Cleanup uses the captured lease, never a later task's current lease.
+        await Promise.race([operation.bridge.command(this.identity, 'playwrightEnd',
+          { leaseId: operation.leaseId, approvedOrigin: operation.origin, ...(detach ? { detach: true } : {}) },
+          controller.signal).then(() => undefined, () => undefined), deadline]);
+      } catch { /* Cleanup failure cannot prevent local disconnection or release. */ }
+      finally { clearTimeout(timer); controller.abort(); }
+    })();
+    return operation[key]!;
   }
 
   private assertClaim(bridge: PlaywrightCommandBridge, origin: string, signal?: AbortSignal): void {
@@ -151,8 +273,12 @@ export class ExternalBrowserPlaywrightRelay {
   private onEvent(event: ExternalBrowserPlaywrightEvent): void {
     const operation = this.operation;
     if (!operation || event.leaseId !== operation.leaseId || operation.signal?.aborted) return;
-    if (event.method === 'Memmy.executorRevoked') { this.socket?.close(1000, 'Browser action revoked'); return; }
-    try { this.assertActive(); } catch { this.socket?.close(1000, 'Browser action revoked'); return; }
+    if (event.method === 'Memmy.executorRevoked') {
+      this.interrupt(operation, new Error('Browser action revoked')); void this.close(); return;
+    }
+    try { this.assertActive(); } catch (error) {
+      this.interrupt(operation, error as Error); void this.close(); return;
+    }
     const params = event.params as Record<string, any>;
     if (event.method === 'Target.attachedToTarget') {
       const url = String(params.targetInfo?.url || '');
@@ -227,6 +353,11 @@ export class ExternalBrowserPlaywrightRelay {
 
   async send(method: string, params: Record<string, any> = {}, sessionId = this.mainSessionId): Promise<any> {
     const operation = this.assertActive();
+    if (method === 'Runtime.enable') {
+      const replies = [...(this.frameTreeReplies.get(sessionId) ?? [])];
+      if (replies.length) await Promise.race([Promise.all(replies.map(reply => reply.promise)), this.interruption]);
+      if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
+    }
     if (sessionId !== this.mainSessionId && !this.permitted(this.childUrls.get(sessionId))) {
       throw new Error('Browser executor frame is unavailable or blocked');
     }
@@ -255,16 +386,16 @@ export class ExternalBrowserPlaywrightRelay {
     if (mutation && this.inputState !== 'confirmed') this.inputState = 'unknown';
     let result: Record<string, any>;
     try {
-      result = await operation.bridge.command(this.identity, 'playwrightCdp', {
+      result = await Promise.race([operation.bridge.command(this.identity, 'playwrightCdp', {
         leaseId: operation.leaseId, approvedOrigin: operation.origin, method, params: commandParams,
         ...(sessionId !== this.mainSessionId ? { sessionId } : {}),
-      }, operation.signal) as Record<string, any>;
+      }, operation.signal), this.interruption]) as Record<string, any>;
       if (mutation) this.inputState = 'confirmed';
     } catch (error) {
       if (mutation && (error as Error).message === 'USER_ACTIVE_ON_TARGET_TAB') this.inputState = previousState;
       throw error;
     }
-    this.assertActive();
+    if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
     if (resolvedUrl) {
       for (const value of [result?.result, result?.object, ...(Array.isArray(result?.result)
         ? result.result.flatMap((property: any) => [property.value, property.get, property.set]) : [])]) {
@@ -308,11 +439,16 @@ export class ExternalBrowserPlaywrightRelay {
     return this.send(message.method, message.params, message.sessionId);
   }
 
-  async close(): Promise<void> {
-    await this.end(true);
-    this.socket?.terminate(); this.socket = null;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    if (this.operation) this.interrupt(this.operation, this.cancelledError());
+    // Local disconnection must not await an unresponsive extension or desktop.
+    this.disconnect();
     this.sockets.close();
-    if (this.server.listening) await new Promise<void>(resolve => this.server.close(() => resolve()));
+    if (this.server.listening) this.server.close();
     this.endpoint = '';
+    this.closePromise = this.end(true);
+    return this.closePromise;
   }
 }

@@ -85,6 +85,7 @@ function frameAt(page: Page, path: number[]): Frame | null {
 
 async function capture(session: Session, allowFrame: (url: string) => boolean,
   query?: { text?: string; regex?: string }): Promise<{ nodes: NodeInfo[]; truncated: boolean }> {
+  session.relay.setStage('observation');
   const nonce = randomBytes(8).toString('hex');
   const refs = new Map<string, Reference>();
   const nodes: NodeInfo[] = [];
@@ -169,6 +170,15 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
   const previous = queues.get(tabKey) ?? Promise.resolve();
   const work = previous.catch(() => undefined).then(async () => {
     if (signal?.aborted) throw new Error('Browser executor cancelled');
+    const operationId = randomBytes(6).toString('hex');
+    const startedAt = Date.now();
+    const diagnostic = (outcome: string, error?: Error & { stage?: string; code?: string }) => {
+      console.info('[browser-executor]', JSON.stringify({ operationId, action, browser: claim.browser,
+        outcome, elapsedMs: Date.now() - startedAt,
+        ...(error?.stage ? { stage: error.stage } : {}), ...(error?.code ? { code: error.code } : {}) }));
+    };
+    diagnostic('started');
+    let outcome = 'completed';
     let session = sessions.get(key);
     if (!session) {
       session = { key, scopeKey: scopeKey(scope), relay: new ExternalBrowserPlaywrightRelay(claim, allowFrame),
@@ -194,6 +204,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         state = await session.relay.begin(bridge, origin, INPUT_ACTIONS.has(action), true, signal, uploadPaths);
       }
       if (!session.browser) {
+        session.relay.setStage('connection');
         const { chromium } = await import('playwright');
         const endpoint = await session.relay.start();
         session.browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, isLocal: true, timeout: 15_000 });
@@ -213,93 +224,103 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
             { inputTargetUncertain: afterInput });
         }
       };
-      switch (action) {
-        case 'consoleMessages': return { messages: session.relay.consoleMessages() };
-        case 'networkRequests': return { requests: session.relay.networkRequests() };
-        case 'snapshot': return await capture(session, allowFrame);
-        case 'find': {
-          return await capture(session, allowFrame, { text: String(args.text || ''),
-            regex: args.regex ? String(args.regex).slice(0, 250) : undefined });
-        }
-        case 'click': {
-          if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
-            assertUntargetedInputAllowed();
-            await page.mouse.click(args.x, args.y,
-              { button: args.button || 'left', clickCount: args.doubleClick ? 2 : 1 });
-            assertUntargetedInputAllowed(true);
+      session.relay.setStage(action);
+      const actionSession = session;
+      const perform = async (): Promise<Record<string, any>> => {
+        switch (action) {
+          case 'consoleMessages': return { messages: actionSession.relay.consoleMessages() };
+          case 'networkRequests': return { requests: actionSession.relay.networkRequests() };
+          case 'snapshot': return await capture(actionSession, allowFrame);
+          case 'find': {
+            return await capture(actionSession, allowFrame, { text: String(args.text || ''),
+              regex: args.regex ? String(args.regex).slice(0, 250) : undefined });
           }
-          else {
-            const locator = await target(session, args.target || args.ref, allowFrame);
-            const options = { button: args.button || 'left', modifiers: args.modifiers };
-            if (args.doubleClick) await locator.dblclick(options); else await locator.click(options);
-          }
-          return await observed({ ok: true, inputDispatched: true });
-        }
-        case 'type': {
-          const locator = await target(session, args.target || args.ref, allowFrame);
-          const text = String(args.text || '');
-          if (text.length > 100_000) throw new Error('Text is too long');
-          if (args.slowly) { await locator.fill(''); await locator.pressSequentially(text); }
-          else await locator.fill(text);
-          if (args.submit) await locator.press('Enter');
-          return await observed({ ok: true, inputDispatched: true, ...(args.submit ? { submitted: true } : {}) });
-        }
-        case 'selectOption': {
-          const values = Array.isArray(args.values) ? args.values.map(String) : [String(args.value || '')];
-          const selected = await (await target(session, args.target || args.ref, allowFrame)).selectOption(values);
-          return await observed({ value: selected.length === 1 ? selected[0] : selected, values: selected });
-        }
-        case 'pressKey': {
-          const key = String(args.key || '').replace(/\bCtrl\b/g, 'Control').replace(/\bCommand\b/g, 'Meta');
-          if (!key || key.length > 50) throw new Error('Invalid key');
-          assertUntargetedInputAllowed();
-          await page.keyboard.press(key);
-          assertUntargetedInputAllowed(true);
-          return await observed({ ok: true, inputDispatched: true });
-        }
-        case 'scroll': {
-          assertUntargetedInputAllowed();
-          await page.mouse.wheel(Number(args.deltaX) || 0, Number(args.deltaY) || 0);
-          assertUntargetedInputAllowed(true);
-          return await observed({ ok: true, inputDispatched: true });
-        }
-        case 'upload': {
-          if (!Array.isArray(uploadPaths) || !uploadPaths.length || uploadPaths.length > 20
-            || uploadPaths.some(file => typeof file !== 'string' || !file)) throw new Error('Approved upload paths are required');
-          await (await target(session, args.target || args.ref, allowFrame)).setInputFiles(uploadPaths);
-          return await observed({ ok: true, uploaded: uploadPaths.length });
-        }
-        case 'waitFor': {
-          const timeout = Math.min(25_000, Math.max(0, Number(args.time || 0) * 1000)) || 5_000;
-          const deadline = Date.now() + timeout;
-          if (!args.text && !args.textGone) {
-            if (args.time) await page.waitForTimeout(timeout);
-          } else while (true) {
-            const result = await capture(session, allowFrame);
-            const text = result.nodes.map(node => `${node.name} ${node.value}`).join('\n');
-            if ((!args.text || text.includes(String(args.text))) && (!args.textGone || !text.includes(String(args.textGone)))) break;
-            if (Date.now() >= deadline) throw new Error('Wait condition was not met');
-            await page.waitForTimeout(150);
-          }
-          return { ok: true };
-        }
-        case 'screenshot': {
-          const assertScreenshotAllowed = () => {
-            if (session!.relay.hasBlockedFrames() || page.frames().some(frame => !['about:blank', 'about:srcdoc'].includes(frame.url()) && !allowFrame(frame.url()))) {
-              throw new Error('Screenshot includes a frame blocked by site policy');
+          case 'click': {
+            if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+              assertUntargetedInputAllowed();
+              await page.mouse.click(args.x, args.y,
+                { button: args.button || 'left', clickCount: args.doubleClick ? 2 : 1 });
+              assertUntargetedInputAllowed(true);
             }
-          };
-          assertScreenshotAllowed();
-          const type = args.type === 'jpeg' ? 'jpeg' : 'png';
-          if (args.fullPage && (args.target || args.ref)) throw new Error('Choose fullPage or an element screenshot');
-          const locator = args.target || args.ref ? await target(session, args.target || args.ref, allowFrame) : null;
-          const data = locator ? await locator.screenshot({ type }) : await page.screenshot({ type, fullPage: args.fullPage === true });
-          assertScreenshotAllowed();
-          return { format: type, data: data.toString('base64') };
+            else {
+              const locator = await target(actionSession, args.target || args.ref, allowFrame);
+              const options = { button: args.button || 'left', modifiers: args.modifiers };
+              if (args.doubleClick) await locator.dblclick(options); else await locator.click(options);
+            }
+            return await observed({ ok: true, inputDispatched: true });
+          }
+          case 'type': {
+            const locator = await target(actionSession, args.target || args.ref, allowFrame);
+            const text = String(args.text || '');
+            if (text.length > 100_000) throw new Error('Text is too long');
+            if (args.slowly) { await locator.fill(''); await locator.pressSequentially(text); }
+            else await locator.fill(text);
+            if (args.submit) await locator.press('Enter');
+            return await observed({ ok: true, inputDispatched: true, ...(args.submit ? { submitted: true } : {}) });
+          }
+          case 'selectOption': {
+            const values = Array.isArray(args.values) ? args.values.map(String) : [String(args.value || '')];
+            const selected = await (await target(actionSession, args.target || args.ref, allowFrame)).selectOption(values);
+            return await observed({ value: selected.length === 1 ? selected[0] : selected, values: selected });
+          }
+          case 'pressKey': {
+            const key = String(args.key || '').replace(/\bCtrl\b/g, 'Control').replace(/\bCommand\b/g, 'Meta');
+            if (!key || key.length > 50) throw new Error('Invalid key');
+            assertUntargetedInputAllowed();
+            await page.keyboard.press(key);
+            assertUntargetedInputAllowed(true);
+            return await observed({ ok: true, inputDispatched: true });
+          }
+          case 'scroll': {
+            assertUntargetedInputAllowed();
+            await page.mouse.wheel(Number(args.deltaX) || 0, Number(args.deltaY) || 0);
+            assertUntargetedInputAllowed(true);
+            return await observed({ ok: true, inputDispatched: true });
+          }
+          case 'upload': {
+            if (!Array.isArray(uploadPaths) || !uploadPaths.length || uploadPaths.length > 20
+              || uploadPaths.some(file => typeof file !== 'string' || !file)) throw new Error('Approved upload paths are required');
+            await (await target(actionSession, args.target || args.ref, allowFrame)).setInputFiles(uploadPaths);
+            return await observed({ ok: true, uploaded: uploadPaths.length });
+          }
+          case 'waitFor': {
+            const timeout = Math.min(25_000, Math.max(0, Number(args.time || 0) * 1000)) || 5_000;
+            const deadline = Date.now() + timeout;
+            if (!args.text && !args.textGone) {
+              if (args.time) await page.waitForTimeout(timeout);
+            } else while (true) {
+              const result = await capture(actionSession, allowFrame);
+              const text = result.nodes.map(node => `${node.name} ${node.value}`).join('\n');
+              if ((!args.text || text.includes(String(args.text))) && (!args.textGone || !text.includes(String(args.textGone)))) break;
+              if (Date.now() >= deadline) throw new Error('Wait condition was not met');
+              await page.waitForTimeout(150);
+            }
+            return { ok: true };
+          }
+          case 'screenshot': {
+            const assertScreenshotAllowed = () => {
+              if (actionSession.relay.hasBlockedFrames() || page.frames().some(frame => !['about:blank', 'about:srcdoc'].includes(frame.url()) && !allowFrame(frame.url()))) {
+                throw new Error('Screenshot includes a frame blocked by site policy');
+              }
+            };
+            assertScreenshotAllowed();
+            const type = args.type === 'jpeg' ? 'jpeg' : 'png';
+            if (args.fullPage && (args.target || args.ref)) throw new Error('Choose fullPage or an element screenshot');
+            const locator = args.target || args.ref ? await target(actionSession, args.target || args.ref, allowFrame) : null;
+            const data = locator ? await locator.screenshot({ type }) : await page.screenshot({ type, fullPage: args.fullPage === true });
+            assertScreenshotAllowed();
+            return { format: type, data: data.toString('base64') };
+          }
+          default: throw new Error('Unsupported Playwright browser action');
         }
-        default: throw new Error('Unsupported Playwright browser action');
-      }
+      };
+      // frame.evaluate can wait for an execution-context event without an
+      // outstanding CDP command. Its wait is not covered by locator timeouts.
+      return await Promise.race([perform(), session.relay.waitForInterruption()]);
     } catch (error) {
+      error = session.relay.actionError ?? error;
+      outcome = signal?.aborted ? 'cancelled' : 'failed';
+      diagnostic(outcome, error as Error);
       const dispatchState = session.relay.dispatchState();
       await dispose(session);
       const message = signal?.aborted ? 'Browser executor cancelled' : String((error as Error)?.message || error);
@@ -322,6 +343,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         session.idleTimer = setTimeout(() => void dispose(session!), 15_000);
         session.idleTimer.unref?.();
       }
+      if (outcome === 'completed') diagnostic(outcome);
     }
   });
   queues.set(tabKey, work);
