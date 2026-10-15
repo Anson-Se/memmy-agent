@@ -7,8 +7,11 @@ import { BrowserDownloadSettings } from './browser-download-settings.js';
 
 export type BrowserDownloadAction = 'pause' | 'resume' | 'cancel';
 type TaskDestination = { filePath: string; destinationId: string; expiresAt: number;
-  isCurrent: () => boolean; state: 'pending' | 'started' | 'cancelled';
+  isCurrent: () => boolean; state: 'pending' | 'started' | 'cancelled'; cancelledAt?: number;
   outcome: Promise<string | null>; settle: (error: string | null) => void };
+// A cancelled action keeps its tab's slot this long, so its late download
+// cannot land in the next action's destination; afterwards the tab is normal.
+const LATE_DOWNLOAD_WINDOW_MS = 30_000;
 
 type LiveDownload = { id: string; name: string; url: string; startedAt: number; item: DownloadItem;
   status: 'started' | 'in_progress' | 'paused'; cancelRequested: boolean;
@@ -51,12 +54,23 @@ export class BrowserWebviewDownloads {
     browserSession.on('will-download', this.onDownload);
   }
 
+  private releaseLapsedDestination(tabId: number): void {
+    const current = this.destinations.get(tabId);
+    if (current?.state === 'cancelled' && Date.now() - (current.cancelledAt ?? 0) > LATE_DOWNLOAD_WINDOW_MS) {
+      this.destinations.delete(tabId);
+    }
+  }
+
   setDestination(tabId: number, filePath: string | null, destinationId: string, isCurrent: () => boolean): void {
+    this.releaseLapsedDestination(tabId);
     const current = this.destinations.get(tabId);
     if (filePath === null) {
       if (current?.destinationId !== destinationId) return;
       if (current.state === 'started') this.destinations.delete(tabId);
-      else { current.state = 'cancelled'; current.settle('Browser download was cancelled before it started'); }
+      else if (current.state === 'pending') {
+        current.state = 'cancelled'; current.cancelledAt = Date.now();
+        current.settle('Browser download was cancelled before it started');
+      }
       return;
     }
     if (current && current.state !== 'started')
@@ -81,7 +95,7 @@ export class BrowserWebviewDownloads {
     let poll: ReturnType<typeof setInterval> | undefined;
     const cancel = (message: string) => {
       if (destination.state !== 'pending') return;
-      destination.state = 'cancelled'; destination.settle(message);
+      destination.state = 'cancelled'; destination.cancelledAt = Date.now(); destination.settle(message);
     };
     if (!isCurrent() || !destination.isCurrent()) cancel('Browser download action was cancelled or its page changed');
     if (destination.state === 'pending') {
@@ -102,6 +116,7 @@ export class BrowserWebviewDownloads {
     const id = randomUUID();
     const name = safeFilename(item.getFilename());
     const preference = this.settings.read();
+    if (contents) this.releaseLapsedDestination(contents.id);
     const destination = contents ? this.destinations.get(contents.id) : undefined;
     if (destination && destination.state !== 'started') {
       if (destination.state === 'cancelled' || destination.expiresAt < Date.now() || !destination.isCurrent()

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DownloadItem, Session } from 'electron';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { BrowserDownloadCatalog } from '../src/main/browser-download-catalog.js';
 import { BrowserDownloadSettings } from '../src/main/browser-download-settings.js';
 import { attachBrowserWebviewDownloads, BrowserWebviewDownloads } from '../src/main/browser-webview-downloads.js';
@@ -169,6 +169,25 @@ it('does not use cancelled, stale or replaced task destinations or overwrite an 
   manager.dispose();
 });
 
+
+it('returns a tab to normal downloads once a cancelled action can no longer deliver late', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-lapsed-download-')); roots.push(root);
+  const session = new EventEmitter();
+  const manager = new BrowserWebviewDownloads(session as unknown as Session, root);
+  const started = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+  try {
+    manager.setDestination(27, path.join(root, 'first.txt'), 'first', () => true);
+    manager.setDestination(27, null, 'first', () => false);
+    expect(() => manager.setDestination(27, path.join(root, 'second.txt'), 'second', () => true)).toThrow(/previous download/);
+    clock.mockReturnValue(started + 31_000);
+    const own = download('own.txt'); session.emit('will-download', {}, own.item, { id: 27 });
+    expect(own.saved()).not.toBe('');
+    manager.setDestination(27, path.join(root, 'second.txt'), 'second', () => true);
+    const next = download('second.txt'); session.emit('will-download', {}, next.item, { id: 27 });
+    expect(next.saved()).toBe(path.join(root, 'second.txt'));
+  } finally { clock.mockRestore(); manager.dispose(); }
+});
 
 it('waits for the matching tab download after its triggering action has returned', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-delayed-download-')); roots.push(root);
