@@ -6,7 +6,9 @@ $ErrorActionPreference = 'Stop'
 # come from Windows' running processes or Start Menu shortcuts, never the API.
 try {
   $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($IdsBase64))
-  $ids = @($json | ConvertFrom-Json)
+  # Windows PowerShell 5.1 emits a parsed JSON array as one pipeline object.
+  # Flatten it before checking each History application id.
+  $ids = @($json | ConvertFrom-Json | ForEach-Object { $_ })
 } catch { exit 2 }
 if ($ids.Count -gt 48) { exit 2 }
 $wanted = @{}
