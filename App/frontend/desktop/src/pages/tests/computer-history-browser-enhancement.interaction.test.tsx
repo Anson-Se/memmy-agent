@@ -128,14 +128,13 @@ describe("shared browser extension entry in Computer History", () => {
     expect(f.getExternalBrowserStatus).not.toHaveBeenCalled();
   });
 
-  it.each(["darwin", "win32"] as const)("lets a first-time %s user install before enabling History", async platform => {
+  it.each(["darwin", "win32"] as const)("hides the enhancement on a %s History page before recording starts", async platform => {
     const f = fixture(platform);
     await render(<ComputerHistorySubPage client={f.client} />);
     expect(host.querySelector(".history-launch-card")).not.toBeNull();
-    const heading = host.querySelector<HTMLButtonElement>(".ch__browser-enhancement-heading");
-    expect(heading).not.toBeNull();
-    await act(async () => heading!.click());
-    expect(browserRow("Google Chrome").textContent).toContain("未安装");
+    expect(host.querySelector(".ch__browser-enhancement")).toBeNull();
+    expect(host.textContent).not.toContain("网页历史记录增强");
+    expect(f.getExternalBrowserStatus).not.toHaveBeenCalled();
     expect(f.client.startComputerHistoryObservation).not.toHaveBeenCalled();
     expect(f.client.updateComputerHistorySettings).not.toHaveBeenCalled();
   });

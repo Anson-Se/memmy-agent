@@ -519,9 +519,6 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
 
       {showIntroduction ? <div className="ch__intro">
         <HistoryLaunchCard onEnable={() => setPendingRecordingAction("start")} />
-        <div className="ch__browser-enhancement-card">
-          <ComputerHistoryBrowserEnhancement client={props.client} />
-        </div>
       </div> :
       <div className="ch__settings-card">
       <div className="ch__recording-setting flex items-center justify-between">
