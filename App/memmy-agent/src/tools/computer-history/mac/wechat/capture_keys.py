@@ -2,7 +2,10 @@
 """Capture keys from the one temporary WeChat process launched by this helper.
 
 The caller must have obtained explicit chat-reading consent. Nothing attaches
-to an existing process, changes the original app, or disables SIP.
+to an existing process, changes the original app, or disables SIP. An injected
+interpose records the SQLCipher key-derivation parameters CommonCrypto already
+computes, so no debugger (and therefore no Xcode or Command Line Tools) is
+required on the user's Mac.
 """
 
 import argparse
@@ -11,8 +14,18 @@ import hmac
 import json
 import os
 from pathlib import Path
+import signal
 import stat
+import struct
+import subprocess
+import tempfile
 import time
+
+
+_SINK_MAGIC = b"MKC1"
+_SINK_HEADER = len(_SINK_MAGIC) + 12  # magic + rounds + saltLen + pwLen (3 x uint32)
+_MAX_SALT = 16
+_MAX_PASSWORD = 256
 
 
 def emit(event, **fields):
@@ -63,53 +76,65 @@ def consent_enabled(file, identifier):
         return False
 
 
-def create_debug_target(lldb, debugger, executable):
-    # connect.py selects a compatible LLDB before quitting the original app.
-    # Only the executable is needed here; avoid eager dependency/symbol loading.
-    # The CommonCrypto breakpoint resolves when its image loads at runtime.
-    interpreter = debugger.GetCommandInterpreter()
-    result = lldb.SBCommandReturnObject()
-    interpreter.HandleCommand("settings set target.preload-symbols false", result)
-    if not result.Succeeded():
-        raise RuntimeError("debugger_configuration_failed")
-    error = lldb.SBError()
-    target = debugger.CreateTarget(str(executable), None, None, False, error)
-    if error.Fail() or not target.IsValid():
-        raise RuntimeError("debug_target_creation_failed")
-    if not target.GetTriple().startswith("arm64"):
-        raise RuntimeError("unsupported_debug_target")
-    return target
+def _validated_injection(app, name):
+    library = app / "Contents/Frameworks" / name
+    info = library.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or library.resolve(strict=True) != library):
+        raise RuntimeError("wechat_private_storage_unsafe")
+    return library
 
 
-def private_storage_launch_environment(executable):
-    # Only the launched connection copy receives the interposer. Memmy's Python
+def private_storage_launch_environment(executable, sink):
+    # Only the launched connection copy receives the interposers. Memmy's Python
     # host keeps its existing source access and authenticates original DB pages.
     app = executable.parent.parent.parent
     if (app.name != "Memmy WeChat Reader.app" or app.parent.name != "connection-helper"
             or executable != app / "Contents/MacOS/WeChat"):
         raise RuntimeError("wechat_private_storage_unsafe")
-    bridge = app / "Contents/Frameworks/MemmyWeChatPrivateStorage.dylib"
-    info = bridge.lstat()
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-            or bridge.resolve(strict=True) != bridge):
-        raise RuntimeError("wechat_private_storage_unsafe")
-    entries = ["DYLD_INSERT_LIBRARIES=" + str(bridge)]
+    bridge = _validated_injection(app, "MemmyWeChatPrivateStorage.dylib")
+    capture = _validated_injection(app, "MemmyWeChatKeyCapture.dylib")
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("DYLD_")}
+    environment["DYLD_INSERT_LIBRARIES"] = str(bridge) + ":" + str(capture)
+    environment["MEMMY_WECHAT_KEY_SINK"] = str(sink)
     for kind in ("CONTAINER", "GROUP"):
         for part in ("SOURCE", "COPY"):
             key = "MEMMY_WECHAT_" + kind + "_" + part
             value = os.environ.get(key)
             if not value:
                 raise RuntimeError("wechat_private_storage_unsafe")
-            entries.append(key + "=" + value)
-    return entries
+            environment[key] = value
+    return environment
+
+
+def _create_sink(parent):
+    descriptor = os.open(parent / "keys.sink", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+    return parent / "keys.sink"
+
+
+def _parse_sink(buffer):
+    """Split complete capture records, returning them with any trailing partial."""
+    records = []
+    offset = 0
+    while len(buffer) - offset >= _SINK_HEADER:
+        if buffer[offset:offset + len(_SINK_MAGIC)] != _SINK_MAGIC:
+            raise RuntimeError("key_sink_corrupt")
+        rounds, salt_length, password_length = struct.unpack_from("<III", buffer, offset + len(_SINK_MAGIC))
+        if salt_length > _MAX_SALT or password_length > _MAX_PASSWORD:
+            raise RuntimeError("key_sink_corrupt")
+        total = _SINK_HEADER + salt_length + password_length
+        if len(buffer) - offset < total:
+            break
+        salt = bytes(buffer[offset + _SINK_HEADER:offset + _SINK_HEADER + salt_length])
+        password = bytes(buffer[offset + _SINK_HEADER + salt_length:offset + total])
+        records.append((rounds, salt, password))
+        offset += total
+    return records, buffer[offset:]
 
 
 def main():
-    try:
-        import lldb
-    except (ImportError, OSError) as error:
-        raise RuntimeError("lldb_unavailable") from error
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
@@ -123,7 +148,6 @@ def main():
     output = args.output
     if not consent_enabled(args.consent_file, args.consent_id):
         raise RuntimeError("wechat_consent_required")
-    launch_environment = private_storage_launch_environment(executable)
     if output.exists() or output.with_suffix(".pending").exists():
         raise RuntimeError("key_output_already_exists")
     pages = encrypted_pages(root)
@@ -132,95 +156,74 @@ def main():
     by_salt = {}
     for name, page in pages.items():
         by_salt.setdefault(page[:16], []).append((name, page))
+    # SQLCipher derives the HMAC key with the page salt XORed by 0x3a. The 2-round
+    # call therefore reveals the derived key under that transformed salt.
     mac_salts = {bytes(byte ^ 0x3A for byte in salt): salt for salt in by_salt}
     found = {}
-    calls = 0
 
-    debugger = lldb.SBDebugger.Create()
-    debugger.SkipLLDBInitFiles(True)
-    debugger.SetAsync(True)
-    listener = debugger.GetListener()
+    sink_directory = Path(tempfile.mkdtemp(prefix="key-capture-", dir=output.parent))
+    os.chmod(sink_directory, 0o700)
+    sink = _create_sink(sink_directory)
+    launch_environment = private_storage_launch_environment(executable, sink)
     process = None
-
-    def memory(address, size):
-        read_error = lldb.SBError()
-        value = bytes(process.ReadMemory(address, size, read_error))
-        return value if read_error.Success() and len(value) == size else b""
-
+    reader = None
     try:
-        target = create_debug_target(lldb, debugger, executable)
-        breakpoint = target.BreakpointCreateByName("CCKeyDerivationPBKDF", "libcommonCrypto.dylib")
-        # A valid pending breakpoint has no locations until CommonCrypto loads.
-        if not breakpoint.IsValid():
-            raise RuntimeError("key_derivation_breakpoint_unavailable")
-        launch = lldb.SBLaunchInfo([])
-        launch.SetListener(listener)
-        launch.SetWorkingDirectory(str(executable.parent))
-        launch.SetEnvironmentEntries(launch_environment, True)
-        launch.AddSuppressFileAction(0, True, False)
-        launch.AddSuppressFileAction(1, False, True)
-        launch.AddSuppressFileAction(2, False, True)
-        error = lldb.SBError()
-        process = target.Launch(launch, error)
-        if error.Fail() or not process.IsValid():
-            raise RuntimeError("temporary_wechat_launch_failed")
+        process = subprocess.Popen([str(executable)], cwd=str(executable.parent), env=launch_environment,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         emit("temporary_app_started", expected_databases=len(pages))
+        reader = open(sink, "rb")
+        buffer = b""
         deadline = time.monotonic() + max(30, min(args.seconds, 300))
         last_status = time.monotonic()
         while time.monotonic() < deadline and len(found) < len(pages):
             if not consent_enabled(args.consent_file, args.consent_id):
                 raise RuntimeError("wechat_consent_revoked")
-            event = lldb.SBEvent()
-            if not listener.WaitForEvent(1, event):
-                if time.monotonic() - last_status >= 15:
-                    emit("waiting_for_login", verified_databases=len(found))
-                    last_status = time.monotonic()
-                continue
-            if not lldb.SBProcess.EventIsProcessEvent(event):
-                continue
-            state = lldb.SBProcess.GetStateFromEvent(event)
-            if state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
-                break
-            if state != lldb.eStateStopped:
-                continue
-            for thread in process:
-                if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+            buffer += reader.read()
+            records, buffer = _parse_sink(buffer)
+            before = len(found)
+            for rounds, observed_salt, password in records:
+                if rounds not in (2, 256000) or len(observed_salt) != 16 or not 0 < len(password) <= _MAX_PASSWORD:
                     continue
-                if thread.GetStopReasonDataCount() < 2 or thread.GetStopReasonDataAtIndex(0) != breakpoint.GetID():
-                    continue
-                calls += 1
-                frame = thread.GetFrameAtIndex(0)
-                argument = lambda index: frame.FindRegister("x" + str(index)).GetValueAsUnsigned()
-                password_ptr, password_len, salt_ptr, salt_len, algorithm, rounds = [argument(i) for i in range(1, 7)]
-                if salt_len != 16 or not 0 < password_len <= 256 or algorithm != 5 or rounds not in (2, 256000):
-                    continue
-                observed_salt = memory(salt_ptr, 16)
                 salt = observed_salt if rounds == 256000 else mac_salts.get(observed_salt)
                 if salt not in by_salt:
                     continue
-                password = memory(password_ptr, password_len)
-                if len(password) != password_len:
-                    continue
                 key = (hashlib.pbkdf2_hmac("sha512", password, salt, 256000, 32)
                        if rounds == 256000 else password)
-                before = len(found)
                 for name, page in by_salt[salt]:
                     if name not in found and authenticated_page(key, page):
                         found[name] = {"enc_key": key.hex()}
-                if len(found) > before:
-                    if not consent_enabled(args.consent_file, args.consent_id):
-                        raise RuntimeError("wechat_consent_revoked")
-                    save_private(output, found)
-                    emit("verified_progress", verified_databases=len(found), expected_databases=len(pages))
-            resume_error = process.Continue()
-            if resume_error.Fail():
-                raise RuntimeError("temporary_wechat_resume_failed")
-        emit("capture_finished", verified_databases=len(found), expected_databases=len(pages), breakpoint_calls=calls)
+            if len(found) > before:
+                if not consent_enabled(args.consent_file, args.consent_id):
+                    raise RuntimeError("wechat_consent_revoked")
+                save_private(output, found)
+                emit("verified_progress", verified_databases=len(found), expected_databases=len(pages))
+                last_status = time.monotonic()
+            elif time.monotonic() - last_status >= 15:
+                emit("waiting_for_login", verified_databases=len(found))
+                last_status = time.monotonic()
+            if process.poll() is not None and not records:
+                break
+            time.sleep(0.25)
+        emit("capture_finished", verified_databases=len(found), expected_databases=len(pages))
         return 0 if found else 3
     finally:
-        if process and process.IsValid() and process.GetState() not in (lldb.eStateExited, lldb.eStateDetached, lldb.eStateInvalid):
-            process.Kill()
-        lldb.SBDebugger.Destroy(debugger)
+        if reader is not None:
+            reader.close()
+        if process is not None and process.poll() is None:
+            try:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            except ProcessLookupError:
+                pass
+        try:
+            sink.unlink(missing_ok=True)
+            sink_directory.rmdir()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

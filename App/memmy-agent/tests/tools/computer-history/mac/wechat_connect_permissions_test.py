@@ -75,7 +75,6 @@ class ConnectPermissionTests(unittest.TestCase):
             mock.patch.object(connect.os, "geteuid", return_value=501),
             mock.patch.object(connect.os, "umask"),
             mock.patch.object(Path, "resolve", resolve),
-            mock.patch.object(connect, "lldb_python_path", return_value="/fake/lldb"),
             mock.patch.object(connect, "consent_id", side_effect=lambda state: self.consent),
             mock.patch.object(connect, "current_database_root", return_value=self.root),
             mock.patch.object(connect, "prepare_permission_helper", side_effect=self.prepare),
@@ -95,11 +94,10 @@ class ConnectPermissionTests(unittest.TestCase):
             if isinstance(value, mock.Mock):
                 self.patched[patch.attribute] = value
 
-    def prepare(self, state, app, lldb_path):
+    def prepare(self, state, app):
         self.order.append("permission_checked")
         self.assertEqual(state, self.state)
         self.assertEqual(app, self.app)
-        self.assertEqual(lldb_path, "/fake/lldb")
         return dict(self.preparation)
 
     def emit(self, event, **fields):
@@ -132,7 +130,7 @@ class ConnectPermissionTests(unittest.TestCase):
         self.order.append("capture_spawned")
         self.assertEqual(arguments[:2], [sys.executable, str(SOURCE / "capture_keys.py")])
         self.assertEqual(arguments[arguments.index("--executable") + 1], str(self.executable))
-        self.assertEqual(options["env"]["PYTHONPATH"], "/fake/lldb")
+        self.assertNotIn("PYTHONPATH", options["env"])
         self.assertFalse(any(key.startswith("DYLD_") for key in options["env"]))
         for kind, source in zip(("CONTAINER", "GROUP"), self.storage["mappings"]):
             self.assertEqual(options["env"]["MEMMY_WECHAT_" + kind + "_SOURCE"], source)
@@ -203,7 +201,7 @@ class ConnectPermissionTests(unittest.TestCase):
         alias.symlink_to(self.state, target_is_directory=True)
         self.state = alias
 
-        def refuse(state, app, lldb_path):
+        def refuse(state, app):
             self.assertEqual(state, alias)
             self.assertTrue(state.is_symlink())
             return {"ready": False, "appPath": None, "error": "wechat_permission_helper_unavailable"}
@@ -218,7 +216,7 @@ class ConnectPermissionTests(unittest.TestCase):
         alias.symlink_to(self.state, target_is_directory=True)
         self.state = alias
 
-        def refuse(state, app, lldb_path):
+        def refuse(state, app):
             self.assertEqual(state, alias)
             self.assertTrue(state.is_symlink())
             return {"ready": False, "appPath": None, "error": "wechat_permission_helper_unavailable"}

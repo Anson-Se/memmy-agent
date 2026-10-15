@@ -49,13 +49,13 @@ def command(arguments, *, env=None):
     return result.stdout or result.stderr
 
 
-def prepare_permission_helper(state, app, lldb_path):
+def prepare_permission_helper(state, app):
     # Resolve beside this script in both source and app.asar.unpacked builds.
     location = Path(__file__).with_name("permission_helper.py")
     spec = importlib.util.spec_from_file_location("memmy_wechat_permission_helper", location)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.prepare_permission_helper(state, app=app, lldb_path=lldb_path)
+    return module.prepare_permission_helper(state, app=app)
 
 
 def private_storage_module():
@@ -66,76 +66,17 @@ def private_storage_module():
     return module
 
 
-def storage_environment(storage, lldb_path):
+def storage_environment(storage):
+    # Drop any ambient DYLD_/injection or PYTHONPATH so the launched copy and the
+    # capture helper run with only the private mappings this connection sets.
     environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("DYLD_", "MEMMY_WECHAT_"))}
-    environment["PYTHONPATH"] = lldb_path
+                   if not key.startswith(("DYLD_", "MEMMY_WECHAT_")) and key != "PYTHONPATH"}
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     for source, copy in storage["mappings"].items():
         kind = "GROUP" if "/Group Containers/" in source else "CONTAINER"
         environment["MEMMY_WECHAT_" + kind + "_SOURCE"] = source
         environment["MEMMY_WECHAT_" + kind + "_COPY"] = copy
     return environment
-
-
-def lldb_candidates():
-    # Avoid the /usr/bin/lldb shim: it can open an installation dialog when no
-    # developer tools are installed. Resolve the selected directory read-only.
-    candidates = []
-    try:
-        selected = subprocess.run(["/usr/bin/xcode-select", "-p"],
-                                  capture_output=True, text=True, timeout=5)
-        directory = Path(selected.stdout.strip())
-        if selected.returncode == 0 and directory.is_absolute():
-            candidates.append(directory / "usr/bin/lldb")
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    candidates.append(Path("/Library/Developer/CommandLineTools/usr/bin/lldb"))
-    candidates.extend(sorted(Path("/Applications").glob("Xcode*.app/Contents/Developer/usr/bin/lldb")))
-    return [path for path in dict.fromkeys(candidates) if path.is_file() and os.access(path, os.X_OK)]
-
-
-def lldb_version(text):
-    match = re.search(r"\blldb-(\d+(?:\.\d+)*)", text)
-    return tuple(int(part) for part in match.group(1).split(".")) if match else None
-
-
-def lldb_python_path():
-    candidates = []
-    for executable in lldb_candidates():
-        try:
-            result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        version = lldb_version(result.stdout)
-        if not result.returncode and version:
-            candidates.append((version, executable))
-
-    mac_version = platform.mac_ver()[0]
-    mac_major = int(mac_version.split(".")[0]) if mac_version else 0
-    incompatible = False
-    compatible_found = False
-    for version, executable in sorted(candidates, key=lambda item: item[0], reverse=True):
-        # Xcode 27 uses Apple LLDB 2100+. The previous 1703 tools crash parsing
-        # macOS 27's shared cache, including when debugging a tiny C program.
-        # Check before importing/launching the capture helper or quitting WeChat.
-        if mac_major >= 27 and version[0] < 2100:
-            incompatible = True
-            continue
-        compatible_found = True
-        try:
-            result = subprocess.run([str(executable), "-P"], capture_output=True, text=True, timeout=10)
-            location = result.stdout.strip()
-            if result.returncode or not location or not Path(location).is_dir():
-                continue
-            environment = dict(os.environ, PYTHONPATH=location)
-            imported = subprocess.run([sys.executable, "-c", "import lldb"],
-                                      env=environment, capture_output=True, text=True, timeout=10)
-            if imported.returncode == 0:
-                return location
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-    raise RuntimeError("lldb_incompatible" if incompatible and not compatible_found else "lldb_unavailable")
 
 
 def wait_for_capture(process):
@@ -311,7 +252,7 @@ def main():
     state = Path(os.path.abspath(args.state))
     if args.prepare_only:
         try:
-            result = prepare_permission_helper(state, Path("/Applications/WeChat.app"), lldb_python_path())
+            result = prepare_permission_helper(state, Path("/Applications/WeChat.app"))
         except RuntimeError as error:
             category = str(error)
             if not re.fullmatch(r"[a-z_]+", category):
@@ -331,14 +272,13 @@ def main():
     original = app / "Contents/MacOS/WeChat"
     if not original.is_file():
         raise RuntimeError("wechat_application_missing")
-    lldb_path = lldb_python_path()
     signature = command(["codesign", "-dvv", str(app)])
     command(["codesign", "--verify", "--deep", "--strict", str(app)])
     os.umask(0o077)
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     # Memmy checks its own source access and verifies private path redirection
     # before disturbing the original. The copy needs no separate disk grant.
-    preparation = prepare_permission_helper(state, app, lldb_path)
+    preparation = prepare_permission_helper(state, app)
     if not preparation["ready"]:
         raise RuntimeError(preparation["error"] or "wechat_data_access_required")
     # A missing/inaccessible database layout is checked only after Memmy's data
@@ -381,7 +321,7 @@ def main():
         # The only real-data snapshot is taken after normal quit has flushed
         # WeChat's databases and WAL files. Live writes are expected at preflight.
         storage = storage_module.create_private_storage(state, consent_id=active_consent_id)
-        environment = storage_environment(storage, lldb_path)
+        environment = storage_environment(storage)
         capture = Path(__file__).with_name("capture_keys.py")
         emit("awaiting_wechat_login")
         process = subprocess.Popen([
