@@ -59,6 +59,28 @@ class CaptureStorageEnvironmentTests(unittest.TestCase):
             "MEMMY_WECHAT_GROUP_COPY": str(self.directory / "private/Library/Group Containers/5A4RE8SF68.com.tencent.xinWeChat"),
         }
 
+    def test_verified_account_password_unlocks_a_second_unopened_shard(self):
+        password = b"synthetic-account-password"
+        salts = [bytes(range(16)), bytes(range(16, 32))]
+        derived = [hashlib.pbkdf2_hmac("sha512", password, salt, 256000, 32) for salt in salts]
+        pages = {salt: [(f"message/message_{index}.db", authenticating_page(key, salt))]
+                 for index, (salt, key) in enumerate(zip(salts, derived))}
+        found, expanded = {}, set()
+        capture.verify_record((256000, salts[0], password), pages, {}, found, expanded, lambda: True)
+        self.assertEqual(found, {f"message/message_{index}.db": {"enc_key": key.hex()}
+                                 for index, key in enumerate(derived)})
+        self.assertEqual(expanded, {password})
+
+    def test_unverified_password_is_not_expanded_and_cancellation_is_observed(self):
+        salt = bytes(range(16))
+        pages = {salt: [("message/message_0.db", authenticating_page(bytes(range(32)), salt))]}
+        found, expanded = {}, set()
+        capture.verify_record((256000, salt, b"wrong"), pages, {}, found, expanded, lambda: True)
+        self.assertEqual(found, {})
+        self.assertEqual(expanded, set())
+        with mock.patch.object(capture.hashlib, "pbkdf2_hmac", side_effect=AssertionError("must not derive")):
+            capture.verify_record((256000, salt, b"cancelled"), pages, {}, found, expanded, lambda: False)
+
     def test_adds_both_injections_the_sink_and_only_four_mappings(self):
         environment = {"PATH": "/usr/bin", "LANG": "en_US.UTF-8",
                        "DYLD_LIBRARY_PATH": "/ambient", **self.mapping_environment}
@@ -140,6 +162,10 @@ class CaptureStorageEnvironmentTests(unittest.TestCase):
         def fake_popen(argv, cwd, env, **options):
             self.assertEqual(argv, [str(self.executable)])
             self.assertEqual(env["DYLD_INSERT_LIBRARIES"], f"{self.bridge}:{self.capture}")
+            targets = Path(env["MEMMY_WECHAT_CAPTURE_PAGES"])
+            self.assertEqual(targets.read_bytes(), b"MKP1" + struct.pack("<I", 1) + page)
+            self.assertEqual(targets.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(env["MEMMY_WECHAT_CAPTURE_SECONDS"], "240")
             with open(env["MEMMY_WECHAT_KEY_SINK"], "ab") as sink:
                 sink.write(record)
             process = mock.Mock()
@@ -156,10 +182,74 @@ class CaptureStorageEnvironmentTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", arguments), \
                 mock.patch.object(capture.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(capture, "consent_enabled", return_value=True), \
-                mock.patch.object(capture, "encrypted_pages", return_value={"message.db": page}), \
+                mock.patch.object(capture, "encrypted_pages", return_value={"message/message_0.db": page}), \
                 mock.patch.object(capture, "emit"):
             self.assertEqual(capture.main(), 0)
-        self.assertEqual(json.loads(output.read_text()), {"keys": {"message.db": {"enc_key": key.hex()}}})
+        self.assertEqual(json.loads(output.read_text()), {"keys": {"message/message_0.db": {"enc_key": key.hex()}}})
+        self.assertEqual(list(output.parent.glob("key-capture-*")), [])
+
+    def test_only_numbered_shards_and_optional_identity_pages_are_requested(self):
+        root = self.directory / "databases"
+        for relative in ("message/message_0.db", "message/message_17.db", "message/message_fts.db",
+                         "message/message_resource.db", "contact/contact.db", "head_image/head_image.db"):
+            db = root / relative
+            db.parent.mkdir(parents=True, exist_ok=True)
+            db.write_bytes(authenticating_page(bytes(range(32)), bytes(range(16))))
+        pages = capture.encrypted_pages(root)
+        self.assertEqual(set(pages), {"message/message_0.db", "message/message_17.db", "contact/contact.db"})
+        self.assertEqual(capture.required_databases(pages), {"message/message_0.db", "message/message_17.db"})
+
+    def test_partial_numbered_shards_cannot_complete_connection(self):
+        root = self.directory / "databases"
+        root.mkdir()
+        output = self.directory / "keys.json"
+        keys = [bytes(range(32)), bytes(range(32, 64))]
+        salts = [bytes(range(16)), bytes(range(16, 32))]
+        pages = {f"message/message_{i}.db": authenticating_page(key, salt)
+                 for i, (key, salt) in enumerate(zip(keys, salts))}
+        raw_salt = bytes(byte ^ 0x3a for byte in salts[0])
+        record = b"MKC1" + struct.pack("<III", 2, 16, 32) + raw_salt + keys[0]
+
+        def fake_popen(argv, cwd, env, **options):
+            Path(env["MEMMY_WECHAT_KEY_SINK"]).write_bytes(record)
+            process = mock.Mock()
+            process.poll.return_value = 0
+            return process
+
+        arguments = ["capture_keys.py", "--executable", str(self.executable), "--root", str(root),
+                     "--output", str(output), "--consent-file", str(self.directory / "consent.json"),
+                     "--consent-id", "explicit-consent"]
+        with mock.patch.dict(os.environ, self.mapping_environment, clear=True), \
+                mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(capture, "encrypted_pages", return_value=pages), \
+                mock.patch.object(capture, "consent_enabled", return_value=True), \
+                mock.patch.object(capture.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(capture.time, "sleep"), mock.patch.object(capture, "emit") as emit:
+            self.assertEqual(capture.main(), 3)
+            emit.assert_any_call("capture_error", category="key_capture_incomplete")
+        self.assertEqual(list(output.parent.glob("key-capture-*")), [])
+
+    def test_invalid_required_shard_is_not_silently_omitted(self):
+        root = self.directory / "databases"
+        (root / "message").mkdir(parents=True)
+        (root / "message/message_0.db").write_bytes(b"truncated")
+        with self.assertRaisesRegex(RuntimeError, "wechat_message_database_invalid"):
+            capture.encrypted_pages(root)
+
+    def test_failed_launch_removes_private_pages_and_sink(self):
+        root = self.directory / "databases"
+        root.mkdir()
+        arguments = ["capture_keys.py", "--executable", str(self.executable), "--root", str(root),
+                     "--output", str(self.directory / "keys.json"),
+                     "--consent-file", str(self.directory / "consent.json"), "--consent-id", "consent"]
+        with mock.patch.dict(os.environ, self.mapping_environment, clear=True), \
+                mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(capture, "encrypted_pages", return_value={"message/message_0.db": bytes(4096)}), \
+                mock.patch.object(capture, "consent_enabled", return_value=True), \
+                mock.patch.object(capture.subprocess, "Popen", side_effect=OSError("launch failed")):
+            with self.assertRaises(OSError):
+                capture.main()
+        self.assertEqual(list(self.directory.glob("key-capture-*")), [])
 
 
 class ConnectStorageEnvironmentTests(unittest.TestCase):

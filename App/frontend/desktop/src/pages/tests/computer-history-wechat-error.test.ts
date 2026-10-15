@@ -9,6 +9,7 @@ describe.each(["zh-CN", "en-US"] as const)("WeChat connection errors in %s", (la
     "wechat_login_required", "temporary_wechat_launch_failed",
     "python_unavailable", "wechat_native_helpers_unavailable", "key_capture_no_keys",
     "key_capture_output_missing",
+    "key_capture_incomplete", "wechat_message_database_invalid", "wechat_message_database_limit",
     "wechat_data_access_required", "wechat_data_access_probe_failed", "wechat_permission_helper_unavailable",
     "wechat_data_access_interrupted",
     "current_account_ambiguous",
