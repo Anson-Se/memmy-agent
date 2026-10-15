@@ -896,6 +896,10 @@ async function writeNodeResponse(res: http.ServerResponse, response: Response): 
     return;
   }
   const nodeStream = Readable.fromWeb(response.body as any);
+  // A silent tool may run for a long time. Expose admission before the first delta.
+  res.flushHeaders();
+  nodeStream.on("error", () => res.destroy());
+  res.once("close", () => nodeStream.destroy());
   nodeStream.pipe(res);
 }
 

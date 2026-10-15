@@ -123,6 +123,7 @@ describe("OpenAI-compatible API request validation", () => {
         agentLoop: { processDirect: async () => "unused" },
         modelName: "test-model",
         sessionLocks: new Map(),
+        activeRequests: new Map(),
       },
     );
     const body = (await response.json()) as any;
