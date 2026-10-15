@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import YAML from "yaml";
 import { buildMemoryAll, verifyMemoryDownload } from "../scripts/internal/shared/build-memory-all.mjs";
+import { writeAgentRuntimeRelease } from "../App/memmy-agent/scripts/write-runtime-release.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const collector = join(root, "scripts/internal/shared/collect-runtime-artifacts.mjs");
@@ -30,7 +31,8 @@ it("collects all target artifacts and rejects corrupted downloads", async () => 
       corrupted = join(input, name);
       await writeFile(corrupted, bytes);
       const metadata = { version, assets: { [target]: { name, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") } } };
-      await writeFile(join(input, kind === "agent" ? `agent-release-${target}.json` : "memory-release.json"), JSON.stringify(metadata));
+      if (kind === "agent") await writeAgentRuntimeRelease(corrupted, version, target);
+      else await writeFile(join(input, "memory-release.json"), JSON.stringify(metadata));
     }
   }
   const args = [collector, join(directory, "input"), join(directory, "output")];
@@ -53,6 +55,31 @@ it("collects all target artifacts and rejects corrupted downloads", async () => 
   await expect(verifyMemoryDownload(memoryOutput, "test-commit")).rejects.toThrow("Checksum");
   await writeFile(corrupted, "corrupted");
   expect(() => execFileSync(process.execPath, memoryArgs, { stdio: "pipe" })).toThrow();
+});
+
+it("writes the finished Agent archive checksum and replaces it when same-version content changes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-release-sha-"));
+  roots.push(directory);
+  await mkdir(join(directory, "package"));
+  const version = "1.2.3";
+  const target = "darwin-arm64";
+  const name = `memmy-agent-runtime-${version}-${target}.tgz`;
+  const archive = join(directory, name);
+  let previous;
+  for (const content of ["first build", "changed content at the same version"]) {
+    await writeFile(join(directory, "package/main.js"), content);
+    execFileSync("tar", ["-czf", archive, "-C", directory, "package"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    const asset = await writeAgentRuntimeRelease(archive, version, target);
+    const bytes = await readFile(archive);
+    const expected = createHash("sha256").update(bytes).digest("hex");
+    expect(asset).toEqual({ name, sha256: expected, size: bytes.length });
+    expect(await readFile(`${archive}.sha256`, "utf8")).toBe(`${expected}  ${name}\n`);
+    expect(JSON.parse(await readFile(join(directory, `agent-release-${target}.json`)))).toEqual({
+      version, assets: { [target]: asset }
+    });
+    if (previous) expect(expected).not.toBe(previous);
+    previous = expected;
+  }
 });
 
 it("rejects local changes before uploading source", async () => {
