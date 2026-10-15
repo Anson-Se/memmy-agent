@@ -70,7 +70,7 @@ async function fixture(options: {
     "const lock = db + '.server.lock'; const version = process.env.FIXTURE_VERSION || '2.1.1';",
     "fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, sqlitePath: db, host: '127.0.0.1', port }));",
     "const server = http.createServer((request, response) => {",
-    "  if (request.url === '/api/v1/health') { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ ok: process.env.FIXTURE_IDENTITY !== 'false' && !fs.existsSync(path.join(serviceHome, 'unexpected-service')), protocolVersion: 1, serviceVersion: version })); return; }",
+    "  if (request.url === '/api/v1/health') { response.setHeader('content-type', 'application/json'); const ownsMemory = process.env.FIXTURE_IDENTITY !== 'false' && !fs.existsSync(path.join(serviceHome, 'unexpected-service')); const health = ownsMemory ? { ok: true, protocolVersion: 1, serviceVersion: version } : { serviceVersion: version }; response.end(JSON.stringify(health)); return; }",
     "  if (request.url === '/api/v1/admin/shutdown') { response.end('{}'); setImmediate(shutdown); return; }",
     "  response.writeHead(404); response.end();",
     "});",
