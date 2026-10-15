@@ -38,10 +38,27 @@ LITERAL = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 RAW_KEY_LITERAL = re.compile(rb"x'([0-9a-fA-F]{96,192})'")
 MAX_USER_ADDRESS = 0x0000800000000000
 MAX_BLOB = 1024
+# The reader is only usable once a chat database key verifies. Without one the
+# connection would report success and then fail the first poll as "keys outdated".
+MESSAGE_DATABASE = re.compile(r"(?:^|/)message_\d+\.db$", re.IGNORECASE)
 
 
 def emit(event, **fields):
     print(json.dumps({"event": event, **fields}, separators=(",", ":")), flush=True)
+
+
+def usable_capture(pages, found):
+    """A connection is usable only once a chat database key verifies.
+
+    When the store has numbered message databases, require at least one of their
+    keys so the UI never reports "connected" and then fails the first poll as
+    "keys outdated". Stores without message databases accept any verified key.
+    """
+    if not found:
+        return False
+    if any(MESSAGE_DATABASE.search(name) for name in pages):
+        return any(MESSAGE_DATABASE.search(name) for name in found)
+    return True
 
 
 def authenticated_page(raw_key, page):
@@ -1042,13 +1059,15 @@ def main():
     found, stats = capture_from_running_weixin(pages)
     if not consent_enabled(consent_file, identifier):
         raise RuntimeError("wechat_consent_revoked")
-    if found:
+    if usable_capture(pages, found):
         entries = {name: {"enc_key": key} for name, key in sorted(found.items())}
         save_private(args.output, entries)
         write_connection_files(args.output, root, consent_file, identifier, started_at)
     emit("capture_finished", verified_databases=len(found), expected_databases=len(pages), **stats)
-    if not found:
-        emit("capture_error", category="weixin_keys_not_found", detail="no candidate authenticated a database page")
+    if not usable_capture(pages, found):
+        emit("capture_error", category="weixin_keys_not_found",
+             detail=("no candidate authenticated a database page" if not found
+                     else "no message database key was verified"))
         return 3
     return 0
 

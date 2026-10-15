@@ -24,6 +24,20 @@ def page_for(raw_key, salt=None):
     return salt + body + digest
 
 
+class UsableCaptureTests(unittest.TestCase):
+    def test_requires_a_message_database_key_when_message_stores_exist(self):
+        pages = {"message/message_0.db": b"", "contact/contact.db": b"", "message/message_fts.db": b""}
+        self.assertFalse(keys.usable_capture(pages, {}))
+        self.assertFalse(keys.usable_capture(pages, {"contact/contact.db": "ab"}))
+        # message_fts.db is a search index, not a numbered chat database.
+        self.assertFalse(keys.usable_capture(pages, {"message/message_fts.db": "ab"}))
+        self.assertTrue(keys.usable_capture(pages, {"message/message_0.db": "ab"}))
+
+    def test_accepts_any_key_when_no_message_databases_are_present(self):
+        self.assertTrue(keys.usable_capture({"contact/contact.db": b""}, {"contact/contact.db": "ab"}))
+        self.assertFalse(keys.usable_capture({"contact/contact.db": b""}, {}))
+
+
 class MapMemory(keys.ProcessMemory):
     def __init__(self, base, data):
         self.base = base
