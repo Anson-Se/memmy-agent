@@ -44,6 +44,7 @@ type Binding = {
   disposition: 'deliverable' | 'handoff' | null;
   usedInTurn: boolean;
   turnRevision: number;
+  activityRevision: number;
   inFlight: number;
   lastUsed: number;
 };
@@ -232,7 +233,7 @@ export class ExternalBrowserSessionRouter {
 
   private assertBinding(scope: BrowserScope, binding: Binding, turnRevision: number): void {
     if (this.bindingFor(scope, binding.identity) !== binding
-      || (this.targetKind === 'embedded' && binding.turnRevision !== turnRevision)) {
+      || binding.turnRevision !== turnRevision) {
       throw new Error(this.changedMessage());
     }
   }
@@ -243,6 +244,7 @@ export class ExternalBrowserSessionRouter {
     const binding = this.bindingFor(scope, identity);
     if (!binding) throw new Error(this.changedMessage());
     const turnRevision = binding.turnRevision;
+    binding.activityRevision += 1;
     binding.inFlight += 1;
     try {
       const result = await operation(binding, turnRevision);
@@ -306,7 +308,7 @@ export class ExternalBrowserSessionRouter {
       allowedOrigins: options.allowedOrigins ?? new Set(),
       outputDir: fs.mkdtempSync(path.join(os.tmpdir(), "memmy-external-browser-session-")),
       agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null,
-      usedInTurn: true, turnRevision: 0, inFlight: 0, lastUsed: 0 };
+      usedInTurn: true, turnRevision: 0, activityRevision: 0, inFlight: 0, lastUsed: 0 };
     chat.tabs.set(claimKey(claim), binding);
     this.touch(key, binding);
     return claim;
@@ -489,6 +491,13 @@ export class ExternalBrowserSessionRouter {
     if (!binding || claim.browser === 'memmy') {
       throw new Error('External browser session changed');
     }
+    const turnRevision = binding.turnRevision;
+    const assertCurrent = () => {
+      if (abortSignal?.aborted || this.bindingFor(scope, binding.identity) !== binding) {
+        throw new Error('Browser upload cancelled');
+      }
+      this.assertBinding(scope, binding, turnRevision);
+    };
     if (this.sitePolicy.decision(claim.url, 'access') === 'block') {
       throw new Error('Browser site is blocked by policy');
     }
@@ -501,9 +510,11 @@ export class ExternalBrowserSessionRouter {
     if (typeof target !== 'string' || !target || target.length > 500) {
       throw new Error('External browser upload requires a file input target');
     }
-    if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+    assertCurrent();
     await this.authorizeCurrent(scope, claim);
+    assertCurrent();
     const initial = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
+    assertCurrent();
     if (!initial?.url || !initial.origin || new URL(initial.url).origin !== initial.origin
       || !binding.allowedOrigins.has(initial.origin)) throw new Error('External browser upload site changed');
     const stamps = files.map(file => {
@@ -512,8 +523,9 @@ export class ExternalBrowserSessionRouter {
         size: info.size, mtimeMs: info.mtimeMs };
     });
     if (!await authorize(initial.url, files, abortSignal ?? undefined)) throw new Error('Browser upload was not approved');
-    if (abortSignal?.aborted || this.bindingFor(scope, claim) !== binding) throw new Error('Browser upload cancelled');
+    assertCurrent();
     const current = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
+    assertCurrent();
     if (current?.url !== initial.url || current?.origin !== initial.origin
       || this.bridge.getClaim(binding.identity)?.connectionId !== claim.connectionId) {
       throw new Error('External browser upload site changed after approval');
@@ -523,7 +535,8 @@ export class ExternalBrowserSessionRouter {
     try {
       const staged: string[] = [];
       for (const [index, stamp] of stamps.entries()) {
-        if (abortSignal?.aborted || fs.realpathSync(stamp.path) !== stamp.realPath) {
+        assertCurrent();
+        if (fs.realpathSync(stamp.path) !== stamp.realPath) {
           throw new Error('Browser upload file changed after approval');
         }
         const directory = path.join(temporary, String(index));
@@ -540,9 +553,10 @@ export class ExternalBrowserSessionRouter {
           try {
             const buffer = Buffer.allocUnsafe(1024 * 1024);
             while (true) {
-              if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+              assertCurrent();
               const { bytesRead } = await source.read(buffer, 0, buffer.length, null);
               if (!bytesRead) break;
+              assertCurrent();
               let written = 0;
               while (written < bytesRead) written += (await output.write(buffer, written, bytesRead - written)).bytesWritten;
             }
@@ -554,16 +568,20 @@ export class ExternalBrowserSessionRouter {
         } finally { await source.close().catch(() => undefined); }
         staged.push(destination);
       }
-      if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+      assertCurrent();
       const final = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
+      assertCurrent();
       if (final?.url !== initial.url || final?.origin !== initial.origin) {
         throw new Error('External browser upload site changed after approval');
       }
       if (this.sitePolicy.decision(initial.url, 'uploads') === 'block') {
         throw new Error('Browser upload was blocked by site policy');
       }
-      return await this.call(scope, claim, 'browser_file_upload',
+      assertCurrent();
+      const result = await this.call(scope, claim, 'browser_file_upload',
         { target, paths: staged, approvedOrigin: initial.origin }, abortSignal);
+      assertCurrent();
+      return result;
     } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
   }
 
@@ -732,21 +750,32 @@ export class ExternalBrowserSessionRouter {
 
   /** Releases the chat's tabs to other chats and closes Agent-created in-app tabs nobody kept. */
   async finishTurn(scope: BrowserScope): Promise<void> {
-    await closeExternalBrowserPlaywrightScope(scope);
     const key = scopeKey(scope);
     const chat = this.chats.get(key);
-    if (!chat) return;
+    // Revoke each pending tool before cleanup yields. A permission prompt can
+    // complete after the turn ends, before Playwright has even created a scope.
+    const ending = [...(chat?.tabs.values() ?? [])].map(binding => {
+      const usedInTurn = binding.usedInTurn;
+      binding.usedInTurn = false;
+      binding.turnRevision += 1;
+      return { binding, usedInTurn, turnRevision: binding.turnRevision,
+        activityRevision: binding.activityRevision, lastUsed: binding.lastUsed };
+    });
     this.closeSurfacesForTurn(scope);
+    await closeExternalBrowserPlaywrightScope(scope);
+    if (!chat) return;
     let freshTabInventory = false;
     if (this.targetKind === 'embedded' && this.bridge.refresh) {
       try { await this.bridge.refresh(); freshTabInventory = true; }
       catch { /* Without fresh visibility evidence, keep the normal close policy. */ }
     }
     const closing: Binding[] = [];
-    for (const binding of chat.tabs.values()) {
-      const usedInTurn = binding.usedInTurn;
-      binding.usedInTurn = false;
-      if (this.targetKind === 'embedded') binding.turnRevision += 1;
+    for (const { binding, usedInTurn, turnRevision, activityRevision, lastUsed } of ending) {
+      // The next turn may start while the old relay is cleaning up. Its use of
+      // this same tab, or a replacement binding, belongs to the new owner.
+      if (this.bindingFor(scope, binding.identity) !== binding
+        || binding.turnRevision !== turnRevision || binding.activityRevision !== activityRevision
+        || binding.lastUsed !== lastUsed || binding.usedInTurn) continue;
       if (!binding.agentCreated || !usedInTurn) continue;
       if (binding.disposition) binding.disposition = null;
       else if (this.targetKind === 'embedded' && freshTabInventory && !binding.retainedUnseen

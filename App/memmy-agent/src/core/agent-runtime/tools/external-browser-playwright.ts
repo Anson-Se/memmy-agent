@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import type { Browser, Frame, Locator, Page } from 'playwright';
+import type { Browser, ElementHandle, Frame, Locator, Page } from 'playwright';
 import type { BrowserScope } from './browser.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
 import { ExternalBrowserPlaywrightRelay, type BrowserExecutionDiagnostics, type PlaywrightCommandBridge } from './external-browser-playwright-relay.js';
@@ -29,6 +29,11 @@ const INPUT_ACTIONS = new Set(['click', 'type', 'selectOption', 'pressKey', 'scr
 function snapshotExpression(nonce: string, query?: { text?: string; regex?: string }): string {
   return `(() => {
     const nonce=${JSON.stringify(nonce)}, query=${JSON.stringify(query ?? {})}, nodes=[], seen=new Set();
+    // The map lives in the page's main world, where frame.evaluateHandle can
+    // retrieve the exact original node. It is replaced on every observation.
+    const refs=new Map();
+    Object.defineProperty(globalThis,Symbol.for('memmy.playwright.element.refs'),
+      {value:refs,writable:true,configurable:true});
     let characters=0,scanned=0,truncated=false;
     const raw=query.regex||'', match=/^\\/(.*)\\/([imsu]*)$/.exec(raw);
     const pattern=raw?(match?new RegExp(match[1],match[2]):new RegExp(raw)):null;
@@ -56,7 +61,7 @@ function snapshotExpression(nonce: string, query?: { text?: string; regex?: stri
       if(!matches(node.role+' '+node.name+' '+node.value+' '+JSON.stringify(state)))return;
       const size=JSON.stringify(node).length;
       if(nodes.length>=600||characters+size>40000){truncated=true;return;}
-      characters+=size;el.setAttribute('data-memmy-playwright-ref',ref);nodes.push(node);
+      characters+=size;refs.set(ref,new WeakRef(el));nodes.push(node);
     };
     const controls=root => {
       for(const el of root.querySelectorAll('button,a[href],input,select,textarea,summary,[role]')) {
@@ -126,7 +131,9 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
   return { nodes, truncated };
 }
 
-async function target(session: Session, value: unknown, allowFrame: (url: string) => boolean): Promise<Locator> {
+type BrowserTarget = Locator | ElementHandle;
+
+async function target(session: Session, value: unknown, allowFrame: (url: string) => boolean): Promise<BrowserTarget> {
   const raw = String(value || '').trim();
   const text = /^\[(pw-[a-f0-9]+-\d+)\]$/.exec(raw)?.[1] ?? raw;
   if (!text || text.length > 2000) throw new Error('A page element reference or selector is required');
@@ -144,15 +151,27 @@ async function target(session: Session, value: unknown, allowFrame: (url: string
   if (current.url !== reference.url || current.timeOrigin !== reference.timeOrigin) {
     throw new Error('This element document changed. Read browser_snapshot again.');
   }
-  const locator = frame.locator(`[data-memmy-playwright-ref=${JSON.stringify(text)}]`);
-  if (await locator.count()) return locator;
-  // A framework may replace a node within the same document. Re-resolve a
-  // unique semantic target; Playwright's strict matching rejects ambiguity.
-  if (reference.name && ['button', 'link', 'textbox', 'combobox', 'checkbox', 'radio', 'heading'].includes(reference.role)) {
-    return frame.getByRole(reference.role as Parameters<Frame['getByRole']>[0], { name: reference.name, exact: true });
+  // CSS attributes and role/name can be cloned or reused by an SPA. Retrieve
+  // the exact element from the world that created the snapshot. A handle keeps
+  // Playwright from silently re-resolving to a replacement before dispatch.
+  const remote = await frame.evaluateHandle((ref: string) => {
+    const refs = (globalThis as any)[Symbol.for('memmy.playwright.element.refs')];
+    const element = refs?.get(ref)?.deref();
+    return element?.isConnected && element.ownerDocument === (globalThis as any).document ? element : null;
+  }, text);
+  const handle = remote.asElement();
+  if (!handle) {
+    await remote.dispose().catch(() => undefined);
+    throw new Error('This element reference is stale. Read browser_snapshot again.');
   }
-  if (reference.name) return frame.getByText(reference.name, { exact: true });
-  throw new Error('This element was removed. Read browser_snapshot again.');
+  return handle;
+}
+
+async function withTarget<T>(session: Session, value: unknown, allowFrame: (url: string) => boolean,
+  action: (target: BrowserTarget) => Promise<T>): Promise<T> {
+  const selected = await target(session, value, allowFrame);
+  try { return await action(selected); }
+  finally { if ('dispose' in selected) await selected.dispose().catch(() => undefined); }
 }
 
 async function dispose(session: Session): Promise<void> {
@@ -267,24 +286,30 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
               assertUntargetedInputAllowed(true);
             }
             else {
-              const locator = await target(actionSession, args.target || args.ref, allowFrame);
-              const options = { button: args.button || 'left', modifiers: args.modifiers };
-              if (args.doubleClick) await locator.dblclick(options); else await locator.click(options);
+              await withTarget(actionSession, args.target || args.ref, allowFrame, async locator => {
+                const options = { button: args.button || 'left', modifiers: args.modifiers };
+                if (args.doubleClick) await locator.dblclick(options); else await locator.click(options);
+              });
             }
             return await observed({ ok: true, inputDispatched: true });
           }
           case 'type': {
-            const locator = await target(actionSession, args.target || args.ref, allowFrame);
             const text = String(args.text || '');
             if (text.length > 100_000) throw new Error('Text is too long');
-            if (args.slowly) { await locator.fill(''); await locator.pressSequentially(text); }
-            else await locator.fill(text);
-            if (args.submit) await locator.press('Enter');
+            await withTarget(actionSession, args.target || args.ref, allowFrame, async locator => {
+              if (args.slowly) {
+                await locator.fill('');
+                if ('pressSequentially' in locator) await locator.pressSequentially(text);
+                else await locator.type(text);
+              } else await locator.fill(text);
+              if (args.submit) await locator.press('Enter');
+            });
             return await observed({ ok: true, inputDispatched: true, ...(args.submit ? { submitted: true } : {}) });
           }
           case 'selectOption': {
             const values = Array.isArray(args.values) ? args.values.map(String) : [String(args.value || '')];
-            const selected = await (await target(actionSession, args.target || args.ref, allowFrame)).selectOption(values);
+            const selected = await withTarget(actionSession, args.target || args.ref, allowFrame,
+              locator => locator.selectOption(values));
             return await observed({ value: selected.length === 1 ? selected[0] : selected, values: selected });
           }
           case 'pressKey': {
@@ -304,7 +329,8 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
           case 'upload': {
             if (!Array.isArray(uploadPaths) || !uploadPaths.length || uploadPaths.length > 20
               || uploadPaths.some(file => typeof file !== 'string' || !file)) throw new Error('Approved upload paths are required');
-            await (await target(actionSession, args.target || args.ref, allowFrame)).setInputFiles(uploadPaths);
+            await withTarget(actionSession, args.target || args.ref, allowFrame,
+              locator => locator.setInputFiles(uploadPaths));
             return await observed({ ok: true, uploaded: uploadPaths.length });
           }
           case 'waitFor': {
@@ -330,8 +356,9 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
             assertScreenshotAllowed();
             const type = args.type === 'jpeg' ? 'jpeg' : 'png';
             if (args.fullPage && (args.target || args.ref)) throw new Error('Choose fullPage or an element screenshot');
-            const locator = args.target || args.ref ? await target(actionSession, args.target || args.ref, allowFrame) : null;
-            const data = locator ? await locator.screenshot({ type }) : await page.screenshot({ type, fullPage: args.fullPage === true });
+            const data = args.target || args.ref
+              ? await withTarget(actionSession, args.target || args.ref, allowFrame, locator => locator.screenshot({ type }))
+              : await page.screenshot({ type, fullPage: args.fullPage === true });
             assertScreenshotAllowed();
             return { format: type, data: data.toString('base64') };
           }

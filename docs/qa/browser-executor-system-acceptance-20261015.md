@@ -14,8 +14,10 @@
 | 停止 task 只清理当前连接，队列还可能继续 | 已停止任务排队的操作仍有机会派发 | task 状态同步撤销；运行中操作终止，排队操作校验原 owner；旧结果不能重新写入已结束 task |
 | 连接回收清理的等待期间 task 已结束，或者最后一次标签页查询期间 child 已导航/解绑 | 已经校验过的旧 owner 或子页面身份在实际发送前失效 | 清理完成后先复查 task owner 再建连接；最后一次异步检查之后、发送之前再核 child 对象和修订 |
 | 权限切换没有进入缓存有效性判断 | 已允许的子页面仍不可见，或沿用之前允许的视图 | `frameVersion` 纳入当前允许的 frame 集合，下轮操作按新策略重建；隐藏的上下文只保留可信身份元数据，所有执行仍校验当前策略和父链 |
+| 任务结束先等待连接清理，权限审批中的旧工具尚未建立连接 | 旧任务在审批返回后可以重新获准并点击或上传 | Chrome/Edge 与内置浏览器的绑定代数在首次异步等待前推进；所有已捕获的桥接与上传流程检查原代数，新任务继续使用原标签页 |
+| 页面在快照后替换了同名控件，旧 ref 被按文字重新定位 | 点击或填写可能落到另一条记录上却报告成功 | 旧 ref 只绑定观察时的 DOM 元素；元素替换后要求重新观察，明确的新选择器仍可操作新元素 |
 
-上述问题已用真实隔离 Chromium 或真实扩展逐项复现失败，再验证修复。没有添加税务网站特判、控件名单、模型提示规则或输入失败后的自动重放。
+上述问题已用真实隔离 Chromium、真实扩展或定向回归用例逐项复现失败，再验证修复。审查新增的两个问题分别复现了任务结束后审批返回仍派发点击/上传，以及旧引用点中同名替代控件却返回成功。没有添加税务网站特判、控件名单、模型提示规则或输入失败后的自动重放。
 
 ### 必须保持的执行约束
 
@@ -61,10 +63,11 @@
 
 最终联合验证：
 
-- Agent 12 个相关测试文件 **155/155 通过**，包括实际执行的隔离 Chromium / 生产 MV3 完整流程；没有 skip。
+- Agent 13 个相关测试文件 **197/197 通过**，包括实际执行的隔离 Chromium / 生产 MV3 完整流程，以及任务结束后的旧审批撤销和旧元素引用拒绝；没有 skip。
 - 桌面 8 个相关测试文件 **195/195 通过**，包括两个桥接、子页面身份、History 接入、统一授权、CDP 事件和旧授权兼容。
 - Agent 和桌面两套 TypeScript `--noEmit` 均通过；`git diff --check` 通过。
 - 独立只读审查提出的连接回收停止竞态、外部插件最终异步查询竞态均已用修复前失败 / 修复后通过的测试闭合。
+- 本次系统复核新增的旧任务审批竞态和同名控件错点，也均有修复前失败 / 修复后通过的证据；点击、输入、选择、上传及元素截图统一使用原始元素身份。
 - 本地合成页面的一次联合执行记录：冷快照约 86ms，复用连接点击及观察约 119ms。这仅说明测试环境中执行开销，不代表真实网站或模型整次任务时延。
 
 Agent 联合命令（在 `App/memmy-agent`，先配置测试 Chromium 运行时）：
@@ -82,7 +85,8 @@ Agent 联合命令（在 `App/memmy-agent`，先配置测试 Chromium 运行时�
   tests/core/agent-runtime/tools/browser-embedded-routing.test.ts \
   tests/core/agent-runtime/tools/browser-global-frame-policy.test.ts \
   tests/core/agent-runtime/tools/external-browser-history-integration.test.ts \
-  tests/core/agent-runtime/tools/external-browser-upgrade-compatibility.test.ts
+  tests/core/agent-runtime/tools/external-browser-upgrade-compatibility.test.ts \
+  tests/core/agent-runtime/tools/browser.test.ts
 ```
 
 桌面联合命令（在 `App/shell/desktop`）：
@@ -102,8 +106,11 @@ Agent 联合命令（在 `App/memmy-agent`，先配置测试 Chromium 运行时�
 ## 范围、兼容和交付
 
 - 外部 Chrome/Edge 插件及内置浏览器两条桥接都修复；它们共用 Agent 执行器。插件沿用本分支尚未交付的 `1.0.7` 和现有自动更新流程。
-- 原有统一权限、网站策略、History 接入、升级兼容一起回归；没有新增 GUI、提示、数据迁移、权限开关或安装流程。
+- 原有统一权限、网站策略、History 接入、升级兼容一起回归。本轮稳定性修复没有新增 GUI、提示、数据迁移、权限开关或安装流程；History 的安装入口沿用浏览器增强分支已有变更。
 - 源码基底 `b0d83635c`，首轮修复 `30caf7a16`。打包任务应从本分支最终提交整合两轮修复，并核对自身发布分支已有修复；不要只取某一个桥接文件。
+- 2026-10-15 源码复核：1.2.3 rc.7 候选 `938b089ed` 没有本分支的浏览器执行层和 History 增强。只从 rc.7 打包，或只挑入最后两次修复提交，都不能交付这套能力。需在隔离的集成工作树中整合本分支的完整依赖链与 rc.7 后续修复，解决重叠文件冲突后再构建。应保留 rc.7 的 Windows History/微信、Mac 权限、Excel 状态及内置标签页等修复；不要用本分支旧文件直接覆盖它们。
+- Mac/Windows 构建均重新编译 Agent 和桌面端并拷贝插件。目标包应确认 Agent JS、桌面内置浏览器 driver JS、`resources/browser-extension` 均来自同一集成提交。如果改为赶 1.2.3，还须同步 root/desktop/agent/native 版本，不可仅修改显示版本。
+- 测试包已有插件 `1.0.6 → 1.0.7` 的权限清单相同。未发布 rc.7 候选里的 `1.0.4` 到 `1.0.7` 增加 `scripting` 和全部 HTTP(S) 站点权限；按 [Chrome 权限更新说明](https://developer.chrome.com/docs/extensions/develop/concepts/permission-warnings)，浏览器可能要求测试用户确认新增权限，插件自身的自动重载不能代替浏览器确认。正式 1.2.2 包没有浏览器插件，因此正式老用户仍走首次安装入口。没有为此新增 Memmy 提示。
 - 本任务只本地提交，不推送、不打包。VM 中当前 rc.4 不会因为源码提交自动获得修复。
 - 本轮真实运行验证发生在 macOS 的隔离 Chromium；桌面桥接和 Windows 共用源码通过自动检查。尚未验收 Windows 安装包、Edge 安装态、真实站点及系统文件对话框，不能将源码测试表述为这些项目已通过。
 

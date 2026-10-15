@@ -543,6 +543,92 @@ describe("external browser session router", () => {
     } finally { grant(true); router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('does not execute an external click after its turn ends during page approval', async () => {
+    const bridge = fakeBridge();
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    let approvals = 0;
+    const authorize = vi.fn(async (url: string, allowed: Set<string>) => {
+      const approved = ++approvals === 1 ? (entered(), await waiting) : true;
+      if (approved) allowed.add(new URL(url).origin);
+      return approved;
+    });
+    const router = new ExternalBrowserSessionRouter(bridge, authorize, 'external');
+    try {
+      router.selectClaim(scopeA, claim);
+      const pending = expect(router.call(scopeA, claim, 'browser_click', { target: '#submit' }))
+        .rejects.toThrow(/Chrome\/Edge.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      expect(router.hasBinding(scopeA)).toBe(true);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'click')).toBe(false);
+      await router.call(scopeA, claim, 'browser_click', { target: '#submit' });
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'click')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); }
+  });
+
+  it('revokes an in-app click while page approval is still pending', async () => {
+    const current = { ...claim, browser: 'memmy' as const };
+    const bridge = fakeBridge([current]);
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    let approvals = 0;
+    const router = new ExternalBrowserSessionRouter(bridge, async (url, allowed) => {
+      const approved = ++approvals === 1 ? (entered(), await waiting) : true;
+      if (approved) allowed.add(new URL(url).origin);
+      return approved;
+    }, 'embedded');
+    try {
+      router.selectClaim(scopeA, current);
+      const pending = expect(router.call(scopeA, current, 'browser_click', { target: 'ax-1' }))
+        .rejects.toThrow(/Memmy in-app.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'click')).toBe(false);
+      await router.call(scopeA, current, 'browser_click', { target: 'ax-1' });
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'click')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); }
+  });
+
+  it('does not upload after its turn ends while file approval is pending', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upload-stopped-turn-'));
+    const source = path.join(workspace, 'evidence.txt');
+    fs.writeFileSync(source, 'fixture evidence');
+    const bridge = fakeBridge();
+    const originalCommand = bridge.command;
+    bridge.command = vi.fn((bound, operation, args, signal) => operation === 'tabState'
+      ? Promise.resolve({ url: claim.url, origin: new URL(claim.url).origin })
+      : originalCommand(bound, operation, args, signal));
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    const approve = vi.fn(async () => { entered(); return waiting; });
+    const router = new ExternalBrowserSessionRouter(bridge, async (url, allowed) => {
+      allowed.add(new URL(url).origin); return true;
+    }, 'external');
+    try {
+      router.selectClaim(scopeA, claim);
+      const pending = expect(router.upload(scopeA, claim, { target: '#attachment', paths: [source] }, approve))
+        .rejects.toThrow(/Chrome\/Edge.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'upload')).toBe(false);
+      await router.upload(scopeA, claim, { target: '#attachment', paths: [source] }, async () => true);
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'upload')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); fs.rmSync(workspace, { recursive: true, force: true }); }
+  });
+
   it('discards a late screenshot after recovery without recreating old files or surfaces', async () => {
     const original = { ...claim };
     const replacement = { ...original, tabId: 18 };

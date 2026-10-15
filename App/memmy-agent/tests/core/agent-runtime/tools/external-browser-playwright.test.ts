@@ -191,8 +191,6 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     const coldMs = performance.now() - cold;
     const reference = snapshot.nodes.find((node: any) => node.name === 'Continue' && node.role === 'text');
     expect(reference).toBeTruthy();
-    await page.evaluate("document.querySelector('#action').replaceWith(document.querySelector('#action').cloneNode(true))");
-    await page.evaluate("document.querySelector('#action').onclick=()=>document.querySelector('#result').textContent='Done'");
     const warm = performance.now();
     const clicked = await run('click', { target: `[${reference.ref}]` });
     const warmMs = performance.now() - warm;
@@ -545,6 +543,51 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
       inputDispatched: true, noActionDispatched: false, freshObservationRequired: true });
     expect(await page.locator('#result').textContent()).toBe('Done');
   });
+
+  it('never rebinds snapshot refs to replacement controls, even when cloneNode copies their attributes', async () => {
+    const snapshot = await run('snapshot');
+    const ref = (name: string) => snapshot.nodes.find((node: any) => node.name === name)?.ref as string;
+    const refs = { click: ref('Continue'), type: ref('Name'), selectOption: ref('Choice'),
+      upload: ref('Attachment') };
+    expect(Object.values(refs).every(Boolean)).toBe(true);
+    await page.evaluate((refs: Record<string, string>) => {
+      const doc = (globalThis as any).document;
+      for (const [id, ref] of [['action', refs.click], ['name', refs.type],
+        ['select', refs.selectOption], ['file', refs.upload]]) {
+        const old = doc.getElementById(id);
+        // A legacy marker is deliberately copied to the replacement. A ref
+        // must still remain bound to the original DOM node.
+        old.setAttribute('data-memmy-playwright-ref', ref);
+        const replacement = old.cloneNode(true);
+        replacement.id = `replacement-${id}`;
+        old.replaceWith(replacement);
+      }
+      doc.getElementById('replacement-action').onclick = () => {
+        doc.getElementById('result').textContent = 'Wrong replacement clicked';
+      };
+    }, refs);
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-ref-identity-'));
+    const uploadFile = path.join(uploadDir, 'approved.txt');
+    fs.writeFileSync(uploadFile, 'isolated fixture');
+    try {
+      for (const [action, args] of [
+        ['click', { target: refs.click }],
+        ['type', { target: refs.type, text: 'Wrong replacement typed' }],
+        ['selectOption', { target: refs.selectOption, values: ['b'] }],
+        ['upload', { target: refs.upload, paths: [uploadFile] }],
+        ['screenshot', { target: refs.click }],
+      ] as const) {
+        await expect(run(action, args)).rejects.toThrow(/stale|removed|replaced/i);
+      }
+      expect(bridge.methods.some(method => method.startsWith('Input.') || method === 'DOM.setFileInputFiles')).toBe(false);
+      expect(await page.locator('#result').textContent()).toBe('');
+      expect(await page.locator('#replacement-name').inputValue()).toBe('');
+      expect(await page.locator('#replacement-select').inputValue()).toBe('a');
+      expect(await page.locator('#replacement-file').evaluate((input: any) => input.files?.length)).toBe(0);
+      const explicit = await run('click', { target: '#replacement-action' });
+      expect(explicit.observation.nodes.some((node: any) => node.name === 'Wrong replacement clicked')).toBe(true);
+    } finally { fs.rmSync(uploadDir, { recursive: true, force: true }); }
+  }, 30_000);
 
   it('rejects references from a reloaded document and supports unique :has-text selectors', async () => {
     const snapshot = await run('snapshot');
