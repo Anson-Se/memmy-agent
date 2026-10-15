@@ -293,5 +293,17 @@ describe("SSE chat completions", () => {
     expect(response.status).toBe(200);
     expect(body).not.toContain('"finish_reason":"stop"');
     expect(body).not.toContain("[DONE]");
+    expect(JSON.parse(ssePayloads(body)[0]).error.code).toBe("server_error");
+    expect(body).not.toContain("backend blew up");
+  });
+
+  it("reports an unavailable session model instead of silently closing the stream", async () => {
+    const app = createApp({ processDirect: async () => {
+      throw new Error("model_selection_unavailable");
+    } }, "m");
+    const response = await app.fetch(request({ messages: [{ role: "user", content: "hi" }], stream: true }));
+    const body = await response.text();
+    expect(JSON.parse(ssePayloads(body)[0]).error).toMatchObject({ code: "model_selection_unavailable" });
+    expect(body).not.toContain("[DONE]");
   });
 });
