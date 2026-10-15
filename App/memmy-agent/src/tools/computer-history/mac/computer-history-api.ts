@@ -56,6 +56,7 @@ import { buildBrowserAuthoritySnapshot, writeBrowserAuthority, type BrowserFocus
 import { appendBrowserHistoryEvent, prepareBrowserHistoryEvent,
   type BrowserHistoryCaptureIntent, type BrowserHistoryTrustedContext } from "../browser-semantic-history.js";
 import { connectBrowserHistoryBridge } from "../browser-history-bridge.js";
+import { discoverWeixinDatabaseRoot, type WindowsDirectoryReader } from "../win/weixin-database.js";
 
 /** The authority sidecar is a recording too: excluded page identity never goes to disk. */
 export function filterHistoryAuthorityObservations(settings: ObservationSettings,
@@ -829,6 +830,41 @@ export class ComputerHistoryDemoService {
     return physicalRuntimeAsset(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "win", "weixin_keys.py"));
   }
 
+  /**
+   * Resolve the Weixin `db_storage` directory from config hints and the default
+   * Documents folder. Best-effort: a null result lets the helper fall back to its
+   * own default-Documents scan, so a standard install never regresses.
+   */
+  private windowsWeChatDatabaseRoot(): string | null {
+    try {
+      const read = (parent: string, kind: "isDirectory" | "isFile"): string[] => {
+        try {
+          return fs.readdirSync(parent, { withFileTypes: true })
+            .filter((entry) => entry[kind]()).map((entry) => entry.name);
+        } catch { return []; }
+      };
+      const reader: WindowsDirectoryReader = {
+        directories: (parent) => read(parent, "isDirectory"),
+        files: (parent) => read(parent, "isFile"),
+      };
+      const configTexts: string[] = [];
+      if (process.env.APPDATA) {
+        const configDirectory = path.join(process.env.APPDATA, "Tencent", "xwechat", "config");
+        for (const name of read(configDirectory, "isFile")) {
+          if (!name.toLowerCase().endsWith(".ini")) continue;
+          try { configTexts.push(fs.readFileSync(path.join(configDirectory, name), "utf8")); } catch { /* skip unreadable config */ }
+        }
+      }
+      return discoverWeixinDatabaseRoot(reader, {
+        documentsDirectory: path.join(os.homedir(), "Documents"),
+        configTexts,
+      });
+    } catch {
+      // Ambiguous or missing data: defer to the helper's own discovery.
+      return null;
+    }
+  }
+
   private weChatReader(consentId = this.weChatConsent.read().consentId): WeChatMessageBatchReader | null {
     const directory = this.weChatStateDirectory;
     const keyFile = path.join(directory, "keys.json");
@@ -952,9 +988,10 @@ export class ComputerHistoryDemoService {
     this.weChatError = null;
     this.weChatReadFailures = 0;
     this.weChatPhase = "preparing";
+    const windowsRoot = windows ? this.windowsWeChatDatabaseRoot() : null;
     const args = windows
       ? [...windowsPython!.args, helper, "--output", path.join(this.weChatStateDirectory, "keys.json"),
-        "--consent-file", this.weChatConsent.filePath]
+        "--consent-file", this.weChatConsent.filePath, ...(windowsRoot ? ["--root", windowsRoot] : [])]
       : ["-B", helper, "--state", this.weChatStateDirectory, "--library", library];
     // A pending read belongs to the old account/key setup, even when the user
     // keeps the same consent while switching accounts or refreshing keys.
