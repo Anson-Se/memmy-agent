@@ -2,7 +2,7 @@
 "use strict";
 
 (() => {
-  const TTL_MS = 1_500, REQUEST_TIMEOUT_MS = 1_000, MAX_PAYLOAD_BYTES = 24_000;
+  const TTL_MS = 1_500, REQUEST_TIMEOUT_MS = 1_000, MAX_PAYLOAD_BYTES = 24_000, MAX_ANCESTORS = 32;
   const safeId = value => typeof value === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(value);
   const webUrl = value => {
     if (typeof value !== "string" || value.length > 4096) return false;
@@ -17,6 +17,11 @@
     let intent = { enabled: false, generation: null, expiresAt: 0 };
     const leases = new Map(), pending = new Map(), tabEpochs = new Map(), tabOrigins = new Map();
     const originOf = value => { try { return new URL(value).origin; } catch { return null; } };
+    // location.ancestorOrigins lists parent to top. Memmy checks each one against
+    // website exclusions, so an opaque or non-web ancestor gets no lease.
+    const ancestry = (value, frameId, topUrl) => Array.isArray(value) && value.length <= MAX_ANCESTORS
+      && value.every(entry => webUrl(entry) && originOf(entry) === entry)
+      && (frameId === 0 ? value.length === 0 : value.at(-1) === originOf(topUrl)) ? [...value] : null;
     const connected = () => !closed && dependencies.isConnected() === true;
     const currentIntent = () => connected() && intent.enabled === true && safeId(intent.generation) && intent.expiresAt > Date.now();
     const keyOf = context => `${context.tabId}:${context.frameId}:${context.documentId}`;
@@ -112,18 +117,20 @@
         pending.set(id, { timer, resolve });
         try { dependencies.send({ type: "browser_history_config_request", id, browser: context.browser,
           tabId: context.tabId, windowId: context.windowId, frameId: context.frameId,
-          topUrl: context.topUrl, frameUrl: context.frameUrl, documentId: context.documentId,
-          privateBrowsing: false, protected: false }); }
+          topUrl: context.topUrl, frameUrl: context.frameUrl, ancestorOrigins: context.ancestorOrigins,
+          documentId: context.documentId, privateBrowsing: false, protected: false }); }
         catch { clearTimeout(timer); pending.delete(id); resolve(null); }
       });
     };
-    const configure = async sender => {
+    const configure = async (sender, ancestorOrigins) => {
       // While History is off or Memmy is away, and in background tabs, frames
       // wait to be woken instead of rechecking.
       if (!currentIntent()) return { enabled: false, idle: true };
       const context = await contextFor(sender);
       const disabled = { enabled: false };
       if (!context) return { enabled: false, idle: sender?.tab?.active !== true };
+      context.ancestorOrigins = ancestry(ancestorOrigins, context.frameId, context.topUrl);
+      if (!context.ancestorOrigins) return disabled;
       const authorization = await requestAuthorization(context);
       const fresh = await contextFor(sender);
       if (!fresh || fresh.epoch !== context.epoch || fresh.topUrl !== context.topUrl || fresh.frameUrl !== context.frameUrl
@@ -134,8 +141,9 @@
       const reusable = previous && previous.epoch === fresh.epoch && previous.topUrl === fresh.topUrl
         && previous.frameUrl === fresh.frameUrl && previous.generation === authorization.generation
         && previous.captureText === authorization.captureText;
-      const lease = { ...fresh, leaseId: reusable ? previous.leaseId : uuid(), generation: authorization.generation,
-        expiresAt: Math.min(authorization.expiresAt, intent.expiresAt, Date.now() + TTL_MS), captureText: authorization.captureText };
+      const lease = { ...fresh, ancestorOrigins: context.ancestorOrigins, leaseId: reusable ? previous.leaseId : uuid(),
+        generation: authorization.generation, expiresAt: Math.min(authorization.expiresAt, intent.expiresAt, Date.now() + TTL_MS),
+        captureText: authorization.captureText };
       if (reusable) Object.assign(previous, lease);
       else {
         for (const [key, existing] of leases) if (existing.expiresAt <= Date.now()) leases.delete(key);
@@ -170,14 +178,15 @@
         ...(safeId(evidence.taskId) ? { taskId: evidence.taskId } : {}) } : undefined;
       dependencies.send({ type: "browser_history", browser: context.browser, tabId: context.tabId,
         windowId: context.windowId, frameId: context.frameId, documentId: context.documentId,
-        topUrl: context.topUrl, frameUrl: context.frameUrl, privateBrowsing: false, protected: false,
-        generation: lease.generation, actor: actorEvidence ? "agent" : "unknown", engine: "content_script",
+        topUrl: context.topUrl, frameUrl: context.frameUrl, ancestorOrigins: lease.ancestorOrigins,
+        privateBrowsing: false, protected: false, generation: lease.generation,
+        actor: actorEvidence ? "agent" : "unknown", engine: "content_script",
         ...(actorEvidence ? { actorEvidence } : {}), payload });
       return { accepted: true };
     };
     const onMessage = (message, sender, respond) => {
       if (message?.type !== "memmy_history_config" && message?.type !== "memmy_history_event") return;
-      void (message.type === "memmy_history_config" ? configure(sender) : event(message, sender))
+      void (message.type === "memmy_history_config" ? configure(sender, message.ancestorOrigins) : event(message, sender))
         .then(respond, () => respond(message.type === "memmy_history_config" ? { enabled: false } : { accepted: false }));
       return true;
     };

@@ -13,6 +13,8 @@ const EXTENSION_ORIGIN = `chrome-extension://${MEMMY_BROWSER_EXTENSION_ID}`;
 export const EXTERNAL_BROWSER_BRIDGE_PORTS = [47321, 47322, 47323] as const;
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+// Same bound as MAX_ANCESTORS in the extension's browser-history-background.js.
+const MAX_HISTORY_ANCESTORS = 32;
 
 export type ExternalBrowserClaim = {
   connectionId: string;
@@ -91,6 +93,10 @@ function isSafePageUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 4096) return false;
   try { return ["http:", "https:"].includes(new URL(value).protocol); }
   catch { return false; }
+}
+
+function isWebOrigin(value: unknown): value is string {
+  return isSafePageUrl(value) && new URL(value).origin === value;
 }
 
 function safeText(value: unknown, length: number): string {
@@ -310,13 +316,18 @@ export class ExternalBrowserBridge {
       || typeof message.documentId !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/u.test(message.documentId)
       || !isSafePageUrl(message.topUrl) || !isSafePageUrl(message.frameUrl)
       || message.privateBrowsing !== false || message.protected !== false) return null;
+    // An older extension reports no ancestry, so only its top frames can be recorded.
+    const ancestorOrigins = message.ancestorOrigins ?? [];
+    if (!Array.isArray(ancestorOrigins) || ancestorOrigins.length > MAX_HISTORY_ANCESTORS
+      || !ancestorOrigins.every(isWebOrigin) || (message.frameId === 0 ? ancestorOrigins.length > 0
+        : ancestorOrigins.at(-1) !== new URL(message.topUrl).origin)) return null;
     const tabId = message.tabId as number;
     const status = client.tabStatuses.get(tabId)?.status;
     if (status === "protected" || status === "unsupported") return null;
     const claim = client.claims.get(tabId);
     if (claim && claim.url !== message.topUrl) return null;
     return { connectionId, browser: client.browser!, tabId, windowId: message.windowId as number,
-      url: message.topUrl, frameUrl: message.frameUrl, documentId: message.documentId,
+      url: message.topUrl, frameUrl: message.frameUrl, ancestorOrigins, documentId: message.documentId,
       privateBrowsing: false, protected: false };
   }
 

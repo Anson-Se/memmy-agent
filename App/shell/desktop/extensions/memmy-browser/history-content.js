@@ -47,7 +47,10 @@
     const current = ++revision;
     let idle = false;
     try {
-      const value = await chrome.runtime.sendMessage({ type: "memmy_history_config" });
+      // Browser frame metadata, not page DOM: every ancestor frame's site must
+      // also pass website exclusions before this frame gets a lease.
+      const value = await chrome.runtime.sendMessage({ type: "memmy_history_config",
+        ancestorOrigins: Array.from(globalThis.location?.ancestorOrigins ?? []) });
       idle = value?.idle === true;
       if (current === revision && !closed) apply(value);
     } catch { if (current === revision) stop(); }

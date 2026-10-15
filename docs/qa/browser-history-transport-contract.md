@@ -43,11 +43,13 @@ The extension sends browser API metadata, with no DOM content, to request a leas
 {
   type: "browser_history_config_request", id,
   browser, tabId, windowId, frameId, documentId,
-  topUrl, frameUrl, privateBrowsing: false, protected: false
+  topUrl, frameUrl, ancestorOrigins, privateBrowsing: false, protected: false
 }
 ```
 
-The server uses the authenticated client browser identity and `browserHistoryConfiguration(intent, context)` to apply the existing `evaluateObservation` policy to both the top page and frame. `context.url` is `topUrl`. It returns:
+`ancestorOrigins` is the frame's `location.ancestorOrigins`, parent to top: empty for the top frame (`frameId` 0); for a subframe, at most 32 HTTP(S) origins whose last entry is the origin of `topUrl`. The worker requires the list and, like the server, refuses an opaque (`"null"`), non-web, oversized or inconsistent one. The server treats a missing list as empty, so an older extension's top frames still record and its subframes do not.
+
+The server uses the authenticated client browser identity and `browserHistoryConfiguration(intent, context)` to apply the existing `evaluateObservation` policy to the top page, the frame and every ancestor origin, so a frame nested inside an excluded site's iframe gets no lease. `context.url` is `topUrl`. It returns:
 
 ```js
 { type: "browser_history_config", id, enabled, generation, expiresAt, captureText }
@@ -55,19 +57,19 @@ The server uses the authenticated client browser identity and `browserHistoryCon
 
 The background checks sender extension ID, Chrome tab/frame/document identity and active document lifecycle. It verifies the current tab, focused normal window, explicit non-private state, no pending navigation, and credential protection. A Chrome `tabs.sendMessage` probe addressed to the frame and document ID rejects a removed or navigated iframe. It repeats current browser checks after the asynchronous policy response. Only then does it issue an isolated content-script lease, including the document ID and an ephemeral lease ID.
 
-For each event the worker repeats those checks, compares its current document/URL/epoch/lease/generation, bounds event size and age, and sends:
+For each event the worker repeats those checks, compares its current document/URL/epoch/lease/generation, bounds event size and age, and sends the `ancestorOrigins` recorded on the lease (never a list supplied with the event):
 
 ```js
 {
   type: "browser_history", browser, tabId, windowId, frameId, documentId,
-  topUrl, frameUrl, privateBrowsing: false, protected: false,
+  topUrl, frameUrl, ancestorOrigins, privateBrowsing: false, protected: false,
   generation, actor: "agent" | "unknown", engine: "content_script",
   actorEvidence: { kind: "memmy_command", commandId, taskId }, // optional, worker-owned
   payload
 }
 ```
 
-The server supplies `connectionId` and browser identity from the authenticated connection. Page payload fields cannot grant permission or supply trusted identity/actor provenance. Without worker-owned input evidence the actor is `unknown`; `Event.isTrusted` is used only to filter web-page synthetic events. It does not prove a human actor.
+The server supplies `connectionId` and browser identity from the authenticated connection, and checks the top page, frame and ancestor origins against the live policy again before append. Page payload fields cannot grant permission or supply trusted identity/actor provenance. Without worker-owned input evidence the actor is `unknown`; `Event.isTrusted` is used only to filter web-page synthetic events. It does not prove a human actor.
 
 Events remain in memory only until the immediate send. The extension does not persist or replay a queue of History events. The sensor removes pending timers on revoke/expiry and excludes password/OTP values before a message leaves the isolated content script; backend validation/redaction repeats that protection before durable append.
 
@@ -79,4 +81,4 @@ Both package scripts run `verify-browser-extension.mjs` against the final `brows
 
 The browser's fixed debugger infobar remains browser-owned whenever Memmy actively operates a page. Passive History should produce no debugger infobar. Memmy's own operation status may say `Memmy 操作中`.
 
-User GUI acceptance should cover: History on with no Agent chat; manual checkbox/text/date/dropdown navigation recorded with local before/after evidence; off/pause stops capture; excluded applications/sites/iframes stay excluded; private windows and protected login/OTP inputs produce no content; switching windows/tabs or navigating an iframe invalidates old leases; disconnect/reconnect does not replay old events; ordinary Agent browser actions still obey page ownership and permissions.
+User GUI acceptance should cover: History on with no Agent chat; manual checkbox/text/date/dropdown navigation recorded with local before/after evidence; off/pause stops capture; excluded applications/sites/iframes, including frames nested inside an excluded site's iframe, stay excluded; private windows and protected login/OTP inputs produce no content; switching windows/tabs or navigating an iframe invalidates old leases; disconnect/reconnect does not replay old events; ordinary Agent browser actions still obey page ownership and permissions.

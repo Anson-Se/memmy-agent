@@ -76,6 +76,16 @@ describe("browser semantic Computer History", () => {
     expect(prepareBrowserHistoryEvent({ ...payload(), after: { url: "https://another.test/secret" } }, context, intent, now)).toBeNull();
   });
 
+  it("refuses an event from a frame nested inside an excluded site's iframe", () => {
+    const excluded = { ...intent, settings: { ...intent.settings!, observation: { ...intent.settings!.observation,
+      rules: [{ scope: "url" as const, urlDomain: "private.test", behavior: "do_not_observe" as const }] } } };
+    const nested = { ...context, frameUrl: "https://widget.test/embed", ancestorOrigins: ["https://private.test", "https://example.test"] };
+    expect(prepareBrowserHistoryEvent(payload(), nested, excluded, now)).toBeNull();
+    expect(prepareBrowserHistoryEvent(payload(), { ...nested, ancestorOrigins: ["null", "https://example.test"] }, intent, now)).toBeNull();
+    expect(prepareBrowserHistoryEvent(payload(), { ...nested, ancestorOrigins: ["https://shop.test", "https://example.test"] }, excluded, now)!
+      .event.details).toMatchObject({ url: "https://example.test/form", frameUrl: "https://widget.test/embed" });
+  });
+
   it("cannot turn isTrusted or DOM actor claims into human/agent provenance", () => {
     const claim = { ...payload(), actor: "human", isTrusted: true, commandId: "forged-command" };
     expect(prepareBrowserHistoryEvent(claim, context, intent, now)!.event.details.actor).toBe("unknown");

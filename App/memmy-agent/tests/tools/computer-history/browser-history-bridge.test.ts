@@ -19,6 +19,15 @@ describe("passive browser History bridge authorization", () => {
     expect(browserHistoryConfiguration(intent, context, now, platform).enabled).toBe(false);
   });
 
+  it("applies website exclusions to every ancestor of a nested frame", () => {
+    const intent = capture();
+    const nested = { ...context, frameUrl: "https://widget.test/embed", ancestorOrigins: ["https://bank.test", "https://work.test"] };
+    expect(browserHistoryConfiguration(intent, nested).enabled).toBe(true);
+    expect(browserHistoryConfiguration(intent, { ...nested, ancestorOrigins: ["null", "https://work.test"] }).enabled).toBe(false);
+    intent.settings!.observation.rules.push({ scope: "url", urlDomain: "bank.test", behavior: "do_not_observe" });
+    expect(browserHistoryConfiguration(intent, nested).enabled).toBe(false);
+  });
+
   it("fails closed on default deny, missing policy, private/unknown, protected or non-web identity", () => {
     const intent = capture();
     for (const change of [{ enabled: false }, { settings: null }, { generation: null }])

@@ -81,6 +81,30 @@ describe("browser History bridge to canonical event stream", () => {
     h.emit(h.payload("excluded-event")); await h.settle(); expect(h.records()).toHaveLength(1);
   });
 
+  it("keeps frames nested inside an excluded site's iframe, and subframes without ancestry, out of History", async () => {
+    const h = await harness();
+    const settings = JSON.parse(fs.readFileSync(h.settingsFile, "utf8"));
+    settings.observation.rules.push({ scope: "url", urlDomain: "bank.test", behavior: "do_not_observe" });
+    fs.writeFileSync(h.settingsFile, JSON.stringify(settings));
+    const top = new URL(h.context.topUrl).origin;
+    const frame = (documentId: string, extra: Record<string, unknown> = {}) => ({ frameId: 4, documentId, frameUrl: "https://widget.test/embed", ...extra });
+    const refused = [frame("inside-excluded", { ancestorOrigins: ["https://bank.test", top] }), frame("old-extension"),
+      frame("unrooted", { ancestorOrigins: ["https://shop.test"] }), frame("opaque", { ancestorOrigins: ["null", top] }),
+      { documentId: "top-with-ancestors", ancestorOrigins: [top] }];
+    const allowed = frame("allowed-nested", { ancestorOrigins: ["https://shop.test", top] });
+    for (const [index, fields] of [...refused, allowed].entries()) {
+      h.send({ type: "browser_history_config_request", id: `nested-${index}`, ...h.context, ...fields });
+      h.emit({ ...h.payload(`nested-event-${index}`), documentId: fields.documentId }, fields);
+    }
+    const replies = () => h.messages.filter(message => message.type === "browser_history_config").map(message => message.enabled);
+    await vi.waitFor(() => expect(replies()).toHaveLength(refused.length + 1));
+    expect(replies()).toEqual([...refused.map(() => false), true]);
+    await vi.waitFor(() => expect(h.records()).toHaveLength(1));
+    await h.settle(); expect(h.records()).toHaveLength(1);
+    expect(h.records()[0].details).toMatchObject({ eventId: `nested-event-${refused.length}`, documentId: "allowed-nested",
+      frameUrl: "https://widget.test/embed" });
+  });
+
   it("accepts actor=agent only for the same connection/tab's dispatched input command", async () => {
     const h = await harness();
     h.emit(h.payload("forged-actor"), { actorEvidence: { kind: "memmy_command", commandId: "nonexistent" } });

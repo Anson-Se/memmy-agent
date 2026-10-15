@@ -14,7 +14,7 @@ export interface BrowserHistoryConfiguration {
 
 /** Browser metadata comes from the authenticated extension, never its DOM event payload. */
 export type BrowserHistoryConfigurationContext = Pick<BrowserHistoryTrustedContext,
-  "browser" | "tabId" | "windowId" | "url" | "frameUrl" | "documentId" | "privateBrowsing" | "protected">;
+  "browser" | "tabId" | "windowId" | "url" | "frameUrl" | "ancestorOrigins" | "documentId" | "privateBrowsing" | "protected">;
 
 export function browserHistoryConfiguration(intent: BrowserHistoryCaptureIntent,
   context: BrowserHistoryConfigurationContext, now = Date.now(), platform: NodeJS.Platform = process.platform): BrowserHistoryConfiguration {
@@ -24,10 +24,11 @@ export function browserHistoryConfiguration(intent: BrowserHistoryCaptureIntent,
     || !Number.isSafeInteger(context.windowId) || context.windowId < 0
     || !/^[A-Za-z0-9._:-]{1,200}$/u.test(context.documentId) || context.privateBrowsing !== false || context.protected !== false) return disabled;
   const topUrl = sanitizeBrowserUrl(context.url), frameUrl = sanitizeBrowserUrl(context.frameUrl ?? context.url);
-  if (!topUrl || !frameUrl) return disabled;
+  const ancestors = (context.ancestorOrigins ?? []).map(origin => sanitizeBrowserUrl(origin));
+  if (!topUrl || !frameUrl || !ancestors.every(Boolean)) return disabled;
   try {
     const bundleId = browserHistoryApplication(context.browser, platform).bundleId;
-    if (![topUrl, frameUrl].every(url => evaluateObservation(intent.settings!, {
+    if (![topUrl, frameUrl, ...ancestors].every(url => evaluateObservation(intent.settings!, {
       bundleId, browser: true, url, privateBrowsing: false, privateBrowsingUnknown: false,
     }).observe)) return disabled;
   } catch { return disabled; }

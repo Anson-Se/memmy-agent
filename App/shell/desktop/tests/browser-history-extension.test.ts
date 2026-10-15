@@ -45,7 +45,7 @@ function harness() {
   const background = (sandbox as any).installMemmyBrowserHistoryBackground(dependencies);
   const permit = (generation = "recording-1") => background.receive({ type: "browser_history_intent", enabled: true, generation, expiresAt: Date.now() + 1500 });
   const invoke = (message: any, source = sender()) => new Promise<any>(resolve => { if (handler(message, source, resolve) !== true) resolve(null); });
-  const configure = (source = sender()) => invoke({ type: "memmy_history_config" }, source);
+  const configure = (source = sender(), ancestorOrigins: unknown = []) => invoke({ type: "memmy_history_config", ancestorOrigins }, source);
   const payload = (generation = "recording-1", documentId = "document-1") => ({ version: 1, eventId: "event-1",
     observedAt: Date.now(), generation, documentId, action: "change", target: { role: "checkbox", name: "Selected", checked: true } });
   const emit = (configuration: any, source = sender(), extra: any = {}) => invoke({ type: "memmy_history_event",
@@ -87,7 +87,7 @@ describe("isolated passive browser History transport", () => {
   it("rejects old iframe documents, stale URL/focus and config replies completing after navigation", async () => {
     const test = harness(); test.permit();
     const frame = sender({ frameId: 2, documentId: "iframe-1", url: "https://frame.test/form" });
-    const configuration = await test.configure(frame); expect(configuration.enabled).toBe(true);
+    const configuration = await test.configure(frame, ["https://work.test"]); expect(configuration.enabled).toBe(true);
     test.documents.delete("iframe-1"); expect(await test.emit(configuration, frame)).toEqual({ accepted: false });
     const fresh = await test.configure(); expect(fresh.enabled).toBe(true);
     test.handlers.focus(); expect(await test.emit(fresh)).toEqual({ accepted: false });
@@ -100,6 +100,35 @@ describe("isolated passive browser History transport", () => {
     test.handlers.update(7, { status: "loading" });
     resolveAuthorization({ enabled: true, generation: "recording-1", expiresAt: Date.now() + 1500, captureText: true });
     expect(await work).toMatchObject({ enabled: false });
+  });
+
+  it("gives no lease to a frame whose reported ancestry is missing, opaque, non-web or not rooted at its tab", async () => {
+    const test = harness(); test.permit();
+    const nested = sender({ frameId: 3, documentId: "iframe-1", url: "https://widget.test/embed" });
+    for (const ancestorOrigins of [undefined, [], "https://work.test", ["https://bank.test"], ["https://work.test", "https://bank.test"],
+      ["null", "https://work.test"], ["chrome-extension://bank", "https://work.test"], ["https://bank.test/", "https://work.test"],
+      [7, "https://work.test"], Array(33).fill("https://work.test")]) {
+      expect(await test.invoke({ type: "memmy_history_config", ancestorOrigins }, nested)).toMatchObject({ enabled: false });
+    }
+    expect(await test.configure(sender(), ["https://work.test"])).toMatchObject({ enabled: false });
+    expect(test.authorizations()).toBe(0);
+    expect(await test.configure(nested, ["https://bank.test", "https://work.test"])).toMatchObject({ enabled: true });
+  });
+
+  it("sends a nested frame's leased ancestry with its config request and every event, not a later page-supplied list", async () => {
+    const test = harness(); delete test.dependencies.authorize; test.permit();
+    const nested = sender({ frameId: 3, documentId: "iframe-1", url: "https://widget.test/embed" });
+    const ancestorOrigins = ["https://bank.test", "https://work.test"];
+    const work = test.configure(nested, ancestorOrigins);
+    await vi.waitFor(() => expect(test.sent.at(-1)?.type).toBe("browser_history_config_request"));
+    const request = test.sent.at(-1);
+    expect(request).toMatchObject({ frameId: 3, topUrl: "https://work.test/form", frameUrl: "https://widget.test/embed", ancestorOrigins });
+    test.background.receive({ type: "browser_history_config", id: request.id, enabled: true,
+      generation: "recording-1", expiresAt: Date.now() + 1500, captureText: true });
+    const configuration = await work; expect(configuration.enabled).toBe(true);
+    expect(await test.invoke({ type: "memmy_history_event", leaseId: configuration.leaseId, ancestorOrigins: ["https://work.test"],
+      payload: test.payload("recording-1", "iframe-1") }, nested)).toEqual({ accepted: true });
+    expect(test.sent.at(-1)).toMatchObject({ type: "browser_history", frameId: 3, ancestorOrigins });
   });
 
   it("ignores page actor/identity and labels only worker-owned input evidence as agent", async () => {
@@ -226,6 +255,18 @@ describe("isolated passive browser History transport", () => {
     expect(stop.mock.calls.length).toBeGreaterThan(beforeExpiry);
     listener({ type: "memmy_history_revoke" }, { id: "extension-id" }, vi.fn());
     expect(stop.mock.calls.length).toBeGreaterThan(beforeExpiry + 1);
+  });
+
+  it("reports the browser's ancestor frame origins with its lease request without reading the DOM", () => {
+    const request = vi.fn(() => Promise.resolve({ enabled: false, idle: true }));
+    const domRead = vi.fn(() => { throw new Error("Unauthorized DOM read"); });
+    const chrome = { runtime: { id: "extension-id", sendMessage: request, onMessage: { addListener: vi.fn() } } };
+    const sandbox = vm.createContext({ chrome, document: new Proxy({}, { get: domRead }), Date, setTimeout, clearTimeout,
+      location: { ancestorOrigins: { length: 2, 0: "https://bank.test", 1: "https://work.test" } }, addEventListener: vi.fn(),
+      __memmyInstallBrowserHistorySensor: vi.fn(), __memmyBrowserHistorySensor: { stop: vi.fn() } });
+    vm.runInContext(fs.readFileSync(path.join(extension, "history-content.js"), "utf8"), sandbox);
+    expect(request).toHaveBeenCalledWith({ type: "memmy_history_config", ancestorOrigins: ["https://bank.test", "https://work.test"] });
+    expect(domRead).not.toHaveBeenCalled();
   });
 
   it("stops rechecking while the worker reports History idle and resumes when woken", async () => {

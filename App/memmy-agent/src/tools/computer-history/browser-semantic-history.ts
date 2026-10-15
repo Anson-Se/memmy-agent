@@ -46,6 +46,8 @@ export interface BrowserHistoryTrustedContext {
   windowId: number;
   url: string;
   frameUrl?: string;
+  /** Origins of the frame's ancestors, parent to top; absent or empty for a top frame. */
+  ancestorOrigins?: string[];
   documentId: string;
   privateBrowsing: boolean | null;
   protected: boolean;
@@ -149,9 +151,10 @@ export function prepareBrowserHistoryEvent(payload: unknown, context: BrowserHis
       || typeof (payload.after as BrowserHistoryState | undefined)?.url !== "string"))) return null;
   const application = browserHistoryApplication(context.browser, platform);
   const url = sanitizeBrowserUrl(context.url), frameUrl = sanitizeBrowserUrl(context.frameUrl ?? context.url);
-  if (!url || !frameUrl) return null;
+  const ancestors = (context.ancestorOrigins ?? []).map(origin => sanitizeBrowserUrl(origin));
+  if (!url || !frameUrl || !ancestors.every(Boolean)) return null;
   const states = [payload.before, payload.after] as Array<BrowserHistoryState | undefined>;
-  const urls = [url, frameUrl];
+  const urls = [url, frameUrl, ...ancestors];
   for (const state of states) {
     if (state?.url !== undefined) {
       const stateUrl = sanitizeBrowserUrl(state.url);
