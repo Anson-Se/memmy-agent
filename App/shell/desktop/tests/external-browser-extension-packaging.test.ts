@@ -1163,3 +1163,47 @@ it('validates a connected cross-origin child before external auth, including aft
     .toEqual({ status: 'page_changed' });
   expect(sent.some(item => item.expression?.includes('cancelled-secret'))).toBe(false);
 });
+
+it.each([true, false])('fills external required auth inputs (already known = %s) and preserves an unspecified optional value', async known => {
+  class Input {
+    isConnected = true; disabled = false; type = 'text';
+    constructor(private currentValue: string) {}
+    get value() { return this.currentValue; }
+    set value(value: string) { this.currentValue = value; }
+    getClientRects() { return [{}]; }
+    dispatchEvent() {}
+  }
+  const code = new Input('old code'), optional = new Input('keep this optional value');
+  const document = { URL: 'https://example.test/login', defaultView: {
+    HTMLInputElement: Input, Event: class { constructor(_name: string, _options: unknown) {} },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+  }, querySelectorAll: (selector: string) => selector === '#code' ? [code] : selector === '#optional' ? [optional] : [] };
+  const collect = vi.fn(async (metadata: { fields: Array<{ id: string }> }) => {
+    expect(metadata.fields.map(field => field.id)).toEqual(['code']);
+    return { values: { code: 'collected-code' } };
+  });
+  const chrome = {
+    runtime: { onMessage: { addListener() {} } },
+    storage: { session: { get: async () => ({}), set: async () => undefined } },
+    debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} },
+      sendCommand: async (_target: unknown, method: string, args: any) => method === 'Runtime.evaluate'
+        ? { result: { value: vm.runInNewContext(args.expression, { document }) } } : {} },
+    tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
+      get: async () => ({ id: 7, active: false, windowId: 1, url: document.URL }) },
+    windows: { get: async () => ({ focused: false }) },
+  };
+  const context = vm.createContext({ chrome, collect, WebSocket: class { static OPEN = 1; },
+    navigator: { userAgent: 'Chrome' }, URL, setTimeout, clearTimeout, setInterval, clearInterval });
+  vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
+  vm.runInContext("connect = async () => undefined; collectAuth = collect; claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpEvents: [], cdpWaiters: new Set(), cdpSessions: new Map(), console: [], requests: [], protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, documentEpoch: 0}); runningCommands.add('auth-optional')", context);
+  (context as Record<string, unknown>).authInput = { origin: 'https://example.test', fields: [
+    { id: 'code', label: 'Code', type: 'text', required: true, selector: '#code' },
+    { id: 'optional', label: 'Optional value', type: 'text', required: false, selector: '#optional' },
+  ], provided_values: known ? { code: 'provided-code-246810' } : {} };
+  const result = await vm.runInContext("run(7, 'authRequest', authInput, 'auth-optional')", context);
+  expect(result).toEqual({ status: 'submitted' });
+  expect(collect).toHaveBeenCalledTimes(known ? 0 : 1);
+  expect(code.value).toBe(known ? 'provided-code-246810' : 'collected-code');
+  expect(optional.value).toBe('keep this optional value');
+  expect(JSON.stringify(result)).not.toContain(code.value);
+});

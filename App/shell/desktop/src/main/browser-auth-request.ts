@@ -105,7 +105,7 @@ export async function collectMissingBrowserAuth(request: BrowserAuthRequest,
   const selected = request.options?.find(option => option.id === request.selected_option);
   const fields = selected?.selector ? [] : selected?.field_ids
     ? request.fields.filter(field => selected.field_ids!.includes(field.id)) : request.fields;
-  const missing = fields.filter(field => provided[field.id] === undefined || (field.required && !provided[field.id]));
+  const missing = fields.filter(field => field.required && !provided[field.id]);
   if (!missing.length && (!request.options || selected)) return {
     values: provided, ...(selected ? { selected_option: selected.id } : {}),
   };

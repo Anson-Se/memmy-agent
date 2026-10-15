@@ -7,6 +7,15 @@ export function redactBrowserAuthArguments(name: unknown, args: any): any {
     ? Object.fromEntries(Object.keys(values).map(key => [key, '[REDACTED]'])) : '[REDACTED]' };
 }
 
+/** Provider extensions may retain signatures, but must not duplicate executable auth input. */
+export function redactBrowserAuthMetadata(name: unknown, metadata: any): any {
+  if (name !== 'browser_auth_request' || !metadata || typeof metadata !== 'object') return metadata;
+  if (Array.isArray(metadata)) return metadata.map(value => redactBrowserAuthMetadata(name, value));
+  return Object.fromEntries(Object.entries(metadata)
+    .filter(([key]) => key !== 'arguments' && key !== 'provided_values')
+    .map(([key, value]) => [key, redactBrowserAuthMetadata(name, value)]));
+}
+
 /** A browser client may report status and control identifiers, never credentials. */
 export function publicBrowserAuthResult(value: unknown): string {
   const result = value as Record<string, any> | null;

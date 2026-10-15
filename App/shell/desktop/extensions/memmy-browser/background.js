@@ -787,7 +787,7 @@ async function requestAuth(tabId, raw, commandId) {
     const knownOption = request.options?.find(option => option.id === request.selected_option);
     const selectedFields = knownOption?.selector ? [] : knownOption?.field_ids
       ? request.fields.filter(field => knownOption.field_ids.includes(field.id)) : request.fields;
-    const missing = selectedFields.filter(field => provided[field.id] === undefined || (field.required && !provided[field.id]));
+    const missing = selectedFields.filter(field => field.required && !provided[field.id]);
     let answer;
     if (!missing.length && (!request.options || knownOption)) {
       answer = { values: provided, ...(knownOption ? { selected_option: knownOption.id } : {}) };
@@ -807,10 +807,11 @@ async function requestAuth(tabId, raw, commandId) {
     if (request.options && !selected) return { status: 'cancelled' };
     const fields = selected?.field_ids ? request.fields.filter(field => selected.field_ids.includes(field.id))
       : selected?.selector ? [] : request.fields;
-    const values = fields.map(field => {
+    const values = fields.flatMap(field => {
       const value = answer.values[field.id];
+      if (value === undefined && !field.required) return [];
       if (typeof value !== 'string' || value.length > 4096 || (field.required && !value)) throw Error('Invalid secure auth input');
-      return { selector: field.selector, value };
+      return [{ selector: field.selector, value }];
     });
     let frame;
     try { frame = await authFrame(tabId, claim, frames); }

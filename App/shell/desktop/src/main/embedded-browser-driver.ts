@@ -462,11 +462,12 @@ export class EmbeddedBrowserDriver {
       const selectedFields = selected?.field_ids
         ? request.fields.filter(field => selected.field_ids!.includes(field.id))
         : selected?.selector ? [] : request.fields;
-      const values = selectedFields.map(field => {
+      const values = selectedFields.flatMap(field => {
         const value = answer.values[field.id];
+        if (value === undefined && !field.required) return [];
         if (typeof value !== 'string' || value.length > 4096 || (field.required && !value))
           throw new Error('Invalid secure browser auth input');
-        return { selector: field.selector, value };
+        return [{ selector: field.selector, value }];
       });
       const revalidated = await validate();
       if (revalidated) return revalidated;

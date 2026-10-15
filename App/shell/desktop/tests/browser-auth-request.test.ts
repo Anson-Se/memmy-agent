@@ -55,6 +55,30 @@ it('does not ask again when all selected sign-in fields are already available', 
   expect(prompts).toBe(0);
 });
 
+it('skips unspecified optional inputs when every required value is known', async () => {
+  const { collectMissingBrowserAuth } = await import('../src/main/browser-auth-request.js');
+  const parsed = parseBrowserAuthRequest({ ...request, fields: [...request.fields,
+    { id: 'optionalCode', label: 'Optional code', type: 'text', required: false, selector: '#optional-code' }],
+    provided_values: { password: 'known-secret' } });
+  let prompts = 0;
+  expect(await collectMissingBrowserAuth(parsed, async () => { prompts++; return null; }))
+    .toEqual({ values: { password: 'known-secret' } });
+  expect(prompts).toBe(0);
+});
+
+it('collects only missing required values and leaves unspecified optional inputs absent', async () => {
+  const { collectMissingBrowserAuth } = await import('../src/main/browser-auth-request.js');
+  const parsed = parseBrowserAuthRequest({ ...request, fields: [...request.fields,
+    { id: 'optionalCode', label: 'Optional code', type: 'text', required: false, selector: '#optional-code' }] });
+  let prompts = 0;
+  expect(await collectMissingBrowserAuth(parsed, async metadata => {
+    prompts++;
+    expect(metadata.fields.map(field => field.id)).toEqual(['password']);
+    return { values: { password: 'collected-secret' } };
+  })).toEqual({ values: { password: 'collected-secret' } });
+  expect(prompts).toBe(1);
+});
+
 
 it('does not fill redaction placeholders restored from a pending-call checkpoint', async () => {
   const { collectMissingBrowserAuth } = await import('../src/main/browser-auth-request.js');

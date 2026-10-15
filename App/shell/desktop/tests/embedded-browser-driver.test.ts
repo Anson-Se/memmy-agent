@@ -1278,22 +1278,39 @@ it('retains typed upload permission only for matching stamped files and refuses 
   } finally { test.driver.dispose(); fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
-it('uses already supplied sign-in values without a second form while preserving credential protection', async () => {
+it.each([true, false])('fills required secure inputs (already known = %s) without changing an unspecified optional input', async known => {
   const { driver, request, sendCommand } = harness();
   await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
+  class Input {
+    isConnected = true; disabled = false; type = 'text';
+    constructor(private currentValue: string) {}
+    get value() { return this.currentValue; }
+    set value(value: string) { this.currentValue = value; }
+    getClientRects() { return [{}]; }
+    dispatchEvent() {}
+  }
+  const code = new Input('old code'), optional = new Input('keep this optional value');
+  const document = { URL: 'https://example.com/', defaultView: {
+    HTMLInputElement: Input, Event: class { constructor(_name: string, _options: unknown) {} },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+  }, querySelectorAll: (selector: string) => selector === '#code' ? [code] : selector === '#optional' ? [optional] : [] };
   sendCommand.mockImplementation(async (method: string, args?: Record<string, any>) => {
     if (method !== 'Runtime.evaluate') return {};
-    return { result: { value: args?.expression.includes('const controls=') ? [] : true } };
+    return { result: { value: runInNewContext(args?.expression, { document }) } };
   });
-  const collect = vi.fn(async () => null);
+  const collect = vi.fn(async metadata => {
+    expect(metadata.fields.map((field: { id: string }) => field.id)).toEqual(['code']);
+    return { values: { code: 'collected-code' } };
+  });
   const result = await driver.requestAuth(27, { origin: 'https://example.com', fields: [
     { id: 'code', label: '验证码', type: 'text', required: true, selector: '#code' },
-  ], provided_values: { code: 'provided-code-246810' } }, collect, () => true);
+    { id: 'optional', label: 'Optional value', type: 'text', required: false, selector: '#optional' },
+  ], provided_values: known ? { code: 'provided-code-246810' } : {} }, collect, () => true);
   expect(result).toEqual({ status: 'submitted' });
-  expect(collect).not.toHaveBeenCalled();
+  expect(collect).toHaveBeenCalledTimes(known ? 0 : 1);
+  expect(code.value).toBe(known ? 'provided-code-246810' : 'collected-code');
+  expect(optional.value).toBe('keep this optional value');
   expect(JSON.stringify(result)).not.toContain('provided-code-246810');
-  expect(sendCommand.mock.calls.filter(([method]) => method === 'Runtime.evaluate')
-    .at(-1)?.[1]?.expression).toContain('provided-code-246810');
   await expect(driver.handle(request('snapshot'))).rejects.toThrow(/credential protection/);
   driver.dispose();
 });
