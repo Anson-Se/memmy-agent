@@ -58,11 +58,18 @@ describe("AgentCommandPalette", () => {
     expect(readRecentSlashCommands(storage)).toEqual(["/history", "/model"]);
   });
 
-  it("prepends a synthetic /stop command only while streaming", () => {
+  it("shows /stop while streaming or searching, but not in idle default suggestions", () => {
     const stopCommand: SlashCommandPaletteItem = { command: "/stop", title: "Stop", description: "Cancel turn", icon: "square", argHint: "", synthetic: true };
 
     expect(buildVisibleSlashCommands(commands, false, stopCommand).map((command) => command.command)).not.toContain("/stop");
     expect(buildVisibleSlashCommands([{ ...stopCommand, synthetic: false }, ...commands], true, stopCommand).map((command) => command.command).slice(0, 2)).toEqual(["/stop", "/status"]);
+    for (const input of ["/s", "/stop"]) {
+      const query = slashQueryFromInput(input)!;
+      const visible = buildVisibleSlashCommands([stopCommand, ...commands], false, stopCommand, query);
+      const matches = filterSlashCommands(visible, query, []);
+      expect(matches.filter((command) => command.command === "/stop")).toEqual([stopCommand]);
+    }
+    expect(filterSlashCommands(buildVisibleSlashCommands(commands, false, stopCommand, "model"), "model", [])).not.toContainEqual(stopCommand);
   });
 
   it("localizes builtin command titles and descriptions for Chinese UI", () => {
@@ -110,7 +117,8 @@ describe("AgentCommandPalette", () => {
     expect(html).toContain('aria-selected="true"');
     expect(html).toContain("w-full");
     expect(html).toContain('aria-labelledby="agent-command-palette-heading"');
-    expect(html).toContain("max-height:min(432px, calc(100vh - 260px))");
+    expect(html).toContain("max-height:min(286px, calc(100vh - 260px))");
+    expect(html).toContain("height:56px;box-sizing:border-box");
     expect(html).toContain("rounded-card");
     expect(html).toContain("rounded-btn px-2.5 py-2");
     expect(html).toContain("shrink-0 whitespace-nowrap font-mono");

@@ -1539,7 +1539,7 @@ export function HomePage() {
     lastCompactionSlashCommand,
     ...localizedSlashCommands.filter((command) => command.command !== "/last-compaction")
   ];
-  const visibleSlashCommands = buildVisibleSlashCommands(slashCommandsWithLocal, state.agent.isSending, stopSlashCommand);
+  const visibleSlashCommands = buildVisibleSlashCommands(slashCommandsWithLocal, state.agent.isSending, stopSlashCommand, slashQuery ?? "");
   const modeVisibleSlashCommands = selectedComposerCommand
     ? filterGoalModeSlashCommands(visibleSlashCommands, Boolean(state.agent.currentChatId))
     : visibleSlashCommands;

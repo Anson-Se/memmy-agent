@@ -19,6 +19,9 @@ import type { MessageKey, ResolvedLanguage } from "../i18n/messages.js";
 
 export const RECENT_SLASH_COMMANDS_STORAGE_KEY = "memmy-agent-recent-slash-commands";
 export const MAX_RECENT_SLASH_COMMANDS = 5;
+const DEFAULT_VISIBLE_COMMAND_ROWS = 5;
+const COMMAND_ROW_HEIGHT = 56;
+const COMMAND_LIST_BOTTOM_PADDING = 6;
 
 export type SlashCommandPaletteItem = MemmyAgentSlashCommand & {
   synthetic?: boolean;
@@ -152,7 +155,7 @@ export function AgentCommandPalette(props: AgentCommandPaletteProps) {
         role="listbox"
         aria-labelledby="agent-command-palette-heading"
         className="px-1.5 pb-1.5 overflow-y-auto"
-        style={{ maxHeight: "min(432px, calc(100vh - 260px))" }}
+        style={{ maxHeight: `min(${DEFAULT_VISIBLE_COMMAND_ROWS * COMMAND_ROW_HEIGHT + COMMAND_LIST_BOTTOM_PADDING}px, calc(100vh - 260px))` }}
       >
         {props.commands.map((command, index) => {
           const Icon = iconByName[command.icon] ?? Activity;
@@ -164,6 +167,7 @@ export function AgentCommandPalette(props: AgentCommandPaletteProps) {
               role="option"
               aria-selected={selected}
               ref={selected ? selectedOptionRef : undefined}
+              style={{ height: COMMAND_ROW_HEIGHT, boxSizing: "border-box" }}
               onClick={() => props.onSelect(command)}
               className={`w-full rounded-btn px-2.5 py-2 text-left cursor-pointer transition-colors flex items-start gap-2.5 ${selected ? "bg-canvas-oat/80" : "hover:bg-canvas-oat/50"}`}
             >
@@ -196,10 +200,11 @@ export function slashQueryFromInput(input: string): string | null {
 export function buildVisibleSlashCommands(
   commands: MemmyAgentSlashCommand[],
   isSending: boolean,
-  stopCommand: SlashCommandPaletteItem
+  stopCommand: SlashCommandPaletteItem,
+  query = ""
 ): SlashCommandPaletteItem[] {
   const filtered = commands.filter((command) => command.command !== "/stop");
-  return isSending ? [stopCommand, ...filtered] : filtered;
+  return isSending || query.length > 0 ? [stopCommand, ...filtered] : filtered;
 }
 
 export function filterSlashCommands(
