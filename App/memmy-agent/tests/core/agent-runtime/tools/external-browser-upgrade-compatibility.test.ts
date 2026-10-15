@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED,
+import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_NOT_READY,
   MEMMY_BROWSER_EXTENSION_ID } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
 import { callExternalBrowserTool } from '../../../../src/core/agent-runtime/tools/external-browser-tools.js';
 import { closeAllExternalBrowserPlaywright } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
@@ -38,7 +38,7 @@ describe('external browser extension upgrade compatibility', () => {
     const transport = bridge(), old = await extension(transport, browser, ['openTab']);
     for (const command of ['playwrightStart', 'playwrightCdp', 'playwrightEnd']) {
       await expect(transport.command(old.claim, command, { method: 'Input.dispatchMouseEvent' })).rejects.toMatchObject({
-        code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED, retryable: false, requiresUserAction: true,
+        code: EXTERNAL_BROWSER_EXTENSION_NOT_READY, retryable: false,
         dispatchState: 'none', noActionDispatched: true, inputDispatched: false,
       });
     }
@@ -56,7 +56,7 @@ describe('external browser extension upgrade compatibility', () => {
   it.each([undefined, [], ['unrelated-capability']])('fails closed when the hello does not advertise Playwright: %j', async capabilities => {
     const transport = bridge(), old = await extension(transport, 'chrome', capabilities);
     await expect(transport.command(old.claim, 'playwrightStart')).rejects.toMatchObject({
-      code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED, noActionDispatched: true,
+      code: EXTERNAL_BROWSER_EXTENSION_NOT_READY, noActionDispatched: true,
     });
     expect(old.messages.filter(message => message.type === 'command')).toEqual([]);
   });
@@ -64,7 +64,7 @@ describe('external browser extension upgrade compatibility', () => {
   it('uses the capability of the claimed connection and accepts an updated worker without changing site permissions', async () => {
     const transport = bridge(), old = await extension(transport, 'chrome', ['openTab']);
     const updated = await extension(transport, 'chrome', ['openTab', 'playwright', 'browserHistory']);
-    await expect(transport.command(old.claim, 'playwrightStart')).rejects.toMatchObject({ code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED });
+    await expect(transport.command(old.claim, 'playwrightStart')).rejects.toMatchObject({ code: EXTERNAL_BROWSER_EXTENSION_NOT_READY });
     const action = transport.command(updated.claim, 'playwrightStart', { leaseId: 'fixture-lease' });
     await vi.waitFor(() => expect(updated.messages.some(message => message.command === 'playwrightStart')).toBe(true));
     const request = updated.messages.find(message => message.command === 'playwrightStart');
@@ -74,19 +74,18 @@ describe('external browser extension upgrade compatibility', () => {
     expect(transport.listClaims()).toEqual(expect.arrayContaining([old.claim, updated.claim]));
   });
 
-  it.each(['browser_snapshot', 'browser_click', 'browser_file_upload'] as const)('reports a non-retryable update requirement for %s', async tool => {
+  it.each(['browser_snapshot', 'browser_click', 'browser_file_upload'] as const)('reports a short non-retryable connection failure for %s without a new user flow', async tool => {
     const transport = bridge(), old = await extension(transport, 'chrome', ['openTab']);
     const result = await callExternalBrowserTool(transport, old.claim,
       { sessionKey: 'upgrade-fixture', channel: 'test', chatId: tool }, tool,
       { element: 'button', paths: ['/tmp/unused-upgrade-fixture.txt'] }, async () => true);
     const status = JSON.parse(result[0].text);
-    expect(status).toMatchObject({ ok: false, code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED,
-      retryable: false, requiresUserAction: true, noActionDispatched: true, inputDispatched: false });
-    expect(status.error).toContain('1.0.5');
-    expect(status.error).toContain('website-reading permission');
-    expect(status.error).toContain('reconnect');
-    expect(status.error).toContain('Do not retry');
-    expect(status.error).not.toContain('take a fresh observation');
+    expect(status).toEqual({ ok: false, code: EXTERNAL_BROWSER_EXTENSION_NOT_READY,
+      retryable: false, noActionDispatched: true, inputDispatched: false,
+      error: 'External browser extension is not ready.' });
+    expect(status).not.toHaveProperty('requiresUserAction');
+    expect(status).not.toHaveProperty('recoveryInstructions');
+    expect(status.error).not.toMatch(/version|1\.0\.5|permission|setup|update|reload|reconnect|manual|fresh observation/iu);
     expect(old.messages.filter(message => message.type === 'command')).toEqual([]);
     expect(transport.getClaim(old.claim)).toEqual(old.claim);
   });

@@ -1,7 +1,7 @@
 import type { BrowserToolName, BrowserScope } from "./browser.js";
 import { emitComputerUseSurface } from "../../../tools/computer-use/surface-preview.js";
 import { browserAppKey } from "../../../tools/computer-use/native-app-key.js";
-import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED, type ExternalBrowserClaim } from "./external-browser-bridge.js";
+import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_NOT_READY, EXTERNAL_BROWSER_EXTENSION_NOT_READY_MESSAGE, type ExternalBrowserClaim } from "./external-browser-bridge.js";
 import { OcuUserIntervened } from "../../../tools/computer-use/mac-focus-guard.js";
 import { executeExternalBrowserPlaywright } from './external-browser-playwright.js';
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
@@ -62,11 +62,11 @@ function formatActionResult(result: ExternalResult): string {
     ? `\n\nObserved page after action:\n${formatNodes(observation.nodes, observation.truncated === true)}` : '');
 }
 
-function extensionUpdateFailure(error: unknown): ToolContent | null {
-  if ((error as { code?: string } | null)?.code !== EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED) return null;
-  return [{ type: 'text', text: JSON.stringify({ ok: false, code: EXTERNAL_BROWSER_EXTENSION_UPDATE_REQUIRED,
-    retryable: false, requiresUserAction: true, noActionDispatched: true, inputDispatched: false,
-    error: String((error as { recoveryInstructions?: string }).recoveryInstructions ?? (error as Error).message) }) }];
+function extensionConnectionFailure(error: unknown): ToolContent | null {
+  if ((error as { code?: string } | null)?.code !== EXTERNAL_BROWSER_EXTENSION_NOT_READY) return null;
+  return [{ type: 'text', text: JSON.stringify({ ok: false, code: EXTERNAL_BROWSER_EXTENSION_NOT_READY,
+    retryable: false, noActionDispatched: true, inputDispatched: false,
+    error: EXTERNAL_BROWSER_EXTENSION_NOT_READY_MESSAGE }) }];
 }
 
 /** Translate the existing browser tool vocabulary to a user-claimed Chrome/Edge tab. */
@@ -92,7 +92,7 @@ export async function callExternalBrowserTool(
           bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), abortSignal ?? undefined)
         : await bridge.command(claim, 'upload', params, abortSignal ?? undefined) as ExternalResult;
     } catch (error) {
-      const failure = extensionUpdateFailure(error);
+      const failure = extensionConnectionFailure(error);
       if (failure) return failure;
       throw error;
     }
@@ -130,7 +130,7 @@ export async function callExternalBrowserTool(
       : bridge.command(claim, action, params)) as ExternalResult;
   }
   catch (error) {
-    const failure = extensionUpdateFailure(error);
+    const failure = extensionConnectionFailure(error);
     if (failure) return failure;
     if ((error as Error).message === "USER_ACTIVE_ON_TARGET_TAB") {
       throw new OcuUserIntervened(claim.browser === "memmy"
