@@ -585,7 +585,11 @@ export async function writeAccountModelProjectionToMemmyConfig(
       appConfig,
       LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE
     );
-    appConfig.userMode = "account";
+    // Projection repair also runs during migration; preserve an explicit BYOK choice.
+    const userMode = existingString(appConfig.userMode);
+    if (!userMode || userMode === "unset") {
+      appConfig.userMode = "account";
+    }
     if (normalizedCloudUuid) appConfig.cloudUuid = normalizedCloudUuid;
     if (normalizedUserId) appConfig.userId = normalizedUserId;
     delete appConfig[LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE];

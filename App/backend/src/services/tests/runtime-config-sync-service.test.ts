@@ -612,6 +612,36 @@ describe("syncRuntimeConfigWithAppState", () => {
     expect(saved.modelAssignments.account.ownerAccountId).toBe("owner-a");
   });
 
+  it.each([false, true])("preserves explicit BYOK while repairing a migrated account projection (runtime migrated: %s)", async (runtimeSourceWasMigrated) => {
+    const context = createContext();
+    seedAccountSession(context);
+    const byok = currentByokCatalog() as any;
+    context.writeConfig({ ...byok, app: { ...byok.app, userMode: "byok" } });
+
+    const options = {
+      ...context,
+      accountChannel: "email" as const,
+      migrationConsistency: {
+        accountSourceIsAuthoritative: true,
+        runtimeSourceWasMigrated,
+        categorySourcesShareGeneration: false
+      }
+    };
+    await expect(syncRuntimeConfigWithAppState(options)).resolves.toMatchObject({
+      mode: "byok", provider: "openai", model: "gpt-5", hydratedAppState: true
+    });
+    const saved = YAML.parse(readFileSync(context.memmyConfigPath, "utf8"));
+    expect(saved.app.userMode).toBe("byok");
+    expect(saved.providers.openai).toEqual(byok.providers.openai);
+    expect(saved.modelAssignments.byok).toEqual(byok.modelAssignments.byok);
+    expect(saved.providers.memmy_account).toMatchObject({ ownerAccountId: "owner-a", apiKey: "cloud-token-a" });
+    expect(context.store.repositories.bootstrap.getAppSettings().userMode).toBe("byok");
+    expect(context.store.repositories.accountSession.get()).toMatchObject({ authenticated: true });
+    const snapshot = readFileSync(context.memmyConfigPath, "utf8");
+    await expect(syncRuntimeConfigWithAppState(options)).resolves.toMatchObject({ mode: "byok", wroteConfig: false });
+    expect(readFileSync(context.memmyConfigPath, "utf8")).toBe(snapshot);
+  });
+
   it("restores the active account after an upgrade left active_uuid empty", async () => {
     const context = createContext();
     seedAccountSession(context);
