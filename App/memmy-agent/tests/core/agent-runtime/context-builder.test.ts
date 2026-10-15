@@ -212,6 +212,13 @@ describe("Bundled Tool Contract", () => {
     expect(prompt).toContain("## Execution Progress");
     expect(prompt).toContain("Keep long-running services in the foreground");
     expect(prompt).toContain("independent static `.html`/`.htm` page");
+    expect(prompt).toContain("On Windows 11, native Computer Use works in an unlocked, signed-in desktop");
+    expect(prompt).toContain("Allow once** covers the current interactive user message");
+    expect(prompt).toContain("Browser website approval has a different scope");
+    expect(prompt).toContain("Neither access decision authorizes payment");
+    expect(prompt).toContain("not answered in time, tell the user which permission");
+    expect(prompt).not.toContain("defaults to Block");
+    expect(prompt).toContain("**computer-use** - Choose Memmy browser, desktop Computer Use");
     expect(prompt.match(/# Verification Contract/g)).toHaveLength(1);
     expect(prompt).toContain("`failed` means the validation output must be inspected");
   });

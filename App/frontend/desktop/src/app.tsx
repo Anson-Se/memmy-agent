@@ -20,6 +20,7 @@ import { AppRouter } from "./app/router.js";
 import { UpdateCoordinatorProvider } from "./app/update-coordinator.js";
 import { CampaignPromptHost } from "./components/campaign-prompt-host.js";
 import { GithubStarPromptHost } from "./components/github-star-prompt-host.js";
+import { HistoryLaunchPromptHost } from "./components/history-launch-prompt-host.js";
 import { InviteResultToast } from "./components/invite-result-toast.js";
 import { NotificationCenterProvider } from "./components/notification-center.js";
 import { TokenCreditToastHost } from "./components/token-credit-toast-host.js";
@@ -43,6 +44,7 @@ import { createEventsConnection } from "./api/events.js";
 import { MemmyAgentRequestError, type MemmyAgentClient } from "./api/memmy-agent-client.js";
 import { getRuntimeConfig } from "./api/runtime-config.js";
 import { readHistoryPermissionSetup } from "./pages/memory/computer-history-permission-state.js";
+import { shouldReturnToWeChatSettings } from "./pages/memory/computer-history-wechat-permission-state.js";
 import { clearMemoryPanelCache } from "./pages/memory/memory-panel-cache.js";
 import { readLocalNickname } from "./app/nickname.js";
 import {
@@ -59,6 +61,7 @@ import {
 } from "./state/app-actions.js";
 import type { AgentState } from "./state/agent-chat-slice.js";
 import { useAppState } from "./state/app-state.js";
+import { useComputerHistoryTrayIndicator } from "./app/computer-history-tray-indicator.js";
 
 /** Handles app. */
 export function App() {
@@ -75,11 +78,10 @@ function RuntimeApp() {
   const { clients, setClients } = useApiClients();
   const { receive: receivePluginEvent } = usePluginUi();
   const historyModelScope = state.agent.currentChatId ?? "draft-new-task";
+  useComputerHistoryTrayIndicator(clients?.memmyAgent ?? null);
   useComputerHistoryModelSync({
     client: clients?.memmyAgent ?? null,
     enabled: Boolean(state.bootstrap && state.modelConfig),
-    preset: state.agent.pendingPresetByScope[historyModelScope]
-      ?? state.agent.committedModelSelectionByScope[historyModelScope]?.presetId ?? null,
     revision: JSON.stringify([state.bootstrap?.app.userMode, state.account.userId, state.modelConfig?.configRevision]),
   });
   const { track } = useAnalytics();
@@ -232,10 +234,11 @@ function RuntimeApp() {
           guidanceCompleted,
           modelConfig
         });
+        const returnToWeChatSettings = isComputerHistorySupported() && await shouldReturnToWeChatSettings();
         const initialPath = resolveLaunchInitialView({
           defaultPath: defaultInitialPath,
           currentRoute,
-          launchRouteOverride: launchRouteOverride ?? (isComputerHistorySupported() && readHistoryPermissionSetup() && launchModeOverride !== "pet" ? "/memory" : null),
+          launchRouteOverride: launchRouteOverride ?? (isComputerHistorySupported() && (readHistoryPermissionSetup() || returnToWeChatSettings) && launchModeOverride !== "pet" ? "/memory" : null),
           launchModeOverride,
           petIntent
         });
@@ -366,6 +369,7 @@ function RuntimeApp() {
       <AgentRuntimeBridge taskStateCoordinator={taskStateCoordinator ?? undefined}>
         <NotificationCenterProvider>
           <AppRouter onRetry={retry} />
+          <HistoryLaunchPromptHost />
           <CampaignPromptHost />
           <TokenCreditToastHost />
           <GithubStarPromptHost />

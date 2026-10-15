@@ -12,6 +12,7 @@
  * arrows and connectors). Charts and formulas are ignored.
  */
 import JSZip from "jszip";
+import { readXlsxLayout, readXlsxStyles, XLSX_MAX_COLUMNS, XLSX_MAX_ROWS, type XlsxLayout } from "./xlsx-layout.js";
 
 const WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -99,6 +100,7 @@ export type DocxBlock =
 export interface XlsxSheet {
   name: string;
   rows: string[][];
+  layout?: XlsxLayout;
 }
 
 /**
@@ -348,6 +350,7 @@ export async function readXlsxSheets(data: ArrayBuffer | Blob): Promise<XlsxShee
 
   const sharedStrings = await readSharedStrings(zip);
   const dateStyles = await readDateCellStyles(zip);
+  const styles = await readXlsxStyles(zip);
   const targetsByRelId = await readWorkbookRelationships(zip);
 
   const sheets: XlsxSheet[] = [];
@@ -356,9 +359,11 @@ export async function readXlsxSheets(data: ArrayBuffer | Blob): Promise<XlsxShee
     const target = relId ? targetsByRelId.get(relId) : undefined;
     const sheetXml = target ? await zip.file(target)?.async("string") : undefined;
     if (!sheetXml) continue;
+    const document = parseXml(sheetXml);
     sheets.push({
       name: sheet.getAttribute("name") ?? `Sheet${sheets.length + 1}`,
-      rows: readSheetRows(parseXml(sheetXml), sharedStrings, dateStyles)
+      rows: readSheetRows(document, sharedStrings, dateStyles),
+      layout: readXlsxLayout(document, styles)
     });
   }
   return sheets;
@@ -820,9 +825,11 @@ function readSheetRows(document: Document, sharedStrings: readonly string[], dat
   for (const row of descendants(document, SHEET_NS, "row")) {
     const declaredIndex = Number(row.getAttribute("r"));
     const rowIndex = Number.isInteger(declaredIndex) && declaredIndex > 0 ? declaredIndex - 1 : grid.length;
+    if (rowIndex >= XLSX_MAX_ROWS) continue;
     const cells: string[] = [];
     for (const [position, cell] of directChildren(row, SHEET_NS, "c").entries()) {
       const columnIndex = columnIndexFromReference(cell.getAttribute("r")) ?? position;
+      if (columnIndex >= XLSX_MAX_COLUMNS) continue;
       cells[columnIndex] = readCellText(cell, sharedStrings, dateStyles);
     }
     width = Math.max(width, cells.length);

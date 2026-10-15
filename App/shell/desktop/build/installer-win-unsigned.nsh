@@ -360,7 +360,17 @@ Function MemmyValidateSelectedDirectories
 
   memmy_validate_resolve_paths:
   Call MemmyResolveMigrationPaths
+  Call MemmyExtractDataMigrationScript
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\MemmyDataMigration\MemmyWindowsRuntimeOwnership.ps1" -RuntimeHomePath "$MemmyTargetRuntimeHomePath"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" memmy_validate_ownership_succeeded
+  StrCpy $R8 "Cannot verify that this drive's Memmy data belongs to your Windows account. Choose C: for a per-user installation, or a separate drive. Another folder on this same drive cannot isolate the data."
+  StrCmp $LANGUAGE ${MEMMY_LANG_SIMPCHINESE} 0 memmy_validate_failed
+  StrCpy $R8 "无法确认此盘的 Memmy 数据属于当前 Windows 账户。请选择 C 盘按用户安装，或使用独立盘；选择同一盘上的其他文件夹无法隔离数据。"
+  Goto memmy_validate_failed
 
+  memmy_validate_ownership_succeeded:
   StrCpy $R0 "$INSTDIR"
   Call MemmyProbeWritableDirectory
   Pop $0
@@ -403,6 +413,7 @@ Function MemmyExtractDataMigrationScript
   CreateDirectory "$PLUGINSDIR\MemmyDataMigration"
   SetOutPath "$PLUGINSDIR\MemmyDataMigration"
   File /oname=MemmyWindowsDataMigration.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsDataMigration.ps1"
+  File /oname=MemmyWindowsRuntimeOwnership.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsRuntimeOwnership.ps1"
   StrCpy $MemmyMigrationScriptPath "$PLUGINSDIR\MemmyDataMigration\MemmyWindowsDataMigration.ps1"
 FunctionEnd
 
@@ -411,6 +422,7 @@ Function MemmyExtractStandardUpgradeCheckScript
   CreateDirectory "$PLUGINSDIR\MemmyStandardUpgradeCheck"
   SetOutPath "$PLUGINSDIR\MemmyStandardUpgradeCheck"
   File /oname=MemmyWindowsStandardUpgradeCheck.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsStandardUpgradeCheck.ps1"
+  File /oname=MemmyWindowsRuntimeOwnership.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsRuntimeOwnership.ps1"
   StrCpy $MemmyStandardUpgradeCheckScriptPath "$PLUGINSDIR\MemmyStandardUpgradeCheck\MemmyWindowsStandardUpgradeCheck.ps1"
 FunctionEnd
 
@@ -489,16 +501,16 @@ Function MemmyPrepareDirectDataMigration
     Pop $0
     Pop $1
     StrCmp $0 "0" memmy_direct_prepare_succeeded
-    DetailPrint "Memmy data migration was skipped after a safe rollback; installation will continue."
-    RMDir /r "$MemmyMigrationLockPath"
-    Goto memmy_direct_prepare_skipped
+    StrCpy $R8 "Memmy data migration could not be prepared. The existing data was left in place; close Memmy and retry the upgrade. Installation will not continue."
+    DetailPrint "$R8"
+    Goto memmy_direct_prepare_failed
 
   memmy_direct_prepare_failed:
-    DetailPrint "Memmy data migration helper is unavailable; installation will continue without automatic migration."
+    StrCpy $R8 "Memmy data migration helper is unavailable. The existing data was left in place; retry the upgrade after repairing the installation. Installation will not continue."
+    DetailPrint "$R8"
 
-  memmy_direct_prepare_skipped:
     StrCpy $MemmyDirectMigrationPrepared "0"
-    Push "1"
+    Push "0"
     Return
 
   memmy_direct_prepare_succeeded:
@@ -689,6 +701,7 @@ Function MemmyRelayLegacyUpgrade
     IfErrors memmy_relay_failed
     IfFileExists "$R1\MemmyWindowsUpgradeCleanup.ps1" 0 memmy_relay_failed
     File /oname=MemmyWindowsDataMigration.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsDataMigration.ps1"
+  File /oname=MemmyWindowsRuntimeOwnership.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsRuntimeOwnership.ps1"
     IfErrors memmy_relay_failed
     IfFileExists "$R1\MemmyWindowsDataMigration.ps1" 0 memmy_relay_failed
 
@@ -857,6 +870,7 @@ Function MemmyInstallLaunchProxy
   File /oname=MemmyUpdatePrompt.ps1 "${BUILD_RESOURCES_DIR}\MemmyUpdatePrompt.ps1"
   File /oname=MemmyWindowsUpgradeRecovery.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsUpgradeRecovery.ps1"
   File /oname=MemmyWindowsDataMigration.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsDataMigration.ps1"
+  File /oname=MemmyWindowsRuntimeOwnership.ps1 "${BUILD_RESOURCES_DIR}\MemmyWindowsRuntimeOwnership.ps1"
 
   FileOpen $1 "$0\MemmyLauncher.vbs" w
   FileWrite $1 "Set shell = CreateObject($\"WScript.Shell$\")$\r$\n"

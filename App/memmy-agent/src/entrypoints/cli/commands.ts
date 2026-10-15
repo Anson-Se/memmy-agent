@@ -55,7 +55,6 @@ import {
 } from "../../providers/openai-codex-oauth.js";
 import { PROVIDERS } from "../../providers/registry.js";
 import { ModelCatalogWatcher } from "../../providers/model-catalog-watcher.js";
-import { evaluateResponse } from "../../utils/evaluator.js";
 import { installConsoleLevelGate } from "../../runtime-log-level.js";
 import { syncWorkspaceTemplates } from "../../utils/helpers.js";
 import { withProgressCapabilities } from "../../utils/progress-events.js";
@@ -1024,6 +1023,7 @@ function stripDeliveryMetadata(metadata: Record<string, any>): [Record<string, a
 
 type CronDeliveryContext = {
   jobId: string;
+  jobName: string;
   channel: string;
   chatId: string;
   targetSessionKey: string;
@@ -1031,6 +1031,7 @@ type CronDeliveryContext = {
   createdFromMetadata: Record<string, any>;
   busyAtDue: boolean;
   goalActiveAtDue: boolean;
+  deliverySequence: number;
 };
 
 const cronDeliveryContext = new AsyncLocalStorage<CronDeliveryContext>();
@@ -1039,6 +1040,13 @@ const WEBUI_CRON_TRANSIENT_METADATA_KEYS = [
   "turnId",
   "message_id",
   "messageId",
+  "client_request_id",
+  "clientRequestId",
+  "webui_request_digest",
+  "webuiRequestDigest",
+  "turn_source",
+  "computerUseInteractive",
+  "computerUseInteractiveReason",
   "wantsStream",
   "streamId",
   "streamDelta",
@@ -1143,7 +1151,6 @@ export async function gateway({
   if (loop.sessions instanceof SessionManager) {
     loop.guiTranscriptMirror = new GuiTranscriptMirror(loop.sessions, canonicalWorkspace);
   }
-  await initializeLoopRuntimeTools(loop);
   const cancelSessionTasks = async (sessionKey: string): Promise<number> => {
     const stopped = await loop.cancelActiveTasks(sessionKey);
     const terminalOwner = sessionKey.startsWith("cli:")
@@ -1170,6 +1177,20 @@ export async function gateway({
     webuiRuntimeToolNames: () => loop.toolNames,
     webuiModelSelectionResolver: (input) => loop.resolveTurnModelSelection(input),
     cancelActiveTasks: cancelSessionTasks,
+    stopCurrentTurn: async (sessionKey, expectedTurnId) => {
+      const stopped = await loop.stopCurrentTurn(sessionKey, expectedTurnId);
+      if (stopped || !sessionKey.startsWith("cli:")) return stopped;
+      const terminalOwner = loop.terminalRunControl.read(sessionKey);
+      if (!terminalOwner || (expectedTurnId && terminalOwner.turnId !== expectedTurnId)) return 0;
+      const requested = await loop.terminalRunControl.requestCancel(sessionKey, terminalOwner.turnId);
+      if (requested) {
+        const deadline = Date.now() + 120_000;
+        while (loop.terminalRunControl.read(sessionKey)?.turnId === terminalOwner.turnId && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      }
+      return Number(requested);
+    },
     closeBrowserChat: (channel, chatId) => loop.closeBrowserChat(channel, chatId),
     goalControlHandler: (request) => loop.goalRuntime.control(request),
     getWebuiQueueSnapshot: (sessionKey) => loop.getWebuiQueueSnapshot(sessionKey),
@@ -1212,7 +1233,7 @@ export async function gateway({
       sessionDagQueue: loop.sessionDagQueue,
     });
     webuiChannel.setChannelAdmin(createChannelAdmin(manager));
-    webuiChannel.computerHistory.setLlmRuntime((preset) => loop.llmRuntime(preset));
+    webuiChannel.refreshComputerHistorySummaryModel();
     webuiChannel.setWebuiTitleService(
       new WebuiTitleService({
         bus,
@@ -1260,6 +1281,16 @@ export async function gateway({
       const key = sessionKey ?? channelSessionKey(loop, outbound.channel, outbound.chatId);
       const session = loop.sessions.getOrCreate(key);
       const extra: Record<string, any> = { channelDelivery: true };
+      if (outbound.metadata.proactiveDelivery === "cron") {
+        extra.metadata = {
+          proactiveDelivery: "cron",
+          cronJobId: outbound.metadata.cronJobId,
+          cronJobName: outbound.metadata.cronJobName,
+          scheduledForMs: outbound.metadata.scheduledForMs,
+          deliveryId: outbound.metadata.deliveryId,
+          deliveredAtMs: outbound.metadata.deliveredAtMs,
+        };
+      }
       if (outbound.media.length) extra.media = [...outbound.media];
       session.addMessage("assistant", outbound.content, extra);
       loop.sessions.save(session);
@@ -1293,8 +1324,11 @@ export async function gateway({
     const delayedByMs = Math.max(0, Date.now() - cronContext.scheduledForMs);
     metadata.proactiveDelivery = "cron";
     metadata.cronJobId = cronContext.jobId;
+    metadata.cronJobName = cronContext.jobName;
     metadata.scheduledForMs = cronContext.scheduledForMs;
     metadata.delayedByMs = delayedByMs;
+    metadata.deliveryId = `cron:${cronContext.jobId}:${cronContext.scheduledForMs}:${++cronContext.deliverySequence}`;
+    metadata.deliveredAtMs = Date.now();
     const content = prefixCronDelayNotice({
       content: msg.content,
       metadata,
@@ -1358,6 +1392,7 @@ export async function gateway({
     const scheduledForMs = job.state.nextRunAtMs ?? Date.now();
     const cronContext: CronDeliveryContext = {
       jobId: job.id,
+      jobName: job.name,
       channel,
       chatId,
       targetSessionKey,
@@ -1365,6 +1400,7 @@ export async function gateway({
       createdFromMetadata: { ...(job.payload.channelMeta ?? {}) },
       busyAtDue: channel === "websocket" ? loop.isSessionBusy(targetSessionKey) : false,
       goalActiveAtDue: channel === "websocket" ? loop.isSessionGoalActive(targetSessionKey) : false,
+      deliverySequence: 0,
     };
     const prompt =
       "The scheduled time has arrived. Deliver this reminder to the user now, " +
@@ -1387,11 +1423,11 @@ export async function gateway({
               msg.channel === channel &&
               msg.chatId === chatId &&
               msgSessionKey === targetSessionKey;
-            if (sameCronTarget) sentInCronTarget = true;
             await deliverToChannel(
               msg,
               sameCronTarget ? { record: true, sessionKey: targetSessionKey } : {},
             );
+            if (sameCronTarget) sentInCronTarget = true;
           }
         : null;
 
@@ -1409,6 +1445,27 @@ export async function gateway({
           sessionBindingOverride: targetSessionBinding,
         });
         content = response?.content ?? "";
+        if (response?.metadata?.modelErrorCategory) {
+          throw new Error(`scheduled task model failure: ${String(response.metadata.modelErrorCategory)}`);
+        }
+        if (job.payload.deliver && !sentInCronTarget && !content.trim()) {
+          throw new Error("scheduled task returned no deliverable result");
+        }
+      } catch (error) {
+        if (job.payload.deliver) {
+          await deliverToChannel(
+            new OutboundMessage({
+              channel,
+              chatId,
+              content: usesChineseCronLanguage(job.payload.channelMeta ?? {})
+                ? `定时任务「${job.name}」执行失败，请查看任务详情或稍后重试。`
+                : `Scheduled task "${job.name}" failed. Open the task for details or try again later.`,
+              metadata: job.payload.channelMeta,
+            }),
+            { record: true, sessionKey: targetSessionKey },
+          );
+        }
+        throw error;
       } finally {
         if (cronTool instanceof CronTool && cronContextToken != null)
           cronTool.resetCronContext(cronContextToken);
@@ -1419,23 +1476,17 @@ export async function gateway({
       if (job.payload.deliver && sentInCronTarget) return content;
 
       if (job.payload.deliver && content.trim()) {
-        const shouldNotify = await evaluateResponse(
-          content,
-          message,
-          loop.provider,
-          loop.model ?? "",
+        // Explicit user schedules promise delivery, including requested empty
+        // status reports. Background relevance filtering must not override it.
+        await deliverToChannel(
+          new OutboundMessage({
+            channel,
+            chatId,
+            content,
+            metadata: job.payload.channelMeta,
+          }),
+          { record: true, sessionKey: job.payload.sessionKey },
         );
-        if (shouldNotify) {
-          await deliverToChannel(
-            new OutboundMessage({
-              channel,
-              chatId,
-              content,
-              metadata: job.payload.channelMeta,
-            }),
-            { record: true, sessionKey: job.payload.sessionKey },
-          );
-        }
       }
       return content;
     });
@@ -1499,6 +1550,9 @@ export async function gateway({
   void manager.startAll();
   transcriptMonitor?.start();
   await heartbeat.start();
+  // AgentLoop.run initializes tools before consuming messages. Keep browser/MCP
+  // preparation there so the desktop bootstrap can be served while it finishes.
+  // Keep an unexpected loop rejection fatal so the desktop supervisor can recover.
   const inboundTask = loop.run();
   console.log(
     `memmy gateway started (${manager.enabledChannels.join(", ") || "no channels enabled"})`,
@@ -1536,7 +1590,6 @@ export async function gateway({
       await Promise.allSettled([
         inboundTask,
         manager.stopAll(),
-        closeLoopRuntimeTools(loop),
         Promise.resolve(
           typeof sessionStore.flushAll === "function"
             ? sessionStore.flushAll({
@@ -1546,6 +1599,9 @@ export async function gateway({
         ),
         closeServer(healthServer),
       ]);
+      // Initialization may still be in flight when the desktop exits. Close
+      // its resources after it settles so no late connection survives shutdown.
+      await Promise.allSettled([closeLoopRuntimeTools(loop)]);
     },
   };
 }

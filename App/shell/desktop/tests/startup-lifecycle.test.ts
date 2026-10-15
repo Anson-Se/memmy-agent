@@ -15,15 +15,18 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main/
 const functionNames = new Set([
   "boot", "showSplashWindow", "showUpdateInstallSplashWindow", "showSplashHtml", "closeSplashWindow",
   "createInitialWindow", "createMainWindow", "showPetWindowAfterRendererLayout", "hideAppShellForQuit",
+  "startWindowsServicesAfterFirstWindow",
   "watchStartupRenderer", "handleStartupFailure", "handleRendererLoadFailure"
 ]);
 const variableNames = new Set([
-  "mainWindow", "petWindow", "runtimeServices", "runtimeConfig", "isBootReady", "isQuitting",
+  "mainWindow", "memmyPermissionOnboarding", "petWindow", "runtimeServices", "runtimeConfig", "isBootReady", "isQuitting",
   "isQuitCleanupInProgress", "isQuitCleanupComplete", "stopMemoryServiceForCurrentQuit",
   "splashWindow", "splashCloseTimer", "splashTimer", "SPLASH_MAX_VISIBLE_MS", "STARTUP_SLOW_MS",
   "UPDATE_SPLASH_MAX_VISIBLE_MS", "bootStage", "bootStartedAt", "isPetWindowReadyToShow",
   "latestPetWindowLayout", "petMascotScreenAnchor", "startupRendererCleanup", "STARTUP_RENDERER_TIMEOUT_MS",
-  "isStartupFailureReported", "localBackend"
+  "isStartupFailureReported", "localBackend", "computerUseSurfaceWindows", "browserSidebarBridge",
+  "embeddedBrowserHistoryStore", "embeddedBrowserDriver", "browserWebviewDownloads",
+  "browserWebviewExtensions", "disposeBrowserWebviewPermissions"
 ]);
 const selected = source.statements.filter(statement => {
   if (ts.isFunctionDeclaration(statement)) return functionNames.has(statement.name?.text ?? "");
@@ -43,7 +46,7 @@ const code = ts.transpileModule([
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
 }).outputText;
 
-function setup(options: { delay?: number; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet" } = {}) {
+function setup(options: { delay?: number; error?: Error; apiError?: Error; cleanupHangs?: boolean; platform?: string; mode?: "full" | "pet"; gatewayIssue?: "model_config_invalid" } = {}) {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   const events: string[] = [];
@@ -54,7 +57,7 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     destroyed = false;
     visible: boolean;
     urls: string[] = [];
-    webContents = new EventEmitter();
+    webContents = Object.assign(new EventEmitter(), { send: vi.fn() });
     constructor(settings: { show?: boolean } = {}) {
       super();
       this.visible = settings.show !== false;
@@ -62,8 +65,8 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     }
     static getAllWindows() { return [...windows]; }
     isDestroyed() { return this.destroyed; }
-    show() { this.visible = true; }
-    showInactive() { this.visible = true; }
+    show() { this.visible = true; this.emit("show"); }
+    showInactive() { this.visible = true; this.emit("show"); }
     hide() { this.visible = false; }
     loadURL(url: string) { this.urls.push(url); return Promise.resolve(); }
     close() {
@@ -79,7 +82,12 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
       if (windows.size === 0) app.emit("window-all-closed");
     }
   }
-  const services = { close: vi.fn(() => options.cleanupHangs ? new Promise<void>(() => {}) : Promise.resolve()) };
+  const services = {
+    agentGateway: { configPath: "test-user-data/agent-config.json" },
+    startAgentGateway: vi.fn(async () => { events.push("gateway-started"); return options.gatewayIssue ?? null; }),
+    startBrowserPreparation: vi.fn(() => { events.push("browser-preparation-started"); }),
+    close: vi.fn(() => options.cleanupHangs ? new Promise<void>(() => {}) : Promise.resolve())
+  };
   const quit = vi.fn(() => {
     events.push("quit");
     const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
@@ -91,20 +99,32 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     app, BrowserWindow: FakeWindow, process: { platform: options.platform ?? "win32", env: {}, resourcesPath: "test-resources" },
     console: { warn: vi.fn(), error: vi.fn() }, Date, setTimeout, clearTimeout,
     join: (...parts: string[]) => parts.join("/"),
+    dirname: (path: string) => path.slice(0, path.lastIndexOf("/")),
     writePackagedStartupLog: async (message: string) => { events.push(message); },
     formatStartupError: (error: Error) => error.message,
     showPackagedStartupError: () => { events.push("error-dialog"); },
     resolveCurrentDesktopEdition: () => "cn", initLogger: noop, forceLightWindowChrome: noop,
     installPreparedRequiredUpdateBeforeBoot: async () => false,
     registerIpcHandlers: noop, installBundledCliIfNeeded: async () => {}, startPackagedRendererServerIfNeeded: async () => {},
-    createDesktopScreenCapture: noop, createComputerUseOnboarding: noop,
+    createDesktopScreenCapture: noop, createComputerUseOnboarding: noop, captureComputerUseWindow: noop,
+    createComputerUseSurfaceWindows: () => ({ update: noop, closeAll: noop }),
+    createBrowserSidebarBridge: () => ({ update: noop, clear: noop }),
+    EmbeddedBrowserDriver: class { setHistoryStore() {} },
+    BrowserWebviewDownloads: class { dispose() {} },
+    session: { fromPartition: () => ({}) },
+    attachBrowserWebviewDownloads: () => noop,
+    attachBrowserWebviewPermissions: () => noop,
+    BrowserHistoryStore: class { constructor(_path: string) {} },
     windowsDataLayout: null,
     startManagedRuntimeServices: async () => {
       if (options.delay) await new Promise(resolve => setTimeout(resolve, options.delay));
       if (options.error) throw options.error;
       return services;
     },
-    startLocalApi: async () => { if (options.apiError) throw options.apiError; return {}; },
+    startLocalApi: async () => {
+      if (options.apiError) throw options.apiError;
+      return { agentGateway: {} };
+    },
     triggerAgentSourceAutoInject: noop, getCurrentLogLevel: () => "info",
     setDevelopmentDockIcon: noop, startRequiredUpdateBackgroundChecks: noop,
     pruneUpdatesDirectory: noop, pruneWindowsLegacyUpdateCaches: noop, UPDATES_PRUNE_STARTUP_DELAY_MS: 999_999,
@@ -117,8 +137,12 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
     resolveFullWindowSize: () => ({}), screen: { getPrimaryDisplay: () => ({ workArea: {} }) }, createWebPreferences: () => ({}),
     hideInWindowMenuBar: noop, updateFullWindowButtonPosition: noop, attachWindowOpenHandler: noop,
     attachRendererContextMenu: noop, attachRendererShortcutGuards: noop, attachMainWindowFullScreenSync: noop,
+    attachShellRendererRecovery: noop,
     handleMainWindowClose: noop, handleMainWindowMinimize: noop, resolveRendererUrl: () => "http://test-renderer.invalid",
+    captureMacPermissionRestartRequest: () => false,
+    readMacQuitContext: () => null,
     shouldIgnoreStaleReopenQuit: () => false,
+    readMacQuitContext: () => null,
     shouldQuitWhenAllWindowsClosed,
     hasSingleInstanceLock: true,
     readStopMemoryServiceOnExitSetting: () => false, armQuitCleanupForceExitTimer: noop,
@@ -138,6 +162,58 @@ function setup(options: { delay?: number; error?: Error; apiError?: Error; clean
 afterEach(() => vi.useRealTimers());
 
 describe("desktop startup lifecycle", () => {
+  it("shows the Windows first window before starting its Agent and browser preparation", async () => {
+    const test = setup();
+    await test.start();
+    expect(test.main()).not.toBeNull();
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
+    test.main()!.emit("ready-to-show");
+    await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+    expect(test.splash()).toBeNull();
+  });
+
+  it("publishes a deferred Agent configuration failure to the visible window", async () => {
+    const test = setup({ gatewayIssue: "model_config_invalid" });
+    await test.start();
+    test.main()!.emit("ready-to-show");
+    await vi.waitFor(() => expect(test.main()!.webContents.send).toHaveBeenCalledWith(
+      "memmy:agent-gateway-startup-issue", "model_config_invalid"
+    ));
+    expect(test.run("runtimeConfig.agentGateway.startupIssue")).toBe("model_config_invalid");
+  });
+
+  it("keeps deferred services idle after page load until the first paint", async () => {
+    const test = setup();
+    await test.start();
+    test.main()!.webContents.emit("did-finish-load");
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
+    test.main()!.emit("ready-to-show");
+    await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts deferred services after a bounded wait when a hidden pet never paints", async () => {
+    const test = setup({ mode: "pet" });
+    await test.start();
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
+    expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not launch deferred services after the user quits", async () => {
+    const test = setup();
+    await test.start();
+    test.app.quit();
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(test.services.startAgentGateway).not.toHaveBeenCalled();
+    expect(test.services.startBrowserPreparation).not.toHaveBeenCalled();
+  });
+
   it("keeps the startup splash and process alive while runtime startup takes 20 seconds", async () => {
     const test = setup({ delay: 20_000 });
     const boot = test.start();
@@ -181,6 +257,8 @@ describe("desktop startup lifecycle", () => {
     expect(test.pet()?.visible).toBe(true);
     expect(test.splash()).toBeNull();
     expect(test.quit).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(test.services.startBrowserPreparation).toHaveBeenCalledTimes(1));
+    expect(test.services.startAgentGateway).toHaveBeenCalledTimes(1);
   });
 
   it("records and displays a boot error before requesting quit", async () => {

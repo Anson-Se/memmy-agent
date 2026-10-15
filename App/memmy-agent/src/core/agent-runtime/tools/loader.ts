@@ -30,6 +30,7 @@ import { ExecTool } from "./shell.js";
 import { SpawnTool } from "./spawn.js";
 import { WebFetchTool, WebSearchTool } from "./web.js";
 import { BROWSER_TOOL_CLASSES } from "./browser.js";
+import { ExcelLiveTool } from "./excel-live.js";
 
 export const SKIP_MODULES = new Set([
   "base",
@@ -53,6 +54,7 @@ type ToolClass = (new (...args: any[]) => Tool) & {
 
 const BUILTIN_TOOL_CLASSES: ToolClass[] = [
   DesktopScreenCaptureTool,
+  ExcelLiveTool,
   AgentSourceTool,
   ApplyPatchTool,
   AskQuestionTool,

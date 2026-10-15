@@ -5,61 +5,45 @@ import { Window } from "happy-dom";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { InstalledPluginSchema } from "@memmy/local-api-contracts";
-import { ApiRequestError } from "../../api/http.js";
-import { MemmyAgentMessageRejectedError, MemmyAgentRequestError } from "../../api/memmy-agent-client.js";
+import type { PluginUiCall } from "../../app/plugin-ui-context.js";
+import { MemmyAgentMessageRejectedError } from "../../api/memmy-agent-client.js";
 import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
+import { agentReducer, initialAgentState } from "../../state/agent-chat-slice.js";
 import { AppProviders } from "../../app/providers.js";
 import { FOCUSED_AGENT_CHAT_STORAGE_KEY } from "../../app/routes.js";
-import type { PluginUiCall } from "../../app/plugin-ui-context.js";
 import type { SlashCommandPaletteItem, SlashCommandStorageLike } from "../agent-command-palette.js";
 import { buildAgentDisplayUnits } from "../agent-thread-messages.js";
 import {
   AGENT_RESTART_STATE_STORAGE_KEY,
   AGENT_MEDIA_ACCEPT,
   ComposerCommandChip,
-  addCapabilityBlockToDraft,
-  appendPluginArtifact,
   ComposerMediaPreviewStrip,
   ComposerSubmitButton,
   HomePage,
   AgentOperationErrorSlot,
   agentComposerPrimaryAction,
   agentErrorText,
-  pluginInvocationError,
   agentStatusText,
   agentChatScopeKey,
   attachmentFilesFromDataTransfer,
   buildComposerCommandDraft,
-  buildAgentRoutedPluginPrompt,
   collectPluginCommandTargets,
-  collectPluginScenarios,
-  selectPinnedPluginCommands,
   selectConversationPinnedCommands,
-  selectSlashPluginCommands,
-  selectTopbarPluginCommand,
-  selectOpenPinnedCapabilities,
-  selectPinnedToggleCall,
-  pressPinnedPluginCommand,
   clipboardAttachmentFilesFromDataTransfer,
   dataTransferHasAttachmentFiles,
   hasActiveAgentConversation,
-  homeSuggestionDraft,
   hydrateAgentThreadInBackground,
-  insertCapabilityAtSelection,
   isAgentConversationAtBottom,
   isComposingKeyboardEvent,
   isSingleLineComposerInput,
   isSteerableCurrentTurn,
   parseStoredAgentRestartState,
-  parsePluginCommandInvocation,
   parseComposerCommandDraft,
   readFocusedAgentChatId,
   requestNewSessionReset,
   requestAgentRestart,
   requestAgentStop,
   resolveComposerCommandDraft,
-  replaceSlashQueryAtSelection,
-  replaceTrailingSlashQuery,
   shouldAcceptAgentStatusResult,
   submitAgentComposerMessage,
   updateAgentComposerOverlayHeight,
@@ -71,16 +55,10 @@ import {
   validateAgentMediaFiles,
   type PendingFileAttachment
 } from "../home-page.js";
-import {
-  ComposerHighlightedTextarea,
-  composerHighlightSegments,
-  removeHighlightedCommandAtCaret
-} from "../home-composer-quick-actions.js";
 
 const homePageSourcePath = fileURLToPath(new URL("../home-page.tsx", import.meta.url));
 const agentRuntimeBridgeSourcePath = fileURLToPath(new URL("../../app/agent-runtime-bridge.tsx", import.meta.url));
 const agentModelSelectorSourcePath = fileURLToPath(new URL("../../components/agent-model-selector.tsx", import.meta.url));
-const pluginCapabilityHostSourcePath = fileURLToPath(new URL("../plugin-capability-host.tsx", import.meta.url));
 const stylesSourcePath = fileURLToPath(new URL("../../styles.css", import.meta.url));
 
 function readAgentRuntimeBridgeSource(): string {
@@ -96,377 +74,12 @@ function mockCallOrder(fn: { mock: { invocationCallOrder: readonly number[] } },
 }
 
 describe("HomePage", () => {
-  it("adds the published workspace path for a hosted plugin artifact", () => {
-    expect(appendPluginArtifact("Inspect", {
-      id: "review",
-      name: "review.pdf",
-      mediaType: "application/pdf",
-      uri: "/api/v1/plugins/literature-review/artifacts/token/preview",
-      path: "/workspace/outputs/literature-review/review-1/review.pdf"
-    })).toBe("Inspect\nreview.pdf: /workspace/outputs/literature-review/review-1/review.pdf");
-  });
-
-  it("registers only active non-reserved plugin commands and parses their arguments", () => {
-    const plugin = InstalledPluginSchema.parse({
-      id: "com.example.review",
-      version: "1.0.0",
-      manifest: {
-        apiVersion: "memmy/v1",
-        id: "com.example.review",
-        name: "Review",
-        version: "1.0.0",
-        runtime: { adapter: "http" },
-        capabilities: [{ id: "run", name: "Run", description: "Run", inputSchema: {}, outputSchema: {}, execution: "job" }],
-        commands: [
-          { command: "/review", name: "Review", description: "Create a review", capabilityId: "run" },
-          { command: "/status", name: "Bad collision", description: "Reserved", capabilityId: "run" }
-        ],
-        permissions: []
-      },
-      state: "active",
-      approvedPermissions: [],
-      config: {},
-      lastError: null,
-      createdAt: "2026-08-31T00:00:00.000Z",
-      updatedAt: "2026-08-31T00:00:00.000Z"
-    });
-    const targets = collectPluginCommandTargets([plugin], ["/status"]);
-    expect(targets.map((item) => item.command.command)).toEqual(["/review"]);
-    expect(parsePluginCommandInvocation("/review agent memory", targets)).toMatchObject({ arguments: "agent memory", plugin });
-  });
-
-  it("pins only the commands that asked to be pinned", () => {
-    const plugin = InstalledPluginSchema.parse({
-      id: "com.example.review",
-      version: "1.0.0",
-      manifest: {
-        apiVersion: "memmy/v1",
-        id: "com.example.review",
-        name: "Review",
-        version: "1.0.0",
-        runtime: { adapter: "http" },
-        capabilities: [{ id: "run", name: "Run", description: "Run", inputSchema: {}, outputSchema: {}, execution: "job" }],
-        commands: [
-          { command: "/guide", name: "Guidance", description: "Open the guidance card", capabilityId: "run", pinned: true },
-          { command: "/record", name: "Record", description: "Record an interview", capabilityId: "run", pinned: true },
-          { command: "/review", name: "Review", description: "Create a review", capabilityId: "run" }
-        ],
-        permissions: []
-      },
-      state: "active",
-      approvedPermissions: [],
-      config: {},
-      lastError: null,
-      createdAt: "2026-08-31T00:00:00.000Z",
-      updatedAt: "2026-08-31T00:00:00.000Z"
-    });
-    const targets = collectPluginCommandTargets([plugin]);
-
-    // A pinned button is a shortcut for the same command, so it is selected
-    // from the same targets the slash commands resolve against.
-    expect(selectPinnedPluginCommands(targets).map((item) => item.command.command)).toEqual(["/guide", "/record"]);
-    // Plugins that pin nothing must leave the composer layout alone.
-    expect(selectPinnedPluginCommands(targets.filter((item) => item.command.command === "/review"))).toEqual([]);
-    // A pinned command already has a button; listing it in the palette too
-    // would offer the same action twice.
-    expect(selectSlashPluginCommands(targets).map((item) => item.command.command)).toEqual(["/review"]);
-  });
-
-  it("puts a top-bar button up only for a plugin that asked for one", () => {
-    const pluginWith = (id: string, command: string, topbar?: boolean) => InstalledPluginSchema.parse({
-      id,
-      version: "1.0.0",
-      manifest: {
-        apiVersion: "memmy/v1",
-        id,
-        name: id,
-        version: "1.0.0",
-        runtime: { adapter: "http" },
-        capabilities: [{ id: "run", name: "Run", description: "Run", inputSchema: {}, outputSchema: {}, execution: "job" }],
-        commands: [{
-          command,
-          name: "Record",
-          description: "Record an interview",
-          capabilityId: "run",
-          ...(topbar === undefined ? {} : { topbar })
-        }],
-        permissions: []
-      },
-      state: "active",
-      approvedPermissions: [],
-      config: {},
-      lastError: null,
-      createdAt: "2026-08-31T00:00:00.000Z",
-      updatedAt: "2026-08-31T00:00:00.000Z"
-    });
-
-    // The top bar belongs to the conversation, so a plugin that never asked is
-    // not given a button there — the recording entry is opt-in per plugin.
-    expect(selectTopbarPluginCommand(collectPluginCommandTargets([pluginWith("com.example.a", "/record")]))).toBeNull();
-    expect(
-      selectTopbarPluginCommand(collectPluginCommandTargets([pluginWith("com.example.a", "/record", true)]))?.command.command
-    ).toBe("/record");
-    // Only one button fits the slot, so the first claim wins rather than two
-    // buttons leaving the user to guess.
-    expect(
-      selectTopbarPluginCommand(collectPluginCommandTargets([
-        pluginWith("com.example.a", "/record", true),
-        pluginWith("com.example.b", "/other", true)
-      ]))?.command.command
-    ).toBe("/record");
-  });
-
-  it("finds the pending card a pinned button can hide or restore", () => {
-    const call = (callId: string, origin: "user" | "agent", events: PluginUiCall["events"]): PluginUiCall => ({
-      pluginId: "com.example.review",
-      capabilityId: "run",
-      callId,
-      conversationId: "websocket:chat-1",
-      origin,
-      events
-    });
-    const live: PluginUiCall["events"] = [
-      { type: "interaction", request: { interactionId: "guide", type: "question", payload: {} } }
-    ];
-    const finished: PluginUiCall["events"] = [{ type: "result", output: {} }];
-
-    // A live card the user opened is what the button closes.
-    expect(selectPinnedToggleCall([call("live", "user", live)], "com.example.review", "run")).toBe("live");
-    // An Agent's question is not this button's to close, even under the same
-    // plugin and capability: the Agent is still waiting on the answer.
-    expect(selectPinnedToggleCall([call("asked", "agent", live)], "com.example.review", "run")).toBeNull();
-    expect(selectPinnedToggleCall(
-      [call("asked", "agent", live)],
-      "com.example.review",
-      "run",
-      undefined,
-      new Set(["com.example.review:run"])
-    )).toBe("asked");
-    // A card that already delivered has nothing left to close, so its button
-    // goes back to opening a new one.
-    expect(selectPinnedToggleCall([call("done", "user", finished)], "com.example.review", "run")).toBeNull();
-    // Another plugin's card must not be mistaken for this button's.
-    expect(selectPinnedToggleCall([call("live", "user", live)], "com.example.other", "run")).toBeNull();
-    // With both on screen the newest is the one the button just opened.
-    expect(
-      selectPinnedToggleCall([call("older", "user", live), call("newer", "user", live)], "com.example.review", "run")
-    ).toBe("newer");
-    // A card the user just closed is still in the call list until the plugin's
-    // cancellation comes back. It is not something a press can close again, so
-    // counting it would turn the next press into a no-op instead of reopening.
-    expect(
-      selectPinnedToggleCall([call("closed", "user", live)], "com.example.review", "run", new Set(["closed"]))
-    ).toBeNull();
-    // With the closed one out of the way the press finds the card still open.
-    expect(
-      selectPinnedToggleCall(
-        [call("closed", "user", live), call("open", "user", live)],
-        "com.example.review",
-        "run",
-        new Set(["closed"])
-      )
-    ).toBe("open");
-  });
-
-  it("opens a fresh card only when there is no pending call to restore", async () => {
-    const open = vi.fn(async () => undefined);
-    const toggleVisibility = vi.fn();
-    const options = { calls: [] as PluginUiCall[], pluginId: "legal-labor", capabilityId: "session-start", pinnedCapabilities: new Set(["legal-labor:session-start"]), open, toggleVisibility };
-    await pressPinnedPluginCommand(options);
-    expect(open).toHaveBeenCalledTimes(1);
-    expect(toggleVisibility).not.toHaveBeenCalled();
-    const pending: PluginUiCall = { pluginId: "legal-labor", capabilityId: "session-start", callId: "pending", origin: "agent", events: [] };
-    expect(selectOpenPinnedCapabilities([pending], undefined, options.pinnedCapabilities, new Set(["pending"]))).toEqual(new Set());
-    await pressPinnedPluginCommand({ ...options, calls: [pending] });
-    expect(toggleVisibility).toHaveBeenCalledWith("pending");
-    expect(open).toHaveBeenCalledTimes(1);
-    await pressPinnedPluginCommand({ ...options, calls: [{ ...pending, events: [{ type: "result", result: { sessionId: "session-1" } }] }] });
-    expect(open).toHaveBeenCalledTimes(2);
-  });
-
-  it("stops highlighting a pinned button the moment its card is closed", () => {
-    const openCall = (callId: string): PluginUiCall => ({
-      pluginId: "com.example.review",
-      capabilityId: "run",
-      callId,
-      conversationId: "websocket:chat-1",
-      origin: "user",
-      events: [{ type: "interaction", request: { interactionId: "guide", type: "question", payload: {} } }]
-    });
-
-    // The cancellation round trip takes a moment, so the button cannot wait for
-    // it to stop looking pressed: the card is already gone from the screen.
-    expect(selectOpenPinnedCapabilities([openCall("live")])).toEqual(new Set(["com.example.review:run"]));
-    expect(selectOpenPinnedCapabilities([openCall("live")], new Set(["live"]))).toEqual(new Set());
-    const agentCall = { ...openCall("agent"), origin: "agent" as const };
-    expect(selectOpenPinnedCapabilities([agentCall], undefined, new Set(["com.example.review:run"]))).toEqual(new Set(["com.example.review:run"]));
-  });
-
-  it("keeps the conversation reachable when a pinned card is on screen", () => {
-    const source = readFileSync(homePageSourcePath, "utf8");
-    const styles = readFileSync(stylesSourcePath, "utf8");
-
-    // The overlay sits on top of the scroller, so a card tall enough to reach
-    // the pane's top would otherwise take the wheel with it and leave the
-    // conversation above it unreachable.
-    expect(styles).toMatch(/\.plugin-capability-region--pinned\s*\{[^}]*max-height:/s);
-    expect(styles).toMatch(/\.plugin-capability-region--pinned\s*\{[^}]*overflow-y:\s*auto;/s);
-
-    // Only the controls take the pointer; the backdrop between them lets a
-    // gesture through to the transcript underneath.
-    expect(styles).toMatch(/\.agent-conversation-composer\s*>\s*\*\s*\{[^}]*pointer-events:\s*none;/s);
-    expect(styles).toMatch(/\.agent-conversation-composer\s*>\s*\*\s*>\s*\*\s*\{[^}]*pointer-events:\s*auto;/s);
-
-    // The pinned host is the one that carries the cap.
-    const host = readFileSync(pluginCapabilityHostSourcePath, "utf8");
-    expect(host).toContain("plugin-capability-region plugin-capability-region--pinned");
-    // A card closed from its button must stay closed rather than being
-    // replaced by the cancellation it caused.
-    expect(host).toContain("props.dismissedCallIds?.has(call.callId)");
-    expect(source).toContain("dismissedCallIds={dismissedPluginCalls}");
-  });
-
-  it("collects scenario entry cards only from plugins that can serve them", () => {
-    const manifest = {
-      apiVersion: "memmy/v1" as const,
-      id: "com.example.legal",
-      name: "Legal",
-      version: "1.0.0",
-      runtime: { adapter: "command" as const },
-      capabilities: [{ id: "run", name: "Run", description: "Run", inputSchema: {}, outputSchema: {}, execution: "job" as const }],
-      permissions: [],
-      scenarios: [
-        { id: "risk", name: "用工风险诊断", description: "企业资料、访谈录音，一键生成风险诊断报告", icon: "scale", prompt: "帮我生成一份用工风险诊断报告。" }
-      ]
-    };
-    const base = {
-      id: "com.example.legal",
-      version: "1.0.0",
-      approvedPermissions: [],
-      config: {},
-      lastError: null,
-      createdAt: "2026-08-31T00:00:00.000Z",
-      updatedAt: "2026-08-31T00:00:00.000Z"
-    };
-    const active = InstalledPluginSchema.parse({ ...base, manifest, state: "active" });
-    const disabled = InstalledPluginSchema.parse({ ...base, manifest, state: "disabled" });
-
-    expect(collectPluginScenarios([active])).toEqual([
-      { ...manifest.scenarios[0], pluginId: "com.example.legal" }
-    ]);
-    // A disabled plugin cannot serve the work its card would start, so
-    // offering the card would dead-end.
-    expect(collectPluginScenarios([disabled])).toEqual([]);
-  });
-
-  it("converts Agent-routed plugin commands into explicit Skill prompts", () => {
-    const plugin = InstalledPluginSchema.parse({
-      id: "com.example.review",
-      version: "1.0.0",
-      manifest: {
-        apiVersion: "memmy/v1",
-        id: "com.example.review",
-        name: "Review",
-        version: "1.0.0",
-        runtime: { adapter: "http" },
-        capabilities: [{ id: "run", name: "Run", description: "Run", inputSchema: {}, outputSchema: {}, execution: "job" }],
-        skills: [{ id: "literature-review", name: "Literature Review", description: "Coordinate review tools", entry: "skills/literature-review/SKILL.md" }],
-        commands: [{ command: "/literature-review", name: "Literature Review", description: "Create a review", capabilityId: "run", agentSkillId: "literature-review" }],
-        permissions: []
-      },
-      state: "active",
-      approvedPermissions: [],
-      config: {},
-      lastError: null,
-      createdAt: "2026-08-31T00:00:00.000Z",
-      updatedAt: "2026-08-31T00:00:00.000Z"
-    });
-    const targets = collectPluginCommandTargets([plugin]);
-    expect(buildAgentRoutedPluginPrompt("/literature-review compare memory agents", targets)).toBe(
-      "$literature-review compare memory agents"
-    );
-    expect(buildAgentRoutedPluginPrompt("/literature-review", targets)).toBe("$literature-review");
-    expect(buildAgentRoutedPluginPrompt("ordinary chat", targets)).toBeNull();
-  });
-
   it("allows Goal steering when source metadata is missing without opening TUI or IM turns", () => {
     expect(isSteerableCurrentTurn(null, true)).toBe(true);
     expect(isSteerableCurrentTurn(null, false)).toBe(false);
     expect(isSteerableCurrentTurn({ kind: "gui", channel: "websocket" }, false)).toBe(true);
     expect(isSteerableCurrentTurn({ kind: "tui", channel: "websocket" }, true)).toBe(false);
     expect(isSteerableCurrentTurn({ kind: "im", channel: "slack" }, true)).toBe(false);
-  });
-
-  it("adds a capability block without clearing the existing draft", () => {
-    expect(addCapabilityBlockToDraft("/review", "比较两篇论文")).toBe(
-      "/review  比较两篇论文"
-    );
-    expect(addCapabilityBlockToDraft("/review", "")).toBe("/review  ");
-    expect(replaceTrailingSlashQuery("比较两篇论文 /lit", "/review", true)).toBe(
-      "比较两篇论文 /review "
-    );
-  });
-
-  it("keeps suggestions as plain drafts until a plugin command is selected", () => {
-    expect(homeSuggestionDraft("写一篇完整综述")).toBe("写一篇完整综述");
-    expect(homeSuggestionDraft("总结本周工作")).toBe("总结本周工作");
-  });
-
-  it("inserts and replaces a capability at the active caret", () => {
-    expect(insertCapabilityAtSelection("前文后文", "/review", 2)).toEqual({
-      value: "前文  /review  后文",
-      caret: 13
-    });
-    expect(replaceSlashQueryAtSelection("前文 /lit 后文", "/review", 7, 7, true)).toEqual({
-      value: "前文 /review  后文",
-      caret: 11
-    });
-  });
-
-  it("renders a selected capability inline without replacing the textarea", () => {
-    const html = renderToString(
-      <ComposerHighlightedTextarea
-        value="/review "
-        highlightedCommands={["/review"]}
-        placeholder="分配一个任务或提问任何问题..."
-        onChange={() => undefined}
-      />
-    );
-
-    expect(html).toContain("composer-slash-chip");
-    expect(html).toContain(">/review </textarea>");
-    expect(html).toContain("分配一个任务或提问任何问题...");
-  });
-
-  it("keeps unselected slash text editable instead of turning it into a capability chip", () => {
-    const html = renderToString(
-      <ComposerHighlightedTextarea
-        value="/AI Memory"
-        highlightedCommands={["/review"]}
-        placeholder="分配一个任务或提问任何问题..."
-        onChange={() => undefined}
-      />
-    );
-
-    expect(html).not.toContain("composer-slash-chip");
-    expect(html).toContain("/AI Memory");
-  });
-
-  it("highlights and removes a selected capability at an inline caret position", () => {
-    expect(composerHighlightSegments(
-      "前文 /review 后文",
-      ["/review"]
-    )).toEqual([
-      { text: "前文 ", command: false },
-      { text: "/review", command: true },
-      { text: " 后文", command: false }
-    ]);
-    expect(removeHighlightedCommandAtCaret(
-      "前文 /review 后文",
-      ["/review"],
-      10,
-      "Backspace"
-    )).toEqual({ value: "前文 后文", caret: 3 });
   });
 
   it("renders the first-phase agent input controls", () => {
@@ -479,14 +92,9 @@ describe("HomePage", () => {
     );
 
     expect(html).toContain("分配一个任务或提问任何问题...");
-    expect(html).toContain("添加资料");
-    expect(html).not.toContain('aria-label="引用"');
-    expect(html).toContain("能力");
+    expect(html).toContain("添加图片和文件");
     expect(html).toContain("语音输入");
     expect(html).toContain("发送");
-    expect(html).toContain("帮我写一篇关于 AI Memory 研究的文献综述");
-    expect(html).toContain("帮我总结一下本周的工作");
-    expect(html).toContain("梳理我最近的一个任务，并列出可行的待办");
     expect(html).toContain("Agent 正在连接");
     expect(html).not.toContain('aria-haspopup="menu"');
     expect(html).toContain('class="home-project-picker__trigger"');
@@ -494,7 +102,7 @@ describe("HomePage", () => {
     expect(html).toContain(`accept="${AGENT_MEDIA_ACCEPT}"`);
     expect(html).toContain("hidden");
     expect(html).toContain('class="hidden"');
-    expect(html).toContain("lucide-plus");
+    expect(html).toContain('data-icon="plus"');
     expect(html).toContain('data-icon="mic"');
     expect(html).toContain('data-icon="send"');
     expect(html).not.toContain("添加照片和文件");
@@ -502,7 +110,7 @@ describe("HomePage", () => {
     expect(html).not.toContain('data-icon="image-plus"');
     expect(html).not.toContain('data-icon="pause"');
     expect(html).toContain("内容由 AI 生成，请仔细甄别");
-    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-3");
+    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-4");
     expect(html).not.toContain("未选择任何文件");
   });
 
@@ -540,16 +148,11 @@ describe("HomePage", () => {
     expect(chipStyles).toContain("font-weight: 500;");
     expect(chipStyles).toMatch(/\.composer-command-chip__icon\s*{[^}]*position:\s*absolute;/s);
     expect(chipStyles).toMatch(/\.composer-command-chip__leading\s*{[^}]*display:\s*inline-flex;/s);
-    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(1);
-    expect(source.match(/\{renderComposerLeadingActions\(\)\}/g)).toHaveLength(2);
-    expect(source.match(/<ComposerHighlightedTextarea/g)).toHaveLength(1);
-    expect(source.match(/<textarea\b/g)).toHaveLength(1);
+    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(2);
+    expect(source.match(/value=\{composerInput\}/g)).toHaveLength(2);
     expect(source).toContain("setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, value));");
     expect(source).toContain("selectedComposerCommandsByScope[chatScopeKey] ?? null");
     expect(source).toContain("setSelectedComposerCommandForScope(chatScopeKey, COMPOSER_GOAL_COMMAND);");
-    expect(source).toContain("const goalSlashCommand: SlashCommandPaletteItem");
-    expect(source).toContain("command: COMPOSER_GOAL_COMMAND");
-    expect(source).toContain('icon: "target"');
     expect(source).toContain('label={t("home.command.goalChip")}');
     expect(source).toContain('placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}');
     expect(styles).toContain(".agent-composer-shell--expanded textarea.agent-composer-input--conversation");
@@ -575,8 +178,7 @@ describe("HomePage", () => {
     expect(filterGoalModeSlashCommands(commands, false).map((item) => item.command)).toEqual([
       "/last-compaction"
     ]);
-    expect(source).toContain("const slashQuery = slashMenuDismissed");
-    expect(source).toContain(": slashQueryFromInput(composerInput.slice(0, Math.min(composerSelection.start, composerInput.length)));");
+    expect(source).toContain("const slashQuery = slashMenuDismissed ? null : slashQueryFromInput(composerInput);");
     expect(source).toContain("clearAuxiliarySlashQuery();");
     expect(source).toContain('setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, ""));');
   });
@@ -631,6 +233,8 @@ describe("HomePage", () => {
       .toBe("home.queue.steerFailed");
     expect(agentErrorText("home.queue.steerUnavailable", (key) => key))
       .toBe("home.queue.steerUnavailable");
+    expect(agentErrorText("home.queue.editBlocked", (key) => key))
+      .toBe("home.queue.editBlocked");
   });
 
   it("recovers slash commands after the initial command snapshot fails", () => {
@@ -640,7 +244,7 @@ describe("HomePage", () => {
       source.indexOf("  useEffect(() => {\n    if (!clients?.memmyAgent)")
     );
     const updateComposerInputBlock = source.slice(
-      source.indexOf("function updateComposerInput(value: string,"),
+      source.indexOf("function updateComposerInput(value: string)"),
       source.indexOf("  /**\n   * 自动收缩或展开输入框高度。")
     );
 
@@ -662,39 +266,17 @@ describe("HomePage", () => {
     expect(updateComposerInputBlock).toContain("loadSlashCommands({ resetAttempts: true });");
   });
 
-  it("anchors typed slash menus at the caret and button-triggered menus at the button", () => {
+  it("keeps slash menu rendering and command panels on their existing boundaries", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
-    const styles = readFileSync(stylesSourcePath, "utf8");
 
     expect(source).toContain("const slashMenuOpen = filteredSlashCommands.length > 0;");
-    expect(source).toContain("function ComposerCaretMenu(props:");
-    expect(source).toContain('mirror.style.whiteSpace = "pre-wrap";');
-    expect(source).toContain("const caretTop = caretMarker.offsetTop;");
-    expect(source).not.toContain("context?.measureText(currentLine)");
-    expect(source.match(/\{slashMenuOpen && !slashPickerOpen \? \(/g)).toHaveLength(2);
-    expect(source).toContain("{slashMenuOpen && slashPickerOpen ? (");
-    expect(source).toContain('className="composer-quick-actions__anchor"');
-    expect(source).toContain('className="composer-quick-actions__popover composer-quick-actions__popover--slash"');
-    expect(source).toContain("aria-expanded={slashPickerOpen}");
-    expect(source).toContain("onClick={insertComposerSlashTrigger}");
-    expect(source).toContain('ref={composerAttachMenuRef} className="agent-composer-attach-menu"');
-    expect(source).toContain('composerAttachMenuRef.current?.removeAttribute("open");');
-    expect(styles).toContain(".agent-composer-shell--expanded .composer-quick-actions__popover--slash");
-    expect(styles).toContain("bottom: calc(100% + 8px);");
-    expect(source).toContain('<ComposerCaretMenu textareaRef={inputRef} containerRef={composerShellRef} value={composerInput} placement="above">');
-    expect(source).toContain('bottom: Math.max(8, container.clientHeight - caretTopInContainer + 4)');
-    expect(styles).toContain("top: calc(100% + 6px);");
-    expect(source).not.toContain('slashPickerOpen || /^\\s*\\//.test(input)');
-    expect(source).not.toContain("referenceMenuOpen");
-    expect(source).not.toContain("referencePickerOpen");
+    expect(source.match(/\{slashMenuOpen && \(/g)).toHaveLength(2);
     expect(source).toContain("const [lastCompactionPanel, setLastCompactionPanel] = useState<StatusPanelState>({ open: false });");
     expect(source).toContain("const lastCompactionSlashCommand: SlashCommandPaletteItem = {");
     expect(source).toContain('command: "/last-compaction"');
     expect(source).toContain("const slashCommandsWithLocal = [");
-    expect(source).toContain("goalSlashCommand,");
     expect(source).toContain("lastCompactionSlashCommand,");
-    expect(source).toContain("command.command !== COMPOSER_GOAL_COMMAND");
-    expect(source).toContain('command.command !== "/last-compaction"');
+    expect(source).toContain('...localizedSlashCommands.filter((command) => command.command !== "/last-compaction")');
     expect(source).toContain("buildVisibleSlashCommands(slashCommandsWithLocal, state.agent.isSending, stopSlashCommand)");
     expect(source).toContain("{statusPanel.open && !slashMenuOpen && (");
     expect(source).toContain("{lastCompactionPanel.open && !slashMenuOpen && (");
@@ -712,39 +294,18 @@ describe("HomePage", () => {
     expect(source).toContain("const activeConversationTitle = state.agent.currentSessionKey");
     expect(source).toContain("const activeImTitleDisplay = imChannelTitleDisplay(activeConversationTitle);");
     expect(source).toContain("formatConversationTitleForDisplay(activeImTitleDisplay?.title ?? activeConversationTitle)");
-    expect(source).toContain("topBar={hasActiveConversation || environmentScope ? (");
-    expect(source).toContain('className={`agent-conversation-topbar${sidePreviewOpen ? " agent-conversation-topbar--preview-open" : ""}`}');
-    expect(source).toContain("topBarEnd={hasActiveConversation || environmentScope ? (");
-    expect(source).toContain('title={hasActiveConversation ? activeConversationTitle : selectedDraftProject?.name}');
-    expect(source).toContain("{hasActiveConversation ? activeConversationTitleDisplay : selectedDraftProject?.name}");
-    expect(source).toContain('{hasActiveConversation && activeImTitleDisplay ? <ImChannelTitleIcon slug={activeImTitleDisplay.slug} name={activeImTitleDisplay.channelName} /> : null}');
-    expect(source).toContain("topBarBorder={Boolean(hasActiveConversation || environmentScope) && !sidePreviewOpen}");
+    expect(source).toContain("topBar={hasActiveConversation ? (");
+    expect(source).toContain("<AgentThreadToolbar");
+    expect(source).toContain("title={activeConversationTitleDisplay}");
+    expect(source).toContain("titleTrailing={activeImTitleDisplay ? <ImChannelTitleIcon");
+    expect(source).not.toContain("selectedDraftProject?.name");
+    expect(source).toContain("topBarBorder={hasActiveConversation}");
+    expect(source).toContain("topBarInset={hasActiveConversation ? false : undefined}");
+    expect(source).toContain("windowsTitlebarSafe={hasActiveConversation}");
     expect(source).not.toContain("agent-conversation-titlebar");
     expect(source).toContain("app-frame-page-content agent-conversation-scroll flex-1 overflow-y-auto");
     expect(source).toContain("onScroll={handleAgentConversationScroll}");
     expect(source).toContain('className="agent-conversation-composer"');
-    expect(source).toContain("{environmentScope && !recordingEntry.open ? (");
-    expect(source).toContain("const previewToggle = previewScope ? (");
-    expect(source).toContain("<PanelRight size={15}");
-    expect(source).toContain("<WorkspaceArtifactPanel");
-    expect(source).toContain("focusExternalFile={previewFocusExternalFile}");
-    expect(source).toContain("if (mediaUrl)");
-    // The recorder shares the panel, so the file preview stays mounted when it
-    // is closed but a recorder is on screen, and hides behind one that is open.
-    expect(source).toContain("hidden={(!previewPanelOpen && !recordingEntry.open) || pluginArtifactPreview !== null || recorderPaneOpen}");
-    expect(source).toContain("toolbarEnd={previewToggle}");
-    expect(source).toContain("{!sidePreviewOpen ? previewToggle : null}");
-    expect(source).toContain("agent-environment-toggle--with-preview");
-    const environmentButton = source.slice(
-      source.indexOf("data-agent-environment-toggle"),
-      source.indexOf("</button>", source.indexOf("data-agent-environment-toggle"))
-    );
-    const previewButton = source.slice(
-      source.indexOf("agent-preview-toggle"),
-      source.indexOf("</button>", source.indexOf("agent-preview-toggle"))
-    );
-    expect(environmentButton).not.toContain("setPreviewPanelOpen(false)");
-    expect(previewButton).not.toContain("setEnvironmentPanelOpen(false)");
   });
 
   it("anchors the history DAG popover to the composer width", () => {
@@ -793,7 +354,9 @@ describe("HomePage", () => {
     expect(source).toContain("state.agent.composerPendingAttachmentsByScope");
     expect(source).toContain("agentActions.composerDraftUpdated(scopeKey, nextValue)");
     expect(source).toContain("const sendScopeKey = chatScopeKey;");
-    expect(source).toContain("clearComposer: () => clearComposerAfterSend(sendScopeKey)");
+    expect(source).toContain("clearComposer: () => stageComposerForSend(sendScopeKey)");
+    expect(source).toContain("restoreComposer: () => restoreComposerAfterFailedSend(");
+    expect(source).toContain("settleComposer: () => settleComposerAfterSend(sendScopeKey, submittedAttachments)");
     expect(source).not.toContain("useState<Record<string, string>>({})");
     expect(source).not.toContain("useState<Record<string, PendingAttachment[]>>({})");
     expect(source).not.toContain("composerMediaErrorByScope");
@@ -937,7 +500,7 @@ describe("HomePage", () => {
 
   it("passes the current UI language into agent websocket messages", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
-    const sendBlock = source.slice(source.indexOf("async function sendMessage()"), source.indexOf("function stopCurrentTurn"));
+    const sendBlock = source.slice(source.indexOf("async function sendMessage()"), source.indexOf("  /**\n   * 停止当前 Agent 回合"));
 
     expect(source).toContain("const { language, t } = useTranslation();");
     expect(sendBlock).toContain("language,");
@@ -945,20 +508,12 @@ describe("HomePage", () => {
 
   it("intercepts exact local slash commands before normal message submission", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
-    const sendBlock = source.slice(source.indexOf("async function sendMessage()"), source.indexOf("function stopCurrentTurn"));
-    const localSlashBlock = source.slice(source.indexOf("function runExactLocalSlashCommand"), source.indexOf("function stopCurrentTurn"));
+    const sendBlock = source.slice(source.indexOf("async function sendMessage()"), source.indexOf("  /**\n   * 停止当前 Agent 回合"));
+    const localSlashBlock = source.slice(source.indexOf("function runExactLocalSlashCommand"), source.indexOf("  /**\n   * 停止当前 Agent 回合"));
 
     expect(sendBlock).toContain("if (runExactLocalSlashCommand(input))");
     expect(sendBlock.indexOf("runExactLocalSlashCommand(input)")).toBeLessThan(sendBlock.indexOf("submitAgentComposerMessage({"));
-    expect(localSlashBlock).toContain("parsePluginCommandInvocation(command, pluginCommandTargets)");
-    expect(localSlashBlock).toContain("pluginInvocation?.contribution.agentSkillId");
-    expect(localSlashBlock).toContain("clients.plugins.invoke(plugin.id, contribution.capabilityId");
-    expect(localSlashBlock).toContain("openSurface({ pluginId: plugin.id");
-    expect(localSlashBlock).toContain('appActions.navigate("/plugin")');
-    expect(localSlashBlock).toContain("references: contextChips");
-    expect(localSlashBlock).toContain("composerContextReferencesUpdated(chatScopeKey, [])");
-    expect(localSlashBlock).toContain('draftTarget.kind === "project"');
-    expect(localSlashBlock).not.toContain("sessionStorage");
+    expect(localSlashBlock).toContain("if (pendingAttachments.length > 0) return false;");
     expect(localSlashBlock).toContain('normalized === "/last-compaction"');
     expect(localSlashBlock).toContain("requestLastCompactionPanel();");
     expect(localSlashBlock).toContain('normalized === "/history-dag"');
@@ -1051,38 +606,46 @@ describe("HomePage", () => {
     expect(styles).not.toContain("padding-left: 86px;");
     expect(source).toContain('className="relative agent-composer-shell agent-composer-shell--expanded rounded-card-lg"');
     expect(source).toContain('className="agent-composer-toolbar"');
-    expect(source).toContain('<div className="agent-conversation-content agent-conversation-content--composer max-w-3xl mx-auto">');
+    expect(source).toContain('<div className="agent-conversation-content agent-conversation-content--composer agent-conversation-column">');
     expect(styles).toMatch(/\.agent-composer-toolbar\s*{[^}]*display:\s*flex;/s);
     expect(styles).toMatch(/\.agent-composer-toolbar \.composer-actions\s*{[^}]*margin-left:\s*auto;/s);
-    expect(source).toContain("COMPOSER_SINGLE_LINE_HEIGHT_PX = 52");
+    expect(source).toContain("COMPOSER_SINGLE_LINE_HEIGHT_PX = 76");
   });
 
-  it("shifts the conversation without resizing it when the environment panel has room", () => {
+  it("docks the thread side panel beside the conversation instead of the legacy environment popover", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
     const styles = readFileSync(stylesSourcePath, "utf8");
+    const conversationColumnRule = styles.match(/\.agent-workspace-layout > \.agent-conversation-panel\s*\{[^}]*\}/)?.[0] ?? "";
 
-    expect(source).toContain('agent-workspace-layout${environmentPanelOpen ? " agent-workspace-layout--environment-open" : ""}${sidePreviewOpen ? " agent-workspace-layout--preview-open" : ""}');
-    expect(source).toContain('className="agent-conversation-content max-w-3xl mx-auto space-y-3"');
-    expect(source).toContain('className="agent-conversation-content agent-conversation-content--composer max-w-3xl mx-auto"');
+    expect(source).toContain('className="home-empty-column"');
+    expect(styles).toMatch(/\.home-empty-column\s*{[^}]*width:\s*clamp\(min\(100%,\s*40rem\),\s*62cqw,\s*var\(--home-column-max,\s*50rem\)\);/s);
+    expect(styles).toMatch(/\.home-empty-column\s*{[^}]*max-width:\s*min\(\s*100%,\s*max\(calc\(100cqw - 2 \* var\(--agent-column-min-gap,\s*80px\)\),\s*min\(100%,\s*20rem\)\)\s*\);/s);
+    expect(styles).toMatch(/\.agent-conversation-content\s*{[^}]*--agent-conversation-track:\s*min\(832px,\s*100cqw\);[^}]*width:\s*calc\(var\(--agent-conversation-track\) - 2 \* var\(--agent-conversation-inset\)\);/s);
+    expect(styles).toMatch(/\.agent-conversation-content--composer\s*{\s*--agent-conversation-inset:\s*24px;/s);
+    expect(styles).toMatch(/@container agent-workspace \(width > 1200px\)\s*{\s*\.agent-conversation-content\s*{\s*--agent-conversation-track:\s*65cqw;/s);
+    expect(styles).toMatch(/@container agent-workspace \(width > 1600px\)\s*{\s*\.agent-conversation-content\s*{\s*--agent-conversation-track:\s*60cqw;/s);
+    expect(styles).toMatch(/@container agent-workspace \(width > 2000px\)\s*{\s*\.agent-conversation-content\s*{\s*--agent-conversation-track:\s*min\(55cqw,\s*1400px\);/s);
+    expect(styles).toMatch(/--home-column-max:\s*50rem;/);
+    expect(styles).toMatch(/--agent-column-min-gap:\s*80px;/);
+    expect(source).toContain('className="agent-conversation-content agent-conversation-column space-y-3"');
+    expect(source).toContain('className="agent-conversation-content agent-conversation-content--composer agent-conversation-column"');
     const composerRule = styles.match(/\.agent-conversation-composer\s*\{[^}]*\}/)?.[0] ?? "";
-    expect(composerRule).toContain("padding: 40px var(--codex-content-padding-x) 12px;");
+    expect(composerRule).toContain("padding: 40px var(--codex-content-padding-x) 0;");
     expect(styles).toContain("container-name: agent-workspace;");
-    expect(styles).toContain("@container agent-workspace (min-width: 1240px)");
-    expect(styles).toContain(".agent-workspace-layout--environment-open .agent-conversation-content");
-    expect(styles).toMatch(/--agent-conversation-shift:\s*\d+px;/);
-    expect(styles).toContain("transform: translateX(calc(0px - var(--agent-conversation-shift)));");
-    expect(styles).toContain("@container agent-workspace (max-width: 479px)");
-    expect(styles).toContain(".agent-workspace-layout--preview-open > .workspace-artifact-preview-pane");
-    expect(styles).toContain("right: calc(var(--agent-preview-panel-width, 520px) + 20px);");
-    expect(styles).toContain(".agent-workspace-layout--preview-open > .agent-conversation-panel");
-    expect(styles).toContain(".app-frame-content-topbar:has(.agent-conversation-topbar--preview-open)");
-    expect(styles).toMatch(/body:has\(\.sidebar-shell\) \.window-drag-region\s*{[^}]*display:\s*none;/s);
-    expect(styles).toMatch(/\.agent-conversation-title\s*{[^}]*-webkit-app-region:\s*drag;/s);
-    expect(styles).toMatch(/\.workspace-artifact-file-tabs\s*{[^}]*-webkit-app-region:\s*drag;/s);
-    expect(styles).toMatch(/\.workspace-artifact-file-tab\s*{[^}]*-webkit-app-region:\s*no-drag;/s);
-    expect(styles).toMatch(/\.workspace-artifact-file-tab__close\s*{[^}]*-webkit-app-region:\s*no-drag;/s);
-    expect(styles).toContain("right: calc(76px - var(--codex-content-padding-x));");
-    expect(styles).toMatch(/\.agent-environment-panel\s*{[^}]*position:\s*absolute;/s);
+    expect(source).toContain("const threadPanel = useAgentThreadPanel({");
+    expect(source).toContain("className={`agent-workspace-layout ${threadPanelMotionClass}`}");
+    expect(source).toContain('style={{ "--thread-panel-offset": `${threadPanel.offset}px` } as CSSProperties}');
+    expect(source).toContain("topBarStyle={hasActiveConversation ? { right: threadPanel.offset } : undefined}");
+    expect(source).toContain("sidePanel={sidePanelMounted ? (\n        <AgentThreadPanel");
+    expect(source).toContain("<AgentThreadPanel");
+    expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-main\s*\{[^}]*isolation:\s*auto;/s);
+    expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-content-topbar\.thread-topbar\s*\{[^}]*display:\s*none;/s);
+    expect(source).not.toContain("<AgentEnvironmentPanel");
+    expect(source).not.toContain("<SlidersHorizontal");
+    expect(conversationColumnRule).toContain("margin-right: var(--thread-panel-offset, 0px);");
+    expect(conversationColumnRule).toContain("transition: margin-right 200ms cubic-bezier(0, 0, 0.2, 1);");
+    expect(styles).toMatch(/\.thread-panel-motion--closing[^{]*\{[^}]*transition-duration:\s*150ms;[^}]*cubic-bezier\(0\.4, 0, 1, 1\)/s);
+    expect(styles).toMatch(/\.thread-panel\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*20;/s);
   });
 
   it("lets expanded conversation text use the full width above the action footer", () => {
@@ -1113,24 +676,28 @@ describe("HomePage", () => {
     expect(window.getComputedStyle(textarea).paddingRight).toBe("16px");
   });
 
-  it("keeps the single-line composer text and caret vertically centered", () => {
+  it("keeps the single-line conversation composer on a 76px field with the first line 12px from the top", () => {
     const window = new Window();
     const style = window.document.createElement("style");
     style.textContent = readFileSync(stylesSourcePath, "utf8").replace(/^@import[^;]+;$/gm, "");
     window.document.head.append(style);
 
+    const composer = window.document.createElement("div");
+    composer.className = "agent-conversation-composer";
     const shell = window.document.createElement("div");
-    shell.className = "agent-composer-shell";
+    shell.className = "agent-composer-shell agent-composer-shell--expanded";
     const textarea = window.document.createElement("textarea");
-    textarea.className = "agent-composer-input--single py-3 text-sm";
+    textarea.className = "agent-composer-input--single agent-composer-input--conversation py-3 text-sm";
     shell.append(textarea);
-    window.document.body.append(shell);
+    composer.append(shell);
+    window.document.body.append(composer);
 
     const computed = window.getComputedStyle(textarea);
-    expect(computed.height).toBe("52px");
-    expect(computed.lineHeight).toBe("24px");
-    expect(computed.paddingTop).toBe("14px");
-    expect(computed.paddingBottom).toBe("14px");
+    expect(computed.height).toBe("76px");
+    expect(computed.fontSize).toBe("15px");
+    expect(computed.lineHeight).toBe("26.25px");
+    expect(computed.paddingTop).toBe("12px");
+    expect(computed.paddingBottom).toBe("0px");
     // Must stay scrollable if wrapped content briefly lags behind single-line detection.
     expect(computed.overflowY).toBe("auto");
   });
@@ -1242,6 +809,10 @@ describe("HomePage", () => {
   it("guards duplicate stop requests while a stop control frame is in flight", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
     const normalizedSource = source.replace(/\r\n/g, "\n");
+    const sendDisabledBlock = normalizedSource.slice(
+      normalizedSource.indexOf("const composerSendDisabled"),
+      normalizedSource.indexOf("const composerStopDisabled")
+    );
     const submitDisabledBlock = normalizedSource.slice(
       normalizedSource.indexOf("const composerSubmitDisabled"),
       normalizedSource.indexOf("\n\n  useEffect", normalizedSource.indexOf("const composerSubmitDisabled"))
@@ -1251,6 +822,7 @@ describe("HomePage", () => {
     expect(source).toContain("const stopRequestLocksRef = useRef<Set<string>>(new Set());");
     expect(source).toContain("input.stopRequestLocks.has(chatId)");
     expect(source).toContain("const composerStopDisabled = stopInFlight");
+    expect(sendDisabledBlock).not.toContain("stopInFlight");
     expect(submitDisabledBlock).toContain('composerPrimaryAction === "stop"');
   });
 
@@ -1262,7 +834,7 @@ describe("HomePage", () => {
     );
     const conversationComposer = source.slice(
       source.indexOf("{state.agent.currentChatId && currentGoal ? ("),
-      source.indexOf('<p className="text-center text-[11px] text-text-ink/40 mt-2">')
+      source.indexOf('<p className="agent-conversation-disclaimer">')
     );
     expect(agentComposerPrimaryAction({ isRunning: true, isGoalActive: true, hasIntent: false })).toBe("stop");
     expect(agentComposerPrimaryAction({ isRunning: true, isGoalActive: true, hasIntent: true })).toBe("send");
@@ -1497,29 +1069,14 @@ describe("HomePage", () => {
     expect(focusInput).toHaveBeenCalledTimes(1);
   });
 
-  it("offers file and folder choices from the composer plus button", () => {
+  it("opens the system media picker directly from the plus button without rendering a floating media menu", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
-    const styles = readFileSync(stylesSourcePath, "utf8");
-    const baseSelector = ".agent-composer-attach-menu__popover {";
-    const baseStart = styles.indexOf(baseSelector);
-    const baseBlock = styles.slice(baseStart, styles.indexOf("}", baseStart));
-    const conversationSelector = ".agent-composer-shell--expanded .agent-composer-attach-menu__popover {";
-    const conversationStart = styles.indexOf(conversationSelector);
-    const conversationBlock = styles.slice(conversationStart, styles.indexOf("}", conversationStart));
 
-    expect(source).toContain("openMediaFilePicker();");
-    expect(source).toContain("openFolderPicker();");
-    expect(source).toContain("agent-composer-attach-menu__popover");
-    expect(source).toContain('ref={composerCapabilityMenuRef} className="composer-quick-actions__anchor"');
-    expect(source).toContain("!composerCapabilityMenuRef.current?.contains(event.target as Node)");
+    expect(source).toContain("onClick={openMediaFilePicker}");
+    expect(source).not.toContain("function ComposerMediaMenu");
+    expect(source).not.toContain("setMediaMenuOpen");
     expect(source).not.toContain("aria-haspopup=\"menu\"");
-    expect(source).toContain("role=\"menuitem\"");
-    expect(baseBlock).toContain("top: calc(100% + 8px);");
-    expect(baseBlock).toContain("right: auto;");
-    expect(baseBlock).toContain("bottom: auto;");
-    expect(baseBlock).toContain("left: 0;");
-    expect(conversationBlock).toContain("top: auto;");
-    expect(conversationBlock).toContain("bottom: calc(100% + 8px);");
+    expect(source).not.toContain("role=\"menuitem\"");
   });
 
   it("renders composer media previews as compact thumbnail and file chips", () => {
@@ -1556,44 +1113,35 @@ describe("HomePage", () => {
     expect(html).toContain("agent-attachment-card__name");
     expect(html).toContain("agent-attachment-card__meta");
     expect(html).toContain(">shot<");
-    expect(html).toContain(">report<");
-    expect(html).toContain(">brief<");
-    expect(html).toContain(">sheet<");
-    expect(html).toContain(">deck<");
-    expect(html).toContain(">notes<");
-    expect(html).toContain(">table<");
-    expect(html).toContain(">data<");
-    expect(html).toContain(">payload<");
-    expect(html).toContain("file-type-icon__paper");
-    expect(html).toContain("file-type-icon__glyph");
-    expect(html).toContain("file-type-icon__format-label");
-    expect(html).toContain(">PDF</text>");
-    expect(html).toContain(">DOC</text>");
-    expect(html).toContain(">XLS</text>");
-    expect(html).toContain(">PPT</text>");
+    expect(html).toContain(">report.pdf<");
+    expect(html).toContain(">brief.docx<");
+    expect(html).toContain(">sheet.xlsx<");
+    expect(html).toContain(">deck.pptx<");
+    expect(html).toContain(">notes.txt<");
+    expect(html).toContain(">table.csv<");
+    expect(html).toContain(">data.json<");
+    expect(html).toContain(">payload.xml<");
     expect(compactHtml).toContain("XLSX · 2.0 KB");
     expect(compactHtml).toContain("PPTX · 1.5 KB");
     expect(compactHtml).toContain("TXT · 512 B");
     expect(compactHtml).toContain("CSV · 768 B");
     expect(compactHtml).toContain("JSON · 1.0 KB");
     expect(compactHtml).toContain("XML · 640 B");
-    expect(html).toContain('data-testid="file-type-icon-pdf"');
-    expect(html).toContain('data-testid="file-type-icon-word"');
-    expect(html).toContain('data-testid="file-type-icon-spreadsheet"');
-    expect(html).toContain('data-testid="file-type-icon-presentation"');
-    expect(html).toContain('data-testid="file-type-icon-text"');
-    expect(html).toContain('data-testid="file-type-icon-code"');
-    expect(html).toContain("file-type-icon--pdf");
-    expect(html).toContain("file-type-icon--word");
-    expect(html).toContain("file-type-icon--spreadsheet");
-    expect(html).toContain("file-type-icon--presentation");
-    expect(html).toContain("file-type-icon--text");
-    expect(html).toContain("file-type-icon--code");
-    expect(html).toContain('aria-label="PDF document"');
+    expect(html).toContain('data-testid="agent-file-icon-pdf"');
+    expect(html).toContain('data-testid="agent-file-icon-docx"');
+    expect(html).toContain('data-testid="agent-file-icon-xlsx"');
+    expect(html).toContain('data-testid="agent-file-icon-pptx"');
+    expect(html).toContain('data-testid="agent-file-icon-file"');
+    expect(html).toContain("agent-attachment-card__file-tile--pdf");
+    expect(html).toContain("agent-attachment-card__file-tile--docx");
+    expect(html).toContain("agent-attachment-card__file-tile--xlsx");
+    expect(html).toContain("agent-attachment-card__file-tile--pptx");
+    expect(html).toContain("agent-attachment-card__file-tile--file");
+    expect(html).toContain('aria-label="PDF file"');
     expect(html).toContain('aria-label="Word document"');
-    expect(html).toContain('aria-label="Spreadsheet"');
-    expect(html).toContain('aria-label="Presentation"');
-    expect(html).toContain('aria-label="Text document"');
+    expect(html).toContain('aria-label="Spreadsheet file"');
+    expect(html).toContain('aria-label="Presentation file"');
+    expect(html).toContain('aria-label="File attachment"');
     expect(html).not.toContain("absolute -right-1 -bottom-1");
     expect(html).not.toContain('data-testid="composer-file-kind-');
     expect(compactHtml).toContain("PNG · 2.0 KB");
@@ -1615,7 +1163,7 @@ describe("HomePage", () => {
     expect(sendHtml).toContain('data-icon="send"');
     expect(sendHtml).toContain("composer-action-submit");
     expect(sendHtml).toContain("bg-action-sky");
-    expect(sendHtml).toContain("translate-y-[1px]");
+    expect(sendHtml).toContain("translate(-1px, 1px)");
     expect(sendHtml).not.toContain("停止");
     expect(sendHtml).not.toContain('data-icon="pause"');
     expect(sendHtml).not.toContain('data-icon="stop-square"');
@@ -1636,8 +1184,6 @@ describe("HomePage", () => {
   });
 
   it("translates media send error keys for visible agent errors", () => {
-    const denied = pluginInvocationError(new ApiRequestError("Plugin grant missing", 403, "plugin_entitlement_required"));
-    expect(agentErrorText(denied)).toBe("当前账号未获得此插件的使用授权，请刷新账号状态后重试。");
     expect(agentErrorText("home.media.error.sendUnsupported")).toBe("当前不支持此文件格式。请上传图片、PDF、Office 文档或文本文件。");
     expect(agentErrorText("home.modelSelector.unavailable")).toBe("当前模型或连接已失效，无法继续调用，需要切换模型。");
     expect(agentErrorText("message_request_rejected:model_selection_unavailable")).toBe("当前模型或连接已失效，无法继续调用，需要切换模型。");
@@ -1648,16 +1194,8 @@ describe("HomePage", () => {
       "麦克风权限未开启。请到 设置 › 隐私和安全性 › 麦克风 中开启 Memmy"
     );
     expect(agentErrorText("plain error")).toBe("操作未完成，请重试");
+    expect(agentErrorText("request_timeout")).toBe("请求超时，请重试");
     expect(agentErrorText(null)).toBeNull();
-  });
-
-  it("does not clear the composer when the chat send is rejected", async () => {
-    const cleared = vi.fn();
-    await expect(submitAgentComposerMessage({ chatId: "chat-1", content: "Revise this card", pendingAttachments: [],
-      connection: { getReadyGeneration: () => 1, newChat: vi.fn(), submitMessage: vi.fn(async () => { throw new Error("Disconnected"); }) },
-      uploadAgentMedia: vi.fn(), dispatch: vi.fn(), track: vi.fn(), clearComposer: cleared
-    })).resolves.toBe(false);
-    expect(cleared).not.toHaveBeenCalled();
   });
 
   it("keeps the model unavailable reason when a tombstone blocks new-chat creation", async () => {
@@ -1740,6 +1278,7 @@ describe("HomePage", () => {
     expect(dispatch).toHaveBeenNthCalledWith(1, { type: "agent/newChatCreated", chatId: "chat-new" });
     expect(dispatch).toHaveBeenNthCalledWith(2, {
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "chat-new",
       content: "帮我整理计划",
       media: [
@@ -1804,6 +1343,7 @@ describe("HomePage", () => {
     }), 1);
     expect(dispatch).toHaveBeenCalledWith({
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "chat-project",
       content: "检查项目",
       media: [],
@@ -1837,6 +1377,7 @@ describe("HomePage", () => {
     expect(newChat).not.toHaveBeenCalled();
     expect(dispatch).toHaveBeenCalledWith({
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "chat-1",
       content: "继续",
       media: [],
@@ -1855,13 +1396,14 @@ describe("HomePage", () => {
     expect(onNewChatMessageSent).not.toHaveBeenCalled();
   });
 
-  it("does not clear the composer or add an optimistic user before send confirmation", async () => {
+  it("clears the composer and renders the user message before send confirmation", async () => {
     let confirmSend!: () => void;
     const sendMessage = vi.fn(() => new Promise<{ status: "accepted" }>((resolve) => {
       confirmSend = () => resolve({ status: "accepted" });
     }));
     const dispatch = vi.fn();
     const clearComposer = vi.fn();
+    const settleComposer = vi.fn();
     const submission = submitAgentComposerMessage({
       chatId: "chat-1",
       connection: {
@@ -1874,29 +1416,62 @@ describe("HomePage", () => {
       uploadAgentMedia: vi.fn(async () => []),
       dispatch,
       track: vi.fn(),
-      clearComposer
+      clearComposer,
+      settleComposer
     });
 
     await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
-    expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "agent/userMessageQueued" }));
-    expect(clearComposer).not.toHaveBeenCalled();
-
-    confirmSend();
-    await expect(submission).resolves.toBe(true);
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "chat-1",
       content: "等待正式接受"
     }));
     expect(clearComposer).toHaveBeenCalledOnce();
+    expect(settleComposer).not.toHaveBeenCalled();
+
+    confirmSend();
+    await expect(submission).resolves.toBe(true);
+    expect(settleComposer).toHaveBeenCalledOnce();
   });
 
-  it("clears a composer after queued confirmation without inserting a premature user message", async () => {
-    const submitMessage = vi.fn(async () => ({ status: "queued" as const }));
-    const dispatch = vi.fn();
+  it("keeps a running chat's submitted follow-up in the queue before and after confirmation", async () => {
+    let state = agentReducer(initialAgentState, { type: "agent/newChatCreated", chatId: "chat-running" });
+    state = agentReducer(state, {
+      type: "agent/wsEvent",
+      event: { event: "run_status", chat_id: "chat-running", status: "running", started_at: 1780732800 }
+    });
+    state = agentReducer(state, {
+      type: "agent/wsEvent",
+      event: { event: "delta", chat_id: "chat-running", text: "原来的回答仍在生成" }
+    });
+    const runningMessages = state.messages;
+    let confirmQueue!: () => void;
+    const submitMessage = vi.fn(() => new Promise<{ status: "queued" }>((resolve) => {
+      confirmQueue = () => {
+        state = agentReducer(state, {
+          type: "agent/wsEvent",
+          event: {
+            event: "message_queued",
+            chat_id: "chat-running",
+            client_request_id: "66666666-6666-4666-8666-666666666666",
+            item: {
+              client_request_id: "66666666-6666-4666-8666-666666666666",
+              text: "排到下一条",
+              media_urls: [],
+              queued_at: new Date().toISOString(),
+              source: { kind: "gui", channel: "websocket" },
+              queue_surface: "chat_composer"
+            }
+          }
+        });
+        resolve({ status: "queued" });
+      };
+    }));
+    const dispatch = vi.fn((action) => { state = agentReducer(state, action); });
     const clearComposer = vi.fn();
 
-    await expect(submitAgentComposerMessage({
+    const submission = submitAgentComposerMessage({
       chatId: "chat-running",
       clientRequestId: "66666666-6666-4666-8666-666666666666",
       connection: {
@@ -1910,34 +1485,83 @@ describe("HomePage", () => {
       dispatch,
       track: vi.fn(),
       clearComposer
-    })).resolves.toBe(true);
+    });
+
+    expect(state.messages).toBe(runningMessages);
+    expect(state.queuedMessagesByChatId["chat-running"]).toHaveLength(1);
+    expect(state.queuedMessagesByChatId["chat-running"]?.[0]?.status).toBe("sending");
+    expect(state.isSending).toBe(true);
+    confirmQueue();
+    await expect(submission).resolves.toBe(true);
+    expect(state.messages).toBe(runningMessages);
+    expect(state.queuedMessagesByChatId["chat-running"]).toHaveLength(1);
+    expect(state.queuedMessagesByChatId["chat-running"]?.[0]?.status).toBe("queued");
+    expect(state.isSending).toBe(true);
 
     expect(submitMessage).toHaveBeenCalledWith(expect.objectContaining({
       chatId: "chat-running",
       clientRequestId: "66666666-6666-4666-8666-666666666666"
     }), 1);
-    expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "agent/userMessageQueued" }));
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      type: "agent/userMessageQueued",
+      queueIfBusy: true,
+      chatId: "chat-running",
+      clientRequestId: "66666666-6666-4666-8666-666666666666"
+    }));
     expect(clearComposer).toHaveBeenCalledOnce();
   });
 
-  it("anchors the capability menu to its button while status popovers stay above the queue", () => {
+  it("rolls back the optimistic message and restores the composer when confirmation fails", async () => {
+    const dispatch = vi.fn();
+    const clearComposer = vi.fn();
+    const restoreComposer = vi.fn();
+    const settleComposer = vi.fn();
+
+    await expect(submitAgentComposerMessage({
+      chatId: "chat-1",
+      clientRequestId: "77777777-7777-4777-8777-777777777777",
+      connection: {
+        getReadyGeneration: () => 1,
+        newChat: vi.fn(async () => ({ chatId: "unused-chat", modelPreset: "desktop-openai-gpt-5" })),
+        submitMessage: vi.fn(() => Promise.reject(
+          new MemmyAgentMessageRejectedError("message_request_rejected", "result_unknown")
+        ))
+      },
+      content: "失败后恢复",
+      pendingAttachments: [],
+      uploadAgentMedia: vi.fn(async () => []),
+      dispatch,
+      track: vi.fn(),
+      clearComposer,
+      restoreComposer,
+      settleComposer
+    })).resolves.toBe(false);
+
+    expect(clearComposer).toHaveBeenCalledOnce();
+    expect(restoreComposer).toHaveBeenCalledOnce();
+    expect(settleComposer).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "agent/optimisticMessageRejected",
+      chatId: "chat-1",
+      clientRequestId: "77777777-7777-4777-8777-777777777777"
+    });
+  });
+
+  it("anchors composer popovers above the queue and keeps Goal next to the composer", () => {
     const source = readFileSync(homePageSourcePath, "utf8").replace(/\r\n/g, "\n");
     const flowStart = source.indexOf('<div className="agent-composer-flow">');
-    const stackStart = source.indexOf('<div className="agent-composer-stack">', flowStart);
+    const slashStart = source.indexOf("{slashMenuOpen && (", flowStart);
+    const stackStart = source.indexOf('<div className="agent-composer-stack">', slashStart);
     const queueStart = source.indexOf("<AgentQueuedMessageList", stackStart);
     const goalStart = source.indexOf("<AgentGoalBar", stackStart);
     const shellStart = source.indexOf('className="relative agent-composer-shell agent-composer-shell--expanded rounded-card-lg"', stackStart);
-    const leadingActionsStart = source.indexOf("function renderComposerLeadingActions");
-    const capabilityAnchorStart = source.indexOf('className="composer-quick-actions__anchor"', leadingActionsStart);
-    const capabilityMenuStart = source.indexOf('className="composer-quick-actions__popover composer-quick-actions__popover--slash"', capabilityAnchorStart);
 
     expect(flowStart).toBeGreaterThan(0);
-    expect(stackStart).toBeGreaterThan(flowStart);
+    expect(slashStart).toBeGreaterThan(flowStart);
+    expect(stackStart).toBeGreaterThan(slashStart);
     expect(queueStart).toBeGreaterThan(stackStart);
     expect(goalStart).toBeGreaterThan(queueStart);
     expect(shellStart).toBeGreaterThan(goalStart);
-    expect(capabilityAnchorStart).toBeGreaterThan(leadingActionsStart);
-    expect(capabilityMenuStart).toBeGreaterThan(capabilityAnchorStart);
     expect(source).toContain('ref={conversationPanelRef} className="agent-conversation-panel flex flex-col h-full"');
     expect(source).toContain('ref={composerOverlayRef} className="agent-conversation-composer"');
     expect(source).toContain("updateAgentComposerOverlayHeight(panel, composer, measuredHeight)");
@@ -1956,6 +1580,26 @@ describe("HomePage", () => {
       .toHaveLength(2);
     expect(steerBlock).toContain('if (result.outcome === "already_dequeued")');
     expect(steerBlock).toContain("agentActions.queueItemSteerReset(chatId, clientRequestId)");
+  });
+
+  it("writes a queued question back only after removal, and leaves it queued when the composer is busy", () => {
+    const source = readFileSync(homePageSourcePath, "utf8");
+    const editBlock = source.slice(
+      source.indexOf("async function editQueuedMessage"),
+      source.indexOf("async function steerQueuedMessage")
+    );
+    const blockedAt = editBlock.indexOf('message: "home.queue.editBlocked"');
+    const removedAt = editBlock.indexOf("const removed = await removeQueuedMessage(clientRequestId);");
+    const draftAt = editBlock.indexOf("setCurrentComposerDraft(item.content);");
+
+    expect(editBlock).toContain("queuedComposerEditDecision({");
+    expect(editBlock).toContain('if (decision === "ignore" || !item || !chatId) return;');
+    expect(editBlock).toContain('if (decision === "blocked")');
+    expect(editBlock).toContain("if (!removed) return;");
+    expect(editBlock).toContain("inputRef.current?.focus();");
+    expect(blockedAt).toBeGreaterThan(0);
+    expect(removedAt).toBeGreaterThan(blockedAt);
+    expect(draftAt).toBeGreaterThan(removedAt);
   });
 
   it("writes the measured composer height and ignores sub-pixel-equivalent changes", () => {
@@ -2005,6 +1649,7 @@ describe("HomePage", () => {
     }, 1);
     expect(dispatch).toHaveBeenCalledWith({
       type: "agent/userMessageQueued",
+      queueIfBusy: false,
       chatId: "chat-goal",
       content: "编写亚洲流行文化网页",
       media: [],
@@ -2133,6 +1778,7 @@ describe("HomePage", () => {
 
     expect(dispatch).toHaveBeenCalledWith({
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "chat-1",
       content: "发送后立刻断线",
       media: [],
@@ -2173,6 +1819,7 @@ describe("HomePage", () => {
     expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "agent/newChatCreated" }));
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
       type: "agent/userMessageQueued",
+      queueIfBusy: true,
       chatId: "background-chat",
       focus: false
     }));

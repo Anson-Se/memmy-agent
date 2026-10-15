@@ -18,7 +18,7 @@ describe("model token defaults", () => {
       .sort();
     const tokenDefaultModels = Object.keys(MODEL_TOKEN_DEFAULTS).sort();
 
-    expect(tokenDefaultModels).toHaveLength(243);
+    expect(tokenDefaultModels).toHaveLength(275);
     expect(tokenDefaultModels).toEqual(inputCapabilityModels);
     expect(MODEL_TOKEN_DEFAULTS_REVIEWED_AT >= MODEL_INPUT_CAPABILITIES_REVIEWED_AT).toBe(true);
     expect(Object.isFrozen(MODEL_TOKEN_DEFAULTS)).toBe(true);
@@ -53,6 +53,14 @@ describe("model token defaults", () => {
     expect(getModelTokenDefaults("qwen3.8-max")).toEqual({
       contextWindowTokens: 1_000_000,
       maxTokens: 65_536,
+    });
+    expect(getModelTokenDefaults("qwen-plus")).toEqual({
+      contextWindowTokens: 1_000_000,
+      maxTokens: 32_768,
+    });
+    expect(getModelTokenDefaults("qwen-plus-latest")).toEqual({
+      contextWindowTokens: 1_000_000,
+      maxTokens: 32_768,
     });
     expect(getModelTokenDefaults("xopdeepseekv4pro")).toEqual({
       contextWindowTokens: 1_000_000,
