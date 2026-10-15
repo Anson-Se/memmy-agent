@@ -117,7 +117,7 @@ function createSpanBigTurnLlm(
 }
 
 describe("MemoryService / evolution / span big turn", () => {
-  it("stores and recalls subtask spans for a positively rewarded complex turn", async () => {
+  it("stores, recalls, and deletes subtask spans with their task", async () => {
     const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
     const embeddedTexts: string[] = [];
     const embeddedRoles: Array<"query" | "document" | undefined> = [];
@@ -321,6 +321,15 @@ describe("MemoryService / evolution / span big turn", () => {
       toolCalls: toolCalls.slice(0, 4).map(({ id, name, input }) => ({ id, name, input }))
     });
     expect(completed.l1MemoryIds).toHaveLength(1);
+
+    const deleted = service.deletePanelTask(completed.episodeId, { namespace });
+    expect(new Set(deleted.deletedMemoryIds)).toEqual(new Set([
+      completed.l1MemoryId,
+      ...storedSpanIds
+    ]));
+    expect(service.panelTasks({ namespace, page: 1 }).tasks).toHaveLength(0);
+    expect(service.panelItems({ namespace, layer: "L1" }).items).toHaveLength(0);
+    expect(() => service.getMemory(firstSpanId!, { namespace })).toThrow(/not found/i);
     db.close();
   });
 
