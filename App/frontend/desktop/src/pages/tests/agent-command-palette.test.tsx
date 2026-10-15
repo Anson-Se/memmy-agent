@@ -29,16 +29,17 @@ describe("AgentCommandPalette", () => {
     expect(slashQueryFromInput("show /history")).toBeNull();
   });
 
-  it("filters by command metadata", () => {
+  it("filters only by command-name prefix, case-insensitively", () => {
     expect(filterSlashCommands(commands, "his", []).map((command) => command.command)).toEqual(["/history"]);
-    expect(filterSlashCommands(commands, "preset", []).map((command) => command.command)).toEqual(["/model"]);
+    expect(filterSlashCommands(commands, "MoD", []).map((command) => command.command)).toEqual(["/model"]);
+    expect(filterSlashCommands(commands, "preset", [])).toEqual([]);
+    expect(filterSlashCommands(commands, "istory", [])).toEqual([]);
   });
 
   it("keeps every available command reachable beyond the first eight results", () => {
     const available = ["/new", "/restart", "/status", "/model", "/history", "/history-dag", "/goal", "/help", "/pairing", "/last-compaction"]
       .map((command) => ({ command, title: command, description: "Available command", icon: "activity", argHint: "" }));
     expect(filterSlashCommands(available, "", [])).toEqual(available);
-    expect(filterSlashCommands(available, "available", [])).toEqual(available);
     for (const command of available) {
       expect(filterSlashCommands(available, slashQueryFromInput(command.command)!, [])).toContainEqual(command);
     }
@@ -70,6 +71,21 @@ describe("AgentCommandPalette", () => {
       expect(matches.filter((command) => command.command === "/stop")).toEqual([stopCommand]);
     }
     expect(filterSlashCommands(buildVisibleSlashCommands(commands, false, stopCommand, "model"), "model", [])).not.toContainEqual(stopCommand);
+  });
+
+  it("does not suggest /new when its description contains Stop", () => {
+    const stopCommand: SlashCommandPaletteItem = { command: "/stop", title: "Stop", description: "Cancel turn", icon: "square", argHint: "", synthetic: true };
+    const available = [
+      ...commands,
+      { command: "/new", title: "New chat", description: "Stop the current task and start a fresh conversation.", icon: "square-pen", argHint: "" }
+    ];
+    for (const isSending of [false, true]) {
+      for (const [input, expected] of [["/s", ["/stop", "/status"]], ["/stop", ["/stop"]]] as const) {
+        const query = slashQueryFromInput(input)!;
+        const visible = buildVisibleSlashCommands(available, isSending, stopCommand, query);
+        expect(filterSlashCommands(visible, query, []).map((command) => command.command)).toEqual(expected);
+      }
+    }
   });
 
   it("localizes builtin command titles and descriptions for Chinese UI", () => {

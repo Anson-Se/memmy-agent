@@ -248,8 +248,7 @@ export function updateRecentSlashCommands(command: string, previous: string[]): 
 }
 
 function commandMatchesQuery(command: SlashCommandPaletteItem, query: string): boolean {
-  return [command.command, command.title, command.description, command.argHint]
-    .some((value) => value.toLowerCase().includes(query));
+  return command.command.toLowerCase().startsWith(`/${query}`);
 }
 
 function sortByRecent(commands: SlashCommandPaletteItem[], recentCommands: string[]): SlashCommandPaletteItem[] {
