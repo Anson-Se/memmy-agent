@@ -210,7 +210,7 @@ function narrowBrowserToolDefinition(tool: any): BrowserToolDefinition {
     delete definition.inputSchema.properties.tabDisposition;
   }
   if (definition.name === 'browser_snapshot' || definition.name === 'browser_find') {
-    definition.description += ' Connected Memmy, Chrome and Edge pages return current semantic controls, visible text, state and element references. Use the exact returned reference for the next element action. Memmy in-app tabs have no screenshots, image previews or snapshot boxes.';
+    definition.description += ' Connected Memmy, Chrome and Edge pages return current semantic controls, visible text, state and element references in page order; indentation shows the dialog, form, table row, list or frame an element belongs to, and browser_find names that location. Use the exact returned reference for the next element action. Memmy in-app tabs have no screenshots, image previews or snapshot boxes.';
   }
   if (definition.name === 'browser_press_key') {
     definition.description += ' In a Chrome/Edge tab, keys reach only the page; browser shortcuts such as switching tabs or Back do nothing. Use browser_select_tab to show another tab.';

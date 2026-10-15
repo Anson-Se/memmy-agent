@@ -28,6 +28,19 @@ describe("external browser tool adapter", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('renders observed structure as indentation and found elements with their location', async () => {
+    const command = vi.fn(async (_claim, operation) => operation === 'snapshot'
+      ? { nodes: [{ ref: '', role: 'row', name: '044001 | 1000.00', value: '', depth: 0 },
+        { ref: 'pw-1', role: 'button', name: 'Delete', value: '', depth: 1 }] }
+      : { nodes: [{ ref: 'pw-2', role: 'button', name: 'Delete', value: '', context: 'table > row "044001 | 1000.00"' }] });
+    const bridge = { command } as unknown as ExternalBrowserBridge;
+    const embedded = { ...claim, browser: 'memmy' as const };
+    expect(await callExternalBrowserTool(bridge, embedded, scope, 'browser_snapshot', {}, async () => true))
+      .toEqual([{ type: 'text', text: 'row "044001 | 1000.00"\n  [pw-1] button "Delete"' }]);
+    expect(await callExternalBrowserTool(bridge, embedded, scope, 'browser_find', { text: 'Delete' }, async () => true))
+      .toEqual([{ type: 'text', text: '[pw-2] button "Delete" in "table > row \\"044001 | 1000.00\\""' }]);
+  });
+
   it('cancels a pending preview with the turn and never publishes its late response', async () => {
     const controller = new AbortController();
     let resolve!: (value: unknown) => void;

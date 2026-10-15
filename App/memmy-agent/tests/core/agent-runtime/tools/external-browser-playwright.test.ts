@@ -314,6 +314,41 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     expect(command.mock.calls.map(call => call[1])).toEqual(frameAllowed ? ['screenshot', 'historyState'] : []);
   });
 
+  it('observes fields beside their labels and actions inside their table row, dialog and frame', async () => {
+    await page.setContent(`<style>.action{cursor:pointer}</style><form><div><span>Invoice date</span><div><input placeholder="Pick a date"></div></div>
+      <div class="action">Search</div></form>
+      <table><tr><td>044001</td><td>1000.00</td><td><button>Delete</button></td></tr>
+      <tr><td>044002</td><td>2000.00</td><td><button>Delete</button></td></tr></table>
+      <div role="dialog" aria-modal="true"><h3>Confirm issue</h3><button>Confirm</button></div>
+      <iframe src="${origin.replace('127.0.0.1', 'localhost')}/frame"></iframe>`);
+    bridge.claim.url = page.url();
+    await page.locator('iframe').contentFrame().locator('#inside').waitFor();
+    const { nodes } = await run('snapshot');
+    const at = (role: string, name: string) => nodes.findIndex((node: any) => node.role === role && node.name === name);
+    expect(at('textbox', 'Pick a date')).toBe(at('text', 'Invoice date') + 1);
+    expect(nodes[at('text', 'Search')].state).toMatchObject({ clickable: true });
+    const row = at('row', '044002 | 2000.00 | Delete');
+    expect(row).toBeGreaterThan(-1);
+    expect(nodes.slice(row + 1).find((node: any) => node.role === 'button')).toMatchObject({ name: 'Delete', depth: nodes[row].depth + 1 });
+    expect(nodes[at('dialog', 'Confirm issue')]).toMatchObject({ ref: '', state: { modal: true } });
+    const frame = at('iframe', new URL(origin.replace('127.0.0.1', 'localhost')).host);
+    expect(nodes[frame + 1]).toMatchObject({ name: 'Frame name', depth: nodes[frame].depth + 1 });
+    const found = await run('find', { text: 'Delete' });
+    expect(found.nodes.map((node: any) => node.context)).toEqual(['table > row "044001 | 1000.00 | Delete"', 'table > row "044002 | 2000.00 | Delete"']);
+    const inFrame = await run('find', { text: 'Frame action' });
+    expect(inFrame.nodes[0].context).toMatch(/^iframe localhost:/);
+  });
+
+  it('keeps the labels beside controls before unrelated text when a page is over budget', async () => {
+    await page.setContent(`${Array.from({ length: 1500 }, (_, index) => `<p>Background ${index} ${'x'.repeat(40)}</p>`).join('')}
+      <form><span>Buyer tax ID</span><input placeholder="Required"></form>`);
+    bridge.claim.url = page.url();
+    const { nodes, truncated } = await run('snapshot');
+    expect(truncated).toBe(true);
+    const field = nodes.findIndex((node: any) => node.role === 'textbox' && node.name === 'Required');
+    expect(nodes[field - 1]).toMatchObject({ role: 'text', name: 'Buyer tax ID' });
+  });
+
   it('reports a confirmation it dismissed and accepts it only when asked', async () => {
     await page.setContent(`<button id="issue" onclick="document.querySelector('#state').textContent = confirm('Issue the invoice?') ? 'Issued' : 'Kept'">Issue</button><p id="state">Draft</p>`);
     // The fixture's own Playwright connection must leave the dialog to the executor.

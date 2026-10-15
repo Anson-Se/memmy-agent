@@ -4,7 +4,8 @@ import type { BrowserScope } from './browser.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
 import { ExternalBrowserPlaywrightRelay, type BrowserExecutionDiagnostics, type PlaywrightCommandBridge } from './external-browser-playwright-relay.js';
 
-type NodeInfo = { ref: string; role: string; name: string; value: string; state?: Record<string, unknown> };
+type NodeInfo = { ref: string; role: string; name: string; value: string; state?: Record<string, unknown>;
+  depth?: number; context?: string };
 export const EXTERNAL_BROWSER_SNAPSHOT_BUDGET = { nodes: 800, characters: 60_000, frames: 32 } as const;
 type Reference = NodeInfo & { framePath: number[]; url: string; timeOrigin: number };
 // Observations belong to the task, while a CDP connection can be recycled
@@ -31,25 +32,56 @@ const replacedPages = new WeakMap<object, number | undefined>();
 
 // This standards-based DOM view assigns refs to real Elements (including the
 // parents of visible text nodes). Playwright's public locators execute actions.
+// Output follows document order under named structural containers (dialogs,
+// forms, table rows, lists, groups), so a field sits beside its label and a
+// row action beside its row. Over budget, controls and the text sharing their
+// container are kept before other text.
 function snapshotExpression(nonce: string, query?: { text?: string; regex?: string }): string {
   return `(() => {
-    const nonce=${JSON.stringify(nonce)}, query=${JSON.stringify(query ?? {})}, nodes=[], seen=new Set();
+    const nonce=${JSON.stringify(nonce)}, query=${JSON.stringify(query ?? {})};
     // The map lives in the page's main world, where frame.evaluateHandle can
     // retrieve the exact original node. It is replaced on every observation.
     const refs=new Map();
     Object.defineProperty(globalThis,Symbol.for('memmy.playwright.element.refs'),
       {value:refs,writable:true,configurable:true});
-    let characters=0,scanned=0,truncated=false;
+    let scanned=0,truncated=false;
     const raw=query.regex||'', match=/^\\/(.*)\\/([imsu]*)$/.exec(raw);
     const pattern=raw?(match?new RegExp(match[1],match[2]):new RegExp(raw)):null;
+    const filtering=!!(pattern||query.text);
     const matches=value => pattern?pattern.test(value):!query.text||value.toLowerCase().includes(query.text.toLowerCase());
-    const visible=el => !!el.getClientRects().length && getComputedStyle(el).visibility!=='hidden';
-    const clean=value => String(value||'').replace(/\\s+/g,' ').trim().slice(0,1000);
-    const role=el => el.getAttribute('role') || ({BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox',A:el.hasAttribute('href')?'link':'',SUMMARY:'button',DIALOG:'dialog'}[el.tagName]) || (el.tagName==='INPUT' ? ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',range:'slider'}[el.type]||'textbox') : /^H[1-6]$/.test(el.tagName)?'heading':'');
+    const style=el => getComputedStyle(el);
+    const visible=el => !!el.getClientRects().length && style(el).visibility!=='hidden';
+    const clean=value => String(value||'').slice(0,4000).replace(/\\s+/g,' ').trim().slice(0,1000);
+    const explicitRole=el => { const value=el.getAttribute('role'); return value&&!/^(presentation|none|generic)$/.test(value)?value:''; };
+    const role=el => explicitRole(el) || ({BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox',A:el.hasAttribute('href')?'link':'',SUMMARY:'button'}[el.tagName]) || (el.tagName==='INPUT' ? ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',range:'slider'}[el.type]||'textbox') : /^H[1-6]$/.test(el.tagName)?'heading':'');
     const name=el => clean(el.getAttribute('aria-label') || (el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.textContent||'').join(' ').trim() || Array.from(el.labels||[]).map(label=>label.innerText).join(' ') || el.getAttribute('alt') || (['INPUT','TEXTAREA'].includes(el.tagName)?el.getAttribute('placeholder'):el.innerText) || el.getAttribute('title'));
-    const add=(el,r,n) => {
-      if(seen.has(el)||!visible(el)||el.closest('[aria-hidden="true"]'))return;
-      seen.add(el); const ref='pw-'+nonce+'-'+nodes.length;
+    const INTERACTIVE=/^(button|link|textbox|searchbox|combobox|checkbox|radio|switch|slider|spinbutton|tab|menuitem|menuitemcheckbox|menuitemradio|option|treeitem)$/;
+    const CONTAINER=/^(dialog|alertdialog|form|table|grid|treegrid|row|list|listbox|menu|menubar|tablist|tabpanel|tree|group|radiogroup|region|navigation|main|complementary|search|toolbar)$/;
+    const containerRole=el => {
+      const value=explicitRole(el);
+      if(value)return CONTAINER.test(value)?value:'';
+      if(el.tagName==='FORM')return el.elements.length?'form':'';
+      if(el.tagName==='SECTION')return el.hasAttribute('aria-label')||el.hasAttribute('aria-labelledby')?'region':'';
+      return ({DIALOG:'dialog',TABLE:'table',TR:'row',UL:'list',OL:'list',FIELDSET:'group',NAV:'navigation',MAIN:'main',ASIDE:'complementary'})[el.tagName]||'';
+    };
+    const textOf=(el,limit) => {
+      if(!el)return '';
+      const walker=document.createTreeWalker(el,4); let text='',node,count=0;
+      while((node=walker.nextNode())&&text.length<limit&&count++<200) {
+        if(!/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(node.parentElement?.tagName||''))text+=' '+node.nodeValue;
+      }
+      return clean(text).slice(0,limit);
+    };
+    const containerName=(el,r) => {
+      const own=clean(el.getAttribute('aria-label')||(el.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent||'').join(' ')).slice(0,160);
+      if(own)return own;
+      if(el.tagName==='FIELDSET')return textOf(el.querySelector(':scope>legend'),120);
+      if(r==='dialog'||r==='alertdialog')return textOf(el.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]'),120);
+      if(r==='row')return [...el.children].slice(0,4).map(cell=>textOf(cell,60)).filter(Boolean).join(' | ').slice(0,160);
+      if(el.tagName==='TABLE')return textOf(el.querySelector(':scope>caption'),120);
+      return '';
+    };
+    const stateOf=el => {
       const state={};
       for(const [attribute,key] of [['aria-checked','checked'],['aria-expanded','expanded'],['aria-selected','selected'],['aria-disabled','disabled']]) {
         if(el.hasAttribute(attribute))state[key]=el.getAttribute(attribute)==='true'?true:el.getAttribute(attribute)==='false'?false:el.getAttribute(attribute);
@@ -62,34 +94,77 @@ function snapshotExpression(nonce: string, query?: { text?: string; regex?: stri
         state.options=filtered.slice(0,25).map(option=>({label:clean(option.text).slice(0,200),value:String(option.value).slice(0,200),selected:option.selected,disabled:option.disabled}));
         if(filtered.length>25)state.optionsTruncated=true;
       }
-      const node={ref,role:r||'text',name:clean(n),value:el.tagName==='INPUT'&&el.type==='password'?'':clean(el.value),...(Object.keys(state).length?{state}:{})};
-      if(!matches(node.role+' '+node.name+' '+node.value+' '+JSON.stringify(state)))return;
-      const size=JSON.stringify(node).length;
-      if(nodes.length>=600||characters+size>40000){truncated=true;return;}
-      characters+=size;refs.set(ref,new WeakRef(el));nodes.push(node);
+      return state;
     };
-    const controls=root => {
-      for(const el of root.querySelectorAll('button,a[href],input,select,textarea,summary,[role]')) {
-        if(++scanned>15000){truncated=true;break;}
-        const r=role(el);if(/^(button|link|textbox|combobox|checkbox|radio|switch|slider|spinbutton|tab|menuitem|menuitemcheckbox|menuitemradio)$/.test(r))add(el,r,name(el));
-      }
+    const entries=[], seen=new Set(), stack=[];
+    const add=(el,r,n,depth,text) => {
+      if(entries.length>=5000){truncated=true;return;}
+      if((!text&&seen.has(el))||!visible(el)||el.closest('[aria-hidden="true"]'))return;
+      if(!text)seen.add(el);
+      const state=text?{}:stateOf(el);
+      // Pages often build buttons from styled text; the pointer cursor says it acts.
+      if((text||!INTERACTIVE.test(r))&&style(el).cursor==='pointer')state.clickable=true;
+      const node={role:r||'text',name:clean(n),value:text||(el.tagName==='INPUT'&&el.type==='password')?'':clean(el.value),
+        ...(Object.keys(state).length?{state}:{})};
+      if(filtering&&!matches(node.role+' '+node.name+' '+node.value+' '+JSON.stringify(state)))return;
+      entries.push({node,el,depth,control:INTERACTIVE.test(node.role),owner:stack.at(-1),
+        ...(filtering?{context:stack.map(container=>container.label).join(' > ').slice(0,240)}:{})});
     };
-    const walk=(root,scan=false) => {
-      if(scan)controls(root);
+    const walk=(root,depth) => {
       for(const child of root.childNodes) {
-        if(++scanned>15000||nodes.length>=600){truncated=true;break;}
+        if(++scanned>30000){truncated=true;return;}
         if(child.nodeType===1) {
-          if(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','IFRAME'].includes(child.tagName))continue;
-          const r=role(child); if(r)add(child,r,name(child));
-          if(child.shadowRoot)walk(child.shadowRoot,true);
-          walk(child);
-        } else if(child.nodeType===3&&clean(child.textContent)) {
+          if(/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|FRAME)$/.test(child.tagName)||child.getAttribute('aria-hidden')==='true')continue;
+          const containerKind=containerRole(child);
+          let inner=depth, container=null;
+          if(containerKind&&visible(child)) {
+            const containerLabel=containerName(child,containerKind);
+            container={container:true,role:containerKind,name:containerLabel,depth,start:entries.length,end:entries.length,
+              label:containerKind+(containerLabel?' "'+containerLabel+'"':''),
+              modal:/dialog/.test(containerKind)&&(child.getAttribute('aria-modal')==='true'||child.matches(':modal'))};
+            entries.push(container); stack.push(container); inner=depth+1;
+          } else if(!containerKind) {
+            const r=role(child); if(r)add(child,r,name(child),depth);
+          }
+          if(child.shadowRoot)walk(child.shadowRoot,inner);
+          walk(child,inner);
+          if(container){stack.pop(); container.end=entries.length;}
+        } else if(child.nodeType===3&&child.textContent.trim()) {
           const parent=child.parentElement,el=parent?.tagName==='LABEL'&&parent.control?parent.control:parent;
-          if(el)add(el,role(el)||'text',role(el)?name(el):el.innerText||child.textContent);
+          if(!el)continue;
+          // Text directly inside a container is kept as text; the container itself is not a node.
+          if(containerRole(el))add(el,'text',child.textContent,depth,child.textContent);
+          else add(el,role(el)||'text',role(el)?name(el):el.innerText||child.textContent,depth);
         }
       }
     };
-    walk(document.body||document.documentElement,true);
+    walk(document.body||document.documentElement,0);
+    // A page longer than the scan still offers its remaining controls.
+    if(scanned>30000)for(const el of document.querySelectorAll('button,a[href],input,select,textarea,summary,[role]')) {
+      if(entries.length>=5000)break;
+      const r=role(el); if(INTERACTIVE.test(r))add(el,r,name(el),0);
+    }
+    const leaves=entries.filter(entry=>!entry.container);
+    const actionable=new Set(leaves.filter(entry=>entry.control).map(entry=>entry.owner));
+    let count=0,characters=0;
+    for(const level of [0,1,2])for(const entry of leaves) {
+      if((entry.control?0:actionable.has(entry.owner)?1:2)!==level)continue;
+      const size=JSON.stringify(entry.node).length+24;
+      if(count>=600||characters+size>40000){truncated=true;continue;}
+      entry.keep=true; count++; characters+=size;
+    }
+    const nodes=[]; let next=0;
+    for(const [index,entry] of entries.entries()) {
+      if(entry.container) {
+        if(filtering||!entries.slice(index+1,entry.end).some(inner=>inner.keep))continue;
+        nodes.push({ref:'',role:entry.role,name:entry.name,value:'',depth:entry.depth,...(entry.modal?{state:{modal:true}}:{})});
+        continue;
+      }
+      if(!entry.keep)continue;
+      const ref='pw-'+nonce+'-'+(next++);
+      refs.set(ref,new WeakRef(entry.el));
+      nodes.push({ref,...entry.node,...(filtering?(entry.context?{context:entry.context}:{}):{depth:entry.depth})});
+    }
     return {nodes,timeOrigin:performance.timeOrigin,url:location.href,truncated};
   })()`;
 }
@@ -136,12 +211,21 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
       skippedFrames++; truncated = true; return;
     }
     truncated ||= captured.truncated;
-    for (const node of captured.nodes) {
+    // Embedded frame content follows the page, under a line naming the frame's host.
+    let host = '';
+    try { host = new URL(captured.url).host; } catch { /* about:blank and srcdoc frames have no host. */ }
+    const frameNodes = embedded && captured.nodes.length
+      ? [{ ref: '', role: 'iframe', name: host, value: '', ...(query ? {} : { depth: framePath.length - 1 }) }, ...captured.nodes.map(node => query
+        ? { ...node, context: [`iframe ${host}`.trim(), node.context].filter(Boolean).join(' > ') }
+        : { ...node, depth: (node.depth ?? 0) + framePath.length })]
+      : captured.nodes;
+    for (const node of frameNodes) {
+      if (query && !node.ref) continue;
       const size = JSON.stringify(node).length;
       if (nodes.length >= EXTERNAL_BROWSER_SNAPSHOT_BUDGET.nodes
         || characters + size > EXTERNAL_BROWSER_SNAPSHOT_BUDGET.characters) { truncated = true; continue; }
       characters += size;
-      refs.set(node.ref, { ...node, framePath, url: captured.url, timeOrigin: captured.timeOrigin });
+      if (node.ref) refs.set(node.ref, { ...node, framePath, url: captured.url, timeOrigin: captured.timeOrigin });
       nodes.push(node);
     }
     for (const [index, child] of frame.childFrames().entries()) await visit(child, [...framePath, index]);

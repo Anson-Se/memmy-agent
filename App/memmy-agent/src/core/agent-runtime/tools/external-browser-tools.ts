@@ -65,9 +65,11 @@ export async function emitExternalBrowserFrame(
 function formatNodes(nodes: unknown, truncated = false): string {
   if (!Array.isArray(nodes)) return "No accessible elements.";
   const rendered = nodes.map((node: any) => {
+    const indent = Number.isInteger(node.depth) && node.depth > 0 ? '  '.repeat(Math.min(node.depth, 12)) : '';
     const label = [node.name, node.value].filter(Boolean).map((value: string) => JSON.stringify(value)).join(" ");
     const state = node.state && typeof node.state === 'object' ? ` state=${JSON.stringify(node.state)}` : '';
-    return `${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label ? ` ${label}` : ""}${state}`;
+    const context = typeof node.context === 'string' && node.context ? ` in ${JSON.stringify(node.context)}` : '';
+    return `${indent}${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label ? ` ${label}` : ""}${state}${context}`;
   }).join("\n");
   return (truncated || rendered.length > 150_000
     ? '[Observation truncated by the page budget. Use a narrow browser_find query or a unique locator for more detail.]\n' : '')
