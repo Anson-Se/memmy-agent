@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import {
   Activity,
   BookOpen,
@@ -17,7 +18,6 @@ import type { MemmyAgentSlashCommand } from "../api/memmy-agent-client.js";
 import type { MessageKey, ResolvedLanguage } from "../i18n/messages.js";
 
 export const RECENT_SLASH_COMMANDS_STORAGE_KEY = "memmy-agent-recent-slash-commands";
-export const MAX_VISIBLE_SLASH_COMMANDS = 8;
 export const MAX_RECENT_SLASH_COMMANDS = 5;
 
 export type SlashCommandPaletteItem = MemmyAgentSlashCommand & {
@@ -132,6 +132,13 @@ export function localizeSlashCommands(
 }
 
 export function AgentCommandPalette(props: AgentCommandPaletteProps) {
+  const selectedOptionRef = useRef<HTMLButtonElement>(null);
+  const selectedCommand = props.commands[props.selectedIndex]?.command;
+
+  useEffect(() => {
+    selectedOptionRef.current?.scrollIntoView({ block: "nearest" });
+  }, [props.selectedIndex, selectedCommand]);
+
   if (!props.commands.length) {
     return null;
   }
@@ -156,6 +163,7 @@ export function AgentCommandPalette(props: AgentCommandPaletteProps) {
               type="button"
               role="option"
               aria-selected={selected}
+              ref={selected ? selectedOptionRef : undefined}
               onClick={() => props.onSelect(command)}
               className={`w-full rounded-btn px-2.5 py-2 text-left cursor-pointer transition-colors flex items-start gap-2.5 ${selected ? "bg-canvas-oat/80" : "hover:bg-canvas-oat/50"}`}
             >
@@ -203,7 +211,7 @@ export function filterSlashCommands(
   const matched = normalizedQuery
     ? commands.filter((command) => commandMatchesQuery(command, normalizedQuery))
     : sortByRecent(commands, recentCommands);
-  return matched.slice(0, MAX_VISIBLE_SLASH_COMMANDS);
+  return matched;
 }
 
 export function readRecentSlashCommands(storage: SlashCommandStorageLike | null = browserStorage()): string[] {

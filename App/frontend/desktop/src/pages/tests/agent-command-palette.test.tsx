@@ -29,10 +29,19 @@ describe("AgentCommandPalette", () => {
     expect(slashQueryFromInput("show /history")).toBeNull();
   });
 
-  it("filters by command metadata and caps visible results", () => {
+  it("filters by command metadata", () => {
     expect(filterSlashCommands(commands, "his", []).map((command) => command.command)).toEqual(["/history"]);
     expect(filterSlashCommands(commands, "preset", []).map((command) => command.command)).toEqual(["/model"]);
-    expect(filterSlashCommands([...commands, ...commands, ...commands], "", [])).toHaveLength(8);
+  });
+
+  it("keeps every available command reachable beyond the first eight results", () => {
+    const available = ["/new", "/restart", "/status", "/model", "/history", "/history-dag", "/goal", "/help", "/pairing", "/last-compaction"]
+      .map((command) => ({ command, title: command, description: "Available command", icon: "activity", argHint: "" }));
+    expect(filterSlashCommands(available, "", [])).toEqual(available);
+    expect(filterSlashCommands(available, "available", [])).toEqual(available);
+    for (const command of available) {
+      expect(filterSlashCommands(available, slashQueryFromInput(command.command)!, [])).toContainEqual(command);
+    }
   });
 
   it("orders empty-query results by recent commands without storing /stop", () => {
