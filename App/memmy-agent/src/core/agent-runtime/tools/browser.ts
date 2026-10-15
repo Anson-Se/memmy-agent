@@ -215,6 +215,10 @@ function narrowBrowserToolDefinition(tool: any): BrowserToolDefinition {
   if (definition.name === 'browser_press_key') {
     definition.description += ' In a Chrome/Edge tab, keys reach only the page; browser shortcuts such as switching tabs or Back do nothing. Use browser_select_tab to show another tab.';
   }
+  if (['browser_click', 'browser_type', 'browser_select_option', 'browser_press_key'].includes(definition.name)) {
+    definition.inputSchema.properties.acceptDialog = { type: 'boolean',
+      description: 'Memmy, Chrome and Edge pages: accept an alert/confirm/prompt this action opens. Dialogs are otherwise dismissed and reported as dialogs in the result. Set it only after seeing that report and only when the task requires accepting.' };
+  }
   if (['browser_click', 'browser_type', 'browser_select_option'].includes(definition.name)) {
     definition.description += ' For connected Memmy, Chrome and Edge pages, prefer the exact element reference from the latest snapshot. Unique CSS selectors, text=substring and CSS selectors ending in :has-text("substring") are supported. Multiple matches require a more precise target or an explicit >> nth=N suffix. Actions wait for the target to be usable and return a fresh observation for verifying the result. A stale, hidden or covered target requires a fresh snapshot; do not infer the selected-tab state from a locator error.';
   }
@@ -1290,6 +1294,8 @@ export class BrowserSessionManager {
         return Array.isArray(result) ? convertMcpToolContent({ content: this.withExternalDownloadInstruction(result, downloadPath) }, 'structured') : result;
       }
     }
+    // Only in-app and extension tabs take acceptDialog.
+    delete browserParams.acceptDialog;
     if (this.config.enabled && this.embeddedBridge && this.embeddedRouter
       && name === 'browser_navigate' && !abortSignal?.aborted
       && (openNewTab || (!this.embeddedRouter.hasBinding(scope)

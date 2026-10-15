@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import type { Browser, ElementHandle, Frame, Locator, Page } from 'playwright';
+import type { Browser, Dialog, ElementHandle, Frame, Locator, Page } from 'playwright';
 import type { BrowserScope } from './browser.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
 import { ExternalBrowserPlaywrightRelay, type BrowserExecutionDiagnostics, type PlaywrightCommandBridge } from './external-browser-playwright-relay.js';
@@ -266,6 +266,11 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
     const abort = () => { void dispose(session!); };
     signal?.addEventListener('abort', abort, { once: true });
     let documentEpoch: number | undefined;
+    const dialogs: Array<{ type: string; handled: 'accepted' | 'dismissed'; message?: string }> = [];
+    let removeDialogListener = () => undefined as unknown;
+    const withDialogs = <T extends Record<string, any>>(result: T): T => dialogs.length ? { ...result, dialogs,
+      ...(dialogs.some(dialog => dialog.handled === 'dismissed' && dialog.type !== 'alert')
+        ? { dialogNote: 'The page asked for confirmation and it was dismissed. Repeat the action with acceptDialog: true only if the task requires accepting.' } : {}) } : result;
     try {
       if (claim.browser === 'memmy' && action === 'screenshot') throw new Error('Screenshots are not supported for Memmy in-app browser tabs');
       const uploadPaths = action === 'upload' ? args.paths as string[] : undefined;
@@ -310,6 +315,17 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         }
       };
       session.relay.setStage(action);
+      // Dialogs are dismissed unless the caller asked to accept them; either way
+      // the result reports them, since a dismissed confirm usually stops the step.
+      const blockedFrames = session.relay.hasBlockedFrames();
+      const onDialog = (dialog: Dialog) => {
+        const accept = args.acceptDialog === true && INPUT_ACTIONS.has(action);
+        dialogs.push({ type: dialog.type(), handled: accept ? 'accepted' : 'dismissed',
+          ...(blockedFrames ? {} : { message: dialog.message().slice(0, 500) }) });
+        void (accept ? dialog.accept() : dialog.dismiss()).catch(() => undefined);
+      };
+      page.on('dialog', onDialog);
+      removeDialogListener = () => page.off('dialog', onDialog);
       const actionSession = session;
       const perform = async (): Promise<Record<string, any>> => {
         switch (action) {
@@ -409,7 +425,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       };
       // frame.evaluate can wait for an execution-context event without an
       // outstanding CDP command. Its wait is not covered by locator timeouts.
-      return await Promise.race([perform(), session.relay.waitForInterruption()]);
+      return withDialogs(await Promise.race([perform(), session.relay.waitForInterruption()]));
     } catch (error) {
       error = session.relay.actionError ?? error;
       outcome = signal?.aborted ? 'cancelled' : 'failed';
@@ -421,16 +437,16 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none' && replaced
         && !(error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain) {
         // Input was sent and then the tab moved to a new document, as a submit or link does.
-        const result = { ok: dispatchState === 'confirmed', dispatchState, inputDispatched: dispatchState === 'confirmed',
-          noActionDispatched: false, pageChanged: true };
+        const result = withDialogs({ ok: dispatchState === 'confirmed', dispatchState, inputDispatched: dispatchState === 'confirmed',
+          noActionDispatched: false, pageChanged: true });
         replacedPages.set(result, documentEpoch);
         return result;
       }
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none') {
-        return { ok: false, dispatchState, inputDispatched: dispatchState === 'confirmed',
+        return withDialogs({ ok: false, dispatchState, inputDispatched: dispatchState === 'confirmed',
           noActionDispatched: false, freshObservationRequired: true, error: message,
           ...((error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain
-            ? { inputTargetUncertain: true } : {}) };
+            ? { inputTargetUncertain: true } : {}) });
       }
       const failure = error instanceof Error && !signal?.aborted ? error : new Error(message);
       Object.assign(failure, { dispatchState, noActionDispatched: dispatchState === 'none', freshObservationRequired: true });
@@ -439,6 +455,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
         : ' Input may already have been dispatched; take a fresh observation before acting.';
       throw failure;
     } finally {
+      removeDialogListener();
       signal?.removeEventListener('abort', abort);
       await session.relay.end();
       if (sessions.get(key) === session) {

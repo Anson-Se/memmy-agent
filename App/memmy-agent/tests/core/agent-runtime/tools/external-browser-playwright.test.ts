@@ -314,6 +314,20 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     expect(command.mock.calls.map(call => call[1])).toEqual(frameAllowed ? ['screenshot', 'historyState'] : []);
   });
 
+  it('reports a confirmation it dismissed and accepts it only when asked', async () => {
+    await page.setContent(`<button id="issue" onclick="document.querySelector('#state').textContent = confirm('Issue the invoice?') ? 'Issued' : 'Kept'">Issue</button><p id="state">Draft</p>`);
+    // The fixture's own Playwright connection must leave the dialog to the executor.
+    page.on('dialog', () => undefined);
+    const dismissed = await run('click', { target: '#issue' });
+    expect(dismissed).toMatchObject({ ok: true, dialogs: [{ type: 'confirm', handled: 'dismissed', message: 'Issue the invoice?' }],
+      dialogNote: expect.stringMatching(/acceptDialog/) });
+    expect(await page.locator('#state').textContent()).toBe('Kept');
+    const accepted = await run('click', { target: '#issue', acceptDialog: true });
+    expect(accepted).toMatchObject({ ok: true, dialogs: [{ type: 'confirm', handled: 'accepted' }] });
+    expect(accepted).not.toHaveProperty('dialogNote');
+    expect(await page.locator('#state').textContent()).toBe('Issued');
+  });
+
   it('reports input that replaced the page as done and returns the new page', async () => {
     await page.setContent(`<a href="${origin}/journey/receipt?applicant=Ada">Send</a>`);
     bridge.claim.url = page.url();
