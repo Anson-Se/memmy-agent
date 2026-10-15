@@ -276,8 +276,8 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
     ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n此操作可修改当前网页或浏览器状态。始终允许可在浏览器设置的「网站权限」中撤销。`
       : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation can modify the current page or browser state. Revoke a saved grant in Browser settings → Website permissions.`)
     : capability === 'debug'
-    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n本次操作为只读。始终允许将保存此网站的 Debug / CDP 权限，可在浏览器设置中撤销。`
-      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation is read-only. Always allow saves this site's Debug / CDP permission; revoke it in Browser settings.`)
+    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n本次操作为只读。始终允许会保存此网站的 Debug / CDP 权限，之后包括可修改页面的操作也不再询问，可在浏览器设置中撤销。`
+      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation is read-only. Always allow saves this site's Debug / CDP permission, so later operations that can change the page will not ask either; revoke it in Browser settings.`)
     : (chinese ? `站点：${origin}\n文件：${names.join('、')}\n仅本次${direction}有效。`
       : `Site: ${origin}\nFiles: ${names.join(', ')}\nApplies only to this ${direction}.`);
   const message = capability === 'debug-write'
@@ -305,7 +305,10 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
   if (approvalWindow.isDestroyed() || (choice.response !== 1 && !(isDebug && choice.response === 2))) return false;
   try {
     const store = new BrowserUseSitePolicyStore(dirname(configPath));
-    if (isDebug && choice.response === 2) return rememberBrowserCdpGrant(store, origin);
+    if (isDebug && choice.response === 2) {
+      return rememberBrowserCdpGrant(store, origin,
+        new BrowserAccessStore(dirname(configPath)).list().find(entry => entry.origin === origin)?.decision);
+    }
     return browserSiteDecision(origin,
       capability === 'download' ? 'downloads' : capability === 'upload' ? 'uploads' : 'fullCdp') !== 'block';
   } catch { return false; }
@@ -587,7 +590,8 @@ async function boot(): Promise<void> {
           const configPath = runtimeServices?.agentGateway.configPath;
           if (!choice || !configPath || !Number.isSafeInteger(request.tabId) || !isCurrentChild()
             || embeddedBrowserDriver.uploadOrigin(request.tabId!) !== choice.origin
-            || (choice.allow && browserSiteDecision(choice.origin, 'access') === 'block')) {
+            || (choice.allow && (browserSiteDecision(choice.origin, 'access') === 'block'
+              || browserAllowAllStore()?.siteRuleDecision(choice.origin, 'access') === 'block'))) {
             throw new Error('Browser permission target is no longer current');
           }
           new BrowserSitePermissions(dirname(configPath)).set(choice.origin, choice.permission, choice.allow);

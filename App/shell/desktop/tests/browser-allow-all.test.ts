@@ -38,6 +38,16 @@ describe('browser global authorization', () => {
     expect(browser.decision('https://example.test', 'fullCdp')).toBe('block');
   });
 
+  it('still reports a site block to grants that outlive the global switch', () => {
+    const { browser, sites } = fixture();
+    sites.upsert({ pattern: 'https://blocked.test', access: 'block', downloads: 'ask', uploads: 'ask', fullCdp: 'ask' });
+    browser.setEnabled(true);
+    expect(browser.decision('https://blocked.test', 'access')).toBe('allow');
+    expect(browser.siteRuleDecision('https://blocked.test', 'access')).toBe('block');
+    expect(browser.siteRuleDecision('https://other.test', 'access')).toBe('ask');
+    expect(browser.siteRuleDecision('file:///tmp/page', 'access')).toBe('block');
+  });
+
   it('remembers an independent website grant across restarts and parent on/off transitions', () => {
     const { data, native, browser } = fixture();
     expect(browser.setEnabled(true)).toEqual({ enabled: true, inherited: false, effective: true });

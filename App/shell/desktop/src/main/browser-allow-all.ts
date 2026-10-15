@@ -49,6 +49,14 @@ export class BrowserAllowAll {
       if (!['http:', 'https:'].includes(new URL(url).protocol)) return 'block';
       // A global grant intentionally takes precedence over every remembered site restriction.
       if (this.read().effective) return 'allow';
+      return this.siteRuleDecision(url, capability);
+    } catch { return 'block'; }
+  }
+
+  /** The site's own rule. Grants that outlive the global switch, such as device permissions, must honor it. */
+  siteRuleDecision(url: string, capability: BrowserUseCapability): BrowserUseDecision {
+    try {
+      if (!['http:', 'https:'].includes(new URL(url).protocol)) return 'block';
       return evaluateBrowserUseSiteRule(new BrowserUseSitePolicyStore(this.agentDataDirectory).list(), url, capability);
     } catch { return 'block'; }
   }

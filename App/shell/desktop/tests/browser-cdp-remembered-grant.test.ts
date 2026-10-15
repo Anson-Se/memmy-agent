@@ -33,6 +33,25 @@ describe('remembering the dialog Debug / CDP grant', () => {
       downloads: 'block', uploads: 'allow', fullCdp: 'allow' }]);
   });
 
+  it.each([['allow', 'allow'], ['deny', 'block']] as const)('carries a remembered %s access choice into the new exact rule', (remembered, access) => {
+    const policy = store();
+    expect(rememberBrowserCdpGrant(policy, 'https://example.test', remembered)).toBe(remembered === 'allow');
+    expect(policy.list()).toEqual([{ pattern: 'https://example.test', access,
+      downloads: 'ask', uploads: 'ask', fullCdp: 'allow' }]);
+  });
+
+  it('keeps decisions from a broader rule when it adds the exact rule after it', () => {
+    const policy = store();
+    policy.upsert({ pattern: 'https://**.example.test', access: 'allow', downloads: 'allow', uploads: 'block', fullCdp: 'ask' });
+    expect(rememberBrowserCdpGrant(policy, 'https://tax.example.test', 'deny')).toBe(true);
+    const rules = policy.list();
+    for (const capability of ['access', 'downloads', 'uploads'] as const) {
+      expect(evaluateBrowserUseSiteRule(rules, 'https://tax.example.test/form', capability))
+        .toBe({ access: 'allow', downloads: 'allow', uploads: 'block' }[capability]);
+    }
+    expect(evaluateBrowserUseSiteRule(rules, 'https://tax.example.test/form', 'fullCdp')).toBe('allow');
+  });
+
   it.each(['access', 'fullCdp'] as const)('respects a concurrent or wildcard %s denial', capability => {
     const policy = store();
     policy.upsert({ pattern: 'https://**.example.test', access: 'ask', downloads: 'ask',
