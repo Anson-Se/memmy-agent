@@ -100,7 +100,7 @@ describe("Weixin database location", () => {
       [files]: { directories: ["all_users", "Backup", "wxid_example_aaaa"] },
       [message]: { files: ["key_info.db", "message_0.db", "message_fts.db"] },
     }), { documentsDirectory: documents, configTexts: ["MyDocument:", documents] });
-    expect(root).toBe(String.raw`C:\Users\Grace\Documents\xwechat_files\wxid_example_aaaa\db_storage`);
+    expect(root).toBe(String.raw`C:\Users\TestUser\Documents\xwechat_files\wxid_example_aaaa\db_storage`);
   });
 
   it("discovers a moved store on another drive while Documents stays empty", () => {
