@@ -204,6 +204,8 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
       // CDP attachment. Read only location first, then check policy before DOM.
       const url = await evaluate<string>('location.href');
       if (url !== 'about:blank' && url !== 'about:srcdoc' && !allowFrame(url)) return;
+      if (embedded) await bounded(frame.waitForLoadState('domcontentloaded'),
+        EMBEDDED_FRAME_OBSERVATION_MS, 'Embedded frame did not respond');
       captured = await evaluate(snapshotExpression(`${nonce}${framePath.join('a') || 'b'}`, query));
       if (url !== captured.url) throw new Error('Browser frame changed during observation');
     } catch (error) {
