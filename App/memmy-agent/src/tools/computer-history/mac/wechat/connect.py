@@ -143,18 +143,18 @@ def temporary_copy_running(shadow):
     return False
 
 
-def current_database_root():
+def current_database_root(original=None):
     # Listing WeChat's container can wait for macOS approval, and a lost approval
     # interrupts the call; listing again requests it again.
     for attempt in range(3):
         try:
-            return _current_database_root()
+            return _current_database_root(original)
         except InterruptedError:
             if attempt == 2:
                 raise RuntimeError("wechat_data_access_interrupted") from None
 
 
-def _current_database_root():
+def _current_database_root(original=None):
     home = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
     roots = []
     for candidate in home.glob("*/db_storage"):
@@ -171,20 +171,68 @@ def _current_database_root():
 
     # Modification time can select the wrong account when two accounts have
     # recently synced. Identify the database opened by the running original.
-    pids = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True).stdout.split()
-    if pids:
-        opened = subprocess.run(["/usr/sbin/lsof", "-Fn", "-p", ",".join(pids)],
-                                capture_output=True, text=True)
-        active = set()
-        for line in opened.stdout.splitlines():
-            if not line.startswith("n"):
+    original = original or wechat_application() / "Contents/MacOS/WeChat"
+    try:
+        pids = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True,
+                              timeout=5).stdout.split()
+        pids = [pid for pid in pids if pid.isdecimal()]
+        if not pids:
+            raise RuntimeError("current_account_ambiguous")
+        processes = subprocess.run(["ps", "-ww", "-p", ",".join(pids), "-o", "pid=,comm="],
+                                   capture_output=True, text=True, timeout=5)
+        original_pids = set()
+        for line in processes.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or fields[0] not in pids:
                 continue
-            name = line[1:]
-            for candidate in roots:
-                if name.startswith(str(candidate) + os.sep):
+            try:
+                if Path(fields[1]).samefile(original):
+                    original_pids.add(fields[0])
+            except InterruptedError:
+                raise
+            except OSError:
+                continue
+        if not original_pids:
+            raise RuntimeError("current_account_ambiguous")
+        opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fpn", "-p", ",".join(sorted(original_pids))],
+                                capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        raise RuntimeError("current_account_ambiguous") from None
+
+    # Firmlinks are not symlinks: resolve() can leave lsof's /System/Volumes/Data
+    # spelling different from /Users. Match ancestor directory identities, not
+    # string prefixes, and only use database files opened by the original app.
+    root_identities = {}
+    for candidate in roots:
+        info = candidate.stat()
+        root_identities[(info.st_dev, info.st_ino)] = candidate
+    active = set()
+    current_pid = None
+    for line in opened.stdout.splitlines():
+        if line.startswith("p"):
+            current_pid = line[1:]
+            continue
+        if not line.startswith("n") or current_pid not in original_pids:
+            continue
+        name = line[1:]
+        if not name.endswith((".db", ".db-wal", ".db-shm")):
+            continue
+        try:
+            database = Path(name).resolve(strict=True)
+            if not database.is_file():
+                continue
+            for parent in database.parents:
+                info = parent.stat()
+                candidate = root_identities.get((info.st_dev, info.st_ino))
+                if candidate is not None:
                     active.add(candidate)
-        if len(active) == 1:
-            return next(iter(active))
+                    break
+        except InterruptedError:
+            raise
+        except OSError:
+            continue
+    if len(active) == 1:
+        return next(iter(active))
     raise RuntimeError("current_account_ambiguous")
 
 
@@ -303,7 +351,7 @@ def main():
         raise RuntimeError(preparation["error"] or "wechat_data_access_required")
     # A missing/inaccessible database layout is checked only after Memmy's data
     # access has been verified, so a disk-permission error is not called logout.
-    root = current_database_root()
+    root = current_database_root(original)
     if consent_id(state) != active_consent_id:
         raise RuntimeError("wechat_consent_revoked")
     shadow = Path(preparation["appPath"])
