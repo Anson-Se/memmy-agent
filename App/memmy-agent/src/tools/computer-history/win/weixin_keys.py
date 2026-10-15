@@ -1064,6 +1064,29 @@ def discover_database_root():
     return roots[0]
 
 
+def account_pages_for_capture(roots, explicit=False):
+    """A broken historical store must not hide a readable current account.
+
+    Only discovery candidates may be skipped. The selected account still needs
+    every message key and a successful production-reader baseline afterwards.
+    """
+    accounts = []
+    first_error = None
+    for root in roots:
+        try:
+            accounts.append((root, encrypted_pages(root)))
+        except (OSError, RuntimeError) as error:
+            if explicit:
+                raise
+            if first_error is None:
+                first_error = error
+    if not accounts:
+        if first_error is not None:
+            raise first_error
+        raise RuntimeError("wechat_login_required")
+    return accounts
+
+
 def select_captured_account(accounts, found):
     """Choose by cryptographic proof from running Weixin, never directory age."""
     matching = []
@@ -1191,7 +1214,7 @@ def main():
     roots = [args.root.resolve(strict=True)] if args.root else discover_database_roots()
     if any(root.name != "db_storage" for root in roots):
         raise RuntimeError("invalid_database_root")
-    accounts = [(root, encrypted_pages(root)) for root in roots]
+    accounts = account_pages_for_capture(roots, explicit=args.root is not None)
     pages = {str(index) + "/" + name: page
              for index, (_root, account_pages) in enumerate(accounts)
              for name, page in account_pages.items()}
@@ -1212,11 +1235,21 @@ def main():
     return 0
 
 
+def capture_error_category(error):
+    category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+    if category in {"invalid_database_page", "database_unreadable", "readonly_query_failed",
+                    "readonly_database_snapshot_busy", "database_baseline_failed"} or isinstance(error, OSError):
+        return "wechat_reader_unavailable"
+    if category in {"database_key_rejected", "database_key_missing", "invalid_database_key"}:
+        return "wechat_keys_outdated"
+    return category
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
         detail = str(error).splitlines()[0][:180]
-        category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        category = capture_error_category(error)
         emit("capture_error", category=category, detail=detail)
         raise SystemExit(2)

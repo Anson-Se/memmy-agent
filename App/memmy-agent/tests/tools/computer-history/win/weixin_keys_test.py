@@ -155,7 +155,7 @@ class VerifiedAccountTests(unittest.TestCase):
             (root / "message/message_resource.db").write_bytes(b"not an encrypted database")
             self.assertEqual(keys.encrypted_pages(root), {"message/message_0.db": expected})
 
-    def test_connection_verifies_reader_before_publishing_and_keeps_existing_cursor(self):
+    def assert_connection_retains_cursor(self, historical_error=None):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             state.mkdir(mode=0o700)
@@ -174,6 +174,18 @@ class VerifiedAccountTests(unittest.TestCase):
             output = state / "keys.json"
             original_cursor = cursor.read_bytes()
             checks = []
+            roots = [root]
+            original_pages = keys.encrypted_pages
+            historical = state / "old/db_storage"
+            if historical_error:
+                (historical / "message").mkdir(parents=True)
+                (historical / "message/message_0.db").touch()
+                roots.insert(0, historical)
+
+            def read_pages(candidate):
+                if candidate == historical and historical_error == "permission":
+                    raise PermissionError("fixture old account cannot be read")
+                return original_pages(candidate)
 
             def verify(actual_root, entries):
                 self.assertEqual(actual_root, root)
@@ -182,7 +194,8 @@ class VerifiedAccountTests(unittest.TestCase):
                 checks.append("reader verified")
 
             with mock.patch.object(keys.sys, "argv", ["weixin_keys.py", "--output", str(output)]), \
-                    mock.patch.object(keys, "discover_database_roots", return_value=[root]), \
+                    mock.patch.object(keys, "discover_database_roots", return_value=roots), \
+                    mock.patch.object(keys, "encrypted_pages", side_effect=read_pages), \
                     mock.patch.object(keys, "capture_from_running_weixin", return_value=(
                         {"0/message/message_0.db": raw_key.hex()}, {})), \
                     mock.patch.object(keys, "verify_message_databases", side_effect=verify), \
@@ -192,6 +205,45 @@ class VerifiedAccountTests(unittest.TestCase):
             self.assertEqual(cursor.read_bytes(), original_cursor)
             self.assertEqual(json.loads(account.read_text())["baselineSince"], 123)
             self.assertEqual(json.loads(output.read_text())["keys"]["message/message_0.db"]["enc_key"], raw_key.hex())
+
+    def test_connection_verifies_reader_before_publishing_and_keeps_existing_cursor(self):
+        self.assert_connection_retains_cursor()
+
+    def test_damaged_or_unreadable_old_account_does_not_block_verified_current_account(self):
+        for error in ("empty", "permission"):
+            with self.subTest(error=error):
+                self.assert_connection_retains_cursor(error)
+
+    def test_only_damaged_default_account_still_fails_without_capture_or_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            root = state / "db_storage"
+            (root / "message").mkdir(parents=True)
+            (root / "message/message_0.db").touch()
+            (state / "consent.json").write_text(json.dumps({"version": 1, "enabled": True,
+                "consentId": "fixture", "consentedAt": "2026-10-15T00:00:00Z"}))
+            output = state / "keys.json"
+            with mock.patch.object(keys.sys, "argv", ["weixin_keys.py", "--output", str(output)]), \
+                    mock.patch.object(keys, "discover_database_roots", return_value=[root]), \
+                    mock.patch.object(keys, "capture_from_running_weixin") as capture:
+                with self.assertRaisesRegex(RuntimeError, "invalid_database_page"):
+                    keys.main()
+            capture.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse((state / "account.json").exists())
+
+    def test_explicit_root_error_is_not_replaced_by_another_candidate(self):
+        with mock.patch.object(keys, "encrypted_pages", side_effect=PermissionError("fixture")) as pages:
+            with self.assertRaises(PermissionError):
+                keys.account_pages_for_capture([Path("chosen/db_storage"), Path("other/db_storage")], explicit=True)
+        self.assertEqual(pages.call_args_list, [mock.call(Path("chosen/db_storage"))])
+
+    def test_storage_and_key_failures_use_existing_safe_ui_categories(self):
+        for error in (RuntimeError("invalid_database_page"), RuntimeError("database_unreadable"),
+                      RuntimeError("readonly_query_failed"), PermissionError("fixture private path")):
+            self.assertEqual(keys.capture_error_category(error), "wechat_reader_unavailable")
+        self.assertEqual(keys.capture_error_category(RuntimeError("database_key_missing")), "wechat_keys_outdated")
+        self.assertEqual(keys.capture_error_category(RuntimeError("current_account_ambiguous")), "current_account_ambiguous")
 
     def test_verification_failure_publishes_no_connection_state(self):
         with tempfile.TemporaryDirectory() as directory:
