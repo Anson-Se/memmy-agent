@@ -105,3 +105,22 @@ it('rechecks a newly blocked site after a delayed approval and before saveAs', a
     expect(saveAs).not.toHaveBeenCalled();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+it('uses a known task destination without asking for it again or changing preferences', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-browser-download-'));
+  roots.push(root);
+  const store = new BrowserDownloadStore(path.join(root, 'downloads'), async () => true);
+  fs.mkdirSync(path.dirname(store.settingsPath), { recursive: true });
+  fs.writeFileSync(store.settingsPath, JSON.stringify({ askBeforeDownload: true }));
+  const requestSavePath = vi.spyOn(store as any, 'requestSavePath');
+  const destination = path.join(root, '用户指定报告.txt');
+  const entry = await store.save({ suggestedFilename: () => 'server.txt', url: () => 'https://example.com/report',
+    saveAs: async (target: string) => { fs.writeFileSync(target, 'report'); } } as any,
+    'https://example.com/page', destination);
+  expect(requestSavePath).not.toHaveBeenCalled();
+  expect(entry).toMatchObject({ name: '用户指定报告.txt', rootDirectory: root });
+  expect(fs.readFileSync(destination, 'utf8')).toBe('report');
+  expect(JSON.parse(fs.readFileSync(store.settingsPath, 'utf8'))).toEqual({ askBeforeDownload: true });
+  await expect(store.save({ suggestedFilename: () => 'server.txt', url: () => 'https://example.com/report',
+    saveAs: vi.fn() } as any, 'https://example.com/page', destination)).rejects.toThrow(/new file/);
+});

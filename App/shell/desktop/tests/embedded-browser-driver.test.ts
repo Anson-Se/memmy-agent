@@ -566,7 +566,7 @@ it('does not fill a vault password while a timed-out CDP read is still in flight
   } finally { release(); await new Promise(resolve => setTimeout(resolve, 0)); driver.dispose(); }
 });
 
-it('sends child CDP commands only to an attached same-site session and rejects navigation races', async () => {
+it('sends child CDP commands only to the approved attached iframe and rejects probe/navigation races', async () => {
   const { driver, request, guest, sendCommand } = harness();
   await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
   const grant = { origin: 'https://example.com', isCurrentChild: () => true,
@@ -578,16 +578,29 @@ it('sends child CDP commands only to an attached same-site session and rejects n
   let childUrl = 'https://example.com/frame';
   sendCommand.mockImplementation(async (method: string) => method === 'Target.getTargetInfo'
     ? { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } } : {});
+  let approvedTarget = await driver.cdpTarget(27, { targetId: 'child-1' });
   await driver.handle(request('cdpWrite', { method: 'Input.dispatchMouseEvent',
-    params: { type: 'mouseMoved', x: 1, y: 2 }, target: { targetId: 'child-1' } }), undefined, grant);
+    params: { type: 'mouseMoved', x: 1, y: 2 }, target: { targetId: 'child-1' } }), undefined,
+    { ...grant, target: approvedTarget });
   expect(sendCommand.mock.calls.find(([method]) => method === 'Input.dispatchMouseEvent')?.[2])
     .toBe('session-1');
   sendCommand.mockClear();
+  childUrl = 'https://silent-navigation.test/frame';
+  await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
+    .rejects.toThrow(/changed after approval/);
+  expect(sendCommand.mock.calls.some(([method]) => method === 'Page.getLayoutMetrics')).toBe(false);
+  childUrl = 'https://example.com/frame';
   guest.debugger.emit('message', {}, 'Target.targetInfoChanged', {
     targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://other.test/frame' } });
   childUrl = 'https://other.test/frame';
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
+    .rejects.toThrow(/changed after approval/);
+  expect(sendCommand.mock.calls.some(([method]) => method === 'Page.getLayoutMetrics')).toBe(false);
+  approvedTarget = await driver.cdpTarget(27, { sessionId: 'session-1' });
+  await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .resolves.toEqual({});
   expect(sendCommand.mock.calls.find(([method]) => method === 'Page.getLayoutMetrics')?.[2])
     .toBe('session-1');
@@ -606,11 +619,11 @@ it('sends child CDP commands only to an attached same-site session and rejects n
     return {};
   });
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .rejects.toThrow(/child target site changed/);
   guest.debugger.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'session-1' });
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .rejects.toThrow(/not attached/);
   driver.dispose();
 });
@@ -1263,4 +1276,24 @@ it('retains typed upload permission only for matching stamped files and refuses 
     await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } })).rejects.toThrow(/file changed/);
     expect(test.sendCommand).not.toHaveBeenCalled();
   } finally { test.driver.dispose(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+it('uses already supplied sign-in values without a second form while preserving credential protection', async () => {
+  const { driver, request, sendCommand } = harness();
+  await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>) => {
+    if (method !== 'Runtime.evaluate') return {};
+    return { result: { value: args?.expression.includes('const controls=') ? [] : true } };
+  });
+  const collect = vi.fn(async () => null);
+  const result = await driver.requestAuth(27, { origin: 'https://example.com', fields: [
+    { id: 'code', label: '验证码', type: 'text', required: true, selector: '#code' },
+  ], provided_values: { code: 'provided-code-246810' } }, collect, () => true);
+  expect(result).toEqual({ status: 'submitted' });
+  expect(collect).not.toHaveBeenCalled();
+  expect(JSON.stringify(result)).not.toContain('provided-code-246810');
+  expect(sendCommand.mock.calls.filter(([method]) => method === 'Runtime.evaluate')
+    .at(-1)?.[1]?.expression).toContain('provided-code-246810');
+  await expect(driver.handle(request('snapshot'))).rejects.toThrow(/credential protection/);
+  driver.dispose();
 });

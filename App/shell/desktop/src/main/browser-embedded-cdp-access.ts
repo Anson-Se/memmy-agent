@@ -1,8 +1,9 @@
 import { normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall, normalizeBrowserCdpEventQuery,
+  normalizeBrowserCdpCommandOptions,
   type EmbeddedBrowserRequest } from '@memmy/local-api-contracts';
 import type { EmbeddedBrowserDriver, ApprovedBrowserCdpRead } from './embedded-browser-driver.js';
 
-type Driver = Pick<EmbeddedBrowserDriver, 'uploadOrigin' | 'handle'>;
+type Driver = Pick<EmbeddedBrowserDriver, 'uploadOrigin' | 'cdpTarget' | 'handle'>;
 
 /** Keep the visible Debug/CDP decision bound to one selected webview and current origin. */
 export async function runApprovedEmbeddedCdpRead(request: EmbeddedBrowserRequest, driver: Driver,
@@ -39,6 +40,11 @@ async function runApprovedEmbeddedCdpOperation(request: EmbeddedBrowserRequest, 
     : (normalizeBrowserCdpEventQuery(request.args), 'readEvents');
   const origin = driver.uploadOrigin(request.tabId!);
   if (!isAllowed(origin)) throw new Error('Browser CDP operation is blocked by site policy');
+  const { target } = normalizeBrowserCdpCommandOptions(request.args);
+  const child = target ? await driver.cdpTarget(request.tabId!, target) : undefined;
+  if (child && (!isCurrentChild() || driver.uploadOrigin(request.tabId!) !== origin || !isAllowed(child.url))) {
+    throw new Error('Browser CDP child target is blocked by site policy');
+  }
   const deadline = Date.now() + approvalTimeoutMs;
   const askBeforeDeadline = async (site: string): Promise<boolean> => {
     const remaining = deadline - Date.now();
@@ -52,7 +58,7 @@ async function runApprovedEmbeddedCdpOperation(request: EmbeddedBrowserRequest, 
   const stillValid = () => Date.now() < deadline && isCurrentChild() && isAllowed(origin)
     && driver.uploadOrigin(request.tabId!) === origin;
   if (!await askBeforeDeadline(origin) || !stillValid()) throw new Error('Browser CDP operation was not approved');
-  const targetOrigins = [...new Set((write?.targetUrls ?? []).map(target => {
+  const targetOrigins = [...new Set([...(write?.targetUrls ?? []), ...(child ? [child.url] : [])].map(target => {
     const url = new URL(target);
     if (!['http:', 'https:'].includes(url.protocol) || url.href.length > 4096) {
       throw new Error('Invalid CDP destination URL');
@@ -65,6 +71,7 @@ async function runApprovedEmbeddedCdpOperation(request: EmbeddedBrowserRequest, 
     }
   }
   const grant: ApprovedBrowserCdpRead = { origin, isCurrentChild,
-    isAllowed: () => isAllowed(origin) && targetOrigins.every(target => isAllowed(target)), mode };
+    isAllowed: () => isAllowed(origin) && targetOrigins.every(target => isAllowed(target))
+      && (!child || isAllowed(child.url)), mode, ...(child ? { target: child } : {}) };
   return driver.handle(request, undefined, grant);
 }

@@ -1,3 +1,4 @@
+import { redactBrowserAuthArguments } from "../utils/browser-auth-privacy.js";
 import {
   classifyImageInputUnsupported,
   type ProviderErrorCategory,
@@ -32,13 +33,18 @@ export class ToolCallRequest {
     this.functionProviderSpecificFields = init.functionProviderSpecificFields ?? null;
   }
 
+  /** General JSON/RPC/log serialization must follow the same credential boundary as history. */
+  toJSON(): Record<string, any> {
+    return { ...this, arguments: redactBrowserAuthArguments(this.name, this.arguments) };
+  }
+
   toOpenAIToolCall(): Record<string, any> {
     const toolCall: Record<string, any> = {
       id: this.id,
       type: "function",
       function: {
         name: this.name,
-        arguments: JSON.stringify(this.arguments),
+        arguments: JSON.stringify(redactBrowserAuthArguments(this.name, this.arguments)),
       },
     };
     if (this.extraContent) toolCall.extra_content = this.extraContent;

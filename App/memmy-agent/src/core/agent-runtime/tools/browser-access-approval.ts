@@ -17,9 +17,11 @@ export class BrowserAccessApproval {
   clear(): void { fs.rmSync(this.filePath, { force: true }); }
 
   private revision(): string {
-    return [this.filePath, this.sitePolicy.filePath].map(file => {
+    return [this.filePath, this.sitePolicy.filePath, this.sitePolicy.allowAllFilePath,
+      this.sitePolicy.nativeAllowAllFilePath].map(file => {
+      if (!file) return 'unconfigured';
       try {
-        const stat = fs.statSync(file, { bigint: true });
+        const stat = fs.lstatSync(file, { bigint: true });
         return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       } catch { return 'unavailable'; }
     }).join('|');

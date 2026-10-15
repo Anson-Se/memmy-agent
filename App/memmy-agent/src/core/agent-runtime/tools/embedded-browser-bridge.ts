@@ -51,7 +51,8 @@ export class EmbeddedBrowserBridge {
         try { process.send?.({ type: EMBEDDED_BROWSER_CANCEL, requestId }, () => undefined); }
         catch { /* A timed-out request remains cancelled locally. */ }
         reject(new Error('Embedded browser command timed out'));
-      }, command === 'queryHistory' ? 5 * 60_000
+      }, command === 'waitDownloadDestination' ? 35_000
+        : command === 'queryHistory' ? 5 * 60_000
         : command === 'authRequest' ? 5 * 60_000 + 15_000
         : command === 'upload' ? 5 * 60_000 + 15_000
         : command === 'playwrightStart' && Array.isArray(args.uploadPaths) && args.uploadPaths.length > 0

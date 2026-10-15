@@ -7,6 +7,30 @@ export type BrowserCdpReadMethod = typeof BROWSER_CDP_READ_METHODS[number];
 
 export type BrowserCdpTarget = { sessionId: string } | { targetId: string };
 
+/** Internal approval snapshot for an attached iframe within the selected tab. */
+export type BrowserCdpTargetApproval = {
+  sessionId: string;
+  targetId: string;
+  url: string;
+  origin: string;
+  revision: number;
+};
+
+export function parseBrowserCdpTargetApproval(value: unknown): BrowserCdpTargetApproval | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  if (typeof input.sessionId !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+    || typeof input.targetId !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.targetId)
+    || typeof input.url !== 'string' || input.url.length > 4096
+    || typeof input.origin !== 'string' || !Number.isSafeInteger(input.revision) || (input.revision as number) < 0) return null;
+  try {
+    const url = new URL(input.url);
+    if (!['http:', 'https:'].includes(url.protocol) || url.origin !== input.origin) return null;
+  } catch { return null; }
+  return { sessionId: input.sessionId, targetId: input.targetId, url: input.url,
+    origin: input.origin, revision: input.revision as number };
+}
+
 export function normalizeBrowserCdpTarget(input: unknown): BrowserCdpTarget | undefined {
   if (input === undefined) return undefined;
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid CDP target');

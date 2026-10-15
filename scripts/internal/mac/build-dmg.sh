@@ -109,8 +109,9 @@ write_desktop_edition_manifest() {
   node "$ROOT_DIR/scripts/internal/shared/write-desktop-edition-manifest.mjs" "${manifest_args[@]}"
 }
 
-# Resolves NSMicrophoneUsageDescription from the package edition (cn/intl).
-resolve_microphone_usage_description() {
+# Resolves camera/microphone usage descriptions from the package edition (cn/intl).
+resolve_media_usage_description() {
+  local media="${1:-}"
   local edition="${MEMMY_APP_EDITION:-}"
 
   if [ -z "$edition" ]; then
@@ -124,18 +125,32 @@ resolve_microphone_usage_description() {
     esac
   fi
 
-  case "$edition" in
-    intl)
-      printf '%s' "Memmy uses the microphone only when you start voice input."
+  case "$edition:$media" in
+    intl:microphone)
+      printf '%s' "Memmy uses the microphone for voice input and for website tasks you request."
       ;;
-    cn)
-      printf '%s' "Memmy 仅在你开始语音输入时使用麦克风"
+    cn:microphone)
+      printf '%s' "Memmy 会在语音输入和你要求的网页任务中使用麦克风。"
+      ;;
+    intl:camera)
+      printf '%s' "Memmy uses the camera for website tasks you request."
+      ;;
+    cn:camera)
+      printf '%s' "Memmy 会在你要求的网页任务中使用摄像头。"
       ;;
     *)
-      echo "Unsupported package edition for microphone usage description: $edition" >&2
+      echo "Unsupported package edition or media type for usage description: $edition:$media" >&2
       exit 1
       ;;
   esac
+}
+
+resolve_microphone_usage_description() {
+  resolve_media_usage_description microphone
+}
+
+resolve_camera_usage_description() {
+  resolve_media_usage_description camera
 }
 
 create_cli_launcher() {
@@ -1160,13 +1175,16 @@ cd "$DESKTOP_DIR"
 # DMG background images are committed static assets and are no longer generated during packaging.
 # For style changes, see the historical generator in git history.
 MEMMY_MICROPHONE_USAGE_DESCRIPTION="$(resolve_microphone_usage_description)"
+MEMMY_CAMERA_USAGE_DESCRIPTION="$(resolve_camera_usage_description)"
 echo "Using edition microphone usage description: $MEMMY_MICROPHONE_USAGE_DESCRIPTION"
+echo "Using edition camera usage description: $MEMMY_CAMERA_USAGE_DESCRIPTION"
 
 BUILDER_ARGS=(--config "$BUILDER_CONFIG")
 if [ -n "${MEMMY_ELECTRON_DIST:-}" ]; then
   BUILDER_ARGS+=(--config.electronDist="$MEMMY_ELECTRON_DIST")
 fi
 BUILDER_ARGS+=(--config.mac.extendInfo.NSMicrophoneUsageDescription="$MEMMY_MICROPHONE_USAGE_DESCRIPTION")
+BUILDER_ARGS+=(--config.mac.extendInfo.NSCameraUsageDescription="$MEMMY_CAMERA_USAGE_DESCRIPTION")
 
 package_step_start "Run electron-builder macOS DMG packaging"
 npx electron-builder "${BUILDER_ARGS[@]}" --mac dmg "$@"

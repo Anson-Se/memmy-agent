@@ -59,6 +59,8 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   const [allowAll, setAllowAll] = useState(false);
   const [allowAllReady, setAllowAllReady] = useState(false);
   const [allowAllBusy, setAllowAllBusy] = useState(false);
+  const allowAllEpoch = useRef(0);
+  const allowAllWriting = useRef(false);
   const approvalEpoch = useRef(0);
   const excelEpoch = useRef(0);
   const failedExcelAction = useRef<boolean | null>(null);
@@ -121,15 +123,28 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
 
   useEffect(() => {
     let live = true;
-    const read = window.memmy?.getNativeAppAllowAll;
-    if (!read) {
-      setAllowAllReady(true);
-      return;
-    }
-    void read().then(value => {
-      if (live) { setAllowAll(value); setAllowAllReady(true); }
-    }).catch(() => { if (live) { setError(true); setAllowAllReady(true); } });
-    return () => { live = false; };
+    const apply = (value: boolean) => {
+      if (!live) return;
+      allowAllEpoch.current++;
+      setAllowAll(value); setAllowAllReady(true);
+    };
+    const unsubscribe = window.memmy?.onBrowserAllowAllChanged?.(state => apply(state.inherited));
+    const load = () => {
+      if (allowAllWriting.current) return;
+      const read = window.memmy?.getBrowserAllowAll
+        ? () => window.memmy!.getBrowserAllowAll!().then(state => state.inherited)
+        : window.memmy?.getNativeAppAllowAll;
+      if (!read) { setAllowAllReady(true); return; }
+      const epoch = ++allowAllEpoch.current;
+      void read().then(value => {
+        if (live && epoch === allowAllEpoch.current) apply(value);
+      }).catch(() => {
+        if (live && epoch === allowAllEpoch.current) { setError(true); setAllowAllReady(true); }
+      });
+    };
+    load();
+    window.addEventListener('focus', load);
+    return () => { live = false; allowAllEpoch.current++; unsubscribe?.(); window.removeEventListener('focus', load); };
   }, []);
 
   useEffect(() => {
@@ -204,14 +219,18 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   }
 
   async function setAllowAllApps(enabled: boolean) {
-    if (!window.memmy?.setNativeAppAllowAll || allowAllBusy) return;
+    if (!window.memmy?.setNativeAppAllowAll || allowAllWriting.current) return;
+    const epoch = ++allowAllEpoch.current;
+    allowAllWriting.current = true;
     setAllowAllBusy(true);
     setError(false);
     try {
-      setAllowAll(await window.memmy.setNativeAppAllowAll(enabled));
+      const value = await window.memmy.setNativeAppAllowAll(enabled);
+      if (epoch === allowAllEpoch.current) setAllowAll(value);
     } catch {
-      setError(true);
+      if (epoch === allowAllEpoch.current) setError(true);
     } finally {
+      allowAllWriting.current = false;
       setAllowAllBusy(false);
     }
   }

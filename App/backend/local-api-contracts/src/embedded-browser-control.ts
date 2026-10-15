@@ -20,7 +20,7 @@ export const EMBEDDED_BROWSER_COMMANDS = [
   'click', 'type', 'selectOption', 'pressKey', 'scroll', 'waitFor', 'screenshot',
   'consoleMessages', 'networkRequests', 'viewport', 'historyState', 'resize', 'open',
   'fillCredential', 'fillContact',
-  'authRequest',
+  'authRequest', 'setSitePermission', 'setDownloadDestination', 'waitDownloadDestination',
   'upload',
   'cdpCall', 'cdpEvents', 'cdpWrite',
   'playwrightStart', 'playwrightCdp', 'playwrightEvents', 'playwrightEnd',

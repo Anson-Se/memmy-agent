@@ -11,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.5";
+const EXTENSION_VERSION = "1.0.6";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -618,7 +618,7 @@ chrome.windows?.onRemoved?.addListener(windowId => {
 
 function parseAuthRequest(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some(key => !['origin', 'frame', 'frames', 'fields', 'options', 'submit'].includes(key))) throw Error('Invalid auth request');
+    || Object.keys(value).some(key => !['origin', 'frame', 'frames', 'fields', 'options', 'submit', 'provided_values', 'selected_option'].includes(key))) throw Error('Invalid auth request');
   const validId = item => typeof item === 'string' && /^[a-zA-Z][a-zA-Z0-9_-]{0,39}$/.test(item);
   const validLabel = item => typeof item === 'string' && item.length > 0 && item.length <= 80 && !/[\r\n<>]/.test(item);
   const validSelector = item => typeof item === 'string' && item.length > 0 && item.length <= 300 && !/[\r\n\0]/.test(item);
@@ -655,8 +655,15 @@ function parseAuthRequest(value) {
       || (submit.action === 'press_enter' && !value.fields.some(field => field.selector === submit.selector))
       || (submit.action === 'click' && value.fields.some(field => field.selector === submit.selector))) throw Error('Invalid auth submit');
   }
+  if (value.provided_values !== undefined && (!value.provided_values || typeof value.provided_values !== 'object'
+    || Array.isArray(value.provided_values) || Object.entries(value.provided_values).some(([id, item]) =>
+      !value.fields.some(field => field.id === id) || typeof item !== 'string' || item.length > 4096)))
+    throw Error('Invalid provided auth fields');
+  if (value.selected_option !== undefined && !value.options?.some(option => option.id === value.selected_option))
+    throw Error('Invalid provided auth option');
   if (!value.fields.length && !value.options) throw Error('No auth controls');
-  return value;
+  return { ...value, ...(value.provided_values ? { provided_values: Object.fromEntries(
+    Object.entries(value.provided_values).filter(([, item]) => !/^\[redacted\]$/i.test(item.trim()))) } : {}) };
 }
 
 async function collectAuth(request, commandId) {
@@ -776,7 +783,23 @@ async function requestAuth(tabId, raw, commandId) {
     if (!await current()) return { status: 'page_changed' };
     const invalid = await validateAuthControls(tabId, request, initialFrame);
     if (invalid.length) return { status: 'locator_invalid', locator_error: { field_id: invalid[0], reason: 'not_user_visible' } };
-    const answer = await collectAuth(request, commandId);
+    const provided = request.provided_values || {};
+    const knownOption = request.options?.find(option => option.id === request.selected_option);
+    const selectedFields = knownOption?.selector ? [] : knownOption?.field_ids
+      ? request.fields.filter(field => knownOption.field_ids.includes(field.id)) : request.fields;
+    const missing = selectedFields.filter(field => provided[field.id] === undefined || (field.required && !provided[field.id]));
+    let answer;
+    if (!missing.length && (!request.options || knownOption)) {
+      answer = { values: provided, ...(knownOption ? { selected_option: knownOption.id } : {}) };
+    } else {
+      const { provided_values: _values, selected_option: _option, options: _options, ...metadata } = request;
+      const options = knownOption ? undefined : request.options?.map(option => ({ ...option,
+        ...(option.field_ids ? { field_ids: option.field_ids.filter(id => missing.some(field => field.id === id)) } : {}),
+      }));
+      answer = await collectAuth({ ...metadata, fields: missing, ...(options ? { options } : {}) }, commandId);
+      if (answer && !answer.status) answer = { values: { ...provided, ...answer.values },
+        ...(knownOption ? { selected_option: knownOption.id } : answer.selected_option ? { selected_option: answer.selected_option } : {}) };
+    }
     if (!answer) return { status: 'declined' };
     if (answer.status === 'expired') return answer;
     if (!await current()) return { status: 'page_changed' };
@@ -1009,6 +1032,44 @@ async function resolveCdpTarget(tabId, claim, target) {
   return { sessionId, info, revision: info.revision, origin: childOrigin };
 }
 
+function cdpChildApproval(child) {
+  return { sessionId: child.sessionId, targetId: child.info.targetId, url: child.info.url,
+    origin: child.origin, revision: child.revision };
+}
+
+function assertCdpChildApproval(claim, child, approved) {
+  if (!child || !approved || typeof approved !== 'object'
+    || approved.sessionId !== child.sessionId || approved.targetId !== child.info.targetId
+    || approved.url !== child.info.url || approved.origin !== child.origin
+    || approved.revision !== child.revision || claim.cdpSessions.get(child.sessionId) !== child.info
+    || child.info.revision !== child.revision) throw new Error('CDP child target changed after approval');
+}
+
+/** Only resolves metadata for an iframe already attached to this claimed tab. */
+async function probeCdpTarget(tabId, args, commandId) {
+  const claim = claims.get(tabId);
+  const approvedOrigin = pageOrigin(String(args.approvedOrigin || ''));
+  const check = async () => {
+    if (!claim || claims.get(tabId) !== claim || cancelledCommands.has(commandId)
+      || claim.credentialProtected || claim.protectedActivity || claim.playwrightLease) {
+      throw new Error('CDP child target probe is unavailable');
+    }
+    const tab = await chrome.tabs.get(tabId);
+    if (pageOrigin(tab.url || '') !== approvedOrigin || !claim.allowedOrigins.has(approvedOrigin)) {
+      throw new Error('CDP site changed');
+    }
+    resetCdpOrigin(claim, approvedOrigin);
+  };
+  await check();
+  const target = cdpTarget(args.target);
+  if (!target) throw new Error('CDP child target is required');
+  const child = await resolveCdpTarget(tabId, claim, target);
+  const approved = cdpChildApproval(child);
+  await check();
+  assertCdpChildApproval(claim, child, approved);
+  return approved;
+}
+
 function normalizeCdpRead(method, params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)
     || JSON.stringify(params).length > 24000) throw new Error('Invalid CDP parameters');
@@ -1162,7 +1223,7 @@ async function cdpRead(tabId, name, args, commandId) {
     const params = name === 'cdpWrite'
       ? normalizeCdpWrite(method, args.params || {}) : normalizeCdpRead(method, args.params || {});
     if (name === 'cdpWrite') {
-      if (Object.keys(args).some(key => !['method', 'params', 'approvedOrigin', 'target', 'timeoutMs'].includes(key))) {
+      if (Object.keys(args).some(key => !['method', 'params', 'approvedOrigin', 'approvedTarget', 'target', 'timeoutMs'].includes(key))) {
         throw new Error('CDP write options are unavailable');
       }
       await assertUserIsNotUsingTab(tabId);
@@ -1175,6 +1236,7 @@ async function cdpRead(tabId, name, args, commandId) {
     } else claim.cdpReadDepth = (claim.cdpReadDepth || 0) + 1;
     const ongoing = (async () => {
     const child = await resolveCdpTarget(tabId, claim, target);
+    if (child) assertCdpChildApproval(claim, child, args.approvedTarget);
     const sessionId = child?.sessionId;
     if (await check() !== claim || claim.cdpEpoch !== approvedEpoch) throw new Error('CDP claim changed');
     if (child && (claim.cdpSessions.get(sessionId) !== child.info
@@ -1186,6 +1248,7 @@ async function cdpRead(tabId, name, args, commandId) {
       const live = await command(tabId, 'Target.getTargetInfo', { targetId: child.info.targetId });
       if (claim.cdpSessions.get(sessionId) !== child.info || child.info.revision !== child.revision
         || live?.targetInfo?.targetId !== child.info.targetId
+        || String(live.targetInfo.url || '') !== args.approvedTarget.url
         || pageOrigin(String(live.targetInfo.url || '')) !== child.origin) {
         throw new Error('CDP child target site changed');
       }
@@ -1208,10 +1271,16 @@ async function cdpRead(tabId, name, args, commandId) {
     throw new Error('Invalid CDP event query');
   }
   const start = afterSequence ?? claim.cdpSequence - 1;
+  const child = await resolveCdpTarget(tabId, claim, target);
+  if (child) assertCdpChildApproval(claim, child, args.approvedTarget);
   const deadline = Date.now() + (timeoutMs ?? 0);
   let first, eligible, events;
   do {
     if (await check() !== claim || claim.cdpEpoch !== approvedEpoch) throw new Error('CDP claim changed');
+    if (child) {
+      const currentChild = await resolveCdpTarget(tabId, claim, target);
+      assertCdpChildApproval(claim, currentChild, args.approvedTarget);
+    }
     first = claim.cdpEvents[0]?.sequence ?? claim.cdpSequence;
     eligible = claim.cdpEvents.filter(event => event.sequence > start
       && (!methods || methods.includes(event.method))
@@ -1227,6 +1296,7 @@ async function cdpRead(tabId, name, args, commandId) {
   } while (true);
   const latest = claim.cdpSequence - 1;
   if (await check() !== claim || claim.cdpEpoch !== approvedEpoch) throw new Error('CDP claim changed');
+  if (child) assertCdpChildApproval(claim, await resolveCdpTarget(tabId, claim, target), args.approvedTarget);
   return { cursor: events.at(-1)?.sequence ?? Math.max(start, latest), events,
     hasMore: eligible.length > events.length, truncated: start < first - 1 };
 }
@@ -1585,7 +1655,7 @@ async function run(tabId, name, args, commandId) {
   }
   if ((claims.get(tabId).credentialProtected || claims.get(tabId).protectedActivity)
     && ['snapshot', 'find', 'screenshot', 'consoleMessages', 'networkRequests',
-      'cdpCall', 'cdpEvents', 'cdpWrite'].includes(name)) {
+      'cdpCall', 'cdpEvents', 'cdpWrite', 'cdpTarget'].includes(name)) {
     throw new Error('Browser page observation is unavailable during credential protection or autofill');
   }
   if (["navigate", "back", "forward", "reload", "click", "type", "selectOption",
@@ -1607,6 +1677,7 @@ async function run(tabId, name, args, commandId) {
     case "cdpCall":
     case "cdpEvents":
     case "cdpWrite": return cdpRead(tabId, name, args, commandId);
+    case 'cdpTarget': return probeCdpTarget(tabId, args, commandId);
     case "upload": return withProtectedActivity(tabId, () => upload(tabId, args, commandId));
     case "snapshot": return { nodes: await snapshot(tabId), tab: await chrome.tabs.get(tabId) };
     case "find": {

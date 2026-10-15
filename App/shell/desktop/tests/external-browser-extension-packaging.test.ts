@@ -665,7 +665,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.5");
+    expect(manifest.version).toBe("1.0.6");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
@@ -888,26 +888,42 @@ describe("Chrome and Edge extension packaging", () => {
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), console: [], requests: [], cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set()})", context);
     onEvent({ tabId: 7 }, 'Target.attachedToTarget', { sessionId: 'session-1',
       targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.test/frame' } });
+    let approvedTarget = await vm.runInContext("run(7, 'cdpTarget', {approvedOrigin: 'https://example.test', target: {targetId: 'child-1'}}, 'probe-1')", context);
+    expect(approvedTarget).toMatchObject({ sessionId: 'session-1', targetId: 'child-1',
+      url: childUrl, origin: 'https://example.test', revision: 0 });
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
       method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 1, y: 2 },
-      target: { targetId: 'child-1' } };
+      target: { targetId: 'child-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpWrite', args, 'child-1')", context)).resolves.toEqual({});
     expect(sent.find(item => item.method === 'Input.dispatchMouseEvent')?.target)
       .toEqual({ tabId: 7, sessionId: 'session-1' });
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      afterSequence: 0, target: { sessionId: 'session-1' }, timeoutMs: 100 };
+      afterSequence: 0, target: { sessionId: 'session-1' }, timeoutMs: 100, approvedTarget };
     const pending = vm.runInContext("run(7, 'cdpEvents', args, 'events-1')", context) as Promise<unknown>;
     onEvent({ tabId: 7, sessionId: 'session-1' }, 'Runtime.consoleAPICalled', { type: 'log' });
     await expect(pending).resolves.toMatchObject({ events: [{ source: {
       tabId: 7, sessionId: 'session-1', targetId: 'child-1',
     } }] });
+    childUrl = 'https://silent-navigation.test/frame';
+    (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
+    await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-silent-race')", context))
+      .rejects.toThrow(/changed after approval/);
+    expect(sent.some(item => item.method === 'Page.getLayoutMetrics')).toBe(false);
+    childUrl = 'https://example.test/frame';
     onEvent({ tabId: 7 }, 'Target.targetInfoChanged', {
       targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://other.test/frame' },
     });
     childUrl = 'https://other.test/frame';
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' } };
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-2')", context))
+      .rejects.toThrow(/changed after approval/);
+    expect(sent.some(item => item.method === 'Page.getLayoutMetrics')).toBe(false);
+    approvedTarget = await vm.runInContext("run(7, 'cdpTarget', {approvedOrigin: 'https://example.test', target: {sessionId: 'session-1'}}, 'probe-2')", context);
+    (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
+    await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-2-approved')", context))
       .resolves.toEqual({});
     expect(sent.find(item => item.method === 'Page.getLayoutMetrics')?.target)
       .toEqual({ tabId: 7, sessionId: 'session-1' });
@@ -915,10 +931,9 @@ describe("Chrome and Edge extension packaging", () => {
     await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-3')", context))
       .rejects.toThrow(/not attached/);
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      afterSequence: 0, target: { targetId: 'child-1' } };
+      afterSequence: 0, target: { targetId: 'child-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpEvents', args, 'events-2')", context))
-      .resolves.toMatchObject({ events: [{ method: 'Runtime.consoleAPICalled',
-        source: { targetId: 'child-1' } }] });
+      .rejects.toThrow(/not attached/);
   });
 
   it('blocks raw CDP writes during protected autofill and vice versa', async () => {

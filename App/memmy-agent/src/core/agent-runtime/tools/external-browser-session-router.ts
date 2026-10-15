@@ -3,8 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall, normalizeBrowserCdpEventQuery,
-  normalizeBrowserCdpCommandOptions,
-  type ComputerUseSurfaceAction } from "@memmy/local-api-contracts";
+  normalizeBrowserCdpCommandOptions, parseBrowserCdpTargetApproval, parseBrowserTaskSitePermission,
+  type BrowserTaskSitePermissionRequest,
+  type BrowserCdpTarget, type ComputerUseSurfaceAction } from "@memmy/local-api-contracts";
 import { emitComputerUseSurface } from "../../../tools/computer-use/surface-preview.js";
 import { type ExternalBrowserClaim, type ExternalBrowserTabStatus, type ExternalBrowserPlaywrightEvent } from "./external-browser-bridge.js";
 import { formatExternalBrowserTabReference, parseExternalBrowserTabReference } from './external-browser-tab-reference.js';
@@ -13,6 +14,7 @@ import { callExternalBrowserTool, emitExternalBrowserFrame, externalBrowserTarge
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
 import { closeExternalBrowserPlaywrightScope, closeAllExternalBrowserPlaywright } from './external-browser-playwright.js';
 import type { BrowserCommandBridge } from './external-browser-tools.js';
+import { publicBrowserAuthResult } from '../../../utils/browser-auth-privacy.js';
 
 export type ClaimedBrowserBridge = {
   refresh?(): Promise<ExternalBrowserClaim | null>;
@@ -301,8 +303,7 @@ export class ExternalBrowserSessionRouter {
     const binding: Binding = { scope: { ...scope },
       identity: { connectionId: claim.connectionId, tabId: claim.tabId },
       browser: claim.browser, targetId: externalBrowserTargetId(claim), title: claim.title,
-      allowedOrigins: options.allowedOrigins
-        ?? (claim.browser === 'memmy' ? new Set() : new Set([new URL(claim.url).origin])),
+      allowedOrigins: options.allowedOrigins ?? new Set(),
       outputDir: fs.mkdtempSync(path.join(os.tmpdir(), "memmy-external-browser-session-")),
       agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null,
       usedInTurn: true, turnRevision: 0, inFlight: 0, lastUsed: 0 };
@@ -348,7 +349,7 @@ export class ExternalBrowserSessionRouter {
       this.assertBinding(scope, binding, turnRevision);
       const scopedBridge = this.scopedBridge(scope, binding, turnRevision);
       const content = await callExternalBrowserTool(scopedBridge, claim, scope, name, params,
-        url => this.authorizePage(claim, binding, url), abortSignal);
+        url => this.authorizePage(binding, url), abortSignal);
       this.assertBinding(scope, binding, turnRevision);
       if (name === "browser_take_screenshot") {
         const filename = typeof params.filename === "string" && params.filename.trim()
@@ -380,7 +381,57 @@ export class ExternalBrowserSessionRouter {
       if (!result || typeof result !== 'object' || typeof (result as { status?: unknown }).status !== 'string') {
         throw new Error('Invalid browser auth response');
       }
+      return publicBrowserAuthResult(result);
+    });
+  }
+
+  async setDownloadDestination(scope: BrowserScope, claim: ExternalBrowserClaim,
+    filePath: string | null, destinationId: string, signal?: AbortSignal | null): Promise<unknown> {
+    if (claim.browser !== 'memmy') throw new Error('Download destination is available for in-app browser tabs');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      // Revoke this request's private destination without asking for page access
+      // again. The bridge still binds cleanup to the original task and tab.
+      if (filePath !== null) await this.authorizeCurrent(scope, claim);
+      return this.scopedBridge(scope, binding, revision)
+        .command(claim, 'setDownloadDestination', { filePath, destinationId }, signal ?? undefined);
+    });
+  }
+
+  async setSitePermission(scope: BrowserScope, claim: ExternalBrowserClaim,
+    input: BrowserTaskSitePermissionRequest, signal?: AbortSignal | null): Promise<string> {
+    const request = parseBrowserTaskSitePermission(input);
+    if (!request) throw new Error('Invalid browser site permission');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      const current = () => {
+        this.assertBinding(scope, binding, revision);
+        if (signal?.aborted) throw new Error('Browser site permission operation cancelled');
+        const latest = this.bridge.getClaim(binding.identity);
+        if (!latest || latest.browser !== binding.browser || new URL(latest.url).origin !== request.origin) {
+          throw new Error('Browser site permission origin changed');
+        }
+        return latest;
+      };
+      current();
+      if (request.allow) await this.authorizeCurrent(scope, claim);
+      const latest = current();
+      if (claim.browser !== 'memmy') {
+        return JSON.stringify({ status: 'requires_browser_ui', browser: claim.browser, ...request,
+          tabMention: formatExternalBrowserTabReference({ ...latest, browser: claim.browser }),
+          agentAction: 'Select this task tab, then use Computer Use on this browser to complete its normal permission prompt or change this exact site permission in the browser site controls. Continue the task and verify the page result.' });
+      }
+      const result = await this.scopedBridge(scope, binding, revision)
+        .command(claim, 'setSitePermission', request, signal ?? undefined);
+      current();
       return JSON.stringify(result);
+    });
+  }
+
+  async waitDownloadDestination(scope: BrowserScope, claim: ExternalBrowserClaim,
+    destinationId: string, signal?: AbortSignal | null): Promise<unknown> {
+    if (claim.browser !== 'memmy') throw new Error('Download destination is available for in-app browser tabs');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      return this.scopedBridge(scope, binding, revision)
+        .command(claim, 'waitDownloadDestination', { destinationId }, signal ?? undefined);
     });
   }
 
@@ -397,12 +448,8 @@ export class ExternalBrowserSessionRouter {
     });
   }
 
-  private async authorizePage(claim: ExternalBrowserClaim, binding: Binding, url: string): Promise<boolean> {
+  private async authorizePage(binding: Binding, url: string): Promise<boolean> {
     if (this.sitePolicy.decision(url, 'access') === 'block') return false;
-    if (claim.browser !== 'memmy') {
-      binding.allowedOrigins.add(new URL(url).origin);
-      return true;
-    }
     return this.authorizeNavigation(url, binding.allowedOrigins);
   }
 
@@ -414,25 +461,23 @@ export class ExternalBrowserSessionRouter {
         throw new Error('Browser site is blocked by policy');
       }
       binding.usedInTurn = true;
-      if (claim.browser !== 'memmy') {
-        try { binding.allowedOrigins.add(new URL(liveClaim.url).origin); }
-        catch { throw new Error('Browser site is blocked by policy'); }
-      } else {
-        const currentOrigin = new URL(liveClaim.url).origin;
-        const previouslyAllowed = binding.allowedOrigins.has(currentOrigin);
-        // The approval gate revalidates saved rules and revocations, including
-        // cached temporary grants. The origin Set alone is not an approval.
-        if (!await this.authorizeNavigation(liveClaim.url, binding.allowedOrigins)) {
-          throw new Error(`Access to ${currentOrigin} was not approved`);
-        }
-        this.assertBinding(scope, binding, turnRevision);
-        const approvedClaim = this.bridge.getClaim(binding.identity);
-        if (!approvedClaim) throw new Error(this.disconnectedMessage());
-        if (new URL(approvedClaim.url).origin !== currentOrigin) throw new Error(this.changedMessage());
-        if (!previouslyAllowed || !binding.allowedOrigins.has(currentOrigin)) {
-          await this.scopedBridge(scope, binding, turnRevision).command(claim, 'allowOrigin', { origin: currentOrigin });
-        }
+      const currentOrigin = new URL(liveClaim.url).origin;
+      const previouslyAllowed = binding.allowedOrigins.has(currentOrigin);
+      // The approval gate revalidates saved rules and revocations, including
+      // cached temporary grants. The origin Set alone is not an approval.
+      if (!await this.authorizeNavigation(liveClaim.url, binding.allowedOrigins)) {
+        throw new Error(`Access to ${currentOrigin} was not approved`);
       }
+      this.assertBinding(scope, binding, turnRevision);
+      const approvedClaim = this.bridge.getClaim(binding.identity);
+      if (!approvedClaim) throw new Error(this.disconnectedMessage());
+      if (new URL(approvedClaim.url).origin !== currentOrigin) throw new Error(this.changedMessage());
+      if (!previouslyAllowed || !binding.allowedOrigins.has(currentOrigin)) {
+        await this.scopedBridge(scope, binding, turnRevision).command(claim, 'allowOrigin', { origin: currentOrigin });
+      }
+      // This tracks the approved page for navigation/file binding only. The
+      // approval gate revalidates it on every call, including global revocation.
+      binding.allowedOrigins.add(currentOrigin);
     });
   }
 
@@ -457,10 +502,8 @@ export class ExternalBrowserSessionRouter {
       throw new Error('External browser upload requires a file input target');
     }
     if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+    await this.authorizeCurrent(scope, claim);
     const initial = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
-    if (initial?.origin && initial.url && new URL(initial.url).origin === initial.origin) {
-      binding.allowedOrigins.add(initial.origin);
-    }
     if (!initial?.url || !initial.origin || new URL(initial.url).origin !== initial.origin
       || !binding.allowedOrigins.has(initial.origin)) throw new Error('External browser upload site changed');
     const stamps = files.map(file => {
@@ -552,7 +595,8 @@ export class ExternalBrowserSessionRouter {
       }
       const initialUrl = currentClaim.url;
       const initialOrigin = new URL(initialUrl).origin;
-      if (claim.browser === 'memmy') await this.authorizeCurrent(scope, currentClaim);
+      await this.authorizeCurrent(scope, currentClaim);
+      let approvedTarget: ReturnType<typeof parseBrowserCdpTargetApproval> = null;
       if (claim.browser !== 'memmy') {
         binding.allowedOrigins.add(initialOrigin);
         const state = await bridge.command(claim, 'tabState', {}, signal ?? undefined) as { url?: string; origin?: string };
@@ -561,6 +605,23 @@ export class ExternalBrowserSessionRouter {
         if (!await approve(initialUrl, actionName, signal ?? undefined)) throw new Error('Browser CDP operation was not approved');
         const after = await bridge.command(claim, 'tabState', {}, signal ?? undefined) as { url?: string; origin?: string };
         if (after.url !== initialUrl || after.origin !== initialOrigin) throw new Error('Browser tab changed after CDP approval');
+        const target = (args as { target?: BrowserCdpTarget }).target;
+        if (target) {
+          approvedTarget = parseBrowserCdpTargetApproval(await bridge.command(claim, 'cdpTarget',
+            { target, approvedOrigin: initialOrigin }, signal ?? undefined));
+          if (!approvedTarget
+            || ('sessionId' in target && target.sessionId !== approvedTarget.sessionId)
+            || ('targetId' in target && target.targetId !== approvedTarget.targetId)) {
+            throw new Error('Browser CDP child target approval is unavailable');
+          }
+          if (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+            || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'
+            || !await this.authorizePage(binding, approvedTarget.url)
+            || (approvedTarget.origin !== initialOrigin
+              && !await approve(approvedTarget.url, actionName, signal ?? undefined))) {
+            throw new Error('Browser CDP child target site was not approved');
+          }
+        }
       }
       for (const target of [...new Set(targetUrls)]) {
         let destination: URL;
@@ -570,7 +631,7 @@ export class ExternalBrowserSessionRouter {
           throw new Error('Invalid CDP destination URL');
         }
         if (destination.origin === initialOrigin) continue;
-        if (!await this.authorizePage(claim, binding, destination.href)) {
+        if (!await this.authorizePage(binding, destination.href)) {
           throw new Error('CDP destination site was not approved');
         }
         binding.allowedOrigins.add(destination.origin);
@@ -582,14 +643,19 @@ export class ExternalBrowserSessionRouter {
         }
       }
       if (signal?.aborted || this.bindingFor(scope, binding.identity) !== binding
+        || (approvedTarget && (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+          || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'))
         || this.sitePolicy.decision(initialUrl, 'fullCdp') === 'block'
         || targetUrls.some(url => this.sitePolicy.decision(url, 'access') === 'block'
           || this.sitePolicy.decision(url, 'fullCdp') === 'block')) {
         throw new Error('Browser CDP operation is blocked');
       }
       const result = await bridge.command(claim, operation,
-        claim.browser === 'memmy' ? args : { ...args, approvedOrigin: initialOrigin }, signal ?? undefined);
+        claim.browser === 'memmy' ? args : { ...args, approvedOrigin: initialOrigin,
+          ...(approvedTarget ? { approvedTarget } : {}) }, signal ?? undefined);
       if (signal?.aborted || this.bindingFor(scope, binding.identity) !== binding
+        || (approvedTarget && (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+          || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'))
         || this.sitePolicy.decision(initialUrl, 'fullCdp') === 'block'
         || targetUrls.some(url => this.sitePolicy.decision(url, 'access') === 'block'
           || this.sitePolicy.decision(url, 'fullCdp') === 'block')) {
@@ -620,14 +686,16 @@ export class ExternalBrowserSessionRouter {
         this.assertBinding(scope, binding, turnRevision);
         const claim = this.bridge.getClaim(binding.identity);
         if (!claim || externalBrowserTargetId(claim) !== action.targetId) return true;
+        if ((action.action === 'fill-credential' || action.action === 'fill-contact')
+          && (!action.autofill || new URL(claim.url).origin !== action.autofill.origin)) return true;
         if (this.sitePolicy.decision(claim.url, 'access') === 'block') return true;
-        if (claim.browser === 'memmy') await this.authorizeCurrent(scope, claim);
+        await this.authorizeCurrent(scope, claim);
         const bridge = this.scopedBridge(scope, binding, turnRevision);
         if (action.action === "navigate") {
           const url = new URL(action.url!);
           if (!["http:", "https:"].includes(url.protocol)) return true;
           if (url.origin !== new URL(claim.url).origin) {
-            if (!await this.authorizePage(claim, binding, url.href)) return true;
+            if (!await this.authorizePage(binding, url.href)) return true;
             await bridge.command(claim, "allowOrigin", { origin: url.origin });
           }
           await bridge.command(claim, "navigate", { url: url.href });

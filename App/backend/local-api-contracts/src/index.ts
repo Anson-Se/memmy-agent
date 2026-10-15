@@ -21,6 +21,8 @@ export * from "./browser-access-approval.js";
 export * from "./native-app-approval.js";
 export * from "./browser-download-approval.js";
 export * from "./browser-capability-approval.js";
+export * from "./browser-global-approval.js";
+export * from "./browser-task-site-permission.js";
 export * from "./browser-use-site-policy.js";
 export * from "./browser-cdp-readonly.js";
 export * from "./browser-cdp-write.js";

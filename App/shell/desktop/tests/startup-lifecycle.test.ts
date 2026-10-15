@@ -129,6 +129,8 @@ function setup(options: { delay?: number; gatewayDelay?: number; apiDelay?: numb
     attachBrowserWebviewDownloads: () => noop,
     attachBrowserWebviewPermissions: () => noop,
     BrowserHistoryStore: class { constructor(_path: string) {} },
+    BROWSER_NATIVE_ALLOW_ALL_FILE_ENV: 'MEMMY_NATIVE_APP_ALLOW_ALL_FILE',
+    allowAllNativeApps: () => ({ filePath: 'test-user-data/computer-use/allow-all-apps.json' }),
     windowsDataLayout: null,
     startManagedRuntimeServices: async () => {
       if (options.delay) await new Promise(resolve => setTimeout(resolve, options.delay));

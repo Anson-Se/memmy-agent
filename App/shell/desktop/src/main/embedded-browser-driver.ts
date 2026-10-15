@@ -3,12 +3,12 @@ import { lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { BrowserWindow, Session, WebContents } from 'electron';
 import { formatEmbeddedBrowserTabMention, normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall,
-  normalizeBrowserCdpCommandOptions, type BrowserCdpTarget,
+  normalizeBrowserCdpCommandOptions, type BrowserCdpTarget, type BrowserCdpTargetApproval,
   BROWSER_PLAYWRIGHT_CDP_METHODS,
   type EmbeddedBrowserCommand, type EmbeddedBrowserRequest } from '@memmy/local-api-contracts';
 import type { BrowserHistoryStore, BrowserVisitSource } from './browser-history-store.js';
 import { BrowserCdpEventBuffer } from './browser-cdp-event-buffer.js';
-import { parseBrowserAuthRequest, type BrowserAuthRequest, type BrowserAuthResult } from './browser-auth-request.js';
+import { collectMissingBrowserAuth, parseBrowserAuthRequest, type BrowserAuthRequest, type BrowserAuthResult } from './browser-auth-request.js';
 import type { BrowserAuthFormResult } from './browser-auth-form.js';
 
 type Node = { ref: string; role: string; name: string; value: string };
@@ -16,6 +16,7 @@ type Point = { x: number; y: number };
 type ClickGeometry = { width: number; height: number; quads: number[][] };
 type ClickAction = Point & { objectId?: string; backendNodeId?: number; geometry?: ClickGeometry; checkCurrent: () => void };
 type CdpSession = { targetId: string; url: string; revision: number; parentSessionId?: string };
+type ResolvedCdpTarget = { sessionId: string; info: CdpSession; revision: number; origin: string };
 type PlaywrightLease = { id: string; origin: string; input: boolean; expiresAt: number;
   documentEpoch: number; cdpEpoch: number; targetId: string;
   uploadStamps?: ApprovedBrowserUpload['stamps']; uploadPaths?: string[] };
@@ -40,7 +41,7 @@ export type ApprovedBrowserUpload = { origin: string; stamps: Array<{
 }>; isCurrentChild: () => boolean };
 
 export type ApprovedBrowserCdpRead = { origin: string; isCurrentChild: () => boolean;
-  isAllowed: () => boolean; mode?: 'read' | 'write' };
+  isAllowed: () => boolean; mode?: 'read' | 'write'; target?: BrowserCdpTargetApproval };
 
 export type BrowserAutofillPayload =
   | { kind: 'credential'; origin: string; username: string; password: string }
@@ -164,6 +165,29 @@ export class EmbeddedBrowserDriver {
   constructor(private readonly getHost: () => BrowserWindow | null = () => null) {}
 
   setHistoryStore(store: BrowserHistoryStore): void { this.historyStore = store; }
+
+  /** A task destination belongs only to this live tab and one browser action. */
+  setDownloadDestination(tabId: number, raw: Record<string, unknown>,
+    set: (tabId: number, filePath: string | null, destinationId: string, isCurrent: () => boolean) => void,
+    isCurrentChild: () => boolean): { configured: boolean } {
+    if (typeof raw.destinationId !== 'string' || !/^[a-f\d-]{36}$/i.test(raw.destinationId)
+      || (raw.filePath !== null && (typeof raw.filePath !== 'string' || raw.filePath.length > 4096
+        || !path.isAbsolute(raw.filePath) || raw.filePath.includes('\0')))
+      || Object.keys(raw).some(key => !['filePath', 'destinationId'].includes(key)))
+      throw new Error('Invalid browser download destination');
+    if (raw.filePath === null) {
+      set(tabId, null, raw.destinationId, () => false);
+      return { configured: false };
+    }
+    const entry = this.active(tabId);
+    if (!isCurrentChild() || entry.credentialProtected || entry.protectedActivity
+      || !entry.allowedOrigins.has(origin(entry.guest.getURL()))) throw new Error('Browser download target is unavailable');
+    const initialUrl = entry.guest.getURL();
+    set(tabId, raw.filePath, raw.destinationId, () => isCurrentChild()
+      && this.entries.get(tabId) === entry && !entry.guest.isDestroyed()
+      && !entry.credentialProtected && !entry.protectedActivity && entry.guest.getURL() === initialUrl);
+    return { configured: true };
+  }
 
   attach(guest: WebContents, host: BrowserWindow): void {
     const entry: Entry = { guest, host, allowedOrigins: new Set(), console: [], requests: [],
@@ -429,7 +453,7 @@ export class EmbeddedBrowserDriver {
       };
       const invalid = await validate();
       if (invalid) return invalid;
-      const answer = await collect(request);
+      const answer = await collectMissingBrowserAuth(request, collect);
       if (!answer) return { status: 'declined' };
       if ('status' in answer) return answer;
       if (!stillCurrent()) return { status: 'page_changed' };
@@ -499,6 +523,34 @@ export class EmbeddedBrowserDriver {
       throw new Error('Selected in-app browser tab changed');
     }
     return origin(entry.guest.getURL());
+  }
+
+  /** Resolve only an attached iframe's identity before main-process site approval. */
+  async cdpTarget(tabId: number, target: BrowserCdpTarget): Promise<BrowserCdpTargetApproval> {
+    const entry = this.active(tabId);
+    const pageOrigin = this.uploadOrigin(tabId);
+    if (entry.credentialProtected || entry.protectedActivity || entry.playwrightLease) {
+      throw new Error('CDP child target probe is unavailable during a protected browser operation');
+    }
+    this.ensureCdpOrigin(entry);
+    const epoch = entry.cdpEpoch;
+    const child = await this.resolveCdpTarget(entry, target);
+    if (!child || this.uploadOrigin(tabId) !== pageOrigin || entry.cdpEpoch !== epoch
+      || entry.cdpSessions.get(child.sessionId) !== child.info || child.info.revision !== child.revision) {
+      throw new Error('CDP child target changed before approval');
+    }
+    return { sessionId: child.sessionId, targetId: child.info.targetId, url: child.info.url,
+      origin: child.origin, revision: child.revision };
+  }
+
+  private assertCdpTargetApproval(entry: Entry,
+    child: ResolvedCdpTarget,
+    approved: BrowserCdpTargetApproval | undefined): void {
+    if (!approved || approved.sessionId !== child.sessionId || approved.targetId !== child.info.targetId
+      || approved.url !== child.info.url || approved.origin !== child.origin || approved.revision !== child.revision
+      || entry.cdpSessions.get(child.sessionId) !== child.info || child.info.revision !== child.revision) {
+      throw new Error('CDP child target changed after approval');
+    }
   }
 
   private async command(entry: Entry, method: string, params: Record<string, unknown> = {},
@@ -726,8 +778,7 @@ export class EmbeddedBrowserDriver {
     return result;
   }
 
-  private async resolveCdpTarget(entry: Entry, target: BrowserCdpTarget | undefined): Promise<{
-    sessionId: string; info: CdpSession; revision: number; origin: string } | undefined> {
+  private async resolveCdpTarget(entry: Entry, target: BrowserCdpTarget | undefined): Promise<ResolvedCdpTarget | undefined> {
     if (!target) return undefined;
     const found = [...entry.cdpSessions.entries()].find(([sessionId, info]) =>
       'sessionId' in target ? sessionId === target.sessionId : info.targetId === target.targetId);
@@ -1310,6 +1361,7 @@ export class EmbeddedBrowserDriver {
         const approvedEpoch = entry.cdpEpoch;
         if (!entry.attached) await this.command(entry, 'Page.enable');
         const child = await this.resolveCdpTarget(entry, target);
+        if (child) this.assertCdpTargetApproval(entry, child, approvedCdp!.target);
         const sessionId = child?.sessionId;
         const result = await this.command(entry, call.method, call.params, () => {
           if (!approvedCdp!.isCurrentChild() || !approvedCdp!.isAllowed()
@@ -1327,6 +1379,7 @@ export class EmbeddedBrowserDriver {
           if (entry.cdpSessions.get(child.sessionId) !== child.info
             || child.info.revision !== child.revision
             || live?.targetInfo?.targetId !== child.info.targetId
+            || String(live.targetInfo.url ?? '') !== approvedCdp!.target?.url
             || origin(String(live.targetInfo.url ?? '')) !== child.origin) {
             throw new Error('CDP child target site changed while reading');
           }
@@ -1348,19 +1401,25 @@ export class EmbeddedBrowserDriver {
         this.ensureCdpOrigin(entry);
         const approvedEpoch = entry.cdpEpoch;
         if (!entry.attached) await this.command(entry, 'Page.enable');
+        const { target } = normalizeBrowserCdpCommandOptions(args);
+        const child = await this.resolveCdpTarget(entry, target);
+        if (child) this.assertCdpTargetApproval(entry, child, approvedCdp!.target);
+        const targetStillApproved = () => !child || (entry.cdpSessions.get(child.sessionId) === child.info
+          && child.info.revision === child.revision && child.info.url === approvedCdp!.target?.url);
         if (!approvedCdp!.isCurrentChild() || !approvedCdp!.isAllowed()
           || this.uploadOrigin(request.tabId!) !== approvedCdp!.origin
-          || entry.cdpEpoch !== approvedEpoch) {
+          || entry.cdpEpoch !== approvedEpoch || !targetStillApproved()) {
           throw new Error('Browser CDP events are no longer approved');
         }
         const { approvedOrigin: _approvedOrigin, ...query } = args;
         const result = await entry.cdpEvents.wait(query, () => !entry.credentialProtected && !entry.protectedActivity
           && approvedCdp!.isCurrentChild()
           && approvedCdp!.isAllowed() && this.uploadOrigin(request.tabId!) === approvedCdp!.origin
-          && entry.cdpEpoch === approvedEpoch);
+          && entry.cdpEpoch === approvedEpoch && targetStillApproved());
         if (entry.credentialProtected || entry.protectedActivity
           || !approvedCdp!.isCurrentChild() || !approvedCdp!.isAllowed()
-          || this.uploadOrigin(request.tabId!) !== approvedCdp!.origin || entry.cdpEpoch !== approvedEpoch) {
+          || this.uploadOrigin(request.tabId!) !== approvedCdp!.origin || entry.cdpEpoch !== approvedEpoch
+          || !targetStillApproved()) {
           throw new Error('Browser CDP events are no longer approved');
         }
         return result;

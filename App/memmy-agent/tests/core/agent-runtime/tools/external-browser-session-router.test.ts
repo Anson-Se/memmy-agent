@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { ExternalBrowserSessionRouter } from "../../../../src/core/agent-runtime/tools/external-browser-session-router.js";
 import { BrowserUseSitePolicyReader } from '../../../../src/core/agent-runtime/tools/browser-use-site-policy-store.js';
+import { BrowserAccessApproval } from '../../../../src/core/agent-runtime/tools/browser-access-approval.js';
+import { BrowserCapabilityApproval } from '../../../../src/core/agent-runtime/tools/browser-capability-approval.js';
 import type { ExternalBrowserBridge, ExternalBrowserClaim } from "../../../../src/core/agent-runtime/tools/external-browser-bridge.js";
 import * as surfaces from '../../../../src/tools/computer-use/surface-preview.js';
 
@@ -33,6 +35,92 @@ function bindingOf(router: ExternalBrowserSessionRouter, scope: typeof scopeA, t
 }
 
 describe("external browser session router", () => {
+  it.each(['website', 'computer'] as const)('applies %s allow-all and revocation to raw CDP attached cross-site iframe targets', async source => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-child-cdp-policy-'));
+    const reader = new BrowserUseSitePolicyReader(path.join(directory, 'site-policy.json'), {
+      nativeAllowAllFilePath: path.join(directory, 'allow-all-apps.json'),
+    });
+    fs.writeFileSync(reader.filePath, JSON.stringify({ version: 1, rules: [
+      { pattern: 'https://example.test', access: 'allow', downloads: 'ask', uploads: 'ask', fullCdp: 'allow' },
+      { pattern: 'https://frame.test', access: 'block', downloads: 'block', uploads: 'block', fullCdp: 'block' },
+    ] }));
+    const approvedTarget = { sessionId: 'child-session', targetId: 'child-target',
+      url: 'https://frame.test/private', origin: 'https://frame.test', revision: 1 };
+    const bridge = fakeBridge();
+    const command = vi.fn(async (_bound: unknown, operation: string) => {
+      if (operation === 'tabState') return { url: claim.url, origin: 'https://example.test' };
+      if (operation === 'cdpTarget') return approvedTarget;
+      return {};
+    });
+    bridge.command = command;
+    const access = new BrowserAccessApproval(path.join(directory, 'access.json'), reader);
+    const prompt = vi.spyOn(access as any, 'requestDecision').mockResolvedValue('deny');
+    const capability = new BrowserCapabilityApproval(reader);
+    const router = new ExternalBrowserSessionRouter(bridge, (url, grants) => access.authorize(url, grants), 'external', reader);
+    router.selectClaim(scopeA, claim);
+    const run = () => router.cdp(scopeA, claim, 'cdpCall', { method: 'Page.getLayoutMetrics',
+      target: { sessionId: 'child-session' } }, (url, method) => capability.authorize('debug', url, [method]));
+    try {
+      await expect(run()).rejects.toThrow(/child target site was not approved/);
+      expect(command.mock.calls.some(call => call[1] === 'cdpCall')).toBe(false);
+      const globalPath = source === 'website' ? reader.allowAllFilePath : reader.nativeAllowAllFilePath!;
+      fs.writeFileSync(globalPath, JSON.stringify({ version: 1, enabled: true }));
+      await expect(run()).resolves.toBe('{}');
+      expect(bridge.command).toHaveBeenCalledWith(claim, 'cdpCall', expect.objectContaining({ approvedTarget }), undefined);
+      expect(prompt).not.toHaveBeenCalled();
+      command.mockClear();
+      fs.writeFileSync(globalPath, JSON.stringify({ version: 1, enabled: false }));
+      await expect(run()).rejects.toThrow(/child target site was not approved/);
+      expect(command.mock.calls.some(call => call[1] === 'cdpCall')).toBe(false);
+    } finally { router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('clears only the bound in-app download destination after page access is revoked without asking again', async () => {
+    const current = { ...claim, browser: 'memmy' as const };
+    const bridge = fakeBridge([current]);
+    const authorize = vi.fn(async () => true);
+    const router = new ExternalBrowserSessionRouter(bridge, authorize, 'embedded');
+    try {
+      router.selectClaim(scopeA, current);
+      await router.setDownloadDestination(scopeA, current, '/private/output.txt', 'request-a');
+      expect(authorize).toHaveBeenCalledOnce();
+      authorize.mockResolvedValue(false);
+      await router.setDownloadDestination(scopeA, current, null, 'request-a');
+      expect(authorize).toHaveBeenCalledOnce();
+      expect(bridge.command).toHaveBeenCalledWith(current, 'setDownloadDestination',
+        { filePath: null, destinationId: 'request-a' }, undefined);
+      router.closeSession(scopeA);
+      await expect(router.setDownloadDestination(scopeA, current, null, 'request-a')).rejects.toThrow(/changed/);
+    } finally { router.closeAll(); }
+  });
+
+  it.each(['memmy', 'chrome', 'edge'] as const)('uses the shared website gate for %s and revalidates global revocation', async browser => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-shared-access-'));
+    const current = { ...claim, browser };
+    const bridge = fakeBridge([current]);
+    const reader = new BrowserUseSitePolicyReader(path.join(directory, 'site-policy.json'));
+    const access = new BrowserAccessApproval(path.join(directory, 'access.json'), reader);
+    const prompt = vi.spyOn(access as any, 'requestDecision').mockResolvedValue('deny');
+    const router = new ExternalBrowserSessionRouter(bridge,
+      (url, allowed) => access.authorize(url, allowed), browser === 'memmy' ? 'embedded' : 'external', reader);
+    try {
+      router.selectClaim(scopeA, current);
+      expect(bindingOf(router, scopeA, current).allowedOrigins.size).toBe(0);
+      await expect(router.call(scopeA, current, 'browser_snapshot', {})).rejects.toThrow(/not approved/);
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(bridge.command).not.toHaveBeenCalled();
+      fs.writeFileSync(reader.allowAllFilePath, JSON.stringify({ version: 1, enabled: true }));
+      await expect(router.call(scopeA, current, 'browser_snapshot', {})).resolves.toBeDefined();
+      expect(prompt).toHaveBeenCalledOnce();
+      (bridge.command as ReturnType<typeof vi.fn>).mockClear();
+      fs.writeFileSync(reader.allowAllFilePath, JSON.stringify({ version: 1, enabled: false }));
+      await expect(router.call(scopeA, current, 'browser_click', { target: 'ax-1' })).rejects.toThrow(/not approved/);
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(bridge.command).not.toHaveBeenCalled();
+      expect(bindingOf(router, scopeA, current).allowedOrigins.size).toBe(0);
+    } finally { router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('rejects in-app screenshot tools and CDP before site approval or any browser command', async () => {
     const current = { ...claim, browser: 'memmy' as const };
     const bridge = fakeBridge([current]);
@@ -600,7 +688,7 @@ describe("external browser session router", () => {
     } finally { finish({}); router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('keeps high-risk CDP approval for another site without asking for page access again', async () => {
+  it('checks page access and high-risk CDP approval for both current and destination sites', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'external-cdp-destination-'));
     const policyPath = path.join(directory, 'site-policy.json');
     fs.writeFileSync(policyPath, JSON.stringify({ version: 1, rules: [
@@ -627,7 +715,7 @@ describe("external browser session router", () => {
         .rejects.toThrow(/destination debug access/);
       expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'cdpWrite'))
         .toBe(false);
-      expect(authorize).not.toHaveBeenCalled();
+      expect(authorize.mock.calls.map(call => call[0])).toEqual([claim.url, 'https://destination.test/']);
       approve.mockResolvedValue(true);
       await expect(router.cdp(scopeA, claim, 'cdpWrite', input, approve)).resolves.toBe('{}');
       expect(bridge.command).toHaveBeenCalledWith(claim, 'allowOrigin',
@@ -648,6 +736,8 @@ describe("external browser session router", () => {
     const bridge = fakeBridge();
     bridge.command = vi.fn(async (_bound, operation: string, args: Record<string, unknown>) => {
       if (operation === 'tabState') return { url: currentUrl, origin: new URL(currentUrl).origin };
+      if (operation === 'cdpTarget') return { sessionId: 'child-1', targetId: 'frame-1',
+        url: claim.url, origin: 'https://example.test', revision: 0 };
       if (operation === 'cdpCall') {
         expect(args).toMatchObject({ method: 'Runtime.evaluate', approvedOrigin: 'https://example.test',
           params: { expression: 'document.title', throwOnSideEffect: true } });
@@ -738,7 +828,7 @@ describe("external browser session router", () => {
       return original(bound, operation, args);
     });
     bridge.command = command;
-    const router = new ExternalBrowserSessionRouter(bridge, async () => false);
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
     router.selectClaim(scopeA, claim);
     const approve = vi.fn(async () => true);
     try {
