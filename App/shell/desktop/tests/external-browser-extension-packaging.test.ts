@@ -10,7 +10,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const extension = path.join(root, "extensions", "memmy-browser");
 
 function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean; attach?: (tabId: number) => Promise<void>;
-  command?: (method: string) => Promise<unknown>; targets?: Array<{ tabId: number; attached: boolean }> } = {}) {
+  command?: (method: string, params: Record<string, unknown>, target: Record<string, unknown>) => Promise<unknown>;
+  targets?: Array<{ tabId: number; attached: boolean }> } = {}) {
   const tabs = new Map<number, Record<string, unknown>>([
     [7, { id: 7, title: "百度", url: "https://www.baidu.com/", active: true, windowId: 1 }],
   ]);
@@ -42,7 +43,8 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
     action: { setBadgeText: async () => undefined },
     debugger: { attach: async ({ tabId }: { tabId: number }) => { attaches.push(tabId); await options.attach?.(tabId); },
       detach: async ({ tabId }: { tabId: number }) => { detaches.push(tabId); },
-      sendCommand: async (_target: unknown, method: string) => options.command ? options.command(method) : ({}),
+      sendCommand: async (target: Record<string, unknown>, method: string, params: Record<string, unknown>) =>
+        options.command ? options.command(method, params, target) : ({}),
       onDetach: { addListener(listener: typeof detached) { detached = listener; } },
       onEvent: { addListener(listener: typeof debuggerEvent) { debuggerEvent = listener; } },
       ...(options.targets ? { getTargets: async () => options.targets } : {}) },
@@ -394,6 +396,50 @@ describe("external browser page discovery", () => {
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 
+  it("installs the input observer in the current page and child frames", async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown>; target: Record<string, unknown> }> = [];
+    let unsupportedRunImmediately = true;
+    const test = discoveryHarness({ command: async (method, params, target) => {
+      calls.push({ method, params, target });
+      if (method === 'Page.addScriptToEvaluateOnNewDocument' && target.sessionId === undefined
+        && params.runImmediately === true && unsupportedRunImmediately) {
+        unsupportedRunImmediately = false;
+        throw Error('Unknown parameter runImmediately');
+      }
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: {
+        id: target.sessionId ? 'child-frame' : 'main-frame',
+      } } };
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: target.sessionId ? 22 : 11 };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [] };
+      return {};
+    } });
+    await vm.runInContext('discoverOpenTabs()', test.context);
+    expect(await test.command('snapshot')).toMatchObject({ ok: true });
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Runtime.addBinding',
+      params: expect.objectContaining({ executionContextName: 'memmy-user-input' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Page.addScriptToEvaluateOnNewDocument',
+      params: expect.objectContaining({ worldName: 'memmy-user-input' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Page.createIsolatedWorld',
+      params: expect.objectContaining({ frameId: 'main-frame' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Runtime.evaluate',
+      params: expect.objectContaining({ contextId: 11,
+        expression: expect.stringContaining('pointerdown') }) }));
+    test.debuggerEvent(7, 'Target.attachedToTarget', {
+      sessionId: 'child-session', targetInfo: { type: 'iframe', targetId: 'child-target',
+        url: 'https://www.baidu.com/frame' },
+    });
+    await vi.waitFor(() => expect(calls).toContainEqual(expect.objectContaining({
+      method: 'Runtime.evaluate', target: { tabId: 7, sessionId: 'child-session' },
+      params: expect.objectContaining({ contextId: 22 }),
+    })));
+    const token = vm.runInContext('claims.get(7).inputObserverToken', test.context);
+    test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
+    test.debuggerEvent(7, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: JSON.stringify([token, 'keydown', Date.now()]),
+    }, 'child-session');
+    expect(vm.runInContext('claims.get(7).lastUserInputAt', test.context)).toBe(0);
+  });
+
   it("reports an attachment failure on that command and attaches again for the next one", async () => {
     vi.useFakeTimers();
     try {
@@ -666,7 +712,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.9");
+    expect(manifest.version).toBe("1.0.10");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
@@ -680,24 +726,119 @@ describe("Chrome and Edge extension packaging", () => {
     expect(manifest.permissions).not.toContain("cookies");
   });
 
-  it("pauses writes while the user is focused on the claimed tab", async () => {
-    const sendCommand = async () => ({ nodes: [] });
+  it("allows a focused idle tab, but pauses writes after physical page input", async () => {
+    let onEvent: ((source: { tabId: number }, method: string, data: unknown) => void) | undefined;
+    let delayedAgentInput: string | undefined;
+    const sendCommand = async (_target: unknown, method: string, params: Record<string, unknown>) => {
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') {
+        const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+        delayedAgentInput = JSON.stringify([token, 'pointerdown', Number(params.timestamp) * 1000]);
+        onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+          name: '__memmyUserInput', payload: delayedAgentInput,
+        });
+      }
+      return { nodes: [] };
+    };
     const chrome = {
       runtime: { onMessage: { addListener() {} } },
-      debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} }, sendCommand },
+      debugger: { onDetach: { addListener() {} }, onEvent: { addListener(callback: typeof onEvent) { onEvent = callback; } }, sendCommand },
       tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
         get: async () => ({ id: 7, active: true, windowId: 1, url: "https://example.test/" }) },
       windows: { get: async () => ({ focused: true }) },
     };
     const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: "Chrome" }, URL });
     vm.runInContext(fs.readFileSync(path.join(extension, "background.js"), "utf8"), context);
-    vm.runInContext("claims.set(7, { allowedOrigins: new Set(['https://example.test']) })", context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test')); claims.get(7).attached = true", context);
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .resolves.toMatchObject({ x: 10, y: 10 });
+    // CDP-generated trusted DOM events are excluded from physical takeover.
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: delayedAgentInput,
+    });
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+    const physical = JSON.stringify([token, 'keydown', Date.now()]);
+    onEvent?.({ tabId: 8 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
     await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
       .rejects.toThrow("USER_ACTIVE_ON_TARGET_TAB");
     await expect(vm.runInContext("run(7, 'cdpWrite', {approvedOrigin: 'https://example.test', method: 'Runtime.evaluate', params: {expression: 'document.title = \"changed\"'}}, 'write-1')", context))
       .rejects.toThrow("USER_ACTIVE_ON_TARGET_TAB");
     await expect(vm.runInContext("run(7, 'snapshot', {})", context))
       .resolves.toMatchObject({ nodes: [] });
+    vm.runInContext("claims.get(7).lastUserInputAt = Date.now() - USER_ACTIVE_WINDOW_MS - 1", context);
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .resolves.toMatchObject({ x: 10, y: 10 });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: JSON.stringify([token, 'pointerdown', Date.now()]),
+    });
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    vm.runInContext('markDebuggerDetached(claims.get(7))', context);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
+    expect(vm.runInContext('claims.get(7).lastUserInputAt', context)).toBe(0);
+  });
+
+  it("stops slow typing when the user starts typing between characters", async () => {
+    let onEvent: ((source: { tabId: number }, method: string, data: unknown) => void) | undefined;
+    const inserted: string[] = [];
+    const chrome = {
+      runtime: { onMessage: { addListener() {} } },
+      debugger: { onDetach: { addListener() {} },
+        onEvent: { addListener(callback: typeof onEvent) { onEvent = callback; } },
+        sendCommand: async (_target: unknown, method: string, params: Record<string, unknown>) => {
+          if (method === 'DOM.resolveNode') return { object: { objectId: 'input-1' } };
+          if (method === 'Input.insertText') {
+            inserted.push(String(params.text));
+            if (inserted.length === 1) {
+              const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+              onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+                name: '__memmyUserInput', payload: JSON.stringify([token, 'keydown', Date.now()]),
+              });
+            }
+          }
+          return {};
+        } },
+      tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
+        get: async () => ({ id: 7, active: false, windowId: 1, url: 'https://example.test/' }) },
+      windows: { get: async () => ({ focused: false }) },
+    };
+    const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: 'Chrome' }, URL });
+    vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test')); claims.get(7).attached = true", context);
+    await expect(vm.runInContext("run(7, 'type', {x: 10, y: 10, target: 'ax-1', text: 'AB', slowly: true})", context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    expect(inserted).toEqual(['A']);
+  });
+
+  it("observes trusted page input without collecting text or treating modifiers as takeover", () => {
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const reported: string[] = [];
+    const wallNow = Date.now();
+    const timeOrigin = wallNow - 10_000; // The page predates a VM clock correction.
+    const context = vm.createContext({
+      addEventListener: (type: string, listener: (event: Record<string, unknown>) => void) => listeners.set(type, listener),
+      __memmyUserInput: (payload: string) => reported.push(payload),
+      Date: { now: () => wallNow }, performance: { timeOrigin, now: () => 105 },
+    });
+    const extensionContext = vm.createContext({ chrome: {
+      runtime: { onMessage: { addListener() {} } },
+      debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} } },
+      tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} } },
+    }, WebSocket: class {}, navigator: { userAgent: 'Chrome' }, URL });
+    vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), extensionContext);
+    vm.runInContext(vm.runInContext('inputObserverSource("claim-1")', extensionContext), context);
+    listeners.get('keydown')?.({ type: 'keydown', key: 'Shift', isTrusted: true, timeStamp: 101 });
+    listeners.get('keydown')?.({ type: 'keydown', key: 'A', isTrusted: false, timeStamp: 102 });
+    listeners.get('pointerdown')?.({ type: 'pointerdown', isTrusted: true, timeStamp: 103 });
+    listeners.get('wheel')?.({ type: 'wheel', isTrusted: true, timeStamp: 104 });
+    expect(reported.map(JSON.parse)).toEqual([
+      ['claim-1', 'pointerdown', wallNow - 2],
+      ['claim-1', 'wheel', wallNow - 1],
+    ]);
   });
 
   it("captures viewport and element screenshots at CSS or device resolution", async () => {
@@ -1371,19 +1512,30 @@ it('sends a child command to a registered child that navigated before dispatch',
   } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });
 
-it('marks an input lease while the user focuses its tab and clears it after focus leaves', async () => {
-  const test = discoveryHarness();
+it('keeps an idle focused executor running and stops its lease synchronously on real input', async () => {
+  const calls: string[] = [];
+  const test = discoveryHarness({ command: async method => { calls.push(method); return {}; } });
   const origin = 'https://example.test';
-  let focused = false;
+  const leaseId = 'a'.repeat(32);
   (test.context as any).chrome.tabs.get = async () => ({ id: 7, incognito: false, url: origin + '/', active: true, windowId: 1 });
-  (test.context as any).chrome.windows.get = async () => ({ focused });
+  (test.context as any).chrome.windows.get = async () => ({ focused: true });
   vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
-    claims.get(7).playwrightLease = {id:'${'a'.repeat(32)}', origin:'${origin}', input:true, documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+    Object.assign(claims.get(7), {attached:true, inputObserverToken:'lease-input',
+      playwrightLease: {id:'${leaseId}', origin:'${origin}', input:true, documentEpoch:0, expiresAt:Date.now()+45000}});`, test.context);
+  const write = () => vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+    leaseId:'${leaseId}', approvedOrigin:'${origin}', method:'Input.insertText', params:{text:'A'} }, 'input-check')`, test.context);
   try {
-    focused = true; vm.runInContext('refreshUserActivity()', test.context);
-    await vi.waitFor(() => expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(true));
-    focused = false; vm.runInContext('refreshUserActivity()', test.context);
-    await vi.waitFor(() => expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(false));
+    vm.runInContext('refreshUserActivity()', test.context);
+    await expect(write()).resolves.toEqual({});
+    test.debuggerEvent(7, 'Runtime.bindingCalled', { name: '__memmyUserInput',
+      payload: JSON.stringify(['lease-input', 'keydown', Date.now()]) });
+    // No asynchronous focus query can allow another character through here.
+    expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(true);
+    await expect(write()).rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    vm.runInContext('claims.get(7).lastUserInputAt = Date.now() - USER_ACTIVE_WINDOW_MS - 1; refreshUserActivity()', test.context);
+    await expect(write()).rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    expect(calls).toEqual(['Input.insertText']);
+    expect(test.sent.filter(message => message.type === 'playwright_event')).toHaveLength(0);
   } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });
 

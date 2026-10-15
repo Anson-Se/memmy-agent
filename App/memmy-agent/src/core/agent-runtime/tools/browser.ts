@@ -1471,8 +1471,7 @@ export class BrowserSessionManager {
           const result = this.desktopManaged && process.env.MEMMY_DESKTOP_MANAGED_GATEWAY === '1'
             && process.platform === 'darwin'
             && this.definitions.get(name)?.annotations?.readOnlyHint !== true
-            ? await withMacFocusGuard('com.google.chrome.for.testing', name, invoke,
-              undefined, { blockWhenTargetForeground: true })
+            ? await withMacFocusGuard('com.google.chrome.for.testing', name, invoke)
             : await invoke();
           if (pendingDownload && result.isError !== true)
             await this.waitManagedDownload(pendingDownload.page, pendingDownload.destination, abortSignal);

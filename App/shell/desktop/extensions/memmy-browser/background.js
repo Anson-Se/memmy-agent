@@ -11,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.9";
+const EXTENSION_VERSION = "1.0.10";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -38,6 +38,32 @@ const OPEN_TAB_READY_MS = 10_000;
 // link opened the new tab. A Page.windowOpen is paired with a tab created within
 // this window whose URL matches or is not known yet (link tabs start without one).
 const OPEN_MATCH_WINDOW_MS = 3_000;
+const USER_ACTIVE_WINDOW_MS = 2_000;
+const INPUT_OBSERVER_WORLD = "memmy-user-input";
+const INPUT_OBSERVER_BINDING = "__memmyUserInput";
+let inputObserverGeneration = 0;
+// The isolated world reports only the event type and creation time. It never
+// sends keys, field values, coordinates, or page content to the extension.
+function inputObserverSource(token) { return `(() => {
+  globalThis.__memmyInputObserverToken = ${JSON.stringify(token)};
+  if (globalThis.__memmyInputObserverReady) return;
+  Object.defineProperty(globalThis, '__memmyInputObserverReady', { value: true });
+  const report = event => {
+    if (!event.isTrusted || (event.type === 'keydown'
+      && ['Alt', 'Control', 'Meta', 'Shift'].includes(event.key))) return;
+    // Compare with CDP's current epoch timestamp even if the system clock was
+    // corrected after this page loaded (common after a VM resumes).
+    const occurredAt = Date.now() - (performance.now() - event.timeStamp);
+    if (Number.isFinite(occurredAt)) {
+      globalThis.__memmyUserInput(JSON.stringify([
+        globalThis.__memmyInputObserverToken, event.type, occurredAt,
+      ]));
+    }
+  };
+  for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
+    addEventListener(type, report, { capture: true, passive: true });
+  }
+})()`; }
 const pageOpens = [];
 const createdTabs = new Map();
 const sourceTabs = new Map();
@@ -342,8 +368,106 @@ function allowPage(claim, url) {
   return origin;
 }
 
+function generatedInputTypes(method, params) {
+  if (method === "Input.dispatchMouseEvent") {
+    if (params.type === "mousePressed") return ["pointerdown"];
+    if (params.type === "mouseWheel") return ["wheel"];
+  }
+  if (method === "Input.dispatchKeyEvent"
+    && ["keyDown", "rawKeyDown"].includes(params.type)) return ["keydown"];
+  if (method === "Input.dispatchTouchEvent" && params.type === "touchStart") {
+    return ["touchstart", "pointerdown"];
+  }
+  if (method === "Input.synthesizeTapGesture") return ["pointerdown", "touchstart"];
+  if (method === "Input.synthesizeScrollGesture") return ["wheel"];
+  if (method === "Input.emulateTouchFromMouseEvent" && params.type === "mousePressed") {
+    return ["touchstart", "pointerdown"];
+  }
+  return [];
+}
+
+function pruneGeneratedInput(claim) {
+  const oldest = Date.now() - 10_000;
+  claim.generatedInput = claim.generatedInput.filter(entry => entry.endedAt >= oldest).slice(-200);
+}
+
 async function command(tabId, method, params = {}, sessionId) {
-  return chrome.debugger.sendCommand(sessionId ? { tabId, sessionId } : { tabId }, method, params);
+  const claim = claims.get(tabId);
+  const types = generatedInputTypes(method, params);
+  const supportsTimestamp = ["Input.dispatchMouseEvent", "Input.dispatchKeyEvent",
+    "Input.dispatchTouchEvent", "Input.emulateTouchFromMouseEvent"].includes(method);
+  const sentParams = supportsTimestamp && !Number.isFinite(params.timestamp)
+    ? { ...params, timestamp: Date.now() / 1000 } : params;
+  // CDP input also creates trusted DOM events. Keep its type and event time so
+  // delayed binding notifications do not look like later physical input.
+  const generated = claim && types.length ? {
+    types, startedAt: Date.now(), endedAt: Infinity,
+    eventAt: supportsTimestamp && Number.isFinite(sentParams.timestamp)
+      ? sentParams.timestamp * 1000 : null,
+  } : null;
+  if (generated) { pruneGeneratedInput(claim); claim.generatedInput.push(generated); }
+  try {
+    return await chrome.debugger.sendCommand(sessionId ? { tabId, sessionId } : { tabId }, method, sentParams);
+  } finally {
+    if (generated) generated.endedAt = Date.now();
+  }
+}
+
+async function installInputObserver(tabId, sessionId) {
+  const claim = claims.get(tabId);
+  if (!claim?.inputObserverToken) throw new Error("Input observer claim changed");
+  const source = inputObserverSource(claim.inputObserverToken);
+  await command(tabId, "Runtime.addBinding", {
+    name: INPUT_OBSERVER_BINDING, executionContextName: INPUT_OBSERVER_WORLD,
+  }, sessionId);
+  try {
+    await command(tabId, "Page.addScriptToEvaluateOnNewDocument", {
+      source, worldName: INPUT_OBSERVER_WORLD, runImmediately: true,
+    }, sessionId);
+  } catch {
+    // Older Chromium builds may reject runImmediately; the explicit current-frame
+    // installation below still covers the already loaded document.
+    await command(tabId, "Page.addScriptToEvaluateOnNewDocument", {
+      source, worldName: INPUT_OBSERVER_WORLD,
+    }, sessionId);
+  }
+  // runImmediately is not available in every supported Chromium build. Install
+  // in the current document and each same-process frame as well.
+  const tree = await command(tabId, "Page.getFrameTree", {}, sessionId).catch(() => null);
+  const pending = tree?.frameTree ? [tree.frameTree] : [];
+  for (let count = 0; pending.length && count < 100; count++) {
+    const frame = pending.shift();
+    if (Array.isArray(frame.childFrames)) pending.push(...frame.childFrames);
+    if (typeof frame.frame?.id !== "string") continue;
+    try {
+      const world = await command(tabId, "Page.createIsolatedWorld", {
+        frameId: frame.frame.id, worldName: INPUT_OBSERVER_WORLD,
+      }, sessionId);
+      if (Number.isInteger(world?.executionContextId)) {
+        await command(tabId, "Runtime.evaluate", {
+          expression: source, contextId: world.executionContextId,
+        }, sessionId);
+      }
+    } catch { /* A navigating frame gets the registered script on its next document. */ }
+  }
+}
+
+async function installChildInputObserver(tabId, claim, sessionId) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (claims.get(tabId) !== claim || !claim.cdpSessions.has(sessionId)) return;
+    try {
+      await Promise.all([
+        command(tabId, 'Page.enable', {}, sessionId),
+        command(tabId, 'Runtime.enable', {}, sessionId),
+      ]);
+      await installInputObserver(tabId, sessionId);
+      return;
+    } catch {
+      // A child frame can navigate as it is attached. Its replacement session
+      // gets another installation attempt; retry this one while it remains live.
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
 }
 
 function wakeCdpWaiters(claim) {
@@ -374,6 +498,8 @@ function clearIdleDetach(tabId) {
 function markDebuggerDetached(claim) {
   claim.attached = false;
   claim.playwrightLease = null;
+  claim.lastUserInputAt = 0;
+  claim.generatedInput = [];
   claim.cdpSessions?.clear();
   claim.cdpEpoch = (claim.cdpEpoch || 0) + 1;
   wakeCdpWaiters(claim);
@@ -401,7 +527,8 @@ function newClaim(tabId, origin) {
     cdpSessions: new Map(), cdpWaiters: new Set(), protectedActivity: 0,
     cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: protectedCredentialTabs.has(tabId),
     credentialRecoveryOrigin: protectedCredentialOrigins.get(tabId) || origin,
-    recoveryNavigationPending: false, documentEpoch: 0, frameEpoch: 0 };
+    recoveryNavigationPending: false, documentEpoch: 0, frameEpoch: 0,
+    lastUserInputAt: 0, generatedInput: [], inputObserverToken: "" };
 }
 
 async function discoverTab(tabId) {
@@ -464,6 +591,7 @@ async function ensureAttached(tabId) {
   if (current.attached && !debuggerTasks.has(tabId)) return;
   return queueDebuggerTask(tabId, async () => {
     if (current.attached) return;
+    current.inputObserverToken = `${Date.now()}-${++inputObserverGeneration}`;
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (error) {
       // Chrome reports a session this extension already holds as "Another debugger is already attached".
@@ -479,6 +607,7 @@ async function ensureAttached(tabId) {
         await command(tabId, 'Target.setAutoAttach', { autoAttach: true, flatten: true,
           waitForDebuggerOnStart: false, filter: [{ type: 'iframe', exclude: false }] });
       } catch { /* Unsupported child targets remain unavailable. */ }
+      await installInputObserver(tabId);
       if (claims.get(tabId) !== current || pausedTabs.has(tabId)) throw new Error("Page detached during attachment");
     } catch (error) {
       await chrome.debugger.detach({ tabId }).catch(() => undefined);
@@ -911,6 +1040,27 @@ chrome.windows?.onFocusChanged?.addListener?.(() => {
 chrome.debugger.onEvent.addListener((source, method, data) => {
   const claim = claims.get(source.tabId);
   if (!claim) return;
+  if (method === "Runtime.bindingCalled" && data?.name === INPUT_OBSERVER_BINDING) {
+    if (!claim.attached && !debuggerTasks.has(source.tabId)) return;
+    let input;
+    try { input = JSON.parse(data.payload); } catch { return; }
+    if (!Array.isArray(input) || input.length !== 3
+      || input[0] !== claim.inputObserverToken
+      || !["pointerdown", "keydown", "wheel", "touchstart"].includes(input[1])
+      || !Number.isFinite(input[2])
+      || (source.sessionId && !claim.cdpSessions.has(source.sessionId))) return;
+    const [,, occurredAt] = input;
+    pruneGeneratedInput(claim);
+    const generated = claim.generatedInput.some(entry => entry.types.includes(input[1])
+      && (entry.eventAt !== null
+        ? Math.abs(occurredAt - entry.eventAt) <= 50
+        : occurredAt >= entry.startedAt - 50 && occurredAt <= entry.endedAt + 50));
+    if (!generated && occurredAt <= Date.now() + 1_000) {
+      claim.lastUserInputAt = Math.max(claim.lastUserInputAt, occurredAt);
+      refreshUserActivity();
+    }
+    return;
+  }
   // A lease intentionally stops forwarding events while idle. Preserve frame
   // changes as metadata so the next action can invalidate its cached worlds.
   if (['Page.frameNavigated', 'Page.frameAttached', 'Page.frameDetached'].includes(method)) {
@@ -956,6 +1106,9 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
       claim.cdpSessions.set(data.sessionId,
         { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
           ...(source.sessionId ? { parentSessionId: source.sessionId } : {}) });
+      if (claim.inputObserverToken && (claim.attached || debuggerTasks.has(source.tabId))) {
+        void installChildInputObserver(source.tabId, claim, data.sessionId);
+      }
     } else if (method === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
       claim.cdpSessions.delete(data.sessionId);
     } else if (method === 'Page.frameNavigated' && source.sessionId && claim.cdpSessions.has(source.sessionId)) {
@@ -1267,6 +1420,7 @@ async function cdpRead(tabId, name, args, commandId) {
       || child.info.revision !== child.revision || pageOrigin(child.info.url) !== child.origin)) {
       throw new Error('CDP child target changed');
     }
+    if (name === 'cdpWrite') await assertUserIsNotUsingTab(tabId);
     const result = await command(tabId, method, params, sessionId);
     if (child) {
       const live = await attachedChildMetadata(tabId, claim, sessionId, child.info);
@@ -1447,19 +1601,14 @@ function dispatchPlaywrightCdp(tabId, claim, args, commandId) {
   });
 }
 
-// Input leases keep the user's focus state current so each input command can be
-// checked synchronously. Browser focus changes refresh it in the background.
+// Actual page input invalidates an in-flight write lease synchronously. Keep it
+// invalid until the action ends, even if the user later changes browser focus.
 function refreshUserActivity() {
-  for (const [tabId, claim] of claims) {
-    if (!claim.playwrightLease?.input) continue;
-    const sequence = claim.userActivitySequence = (claim.userActivitySequence || 0) + 1;
-    void assertUserIsNotUsingTab(tabId).then(() => false,
-      error => String(error?.message || error) === 'USER_ACTIVE_ON_TARGET_TAB' ? true : undefined)
-      .then(active => {
-        if (active !== undefined && claims.get(tabId) === claim && claim.userActivitySequence === sequence) {
-          claim.userActiveOnTab = active;
-        }
-      });
+  for (const claim of claims.values()) {
+    if (claim.playwrightLease?.input && Number.isFinite(claim.lastUserInputAt)
+      && Date.now() - claim.lastUserInputAt < USER_ACTIVE_WINDOW_MS) {
+      claim.userActiveOnTab = true;
+    }
   }
 }
 
@@ -1504,6 +1653,7 @@ async function click(tabId, args) {
   const modifiers = Array.isArray(args.modifiers) ? args.modifiers.reduce(
     (bits, name) => bits | (modifierBits[name] || 0), 0) : 0;
   for (let count = 1; count <= (args.doubleClick ? 2 : 1); count++) {
+    await assertUserIsNotUsingTab(tabId);
     await command(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, modifiers, clickCount: count });
     await command(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, modifiers, clickCount: count });
   }
@@ -1558,11 +1708,12 @@ async function history(tabId, direction) {
 }
 
 async function assertUserIsNotUsingTab(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  const window = await chrome.windows.get(tab.windowId);
-  if (tab.active && window.focused) {
-    throw new Error("USER_ACTIVE_ON_TARGET_TAB");
-  }
+  const claim = claims.get(tabId);
+  if (!claim || !Number.isFinite(claim.lastUserInputAt)
+    || Date.now() - claim.lastUserInputAt >= USER_ACTIVE_WINDOW_MS) return;
+  // The event came from this claimed page. Focus may already have moved by the
+  // time the next write checks, but the Agent's old target can still be stale.
+  throw new Error("USER_ACTIVE_ON_TARGET_TAB");
 }
 
 async function fillAutofill(tabId, kind, values) {
@@ -1587,6 +1738,7 @@ async function fillAutofill(tabId, kind, values) {
       ["input[autocomplete=street-address]", values.address],
     ];
   const expression = `(() => { const fields = ${JSON.stringify(fields)}; let count=0; for(const [selector,value] of fields){ if(!value)continue; const input=[...document.querySelectorAll(selector)].find(el=>el.getClientRects().length); if(!input)continue; const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input),'value')?.set; if(!setter)continue; setter.call(input,String(value)); input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); count++; } return count; })()`;
+  await assertUserIsNotUsingTab(tabId);
   const response = await command(tabId, "Runtime.evaluate", { expression, returnByValue: true });
   if (response.exceptionDetails) throw new Error("Autofill failed");
   return { fieldsFilled: Number(response.result?.value || 0) };
@@ -1629,6 +1781,7 @@ async function upload(tabId, args, commandId) {
       returnByValue: true });
     if (checked.exceptionDetails || checked.result?.value !== true) throw new Error("Target is not a file input");
     await assertCurrent();
+    await assertUserIsNotUsingTab(tabId);
     await command(tabId, "DOM.setFileInputFiles", { objectId, files: paths });
     return { uploaded: paths.length };
   } finally {
@@ -1774,17 +1927,25 @@ async function run(tabId, name, args, commandId) {
       const text = String(args.text || "");
       if (text.length > 100000) throw new Error("Text is too long");
       const objectId = await targetObject(tabId, args.target || args.ref);
+      await assertUserIsNotUsingTab(tabId);
       await command(tabId, "Runtime.callFunctionOn", { objectId,
         functionDeclaration: "function(){ this.focus(); if(typeof this.select==='function'){this.select();return;} if(this.isContentEditable){const r=document.createRange();r.selectNodeContents(this);const s=window.getSelection();s.removeAllRanges();s.addRange(r);return;} throw Error('Element is not editable'); }" });
       if (args.slowly) {
-        for (const character of text) await command(tabId, "Input.insertText", { text: character });
-      } else await command(tabId, "Input.insertText", { text });
+        for (const character of text) {
+          await assertUserIsNotUsingTab(tabId);
+          await command(tabId, "Input.insertText", { text: character });
+        }
+      } else {
+        await assertUserIsNotUsingTab(tabId);
+        await command(tabId, "Input.insertText", { text });
+      }
       if (args.submit) await run(tabId, "pressKey", { key: "Enter" });
       return { ok: true };
     }
     case "selectOption": {
       const objectId = await targetObject(tabId, args.target || args.ref);
       const values = Array.isArray(args.values) ? args.values.map(String) : [String(args.value || "")];
+      await assertUserIsNotUsingTab(tabId);
       const { result } = await command(tabId, "Runtime.callFunctionOn", { objectId,
         functionDeclaration: "function(values){ if(this.tagName!=='SELECT') throw Error('Not a select'); for(const option of this.options) option.selected=values.includes(option.value); this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); return this.value; }",
         arguments: [{ value: values }], returnByValue: true, awaitPromise: true });
