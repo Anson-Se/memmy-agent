@@ -1543,7 +1543,7 @@ export function HomePage() {
   const modeVisibleSlashCommands = selectedComposerCommand
     ? filterGoalModeSlashCommands(visibleSlashCommands, Boolean(state.agent.currentChatId))
     : visibleSlashCommands;
-  const filteredSlashCommands = slashQuery == null ? [] : filterSlashCommands(modeVisibleSlashCommands, slashQuery, recentSlashCommands);
+  const filteredSlashCommands = slashQuery == null ? [] : filterSlashCommands(modeVisibleSlashCommands, slashQuery, recentSlashCommands, state.agent.modelPresets);
   const slashMenuOpen = filteredSlashCommands.length > 0;
   const displayConnectionStatus = state.agent.recoveryKind === "initial"
     ? "connecting"

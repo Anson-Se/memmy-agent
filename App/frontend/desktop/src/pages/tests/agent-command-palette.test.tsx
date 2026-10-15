@@ -25,7 +25,10 @@ describe("AgentCommandPalette", () => {
   it("detects slash query mode only for a leading command token", () => {
     expect(slashQueryFromInput("/")).toBe("");
     expect(slashQueryFromInput("/his")).toBe("his");
-    expect(slashQueryFromInput("/history 5")).toBeNull();
+    expect(slashQueryFromInput("/history 5")).toBe("history 5");
+    expect(slashQueryFromInput("/GOAL  p")).toBe("goal p");
+    expect(slashQueryFromInput("/goal ")).toBe("goal ");
+    expect(slashQueryFromInput("/goal\npause")).toBeNull();
     expect(slashQueryFromInput("show /history")).toBeNull();
   });
 
@@ -43,6 +46,45 @@ describe("AgentCommandPalette", () => {
     for (const command of available) {
       expect(filterSlashCommands(available, slashQueryFromInput(command.command)!, [])).toContainEqual(command);
     }
+  });
+
+  it("matches every literal subcommand at its current depth", () => {
+    const available = ["/goal", "/pairing", "/model", "/history", "/dream-log"].map((command) => ({
+      command, title: command, description: "", icon: "activity", argHint: ""
+    }));
+    const match = (input: string) => filterSlashCommands(available, slashQueryFromInput(input)!, []);
+    const expected = {
+      "/goal ": ["status", "help", "create", "pause", "resume", "edit", "budget", "clear"],
+      "/pairing ": ["list", "approve", "deny", "revoke"],
+      "/model ": ["list"],
+      "/goal budget ": ["none"]
+    };
+    for (const [prefix, suffixes] of Object.entries(expected)) {
+      expect(match(prefix).map((item) => item.command)).toEqual(suffixes.map((suffix) => prefix + suffix));
+      for (const suffix of suffixes) {
+        expect(match(prefix + suffix).map((item) => item.command)).toEqual([prefix + suffix]);
+        expect(match(prefix + suffix[0]).map((item) => item.command)).toContain(prefix + suffix);
+      }
+    }
+    expect(match("/GOAL   P").map((item) => item.command)).toEqual(["/goal pause"]);
+    expect(match("/pairing a")[0]).toMatchObject({ command: "/pairing approve", argHint: "<code>" });
+    expect(match("/goal c").map((item) => item.command)).toEqual(["/goal create", "/goal clear"]);
+    expect(match("/goal create")[0]?.argHint).toBe("<objective>");
+    for (const input of ["/history 5", "/dream-log abc", "/pairing approve abc", "/goal create write tests", "/goal budget 1000", "/goal status ", "/goal my objective"]) {
+      expect(match(input)).toEqual([]);
+    }
+    expect(filterSlashCommands([], "goal p", [])).toEqual([]);
+  });
+
+  it("matches available model preset names without changing their case", () => {
+    const presets = [
+      { name: "FastModel", available: true },
+      { name: "unavailable", available: false }
+    ];
+    expect(filterSlashCommands(commands, "model ", [], presets).map((item) => item.command)).toEqual(["/model list", "/model FastModel"]);
+    expect(filterSlashCommands(commands, "model fa", [], presets)[0]).toMatchObject({ command: "/model FastModel", argHint: "" });
+    expect(filterSlashCommands(commands, "model un", [], presets)).toEqual([]);
+    expect(filterSlashCommands(commands, "model FastModel ", [], presets)).toEqual([]);
   });
 
   it("orders empty-query results by recent commands without storing /stop", () => {

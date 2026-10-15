@@ -23,6 +23,20 @@ const DEFAULT_VISIBLE_COMMAND_ROWS = 5;
 const COMMAND_ROW_HEIGHT = 56;
 const COMMAND_LIST_BOTTOM_PADDING = 6;
 
+// Literal subcommands only; free-form arguments are displayed as hints.
+const SUBCOMMANDS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+  "/goal": [
+    ["status", ""], ["help", ""], ["create", "<objective>"],
+    ["pause", ""], ["resume", ""], ["edit", "<objective>"],
+    ["budget", "<positive-int|none>"], ["budget none", ""], ["clear", ""]
+  ],
+  "/pairing": [
+    ["list", ""], ["approve", "<code>"], ["deny", "<code>"],
+    ["revoke", "[channel] <user_id>"]
+  ],
+  "/model": [["list", ""]]
+};
+
 export type SlashCommandPaletteItem = MemmyAgentSlashCommand & {
   synthetic?: boolean;
 };
@@ -190,11 +204,10 @@ export function AgentCommandPalette(props: AgentCommandPaletteProps) {
 }
 
 export function slashQueryFromInput(input: string): string | null {
-  if (!input.startsWith("/")) {
+  if (!/^\/(?:[^\s/]+(?:[\t ][^\r\n]*)?)?$/.test(input)) {
     return null;
   }
-  const token = input.slice(1);
-  return /\s/.test(token) ? null : token.toLowerCase();
+  return input.slice(1).replace(/[\t ]+/g, " ").toLowerCase();
 }
 
 export function buildVisibleSlashCommands(
@@ -210,9 +223,28 @@ export function buildVisibleSlashCommands(
 export function filterSlashCommands(
   commands: SlashCommandPaletteItem[],
   query: string,
-  recentCommands: string[]
+  recentCommands: string[],
+  modelPresets: ReadonlyArray<{ name: string; available: boolean }> = []
 ): SlashCommandPaletteItem[] {
-  const normalizedQuery = query.toLowerCase();
+  const normalizedQuery = query.toLowerCase().replace(/[\t ]+/g, " ");
+  if (normalizedQuery.includes(" ")) {
+    const [root] = normalizedQuery.split(" ");
+    const parent = commands.find((command) => command.command.toLowerCase() === `/${root}`);
+    if (!parent) return [];
+    const suffixes = [...(SUBCOMMANDS[parent.command.toLowerCase()] ?? [])];
+    if (parent.command === "/model") {
+      for (const preset of modelPresets) {
+        if (preset.available && !/\s/.test(preset.name) && preset.name.toLowerCase() !== "list") {
+          suffixes.push([preset.name, ""]);
+        }
+      }
+    }
+    const depth = normalizedQuery.split(" ").length - 1;
+    return suffixes
+      .filter(([suffix]) => suffix.split(" ").length === depth)
+      .map(([suffix, argHint]) => ({ ...parent, command: `${parent.command} ${suffix}`, argHint }))
+      .filter((command) => commandMatchesQuery(command, normalizedQuery));
+  }
   const matched = normalizedQuery
     ? commands.filter((command) => commandMatchesQuery(command, normalizedQuery))
     : sortByRecent(commands, recentCommands);
