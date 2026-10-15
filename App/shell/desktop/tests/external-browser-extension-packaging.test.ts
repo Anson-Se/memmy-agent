@@ -382,9 +382,9 @@ describe("external browser page discovery", () => {
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
       expect(test.attaches).toEqual([7]);
-      await vi.advanceTimersByTimeAsync(14_000);
+      await vi.advanceTimersByTimeAsync(44_000);
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
-      await vi.advanceTimersByTimeAsync(14_000);
+      await vi.advanceTimersByTimeAsync(44_000);
       expect(test.detaches).toEqual([]);
       await vi.advanceTimersByTimeAsync(1_000);
       expect(test.detaches).toEqual([7]);
@@ -666,7 +666,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.7");
+    expect(manifest.version).toBe("1.0.8");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
@@ -1213,29 +1213,71 @@ it.each([true, false])('fills external required auth inputs (already known = %s)
 });
 
 
-it.each([['playwrightStart', 'cancel'], ['playwrightCdp', 'cancel'], ['playwrightCdp', 'navigate'], ['playwrightCdp', 'expire']])('rechecks the %s boundary after a delayed tab read and %s', async (name, change) => {
+it('rechecks the playwrightStart boundary after a delayed tab read and cancel', async () => {
   const methods: string[] = [];
   const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
   const origin = 'https://example.test';
   vm.runInContext(`assertUserIsNotUsingTab = async () => undefined;
-    claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map(),
-      playwrightLease: {id: '${'a'.repeat(32)}', origin: '${origin}', input: true, expiresAt: Date.now()+45000, documentEpoch: 0} });`, test.context);
-  let reads = 0, resolveTab!: (value: unknown) => void;
-  const delayedRead = name === 'playwrightStart' ? 1 : 2;
+    claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map() });`, test.context);
+  let resolveTab!: (value: unknown) => void, reads = 0;
   const tab = { id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 };
-  (test.context as any).chrome.tabs.get = async () => ++reads === delayedRead
-    ? await new Promise(resolve => { resolveTab = resolve; }) : tab;
-  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32), input: true, fresh: false,
-    method: 'Input.insertText', params: { text: 'never-sent' } };
-  (test.context as any).operationName = name;
-  const pending = vm.runInContext("playwrightControl(7, operationName, controlArgs, 'cancel-race')", test.context) as Promise<unknown>;
-  const checked = expect(pending).rejects.toThrow(/cancelled|document changed|lease expired/);
-  await vi.waitFor(() => expect(reads).toBe(delayedRead));
-  vm.runInContext(change === 'navigate' ? 'claims.get(7).documentEpoch++'
-    : change === 'expire' ? 'claims.get(7).playwrightLease.expiresAt = 0' : "cancelledCommands.add('cancel-race')", test.context);
+  (test.context as any).chrome.tabs.get = async () => ++reads === 1 ? await new Promise(resolve => { resolveTab = resolve; }) : tab;
+  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32), input: true, fresh: false };
+  const pending = vm.runInContext("playwrightControl(7, 'playwrightStart', controlArgs, 'cancel-race')", test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/cancelled/);
+  await vi.waitFor(() => expect(reads).toBe(1));
+  vm.runInContext("cancelledCommands.add('cancel-race')", test.context);
   resolveTab(tab);
   await checked;
   expect(methods).toEqual([]);
+});
+
+it.each(['cancel', 'navigate', 'site', 'expire', 'user-active'])('refuses executor CDP for a %s lease at dispatch without reading browser state', async change => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  const origin = 'https://example.test';
+  const tabReads = vi.fn(async () => ({ id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 }));
+  (test.context as any).chrome.tabs.get = tabReads;
+  vm.runInContext(`claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map(),
+      playwrightLease: {id: '${'a'.repeat(32)}', origin: '${origin}', input: true, expiresAt: Date.now()+45000, documentEpoch: 0} });`, test.context);
+  vm.runInContext(change === 'navigate' ? 'claims.get(7).documentEpoch++'
+    : change === 'site' ? "claims.get(7).origin = 'https://other.test'"
+      : change === 'expire' ? 'claims.get(7).playwrightLease.expiresAt = 0'
+        : change === 'user-active' ? 'claims.get(7).userActiveOnTab = true' : "cancelledCommands.add('cancel-race')", test.context);
+  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32),
+    method: 'Input.insertText', params: { text: 'never-sent' } };
+  await expect(vm.runInContext("playwrightControl(7, 'playwrightCdp', controlArgs, 'cancel-race')", test.context))
+    .rejects.toThrow(/cancelled|document changed|lease expired|USER_ACTIVE_ON_TARGET_TAB/);
+  expect(methods).toEqual([]);
+  expect(tabReads).not.toHaveBeenCalled();
+});
+
+it('delivers an executor reply before the events Chrome emits after it', async () => {
+  // Real browser API reads complete in a later task. A reply delayed by one
+  // would let the next CDP event overtake it, which Playwright cannot recover.
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const tab = { id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 };
+  (test.context as any).chrome.tabs.get = () => new Promise(resolve => setTimeout(() => resolve(tab), 0));
+  (test.context as any).chrome.windows.get = () => new Promise(resolve => setTimeout(() => resolve({ focused: false }), 0));
+  let reply!: (value: unknown) => void;
+  (test.context as any).chrome.debugger.sendCommand = () => new Promise(resolve => { reply = resolve; });
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}')); claims.get(7).attached = true;
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false, documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  try {
+    (test.context as any).pendingCommand = { type: 'command', id: 'ordered-reply', tabId: 7, command: 'playwrightCdp',
+      args: { leaseId, approvedOrigin: origin, method: 'Page.getFrameTree', params: {} } };
+    const handled = vm.runInContext('handleCommand(pendingCommand)', test.context) as Promise<unknown>;
+    await vi.waitFor(() => expect(reply).toBeTypeOf('function'));
+    reply({ frameTree: { frame: { id: 'main', url: origin + '/' } } });
+    setTimeout(() => test.debuggerEvent(7, 'Runtime.executionContextCreated',
+      { context: { id: 1, origin, auxData: { frameId: 'main', isDefault: true } } }), 0);
+    await handled;
+    await vi.waitFor(() => expect(test.sent.some(message => message.type === 'playwright_event')).toBe(true));
+    const order = test.sent.filter(message => message.type === 'playwright_event' || message.id === 'ordered-reply')
+      .map(message => message.type);
+    expect(order).toEqual(['response', 'playwright_event']);
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });
 
 
@@ -1280,41 +1322,69 @@ it.each(['target-id', 'target-type', 'url', 'revision', 'detached'])('rejects ch
   } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });
 
-it.each(['navigate', 'detach'])('does not send a child command after %s during the final tab identity read', async change => {
+it.each([['detach', 'before'], ['navigate', 'during'], ['detach', 'during']])('rejects a child command after the child %s %s dispatch', async (change, when) => {
   const test = discoveryHarness();
   const origin = 'https://example.test', leaseId = 'a'.repeat(32);
   const methods: string[] = [];
-  let resume!: (value: unknown) => void, reads = 0;
-  const tab = { id: 7, incognito: false, active: false, windowId: 1, url: origin + '/' };
-  (test.context as any).chrome.tabs.get = async () => ++reads === 2
-    ? await new Promise(resolve => { resume = resolve; }) : tab;
-  (test.context as any).chrome.debugger.sendCommand = async (target: any, method: string, params: any) => {
+  let finish!: (value: unknown) => void;
+  (test.context as any).chrome.debugger.sendCommand = (target: any, method: string) => {
     methods.push(method);
     expect(target).toEqual({ tabId: 7, sessionId: 'child-session' });
-    if (method === 'Target.getTargetInfo') {
-      expect(params).toEqual({});
-      return { targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } };
-    }
-    return {};
+    return new Promise(resolve => { finish = resolve; });
   };
   vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
     claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false,
       documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
   test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
     targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } });
-  const pending = vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
-    leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
-    method:'Runtime.evaluate', params:{expression:'1'} }, 'child-boundary')`, test.context) as Promise<unknown>;
-  const checked = expect(pending).rejects.toThrow(/frame changed/);
+  const change_ = () => change === 'navigate' ? test.debuggerEvent(7, 'Page.frameNavigated', {
+    frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/form' },
+  }, 'child-session') : test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
   try {
-    await vi.waitFor(() => expect(reads).toBe(2));
-    if (change === 'navigate') test.debuggerEvent(7, 'Page.frameNavigated', {
-      frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/form' },
-    }, 'child-session');
-    else test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
-    resume(tab); await checked;
-    expect(methods).toEqual(['Target.getTargetInfo']);
-  } finally { resume?.(tab); await vm.runInContext('unclaim(7, false)', test.context); }
+    if (when === 'before') change_();
+    const pending = vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+      leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
+      method:'Runtime.evaluate', params:{expression:'1'} }, 'child-boundary')`, test.context) as Promise<unknown>;
+    const checked = expect(pending).rejects.toThrow(/frame changed/);
+    if (when === 'during') { expect(methods).toEqual(['Runtime.evaluate']); change_(); finish({ result: { value: 1 } }); }
+    await checked;
+    expect(methods).toEqual(when === 'before' ? [] : ['Runtime.evaluate']);
+  } finally { finish?.({}); await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it('sends a child command to a registered child that navigated before dispatch', async () => {
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const methods: string[] = [];
+  (test.context as any).chrome.debugger.sendCommand = async (_target: any, method: string) => { methods.push(method); return { result: { value: 1 } }; };
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false,
+      documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+    targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } });
+  test.debuggerEvent(7, 'Page.frameNavigated', { frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/next' } }, 'child-session');
+  try {
+    await expect(vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+      leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
+      method:'Runtime.evaluate', params:{expression:'1'} }, 'child-current')`, test.context)).resolves.toEqual({ result: { value: 1 } });
+    expect(methods).toEqual(['Runtime.evaluate']);
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it('marks an input lease while the user focuses its tab and clears it after focus leaves', async () => {
+  const test = discoveryHarness();
+  const origin = 'https://example.test';
+  let focused = false;
+  (test.context as any).chrome.tabs.get = async () => ({ id: 7, incognito: false, url: origin + '/', active: true, windowId: 1 });
+  (test.context as any).chrome.windows.get = async () => ({ focused });
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    claims.get(7).playwrightLease = {id:'${'a'.repeat(32)}', origin:'${origin}', input:true, documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  try {
+    focused = true; vm.runInContext('refreshUserActivity()', test.context);
+    await vi.waitFor(() => expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(true));
+    focused = false; vm.runInContext('refreshUserActivity()', test.context);
+    await vi.waitFor(() => expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(false));
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
 });
 
 it.each([

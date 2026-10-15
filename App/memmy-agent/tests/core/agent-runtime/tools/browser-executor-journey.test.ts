@@ -126,11 +126,12 @@ describe.skipIf(!fs.existsSync(executable))('production extension through the re
     const submit = text(await manager.callTool(scope, 'browser_click', { target: 'text=Send request' }));
     await page.waitForURL('**/receipt?**');
     expect(await page.locator('output').textContent()).toBe('Isolated applicant on evidence.txt');
-    // A successful navigation must remain observable, even if the input itself
-    // crossed a document epoch before its CDP acknowledgment returned.
+    // The submit replaced the document: that is the click's success, and the
+    // result already shows the page it led to.
+    expect(submit).toContain('"ok":true');
+    expect(submit).toContain('Request received');
     const receipt = text(await manager.callTool(scope, 'browser_snapshot', {}));
     expect(receipt).toContain('Request received');
-    expect(submit).not.toContain('"noActionDispatched":true');
     const consoleLog = text(await manager.callTool(scope, 'browser_console_messages', {}));
     expect(consoleLog).toContain('isolated fixture submitted');
     fs.writeFileSync(policyPath, JSON.stringify({ version: 1, rules: [{ pattern: origin,

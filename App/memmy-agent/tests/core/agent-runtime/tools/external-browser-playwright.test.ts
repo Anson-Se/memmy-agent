@@ -8,7 +8,7 @@ import { WebSocket } from 'ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { executeExternalBrowserPlaywright, closeExternalBrowserPlaywrightScope, closeAllExternalBrowserPlaywright, EXTERNAL_BROWSER_SNAPSHOT_BUDGET } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
 import { ExternalBrowserPlaywrightRelay, type PlaywrightCommandBridge } from '../../../../src/core/agent-runtime/tools/external-browser-playwright-relay.js';
-import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
+import type { BrowserCommandSettle, ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
 import { BROWSER_PLAYWRIGHT_CDP_METHODS } from '@memmy/local-api-contracts';
 import { emitExternalBrowserFrame } from '../../../../src/core/agent-runtime/tools/external-browser-tools.js';
 
@@ -54,13 +54,14 @@ class FixtureBridge implements PlaywrightCommandBridge {
   private children = new Set<string>();
   private childTargets = new Map<string, any>();
   private listeners = new Set<(event: ExternalBrowserPlaywrightEvent) => void>();
-  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; settle?: BrowserCommandSettle }>();
   private stopped = false;
   private input = false;
   private uploadPaths?: string[];
   readonly methods: string[] = [];
   readonly contexts: Array<{ child: boolean; isDefault: boolean; origin: string; frameId?: string }> = [];
   dropDefaultContexts = false;
+  dropChildDefaultContexts = false;
   rejectObservation = false;
 
   private constructor(root: WebSocket, url: string) {
@@ -71,7 +72,10 @@ class FixtureBridge implements PlaywrightCommandBridge {
       const message = JSON.parse(String(raw));
       if (message.id) {
         const pending = this.pending.get(message.id); this.pending.delete(message.id);
-        if (message.error) pending?.reject(new Error(message.error.message)); else pending?.resolve(message.result);
+        // Like the production bridges, report the reply before any later event.
+        if (message.error) {
+          const error = new Error(message.error.message); pending?.settle?.({ ok: false, error }); pending?.reject(error);
+        } else { pending?.settle?.({ ok: true, result: message.result }); pending?.resolve(message.result); }
         return;
       }
       if (message.sessionId !== this.sessionId && !this.children.has(message.sessionId)) return;
@@ -90,8 +94,8 @@ class FixtureBridge implements PlaywrightCommandBridge {
         child: message.sessionId !== this.sessionId, isDefault: message.params.context.auxData?.isDefault === true,
         origin: message.params.context.origin, frameId: message.params.context.auxData?.frameId,
       });
-      if (this.dropDefaultContexts && message.method === 'Runtime.executionContextCreated'
-        && message.params.context.auxData?.isDefault === true) return;
+      if ((this.dropDefaultContexts || (this.dropChildDefaultContexts && message.sessionId !== this.sessionId))
+        && message.method === 'Runtime.executionContextCreated' && message.params.context.auxData?.isDefault === true) return;
       if (this.leaseId) for (const listener of this.listeners) listener({ leaseId: this.leaseId,
         method: message.method, params: message.params,
         ...(message.sessionId !== this.sessionId ? { sessionId: message.sessionId } : {}) });
@@ -113,7 +117,8 @@ class FixtureBridge implements PlaywrightCommandBridge {
   subscribePlaywright = (_identity: any, listener: (event: ExternalBrowserPlaywrightEvent) => void) => {
     this.listeners.add(listener); return () => this.listeners.delete(listener);
   };
-  command = async (_identity: any, name: string, args: Record<string, any> = {}, signal?: AbortSignal): Promise<unknown> => {
+  command = async (_identity: any, name: string, args: Record<string, any> = {}, signal?: AbortSignal,
+    settle?: BrowserCommandSettle): Promise<unknown> => {
     if (name === 'playwrightEnd') { if (this.leaseId === args.leaseId) this.leaseId = ''; return {}; }
     if (signal?.aborted || this.stopped) throw new Error('Browser executor cancelled');
     if (name === 'playwrightStart') {
@@ -137,11 +142,11 @@ class FixtureBridge implements PlaywrightCommandBridge {
       throw new Error('Upload paths are not approved');
     }
     this.methods.push(args.method);
-    return this.send(args.method, args.params, args.sessionId || this.sessionId);
+    return this.send(args.method, args.params, args.sessionId || this.sessionId, settle);
   };
-  private send(method: string, params: any = {}, sessionId?: string): Promise<any> {
+  private send(method: string, params: any = {}, sessionId?: string, settle?: BrowserCommandSettle): Promise<any> {
     const id = ++this.nextId;
-    const result = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    const result = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, settle }));
     this.root.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
     return result;
   }
@@ -231,11 +236,11 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     expect(after.nodes.some((node: any) => node.role === 'button' && node.name === 'Continue')).toBe(true);
   }, 20_000);
 
-  it('preserves the default context when Runtime.enable overtakes the frame-tree reply', async () => {
+  it('keeps the default context when the frame-tree reply settles late', async () => {
     const originalCommand = bridge.command;
     bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
       const result = await originalCommand(...args);
-      // Model the ordinary asynchronous extension/IPC response ordering, without changing the page.
+      // The relay answers when the bridge reports a reply; a late promise cannot reorder it.
       if (args[1] === 'playwrightCdp' && args[2]?.method === 'Page.getFrameTree') {
         await new Promise(resolve => setTimeout(resolve, 150));
       }
@@ -250,7 +255,7 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     } finally { clearTimeout(timer); controller.abort(); }
   }, 15_000);
 
-  it('preserves an opaque OOPIF context emitted before its child frame-tree reply', async () => {
+  it('keeps an OOPIF context when its frame-tree reply settles late', async () => {
     const frameUrl = origin.replace('127.0.0.1', 'localhost') + '/frame';
     await page.evaluate((url: string) => {
       const document = (globalThis as any).document;
@@ -275,6 +280,47 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
       expect(bridge.contexts.some(context => context.child && context.isDefault && !/^https?:/u.test(context.origin))).toBe(true);
     } finally { clearTimeout(timer); controller.abort(); }
   }, 15_000);
+
+  it('leaves out an embedded frame that never exposes a context instead of stalling the observation', async () => {
+    await page.evaluate((url: string) => {
+      const frame = (globalThis as any).document.createElement('iframe'); frame.src = url;
+      (globalThis as any).document.body.append(frame);
+    }, origin.replace('127.0.0.1', 'localhost') + '/frame');
+    await page.locator('iframe').contentFrame().locator('#inside').waitFor();
+    bridge.dropChildDefaultContexts = true;
+    const started = Date.now();
+    const snapshot = await run('snapshot');
+    expect(Date.now() - started).toBeLessThan(12_000);
+    expect(snapshot.nodes.some((node: any) => node.role === 'button' && node.name === 'Continue')).toBe(true);
+    expect(snapshot.nodes.some((node: any) => node.name === 'Frame name')).toBe(false);
+    expect(snapshot.nodes.at(-1)).toMatchObject({ role: 'note', name: expect.stringMatching(/embedded frame/) });
+    expect(snapshot.truncated).toBe(true);
+  }, 20_000);
+
+  it.each([['clear', true], ['blocked', false]] as const)('previews a %s page from the executor that just observed it, without another executor action', async (_label, frameAllowed) => {
+    await page.evaluate((url: string) => {
+      const frame = (globalThis as any).document.createElement('iframe'); frame.src = url;
+      (globalThis as any).document.body.append(frame);
+    }, origin + '/blocked');
+    await page.locator('iframe').contentFrame().locator('#private').waitFor();
+    const allow = (url: string) => frameAllowed || !url.includes('/blocked');
+    await run('snapshot', {}, allow);
+    const command = vi.fn((identity: any, name: string, args?: Record<string, any>, signal?: AbortSignal, settle?: any) =>
+      name === 'screenshot' ? Promise.resolve({ format: 'jpeg', data: 'AAA' })
+        : name === 'historyState' ? Promise.resolve({ canGoBack: false, canGoForward: false })
+          : bridge.command(identity, name, args, signal, settle));
+    await emitExternalBrowserFrame({ command, getClaim: bridge.getClaim, subscribePlaywright: bridge.subscribePlaywright,
+      isFrameAllowed: allow } as any, bridge.claim, scope);
+    expect(command.mock.calls.map(call => call[1])).toEqual(frameAllowed ? ['screenshot', 'historyState'] : []);
+  });
+
+  it('reports input that replaced the page as done and returns the new page', async () => {
+    await page.setContent(`<a href="${origin}/journey/receipt?applicant=Ada">Send</a>`);
+    bridge.claim.url = page.url();
+    const result = await run('click', { target: 'text=Send' });
+    expect(result).toMatchObject({ ok: true, inputDispatched: true });
+    expect(result.observation.nodes.some((node: any) => node.role === 'heading' && node.name === 'Request recorded')).toBe(true);
+  }, 20_000);
 
   it('bounds a contextless snapshot and releases the tab queue for a fresh observation', async () => {
     const originalSetTimeout = globalThis.setTimeout;
@@ -363,13 +409,13 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: any[]) => void,
       milliseconds?: number, ...args: any[]) => {
       const timer = originalSetTimeout(callback, milliseconds, ...args);
-      if (milliseconds === 15_000) idleTimers.push(() => { clearTimeout(timer); callback(...args); });
+      if (milliseconds === 45_000) idleTimers.push(() => { clearTimeout(timer); callback(...args); });
       return timer;
     }) as typeof setTimeout);
     let snapshot: any;
     try {
       snapshot = await run('snapshot');
-      // The last 15-second timer is installed only after the completed operation releases its lease.
+      // The last idle timer is installed only after the completed operation releases its lease.
       expect(idleTimers.length).toBeGreaterThan(0);
       idleTimers.at(-1)!();
       await new Promise<void>(resolve => originalSetTimeout(resolve, 30));
@@ -394,7 +440,8 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     const cleanup = new Promise<void>(resolve => { release = resolve; });
     bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
       if (args[1] === 'playwrightStart') starts++;
-      if (args[1] === 'playwrightEnd' && args[2]?.detach && !held) {
+      // Recycling ends the old lease without detaching; hold that cleanup open.
+      if (args[1] === 'playwrightEnd' && !held) {
         held = true; entered = true;
         await cleanup;
       }
@@ -624,12 +671,13 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     await page.evaluate(`const frame=document.createElement('iframe');frame.src=${JSON.stringify(origin + '/frame')};document.body.append(frame)`);
     await page.locator('iframe').contentFrame().locator('#inside').waitFor();
     const command = bridge.command;
-    bridge.command = async (...args: Parameters<FixtureBridge['command']>) => {
-      const result = await command(...args);
-      if (args[1] === 'playwrightCdp' && args[2]?.method === 'Page.captureScreenshot') {
-        await page.locator('iframe').evaluate((el: any, url: string) => { el.src = url; }, origin + '/blocked');
-        await page.locator('iframe').contentFrame().locator('#private').waitFor();
-      }
+    bridge.command = async (identity, name, args = {}, signal, settle) => {
+      if (name !== 'playwrightCdp' || args.method !== 'Page.captureScreenshot') return command(identity, name, args, signal, settle);
+      const result = await command(identity, name, args, signal);
+      // An ordered transport delivers the navigation events before this reply.
+      await page.locator('iframe').evaluate((el: any, url: string) => { el.src = url; }, origin + '/blocked');
+      await page.locator('iframe').contentFrame().locator('#private').waitFor();
+      settle?.({ ok: true, result });
       return result;
     };
     await expect(run('screenshot', {}, url => !url.includes('/blocked'))).rejects.toThrow(/blocked/);

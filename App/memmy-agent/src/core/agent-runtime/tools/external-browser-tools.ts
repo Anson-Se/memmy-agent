@@ -3,7 +3,7 @@ import { emitComputerUseSurface } from "../../../tools/computer-use/surface-prev
 import { browserAppKey } from "../../../tools/computer-use/native-app-key.js";
 import { ExternalBrowserBridge, EXTERNAL_BROWSER_EXTENSION_NOT_READY, EXTERNAL_BROWSER_EXTENSION_NOT_READY_MESSAGE, type ExternalBrowserClaim } from "./external-browser-bridge.js";
 import { OcuUserIntervened } from "../../../tools/computer-use/mac-focus-guard.js";
-import { executeExternalBrowserPlaywright } from './external-browser-playwright.js';
+import { executeExternalBrowserPlaywright, externalBrowserHasBlockedFrames } from './external-browser-playwright.js';
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
 
 type ExternalResult = Record<string, any>;
@@ -26,23 +26,27 @@ export async function emitExternalBrowserFrame(
   signal?: AbortSignal | null,
 ): Promise<void> {
   if (claim.browser === 'memmy' || signal?.aborted) return;
+  // The executor that just acted knows whether a frame blocked by site policy is
+  // on the page: a clear page gets a direct viewport capture, a blocked one none.
+  const blocked = bridge.subscribePlaywright ? externalBrowserHasBlockedFrames(scope, claim) : false;
+  if (!screenshot && blocked === true) return;
   // A presentation-only preview must not hold up the tool result or a stopped
   // turn. Some pages never finish screenshot preparation (fonts/animations).
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(abort, 3_000);
+  const timer = setTimeout(abort, blocked === false ? 1_500 : 3_000);
   const interrupted = new Promise<void>(resolve => {
     controller.signal.addEventListener('abort', () => resolve(), { once: true });
   });
   try {
     await Promise.race([(async () => {
       const policy = new BrowserUseSitePolicyReader();
-      const frame = screenshot ?? (bridge.subscribePlaywright
-        ? await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
-          subscribePlaywright: bridge.subscribePlaywright.bind(bridge) }, claim, scope, 'screenshot', { type: 'jpeg' },
-          bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), controller.signal)
-        : await bridge.command(claim, "screenshot", { type: "jpeg" }, controller.signal) as ExternalResult);
+      const frame = screenshot ?? (blocked === false
+        ? await bridge.command(claim, "screenshot", { type: "jpeg" }, controller.signal) as ExternalResult
+        : await executeExternalBrowserPlaywright({ command: bridge.command.bind(bridge), getClaim: bridge.getClaim.bind(bridge),
+          subscribePlaywright: bridge.subscribePlaywright!.bind(bridge) }, claim, scope, 'screenshot', { type: 'jpeg' },
+          bridge.isFrameAllowed ?? (url => policy.decision(url, 'access') !== 'block'), controller.signal));
       if (controller.signal.aborted || typeof frame.data !== "string" || !["png", "jpeg"].includes(frame.format)) return;
       const history = await bridge.command(claim, "historyState", {}, controller.signal) as ExternalResult;
       if (controller.signal.aborted) return;

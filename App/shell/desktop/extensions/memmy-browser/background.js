@@ -11,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.7";
+const EXTENSION_VERSION = "1.0.8";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -25,7 +25,7 @@ const CONNECT_TIMEOUT_MS = 6_000;
 const READY_TIMEOUT_MS = 800;
 // Chrome and Edge show a "started debugging this browser" bar while any tab is
 // attached, so a page is attached only while Memmy is operating it.
-const DEBUGGER_IDLE_DETACH_MS = 15_000;
+const DEBUGGER_IDLE_DETACH_MS = 45_000;
 // Closing that bar detaches every attached tab with canceled_by_user. Memmy's own
 // rescans wait this long before offering those pages again; the popup resumes at once.
 const USER_CANCEL_COOLDOWN_MS = 10_000;
@@ -897,6 +897,7 @@ chrome.tabs.onUpdated.addListener((tabId, changes, tab) => {
 });
 chrome.tabs.onActivated?.addListener?.(info => {
   void refreshHistoryFocus();
+  refreshUserActivity();
   if (!claims.has(info.tabId)) { void discoverTab(info.tabId).catch(() => undefined); return; }
   void chrome.tabs.get(info.tabId).then(tab => publishClaim(info.tabId, tab)).catch(() => undefined);
 });
@@ -904,6 +905,7 @@ chrome.tabs.onActivated?.addListener?.(info => {
 chrome.windows?.onFocusChanged?.addListener?.(() => {
   // Clear the prior window before asynchronous tabs/windows calls finish.
   void refreshHistoryFocus();
+  refreshUserActivity();
 });
 
 chrome.debugger.onEvent.addListener((source, method, data) => {
@@ -1368,64 +1370,97 @@ async function playwrightControl(tabId, name, args, commandId) {
     }
     return { ok: true };
   }
+  if (name === 'playwrightCdp') return dispatchPlaywrightCdp(tabId, claim, args, commandId);
+  if (name !== 'playwrightStart') throw new Error('Unsupported browser executor command');
   await current();
-  if (name === 'playwrightStart') {
-    if (typeof args.leaseId !== 'string' || !/^[a-f0-9]{32}$/.test(args.leaseId)) throw new Error('Invalid browser executor lease');
-    if (args.input === true) { await assertUserIsNotUsingTab(tabId); await current(); }
-    // The user-activity check yields: another action may acquire the tab, or
-    // Stop may revoke this request, before this Start can install its lease.
-    assertCurrent();
-    if (claim.playwrightLease && claim.playwrightLease.id !== args.leaseId
-      && claim.playwrightLease.expiresAt > Date.now()) throw new Error('Browser executor is already busy');
-    if (claim.cdpReadDepth || claim.cdpWriteDepth) throw new Error('Browser executor cannot overlap raw CDP');
-    if (args.uploadPaths !== undefined && (!Array.isArray(args.uploadPaths) || !args.uploadPaths.length
-      || args.uploadPaths.length > 20 || args.uploadPaths.some(file => typeof file !== 'string'
-        || !/^(?:\/|[A-Za-z]:[\\/])/.test(file)))) throw new Error('Invalid approved upload paths');
-    claim.playwrightLease = { id: args.leaseId, origin: args.approvedOrigin,
-      input: args.input === true, uploadPaths: args.uploadPaths,
-      documentEpoch: claim.documentEpoch || 0, expiresAt: Date.now() + 45_000 };
-    claim.playwrightLastLeaseId = args.leaseId;
-    const info = await command(tabId, 'Target.getTargetInfo');
-    const tree = await command(tabId, 'Page.getFrameTree');
-    if (args.fresh === true) {
-      await command(tabId, 'Runtime.disable');
-      await command(tabId, 'Target.setAutoAttach', { autoAttach: false, flatten: true,
-        waitForDebuggerOnStart: false });
-    }
-    await current();
-    return { targetInfo: info.targetInfo, frameTree: tree.frameTree,
-      childTargets: [...claim.cdpSessions.values()].map(child => ({ targetId: child.targetId, url: child.url })),
-      documentEpoch: claim.documentEpoch || 0, cdpEpoch: claim.cdpEpoch || 0,
-      frameEpoch: claim.frameEpoch || 0 };
+  if (typeof args.leaseId !== 'string' || !/^[a-f0-9]{32}$/.test(args.leaseId)) throw new Error('Invalid browser executor lease');
+  if (args.input === true) { await assertUserIsNotUsingTab(tabId); await current(); }
+  // The user-activity check yields: another action may acquire the tab, or
+  // Stop may revoke this request, before this Start can install its lease.
+  assertCurrent();
+  if (claim.playwrightLease && claim.playwrightLease.id !== args.leaseId
+    && claim.playwrightLease.expiresAt > Date.now()) throw new Error('Browser executor is already busy');
+  if (claim.cdpReadDepth || claim.cdpWriteDepth) throw new Error('Browser executor cannot overlap raw CDP');
+  if (args.uploadPaths !== undefined && (!Array.isArray(args.uploadPaths) || !args.uploadPaths.length
+    || args.uploadPaths.length > 20 || args.uploadPaths.some(file => typeof file !== 'string'
+      || !/^(?:\/|[A-Za-z]:[\\/])/.test(file)))) throw new Error('Invalid approved upload paths');
+  claim.playwrightLease = { id: args.leaseId, origin: args.approvedOrigin,
+    input: args.input === true, uploadPaths: args.uploadPaths,
+    documentEpoch: claim.documentEpoch || 0, expiresAt: Date.now() + 45_000 };
+  claim.playwrightLastLeaseId = args.leaseId;
+  if (args.input === true) { claim.userActivitySequence = (claim.userActivitySequence || 0) + 1; claim.userActiveOnTab = false; }
+  const info = await command(tabId, 'Target.getTargetInfo');
+  const tree = await command(tabId, 'Page.getFrameTree');
+  if (args.fresh === true) {
+    await command(tabId, 'Runtime.disable');
+    await command(tabId, 'Target.setAutoAttach', { autoAttach: false, flatten: true,
+      waitForDebuggerOnStart: false });
   }
-  const lease = claim.playwrightLease;
-  if (!lease || lease.id !== args.leaseId || lease.expiresAt <= Date.now()
-    || lease.origin !== args.approvedOrigin) throw new Error('Browser executor lease expired');
-  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
+  await current();
+  return { targetInfo: info.targetInfo, frameTree: tree.frameTree,
+    childTargets: [...claim.cdpSessions.values()].map(child => ({ targetId: child.targetId, url: child.url })),
+    documentEpoch: claim.documentEpoch || 0, cdpEpoch: claim.cdpEpoch || 0,
+    frameEpoch: claim.frameEpoch || 0 };
+}
+
+// Playwright relies on CDP's ordering: a reply must reach it before any event
+// Chrome emitted afterwards. Every check here reads state that debugger and tab
+// events keep current, so no browser API call sits between the bridge and Chrome.
+function dispatchPlaywrightCdp(tabId, claim, args, commandId) {
+  const lease = claim?.playwrightLease;
+  const assertLease = () => {
+    if (!claim || claims.get(tabId) !== claim || pausedTabs.has(tabId)
+      || cancelledCommands.has(commandId)) throw new Error('Browser executor cancelled');
+    if (claim.credentialProtected || claim.protectedActivity) throw new Error('Browser executor is unavailable during credential protection');
+    if (!lease || claim.playwrightLease !== lease || lease.id !== args.leaseId
+      || lease.origin !== args.approvedOrigin || lease.expiresAt <= Date.now()) throw new Error('Browser executor lease expired');
+    if ((claim.documentEpoch || 0) !== lease.documentEpoch || claim.origin !== lease.origin) {
+      throw new Error('Browser executor document changed; take a new snapshot');
+    }
+  };
+  assertLease();
   const method = String(args.method || '');
   if (method === 'DOM.setFileInputFiles') {
     if (!lease.uploadPaths || !Array.isArray(args.params?.files)
       || JSON.stringify(args.params.files) !== JSON.stringify(lease.uploadPaths)) throw new Error('Upload paths are not approved for this action');
   } else if (!PLAYWRIGHT_CDP_METHODS.has(method)) throw new Error('Browser executor CDP method is unavailable');
-  if (method.startsWith('Input.')) {
+  const input = method.startsWith('Input.');
+  if (input) {
     if (!lease.input) throw new Error('Browser executor observation cannot send input');
-    await assertUserIsNotUsingTab(tabId);
+    if (claim.userActiveOnTab) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
   }
-  const child = args.sessionId ? await resolveCdpTarget(tabId, claim, { sessionId: args.sessionId }) : null;
-  await current();
-  if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
-  if (lease.expiresAt <= Date.now()) throw new Error('Browser executor lease expired');
-  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
-  if (child && (claim.cdpSessions.get(child.sessionId) !== child.info
-    || child.info.revision !== child.revision)) throw new Error('Browser executor frame changed');
-  if (method.startsWith('Input.')) recordHistoryInput(tabId, commandId);
-  const result = await command(tabId, method, args.params || {}, child?.sessionId);
-  await current();
-  if (claims.get(tabId)?.playwrightLease !== lease) throw new Error('Browser executor lease changed');
-  if (child && (claim.cdpSessions.get(child.sessionId) !== child.info
-    || child.info.revision !== child.revision)) throw new Error('Browser executor frame changed');
-  if ((claim.documentEpoch || 0) !== lease.documentEpoch) throw new Error('Browser executor document changed; take a new snapshot');
-  return result;
+  const sessionId = args.sessionId === undefined ? undefined : String(args.sessionId);
+  const child = sessionId === undefined ? undefined : claim.cdpSessions.get(sessionId);
+  if (sessionId !== undefined) {
+    let webChild = false;
+    try { webChild = !!child && !!pageOrigin(child.url); } catch { /* Non-web child targets stay unavailable. */ }
+    if (!webChild) throw new Error('Browser executor frame changed');
+  }
+  const revision = child?.revision;
+  if (input) recordHistoryInput(tabId, commandId);
+  return command(tabId, method, args.params || {}, sessionId).then(result => {
+    assertLease();
+    if (child && (claim.cdpSessions.get(sessionId) !== child || child.revision !== revision)) {
+      throw new Error('Browser executor frame changed');
+    }
+    return result;
+  });
+}
+
+// Input leases keep the user's focus state current so each input command can be
+// checked synchronously. Browser focus changes refresh it in the background.
+function refreshUserActivity() {
+  for (const [tabId, claim] of claims) {
+    if (!claim.playwrightLease?.input) continue;
+    const sequence = claim.userActivitySequence = (claim.userActivitySequence || 0) + 1;
+    void assertUserIsNotUsingTab(tabId).then(() => false,
+      error => String(error?.message || error) === 'USER_ACTIVE_ON_TARGET_TAB' ? true : undefined)
+      .then(active => {
+        if (active !== undefined && claims.get(tabId) === claim && claim.userActivitySequence === sequence) {
+          claim.userActiveOnTab = active;
+        }
+      });
+  }
 }
 
 async function snapshot(tabId) {

@@ -1192,9 +1192,11 @@ function playwrightHarness() {
   let allowed = true, current = true;
   const approval = { origin: 'https://example.com', isAllowed: () => allowed, isCurrentChild: () => current };
   const id = 'a'.repeat(32);
+  const events: Array<{ leaseId: string; method: string; params: Record<string, unknown>; sessionId?: string }> = [];
   const run = (command: EmbeddedBrowserRequest['command'], args: Record<string, unknown> = {}, upload?: any) =>
-    test.driver.handle(test.request(command, { approvedOrigin: 'https://example.com', leaseId: id, ...args }), upload, approval, () => current);
-  return { ...test, id, run, approval, start: (input = false, args: Record<string, unknown> = {}, upload?: any) =>
+    test.driver.handle(test.request(command, { approvedOrigin: 'https://example.com', leaseId: id, ...args }), upload, approval,
+      () => current, event => { events.push(event); });
+  return { ...test, id, run, approval, events, start: (input = false, args: Record<string, unknown> = {}, upload?: any) =>
     run('playwrightStart', { input, fresh: true, ...args }, upload),
     setAllowed: (value: boolean) => { allowed = value; }, setCurrent: (value: boolean) => { current = value; } };
 }
@@ -1278,8 +1280,7 @@ it.each([
     expect(second.cdpEpoch).toBe(first.cdpEpoch);
     expect(second.frameTree).toEqual(first.frameTree);
     expect(second.childTargets).toEqual(first.childTargets);
-    const events = await test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 });
-    expect(events).toEqual({ events: [] });
+    expect(test.events.filter(item => item.method === event.method)).toEqual([]);
     test.guest.debugger.emit('message', {}, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
     await expect(test.run('playwrightCdp', { method: 'Page.getLayoutMetrics', params: {} }))
       .resolves.toMatchObject({ cssVisualViewport: { clientWidth: 800 } });
@@ -1308,35 +1309,34 @@ it('does not replace a new executor owner after an older Start finishes waiting 
   } finally { resume?.(); idle.mockRestore(); test.driver.dispose(); }
 });
 
-it('streams only scoped executor events and fails closed when its bounded event history loses events', async () => {
+it('pushes only current-lease executor events and reports a revoked lease to the waiting executor', async () => {
   const test = playwrightHarness();
   try {
     await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
     test.guest.debugger.emit('message', {}, 'Runtime.executionContextCreated', { context: { id: 4 } });
-    const result = await test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 });
-    expect(result).toMatchObject({ events: [{ sequence: 1, leaseId: test.id, method: 'Runtime.executionContextCreated', params: { context: { id: 4 } } }] });
-    for (let index = 0; index < 501; index++) test.guest.debugger.emit('message', {}, 'Page.lifecycleEvent', { name: 'load', frameId: 'frame-27' });
-    await expect(test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 })).rejects.toThrow(/interrupted/);
-    await test.run('playwrightEnd'); await test.start();
+    expect(test.events.at(-1)).toEqual({ leaseId: test.id, method: 'Runtime.executionContextCreated', params: { context: { id: 4 } } });
+    await test.run('playwrightEnd');
+    const ended = test.events.length;
+    test.guest.debugger.emit('message', {}, 'Page.lifecycleEvent', { name: 'load', frameId: 'frame-27' });
+    expect(test.events).toHaveLength(ended);
+    await test.start();
     test.guest.emit('did-start-navigation', { isMainFrame: true, url: 'https://example.com/reloaded' });
-    await expect(test.run('playwrightEvents', { afterSequence: 0, waitMs: 0 })).rejects.toThrow(/page changed/);
+    expect(test.events.at(-1)).toEqual({ leaseId: test.id, method: 'Memmy.executorRevoked', params: { reason: 'navigation' } });
+    await expect(test.run('playwrightCdp', { method: 'Page.getLayoutMetrics', params: {} })).rejects.toThrow(/page changed|lease expired/);
   } finally { test.driver.dispose(); }
 });
 
-it('permits only an existing iframe session and detects frame replacement after an asynchronous CDP call', async () => {
+it('permits only an existing iframe session without a metadata round trip and detects frame replacement during a call', async () => {
   const test = playwrightHarness();
   try {
     await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
     await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: '1' }, sessionId: 'foreign-session' }))
-      .rejects.toThrow(/not attached to this tab/);
+      .rejects.toThrow(/frame changed/);
     const info = { targetId: 'iframe-1', type: 'iframe', url: 'https://frame.test/form' };
     test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1', targetInfo: info });
     const initial = test.sendCommand.getMockImplementation()!;
-    test.sendCommand.mockImplementation(async (method, args, sessionId?: string) => {
-      if (method === 'Target.getTargetInfo') {
-        expect(args).toEqual({}); expect(sessionId).toBe('session-1');
-        return { targetInfo: info } as any;
-      }
+    test.sendCommand.mockImplementation(async (method, args) => {
+      if (method === 'Target.getTargetInfo') throw new Error('Executor child commands must not query metadata first');
       if (method === 'Runtime.evaluate') {
         test.guest.debugger.emit('message', {}, 'Page.frameNavigated', { frame: { id: 'iframe-1' } }, 'session-1');
         return { result: { value: 1 } };

@@ -79,6 +79,10 @@ export type ExternalBrowserPlaywrightEvent = {
   sessionId?: string;
 };
 
+/** Reported in the same turn the reply arrives, in order with executor events. */
+export type BrowserCommandOutcome = { ok: true; result: unknown } | { ok: false; error: Error };
+export type BrowserCommandSettle = (outcome: BrowserCommandOutcome) => void;
+
 export const EXTERNAL_BROWSER_EXTENSION_OUTDATED = 'The installed Memmy browser extension is too old to open tabs. Ask the user to reload it in the browser\'s extensions page or restart the browser after updating Memmy (setup: memmy://settings/browser-extension), or use a tab that is already open.';
 export const EXTERNAL_BROWSER_EXTENSION_NOT_READY = 'external_browser_extension_not_ready';
 export const EXTERNAL_BROWSER_EXTENSION_NOT_READY_MESSAGE = 'External browser extension is not ready.';
@@ -317,7 +321,8 @@ export class ExternalBrowserBridge {
   }
 
   async command(claim: Pick<ExternalBrowserClaim, "connectionId" | "tabId">,
-    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
+    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal,
+    settle?: BrowserCommandSettle): Promise<unknown> {
     const client = this.clients.get(claim.connectionId);
     if (!client?.authorized || !client.claims.has(claim.tabId)
       || client.socket.readyState !== WebSocket.OPEN) {
@@ -340,7 +345,12 @@ export class ExternalBrowserBridge {
       if (this.browserHistoryInputs.size >= 2_048) this.browserHistoryInputs.delete(this.browserHistoryInputs.keys().next().value!);
       this.browserHistoryInputs.set(id, { connectionId: claim.connectionId, tabId: claim.tabId, sentAt: now });
     }
-    const result = new Promise<unknown>((resolve, reject) => {
+    const result = new Promise<unknown>((resolvePromise, rejectPromise) => {
+      const report = (outcome: BrowserCommandOutcome) => {
+        try { settle?.(outcome); } catch { /* A caller's reply handling cannot break the bridge. */ }
+      };
+      const resolve = (value: unknown) => { report({ ok: true, result: value }); resolvePromise(value); };
+      const reject = (error: Error) => { report({ ok: false, error }); rejectPromise(error); };
       const cleanup = () => signal?.removeEventListener("abort", onAbort);
       const onAbort = () => {
         const pending = this.pending.get(id);

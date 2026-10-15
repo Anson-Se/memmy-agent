@@ -1,11 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
-import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
+import type { BrowserCommandOutcome, BrowserCommandSettle, ExternalBrowserClaim,
+  ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
 
 export type PlaywrightCommandBridge = {
+  /** `settle` runs when the reply arrives, in order with subscribed executor events. */
   command(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>, name: string,
-    args?: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
+    args?: Record<string, unknown>, signal?: AbortSignal, settle?: BrowserCommandSettle): Promise<unknown>;
   getClaim(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): ExternalBrowserClaim | null;
   subscribePlaywright(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
     listener: (event: ExternalBrowserPlaywrightEvent) => void): () => void;
@@ -17,7 +19,6 @@ type Operation = { bridge: PlaywrightCommandBridge; leaseId: string; origin: str
   timer?: ReturnType<typeof setTimeout>; startedAt: number; rejectInterruption: (error: Error) => void;
   endPromise?: Promise<void>; detachPromise?: Promise<void> };
 type CdpMessage = { id: number; method: string; params?: Record<string, any>; sessionId?: string };
-type FrameTreeReply = { promise: Promise<void>; resolve: () => void };
 type RemoteObjectScope = { url: string; sessionId: string; frameId: string; contextKey?: string };
 type FrameEvent = Pick<ExternalBrowserPlaywrightEvent, 'method' | 'params' | 'sessionId'>;
 export type BrowserExecutionDiagnostics = {
@@ -55,6 +56,7 @@ export class ExternalBrowserPlaywrightRelay {
   private childAttachments = new Map<string, FrameEvent>();
   private autoAttached = false;
   private inputState: 'none' | 'confirmed' | 'unknown' = 'none';
+  private documentReplaced = false;
   private consoleRecords: Array<{ frameUrl: string; type: string; text: string }> = [];
   private networkRecords: Array<{ frameUrl: string; method: string; url: string }> = [];
   private endpoint = '';
@@ -63,7 +65,6 @@ export class ExternalBrowserPlaywrightRelay {
   private stage = 'idle';
   private failure: Error | null = null;
   private interruption: Promise<never> = new Promise(() => undefined);
-  private readonly frameTreeReplies = new Map<string, Set<FrameTreeReply>>();
   readonly mainSessionId = 'memmy-page';
   setStage(stage: string): void { this.stage = /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(stage) ? stage : 'action'; }
   get actionError(): Error | null { return this.failure; }
@@ -72,6 +73,8 @@ export class ExternalBrowserPlaywrightRelay {
   hasBlockedFrames(): boolean { return [...this.frameParents.keys()].some(id => !this.frameAllowed(id))
     || [...this.childUrls.values()].some(url => !this.permitted(url)); }
   dispatchState(): 'none' | 'confirmed' | 'unknown' { return this.inputState; }
+  /** The tab committed (or, for the in-app browser, started) a new main document during this action. */
+  documentWasReplaced(): boolean { return this.documentReplaced; }
   frameVersion(): string { return JSON.stringify({ frames: this.versionFrames,
     children: [...this.childDescriptions.entries()].sort(([a], [b]) => a.localeCompare(b)),
     admittedFrames: [...this.frameParents.keys()].filter(id => this.frameAllowed(id)).sort() }); }
@@ -96,20 +99,7 @@ export class ExternalBrowserPlaywrightRelay {
         ws.on('message', raw => {
           let input: CdpMessage;
           try { input = JSON.parse(String(raw)); } catch { ws.close(1003); return; }
-          // Playwright installs world/context listeners after the frame-tree reply.
-          // Record this synchronously, before another incoming Runtime.enable can run.
-          const sessionId = input.sessionId || this.mainSessionId;
-          const frameTreeReply = input.method === 'Page.getFrameTree' ? this.beginFrameTreeReply(sessionId) : null;
-          void this.handle(input).then(result => {
-            try {
-              if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId, result });
-            } finally { if (frameTreeReply) { this.finishFrameTreeReply(sessionId, frameTreeReply); this.publishFrames(); } }
-          }, error => {
-            try {
-              if (this.socket === ws) this.emit({ id: input.id, sessionId: input.sessionId,
-                error: { code: -32000, message: String(error?.message || error) } });
-            } finally { if (frameTreeReply) this.finishFrameTreeReply(sessionId, frameTreeReply); }
-          });
+          this.receive(input, ws);
         });
         ws.on('close', () => {
           if (this.socket !== ws) return;
@@ -122,22 +112,6 @@ export class ExternalBrowserPlaywrightRelay {
     });
   }
   setFramePolicy(policy: (url: string) => boolean): void { this.allowFrame = policy; }
-
-  private beginFrameTreeReply(sessionId: string): FrameTreeReply {
-    let resolve!: () => void;
-    const promise = new Promise<void>(complete => { resolve = complete; });
-    const reply = { promise, resolve };
-    const pending = this.frameTreeReplies.get(sessionId) ?? new Set<FrameTreeReply>();
-    pending.add(reply); this.frameTreeReplies.set(sessionId, pending);
-    return reply;
-  }
-
-  private finishFrameTreeReply(sessionId: string, reply: FrameTreeReply): void {
-    const pending = this.frameTreeReplies.get(sessionId);
-    pending?.delete(reply);
-    if (!pending?.size) this.frameTreeReplies.delete(sessionId);
-    reply.resolve();
-  }
 
   async start(): Promise<string> {
     if (this.closed) throw this.failure ?? new Error('Browser executor relay closed');
@@ -158,6 +132,7 @@ export class ExternalBrowserPlaywrightRelay {
     if (this.closed) throw this.failure ?? new Error('Browser executor relay closed');
     if (this.operation) throw new Error('Browser executor action is already active');
     this.inputState = 'none';
+    this.documentReplaced = false;
     this.failure = null;
     this.stage = 'lease-start';
     this.assertClaim(bridge, origin, signal);
@@ -207,7 +182,9 @@ export class ExternalBrowserPlaywrightRelay {
   }
 
   async end(detach = false): Promise<void> {
-    const operation = this.operation ?? (detach ? this.lastOperation : null);
+    // Always end the last lease, even when the debugger stays attached;
+    // cleanup is memoized, so an action that already ended sends nothing new.
+    const operation = this.operation ?? this.lastOperation;
     if (this.operation === operation && operation) this.release(operation);
     if (detach && this.lastOperation === operation) this.lastOperation = null;
     if (operation) await this.cleanup(operation, detach);
@@ -224,8 +201,6 @@ export class ExternalBrowserPlaywrightRelay {
     operation.parentSignal?.removeEventListener('abort', operation.parentAbort);
     this.unsubscribe?.(); this.unsubscribe = null;
     operation.controller.abort(this.failure ?? this.cancelledError());
-    for (const pending of this.frameTreeReplies.values()) for (const reply of pending) reply.resolve();
-    this.frameTreeReplies.clear();
   }
 
   private interrupt(operation: Operation, error: Error): void {
@@ -420,8 +395,11 @@ export class ExternalBrowserPlaywrightRelay {
     const operation = this.operation;
     if (!operation || event.leaseId !== operation.leaseId || operation.signal?.aborted) return;
     if (event.method === 'Memmy.executorRevoked') {
+      if ((event.params as Record<string, unknown>)?.reason === 'navigation') this.documentReplaced = true;
       this.interrupt(operation, new Error('Browser action revoked')); void this.close(); return;
     }
+    if (event.method === 'Page.frameNavigated' && !event.sessionId && (event.params as any)?.frame
+      && !(event.params as any).frame.parentId) this.documentReplaced = true;
     try { this.assertActive(); } catch (error) {
       this.interrupt(operation, error as Error); void this.close(); return;
     }
@@ -556,13 +534,35 @@ export class ExternalBrowserPlaywrightRelay {
 
   }
 
-  async send(method: string, params: Record<string, any> = {}, sessionId = this.mainSessionId): Promise<any> {
+  send(method: string, params: Record<string, any> = {}, sessionId = this.mainSessionId): Promise<any> {
+    return Promise.race([new Promise((resolve, reject) => {
+      try { this.dispatchCommand(method, params, sessionId, outcome => outcome.ok ? resolve(outcome.result) : reject(outcome.error)); }
+      catch (error) { reject(error); }
+    }), this.interruption]);
+  }
+
+  // Replies are written in the same turn the bridge reports them, so Playwright
+  // receives each one before any event the browser emitted after it.
+  private receive(input: CdpMessage, ws: WebSocket): void {
+    const reply = (body: Record<string, unknown>) => {
+      if (this.socket === ws) this.emit({ id: input.id, ...(input.sessionId ? { sessionId: input.sessionId } : {}), ...body });
+    };
+    const fail = (error: unknown) => reply({ error: { code: -32000, message: String((error as Error)?.message || error) } });
+    try {
+      if (!Number.isInteger(input.id) || typeof input.method !== 'string') throw new Error('Invalid executor CDP command');
+      this.assertActive();
+      if (!input.sessionId) { reply({ result: this.browserCommand(input) }); return; }
+      this.dispatchCommand(input.method, input.params ?? {}, input.sessionId, outcome => {
+        if (!outcome.ok) { fail(outcome.error); return; }
+        reply({ result: outcome.result });
+        if (input.method === 'Page.getFrameTree') this.publishFrames();
+      });
+    } catch (error) { fail(error); }
+  }
+
+  private dispatchCommand(method: string, params: Record<string, any>, sessionId: string,
+    done: (outcome: BrowserCommandOutcome) => void): void {
     const operation = this.assertActive();
-    if (method === 'Runtime.enable') {
-      const replies = [...(this.frameTreeReplies.get(sessionId) ?? [])];
-      if (replies.length) await Promise.race([Promise.all(replies.map(reply => reply.promise)), this.interruption]);
-      if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
-    }
     if (sessionId !== this.mainSessionId && (!this.permitted(this.childUrls.get(sessionId))
       || !this.frameAllowed(this.childIds.get(sessionId) || ''))) {
       throw new Error('Browser executor frame is unavailable or blocked');
@@ -597,64 +597,72 @@ export class ExternalBrowserPlaywrightRelay {
         && /\.(?:selectOptions|fill|focusNode|setInputFiles|setChecked)\(/.test(String(params.functionDeclaration || '')));
     const previousState = this.inputState;
     if (mutation && this.inputState !== 'confirmed') this.inputState = 'unknown';
-    let result: Record<string, any>;
-    try {
-      result = await Promise.race([operation.bridge.command(this.identity, 'playwrightCdp', {
-        leaseId: operation.leaseId, approvedOrigin: operation.origin, method, params: commandParams,
-        ...(sessionId !== this.mainSessionId ? { sessionId } : {}),
-      }, operation.signal), this.interruption]) as Record<string, any>;
+    const accept = (result: Record<string, any>): Record<string, any> => {
       if (mutation) this.inputState = 'confirmed';
-    } catch (error) {
-      if (mutation && (error as Error).message === 'USER_ACTIVE_ON_TARGET_TAB') this.inputState = previousState;
-      throw error;
-    }
-    if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
-    if (method === 'Runtime.releaseObject' && params.objectId) this.objectScopes.delete(`${sessionId}:${params.objectId}`);
-    if (resolvedUrl && resolvedFrameId) {
-      for (const value of [result?.result, result?.object, ...(Array.isArray(result?.result)
-        ? result.result.flatMap((property: any) => [property.value, property.get, property.set]) : [])]) {
-        if (value?.objectId) this.objectScopes.set(`${sessionId}:${value.objectId}`,
-          { url: resolvedUrl, sessionId, frameId: resolvedFrameId, ...(resolvedContextKey ? { contextKey: resolvedContextKey } : {}) });
+      if (this.assertActive() !== operation) throw new Error('Browser executor action changed');
+      if (method === 'Runtime.releaseObject' && params.objectId) this.objectScopes.delete(`${sessionId}:${params.objectId}`);
+      if (resolvedUrl && resolvedFrameId) {
+        for (const value of [result?.result, result?.object, ...(Array.isArray(result?.result)
+          ? result.result.flatMap((property: any) => [property.value, property.get, property.set]) : [])]) {
+          if (value?.objectId) this.objectScopes.set(`${sessionId}:${value.objectId}`,
+            { url: resolvedUrl, sessionId, frameId: resolvedFrameId, ...(resolvedContextKey ? { contextKey: resolvedContextKey } : {}) });
+        }
       }
-    }
-    if (method === 'DOM.describeNode' && result.node?.frameId && !this.permitted(this.frameUrls.get(result.node.frameId))) {
-      throw new Error('Browser executor frame is blocked');
-    }
-    if (method === 'Page.getFrameTree') {
-      this.readFrameTree(result.frameTree);
-      return { ...result, frameTree: this.pruneFrameTree(result.frameTree) };
-    }
-    return result;
+      if (method === 'DOM.describeNode' && result.node?.frameId && !this.permitted(this.frameUrls.get(result.node.frameId))) {
+        throw new Error('Browser executor frame is blocked');
+      }
+      if (method === 'Page.getFrameTree') {
+        this.readFrameTree(result.frameTree);
+        return { ...result, frameTree: this.pruneFrameTree(result.frameTree) };
+      }
+      return result;
+    };
+    let settled = false;
+    const settle = (outcome: BrowserCommandOutcome) => {
+      if (settled) return;
+      settled = true;
+      if (!outcome.ok) {
+        if (mutation && outcome.error.message === 'USER_ACTIVE_ON_TARGET_TAB') this.inputState = previousState;
+        done(outcome); return;
+      }
+      let accepted: Record<string, any>;
+      try { accepted = accept(outcome.result as Record<string, any>); }
+      catch (error) { done({ ok: false, error: error as Error }); return; }
+      done({ ok: true, result: accepted });
+    };
+    // A bridge reports through `settle` in arrival order; the promise is the fallback.
+    operation.bridge.command(this.identity, 'playwrightCdp', {
+      leaseId: operation.leaseId, approvedOrigin: operation.origin, method, params: commandParams,
+      ...(sessionId !== this.mainSessionId ? { sessionId } : {}),
+    }, operation.signal, settle).then(result => settle({ ok: true, result }),
+      error => settle({ ok: false, error: error instanceof Error ? error : new Error(String(error)) }))
+      .catch(() => undefined);
   }
 
-  private async handle(message: CdpMessage): Promise<unknown> {
-    if (!Number.isInteger(message.id) || typeof message.method !== 'string') throw new Error('Invalid executor CDP command');
-    this.assertActive();
-    if (!message.sessionId) {
-      switch (message.method) {
-        case 'Browser.getVersion': return { protocolVersion: '1.3', product: 'Chrome/150.0.0.0',
-          revision: 'memmy', userAgent: `MemmyBrowserRelay (${process.platform === 'darwin' ? 'Macintosh'
-            : process.platform === 'win32' ? 'Windows NT 10.0' : 'Linux'})`, jsVersion: '1' };
-        case 'Target.setAutoAttach':
-          if (!this.autoAttached) {
-            this.autoAttached = true;
-            this.emit({ method: 'Target.attachedToTarget', params: { sessionId: this.mainSessionId,
-              targetInfo: this.targetInfo, waitingForDebugger: false } });
-          }
-          return {};
-        case 'Target.getTargetInfo': return { targetInfo: this.targetInfo };
-        case 'Target.attachToTarget':
-          if (message.params?.targetId !== this.targetInfo.targetId) throw new Error('Browser executor cannot attach another tab');
-          return { sessionId: this.mainSessionId };
-        case 'Target.detachFromTarget': return {};
-        case 'Browser.close': this.socket?.close(); return {};
-        default: throw new Error(`Browser-wide CDP is unavailable: ${message.method}`);
-      }
+  private browserCommand(message: CdpMessage): unknown {
+    switch (message.method) {
+      case 'Browser.getVersion': return { protocolVersion: '1.3', product: 'Chrome/150.0.0.0',
+        revision: 'memmy', userAgent: `MemmyBrowserRelay (${process.platform === 'darwin' ? 'Macintosh'
+          : process.platform === 'win32' ? 'Windows NT 10.0' : 'Linux'})`, jsVersion: '1' };
+      case 'Target.setAutoAttach':
+        if (!this.autoAttached) {
+          this.autoAttached = true;
+          this.emit({ method: 'Target.attachedToTarget', params: { sessionId: this.mainSessionId,
+            targetInfo: this.targetInfo, waitingForDebugger: false } });
+        }
+        return {};
+      case 'Target.getTargetInfo': return { targetInfo: this.targetInfo };
+      case 'Target.attachToTarget':
+        if (message.params?.targetId !== this.targetInfo.targetId) throw new Error('Browser executor cannot attach another tab');
+        return { sessionId: this.mainSessionId };
+      case 'Target.detachFromTarget': return {};
+      case 'Browser.close': this.socket?.close(); return {};
+      default: throw new Error(`Browser-wide CDP is unavailable: ${message.method}`);
     }
-    return this.send(message.method, message.params, message.sessionId);
   }
 
-  close(): Promise<void> {
+  /** `detach: false` closes only this Playwright connection; the next action reuses the attached tab. */
+  close(detach = true): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     if (this.operation) this.interrupt(this.operation, this.cancelledError());
@@ -663,7 +671,7 @@ export class ExternalBrowserPlaywrightRelay {
     this.sockets.close();
     if (this.server.listening) this.server.close();
     this.endpoint = '';
-    this.closePromise = this.end(true);
+    this.closePromise = this.end(detach);
     return this.closePromise;
   }
 }

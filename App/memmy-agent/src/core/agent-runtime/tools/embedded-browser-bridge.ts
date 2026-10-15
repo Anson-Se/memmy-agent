@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserResult,
+import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserEvent, isEmbeddedBrowserResult,
   formatEmbeddedBrowserTabMention, parseEmbeddedBrowserTabMention,
   type EmbeddedBrowserCommand } from '@memmy/local-api-contracts';
-import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
+import type { BrowserCommandOutcome, BrowserCommandSettle, ExternalBrowserClaim,
+  ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
 
 type Pending = { resolve: (value: unknown) => void; reject: (reason: Error) => void;
   cleanup: () => void };
@@ -16,8 +17,13 @@ export class EmbeddedBrowserBridge {
   private visibleTabs: Array<{ tabId: number; title: string; url: string; tabMention: string | null }> = [];
   private readonly claims = new Map<number, ExternalBrowserClaim>();
   private readonly executorListeners = new Map<number, Set<(event: ExternalBrowserPlaywrightEvent) => void>>();
-  private readonly executorPolls = new Map<number, AbortController>();
   private readonly receive = (value: unknown) => {
+    if (isEmbeddedBrowserEvent(value)) {
+      const event: ExternalBrowserPlaywrightEvent = { leaseId: value.leaseId, method: value.method, params: value.params,
+        ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId }) };
+      for (const listener of this.executorListeners.get(value.tabId) ?? []) listener(event);
+      return;
+    }
     if (!isEmbeddedBrowserResult(value)) return;
     const pending = this.pending.get(value.requestId);
     if (!pending) return;
@@ -32,11 +38,16 @@ export class EmbeddedBrowserBridge {
   }
 
   private request(command: EmbeddedBrowserCommand, args: Record<string, unknown> = {}, tabId?: number,
-    signal?: AbortSignal): Promise<unknown> {
+    signal?: AbortSignal, settle?: BrowserCommandSettle): Promise<unknown> {
     if (!process.send) return Promise.reject(new Error('Embedded browser is available only in the desktop app'));
     if (signal?.aborted) return Promise.reject(new Error('Browser operation was canceled'));
     const requestId = randomUUID();
-    return new Promise((resolve, reject) => {
+    return new Promise((resolvePromise, rejectPromise) => {
+      const report = (outcome: BrowserCommandOutcome) => {
+        try { settle?.(outcome); } catch { /* A caller's reply handling cannot break the bridge. */ }
+      };
+      const resolve = (value: unknown) => { report({ ok: true, result: value }); resolvePromise(value); };
+      const reject = (error: Error) => { report({ ok: false, error }); rejectPromise(error); };
       const onAbort = () => {
         if (!this.pending.delete(requestId)) return;
         cleanup();
@@ -153,17 +164,10 @@ export class EmbeddedBrowserBridge {
     return identity.connectionId === `memmy-webview:${this.browserId}` ? this.claims.get(identity.tabId) ?? null : null;
   }
   command(claim: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
-    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
+    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal,
+    settle?: BrowserCommandSettle): Promise<unknown> {
     if (!this.getClaim(claim)) return Promise.reject(new Error('Embedded browser tab is no longer open'));
-    if (command === 'playwrightEnd') {
-      this.executorPolls.get(claim.tabId)?.abort(); this.executorPolls.delete(claim.tabId);
-    }
-    return this.request(command as EmbeddedBrowserCommand, args, claim.tabId, signal).then(result => {
-      if (command === 'playwrightStart' && typeof args.leaseId === 'string') {
-        this.pollExecutor(claim, args.leaseId, String(args.approvedOrigin || ''));
-      }
-      return result;
-    });
+    return this.request(command as EmbeddedBrowserCommand, args, claim.tabId, signal, settle);
   }
 
   subscribePlaywright(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
@@ -173,45 +177,12 @@ export class EmbeddedBrowserBridge {
     listeners.add(listener); this.executorListeners.set(identity.tabId, listeners);
     return () => {
       listeners.delete(listener);
-      if (!listeners.size) {
-        this.executorListeners.delete(identity.tabId);
-        this.executorPolls.get(identity.tabId)?.abort(); this.executorPolls.delete(identity.tabId);
-      }
+      if (!listeners.size) this.executorListeners.delete(identity.tabId);
     };
   }
 
-  private pollExecutor(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>, leaseId: string, approvedOrigin: string): void {
-    this.executorPolls.get(identity.tabId)?.abort();
-    const controller = new AbortController(); this.executorPolls.set(identity.tabId, controller);
-    void (async () => {
-      let afterSequence = 0;
-      try {
-        while (!controller.signal.aborted && this.getClaim(identity) && this.executorListeners.has(identity.tabId)) {
-          const result = await this.request('playwrightEvents' as EmbeddedBrowserCommand,
-            { leaseId, approvedOrigin, afterSequence, waitMs: 250 }, identity.tabId, controller.signal) as { events?: unknown[] };
-          for (const item of Array.isArray(result?.events) ? result.events : []) {
-            const event = item as ExternalBrowserPlaywrightEvent & { sequence?: number };
-            if (event.leaseId !== leaseId || !Number.isSafeInteger(event.sequence)
-              || event.sequence! <= afterSequence || typeof event.method !== 'string'
-              || !event.params || typeof event.params !== 'object') continue;
-            afterSequence = event.sequence!;
-            for (const listener of this.executorListeners.get(identity.tabId) ?? []) listener(event);
-          }
-        }
-      } catch {
-        if (!controller.signal.aborted) {
-          for (const listener of this.executorListeners.get(identity.tabId) ?? []) {
-            listener({ leaseId, method: 'Memmy.executorRevoked', params: {} });
-          }
-        }
-      } finally {
-        if (this.executorPolls.get(identity.tabId) === controller) this.executorPolls.delete(identity.tabId);
-      }
-    })();
-  }
   close(): void {
-    for (const controller of this.executorPolls.values()) controller.abort();
-    this.executorPolls.clear(); this.executorListeners.clear();
+    this.executorListeners.clear();
     process.removeListener('message', this.receive);
     for (const pending of this.pending.values()) {
       pending.cleanup();

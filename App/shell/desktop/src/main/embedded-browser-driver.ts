@@ -17,8 +17,11 @@ type ClickGeometry = { width: number; height: number; quads: number[][] };
 type ClickAction = Point & { objectId?: string; backendNodeId?: number; geometry?: ClickGeometry; checkCurrent: () => void };
 type CdpSession = { targetId: string; url: string; revision: number; parentSessionId?: string };
 type ResolvedCdpTarget = { sessionId: string; info: CdpSession; revision: number; origin: string };
+/** Delivers an executor CDP event on the same ordered channel as command results. */
+export type EmbeddedExecutorEventSink = (event: { leaseId: string; method: string;
+  params: Record<string, unknown>; sessionId?: string }) => void;
 type PlaywrightLease = { id: string; origin: string; input: boolean; expiresAt: number;
-  documentEpoch: number; cdpEpoch: number; targetId: string;
+  documentEpoch: number; cdpEpoch: number; targetId: string; emit?: EmbeddedExecutorEventSink;
   uploadStamps?: ApprovedBrowserUpload['stamps']; uploadPaths?: string[] };
 type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<string>;
   console: Array<{ type: string; text: string }>; requests: Array<{ method: string; url: string }>;
@@ -27,7 +30,6 @@ type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<stri
   cdpOrigin: string | null;
   cdpEpoch: number;
   playwrightLease: PlaywrightLease | null; playwrightLastLeaseId: string | null;
-  playwrightEvents: BrowserCdpEventBuffer;
   protectedActivity: number; cdpReadDepth: number; cdpWriteDepth: number;
   credentialProtected: boolean; credentialRecoveryOrigin: string | null;
   recoveryNavigationPending: boolean; documentEpoch: number; frameEpoch: number;
@@ -192,7 +194,7 @@ export class EmbeddedBrowserDriver {
   attach(guest: WebContents, host: BrowserWindow): void {
     const entry: Entry = { guest, host, allowedOrigins: new Set(), console: [], requests: [],
       cdpEvents: new BrowserCdpEventBuffer(), cdpSessions: new Map(), cdpOrigin: null, cdpEpoch: 0,
-      playwrightLease: null, playwrightLastLeaseId: null, playwrightEvents: new BrowserCdpEventBuffer(),
+      playwrightLease: null, playwrightLastLeaseId: null,
       protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: false,
       credentialRecoveryOrigin: null, recoveryNavigationPending: false,
       documentEpoch: 0, frameEpoch: 0,
@@ -203,7 +205,7 @@ export class EmbeddedBrowserDriver {
     this.entries.set(guest.id, entry);
     guest.on('did-start-navigation', details => {
       if (details.isMainFrame) {
-        this.revokePlaywright(entry);
+        this.revokePlaywright(entry, details.isSameDocument ? undefined : 'navigation');
         try { this.ensureCdpOrigin(entry, origin(details.url)); }
         catch { entry.cdpEvents.clear(); entry.cdpOrigin = null; entry.cdpEpoch++; }
         entry.lastStartedUrl = details.url;
@@ -239,7 +241,7 @@ export class EmbeddedBrowserDriver {
     };
     guest.on('did-stop-loading', recordNavigation);
     guest.on('did-navigate', () => {
-      this.revokePlaywright(entry);
+      this.revokePlaywright(entry, 'navigation');
       entry.documentEpoch++;
       let recovered = false;
       try { recovered = entry.recoveryNavigationPending
@@ -598,8 +600,9 @@ export class EmbeddedBrowserDriver {
               if (!entry.credentialProtected && !entry.protectedActivity) {
                 entry.cdpEvents.record(name, data, { tabId: entry.guest.id,
                   ...(child ? { sessionId: sourceSessionId, targetId: child.targetId } : {}) });
-                if (entry.playwrightLease) entry.playwrightEvents.record(name, data, { tabId: entry.guest.id,
-                  ...(child ? { sessionId: sourceSessionId, targetId: child.targetId } : {}) });
+                const lease = entry.playwrightLease;
+                if (lease?.emit && lease.expiresAt > Date.now()) lease.emit({ leaseId: lease.id, method: name,
+                  params: data && typeof data === 'object' ? data : {}, ...(child ? { sessionId: sourceSessionId } : {}) });
               }
             }
           } catch { this.revokePlaywright(entry); entry.cdpEvents.clear(); entry.cdpSessions.clear(); entry.cdpOrigin = null; }
@@ -637,13 +640,17 @@ export class EmbeddedBrowserDriver {
     finally { entry.agentInputDepth--; }
   }
 
-  private revokePlaywright(entry: Entry): void {
+  private revokePlaywright(entry: Entry, reason?: 'navigation'): void {
+    const lease = entry.playwrightLease;
     entry.playwrightLease = null;
-    entry.playwrightEvents.clear();
+    // The executor may be waiting for an event, with no command outstanding.
+    try { lease?.emit?.({ leaseId: lease.id, method: 'Memmy.executorRevoked', params: reason ? { reason } : {} }); }
+    catch { /* The Agent process is gone; its executor is already closed. */ }
   }
 
   private async playwrightControl(entry: Entry, request: EmbeddedBrowserRequest, upload: ApprovedBrowserUpload | undefined,
-    approval: ApprovedBrowserCdpRead | undefined, isCurrent?: () => boolean): Promise<unknown> {
+    approval: ApprovedBrowserCdpRead | undefined, isCurrent?: () => boolean,
+    emitEvent?: EmbeddedExecutorEventSink): Promise<unknown> {
     const args = request.args, id = args.leaseId;
     if (typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id) || request.tabId !== entry.guest.id) {
       throw new Error('Invalid browser executor lease');
@@ -700,9 +707,9 @@ export class EmbeddedBrowserDriver {
       }
       this.ensureCdpOrigin(entry);
       this.revokePlaywright(entry);
-      entry.playwrightEvents = new BrowserCdpEventBuffer();
       const lease: PlaywrightLease = { id, origin: args.approvedOrigin as string, input: args.input,
         documentEpoch: entry.documentEpoch, cdpEpoch: entry.cdpEpoch, expiresAt: Date.now() + 45_000, targetId: '',
+        ...(emitEvent ? { emit: emitEvent } : {}),
         ...(uploadPaths && upload ? { uploadPaths, uploadStamps: upload.stamps.map(stamp => ({ ...stamp })) } : {}) };
       entry.playwrightLease = lease; entry.playwrightLastLeaseId = id;
       try {
@@ -727,17 +734,6 @@ export class EmbeddedBrowserDriver {
     const lease = entry.playwrightLease;
     if (!lease) throw new Error('Browser executor lease expired; take a new snapshot');
     current(lease);
-    if (request.command === 'playwrightEvents') {
-      if (!Number.isSafeInteger(args.afterSequence) || (args.afterSequence as number) < 0
-        || !Number.isFinite(args.waitMs) || (args.waitMs as number) < 0 || (args.waitMs as number) > 500) throw new Error('Invalid browser executor event query');
-      const result = await entry.playwrightEvents.wait({ afterSequence: args.afterSequence, timeoutMs: args.waitMs, limit: 500 }, () => {
-        try { current(lease); return true; } catch { return false; }
-      });
-      current(lease);
-      if (result.truncated) throw new Error('Browser executor event stream was interrupted; take a new snapshot');
-      return { events: result.events.map(event => ({ sequence: event.sequence, leaseId: id, method: event.method,
-        params: event.params ?? {}, ...(event.source.sessionId ? { sessionId: event.source.sessionId } : {}) })) };
-    }
     const method = typeof args.method === 'string' ? args.method : '';
     if (request.command !== 'playwrightCdp' || (!PLAYWRIGHT_METHODS.has(method) && method !== 'DOM.setFileInputFiles')
       || !args.params || typeof args.params !== 'object' || Array.isArray(args.params)) throw new Error('Browser executor CDP method is unavailable');
@@ -746,7 +742,16 @@ export class EmbeddedBrowserDriver {
     if (args.sessionId !== undefined && (typeof args.sessionId !== 'string' || !args.sessionId || args.sessionId.length > 200)) {
       throw new Error('Invalid browser executor child session');
     }
-    const child = typeof args.sessionId === 'string' ? await this.resolveCdpTarget(entry, { sessionId: args.sessionId }) : undefined;
+    // A metadata round trip here would let this command overtake earlier ones.
+    // Child sessions are registered and revised by their own debugger events.
+    let child: { sessionId: string; info: CdpSession; revision: number } | undefined;
+    if (typeof args.sessionId === 'string') {
+      const info = entry.cdpSessions.get(args.sessionId);
+      let webChild = false;
+      try { webChild = !!info && !!origin(info.url); } catch { /* Non-web child targets stay unavailable. */ }
+      if (!info || !webChild) throw new Error('Browser executor frame changed; take a new snapshot');
+      child = { sessionId: args.sessionId, info, revision: info.revision };
+    }
     if (method === 'Target.getTargetInfo' && params.targetId !== undefined && params.targetId !== lease.targetId
       && ![...entry.cdpSessions.values()].some(session => session.targetId === params.targetId)) {
       throw new Error('Browser executor target is outside this tab');
@@ -1081,10 +1086,11 @@ export class EmbeddedBrowserDriver {
   }
 
   async handle(request: EmbeddedBrowserRequest, approvedUpload?: ApprovedBrowserUpload,
-    approvedCdp?: ApprovedBrowserCdpRead, isCurrent?: () => boolean): Promise<unknown> {
+    approvedCdp?: ApprovedBrowserCdpRead, isCurrent?: () => boolean,
+    emitEvent?: EmbeddedExecutorEventSink): Promise<unknown> {
     if (request.command === 'playwrightEnd') {
       const entry = this.entries.get(request.tabId ?? -1);
-      return entry ? this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent) : { ok: true };
+      return entry ? this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent, emitEvent) : { ok: true };
     }
     if (request.command === 'screenshot'
       || ((request.command === 'cdpCall' || request.command === 'playwrightCdp') && request.args.method === 'Page.captureScreenshot')) {
@@ -1206,7 +1212,7 @@ export class EmbeddedBrowserDriver {
       throw new Error('This site needs Memmy access approval first');
     }
     if (NAVIGATION_ACTIONS.has(request.command)) this.markVisitSource(entry, 'agent');
-    if (request.command.startsWith('playwright')) return this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent);
+    if (request.command.startsWith('playwright')) return this.playwrightControl(entry, request, approvedUpload, approvedCdp, isCurrent, emitEvent);
     if (entry.playwrightLease && ['cdpCall', 'cdpWrite', 'cdpEvents', 'upload', 'authRequest', 'fillCredential', 'fillContact'].includes(request.command)) {
       throw new Error('Browser operation cannot overlap the current browser executor lease');
     }

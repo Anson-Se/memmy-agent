@@ -23,8 +23,29 @@ export const EMBEDDED_BROWSER_COMMANDS = [
   'authRequest', 'setSitePermission', 'setDownloadDestination', 'waitDownloadDestination',
   'upload',
   'cdpCall', 'cdpEvents', 'cdpWrite',
-  'playwrightStart', 'playwrightCdp', 'playwrightEvents', 'playwrightEnd',
+  'playwrightStart', 'playwrightCdp', 'playwrightEnd',
 ] as const;
+
+/** Executor CDP events share the result channel, so they stay ordered with replies. */
+export const EMBEDDED_BROWSER_EVENT = 'memmy:embedded-browser:event';
+export type EmbeddedBrowserEvent = {
+  type: typeof EMBEDDED_BROWSER_EVENT;
+  tabId: number;
+  leaseId: string;
+  method: string;
+  params: Record<string, unknown>;
+  sessionId?: string;
+};
+export function isEmbeddedBrowserEvent(value: unknown): value is EmbeddedBrowserEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Partial<EmbeddedBrowserEvent>;
+  return input.type === EMBEDDED_BROWSER_EVENT
+    && Number.isSafeInteger(input.tabId) && input.tabId! > 0
+    && typeof input.leaseId === 'string' && /^[a-f0-9]{32}$/.test(input.leaseId)
+    && typeof input.method === 'string' && /^[A-Za-z]+\.[A-Za-z]+$/.test(input.method)
+    && Boolean(input.params && typeof input.params === 'object' && !Array.isArray(input.params))
+    && (input.sessionId === undefined || (typeof input.sessionId === 'string' && input.sessionId.length <= 200));
+}
 
 export type EmbeddedBrowserTabMention = {
   browserId: string;

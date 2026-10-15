@@ -581,7 +581,7 @@ async function boot(): Promise<void> {
         computerUseSurfaceWindows?.closeAll();
         browserSidebarBridge?.clear();
       },
-      handleEmbeddedBrowserRequest: async (request, isCurrentChild) => {
+      handleEmbeddedBrowserRequest: async (request, isCurrentChild, emitEvent) => {
         if (request.command === 'setSitePermission') {
           const choice = parseBrowserTaskSitePermission(request.args);
           const configPath = runtimeServices?.agentGateway.configPath;
@@ -624,7 +624,7 @@ async function boot(): Promise<void> {
           return browserWebviewDownloads.waitDestination(request.tabId!,
             String(request.args.destinationId ?? ''), isCurrentChild);
         }
-        if (['playwrightStart', 'playwrightCdp', 'playwrightEnd', 'playwrightEvents'].includes(request.command)) {
+        if (['playwrightStart', 'playwrightCdp', 'playwrightEnd'].includes(request.command)) {
           const configPath = runtimeServices?.agentGateway.configPath;
           if (!configPath) throw new Error('Browser page policy is unavailable');
           const approvedOrigin = String(request.args.approvedOrigin ?? '');
@@ -637,10 +637,10 @@ async function boot(): Promise<void> {
             return runApprovedEmbeddedUpload({ ...request, command: 'upload',
               args: { ...request.args, paths: request.args.uploadPaths } }, workspace, {
               uploadOrigin: tabId => embeddedBrowserDriver.uploadOrigin(tabId),
-              handle: (_uploadRequest, approval) => embeddedBrowserDriver.handle(request, approval, approvedPage, isCurrentChild),
+              handle: (_uploadRequest, approval) => embeddedBrowserDriver.handle(request, approval, approvedPage, isCurrentChild, emitEvent),
             }, (site, names) => approveBrowserCapabilityOperation('upload', site, names), isCurrentChild);
           }
-          return embeddedBrowserDriver.handle(request, undefined, approvedPage, isCurrentChild);
+          return embeddedBrowserDriver.handle(request, undefined, approvedPage, isCurrentChild, emitEvent);
         }
         if (request.command === 'cdpCall' || request.command === 'cdpEvents'
           || request.command === 'cdpWrite') {

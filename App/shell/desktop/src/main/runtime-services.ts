@@ -2,7 +2,8 @@ import { bindScreenCaptureIpc, type ScreenCaptureHandler } from './desktop-scree
 import { bindComputerUseWindowCaptureIpc } from './computer-use-window-capture.js';
 import { bindComputerUseOnboardingIpc, type ComputerUseOnboarding } from './computer-use-onboarding.js';
 import { mutateRuntimeConfig } from "@memmy/migrations";
-import { BROWSER_PROFILE_CLEAR_REQUEST, BROWSER_ACCESS_RESULT, BROWSER_DOWNLOAD_RESULT, BROWSER_CAPABILITY_RESULT, EMBEDDED_BROWSER_RESULT, NATIVE_APP_ACCESS_RESULT,
+import type { EmbeddedExecutorEventSink } from './embedded-browser-driver.js';
+import { BROWSER_PROFILE_CLEAR_REQUEST, BROWSER_ACCESS_RESULT, BROWSER_DOWNLOAD_RESULT, BROWSER_CAPABILITY_RESULT, EMBEDDED_BROWSER_EVENT, EMBEDDED_BROWSER_RESULT, NATIVE_APP_ACCESS_RESULT,
   isBrowserAccessRequest, isBrowserDownloadRequest, isBrowserCapabilityRequest, isBrowserProfileClearResult, isComputerUseSurfaceAction, isComputerUseSurfaceMessage, isNativeAppAccessRequest, type AgentGatewayStartupIssue,
   type BrowserCapabilityRequest,
   type NativeAppAccessRequest, type NativeAppAccessDecision,
@@ -93,7 +94,7 @@ export interface StartManagedRuntimeServicesOptions extends StartPackagedRuntime
   onComputerUseSurface?: (message: ComputerUseSurfaceMessage, sendAction: (action: ComputerUseSurfaceAction) => void) => void;
   onComputerUseSurfaceStop?: () => void;
   handleEmbeddedBrowserRequest?: (request: EmbeddedBrowserRequest,
-    isCurrentChild: () => boolean) => Promise<unknown>;
+    isCurrentChild: () => boolean, emitEvent: EmbeddedExecutorEventSink) => Promise<unknown>;
   approveBrowserAccess?: (origin: string, url: string) => Promise<'allow-once' | 'allow-always' | 'deny'>;
   approveBrowserCapability?: (request: BrowserCapabilityRequest) => Promise<boolean>;
   approveNativeAppAccess?: (request: NativeAppAccessRequest) => Promise<NativeAppAccessDecision>;
@@ -1957,11 +1958,16 @@ export class AgentGatewaySupervisor {
         if (pendingEmbeddedRequests.has(message.requestId)) return;
         const controller = new AbortController();
         pendingEmbeddedRequests.set(message.requestId, controller);
-        const isCurrentChild = () => !this.stopping && child.process.connected
+        const childIsCurrent = () => !this.stopping && child.process.connected
           && this.ownedChild === child && this.childGeneration === generation
-          && this.pendingRestartNotice?.childGeneration !== generation
-          && !controller.signal.aborted;
-        void Promise.resolve(this.options.handleEmbeddedBrowserRequest?.(message, isCurrentChild) ?? null)
+          && this.pendingRestartNotice?.childGeneration !== generation;
+        const isCurrentChild = () => childIsCurrent() && !controller.signal.aborted;
+        const tabId = message.tabId;
+        const emitEvent: EmbeddedExecutorEventSink = event => {
+          if (tabId === undefined || !childIsCurrent()) return;
+          child.process.send({ type: EMBEDDED_BROWSER_EVENT, tabId, ...event }, () => undefined);
+        };
+        void Promise.resolve(this.options.handleEmbeddedBrowserRequest?.(message, isCurrentChild, emitEvent) ?? null)
           .then(result => {
             if (isCurrentChild()) {
               child.process.send({ type: EMBEDDED_BROWSER_RESULT, requestId: message.requestId,

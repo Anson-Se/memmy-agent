@@ -6,7 +6,7 @@ import { WebSocket } from 'ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { executeExternalBrowserPlaywright, closeAllExternalBrowserPlaywright, closeExternalBrowserPlaywrightScope } from '../../../../src/core/agent-runtime/tools/external-browser-playwright.js';
 import { ExternalBrowserPlaywrightRelay, type PlaywrightCommandBridge } from '../../../../src/core/agent-runtime/tools/external-browser-playwright-relay.js';
-import type { ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
+import type { BrowserCommandSettle, ExternalBrowserClaim, ExternalBrowserPlaywrightEvent } from '../../../../src/core/agent-runtime/tools/external-browser-bridge.js';
 import { BROWSER_PLAYWRIGHT_CDP_METHODS } from '@memmy/local-api-contracts';
 
 const executable = process.env.MEMMY_BROWSER_TEST_EXECUTABLE || (fs.existsSync(chromium.executablePath())
@@ -24,7 +24,7 @@ class FixtureBridge implements PlaywrightCommandBridge {
   private children = new Set<string>();
   private childTargets = new Map<string, any>();
   private listeners = new Set<(event: ExternalBrowserPlaywrightEvent) => void>();
-  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; settle?: BrowserCommandSettle }>();
   private stopped = false;
   private input = false;
   private uploadPaths?: string[];
@@ -41,7 +41,10 @@ class FixtureBridge implements PlaywrightCommandBridge {
       const message = JSON.parse(String(raw));
       if (message.id) {
         const pending = this.pending.get(message.id); this.pending.delete(message.id);
-        if (message.error) pending?.reject(new Error(message.error.message)); else pending?.resolve(message.result);
+        // Like the production bridges, report the reply before any later event.
+        if (message.error) {
+          const error = new Error(message.error.message); pending?.settle?.({ ok: false, error }); pending?.reject(error);
+        } else { pending?.settle?.({ ok: true, result: message.result }); pending?.resolve(message.result); }
         return;
       }
       if (message.sessionId !== this.sessionId && !this.children.has(message.sessionId)) return;
@@ -83,7 +86,8 @@ class FixtureBridge implements PlaywrightCommandBridge {
   subscribePlaywright = (_identity: any, listener: (event: ExternalBrowserPlaywrightEvent) => void) => {
     this.listeners.add(listener); return () => this.listeners.delete(listener);
   };
-  command = async (_identity: any, name: string, args: Record<string, any> = {}, signal?: AbortSignal): Promise<unknown> => {
+  command = async (_identity: any, name: string, args: Record<string, any> = {}, signal?: AbortSignal,
+    settle?: BrowserCommandSettle): Promise<unknown> => {
     if (name === 'playwrightEnd') { if (this.leaseId === args.leaseId) this.leaseId = ''; return {}; }
     if (signal?.aborted || this.stopped) throw new Error('Browser executor cancelled');
     if (name === 'playwrightStart') {
@@ -107,11 +111,11 @@ class FixtureBridge implements PlaywrightCommandBridge {
       throw new Error('Upload paths are not approved');
     }
     this.methods.push(args.method);
-    return this.send(args.method, args.params, args.sessionId || this.sessionId);
+    return this.send(args.method, args.params, args.sessionId || this.sessionId, settle);
   };
-  private send(method: string, params: any = {}, sessionId?: string): Promise<any> {
+  private send(method: string, params: any = {}, sessionId?: string, settle?: BrowserCommandSettle): Promise<any> {
     const id = ++this.nextId;
-    const result = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    const result = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, settle }));
     this.root.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
     return result;
   }

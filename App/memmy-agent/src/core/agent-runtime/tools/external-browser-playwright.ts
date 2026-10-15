@@ -23,6 +23,11 @@ const scopes = new Map<string, ScopeState>();
 const scopeKey = (scope: BrowserScope) => JSON.stringify([scope.sessionKey, scope.channel, scope.chatId]);
 const sessionKey = (scope: BrowserScope, claim: ExternalBrowserClaim) => `${scopeKey(scope)}:${claim.connectionId}:${claim.tabId}`;
 const INPUT_ACTIONS = new Set(['click', 'type', 'selectOption', 'pressKey', 'scroll', 'upload']);
+const EMBEDDED_FRAME_OBSERVATION_MS = 3_000;
+// Long enough to span a model step, so consecutive actions reuse one connection.
+const WARM_CONNECTION_MS = 45_000;
+const REPLACED_PAGE_SETTLE_MS = 5_000;
+const replacedPages = new WeakMap<object, number | undefined>();
 
 // This standards-based DOM view assigns refs to real Elements (including the
 // parents of visible text nodes). Playwright's public locators execute actions.
@@ -95,23 +100,42 @@ function frameAt(page: Page, path: number[]): Frame | null {
   return frame ?? null;
 }
 
+function bounded<T>(work: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  work.catch(() => undefined);
+  return Promise.race([work, new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), milliseconds);
+  })]).finally(() => clearTimeout(timer));
+}
+
 async function capture(session: Session, allowFrame: (url: string) => boolean,
   query?: { text?: string; regex?: string }): Promise<{ nodes: NodeInfo[]; truncated: boolean }> {
   session.relay.setStage('observation');
   const nonce = randomBytes(8).toString('hex');
   const refs = new Map<string, Reference>();
   const nodes: NodeInfo[] = [];
-  let visitedFrames = 0, characters = 0, truncated = false;
+  let visitedFrames = 0, characters = 0, truncated = false, skippedFrames = 0;
   const visit = async (frame: Frame, framePath: number[]) => {
     if (++visitedFrames > EXTERNAL_BROWSER_SNAPSHOT_BUDGET.frames) { truncated = true; return; }
-    // Existing OOPIFs can initially have an empty public Frame.url() after
-    // CDP attachment. Read only location first, then check policy before DOM.
-    const url = await frame.evaluate('location.href') as string;
-    if (url !== 'about:blank' && url !== 'about:srcdoc' && !allowFrame(url)) return;
-    const captured = await frame.evaluate(snapshotExpression(`${nonce}${framePath.join('a') || 'b'}`, query)) as {
-      nodes: NodeInfo[]; timeOrigin: number; url: string; truncated: boolean };
+    // An embedded frame can be mid-navigation or never expose a context; it
+    // must not hold the whole observation, while the main document still must.
+    const embedded = framePath.length > 0;
+    const evaluate = <T>(expression: string) => embedded
+      ? bounded(frame.evaluate(expression) as Promise<T>, EMBEDDED_FRAME_OBSERVATION_MS, 'Embedded frame did not respond')
+      : frame.evaluate(expression) as Promise<T>;
+    let captured: { nodes: NodeInfo[]; timeOrigin: number; url: string; truncated: boolean };
+    try {
+      // Existing OOPIFs can initially have an empty public Frame.url() after
+      // CDP attachment. Read only location first, then check policy before DOM.
+      const url = await evaluate<string>('location.href');
+      if (url !== 'about:blank' && url !== 'about:srcdoc' && !allowFrame(url)) return;
+      captured = await evaluate(snapshotExpression(`${nonce}${framePath.join('a') || 'b'}`, query));
+      if (url !== captured.url) throw new Error('Browser frame changed during observation');
+    } catch (error) {
+      if (!embedded || session.relay.actionError) throw error;
+      skippedFrames++; truncated = true; return;
+    }
     truncated ||= captured.truncated;
-    if (url !== captured.url) throw new Error('Browser frame changed during observation');
     for (const node of captured.nodes) {
       const size = JSON.stringify(node).length;
       if (nodes.length >= EXTERNAL_BROWSER_SNAPSHOT_BUDGET.nodes
@@ -126,6 +150,8 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
   if (scopes.get(session.scopeKey) !== session.state || session.relay.actionError) {
     throw session.relay.actionError ?? new Error('Browser observation belongs to an ended task');
   }
+  if (skippedFrames) nodes.push({ ref: '', role: 'note', value: '',
+    name: `${skippedFrames} embedded frame(s) did not respond and were left out; observe again if their content is needed.` });
   session.refs = refs;
   session.state.observations.set(session.key, refs);
   return { nodes, truncated };
@@ -147,7 +173,10 @@ async function target(session: Session, value: unknown, allowFrame: (url: string
   if (!frame || !allowFrame(reference.url)) {
     throw new Error('This element frame changed or is blocked. Read browser_snapshot again.');
   }
-  const current = await frame.evaluate('({url:location.href,timeOrigin:performance.timeOrigin})') as { url: string; timeOrigin: number };
+  const locate = frame.evaluate('({url:location.href,timeOrigin:performance.timeOrigin})') as Promise<{ url: string; timeOrigin: number }>;
+  const current = reference.framePath.length
+    ? await bounded(locate, EMBEDDED_FRAME_OBSERVATION_MS, 'This element frame did not respond. Read browser_snapshot again.')
+    : await locate;
   if (current.url !== reference.url || current.timeOrigin !== reference.timeOrigin) {
     throw new Error('This element document changed. Read browser_snapshot again.');
   }
@@ -174,30 +203,38 @@ async function withTarget<T>(session: Session, value: unknown, allowFrame: (url:
   finally { if ('dispose' in selected) await selected.dispose().catch(() => undefined); }
 }
 
-async function dispose(session: Session): Promise<void> {
+/** Detach only when the tab is released; a reconnect keeps the debugger attached. */
+async function dispose(session: Session, detach = true): Promise<void> {
   clearTimeout(session.idleTimer);
   if (sessions.get(session.key) === session) sessions.delete(session.key);
   // Closing the relay disconnects Playwright without closing the user's tab.
-  await session.relay.close();
+  await session.relay.close(detach);
   session.browser = null; session.page = null;
+}
+
+/** Whether the tab's connected executor sees a frame blocked by site policy; undefined when it is not connected. */
+export function externalBrowserHasBlockedFrames(scope: BrowserScope, claim: ExternalBrowserClaim): boolean | undefined {
+  const session = sessions.get(sessionKey(scope, claim));
+  return session?.browser ? session.relay.hasBlockedFrames() : undefined;
 }
 
 export async function closeExternalBrowserPlaywrightScope(scope: BrowserScope): Promise<void> {
   const key = scopeKey(scope);
   // Revoke queued work synchronously, before awaiting connection cleanup.
   scopes.delete(key);
-  await Promise.allSettled([...sessions.values()].filter(session => session.scopeKey === key).map(dispose));
+  await Promise.allSettled([...sessions.values()].filter(session => session.scopeKey === key).map(session => dispose(session)));
 }
 
 export async function closeAllExternalBrowserPlaywright(): Promise<void> {
   scopes.clear();
-  await Promise.allSettled([...sessions.values()].map(dispose));
+  await Promise.allSettled([...sessions.values()].map(session => dispose(session)));
 }
 
 /** Ordinary browser actions only; this does not accept model CDP or JavaScript. */
 export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommandBridge,
   claim: ExternalBrowserClaim, scope: BrowserScope, action: string, args: Record<string, any>,
-  allowFrame: (url: string) => boolean, signal?: AbortSignal): Promise<Record<string, any>> {
+  allowFrame: (url: string) => boolean, signal?: AbortSignal,
+  internal: { afterDocument?: number } = {}): Promise<Record<string, any>> {
   const key = sessionKey(scope, claim);
   const ownerKey = scopeKey(scope);
   const owner: ScopeState = scopes.get(ownerKey) ?? { observations: new Map(), diagnostics: new Map() };
@@ -228,6 +265,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
     const origin = new URL(claim.url).origin;
     const abort = () => { void dispose(session!); };
     signal?.addEventListener('abort', abort, { once: true });
+    let documentEpoch: number | undefined;
     try {
       if (claim.browser === 'memmy' && action === 'screenshot') throw new Error('Screenshots are not supported for Memmy in-app browser tabs');
       const uploadPaths = action === 'upload' ? args.paths as string[] : undefined;
@@ -237,7 +275,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       // fresh connection preserves correctness until their automatic update.
       if (session.browser && (state.frameEpoch === null || session.epoch !== epoch)) {
         const refs = session.refs;
-        await dispose(session);
+        await dispose(session, false);
         // The old connection is absent from sessions while native cleanup is
         // pending. Task revocation during that gap must prevent reacquisition.
         if (signal?.aborted || scopes.get(ownerKey) !== owner) throw new Error('Browser executor cancelled');
@@ -245,6 +283,10 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
           browser: null, page: null, epoch: '', refs };
         sessions.set(key, session);
         state = await session.relay.begin(bridge, origin, INPUT_ACTIONS.has(action), true, signal, uploadPaths);
+      }
+      documentEpoch = state.documentEpoch;
+      if (internal.afterDocument !== undefined && documentEpoch <= internal.afterDocument) {
+        throw new Error('The replacement page has not loaded yet');
       }
       if (!session.browser) {
         session.relay.setStage('connection');
@@ -373,8 +415,17 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       outcome = signal?.aborted ? 'cancelled' : 'failed';
       diagnostic(outcome, error as Error);
       const dispatchState = session.relay.dispatchState();
-      await dispose(session);
+      const replaced = session.relay.documentWasReplaced();
+      await dispose(session, false);
       const message = signal?.aborted ? 'Browser executor cancelled' : String((error as Error)?.message || error);
+      if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none' && replaced
+        && !(error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain) {
+        // Input was sent and then the tab moved to a new document, as a submit or link does.
+        const result = { ok: dispatchState === 'confirmed', dispatchState, inputDispatched: dispatchState === 'confirmed',
+          noActionDispatched: false, pageChanged: true };
+        replacedPages.set(result, documentEpoch);
+        return result;
+      }
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none') {
         return { ok: false, dispatchState, inputDispatched: dispatchState === 'confirmed',
           noActionDispatched: false, freshObservationRequired: true, error: message,
@@ -391,7 +442,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       signal?.removeEventListener('abort', abort);
       await session.relay.end();
       if (sessions.get(key) === session) {
-        session.idleTimer = setTimeout(() => void dispose(session!), 15_000);
+        session.idleTimer = setTimeout(() => void dispose(session!), WARM_CONNECTION_MS);
         session.idleTimer.unref?.();
       }
       if (outcome === 'completed') diagnostic(outcome);
@@ -399,5 +450,31 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
   });
   queues.set(tabKey, work);
   void work.finally(() => { if (queues.get(tabKey) === work) queues.delete(tabKey); }).catch(() => undefined);
-  return work;
+  return work.then(result => replacedPages.has(result) && !signal?.aborted
+    ? observeReplacedPage(bridge, claim, scope, result, replacedPages.get(result), allowFrame, signal) : result);
+}
+
+/** Reads the document that replaced the page after an action, once it is the current one. */
+async function observeReplacedPage(bridge: PlaywrightCommandBridge, claim: ExternalBrowserClaim, scope: BrowserScope,
+  result: Record<string, any>, previousDocument: number | undefined, allowFrame: (url: string) => boolean,
+  signal?: AbortSignal): Promise<Record<string, any>> {
+  const origin = new URL(claim.url).origin;
+  const settleBy = Date.now() + REPLACED_PAGE_SETTLE_MS;
+  for (let attempt = 0; !signal?.aborted; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, attempt ? 300 : 100));
+    const latest = bridge.getClaim(claim);
+    if (!latest) break;
+    if (new URL(latest.url).origin !== origin) {
+      return { ...result, observation: { nodes: [{ ref: '', role: 'note', value: latest.url.slice(0, 2000),
+        name: 'The page moved to another site. Observe it with browser_snapshot, which asks for access if needed.' }], truncated: false } };
+    }
+    const lastTry = Date.now() >= settleBy;
+    try {
+      // Until the deadline, only a newer document counts as the result page.
+      const observation = await executeExternalBrowserPlaywright(bridge, latest, scope, 'snapshot', {}, allowFrame, signal,
+        lastTry ? {} : { afterDocument: previousDocument });
+      return { ...result, observation };
+    } catch { if (lastTry) break; }
+  }
+  return { ...result, freshObservationRequired: true };
 }
