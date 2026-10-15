@@ -1,3 +1,4 @@
+import { requestTiming } from "../utils/request-timing.js";
 import crypto from "crypto";
 import OpenAI from "openai";
 import {
@@ -1172,11 +1173,14 @@ export class OpenAICompatProvider extends LLMProvider {
       }
       if (args.signal?.aborted) throw createProviderAbortError();
       const options = providerAbortOptions(args.signal);
+      requestTiming("model.http_start");
       const stream = options
         ? await this.client.chat.completions.create(kwargs as any, options as any)
         : await this.client.chat.completions.create(kwargs as any);
+      requestTiming("model.http_headers");
       const chunks: any[] = [];
       for await (const chunk of timedAsyncIterable(stream, idleTimeoutS)) {
+        requestTiming("model.first_chunk", true);
         if (args.signal?.aborted) throw createProviderAbortError();
         chunks.push(chunk);
         const choice =
