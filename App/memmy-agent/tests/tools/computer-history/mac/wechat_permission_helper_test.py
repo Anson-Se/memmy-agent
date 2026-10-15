@@ -578,7 +578,7 @@ class PackagedLibraryTests(unittest.TestCase):
         with mock.patch.object(Path, "is_file", return_value=False), \
                 mock.patch.object(Path, "glob", return_value=[]), \
                 mock.patch.object(helper.subprocess, "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "^lldb_unavailable$"):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_native_helpers_unavailable$"):
                 helper._developer_clang()
             run.assert_not_called()
 

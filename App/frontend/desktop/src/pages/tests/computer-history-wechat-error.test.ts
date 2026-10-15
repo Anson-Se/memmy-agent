@@ -6,9 +6,9 @@ describe.each(["zh-CN", "en-US"] as const)("WeChat connection errors in %s", (la
   const t = (key: MessageKey) => messageCatalogs[language][key];
   it.each([
     "key_capture_failed", "key_capture_crashed", "connection_process_crashed", "connection_process_failed",
-    "wechat_login_required", "temporary_wechat_launch_failed", "key_derivation_breakpoint_unavailable",
-    "python_unavailable", "lldb_unavailable", "lldb_incompatible", "key_capture_no_keys",
-    "debug_target_creation_failed", "debugger_configuration_failed", "key_capture_output_missing",
+    "wechat_login_required", "temporary_wechat_launch_failed",
+    "python_unavailable", "wechat_native_helpers_unavailable", "key_capture_no_keys",
+    "key_capture_output_missing",
     "wechat_data_access_required", "wechat_data_access_probe_failed", "wechat_permission_helper_unavailable",
     "wechat_data_access_interrupted",
     "current_account_ambiguous",

@@ -754,8 +754,8 @@ export class ComputerHistoryDemoService {
     const helper = physicalRuntimeAsset(moduleFile("wechat/connect.py"));
     const python = resolveMacWeChatPython();
     if (!python) {
-      this.saveWeChatFailure("lldb_unavailable", "reader_permission_check");
-      return Promise.resolve({ ready: false, appPath: null, error: "lldb_unavailable" });
+      this.saveWeChatFailure("python_unavailable", "reader_permission_check");
+      return Promise.resolve({ ready: false, appPath: null, error: "python_unavailable" });
     }
     this.weChatPreparation = new Promise<WeChatReaderPreparation>((resolve) => {
       const child = spawn(python, ["-B", helper, "--state", this.weChatStateDirectory, "--prepare-only"],
@@ -928,7 +928,7 @@ export class ComputerHistoryDemoService {
     }
     if (this.weChatError) return { enabled: true, connection: "error", phase: null, error: this.weChatError };
     if (windows ? !resolveWindowsWeChatPython() : !resolveMacWeChatPython()) {
-      return { enabled: true, connection: "unavailable", phase: null, error: windows ? "python_unavailable" : "lldb_unavailable" };
+      return { enabled: true, connection: "unavailable", phase: null, error: "python_unavailable" };
     }
     return { enabled: true, connection: this.weChatReader(consent.consentId) ? "connected" : "needs_setup",
       phase: null, error: null };
@@ -980,7 +980,7 @@ export class ComputerHistoryDemoService {
     const windowsPython = windows ? resolveWindowsWeChatPython() : null;
     const command = windows ? windowsPython?.executable : resolveMacWeChatPython();
     if (!command) {
-      this.weChatError = windows ? "python_unavailable" : "lldb_unavailable";
+      this.weChatError = "python_unavailable";
       this.weChatPhase = null;
       this.saveWeChatFailure(this.weChatError, "preparing");
       return this.snapshot();

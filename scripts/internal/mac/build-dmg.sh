@@ -747,10 +747,13 @@ verify_computer_history_helpers() {
   done
   if [ "$2" = arm64 ]; then
     require_packaged_runtime_file "$1/../wechat_identity.py"
-    for helper in MemmyWeChatPermissionProbe.dylib MemmyWeChatPrivateStorage.dylib; do
+    for helper in MemmyWeChatPermissionProbe.dylib MemmyWeChatPrivateStorage.dylib MemmyWeChatKeyCapture.dylib; do
       require_packaged_runtime_file "$1/wechat/native/arm64/$helper"
       lipo "$1/wechat/native/arm64/$helper" -verify_arch arm64
     done
+    require_packaged_runtime_file "$1/wechat/python/runtime.json"
+    require_packaged_runtime_file "$1/wechat/python/bin/python3.13"
+    lipo "$1/wechat/python/bin/python3.13" -verify_arch arm64
   fi
 }
 
@@ -1034,6 +1037,9 @@ node "$ROOT_DIR/scripts/internal/shared/check-office-slim-assets.mjs" "$RUNTIME_
 package_step_start "Build Computer History native helpers"
 bash "$ROOT_DIR/scripts/internal/mac/build-computer-history-helpers.sh" \
   "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/mac" "$TARGET_CPU"
+package_step_start "Stage self-contained WeChat Python runtime"
+bash "$ROOT_DIR/scripts/internal/mac/stage-wechat-python.sh" \
+  "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/mac/wechat/python" "$TARGET_CPU"
 package_step_start "Build Computer Use native helpers"
 bash "$ROOT_DIR/scripts/internal/mac/build-computer-use-helpers.sh" \
   "$RUNTIME_DIR/memmy-agent/dist/tools/computer-use/mac" "$TARGET_CPU"

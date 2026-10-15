@@ -202,11 +202,11 @@ describe("WeChat connection process diagnostics", () => {
     state.children.at(-1)!.emit("close", 2, null);
   });
 
-  it("reports missing Mac developer tools before launching Python or changing WeChat", async () => {
+  it("reports a missing bundled Mac interpreter before launching Python or changing WeChat", async () => {
     state.python = null;
-    await expect(service.prepareWeChatReader()).resolves.toMatchObject({ ready: false, error: "lldb_unavailable" });
+    await expect(service.prepareWeChatReader()).resolves.toMatchObject({ ready: false, error: "python_unavailable" });
     service.setWeChatChatAccess(true);
-    expect(service.connectWeChat().wechat?.error).toBe("lldb_unavailable");
+    expect(service.connectWeChat().wechat?.error).toBe("python_unavailable");
     expect(state.children).toHaveLength(0);
   });
 
@@ -271,10 +271,10 @@ describe("WeChat connection process diagnostics", () => {
 
   it("keeps the capture cause when a legacy parent reports only key_capture_failed", () => {
     const child = connect();
-    child.stdout.write(JSON.stringify({ event: "capture_error", category: "lldb_unavailable" }) + "\n");
+    child.stdout.write(JSON.stringify({ event: "capture_error", category: "no_encrypted_databases" }) + "\n");
     child.stdout.write(JSON.stringify({ event: "connection_error", category: "key_capture_failed" }) + "\n");
     child.emit("close", 2, null);
-    expect(service.snapshot().wechat?.error).toBe("lldb_unavailable");
+    expect(service.snapshot().wechat?.error).toBe("no_encrypted_databases");
   });
 
   it("distinguishes a Python process signal from an ordinary connection failure", () => {

@@ -46,7 +46,9 @@ def _developer_clang():
         compiler = directory / "clang"
         if compiler.is_file() and os.access(compiler, os.X_OK) and compiler.resolve() != Path("/usr/bin/clang"):
             return str(compiler)
-    raise RuntimeError("lldb_unavailable")
+    # Only reached in a source checkout with no prebuilt dylibs; packaged builds
+    # ship them. The reader's native helpers cannot be prepared without a compiler.
+    raise RuntimeError("wechat_native_helpers_unavailable")
 
 
 def _install_library(name, destination, compiler_arguments):
