@@ -35,7 +35,7 @@ describe("AgentCommandPalette", () => {
 
   it("filters only by command-name prefix, case-insensitively", () => {
     expect(filterSlashCommands(commands, "his", []).map((command) => command.command)).toEqual(["/history"]);
-    expect(filterSlashCommands(commands, "MoD", []).map((command) => command.command)).toEqual(["/model"]);
+    expect(filterSlashCommands(commands, "MoD", []).map((command) => command.command)).toEqual(["/model list", "/model"]);
     expect(filterSlashCommands(commands, "preset", [])).toEqual([]);
     expect(filterSlashCommands(commands, "istory", [])).toEqual([]);
   });
@@ -43,19 +43,20 @@ describe("AgentCommandPalette", () => {
   it("keeps every available command reachable beyond the first eight results", () => {
     const available = ["/new", "/restart", "/status", "/model", "/history", "/history-dag", "/goal", "/help", "/pairing", "/last-compaction"]
       .map((command) => ({ command, title: command, description: "Available command", icon: "activity", argHint: "" }));
-    expect(filterSlashCommands(available, "", [])).toEqual(available);
+    expect(filterSlashCommands(available, "", []).slice(0, available.length)).toEqual(available);
+    expect(filterSlashCommands(available, "", []).map((item) => item.command)).toContain("/goal budget none");
     for (const command of available) {
       expect(filterSlashCommands(available, slashQueryFromInput(command.command)!, [])).toContainEqual(command);
     }
   });
 
-  it("matches every literal subcommand at its current depth", () => {
+  it("matches every literal subcommand in the same flat candidate list", () => {
     const available = ["/goal", "/pairing", "/model", "/history", "/dream-log"].map((command) => ({
       command, title: command, description: "", icon: "activity", argHint: ""
     }));
     const match = (input: string) => filterSlashCommands(available, slashQueryFromInput(input)!, []);
     const expected = {
-      "/goal ": ["status", "help", "create", "pause", "resume", "edit", "budget", "clear"],
+      "/goal ": ["status", "help", "create", "pause", "resume", "edit", "budget", "budget none", "clear"],
       "/pairing ": ["list", "approve", "deny", "revoke"],
       "/model ": ["list"],
       "/goal budget ": ["none"]
@@ -77,15 +78,19 @@ describe("AgentCommandPalette", () => {
     expect(filterSlashCommands([], "goal p", [])).toEqual([]);
   });
 
-  it("expands exact parent commands without a space and places exact matches last", () => {
+  it("matches parent and descendant commands together and places exact matches last", () => {
     const available = ["/goal", "/pairing", "/model"].map((command) => ({
       command, title: command, description: "", icon: "activity", argHint: ""
     }));
     const match = (query: string) => filterSlashCommands(available, query, []).map((item) => item.command);
     expect(match("goal")).toEqual([
-      "/goal status", "/goal create", "/goal resume", "/goal budget",
+      "/goal budget none", "/goal status", "/goal create", "/goal resume", "/goal budget",
       "/goal pause", "/goal clear", "/goal help", "/goal edit", "/goal"
     ]);
+    expect(match("g")).toEqual(match("goal"));
+    expect(match("goal b")).toEqual(["/goal budget none", "/goal budget"]);
+    expect(match("p")).toEqual(match("pairing"));
+    expect(match("m")).toEqual(match("model"));
     expect(match("goal ")).not.toContain("/goal");
     expect(match("goal budget")).toEqual(["/goal budget none", "/goal budget"]);
     expect(match("goal budget ")).toEqual(["/goal budget none"]);
@@ -112,6 +117,7 @@ describe("AgentCommandPalette", () => {
       { name: "unavailable", available: false }
     ];
     expect(filterSlashCommands(commands, "model ", [], presets).map((item) => item.command)).toEqual(["/model FastModel", "/model list"]);
+    expect(filterSlashCommands(commands, "m", [], presets).map((item) => item.command)).toEqual(["/model FastModel", "/model list", "/model"]);
     expect(filterSlashCommands(commands, "model fa", [], presets)[0]).toMatchObject({ command: "/model FastModel", argHint: "" });
     expect(filterSlashCommands(commands, "model un", [], presets)).toEqual([]);
     expect(filterSlashCommands(commands, "model FastModel ", [], presets)).toEqual([]);

@@ -21,7 +21,7 @@ it("scrolls to and selects commands beyond the initial visible rows", () => {
   const onSelect = vi.fn();
   try {
     act(() => root.render(<AgentCommandPalette commands={commands} heading="Commands" selectedIndex={0} onSelect={onSelect} />));
-    expect(container.querySelectorAll('[role="option"]')).toHaveLength(names.length);
+    expect(container.querySelectorAll('[role="option"]')).toHaveLength(commands.length);
     scrollIntoView.mockClear();
     act(() => root.render(<AgentCommandPalette commands={commands} heading="Commands" selectedIndex={8} onSelect={onSelect} />));
     const selected = container.querySelector<HTMLButtonElement>('[aria-selected="true"]')!;
@@ -31,16 +31,17 @@ it("scrolls to and selects commands beyond the initial visible rows", () => {
     act(() => selected.click());
     expect(onSelect).toHaveBeenCalledWith(commands[8]);
 
-    const goalMatches = filterSlashCommands(commands, "goal", []);
+    const goalMatches = filterSlashCommands(commands.filter((command) => !command.command.includes(" ")), "g", []);
     scrollIntoView.mockClear();
-    act(() => root.render(<AgentCommandPalette commands={goalMatches} heading="Commands" selectedIndex={defaultSlashCommandIndex("goal", goalMatches.length)} onSelect={onSelect} />));
+    act(() => root.render(<AgentCommandPalette commands={goalMatches} heading="Commands" selectedIndex={defaultSlashCommandIndex("g", goalMatches.length)} onSelect={onSelect} />));
     const goalOptions = container.querySelectorAll<HTMLButtonElement>('[role="option"]');
     const closest = goalOptions[goalOptions.length - 1]!;
-    expect(goalOptions).toHaveLength(9);
+    expect(goalOptions).toHaveLength(10);
     expect(closest.getAttribute("aria-selected")).toBe("true");
     expect(closest.querySelector(".font-mono")?.textContent).toBe("/goal");
     expect(scrollIntoView.mock.contexts[0]).toBe(closest);
     expect(container.textContent).toContain("/goal pause");
+    expect(container.textContent).toContain("/goal budget none");
     act(() => closest.click());
     expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ command: "/goal" }));
   } finally {
