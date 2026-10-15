@@ -584,10 +584,10 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
       {snapshot?.wechat ? (
         <div ref={weChatSettingsRef} className="ch__recording-setting flex items-center justify-between">
           <div className="flex-1 pr-4">
-            <div id="computer-history-wechat-label" className="text-sm text-text-ink/70">
+            <div id="computer-history-wechat-label" className="ch__setting-label">
               {t("computerHistory.wechat.label")}
             </div>
-            <p id="computer-history-wechat-description" className="text-xs text-text-ink/60">
+            <p id="computer-history-wechat-description" className="ch__setting-description">
               {t("computerHistory.wechat.description")}
             </p>
             {snapshot.wechat.connection !== "disabled" && snapshot.wechat.connection !== "connected" ? (
