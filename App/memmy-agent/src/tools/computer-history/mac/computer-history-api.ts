@@ -599,8 +599,9 @@ export class ComputerHistoryDemoService {
     appendBrowserHistoryEvent(segment.eventsFile, prepared);
     this.browserEventIds.add(prepared.deduplicationKey);
     if (this.browserEventIds.size > 4096) this.browserEventIds.delete(this.browserEventIds.values().next().value!);
+    // Like native events, the live narration notices the grown event file on
+    // its next check; invalidating here would discard a narration in progress.
     if (!this.captureLastEventAt || prepared.event.timestamp > this.captureLastEventAt) this.captureLastEventAt = prepared.event.timestamp;
-    this.invalidateSummary(segment.historyFile);
     return true;
   }
 

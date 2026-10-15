@@ -15,7 +15,8 @@
     const api = dependencies.chrome ?? chrome;
     let epoch = 0, sequence = 0, closed = false, wakeTimer = null;
     let intent = { enabled: false, generation: null, expiresAt: 0 };
-    const leases = new Map(), pending = new Map(), tabEpochs = new Map();
+    const leases = new Map(), pending = new Map(), tabEpochs = new Map(), tabOrigins = new Map();
+    const originOf = value => { try { return new URL(value).origin; } catch { return null; } };
     const connected = () => !closed && dependencies.isConnected() === true;
     const currentIntent = () => connected() && intent.enabled === true && safeId(intent.generation) && intent.expiresAt > Date.now();
     const keyOf = context => `${context.tabId}:${context.frameId}:${context.documentId}`;
@@ -141,6 +142,7 @@
         if (leases.size >= 128) return disabled;
         leases.set(keyOf(fresh), lease);
       }
+      tabOrigins.set(fresh.tabId, originOf(fresh.topUrl));
       return { enabled: true, generation: lease.generation, documentId: fresh.documentId,
         leaseId: lease.leaseId, expiresAt: lease.expiresAt, captureText: lease.captureText };
     };
@@ -157,7 +159,10 @@
       try { encoded = JSON.stringify(payload); } catch { return { accepted: false }; }
       if (encoded.length > MAX_PAYLOAD_BYTES) return { accepted: false };
       const context = await contextFor(sender);
-      if (!context || context.epoch !== lease.epoch || context.topUrl !== lease.topUrl || context.frameUrl !== lease.frameUrl
+      // The lease is bound to one document by its Chrome document ID; an in-page
+      // route change within that document keeps its origin and its lease.
+      if (!context || context.epoch !== lease.epoch || originOf(context.topUrl) !== originOf(lease.topUrl)
+        || originOf(context.frameUrl) !== originOf(lease.frameUrl)
         || leases.get(keyOf(context)) !== lease || lease.generation !== intent.generation || lease.expiresAt <= Date.now()) return { accepted: false };
       // Actor provenance comes only from worker-owned input dispatch evidence.
       const evidence = dependencies.activeCommand?.(context.tabId, payload.observedAt);
@@ -178,11 +183,17 @@
     };
     api.runtime.onMessage.addListener(onMessage);
     api.tabs.onActivated.addListener(() => { revoke(); wakeActive(); });
-    api.tabs.onUpdated.addListener((tabId, changes) => {
-      if (changes.url || changes.status === "loading") revoke(tabId);
+    api.tabs.onUpdated.addListener((tabId, changes, tab) => {
+      if (changes.url || changes.status === "loading") {
+        // A reload or a different site starts over. A same-site route change
+        // (pushState, a search box synced to the URL) keeps pending page events.
+        const origin = originOf(changes.url ?? tab?.url ?? "");
+        if (!origin || origin !== tabOrigins.get(tabId) || (changes.status === "loading" && !changes.url)) revoke(tabId);
+        if (origin) tabOrigins.set(tabId, origin); else tabOrigins.delete(tabId);
+      }
       if (changes.status === "complete") wakeActive();
     });
-    api.tabs.onRemoved.addListener(tabId => revoke(tabId));
+    api.tabs.onRemoved.addListener(tabId => { revoke(tabId); tabOrigins.delete(tabId); });
     api.windows.onFocusChanged.addListener(() => { revoke(); wakeActive(); });
     return {
       receive(message) {

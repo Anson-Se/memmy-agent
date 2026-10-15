@@ -475,7 +475,8 @@ function reusableHumanAction(record: JsonRecord, { navigationHint = "" }: { navi
   if (record.eventType === "browser_action") {
     if (details.actor === "agent" || details.phase === "context") return null;
     const target = [details.target?.role, details.target?.name].filter((value) => typeof value === "string" && value).join(" ");
-    const action = cleanInline(details.action, 80);
+    const key = typeof details.key === "string" && details.key && details.key !== "[REDACTED]" ? ` ${cleanInline(details.key, 40)}` : "";
+    const action = cleanInline(details.action, 80) + key;
     const after = details.after?.target;
     const expected = after && typeof after === "object"
       ? ["checked", "selected", "expanded", "value"].filter((key) => after[key] !== undefined)
@@ -527,12 +528,34 @@ function compressedScrollHint(scrolls: JsonRecord[]): string {
   return `after moving ${direction} only as needed to reveal the next semantic target`;
 }
 
+const NATIVE_STEP_EVENTS = new Set(["mouse_click", "text_input", "key_press", "scroll"]);
+const eventTime = (record: JsonRecord): number | null => {
+  const value = Date.parse(recordTimestamp(record) ?? "");
+  return Number.isFinite(value) ? value : null;
+};
+
 export function reusableHumanActions(events: JsonRecord[]): string[] {
   const actions: string[] = [];
   const observedInteractions = new Set(events.filter(event => event.eventType === "browser_action" && event.details?.phase !== "attempt"
     && event.details?.phase !== "context" && typeof event.details?.interactionId === "string")
     .map(event => `${event.application?.bundleId}:${event.details.documentId}:${event.details.interactionId}`));
+  // A page step the browser sensor recorded is the same physical action as the
+  // native click, typing or key beside it; replaying both would repeat it.
+  const browserMoments = new Map<string, number[]>();
+  for (const event of events) {
+    const at = eventTime(event);
+    if (event.eventType !== "browser_action" || at === null || event.details?.actor === "agent"
+      || event.details?.phase === "context") continue;
+    const application = String(event.application?.bundleId ?? "");
+    browserMoments.set(application, [...(browserMoments.get(application) ?? []), at]);
+  }
+  const recordedByBrowser = (event: JsonRecord) => {
+    const at = eventTime(event);
+    return NATIVE_STEP_EVENTS.has(event.eventType) && at !== null
+      && !!browserMoments.get(String(event.application?.bundleId ?? ""))?.some(moment => Math.abs(moment - at) <= 2_000);
+  };
   const includedInteractions = new Set<string>();
+  let lastBrowserStep: { document: string; at: number } | null = null;
   let pendingScrolls: JsonRecord[] = [];
   const flushPendingScrolls = () => {
     if (!pendingScrolls.length) return;
@@ -541,6 +564,16 @@ export function reusableHumanActions(events: JsonRecord[]): string[] {
     pendingScrolls = [];
   };
   for (const event of events) {
+    if (recordedByBrowser(event)) continue;
+    if (event.eventType === "browser_action") {
+      const browserAction = event.details?.action, at = eventTime(event);
+      const document = `${event.application?.bundleId}:${event.details?.documentId}`;
+      // Scrolling and the resulting page are context; the page context event records the latter.
+      if (browserAction === "scroll" || browserAction === "navigation") continue;
+      // A change after typing, or a submit after a click or Enter, is that step's outcome.
+      if ((browserAction === "change" || browserAction === "submit") && at !== null
+        && lastBrowserStep?.document === document && at - lastBrowserStep.at <= 2_000) continue;
+    }
     if (event.eventType === "browser_action" && typeof event.details?.interactionId === "string") {
       const key = `${event.application?.bundleId}:${event.details.documentId}:${event.details.interactionId}`;
       if ((event.details.phase === "attempt" && observedInteractions.has(key)) || includedInteractions.has(key)) continue;
@@ -565,6 +598,10 @@ export function reusableHumanActions(events: JsonRecord[]): string[] {
     }
     const action = reusableHumanAction(event);
     if (action) actions.push(action);
+    const at = eventTime(event);
+    if (action && event.eventType === "browser_action" && at !== null) {
+      lastBrowserStep = { document: `${event.application?.bundleId}:${event.details?.documentId}`, at };
+    }
   }
   flushPendingScrolls();
   return actions;

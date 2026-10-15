@@ -112,6 +112,22 @@ describe("isolated passive browser History transport", () => {
     expect(test.sent.at(-1)).toMatchObject({ actor: "agent", actorEvidence: { kind: "memmy_command", commandId: "input-1", taskId: "task-1" } });
   });
 
+  it("keeps a page's lease across a same-site route change and ends it for another site or a reload", async () => {
+    const test = harness(); test.permit(); const configuration = await test.configure();
+    test.tab.url = "https://work.test/form?query=fixture";
+    test.handlers.update(7, { url: test.tab.url }, { ...test.tab });
+    expect(test.revocations).toHaveLength(0);
+    expect(await test.emit(configuration, sender({ url: test.tab.url }))).toEqual({ accepted: true });
+    test.handlers.update(7, { status: "loading" }, { ...test.tab });
+    expect(test.revocations).toHaveLength(1);
+    const renewed = await test.configure(sender({ url: test.tab.url }));
+    test.tab.url = "https://other.test/";
+    test.handlers.update(7, { url: test.tab.url, status: "loading" }, { ...test.tab });
+    expect(test.revocations).toHaveLength(2);
+    expect(await test.emit(renewed, sender({ url: test.tab.url }))).toEqual({ accepted: false });
+    test.background.close();
+  });
+
   it("does not interrupt the focused page's lease when an unrelated background tab navigates", async () => {
     const test = harness(); test.permit(); const configuration = await test.configure();
     test.handlers.update(99, { status: "loading" });

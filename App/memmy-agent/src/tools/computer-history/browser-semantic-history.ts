@@ -77,8 +77,18 @@ function validState(value: unknown): value is BrowserHistoryState | undefined {
 }
 function sensitiveTarget(target: BrowserHistoryTarget | undefined): boolean {
   return !!target && (target.sensitive === true || /^(?:password|hidden)$/iu.test(target.inputType ?? "")
-    || /(?:one-time-code|current-password|new-password|cc-number|cc-csc)/iu.test(target.autocomplete ?? "")
-    || /(?:password|passcode|secret|token|验证码|密码|口令|密钥)/iu.test(target.name ?? ""));
+    || /(?:one-time-code|current-password|new-password|cc-number|cc-csc|cc-exp)/iu.test(target.autocomplete ?? "")
+    || /(?:password|passcode|secret|token|otp|one[-_ ]?time|verification|cvv|cvc|card[-_ ]?(?:number|no)|验证码|动态码|校验码|安全码|密码|口令|密钥|卡号|身份证)/iu
+      .test(target.name ?? ""));
+}
+function luhn(digits: string): boolean {
+  let sum = 0;
+  for (let index = 0; index < digits.length; index++) {
+    let digit = Number(digits[digits.length - 1 - index]);
+    if (index % 2) { digit *= 2; if (digit > 9) digit -= 9; }
+    sum += digit;
+  }
+  return sum % 10 === 0;
 }
 function targetEvidence(target: BrowserHistoryTarget | undefined, captureText: boolean, sensitive: boolean): BrowserHistoryTarget | undefined {
   if (!target) return undefined;
@@ -95,8 +105,9 @@ function targetEvidence(target: BrowserHistoryTarget | undefined, captureText: b
 }
 function browserText(value: string): string {
   return redactSensitive(value)
-    .replace(/((?:验证码|密码|口令|密钥)\s*[:：=]\s*)[^\s,;]+/giu, "$1[REDACTED]")
-    .replace(/((?:otp|verification code|验证码)\s*[:：=]?\s*)\d{4,8}\b/giu, "$1[REDACTED]");
+    .replace(/((?:验证码|动态码|密码|口令|密钥)\s*[:：=]\s*)[^\s,;]+/giu, "$1[REDACTED]")
+    .replace(/((?:otp|verification code|验证码|动态码|校验码)\s*[:：=]?\s*)\d{4,8}\b/giu, "$1[REDACTED]")
+    .replace(/\b\d(?:[ -]?\d){12,18}\b/gu, match => luhn(match.replace(/\D/gu, "")) ? "[REDACTED]" : match);
 }
 function stateEvidence(state: BrowserHistoryState | undefined, captureText: boolean, sensitive: boolean): BrowserHistoryState | undefined {
   if (!state) return undefined;
@@ -107,10 +118,13 @@ function stateEvidence(state: BrowserHistoryState | undefined, captureText: bool
     ...(state.target ? { target: targetEvidence(state.target, captureText, sensitive || sensitiveTarget(state.target)) } : {}),
   };
 }
+/** Matches the native observer's app identity, so one browsing session stays one activity block. */
 export function browserHistoryApplication(browser: "chrome" | "edge", platform: NodeJS.Platform = process.platform) {
-  return { name: browser === "edge" ? "Microsoft Edge" : "Google Chrome", bundleId: platform === "win32"
-    ? (browser === "edge" ? "win32.msedge" : "win32.chrome")
-    : (browser === "edge" ? "com.microsoft.edgemac" : "com.google.Chrome") };
+  if (platform === "win32") {
+    return browser === "edge" ? { name: "msedge", bundleId: "win32.msedge" } : { name: "chrome", bundleId: "win32.chrome" };
+  }
+  return { name: browser === "edge" ? "Microsoft Edge" : "Google Chrome",
+    bundleId: browser === "edge" ? "com.microsoft.edgemac" : "com.google.Chrome" };
 }
 
 /** Reject page-supplied permission/actor claims; authorize against the live History intent. */

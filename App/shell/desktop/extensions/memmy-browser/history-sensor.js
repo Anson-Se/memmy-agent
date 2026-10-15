@@ -10,12 +10,27 @@
     const document = page.document, location = page.location, slot = "__memmyBrowserHistorySensor";
     page[slot]?.stop?.();
     const controller = new page.AbortController(), timers = new Set(), pendingInputs = new Map(), pendingActions = new Map();
-    let stopped = false, sequence = 0, scrollTimer = null, previousUrl = location.href;
-    const clean = (value) => String(value ?? "").replace(/\s+/gu, " ").trim().slice(0, 500)
+    let stopped = false, sequence = 0, scrollTimer = null, previousUrl = location.href, lastUserInput = 0;
+    const luhn = (digits) => {
+        let sum = 0;
+        for (let index = 0; index < digits.length; index++) {
+            let digit = Number(digits[digits.length - 1 - index]);
+            if (index % 2) {
+                digit *= 2;
+                if (digit > 9)
+                    digit -= 9;
+            }
+            sum += digit;
+        }
+        return sum % 10 === 0;
+    };
+    // Bound the input before any regex: an interaction must not scan a whole page's text.
+    const clean = (value) => String(value ?? "").slice(0, 2_000).replace(/\s+/gu, " ").trim().slice(0, 500)
         .replace(/\bBearer\s+[a-z0-9._~+/-]{12,}/giu, "Bearer [REDACTED]")
         .replace(/\bsk-[a-z0-9_-]{12,}\b/giu, "[REDACTED]")
-        .replace(/((?:api[ _-]?key|access[ _-]?token|auth[ _-]?token|password|secret|验证码|密码|口令|密钥)\s*[:：=]\s*)[^\s,;]+/giu, "$1[REDACTED]")
-        .replace(/((?:otp|verification code|验证码)\s*[:：=]?\s*)\d{4,8}\b/giu, "$1[REDACTED]");
+        .replace(/((?:api[ _-]?key|access[ _-]?token|auth[ _-]?token|password|secret|验证码|动态码|密码|口令|密钥)\s*[:：=]\s*)[^\s,;]+/giu, "$1[REDACTED]")
+        .replace(/((?:otp|verification code|验证码|动态码|校验码)\s*[:：=]?\s*)\d{4,8}\b/giu, "$1[REDACTED]")
+        .replace(/\b\d(?:[ -]?\d){12,18}\b/gu, match => luhn(match.replace(/\D/gu, "")) ? "[REDACTED]" : match);
     const safeUrl = () => {
         const url = new page.URL(location.href);
         url.search = "";
@@ -25,15 +40,30 @@
         return url.href;
     };
     const sensitive = (el) => !!el && (el.type === "password" || el.type === "hidden"
-        || /one-time-code|current-password|new-password|cc-number|cc-csc/iu.test(el.autocomplete || "")
-        || /password|passcode|secret|token|验证码|密码|口令|密钥/iu.test([el.name, el.id,
-            el.getAttribute?.("aria-label"), el.getAttribute?.("placeholder")].join(" ")));
+        || /one-time-code|current-password|new-password|cc-number|cc-csc|cc-exp/iu.test(el.autocomplete || "")
+        || /password|passcode|secret|token|otp|one[-_ ]?time|verification|cvv|cvc|card[-_ ]?(?:number|no)|验证码|动态码|校验码|安全码|密码|口令|密钥|卡号|身份证/iu
+            .test([el.name, el.id, el.getAttribute?.("aria-label"), el.getAttribute?.("placeholder")].join(" ")));
+    // The first visible-text characters of an element, without serializing its subtree.
+    const brief = (el, limit) => {
+        if (typeof document.createTreeWalker !== "function")
+            return "";
+        const walker = document.createTreeWalker(el, 4);
+        let text = "", node, visited = 0;
+        while ((node = walker.nextNode()) && text.length < limit && visited++ < 200) {
+            if (!/^(?:SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/u.test(node.parentElement?.tagName))
+                text += " " + node.nodeValue;
+        }
+        return text.slice(0, limit);
+    };
+    const control = (el, tag) => /^(?:button|a|summary|option|label|legend)$/u.test(tag)
+        || /^(?:button|link|menuitem|menuitemcheckbox|menuitemradio|tab|option|checkbox|radio|switch|treeitem)$/u.test(el.getAttribute("role") || "");
     const metadata = (el) => {
         if (!el || el.nodeType !== 1)
             return undefined;
         const secret = sensitive(el), tag = el.tagName.toLowerCase();
         const name = clean(el.getAttribute("aria-label") || el.labels?.[0]?.innerText || el.getAttribute("title")
-            || el.getAttribute("placeholder") || ((secret || tag === "input" || tag === "textarea" || el.isContentEditable) ? "" : el.innerText));
+            || el.getAttribute("placeholder") || ((secret || tag === "input" || tag === "textarea" || el.isContentEditable) ? ""
+            : control(el, tag) ? el.innerText : brief(el, 160)));
         const roles = { button: "button", a: "link", select: "combobox", textarea: "textbox" };
         const role = el.getAttribute("role") || roles[tag] || (tag === "input" ? (/checkbox|radio/u.test(el.type) ? el.type : "textbox") : "generic");
         const result = { role: clean(role), name, tag, inputType: clean(el.type), autocomplete: clean(el.autocomplete), sensitive: secret };
@@ -50,7 +80,7 @@
         // Secret values are never read into the binding/message payload.
         if ("value" in el || el.isContentEditable)
             result.value = secret || !config.captureText ? "[REDACTED]"
-                : clean(el.isContentEditable ? el.innerText : el.value);
+                : clean(el.isContentEditable ? brief(el, 600) : el.value);
         return result;
     };
     const state = (el) => {
@@ -61,17 +91,25 @@
             text = ["[REDACTED]"];
         else if (scope && typeof document.createTreeWalker === "function") {
             const walker = document.createTreeWalker(scope, 4); // SHOW_TEXT; no hidden HTML/script extraction.
+            // Sibling text shares ancestors; decide each ancestor's visibility once.
+            const hiddenAncestors = new Map();
+            const hiddenAncestor = (ancestor) => {
+                if (!hiddenAncestors.has(ancestor)) {
+                    const style = page.getComputedStyle(ancestor);
+                    hiddenAncestors.set(ancestor, /^(?:SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/u.test(ancestor.tagName) || sensitive(ancestor)
+                        || ancestor.hidden || ancestor.getAttribute?.("aria-hidden") === "true" || ancestor.hasAttribute?.("inert")
+                        || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse");
+                }
+                return hiddenAncestors.get(ancestor);
+            };
             let node, visited = 0;
-            while ((node = walker.nextNode()) && text.length < 12 && visited++ < 500) {
+            while ((node = walker.nextNode()) && text.length < 12 && visited++ < 300) {
                 const parent = node.parentElement;
                 if (!parent || !parent.getClientRects?.().length)
                     continue;
                 let blocked = false;
                 for (let ancestor = parent; ancestor; ancestor = ancestor.parentElement) {
-                    const style = page.getComputedStyle(ancestor);
-                    if (/^(?:SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/u.test(ancestor.tagName) || sensitive(ancestor)
-                        || ancestor.hidden || ancestor.getAttribute?.("aria-hidden") === "true" || ancestor.hasAttribute?.("inert")
-                        || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+                    if (hiddenAncestor(ancestor)) {
                         blocked = true;
                         break;
                     }
@@ -125,6 +163,7 @@
     const rememberBefore = (event) => {
         if (!event.isTrusted)
             return;
+        lastUserInput = Date.now();
         const el = element(event);
         if (pendingActions.size >= 128)
             pendingActions.delete(pendingActions.keys().next().value);
@@ -173,7 +212,15 @@
         pending.timer = later(() => { pendingInputs.delete(el); emit("input", el, pending.before); }, 400);
         pendingInputs.set(el, pending);
     });
+    for (const name of ["wheel", "touchmove"])
+        listen(name, event => { if (event.isTrusted)
+            lastUserInput = Date.now(); });
     listen("keydown", event => {
+        if (event.isTrusted)
+            lastUserInput = Date.now();
+        // A held key repeats many times a second; its first press is the step.
+        if (event.repeat)
+            return;
         const pending = event.isTrusted && ["Enter", " ", "Spacebar"].includes(event.key) ? rememberBefore(event) : undefined;
         if (pending && event.key === "Enter")
             emit("key", element(event), pending.before, event.key, "attempt", pending.interactionId);
@@ -183,6 +230,9 @@
         later(() => emit("key", el, before, event.key, "observed", pending?.interactionId));
     });
     listen("scroll", event => {
+        // Pages scroll themselves (live feeds, streamed answers); only user scrolling is a step.
+        if (Date.now() - lastUserInput > 1_000)
+            return;
         if (scrollTimer) {
             page.clearTimeout(scrollTimer);
             timers.delete(scrollTimer);

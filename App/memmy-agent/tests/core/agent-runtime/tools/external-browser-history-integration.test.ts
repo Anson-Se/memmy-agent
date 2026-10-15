@@ -118,6 +118,35 @@ describe("browser History bridge to canonical event stream", () => {
     expect(h.records()[0].details.actor).toBe("unknown");
   });
 
+  it("records a held key once, ignores pages scrolling themselves, bounds text and masks card numbers", async () => {
+    const h = await harness();
+    const page = await syntheticPage();
+    await page.route("**/*", route => route.fulfill({ contentType: "text/html", body: `<main id="feed" style="height:120px;overflow:auto">
+      <div style="height:4000px">Live feed</div></main><section id="article">${"Long article text. ".repeat(50_000)}</section>
+      <input id="note" aria-label="Note"><label>Card number<input name="cardNumber"></label>
+      <p role="status">Paid with 4111 1111 1111 1111</p>` }));
+    await page.goto(h.context.topUrl);
+    await page.exposeFunction("__memmyFixturePublish", (encoded: string) => h.emit(JSON.parse(encoded)));
+    await page.evaluate(browserHistorySensorScript({ generation: h.service.getBrowserCaptureIntent().generation!,
+      documentId: h.context.documentId, captureText: true, bindingName: "__memmyFixturePublish" }));
+    await page.evaluate("document.querySelector('#feed').scrollTop = 600");
+    await new Promise(resolve => setTimeout(resolve, 800));
+    expect(h.records().filter(event => event.details.action === "scroll")).toHaveLength(0);
+    await page.focus("#note");
+    for (let index = 0; index < 8; index++) await page.keyboard.down("ArrowDown");
+    await page.keyboard.up("ArrowDown");
+    await vi.waitFor(() => expect(h.records().some(event => event.details.key === "ArrowDown")).toBe(true));
+    await new Promise(resolve => setTimeout(resolve, 400));
+    expect(h.records().filter(event => event.details.key === "ArrowDown")).toHaveLength(1);
+    await page.click("#article", { position: { x: 4, y: 4 } });
+    await vi.waitFor(() => expect(h.records().some(event => event.details.action === "click" && event.details.phase === "observed")).toBe(true));
+    const article = h.records().find(event => event.details.action === "click" && event.details.phase === "observed");
+    expect(article.details.target.name.length).toBeLessThanOrEqual(200);
+    await page.fill("input[name=cardNumber]", "4111 1111 1111 1111");
+    await vi.waitFor(() => expect(h.records().some(event => event.details.action === "input")).toBe(true));
+    expect(JSON.stringify(h.records())).not.toContain("4111 1111 1111 1111");
+  }, 20_000);
+
   it("captures actual checkbox/input transitions from a synthetic headless Chromium page without an Agent session", async () => {
     const h = await harness();
     const page = await syntheticPage();

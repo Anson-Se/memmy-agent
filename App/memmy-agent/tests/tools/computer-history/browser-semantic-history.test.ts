@@ -36,6 +36,30 @@ describe("browser semantic Computer History", () => {
     expect(prepareBrowserHistoryEvent(payload(), context, denied, now, platform)).toBeNull();
   });
 
+  it("matches the native Windows app name so one browsing session stays one activity", () => {
+    expect(prepareBrowserHistoryEvent(payload(), context, intent, now, "win32")!.event.application).toEqual({ name: "chrome", bundleId: "win32.chrome" });
+    expect(prepareBrowserHistoryEvent(payload(), { ...context, browser: "edge" }, intent, now, "win32")!.event.application)
+      .toEqual({ name: "msedge", bundleId: "win32.msedge" });
+  });
+
+  it("replays each demonstrated page step once and names its key", () => {
+    const browser = (action: string, offset: number, extra: Record<string, unknown> = {}) => prepareBrowserHistoryEvent({ ...payload(),
+      eventId: `event-${action}-${offset}`, observedAt: now + offset, action, ...extra }, context, intent, now + offset, "darwin")!.event;
+    const native = (eventType: string, offset: number, details: Record<string, unknown> = {}) => ({ eventType,
+      timestamp: new Date(now + offset).toISOString(), application: browser("change", 0).application, details });
+    const typed = browser("input", 0, { target: { role: "textbox", name: "Company", value: "Fixture" } });
+    const committed = browser("change", 600, { target: { role: "textbox", name: "Company", value: "Fixture" } });
+    const enter = browser("key", 900, { key: "Enter", target: { role: "textbox", name: "Company" } });
+    const submitted = browser("submit", 1_100, { target: { role: "form", name: "" } });
+    const scrolled = browser("scroll", 1_200, { target: undefined });
+    const steps = reusableHumanActions([native("text_input", 50, { text: "Fixture" }), typed, committed,
+      native("key_press", 905, { keys: ["Enter"] }), enter, submitted, scrolled, native("mouse_click", 20_000, {})]);
+    expect(steps).toHaveLength(3);
+    expect(steps[0]).toContain("input on textbox Company");
+    expect(steps[1]).toContain("key Enter on textbox Company");
+    expect(steps[2]).toContain("an element was activated");
+  });
+
   it("rejects stopped, private, unknown privacy, protected, stale-document and stale-generation observations", () => {
     expect(prepareBrowserHistoryEvent(payload(), context, { ...intent, enabled: false }, now)).toBeNull();
     for (const privateBrowsing of [true, null]) expect(prepareBrowserHistoryEvent(payload(), { ...context, privateBrowsing }, intent, now)).toBeNull();
