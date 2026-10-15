@@ -45,7 +45,9 @@ function panelSpanGoalForMemory(memory: MemoryRow): string | undefined {
 export function panelSourceDistribution(memories: MemoryStatsRow[]): Array<{ source: string; count: number; percentage: number }> {
   const counts = new Map<string, number>();
   for (const memory of memories) {
-    const source = panelSourceForStatsRow(memory);
+    const rawSource = panelSourceForStatsRow(memory);
+    // Aggregate History with Memmy here; individual records retain their source metadata.
+    const source = rawSource === "computer_history" ? "memmy" : rawSource;
     counts.set(source, (counts.get(source) ?? 0) + 1);
   }
 

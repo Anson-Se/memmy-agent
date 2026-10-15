@@ -1,7 +1,6 @@
 import { useMemo } from "react";
 import { Bot, Ellipsis } from "lucide-react";
 import { Select } from "../../components/Select.js";
-import { useTranslation } from "../../i18n/use-translation.js";
 import {
   agentSourceDisplayName,
   agentSourceLogoUrl,
@@ -10,7 +9,8 @@ import {
 } from "../agent-source-logos.js";
 
 export const OTHER_MEMORY_SOURCE_AGENT = "__other__";
-export const MEMORY_SOURCE_AGENT_EXCLUSIONS = [...MEMORY_AGENT_SOURCE_VALUES];
+// History is shown under Memmy, but its stored source must also stay out of "Other".
+export const MEMORY_SOURCE_AGENT_EXCLUSIONS = [...MEMORY_AGENT_SOURCE_VALUES, "computer_history"];
 const ALL_AGENT_ICON_SOURCES = ["memmy-agent", "codex", "claude_code"] as const;
 
 export interface MemoryAgentFilterProps {
@@ -23,7 +23,6 @@ export interface MemoryAgentFilterProps {
 }
 
 export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
-  const { t } = useTranslation();
   const options = useMemo(() => [
     {
       value: "",
@@ -32,7 +31,7 @@ export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
     },
     ...MEMORY_AGENT_SOURCE_VALUES.map((value) => ({
       value,
-      label: value === "computer_history" ? t("memory.memories.historySource") : agentSourceDisplayName(value),
+      label: agentSourceDisplayName(value),
       icon: <SourceAgentLogo sourceAgent={value} />
     })),
     {
@@ -40,7 +39,7 @@ export function MemoryAgentFilter(props: MemoryAgentFilterProps) {
       label: props.otherLabel,
       icon: <Ellipsis size={15} strokeWidth={2} className="memory-source-filter__icon memory-source-filter__icon--other" />
     }
-  ], [props.allLabel, props.otherLabel, t]);
+  ], [props.allLabel, props.otherLabel]);
 
   return (
     <Select
