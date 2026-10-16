@@ -58,7 +58,6 @@ export type ExternalBrowserLabels = {
   launchFailed: string;
   manualGuide: string;
   installButton: string;
-  checkConnection?: string;
   checking?: string;
   installedWaiting?: string;
   connecting?: string;
@@ -66,7 +65,6 @@ export type ExternalBrowserLabels = {
   connectionFailed?: string;
   statusUnavailable?: string;
   openBrowser?: string;
-  repairConnection?: string;
   reinstall?: string;
   manage?: string;
   done?: string;
@@ -235,7 +233,6 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
   const managementRef = useRef<Browser | null>(null);
   managementRef.current = managementBrowser;
   const disconnectedSince = useRef(new Map<Browser, number>());
-  const refreshStatusRef = useRef<() => void>(() => undefined);
   const [statusError, setStatusError] = useState(false);
   const [actionError, setActionError] = useState(false);
   const [directory, setDirectory] = useState<string | null | undefined>(undefined);
@@ -316,12 +313,10 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
         if (live) timer = setTimeout(refresh, 3_000);
       });
     };
-    refreshStatusRef.current = refresh;
     refresh();
     window.addEventListener("focus", refresh);
     return () => {
       live = false;
-      refreshStatusRef.current = () => undefined;
       clearTimeout(timer);
       window.removeEventListener("focus", refresh);
     };
@@ -379,23 +374,6 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
     }
   }
 
-  async function reconnect(browser: Browser) {
-    if (preparing) return;
-    setPreparing(browser);
-    setActionError(false);
-    disconnectedSince.current.set(browser, Date.now());
-    setCheckedAt(Date.now());
-    try {
-      if (!prepareInstall) throw new Error("Browser connection preparation is unavailable");
-      const result = await prepareInstall(browser);
-      if (result.status !== "browser-opened") {
-        setPreparation(current => ({ ...current, [browser]: result.status }));
-      }
-      refreshStatusRef.current();
-    } catch { setActionError(true); }
-    finally { setPreparing(null); }
-  }
-
   const startDrag = dragExtension ?? window.memmy?.dragBrowserExtension;
 
   return (
@@ -444,12 +422,6 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
               </button>}
             </div>}
             {showSetup && installChecked && !ready && !browserClosed && <div className={styles.rowActions}>
-              {hasInstallation && <button type="button" className={styles.setupButton}
-                disabled={preparing !== null} onClick={() => void reconnect(browser)}>
-                {preparing === browser ? labels.preparing
-                  : connectionFailed ? labels.repairConnection ?? "Repair connection"
-                    : labels.checkConnection ?? "Check connection"}
-              </button>}
               <button type="button" className={styles.primaryButton} disabled={preparing !== null}
                 aria-expanded={expanded.has(browser)} aria-controls={`memmy-${browser}-extension-guide`}
                 onClick={() => void prepare(browser)}>

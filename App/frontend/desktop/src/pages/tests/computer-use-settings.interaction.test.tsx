@@ -189,7 +189,11 @@ describe("computer use settings", () => {
       const browserRow = (name: string) => Array.from(container.querySelectorAll("strong"))
         .find(node => node.textContent === name)?.parentElement?.parentElement?.textContent;
       expect(browserRow("Google Chrome")).toContain("已安装，等待浏览器连接");
+      expect(browserRow("Google Chrome")).toContain("重新安装");
+      expect(browserRow("Google Chrome")).not.toContain("检查连接");
       expect(browserRow("Microsoft Edge")).toContain("未安装");
+      expect(browserRow("Microsoft Edge")).not.toContain("检查连接");
+      expect(container.textContent).not.toContain("修复连接");
       expect(container.textContent).not.toContain("Memmy帮你安装");
       expect(container.textContent).not.toContain("手动安装");
       expect(container.textContent).not.toContain("暂时无法操作浏览器窗口");

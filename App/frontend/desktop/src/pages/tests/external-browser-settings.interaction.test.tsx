@@ -108,6 +108,8 @@ it("shows installed browsers as disconnected until they have a live connection",
   expect(container.textContent).toContain("Edge");
   const installButtons = Array.from(container.querySelectorAll("button")).filter(button => button.textContent === "Reinstall");
   expect(installButtons).toHaveLength(2);
+  expect(container.textContent).not.toContain("Check connection");
+  expect(container.textContent).not.toContain("Repair connection");
   expect(installButtons.every(button => button.className.includes("primaryButton"))).toBe(true);
   expect(installButtons[0]?.getAttribute("aria-expanded")).toBe("false");
 });

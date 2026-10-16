@@ -1,4 +1,6 @@
 // @vitest-environment happy-dom
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -122,7 +124,13 @@ describe("shared browser extension entry in Computer History", () => {
     await render(<ComputerHistorySubPage client={f.client} />);
     const wechat = host.querySelector("#computer-history-wechat-label")!.closest(".ch__recording-setting")!;
     const enhancement = host.querySelector(".ch__browser-enhancement")!;
+    const permissions = host.querySelector(".ch__sources");
     expect(wechat.nextElementSibling).toBe(enhancement);
+    expect(enhancement.nextElementSibling).toBe(permissions);
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const sourcesRule = css.slice(css.indexOf(".ch__settings-card > section[aria-label]"), css.indexOf(".ch__sources-row"));
+    expect(sourcesRule).not.toMatch(/border\s*:\s*0/);
+    expect(css).toContain(".ch__settings-card > * + * {\n  border-top: 1px solid var(--ch-border);\n}");
     expect(enhancement.querySelector('[role="switch"]')).toBeNull();
     expect(enhancement.querySelector("button")?.getAttribute("aria-expanded")).toBe("false");
     expect(f.getExternalBrowserStatus).not.toHaveBeenCalled();
