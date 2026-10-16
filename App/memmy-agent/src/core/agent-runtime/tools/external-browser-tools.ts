@@ -66,10 +66,13 @@ function formatNodes(nodes: unknown, truncated = false): string {
   if (!Array.isArray(nodes)) return "No accessible elements.";
   const rendered = nodes.map((node: any) => {
     const indent = Number.isInteger(node.depth) && node.depth > 0 ? '  '.repeat(Math.min(node.depth, 12)) : '';
-    const label = [node.name, node.value].filter(Boolean).map((value: string) => JSON.stringify(value)).join(" ");
+    const label = node.name ? ` ${JSON.stringify(node.name)}` : '';
+    const hasValue = typeof node.value === 'string' && node.state?.valueRedacted !== true
+      && (node.value !== '' || ['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(node.role));
+    const value = hasValue ? ` value=${JSON.stringify(node.value)}` : '';
     const state = node.state && typeof node.state === 'object' ? ` state=${JSON.stringify(node.state)}` : '';
     const context = typeof node.context === 'string' && node.context ? ` in ${JSON.stringify(node.context)}` : '';
-    return `${indent}${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label ? ` ${label}` : ""}${state}${context}`;
+    return `${indent}${node.ref ? `[${node.ref}] ` : ""}${node.role || "generic"}${label}${value}${state}${context}`;
   }).join("\n");
   return (truncated || rendered.length > 150_000
     ? '[Observation truncated by the page budget. Use a narrow browser_find query or a unique locator for more detail.]\n' : '')
@@ -101,6 +104,10 @@ export async function callExternalBrowserTool(
 ): Promise<ToolContent> {
   if (claim.browser === 'memmy' && name === 'browser_take_screenshot') {
     throw new Error(EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED);
+  }
+  if (name === 'browser_snapshot' && (claim.browser === 'memmy' || bridge.subscribePlaywright)
+    && (params.boxes === true || params.target || params.ref)) {
+    throw new Error('Connected browser snapshots return the page text and element references; boxes and target-scoped snapshots are not supported. Use browser_snapshot without these parameters, or browser_find with text or regex to locate a control.');
   }
   if (name === 'browser_file_upload') {
     const policy = new BrowserUseSitePolicyReader();
@@ -154,7 +161,7 @@ export async function callExternalBrowserTool(
     if (failure) return failure;
     if ((error as Error).message === "USER_ACTIVE_ON_TARGET_TAB") {
       throw new OcuUserIntervened(claim.browser === "memmy"
-        ? "你正在操作 Memmy 内置浏览器里的这个页面，我先暂停了。你操作完后发条消息，我再接着做。"
+        ? "你正在操作 Memmy，我先暂停浏览器操作。你操作完后发条消息，我再接着做。"
         : `你正在使用这个 ${claim.browser === "edge" ? "Edge" : "Chrome"} 标签页，我先暂停了。切到其他标签页或窗口后发条消息，我再接着做。`);
     }
     throw error;

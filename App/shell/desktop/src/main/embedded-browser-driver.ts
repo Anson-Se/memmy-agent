@@ -11,6 +11,8 @@ import { BrowserCdpEventBuffer } from './browser-cdp-event-buffer.js';
 import { BrowserTaskSitePermissions } from './browser-task-site-permissions.js';
 import { collectMissingBrowserAuth, parseBrowserAuthRequest, type BrowserAuthRequest, type BrowserAuthResult } from './browser-auth-request.js';
 import type { BrowserAuthFormResult } from './browser-auth-form.js';
+import { assertEmbeddedBrowserInputReceiver, focusEmbeddedBrowserInput,
+  keepEmbeddedBrowserAnimating } from './embedded-browser-input.js';
 
 type Node = { ref: string; role: string; name: string; value: string };
 type Point = { x: number; y: number };
@@ -23,7 +25,10 @@ export type EmbeddedExecutorEventSink = (event: { leaseId: string; method: strin
   params: Record<string, unknown>; sessionId?: string }) => void;
 type PlaywrightLease = { id: string; origin: string; input: boolean; expiresAt: number;
   documentEpoch: number; cdpEpoch: number; targetId: string; emit?: EmbeddedExecutorEventSink;
+  restoreAnimation?: () => void; expiryTimer?: ReturnType<typeof setTimeout>;
   uploadStamps?: ApprovedBrowserUpload['stamps']; uploadPaths?: string[] };
+type BrowserNavigation = { startUrl: string; url: string; state: 'loading' | 'complete' | 'failed';
+  error?: Error; abortError?: Error };
 type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<string>;
   console: Array<{ type: string; text: string }>; requests: Array<{ method: string; url: string }>;
   cdpEvents: BrowserCdpEventBuffer;
@@ -37,7 +42,8 @@ type Entry = { guest: WebContents; host: BrowserWindow; allowedOrigins: Set<stri
   attached: boolean; debuggerListenersInstalled: boolean; lastUserInputAt: number; agentInputDepth: number; lastStartedUrl: string;
   visitSource: BrowserVisitSource; visitSourceUntil: number; visitSourceMarkedAt: number;
   lastRecordedUrl: string; lastRecordedAt: number; lastRecordedSource: BrowserVisitSource;
-  pendingNavigation: boolean; everSelected: boolean };
+  pendingNavigation: boolean; everSelected: boolean; initialNavigationUrl: string;
+  navigation: BrowserNavigation | null };
 
 export type ApprovedBrowserUpload = { origin: string; stamps: Array<{
   path: string; realPath: string; dev: number; ino: number; size: number; mtimeMs: number;
@@ -162,11 +168,39 @@ function keyEvent(key: string, modifiers: number): Record<string, unknown> {
 export class EmbeddedBrowserDriver {
   private readonly browserId = randomUUID();
   private readonly entries = new Map<number, Entry>();
+  private readonly hostInput = new Map<BrowserWindow, { lastInputAt: number; dispose: () => void }>();
   private selectedTabId: number | null = null;
   private historyStore: BrowserHistoryStore | null = null;
   readonly taskSitePermissions = new BrowserTaskSitePermissions();
 
   constructor(private readonly getHost: () => BrowserWindow | null = () => null) {}
+
+  private observeHostInput(host: BrowserWindow): void {
+    if (this.hostInput.has(host)) return;
+    const contents = host.webContents;
+    const state = { lastInputAt: 0, dispose: () => {
+      contents.removeListener('before-input-event', onKey);
+      contents.removeListener('input-event', onPointer);
+      contents.removeListener('destroyed', onDestroyed);
+    } };
+    const record = () => {
+      // Electron may surface injected input on the embedding WebContents too.
+      if (![...this.entries.values()].some(entry => entry.host === host && entry.agentInputDepth > 0)) {
+        state.lastInputAt = Date.now();
+      }
+    };
+    const onKey = (_event: unknown, input: { type?: string; key?: string }) => {
+      if (input?.type === 'keyDown' && !MODIFIER_KEYS.has(input.key ?? '')) record();
+    };
+    const onPointer = (_event: unknown, input: { type?: string }) => {
+      if (['mouseDown', 'mouseWheel', 'pointerDown', 'touchStart'].includes(input?.type ?? '')) record();
+    };
+    const onDestroyed = () => { state.dispose(); this.hostInput.delete(host); };
+    contents.on('before-input-event', onKey);
+    contents.on('input-event', onPointer);
+    contents.once('destroyed', onDestroyed);
+    this.hostInput.set(host, state);
+  }
 
   setHistoryStore(store: BrowserHistoryStore): void { this.historyStore = store; }
 
@@ -194,6 +228,7 @@ export class EmbeddedBrowserDriver {
   }
 
   attach(guest: WebContents, host: BrowserWindow): void {
+    this.observeHostInput(host);
     const entry: Entry = { guest, host, allowedOrigins: new Set(), console: [], requests: [],
       cdpEvents: new BrowserCdpEventBuffer(), cdpSessions: new Map(), cdpOrigin: null, cdpEpoch: 0,
       playwrightLease: null, playwrightLastLeaseId: null,
@@ -203,7 +238,7 @@ export class EmbeddedBrowserDriver {
       attached: false, debuggerListenersInstalled: false, lastUserInputAt: 0, agentInputDepth: 0, lastStartedUrl: '',
       visitSource: 'other', visitSourceUntil: 0, visitSourceMarkedAt: 0,
       lastRecordedUrl: '', lastRecordedAt: 0, lastRecordedSource: 'other', pendingNavigation: false,
-      everSelected: false };
+      everSelected: false, initialNavigationUrl: '', navigation: null };
     this.entries.set(guest.id, entry);
     guest.on('did-start-navigation', details => {
       if (details.isMainFrame) {
@@ -213,8 +248,36 @@ export class EmbeddedBrowserDriver {
         catch { entry.cdpEvents.clear(); entry.cdpOrigin = null; entry.cdpEpoch++; }
         entry.lastStartedUrl = details.url;
         entry.pendingNavigation = true;
+        if (!entry.initialNavigationUrl && /^https?:\/\//.test(details.url)) entry.initialNavigationUrl = details.url;
+        if (!details.isSameDocument) {
+          entry.navigation = { startUrl: details.url, url: details.url, state: 'loading' };
+        } else if (entry.navigation) entry.navigation.url = details.url;
       }
     });
+    guest.on('did-redirect-navigation', details => {
+      if (details.isMainFrame && entry.navigation?.state === 'loading') entry.navigation.url = details.url;
+    });
+    guest.on('did-finish-load', () => {
+      // A Chromium error page can also finish loading. Its failure stays a
+      // failure until another main-frame navigation starts.
+      const navigation = entry.navigation;
+      if (navigation?.state === 'loading' && guest.getURL() === navigation.url) navigation.state = 'complete';
+    });
+    const failedNavigation = (_event: unknown, code: number, description: string, url: string, isMainFrame: boolean) => {
+      const navigation = entry.navigation;
+      if (!isMainFrame || !navigation || navigation.url !== url) return;
+      const error = new Error(`${description || 'Navigation failed'} (${code}) loading '${url}'`);
+      if (code === -3) {
+        // An older same-URL load can abort after its replacement has started.
+        // Wait for loading to stop; a replacement that finishes wins instead.
+        navigation.abortError = error;
+        return;
+      }
+      navigation.state = 'failed';
+      navigation.error = error;
+    };
+    guest.on('did-fail-load', failedNavigation);
+    guest.on('did-fail-provisional-load', failedNavigation);
     guest.on('before-input-event', (_event, input) => {
       if (!entry.agentInputDepth && input?.type === 'keyDown' && !MODIFIER_KEYS.has(input.key)) {
         entry.lastUserInputAt = Date.now();
@@ -242,8 +305,16 @@ export class EmbeddedBrowserDriver {
       }
       catch { /* History disk errors cannot interrupt the browser. */ }
     };
-    guest.on('did-stop-loading', recordNavigation);
+    guest.on('did-stop-loading', () => {
+      const navigation = entry.navigation;
+      if (navigation?.state === 'loading' && navigation.abortError && !guest.isLoading()) {
+        navigation.state = 'failed';
+        navigation.error = navigation.abortError;
+      }
+      recordNavigation();
+    });
     guest.on('did-navigate', () => {
+      if (entry.navigation) entry.navigation.url = guest.getURL();
       this.revokePlaywright(entry, 'navigation');
       // A redirect can commit another origin after the navigation started on this one.
       this.taskSitePermissions.end(guest.id, guest.getURL());
@@ -260,6 +331,7 @@ export class EmbeddedBrowserDriver {
       }
     });
     guest.on('did-navigate-in-page', () => {
+      if (entry.navigation) entry.navigation.url = guest.getURL();
       entry.pendingNavigation = true;
       recordNavigation();
     });
@@ -636,6 +708,9 @@ export class EmbeddedBrowserDriver {
       } catch { /* Child targets remain unavailable if this debugger does not support auto-attach. */ }
     }
     beforeSend?.();
+    if (method === 'Input.insertText' || method === 'Input.dispatchKeyEvent') {
+      assertEmbeddedBrowserInputReceiver(entry.guest, entry.host);
+    }
     if (!method.startsWith('Input.')) return sessionId
       ? entry.guest.debugger.sendCommand(method, params, sessionId)
       : entry.guest.debugger.sendCommand(method, params);
@@ -649,6 +724,8 @@ export class EmbeddedBrowserDriver {
   private revokePlaywright(entry: Entry, reason?: 'navigation'): void {
     const lease = entry.playwrightLease;
     entry.playwrightLease = null;
+    clearTimeout(lease?.expiryTimer);
+    try { lease?.restoreAnimation?.(); } catch { /* A closing guest can no longer be restored. */ }
     // The executor may be waiting for an event, with no command outstanding.
     try { lease?.emit?.({ leaseId: lease.id, method: 'Memmy.executorRevoked', params: reason ? { reason } : {} }); }
     catch { /* The Agent process is gone; its executor is already closed. */ }
@@ -719,6 +796,17 @@ export class EmbeddedBrowserDriver {
         ...(uploadPaths && upload ? { uploadPaths, uploadStamps: upload.stamps.map(stamp => ({ ...stamp })) } : {}) };
       entry.playwrightLease = lease; entry.playwrightLastLeaseId = id;
       try {
+        if (lease.input) {
+          lease.restoreAnimation = keepEmbeddedBrowserAnimating(entry.guest);
+          lease.expiryTimer = setTimeout(() => {
+            if (entry.playwrightLease === lease) this.revokePlaywright(entry);
+          }, Math.max(0, lease.expiresAt - Date.now()));
+          lease.expiryTimer.unref?.();
+          await focusEmbeddedBrowserInput(entry.guest, entry.host, () => {
+            current(lease);
+            if (this.userActive(entry)) throw new Error('USER_ACTIVE_ON_TARGET_TAB');
+          });
+        }
         const info = await this.command(entry, 'Target.getTargetInfo', {}, () => current(lease));
         if (typeof info.targetInfo?.targetId !== 'string' || !info.targetInfo.targetId) throw new Error('Browser executor target is unavailable');
         lease.targetId = info.targetInfo.targetId;
@@ -954,8 +1042,9 @@ export class EmbeddedBrowserDriver {
   }
 
   private userActive(entry: Entry): boolean {
-    return !entry.guest.isDestroyed() && entry.guest.isFocused()
-      && Date.now() - entry.lastUserInputAt < USER_ACTIVE_WINDOW_MS;
+    return Date.now() - (this.hostInput.get(entry.host)?.lastInputAt ?? 0) < USER_ACTIVE_WINDOW_MS
+      || (!entry.guest.isDestroyed() && entry.guest.isFocused()
+        && Date.now() - entry.lastUserInputAt < USER_ACTIVE_WINDOW_MS);
   }
 
   /** Delay a write until a brief user interaction settles; nothing has been sent yet. */
@@ -1154,34 +1243,62 @@ export class EmbeddedBrowserDriver {
       const host = this.getHost();
       if (!host || host.isDestroyed()) throw new Error('Memmy browser window is not available');
       const existingIds = new Set(this.entries.keys());
+      const assertCurrent = () => {
+        if (isCurrent && !isCurrent()) throw new Error('Browser tab opening was canceled');
+        if (host.isDestroyed()) throw new Error('Memmy browser window is not available');
+      };
+      assertCurrent();
       host.webContents.send('memmy:browser:open-url', target.href, { scopeKey });
       const deadline = Date.now() + 20_000;
-      while (Date.now() < deadline) {
-        const entry = [...this.entries.values()].find(candidate => !existingIds.has(candidate.guest.id)
-          && !candidate.guest.isDestroyed() && candidate.host === host
-          && (candidate.guest.getURL() === target.href
-            || (candidate.lastStartedUrl === target.href && !candidate.guest.isLoading())));
-        if (entry) {
-          entry.allowedOrigins.add(target.origin);
-          this.markVisitSource(entry, 'agent');
-          try {
-            if (entry.lastRecordedUrl === entry.guest.getURL()) {
-              this.historyStore?.reviseLatestVisit(String(entry.guest.id), entry.guest.getURL(),
-                entry.guest.getTitle(), 'agent');
-            } else {
-              this.historyStore?.recordVisit(String(entry.guest.id), entry.guest.getURL(), entry.guest.getTitle(),
-                Date.now(), 'agent');
-            }
-          } catch { /* History disk errors cannot interrupt browser control. */ }
-          entry.lastRecordedUrl = entry.guest.getURL();
-          entry.lastRecordedAt = Date.now();
-          entry.lastRecordedSource = 'agent';
-          entry.pendingNavigation = false;
-          return { tabId: entry.guest.id, title: entry.guest.getTitle(), url: entry.guest.getURL() };
+      let opened: Entry | undefined;
+      try {
+        while (Date.now() < deadline) {
+          if (!opened) {
+            opened = [...this.entries.values()].find(candidate => !existingIds.has(candidate.guest.id)
+              && !candidate.guest.isDestroyed() && candidate.host === host
+              && candidate.initialNavigationUrl === target.href);
+          }
+          assertCurrent();
+          const entry = opened;
+          if (entry && (entry.guest.isDestroyed() || this.entries.get(entry.guest.id) !== entry)) {
+            throw new Error('Memmy browser tab closed while opening');
+          }
+          const navigation = entry?.navigation;
+          if (navigation?.state === 'failed') throw navigation.error ?? new Error('Memmy browser navigation failed');
+          if (entry && navigation?.state === 'complete') {
+            assertCurrent();
+            entry.allowedOrigins.add(target.origin);
+            this.markVisitSource(entry, 'agent');
+            try {
+              if (entry.lastRecordedUrl === entry.guest.getURL()) {
+                this.historyStore?.reviseLatestVisit(String(entry.guest.id), entry.guest.getURL(),
+                  entry.guest.getTitle(), 'agent');
+              } else {
+                this.historyStore?.recordVisit(String(entry.guest.id), entry.guest.getURL(), entry.guest.getTitle(),
+                  Date.now(), 'agent');
+              }
+            } catch { /* History disk errors cannot interrupt browser control. */ }
+            entry.lastRecordedUrl = entry.guest.getURL();
+            entry.lastRecordedAt = Date.now();
+            entry.lastRecordedSource = 'agent';
+            entry.pendingNavigation = false;
+            return { tabId: entry.guest.id, title: entry.guest.getTitle(), url: entry.guest.getURL() };
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
-        await new Promise(resolve => setTimeout(resolve, 100));
+        assertCurrent();
+        throw new Error('Memmy browser tab did not finish loading within 20 seconds');
+      } catch (error) {
+        // No tab identity has reached the Agent yet, so it cannot clean up an
+        // unsuccessful open. Close only the new guest this request matched.
+        if (opened && this.entries.get(opened.guest.id) === opened && !opened.guest.isDestroyed()) {
+          try {
+            if (!host.isDestroyed()) host.webContents.send('memmy:browser:close-tab', opened.guest.id);
+            if (!opened.guest.isDestroyed()) opened.guest.close();
+          } catch { /* Preserve the actual navigation/cancellation error. */ }
+        }
+        throw error;
       }
-      throw new Error('Memmy browser tab did not open');
     }
     if (request.command === 'probe') {
       try {
@@ -1264,6 +1381,7 @@ export class EmbeddedBrowserDriver {
             functionDeclaration: "function(){ return this.isConnected && !this.disabled && !this.readOnly && (this.tagName==='TEXTAREA' || (this.tagName==='INPUT' && !['button','submit','reset','checkbox','radio','file','image','hidden','range','color'].includes(this.type)) || this.isContentEditable); }",
             returnByValue: true }, action.checkCurrent), 'Browser editable target validation failed');
           if (editable?.value !== true) throw new Error('Element is not editable, is disabled, or is read-only; no input was sent.');
+          await focusEmbeddedBrowserInput(entry.guest, entry.host, action.checkCurrent);
           await this.dispatchClick(entry, args, action);
           await this.assertClickNode(entry, action);
           const selected = runtimeResult(await this.command(entry, 'Runtime.callFunctionOn', { objectId: action.objectId,
@@ -1301,7 +1419,12 @@ export class EmbeddedBrowserDriver {
           return { value: result.value };
         } finally { await this.command(entry, 'Runtime.releaseObject', { objectId }).catch(() => undefined); }
       }
-      case 'pressKey': await this.pressKey(entry, String(args.key ?? '')); return { ok: true };
+      case 'pressKey': {
+        const checkCurrent = this.actionGuard(entry);
+        await focusEmbeddedBrowserInput(entry.guest, entry.host, checkCurrent);
+        await this.pressKey(entry, String(args.key ?? ''), checkCurrent);
+        return { ok: true };
+      }
       case 'scroll': await this.command(entry, 'Input.dispatchMouseEvent', { type: 'mouseWheel',
         x: Number(args.x) || 300, y: Number(args.y) || 300,
         deltaX: Number(args.deltaX) || 0, deltaY: Number(args.deltaY) || 0 }); return { ok: true };
@@ -1507,6 +1630,8 @@ export class EmbeddedBrowserDriver {
       }
     }
     this.entries.clear();
+    for (const host of this.hostInput.values()) host.dispose();
+    this.hostInput.clear();
     this.selectedTabId = null;
   }
 }

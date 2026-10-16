@@ -10,6 +10,30 @@ const claim: ExternalBrowserClaim = {
 const scope = { sessionKey: "s", channel: "projected-session", chatId: "s" };
 
 describe("external browser tool adapter", () => {
+  it('distinguishes an empty field, its label and its observed value after an action', async () => {
+    const command = vi.fn(async () => ({ ok: true, observation: { nodes: [
+      { ref: 'pw-1', role: 'textbox', name: 'Email', value: '' },
+      { ref: 'pw-2', role: 'textbox', name: 'Font size', value: '11' },
+      { ref: 'pw-3', role: 'textbox', name: 'Notes', value: 'Draft text' },
+      { ref: 'pw-4', role: 'textbox', name: 'Password', value: 'must-not-appear', state: { valueRedacted: true } },
+    ] } }));
+    const result = await callExternalBrowserTool({ command } as unknown as ExternalBrowserBridge,
+      { ...claim, browser: 'memmy' }, scope, 'browser_type', { target: 'pw-3', text: 'Draft text' }, async () => true);
+    const text = result[0].text;
+    expect(text).toContain('[pw-1] textbox "Email" value=""');
+    expect(text).toContain('[pw-2] textbox "Font size" value="11"');
+    expect(text).toContain('[pw-3] textbox "Notes" value="Draft text"');
+    expect(text).not.toContain('must-not-appear');
+  });
+
+  it.each([{ boxes: true }, { target: 'pw-1' }, { ref: 'pw-1' }])('does not silently ignore unsupported connected snapshot options %j', async params => {
+    const command = vi.fn();
+    await expect(callExternalBrowserTool({ command } as unknown as ExternalBrowserBridge,
+      { ...claim, browser: 'memmy' }, scope, 'browser_snapshot', params, async () => true))
+      .rejects.toThrow(/not supported.*browser_find/);
+    expect(command).not.toHaveBeenCalled();
+  });
+
   it('returns the completed observation when its optional preview never responds', async () => {
     vi.useFakeTimers();
     try {

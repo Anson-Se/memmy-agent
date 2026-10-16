@@ -1323,10 +1323,13 @@ export class BrowserSessionManager {
         if (!opened) throw new Error('Memmy browser tab did not open');
         const selected = this.embeddedRouter.selectClaim(scope, opened,
           { allowedOrigins: approved, agentCreated: true });
-        const result = await this.embeddedRouter.call(scope, selected, name, browserParams);
+        // openTab already navigates the webview through its initial src. A
+        // second navigate can abort that load or reset a page that has begun
+        // rendering. Keep the live-site approval check without loading again.
+        await this.embeddedRouter.authorizeCurrent(scope, selected);
         assertEmbeddedTurn();
         if (disposition) this.embeddedRouter.markTab(scope, disposition, selected);
-        return result;
+        return [{ type: 'text', text: JSON.stringify({ url: selected.url }) }];
       }
     }
     if (openNewTab) throw new Error('newTab requires the Memmy in-app browser and an http(s) URL');

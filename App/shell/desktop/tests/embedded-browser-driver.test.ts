@@ -13,6 +13,8 @@ function harness(selected = true) {
   let url = 'https://example.com/';
   let focused = false;
   let destroyed = false;
+  const guestFrame = { frameTreeNodeId: 27 };
+  let focusedFrame: { frameTreeNodeId: number } | null = guestFrame;
   const browserSession = { partition: 'persist:memmy-browser' };
   const debuggerEvents = new EventEmitter();
   const sendCommand = vi.fn(async (method: string, args?: Record<string, any>) => {
@@ -33,22 +35,28 @@ function harness(selected = true) {
   const guest = Object.assign(new EventEmitter(), { id: 27,
     session: browserSession,
     isDestroyed: () => destroyed, isLoading: () => false,
+    mainFrame: { framesInSubtree: [guestFrame] }, backgroundThrottling: true,
+    setBackgroundThrottling: vi.fn((value: boolean) => { guest.backgroundThrottling = value; }),
     getURL: () => url, getTitle: () => 'Example', isFocused: () => focused,
     focus: vi.fn(), loadURL: vi.fn(async (target: string) => { url = target; }),
     debugger: Object.assign(debuggerEvents, { attach: vi.fn(), detach: vi.fn(), sendCommand }) });
   const host = { isDestroyed: () => false, show: vi.fn(),
-    webContents: { send: vi.fn((channel: string, target: string | number) => {
+    webContents: Object.assign(new EventEmitter(), { get focusedFrame() { return focusedFrame; },
+      executeJavaScript: vi.fn(async () => { focusedFrame = guestFrame; return true; }),
+      send: vi.fn((channel: string, target: string | number) => {
       if (channel === 'memmy:browser:close-tab' && target === 27) {
         destroyed = true;
         guest.emit('destroyed');
       } else if (typeof target === 'string') url = target;
-    }) } };
+    }) }) };
+  Object.defineProperty(host.webContents, 'focusedFrame', { get: () => focusedFrame });
   const driver = new EmbeddedBrowserDriver(() => host as any);
   driver.attach(guest as any, host as any);
   if (selected) driver.selectTab(guest.id, host as any);
   const request = (command: EmbeddedBrowserRequest['command'], args: Record<string, unknown> = {}): EmbeddedBrowserRequest =>
     ({ type: EMBEDDED_BROWSER_REQUEST, requestId: 'test', tabId: 27, command, args });
   return { driver, request, sendCommand, guest, host, browserSession,
+    focusFrame: (frame: { frameTreeNodeId: number } | null) => { focusedFrame = frame; },
     navigate: (target: string) => { url = target; }, focus: (value: boolean) => { focused = value; } };
 }
 
@@ -89,7 +97,7 @@ it('keeps inactive guests and history without selecting or losing an approved ba
 
 it('clears only a host-owned selection and never selects an arbitrary remaining guest after destruction', async () => {
   const { driver, guest, host, request } = harness();
-  const otherHost = { isDestroyed: () => false, webContents: { send: vi.fn() } };
+  const otherHost = { isDestroyed: () => false, webContents: Object.assign(new EventEmitter(), { send: vi.fn() }) };
   const other = Object.assign(new EventEmitter(), { id: 28, isDestroyed: () => false,
     getURL: guest.getURL, getTitle: guest.getTitle, debugger: guest.debugger });
   const hidden = Object.assign(new EventEmitter(), { id: 29, isDestroyed: () => false,
@@ -1109,7 +1117,10 @@ it('opens a new visible tab for an Agent navigation while retaining the user tab
   host.webContents.send.mockImplementation((_channel: string, target: string) => {
     const next = Object.assign(new EventEmitter(), { ...guest, id: 28,
       getURL: () => target, getTitle: () => 'New tab' });
+    next.removeAllListeners();
     driver.attach(next as any, host as any);
+    next.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: target });
+    next.emit('did-finish-load');
   });
   const result = await driver.handle(request('openTab', { url: 'https://example.com/guide', scopeKey: 'chat-owner' }));
   expect(host.webContents.send).toHaveBeenCalledWith('memmy:browser:open-url', 'https://example.com/guide', { scopeKey: 'chat-owner' });
@@ -1141,10 +1152,16 @@ it('refuses an ownerless Agent open request before creating or selecting a tab',
 it('skips the initial blank webview when a new browser panel mounts before the requested tab', async () => {
   const { driver, request, host, guest } = harness();
   host.webContents.send.mockImplementation((_channel: string, target: string) => {
-    driver.attach(Object.assign(new EventEmitter(), { ...guest, id: 28,
-      getURL: () => 'about:blank', getTitle: () => '' }) as any, host as any);
-    driver.attach(Object.assign(new EventEmitter(), { ...guest, id: 29,
-      getURL: () => target, getTitle: () => 'Requested tab' }) as any, host as any);
+    const blank = Object.assign(new EventEmitter(), { ...guest, id: 28,
+      getURL: () => 'about:blank', getTitle: () => '' });
+    blank.removeAllListeners();
+    driver.attach(blank as any, host as any);
+    const requested = Object.assign(new EventEmitter(), { ...guest, id: 29,
+      getURL: () => target, getTitle: () => 'Requested tab' });
+    requested.removeAllListeners();
+    driver.attach(requested as any, host as any);
+    requested.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: target });
+    requested.emit('did-finish-load');
   });
   await expect(driver.handle(request('openTab', { url: 'https://example.com/guide', scopeKey: 'chat-owner' })))
     .resolves.toMatchObject({ tabId: 29, url: 'https://example.com/guide' });
@@ -1225,6 +1242,105 @@ function playwrightHarness() {
     run('playwrightStart', { input, fresh: true, ...args }, upload),
     setAllowed: (value: boolean) => { allowed = value; }, setCurrent: (value: boolean) => { current = value; } };
 }
+
+it('focuses only the exact guest for an input lease and stops before dispatch if the host regains focus', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    test.focusFrame({ frameTreeNodeId: 99 });
+    await test.start(true);
+    expect(test.host.webContents.executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('getWebContentsId() === 27'));
+    expect(test.guest.backgroundThrottling).toBe(false);
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'exact guest' } });
+    test.sendCommand.mockClear();
+    test.focusFrame({ frameTreeNodeId: 99 });
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never sent' } }))
+      .rejects.toThrow(/input receiver changed/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await test.run('playwrightEnd');
+    expect(test.guest.backgroundThrottling).toBe(true);
+    expect(test.guest.focus).not.toHaveBeenCalled();
+    expect(test.host.show).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('does not focus or change animation throttling for observation leases', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(false);
+    expect(test.host.webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('waits for real typing in the host composer and leaves its focus alone during continued use', async () => {
+  vi.useFakeTimers();
+  const test = playwrightHarness();
+  let repeated: ReturnType<typeof setInterval> | undefined;
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    const type = () => test.host.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'a' });
+    type(); repeated = setInterval(type, 200);
+    const starting = test.start(true).then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(8_001);
+    expect((await starting)?.message).toBe('USER_ACTIVE_ON_TARGET_TAB');
+    expect(test.host.webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { clearInterval(repeated); vi.useRealTimers(); test.driver.dispose(); }
+});
+
+it('ignores its own keyboard input echoed by the host and removes host listeners on disposal', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(true);
+    const send = test.sendCommand.getMockImplementation()!;
+    test.sendCommand.mockImplementation(async (method, args) => {
+      if (method === 'Input.insertText') test.host.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'a' });
+      return send(method, args);
+    });
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'first' } });
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'second' } });
+    expect(test.sendCommand.mock.calls.filter(([method]) => method === 'Input.insertText')).toHaveLength(2);
+    test.driver.dispose();
+    expect(test.host.webContents.listenerCount('before-input-event')).toBe(0);
+  } finally { test.driver.dispose(); }
+});
+
+it.each(['focus-failed', 'cancelled', 'navigation', 'expired'] as const)('restores animation throttling when an input lease is %s', async failure => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    if (failure === 'focus-failed') test.host.webContents.executeJavaScript.mockResolvedValueOnce(false);
+    if (failure === 'cancelled') test.host.webContents.executeJavaScript.mockImplementationOnce(async () => {
+      test.setCurrent(false); return true;
+    });
+    if (failure === 'focus-failed' || failure === 'cancelled') await expect(test.start(true)).rejects.toThrow();
+    else {
+      if (failure === 'expired') vi.useFakeTimers();
+      await test.start(true);
+      if (failure === 'navigation') test.guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: 'https://example.com/next' });
+      else await vi.advanceTimersByTimeAsync(45_001);
+    }
+    expect(test.guest.backgroundThrottling).toBe(true);
+    expect(test.guest.setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
+  } finally { vi.useRealTimers(); test.driver.dispose(); }
+});
+
+it('restores an already unthrottled guest without enabling throttling, and ignores stale lease cleanup', async () => {
+  const test = playwrightHarness();
+  test.guest.backgroundThrottling = false;
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(true); await test.run('playwrightEnd');
+    expect(test.guest.backgroundThrottling).toBe(false);
+    await test.start(true, { leaseId: 'b'.repeat(32) });
+    test.guest.setBackgroundThrottling.mockClear();
+    await test.run('playwrightEnd');
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
 
 it('starts the built-in executor only with current site access and a fixed explicit tab', async () => {
   const test = playwrightHarness();

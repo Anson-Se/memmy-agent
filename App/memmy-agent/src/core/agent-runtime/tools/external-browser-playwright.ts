@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { browserSemanticSnapshotExpression } from './browser-semantic-snapshot.js';
+import { bindBrowserTextInputReceiver, verifyBrowserTextInput } from './browser-text-verification.js';
 import type { Browser, Dialog, ElementHandle, Frame, Locator, Page } from 'playwright';
 import type { BrowserScope } from './browser.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
@@ -30,144 +32,6 @@ const WARM_CONNECTION_MS = 45_000;
 const REPLACED_PAGE_SETTLE_MS = 5_000;
 const replacedPages = new WeakMap<object, number | undefined>();
 
-// This standards-based DOM view assigns refs to real Elements (including the
-// parents of visible text nodes). Playwright's public locators execute actions.
-// Output follows document order under named structural containers (dialogs,
-// forms, table rows, lists, groups), so a field sits beside its label and a
-// row action beside its row. Over budget, controls and the text sharing their
-// container are kept before other text.
-function snapshotExpression(nonce: string, query?: { text?: string; regex?: string }): string {
-  return `(() => {
-    const nonce=${JSON.stringify(nonce)}, query=${JSON.stringify(query ?? {})};
-    // The map lives in the page's main world, where frame.evaluateHandle can
-    // retrieve the exact original node. It is replaced on every observation.
-    const refs=new Map();
-    Object.defineProperty(globalThis,Symbol.for('memmy.playwright.element.refs'),
-      {value:refs,writable:true,configurable:true});
-    let scanned=0,truncated=false;
-    const raw=query.regex||'', match=/^\\/(.*)\\/([imsu]*)$/.exec(raw);
-    const pattern=raw?(match?new RegExp(match[1],match[2]):new RegExp(raw)):null;
-    const filtering=!!(pattern||query.text);
-    const matches=value => pattern?pattern.test(value):!query.text||value.toLowerCase().includes(query.text.toLowerCase());
-    const style=el => getComputedStyle(el);
-    const visible=el => !!el.getClientRects().length && style(el).visibility!=='hidden';
-    const clean=value => String(value||'').slice(0,4000).replace(/\\s+/g,' ').trim().slice(0,1000);
-    const explicitRole=el => { const value=el.getAttribute('role'); return value&&!/^(presentation|none|generic)$/.test(value)?value:''; };
-    const role=el => explicitRole(el) || ({BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox',A:el.hasAttribute('href')?'link':'',SUMMARY:'button'}[el.tagName]) || (el.tagName==='INPUT' ? ({checkbox:'checkbox',radio:'radio',button:'button',submit:'button',range:'slider'}[el.type]||'textbox') : /^H[1-6]$/.test(el.tagName)?'heading':'');
-    const name=el => clean(el.getAttribute('aria-label') || (el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.textContent||'').join(' ').trim() || Array.from(el.labels||[]).map(label=>label.innerText).join(' ') || el.getAttribute('alt') || (['INPUT','TEXTAREA'].includes(el.tagName)?el.getAttribute('placeholder'):el.innerText) || el.getAttribute('title'));
-    const INTERACTIVE=/^(button|link|textbox|searchbox|combobox|checkbox|radio|switch|slider|spinbutton|tab|menuitem|menuitemcheckbox|menuitemradio|option|treeitem)$/;
-    const CONTAINER=/^(dialog|alertdialog|form|table|grid|treegrid|row|list|listbox|menu|menubar|tablist|tabpanel|tree|group|radiogroup|region|navigation|main|complementary|search|toolbar)$/;
-    const containerRole=el => {
-      const value=explicitRole(el);
-      if(value)return CONTAINER.test(value)?value:'';
-      if(el.tagName==='FORM')return el.elements.length?'form':'';
-      if(el.tagName==='SECTION')return el.hasAttribute('aria-label')||el.hasAttribute('aria-labelledby')?'region':'';
-      return ({DIALOG:'dialog',TABLE:'table',TR:'row',UL:'list',OL:'list',FIELDSET:'group',NAV:'navigation',MAIN:'main',ASIDE:'complementary'})[el.tagName]||'';
-    };
-    const textOf=(el,limit) => {
-      if(!el)return '';
-      const walker=document.createTreeWalker(el,4); let text='',node,count=0;
-      while((node=walker.nextNode())&&text.length<limit&&count++<200) {
-        if(!/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(node.parentElement?.tagName||''))text+=' '+node.nodeValue;
-      }
-      return clean(text).slice(0,limit);
-    };
-    const containerName=(el,r) => {
-      const own=clean(el.getAttribute('aria-label')||(el.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent||'').join(' ')).slice(0,160);
-      if(own)return own;
-      if(el.tagName==='FIELDSET')return textOf(el.querySelector(':scope>legend'),120);
-      if(r==='dialog'||r==='alertdialog')return textOf(el.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]'),120);
-      if(r==='row')return [...el.children].slice(0,4).map(cell=>textOf(cell,60)).filter(Boolean).join(' | ').slice(0,160);
-      if(el.tagName==='TABLE')return textOf(el.querySelector(':scope>caption'),120);
-      return '';
-    };
-    const stateOf=el => {
-      const state={};
-      for(const [attribute,key] of [['aria-checked','checked'],['aria-expanded','expanded'],['aria-selected','selected'],['aria-disabled','disabled']]) {
-        if(el.hasAttribute(attribute))state[key]=el.getAttribute(attribute)==='true'?true:el.getAttribute(attribute)==='false'?false:el.getAttribute(attribute);
-      }
-      if(['checkbox','radio'].includes(el.type))state.checked=el.checked;
-      if('disabled' in el)state.disabled=el.disabled;
-      if('readOnly' in el)state.readOnly=el.readOnly;
-      if(el.tagName==='SELECT') {
-        const options=Array.from(el.options), filtered=options.filter(option=>matches(clean(option.text)+' '+option.value));
-        state.options=filtered.slice(0,25).map(option=>({label:clean(option.text).slice(0,200),value:String(option.value).slice(0,200),selected:option.selected,disabled:option.disabled}));
-        if(filtered.length>25)state.optionsTruncated=true;
-      }
-      return state;
-    };
-    const entries=[], seen=new Set(), stack=[];
-    const add=(el,r,n,depth,text) => {
-      if(entries.length>=5000){truncated=true;return;}
-      if((!text&&seen.has(el))||!visible(el)||el.closest('[aria-hidden="true"]'))return;
-      if(!text)seen.add(el);
-      const state=text?{}:stateOf(el);
-      // Pages often build buttons from styled text; the pointer cursor says it acts.
-      if((text||!INTERACTIVE.test(r))&&style(el).cursor==='pointer')state.clickable=true;
-      const node={role:r||'text',name:clean(n),value:text||(el.tagName==='INPUT'&&el.type==='password')?'':clean(el.value),
-        ...(Object.keys(state).length?{state}:{})};
-      if(filtering&&!matches(node.role+' '+node.name+' '+node.value+' '+JSON.stringify(state)))return;
-      entries.push({node,el,depth,control:INTERACTIVE.test(node.role),owner:stack.at(-1),
-        ...(filtering?{context:stack.map(container=>container.label).join(' > ').slice(0,240)}:{})});
-    };
-    const walk=(root,depth) => {
-      for(const child of root.childNodes) {
-        if(++scanned>30000){truncated=true;return;}
-        if(child.nodeType===1) {
-          if(/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|FRAME)$/.test(child.tagName)||child.getAttribute('aria-hidden')==='true')continue;
-          const containerKind=containerRole(child);
-          let inner=depth, container=null;
-          if(containerKind&&visible(child)) {
-            const containerLabel=containerName(child,containerKind);
-            container={container:true,role:containerKind,name:containerLabel,depth,start:entries.length,end:entries.length,
-              label:containerKind+(containerLabel?' "'+containerLabel+'"':''),
-              modal:/dialog/.test(containerKind)&&(child.getAttribute('aria-modal')==='true'||child.matches(':modal'))};
-            entries.push(container); stack.push(container); inner=depth+1;
-          } else if(!containerKind) {
-            const r=role(child); if(r)add(child,r,name(child),depth);
-          }
-          if(child.shadowRoot)walk(child.shadowRoot,inner);
-          walk(child,inner);
-          if(container){stack.pop(); container.end=entries.length;}
-        } else if(child.nodeType===3&&child.textContent.trim()) {
-          const parent=child.parentElement,el=parent?.tagName==='LABEL'&&parent.control?parent.control:parent;
-          if(!el)continue;
-          // Text directly inside a container is kept as text; the container itself is not a node.
-          if(containerRole(el))add(el,'text',child.textContent,depth,child.textContent);
-          else add(el,role(el)||'text',role(el)?name(el):el.innerText||child.textContent,depth);
-        }
-      }
-    };
-    walk(document.body||document.documentElement,0);
-    // A page longer than the scan still offers its remaining controls.
-    if(scanned>30000)for(const el of document.querySelectorAll('button,a[href],input,select,textarea,summary,[role]')) {
-      if(entries.length>=5000)break;
-      const r=role(el); if(INTERACTIVE.test(r))add(el,r,name(el),0);
-    }
-    const leaves=entries.filter(entry=>!entry.container);
-    const actionable=new Set(leaves.filter(entry=>entry.control).map(entry=>entry.owner));
-    let count=0,characters=0;
-    for(const level of [0,1,2])for(const entry of leaves) {
-      if((entry.control?0:actionable.has(entry.owner)?1:2)!==level)continue;
-      const size=JSON.stringify(entry.node).length+24;
-      if(count>=600||characters+size>40000){truncated=true;continue;}
-      entry.keep=true; count++; characters+=size;
-    }
-    const nodes=[]; let next=0;
-    for(const [index,entry] of entries.entries()) {
-      if(entry.container) {
-        if(filtering||!entries.slice(index+1,entry.end).some(inner=>inner.keep))continue;
-        nodes.push({ref:'',role:entry.role,name:entry.name,value:'',depth:entry.depth,...(entry.modal?{state:{modal:true}}:{})});
-        continue;
-      }
-      if(!entry.keep)continue;
-      const ref='pw-'+nonce+'-'+(next++);
-      refs.set(ref,new WeakRef(entry.el));
-      nodes.push({ref,...entry.node,...(filtering?(entry.context?{context:entry.context}:{}):{depth:entry.depth})});
-    }
-    return {nodes,timeOrigin:performance.timeOrigin,url:location.href,truncated};
-  })()`;
-}
 
 function frameAt(page: Page, path: number[]): Frame | null {
   let frame: Frame | undefined = page.mainFrame();
@@ -206,7 +70,7 @@ async function capture(session: Session, allowFrame: (url: string) => boolean,
       if (url !== 'about:blank' && url !== 'about:srcdoc' && !allowFrame(url)) return;
       if (embedded) await bounded(frame.waitForLoadState('domcontentloaded'),
         EMBEDDED_FRAME_OBSERVATION_MS, 'Embedded frame did not respond');
-      captured = await evaluate(snapshotExpression(`${nonce}${framePath.join('a') || 'b'}`, query));
+      captured = await evaluate(browserSemanticSnapshotExpression(`${nonce}${framePath.join('a') || 'b'}`, query));
       if (url !== captured.url) throw new Error('Browser frame changed during observation');
     } catch (error) {
       if (!embedded || session.relay.actionError) throw error;
@@ -352,6 +216,7 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
     const abort = () => { void dispose(session!); };
     signal?.addEventListener('abort', abort, { once: true });
     let documentEpoch: number | undefined;
+    let textVerified = false;
     const dialogs: Array<{ type: string; handled: 'accepted' | 'dismissed'; message?: string }> = [];
     let removeDialogListener = () => undefined as unknown;
     const withDialogs = <T extends Record<string, any>>(result: T): T => dialogs.length ? { ...result, dialogs,
@@ -440,15 +305,32 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
           case 'type': {
             const text = String(args.text || '');
             if (text.length > 100_000) throw new Error('Text is too long');
-            await withTarget(actionSession, args.target || args.ref, allowFrame, async locator => {
-              if (args.slowly) {
-                await locator.fill('');
-                if ('pressSequentially' in locator) await locator.pressSequentially(text);
-                else await locator.type(text);
-              } else await locator.fill(text);
-              if (args.submit) await locator.press('Enter');
+            const verification = await withTarget(actionSession, args.target || args.ref, allowFrame, async locator => {
+              // Bind selectors too: neither verification nor submission may silently
+              // move to a replacement field after the input has been dispatched.
+              const selected = 'elementHandle' in locator ? await locator.elementHandle() : locator;
+              if (!selected) throw new Error('The input field is no longer available; take a new snapshot.');
+              let field: ElementHandle | undefined;
+              try {
+                field = await bindBrowserTextInputReceiver(selected);
+                if (args.slowly) {
+                  await field.fill('');
+                  await field.type(text);
+                } else await field.fill(text);
+                const verified = await verifyBrowserTextInput(field, text);
+                textVerified = ['matched', 'normalized'].includes(verified.status);
+                if (args.submit && ['matched', 'normalized'].includes(verified.status)) await field.press('Enter');
+                return verified;
+              } finally {
+                await field?.dispose().catch(() => undefined);
+                if (selected !== locator) await selected.dispose().catch(() => undefined);
+              }
             });
-            return await observed({ ok: true, inputDispatched: true, ...(args.submit ? { submitted: true } : {}) });
+            const inputVerified = ['matched', 'normalized'].includes(verification.status);
+            return await observed({ ok: inputVerified, inputDispatched: true, inputVerified, verification,
+              ...(args.submit ? { submitted: inputVerified } : {}),
+              ...(!inputVerified ? { freshObservationRequired: true,
+                error: 'The field did not retain the requested text. Inspect the observation before acting; input was not replayed.' } : {}) });
           }
           case 'selectOption': {
             const values = Array.isArray(args.values) ? args.values.map(String) : [String(args.value || '')];
@@ -523,8 +405,11 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none' && replaced
         && !(error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain) {
         // Input was sent and then the tab moved to a new document, as a submit or link does.
-        const result = withDialogs({ ok: dispatchState === 'confirmed', dispatchState, inputDispatched: dispatchState === 'confirmed',
-          noActionDispatched: false, pageChanged: true });
+        const unverifiedText = action === 'type' && !textVerified;
+        const result = withDialogs({ ok: dispatchState === 'confirmed' && !unverifiedText, dispatchState,
+          inputDispatched: dispatchState === 'confirmed', noActionDispatched: false, pageChanged: true,
+          ...(unverifiedText ? { inputVerified: false, freshObservationRequired: true,
+            error: 'The page changed before the input value could be verified. Input was not replayed.' } : {}) });
         replacedPages.set(result, documentEpoch);
         return result;
       }

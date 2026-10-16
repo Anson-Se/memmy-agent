@@ -210,6 +210,93 @@ describe.skipIf(!fs.existsSync(executable))('external Playwright executor with a
     process.stdout.write(`External browser fixture timing: cold snapshot ${Math.round(coldMs)}ms; warm click+observation ${Math.round(warmMs)}ms\n`);
   });
 
+  it('does not report successful typing or submit when the page rejects the dispatched text', async () => {
+    await page.setContent('<form><input id="reject"><button>Send</button></form><script>reject.onbeforeinput=e=>e.preventDefault();document.querySelector("form").onsubmit=e=>{e.preventDefault();document.body.dataset.submitted="yes"}</script>');
+    const result = await run('type', { target: '#reject', text: 'Rejected fixture text', submit: true });
+    expect(result).toMatchObject({ ok: false, inputDispatched: true, inputVerified: false, submitted: false,
+      verification: { status: 'modified', reason: 'page_changed_value' }, freshObservationRequired: true });
+    expect(await page.locator('#reject').inputValue()).toBe('');
+    expect(await page.locator('body').getAttribute('data-submitted')).toBeNull();
+  });
+
+  it('reports truncation and page transformations without replaying the requested value', async () => {
+    await page.setContent('<input id="limited" maxlength="3"><input id="changed"><script>changed.oninput=()=>{changed.value=changed.value.toUpperCase();document.body.dataset.events=String(Number(document.body.dataset.events||0)+1)}</script>');
+    expect(await run('type', { target: '#limited', text: 'abcdef' })).toMatchObject({ ok: false,
+      inputVerified: false, verification: { status: 'modified', reason: 'maxlength' } });
+    expect(await run('type', { target: '#changed', text: 'lowercase' })).toMatchObject({ ok: false,
+      inputVerified: false, verification: { status: 'modified', reason: 'page_changed_value' } });
+    expect(await page.locator('#changed').inputValue()).toBe('LOWERCASE');
+    expect(await page.locator('body').getAttribute('data-events')).toBe('1');
+  });
+
+  it('verifies multiline, numeric and password fields without returning password text', async () => {
+    await page.setContent('<textarea id="multiline"></textarea><input id="numeric" type="number"><input id="secret" type="password">');
+    expect(await run('type', { target: '#multiline', text: 'first\r\nsecond' })).toMatchObject({ ok: true, inputVerified: true });
+    expect(await run('type', { target: '#numeric', text: '1.50' })).toMatchObject({ ok: true, inputVerified: true });
+    const secret = await run('type', { target: '#secret', text: 'fixture-password-never-returned' });
+    expect(secret).toMatchObject({ ok: true, inputVerified: true });
+    expect(JSON.stringify(secret)).not.toContain('fixture-password-never-returned');
+  });
+
+  it.each(['9007199254740993', '1.0000000000000001'])('does not submit or replay numeric input rounded by the page: %s', async text => {
+    await page.setContent(`<form><input id="numeric" type="number" step="any"><button>Send</button></form>
+      <script>numeric.oninput=()=>{numeric.value=String(Number(numeric.value));document.body.dataset.events=String(Number(document.body.dataset.events||0)+1)};
+      document.querySelector('form').onsubmit=e=>{e.preventDefault();document.body.dataset.submitted='yes'};</script>`);
+    expect(await run('type', { target: '#numeric', text, submit: true })).toMatchObject({
+      ok: false, inputDispatched: true, inputVerified: false, submitted: false,
+      verification: { status: 'modified', reason: 'page_changed_value' }, freshObservationRequired: true,
+    });
+    expect(await page.locator('#numeric').inputValue()).toBe(String(Number(text)));
+    expect(await page.locator('body').getAttribute('data-events')).toBe('1');
+    expect(await page.locator('body').getAttribute('data-submitted')).toBeNull();
+  });
+
+  it.each(['001.500e+1', '000.0100', '-0.000', '.500', '1.5e+2'])('accepts exact decimal formatting before submitting numeric input: %s', async text => {
+    await page.setContent(`<form><input id="numeric" type="number" step="any"><button>Send</button></form>
+      <script>numeric.oninput=()=>{numeric.value=String(Number(numeric.value));document.body.dataset.events=String(Number(document.body.dataset.events||0)+1)};
+      document.querySelector('form').onsubmit=e=>{e.preventDefault();document.body.dataset.submitted='yes'};</script>`);
+    expect(await run('type', { target: '#numeric', text, submit: true })).toMatchObject({
+      ok: true, inputVerified: true, submitted: true, verification: { status: 'normalized' },
+    });
+    expect(await page.locator('body').getAttribute('data-events')).toBe('1');
+    expect(await page.locator('body').getAttribute('data-submitted')).toBe('yes');
+  });
+
+  it('verifies the original field when input handlers replace it, without submitting the replacement', async () => {
+    await page.setContent('<form><input id="replace-on-input"></form><script>document.querySelector("input").oninput=e=>{const next=e.target.cloneNode();e.target.replaceWith(next)}</script>');
+    expect(await run('type', { target: '#replace-on-input', text: 'once', submit: true })).toMatchObject({ ok: false,
+      inputVerified: false, submitted: false, verification: { status: 'unavailable', reason: 'target_replaced' } });
+  });
+
+  it.each(['#field-label', '#label-text'])('binds a label receiver before typing and refuses its replacement for %s', async target => {
+    await page.setContent(`<form><label id="field-label" for="original"><span id="label-text">Notes</span></label><input id="original"></form>
+      <script>document.querySelector('input').oninput=e=>{const next=e.target.cloneNode();next.value='once';e.target.replaceWith(next)};
+      document.querySelector('form').onsubmit=e=>{e.preventDefault();document.body.dataset.submitted='yes'};</script>`);
+    expect(await run('type', { target, text: 'once', submit: true })).toMatchObject({ ok: false,
+      inputVerified: false, submitted: false, verification: { status: 'unavailable', reason: 'target_replaced' } });
+    expect(await page.locator('#original').inputValue()).toBe('once');
+    expect(await page.locator('body').getAttribute('data-submitted')).toBeNull();
+  });
+
+  it('submits the same original receiver when its label is retargeted by an input handler', async () => {
+    await page.setContent(`<form><label id="field-label" for="original">Notes</label><input id="original"><input id="decoy" value="once"></form>
+      <script>document.querySelector('#original').oninput=()=>document.querySelector('label').htmlFor='decoy';
+      document.onkeydown=e=>{if(e.key==='Enter')document.body.dataset.enterReceiver=e.target.id};
+      document.querySelector('form').onsubmit=e=>e.preventDefault();</script>`);
+    expect(await run('type', { target: '#field-label', text: 'once', submit: true })).toMatchObject({ ok: true,
+      inputVerified: true, submitted: true, verification: { status: 'matched' } });
+    expect(await page.locator('body').getAttribute('data-enter-receiver')).toBe('original');
+  });
+
+  it('verifies clearing a rich editor that retains an empty starter paragraph', async () => {
+    await page.setContent(`<div contenteditable="true" id="editor">Old value</div>
+      <script>document.querySelector('#editor').oninput=e=>{if(!e.target.textContent)e.target.innerHTML='<p><br></p>'};</script>`);
+    expect(await run('type', { target: '#editor', text: '' })).toMatchObject({ ok: true,
+      inputVerified: true, verification: { status: 'matched' } });
+    expect(await page.locator('#editor').textContent()).toBe('');
+    expect(await page.locator('#editor').innerText()).toBe('\n');
+  });
+
   it('captures a cold sandboxed cross-origin iframe with opaque execution context origins', async () => {
     const frameUrl = origin.replace('127.0.0.1', 'localhost') + '/frame';
     await page.evaluate((url: string) => {
