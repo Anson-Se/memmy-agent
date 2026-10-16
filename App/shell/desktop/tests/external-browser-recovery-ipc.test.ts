@@ -46,13 +46,21 @@ it('recovers a confirmed enabled, installed, running target without a page URL o
 });
 
 it.each([
+  { installed: null, enabled: null },
+  { installed: true, enabled: null },
+])('recovers a running requested browser when protected configuration cannot establish enablement: %j', async state => {
+  const f = handlers();
+  f.probe.mockReturnValue({ ...f.installation, chrome: state } as typeof f.installation);
+  expect(await f.handle({ command: 'recoverExternalBrowser', args: { browser: 'chrome' } }, () => true)).toBe('woken');
+  expect(f.wake).toHaveBeenCalledExactlyOnceWith('chrome');
+});
+
+it.each([
   { installed: false, enabled: false, running: ['chrome'] as const },
   { installed: true, enabled: false, running: ['chrome'] as const },
-  { installed: true, enabled: null, running: ['chrome'] as const },
-  { installed: null, enabled: null, running: ['chrome'] as const },
   { installed: true, enabled: true, running: [] as const },
   { installed: true, enabled: true, running: null },
-])('does not launch on missing, disabled, or unknown facts: %j', async ({ installed, enabled, running }) => {
+])('does not launch on missing, disabled, or unconfirmed running process: %j', async ({ installed, enabled, running }) => {
   const f = handlers();
   f.probe.mockReturnValue({ ...f.installation, chrome: { installed, enabled } } as typeof f.installation);
   f.running.mockResolvedValue(running ? [...running] : null);

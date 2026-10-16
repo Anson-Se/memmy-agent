@@ -599,7 +599,10 @@ async function boot(): Promise<void> {
           const running = await runningExternalBrowsers();
           if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
           const installation = probeExternalBrowserInstallation()[browser];
-          if (installation.installed !== true || installation.enabled !== true || !running?.includes(browser)) return 'unavailable';
+          // Protected browser metadata is optional evidence. macOS can deny it
+          // after a clean install even though the extension is enabled. Only
+          // explicit negative facts block this user-requested, URL-free wake.
+          if (installation.installed === false || installation.enabled === false || !running?.includes(browser)) return 'unavailable';
           const recovery = await wakeExternalBrowser(browser);
           if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
           return recovery;

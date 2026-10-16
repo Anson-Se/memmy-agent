@@ -367,13 +367,16 @@ export class BrowserSessionManager {
         const enabled = state?.installation[explicitExternal].enabled ?? null;
         const running = state?.runningBrowsers === null || !state ? null : state.runningBrowsers.includes(explicitExternal);
         if (canRecover && installed !== false && enabled !== false && running !== false) {
-          if (installed === true && enabled === true && running === true && this.embeddedBridge) {
+          // Profile metadata can be denied even while the browser is running.
+          // The user's explicit interactive request authorizes a bounded wake;
+          // only a live extension handshake establishes successful recovery.
+          if (running === true && this.embeddedBridge) {
             assertTurn();
             try { recovery = await this.embeddedBridge.recoverExternalBrowser(explicitExternal, discovery.signal); }
             catch { recovery = 'failed'; }
             assertTurn();
           }
-          waitTimeoutMs = installed === true && enabled === true && running === true ? 45_000 : 2_000;
+          waitTimeoutMs = running === true ? 45_000 : 2_000;
           await this.externalRouter!.waitForConnection(explicitExternal, waitTimeoutMs, discovery.signal);
           assertTurn();
           external = await this.externalRouter!.listTabs(scope, explicitExternal);
@@ -1876,7 +1879,7 @@ export class BrowserListTabsTool extends Tool {
 
   get name(): string { return 'browser_list_tabs'; }
   get description(): string {
-    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. For an explicitly requested Chrome/Edge with an installed enabled extension and running process, interactive discovery may bring that browser forward without navigation and waits up to 45 seconds for reconnection. Untargeted, Memmy, and non-interactive discovery never wake an external browser. Unknown metadata gets a short grace period; confirmed absent, disabled, or stopped states return immediately. connectionStatus separates installed/enabled/running/connected facts; null means unknown. Only extensionSetup.installRequired confirms missing installation. Connected extensions with no controllable tabs remain connected; pageDiscoveryStatus unresponsive is a page-list reply failure, not proof of disconnection. Resolve the requested page to its tabMention internally; never ask the user to copy it. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
+    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. For an explicitly requested running Chrome/Edge, interactive discovery may bring that browser forward without navigation and waits up to 45 seconds for a live extension handshake, including when installation metadata cannot be read. Confirmed absent or disabled extensions and stopped browsers return immediately. Untargeted, Memmy, and non-interactive discovery never wake an external browser. When the running-process state is unknown, discovery allows only a short passive grace period. connectionStatus separates installed/enabled/running/connected facts; null means unknown. Only extensionSetup.installRequired confirms missing installation. Connected extensions with no controllable tabs remain connected; pageDiscoveryStatus unresponsive is a page-list reply failure, not proof of disconnection. Resolve the requested page to its tabMention internally; never ask the user to copy it. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
   }
   get parameters(): Record<string, any> { return { type: 'object', properties: { targetBrowser: targetBrowserParameter }, additionalProperties: false }; }
   override get readOnly(): boolean { return false; }
