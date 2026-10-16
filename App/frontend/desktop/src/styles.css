@@ -1945,6 +1945,38 @@ body.memmy-thread-panel-fullscreen .sidebar-restore-button {
   margin-left: 6px;
 }
 
+/* The preview entry sits beside the toolbar's own buttons, so it is sized from
+   the same token; the merge that replaced the title bar dropped these rules and
+   left the button at the browser default size. */
+.agent-preview-toggle {
+  display: inline-flex;
+  width: var(--codex-toolbar-button-size);
+  height: var(--codex-toolbar-button-size);
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--radius-btn);
+  background: transparent;
+  color: color-mix(in srgb, var(--color-text-ink) 50%, transparent);
+  cursor: pointer;
+}
+.agent-preview-toggle:hover {
+  background: color-mix(in srgb, var(--color-canvas-oat) 65%, transparent);
+  color: var(--color-text-ink);
+}
+.agent-preview-toggle--active {
+  background: transparent;
+  color: var(--color-action-sky-hover);
+}
+.agent-preview-toggle--active:hover {
+  background: color-mix(in srgb, var(--color-canvas-oat) 65%, transparent);
+}
+.agent-preview-toggle:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-action-sky) 48%, transparent);
+  outline-offset: 2px;
+}
+
 .agent-environment-toggle,
 .agent-environment-panel__actions button {
   display: inline-flex;
@@ -17135,6 +17167,15 @@ body:has(.sidebar-shell) .window-drag-region {
 .recording-page__list-action:hover {
   background: color-mix(in srgb, var(--color-action-sky) 10%, transparent);
   color: var(--color-action-sky-hover);
+}
+/* A failed row keeps its audio, so retrying is the row's whole purpose. It is
+   drawn as a bordered button rather than a quiet text action: it is the one
+   thing the user came to that row to do. */
+.recording-page__list-action--retry {
+  border: 1px solid var(--color-border-stone);
+  background: var(--color-background-paper);
+  color: var(--color-action-sky-hover);
+  font-weight: 500;
 }
 .recording-bar {
   display: flex;
