@@ -56,16 +56,16 @@ static void late_literal(void) {
     sleep(2);
     free(literal);
 }
-static void masked_context(const char *helper) {
-    // Match the independently audited WeChat 4.1.15 WCDB layout: the
-    // compile-time XOR mask protects key/pass buffers; read_ctx is at 104.
+static void cipher_context(const char *helper, size_t offset, int masked) {
+    // Exercise public SQLCipher contexts and the independently audited WeChat
+    // 4.1.15 WCDB layout, whose key/pass buffers use this compile-time XOR mask.
     const unsigned char mask[32] = {
       0xb8,0xec,0x38,0x29,0x1b,0xd5,0x9c,0x96,0x3f,0x46,0x54,0xd8,0xf9,0xd7,0x43,0x7e,
       0x1a,0xcc,0x81,0xa6,0xca,0xd6,0x31,0x3c,0x7b,0xd0,0xf5,0xe7,0x32,0x38,0xd4,0xaf
     };
     unsigned char *key = calloc(1, 32), *mac = calloc(1, 32), *pass = calloc(1, 32);
     if (fread(key, 1, 32, stdin) != 32 || fread(pass, 1, 32, stdin) != 32) exit(76);
-    for (int i = 0; i < 32; ++i) { key[i] ^= mask[i]; pass[i] ^= mask[i]; mac[i] = mask[i]; }
+    if (masked) for (int i = 0; i < 32; ++i) { key[i] ^= mask[i]; pass[i] ^= mask[i]; mac[i] = mask[i]; }
     unsigned char *context = calloc(1, 32);
     uint32_t pass_length = 32;
     memcpy(context + 4, &pass_length, 4);
@@ -76,7 +76,9 @@ static void masked_context(const char *helper) {
     unsigned char *codec = region + 256 * 1024 - 32;
     const uint32_t fields[8] = {1, 256000, 2, 16, 32, 16, 16, 4096};
     memcpy(codec, fields, sizeof fields);
-    memcpy(codec + 104, &context, 8); memcpy(codec + 112, &context, 8);
+    // One pointer only: a second valid pointer must not conceal a broken
+    // layout branch in the production scanner.
+    memcpy(codec + offset, &context, 8);
     load(helper); sleep(5);
     munmap(region, 512 * 1024); free(context); free(key); free(mac); free(pass);
 }
@@ -88,6 +90,19 @@ int main(int argc, char **argv) {
         return CCKeyDerivationPBKDF(kCCPBKDF2, "synthetic-password", 18, salt, sizeof salt,
                                     kCCPRFHmacAlgSHA512, 2, key, sizeof key);
     }
+    if (!strcmp(mode, "pbkdf-many")) {
+        unsigned char salt[16], key[32]; memset(salt, 45, sizeof salt);
+        uint32_t pid = (uint32_t)getpid();
+        for (uint32_t sequence = 0; sequence < 500; ++sequence) {
+            char password[32] = {0};
+            memcpy(password, &pid, sizeof pid);
+            memcpy(password + 4, &sequence, sizeof sequence);
+            int result = CCKeyDerivationPBKDF(kCCPBKDF2, password, sizeof password, salt, sizeof salt,
+                                             kCCPRFHmacAlgSHA512, 2, key, sizeof key);
+            if (result) return result;
+        }
+        return 0;
+    }
     if (!strcmp(mode, "late")) {
         load(helper); puts("READY"); fflush(stdout); sleep(2); late_literal(); return 0;
     }
@@ -95,7 +110,10 @@ int main(int argc, char **argv) {
         pthread_t thread; pthread_create(&thread, NULL, churn, NULL);
         load(helper); sleep(2); atomic_store(&running, 0); pthread_join(thread, NULL); return 0;
     }
-    if (!strcmp(mode, "masked")) { masked_context(helper); return 0; }
+    if (!strcmp(mode, "plain96")) { cipher_context(helper, 96, 0); return 0; }
+    if (!strcmp(mode, "plain104")) { cipher_context(helper, 104, 0); return 0; }
+    if (!strcmp(mode, "masked104")) { cipher_context(helper, 104, 1); return 0; }
+    if (!strcmp(mode, "masked112")) { cipher_context(helper, 112, 1); return 0; }
     if (!strcmp(mode, "databases")) {
         if (argc < 6) return 65;
         void *library = dlopen(argv[3], RTLD_NOW | RTLD_LOCAL);
@@ -223,16 +241,32 @@ class KeyCaptureNativeTests(unittest.TestCase):
         actual = {password for rounds, _, password in records(self.sink) if rounds == 2}
         self.assertEqual(actual, expected)
 
-    def test_wcdb_masked_context_and_passphrase_across_chunk_boundary(self):
-        password, salt = os.urandom(32), os.urandom(16)
-        key = hashlib.pbkdf2_hmac("sha512", password, salt, 256000, 32)
-        self.page_file([encrypted_page(key, salt)])
-        child = self.launch("masked")
-        _, error = child.communicate(input=key + password, timeout=10)
-        self.assertEqual(child.returncode, 0, error)
+    def test_each_cipher_layout_and_passphrase_across_chunk_boundary(self):
+        for mode in ("plain96", "plain104", "masked104", "masked112"):
+            with self.subTest(layout=mode):
+                self.sink.write_bytes(b"")
+                password, salt = os.urandom(32), os.urandom(16)
+                key = hashlib.pbkdf2_hmac("sha512", password, salt, 256000, 32)
+                self.page_file([encrypted_page(key, salt)])
+                child = self.launch(mode)
+                _, error = child.communicate(input=key + password, timeout=10)
+                self.assertEqual(child.returncode, 0, error)
+                recovered = records(self.sink)
+                self.assertIn((2, bytes(v ^ 0x3a for v in salt), key), recovered)
+                self.assertIn((256000, salt, password), recovered)
+
+    def test_multiple_injected_processes_write_complete_distinct_sink_records(self):
+        self.env.pop("MEMMY_WECHAT_CAPTURE_PAGES")
+        self.env["DYLD_INSERT_LIBRARIES"] = str(self.helper)
+        children = [self.launch("pbkdf-many") for _ in range(16)]
+        for child in children:
+            _, error = child.communicate(timeout=15)
+            self.assertEqual(child.returncode, 0, error)
         recovered = records(self.sink)
-        self.assertIn((2, bytes(v ^ 0x3a for v in salt), key), recovered)
-        self.assertIn((256000, salt, password), recovered)
+        expected = {(2, bytes([45]) * 16, struct.pack("<II", child.pid, sequence) + bytes(24))
+                    for child in children for sequence in range(500)}
+        self.assertEqual(len(recovered), 8000)
+        self.assertEqual(set(recovered), expected)
 
     def test_concurrent_unmap_and_protection_changes_do_not_crash_target(self):
         self.page_file([encrypted_page(os.urandom(32), os.urandom(16))])
