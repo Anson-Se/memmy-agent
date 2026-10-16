@@ -4133,6 +4133,11 @@ export function HomePage() {
     : recordingSession !== null);
   const legacySidePanelOpen = pluginArtifactPreview !== null || recorderPaneOpen || recordingEntry.open;
   const visibleThreadPanelOffset = legacySidePanelOpen ? 0 : threadPanel.offset;
+  // A visible pane carries its own PanelRight control, and clicking that one
+  // also closes the pane it sits in. Showing the header's button beside it put
+  // two panel icons side by side with subtly different behaviour, so the header
+  // offers the panel only while no pane is showing.
+  const headerPanelControlHidden = threadPanel.phase === "open" || legacySidePanelOpen;
   const previewToggle = previewScope ? (
     <button
       type="button"
@@ -4163,10 +4168,10 @@ export function HomePage() {
       data-recording-toggle
       onClick={toggleRecordingEntry}
     >
-      {(() => {
-        const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
-        return <Icon size={15} aria-hidden="true" />;
-      })()}
+      {/* The composer chip for this same command draws a microphone, so the
+          title bar does too; picking the plugin's manifest icon here made one
+          action appear as two different ones. */}
+      <Mic size={15} aria-hidden="true" />
     </button>
   ) : null;
 
@@ -4180,10 +4185,9 @@ export function HomePage() {
         // The label and icon come from the plugin that asked for the button, so
         // the tab and the button that opens it read as one thing.
         label: topbarPluginCommand.command.name,
-        icon: (() => {
-          const Icon = resolveContributionIcon(topbarPluginCommand.command.icon);
-          return <Icon size={12} aria-hidden="true" />;
-        })(),
+        // Same microphone as the title-bar button that opens this tab: one
+        // action, one icon.
+        icon: <Mic size={12} aria-hidden="true" />,
         render: () => <RecordingEntryPage session={recordingEntry.session}
           uploadBlocked={panelRecorders.length > 0}
           onStart={panelRecorders.length > 0 ? () => reopenPluginRecording(true) : undefined}
@@ -4271,7 +4275,7 @@ export function HomePage() {
           titleTrailing={activeImTitleDisplay ? <ImChannelTitleIcon slug={activeImTitleDisplay.slug} name={activeImTitleDisplay.channelName} /> : null}
           actions={recordingToggle}
           messages={state.agent.messages}
-          panelOpen={threadPanel.phase === "open"}
+          panelOpen={headerPanelControlHidden}
           onOpenPanel={threadPanel.open}
           onJumpToMessage={jumpToThreadMessage}
           onSearchNavigate={pauseAgentConversationAutoScroll}
@@ -4281,7 +4285,9 @@ export function HomePage() {
       topBarBorder={hasActiveConversation}
       topBarInset={hasActiveConversation ? false : undefined}
       topBarClassName={hasActiveConversation ? `thread-topbar ${threadPanelMotionClass}` : undefined}
-      topBarStyle={hasActiveConversation ? { right: visibleThreadPanelOffset } : undefined}
+      topBarStyle={hasActiveConversation
+        ? { right: visibleThreadPanelOffset + (legacySidePanelOpen ? previewPanelWidth : 0) }
+        : undefined}
       sidePanel={sidePanelMounted && !recordingEntry.open && !recorderPaneOpen && !pluginArtifactPreview ? (
         <AgentThreadPanel
           controller={threadPanel}
