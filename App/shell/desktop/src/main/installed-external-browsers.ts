@@ -168,14 +168,14 @@ export function installedExternalBrowsers({
   return installed;
 }
 
-/** Preserve absent, disabled, and unreadable installations as separate facts for connection recovery. */
+/** Preserve absent, disabled, and unreadable installations for settings and connection recovery. */
 export function probeExternalBrowserInstallation({
   platform = process.platform, env = process.env, home = homedir(),
   readFile = defaultReadFile, fileExists = strictFileExists,
 }: BrowserFiles = {}): Record<ExternalBrowserName, ExternalBrowserInstallation> {
   const unknown = (): ExternalBrowserInstallation => ({ installed: null, enabled: null });
   const result = { chrome: unknown(), edge: unknown() };
-  if (platform !== 'darwin' && platform !== 'win32') return result;
+  if (platform !== 'darwin' && platform !== 'win32' && platform !== 'linux') return result;
   const readObject = (path: string): Record<string, unknown> => {
     const value: unknown = JSON.parse(readFile(path));
     if (!dictionary(value)) throw new Error('Browser metadata is not an object');

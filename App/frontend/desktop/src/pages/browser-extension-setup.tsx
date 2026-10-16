@@ -23,7 +23,8 @@ export function BrowserExtensionSetup({ client, platform }: {
             if (!window.memmy?.prepareBrowserExtension) throw new Error("Browser installation preparation is unavailable");
             return window.memmy.prepareBrowserExtension(browser, !window.memmy.dragBrowserExtension);
           }}
-          getInstalled={() => window.memmy?.listInstalledBrowserExtensions?.() ?? Promise.resolve([])}
+          getInstallation={() => window.memmy?.getBrowserExtensionInstallation?.()
+            ?? Promise.reject(new Error("Browser extension installation status is unavailable"))}
           getRunning={() => window.memmy?.listRunningExternalBrowsers?.() ?? Promise.resolve(null)}
           platform={platform}
           labels={{
@@ -75,6 +76,8 @@ export function BrowserExtensionSetup({ client, platform }: {
             browserClosed: t("settings.computerUse.extensionBrowserClosed"),
             connectionFailed: t("settings.computerUse.extensionConnectionFailed"),
             statusUnavailable: t("settings.computerUse.extensionStatusUnavailable"),
+            installationUnavailable: t("settings.computerUse.extensionInstallationUnavailable"),
+            disabled: t("settings.computerUse.extensionDisabled"),
             openBrowser: t("settings.computerUse.extensionOpenBrowser"),
             reinstall: t("settings.computerUse.extensionReinstall"),
             manage: t("settings.computerUse.extensionManage"),

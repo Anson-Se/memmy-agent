@@ -1545,6 +1545,10 @@ function registerIpcHandlers(): void {
     if (!mainWindow || BrowserWindow.fromWebContents(event.sender) !== mainWindow) throw new Error('Invalid browser extension request');
     return installedExternalBrowsers();
   });
+  ipcMain.handle('memmy:browser-extension:installation', event => {
+    if (!mainWindow || BrowserWindow.fromWebContents(event.sender) !== mainWindow) throw new Error('Invalid browser extension request');
+    return probeExternalBrowserInstallation();
+  });
   ipcMain.handle('memmy:browser-extension:running', event => {
     if (!mainWindow || BrowserWindow.fromWebContents(event.sender) !== mainWindow) throw new Error('Invalid browser extension request');
     return runningExternalBrowsers();
@@ -6086,6 +6090,7 @@ async function cleanupBeforeQuit(): Promise<void> {
   ipcMain.removeAllListeners(EXTERNAL_BROWSER_EXTENSION_DRAG_CHANNEL);
   ipcMain.removeHandler('memmy:browser-extension:prepare');
   ipcMain.removeHandler('memmy:browser-extension:installed');
+  ipcMain.removeHandler('memmy:browser-extension:installation');
   ipcMain.removeHandler('memmy:browser-extension:running');
   ipcMain.removeHandler('memmy:browser-downloads:settings');
   ipcMain.removeHandler('memmy:browser-downloads:choose-directory');

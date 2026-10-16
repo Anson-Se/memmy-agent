@@ -136,6 +136,29 @@ describe('installed external browsers', () => {
 });
 
 describe('external browser installation facts for recovery', () => {
+  it.each([undefined, '/fixture/xdg'])('retains Linux installation detection with config root %s', config => {
+    const root = join(config ?? '/fixture/.config', 'google-chrome');
+    const edge = join(config ?? '/fixture/.config', 'microsoft-edge');
+    const localState = { profile: { info_cache: { Default: {} } } };
+    for (const disabled of [false, true]) {
+      const files = io({
+        [join(root, 'Local State')]: localState,
+        [join(root, 'Default', 'Secure Preferences')]: prefs(enabled({ disable_reasons: disabled ? [1024] : [] })),
+        [join(edge, 'Local State')]: localState,
+        [join(edge, 'Default', 'Preferences')]: prefs(null),
+        [join(extensionPath, 'manifest.json')]: manifest,
+      });
+      const options = { platform: 'linux' as const, home: '/fixture', env: config ? { XDG_CONFIG_HOME: config } : {}, ...files };
+      expect(probeExternalBrowserInstallation(options)).toEqual({
+        chrome: { installed: true, enabled: !disabled }, edge: { installed: false, enabled: false },
+      });
+      expect(probeExternalBrowserInstallation({ ...options, readFile: path => {
+        if (path.startsWith(root)) throw Object.assign(new Error('Access denied'), { code: 'EACCES' });
+        return files.readFile(path);
+      } })).toEqual({ chrome: { installed: null, enabled: null }, edge: { installed: false, enabled: false } });
+    }
+  });
+
   it.each(['darwin', 'win32'] as const)('separates valid disabled installation from absence on %s', platform => {
     const local = 'C:\\Users\\fixture\\AppData\\Local';
     const paths = platform === 'win32' ? win32 : { join };

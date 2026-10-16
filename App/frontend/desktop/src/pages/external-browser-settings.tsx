@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Copy, FolderOpen, MousePointer2, Play } from "lucide-react";
+import type { ExternalBrowserInstallation } from "@memmy/local-api-contracts";
 import styles from "./external-browser-settings.module.css";
 import chromeIcon from "../assets/google-chrome.svg";
 import edgeIcon from "../assets/microsoft-edge.svg";
@@ -11,6 +12,10 @@ export type ExternalBrowserStatus = {
 };
 
 type Browser = "chrome" | "edge";
+type BrowserInstallation = Record<Browser, ExternalBrowserInstallation>;
+const unknownInstallation = (): BrowserInstallation => ({
+  chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null },
+});
 const connectionGraceMs = 60_000;
 
 /** Stop a stalled status or IPC check from freezing a previously connected badge. */
@@ -64,6 +69,8 @@ export type ExternalBrowserLabels = {
   browserClosed?: string;
   connectionFailed?: string;
   statusUnavailable?: string;
+  installationUnavailable?: string;
+  disabled?: string;
   openBrowser?: string;
   reinstall?: string;
   manage?: string;
@@ -210,10 +217,10 @@ function BrowserInstallDemo({ browser, labels, onClose }: {
   </section>;
 }
 
-export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, revealExtensionFolder, getExtensionDirectory, prepareInstall, platform, dragExtension, labels }: {
+export function ExternalBrowserSettings({ getStatus, getInstallation, getRunning, revealExtensionFolder, getExtensionDirectory, prepareInstall, platform, dragExtension, labels }: {
   getStatus: () => Promise<ExternalBrowserStatus>;
   /** Installed extensions are separate from a verified live browser connection. */
-  getInstalled?: () => Promise<Array<Browser>>;
+  getInstallation?: () => Promise<BrowserInstallation>;
   /** Null means process observation was unavailable, never that the browser is closed. */
   getRunning?: () => Promise<Array<Browser> | null>;
   revealExtensionFolder: () => Promise<void>;
@@ -224,9 +231,8 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
   labels: ExternalBrowserLabels;
 }) {
   const [status, setStatus] = useState<ExternalBrowserStatus | null>(null);
-  const [installed, setInstalled] = useState<Browser[]>([]);
+  const [installation, setInstallation] = useState<BrowserInstallation>(unknownInstallation);
   const [installChecked, setInstallChecked] = useState(false);
-  const [installationKnown, setInstallationKnown] = useState(false);
   const [running, setRunning] = useState<Browser[] | null>(null);
   const [checkedAt, setCheckedAt] = useState(0);
   const [managementBrowser, setManagementBrowser] = useState<Browser | null>(null);
@@ -245,8 +251,8 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
   const restoreDemoFocus = useRef<Browser | null>(null);
   const getStatusRef = useRef(getStatus);
   getStatusRef.current = getStatus;
-  const getInstalledRef = useRef(getInstalled);
-  getInstalledRef.current = getInstalled;
+  const getInstallationRef = useRef(getInstallation);
+  getInstallationRef.current = getInstallation;
   const getRunningRef = useRef(getRunning);
   getRunningRef.current = getRunning;
   const getDirectoryRef = useRef(getExtensionDirectory);
@@ -261,9 +267,9 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
       refreshing = true;
       clearTimeout(timer);
       void (async () => {
-        const [statusResult, installedResult, runningResult] = await Promise.allSettled([
+        const [statusResult, installationResult, runningResult] = await Promise.allSettled([
           checkWithDeadline(() => getStatusRef.current()),
-          checkWithDeadline(() => getInstalledRef.current?.() ?? Promise.resolve([] as Browser[])),
+          checkWithDeadline(() => getInstallationRef.current?.() ?? Promise.resolve(unknownInstallation())),
           checkWithDeadline(() => getRunningRef.current?.() ?? Promise.resolve(null)),
         ]);
         if (!live) return;
@@ -272,16 +278,15 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
         setRunning(runningBrowsers);
         setInstallChecked(true);
         setCheckedAt(now);
-        if (installedResult.status === "fulfilled") {
-          setInstalled(installedResult.value);
-          setInstallationKnown(true);
-          for (const browser of ["chrome", "edge"] as const) {
-            if (!installedResult.value.includes(browser) || runningBrowsers?.includes(browser) === false
-              || (statusResult.status === "fulfilled" && statusResult.value.connected.includes(browser))) {
-              disconnectedSince.current.delete(browser);
-            } else if (!disconnectedSince.current.has(browser)) disconnectedSince.current.set(browser, now);
-          }
-        } else setInstallationKnown(false);
+        const installations = installationResult.status === "fulfilled" ? installationResult.value : unknownInstallation();
+        setInstallation(installations);
+        for (const browser of ["chrome", "edge"] as const) {
+          const installed = installations?.[browser];
+          if (installed?.installed !== true || installed.enabled !== true || runningBrowsers?.includes(browser) === false
+            || (statusResult.status === "fulfilled" && statusResult.value.connected.includes(browser))) {
+            disconnectedSince.current.delete(browser);
+          } else if (!disconnectedSince.current.has(browser)) disconnectedSince.current.set(browser, now);
+        }
         if (statusResult.status === "rejected") {
           // A successful old response is not evidence of a connection during an outage.
           setStatus(null);
@@ -380,20 +385,27 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
     <section className={styles.section}>
       {(["chrome", "edge"] as const).map(browser => {
         const ready = !statusError && status?.connected.includes(browser) === true;
-        const hasInstallation = installed.includes(browser);
-        const browserClosed = hasInstallation && running?.includes(browser) === false;
+        const installed = installation?.[browser];
+        const hasInstallation = installed?.installed === true;
+        const notInstalled = installed?.installed === false;
+        const disabled = hasInstallation && installed.enabled === false;
+        const installationUnavailable = !notInstalled && (!hasInstallation
+          || (installed?.enabled !== true && installed?.enabled !== false));
+        const enabled = hasInstallation && installed.enabled === true;
+        const browserClosed = enabled && running?.includes(browser) === false;
         const since = disconnectedSince.current.get(browser);
-        const connectionFailed = hasInstallation && !browserClosed && !ready
+        const connectionFailed = enabled && !browserClosed && !ready
           && since !== undefined && checkedAt - since >= connectionGraceMs;
         const showSetup = !ready || managementBrowser === browser;
-        const connectionText = statusError || (!installationKnown && installChecked)
-          ? labels.statusUnavailable ?? "Connection status is unavailable. You can check or reinstall."
+        const connectionText = disabled ? labels.disabled ?? "Memmy extension is disabled. Enable it in the browser."
+          : installationUnavailable ? labels.installationUnavailable ?? "Unable to read Memmy extension status. Open Manage to view it in the browser."
+          : notInstalled ? labels.notInstalled
+          : statusError ? labels.statusUnavailable ?? "Connection status is unavailable."
           : browserClosed ? labels.browserClosed ?? "Installed. Open the browser to connect."
           : connectionFailed ? labels.connectionFailed ?? "Installed. Connection has not recovered."
-          : hasInstallation ? (running === null
+          : running === null
             ? labels.installedWaiting ?? "Installed. Waiting for the browser to connect."
-            : labels.connecting ?? "Installed. Connecting automatically…")
-          : labels.notInstalled;
+            : labels.connecting ?? "Installed. Connecting automatically…";
         const managerUrl = `${browser}://extensions`;
         return <div className={styles.browser} key={browser}>
           <div className={styles.row}>
@@ -403,7 +415,7 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
               {ready
                 ? <small>{labels.connected}</small>
                 : installChecked
-                  ? <small>{(!hasInstallation || connectionFailed || statusError) &&
+                  ? <small>{(!hasInstallation || disabled || installationUnavailable || connectionFailed || statusError) &&
                     <span className={styles.statusDot} aria-hidden="true" />}{connectionText}</small>
                   : <small>{labels.checking ?? "Checking installation…"}</small>}
             </div>
@@ -426,6 +438,7 @@ export function ExternalBrowserSettings({ getStatus, getInstalled, getRunning, r
                 aria-expanded={expanded.has(browser)} aria-controls={`memmy-${browser}-extension-guide`}
                 onClick={() => void prepare(browser)}>
                 {preparing === browser ? labels.preparing
+                  : installationUnavailable || disabled ? labels.manage ?? "Manage"
                   : hasInstallation ? labels.reinstall ?? "Reinstall" : labels.installButton}
               </button>
             </div>}
