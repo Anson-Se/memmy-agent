@@ -1,10 +1,12 @@
-import { resolveBrowserContext, type BrowserAuthoritySnapshot } from "../browser-privacy.js";
+import { resolveBrowserContext, sanitizeBrowserUrl, type BrowserAuthoritySnapshot } from "../browser-privacy.js";
 import { BROWSER_BUNDLE_IDS } from "../mac/observation-settings.js";
 import { redactSensitive } from "../mac/redaction.js";
 
 type NativeEvent = Record<string, any>;
 
-/** Bind the privacy decision to this observation, never to a cached browser URL. */
+/** Keep the extension authority as corroboration for normal pages. Native
+ * foreground/committed-address proof is sufficient for History events in any
+ * browsing mode; privacy mode does not veto the whole window. */
 export function applyWindowsBrowserPrivacy(event: NativeEvent, authority: BrowserAuthoritySnapshot | null,
   now = Date.now()): void {
   const app = event.app ?? event.application ?? {};
@@ -12,26 +14,30 @@ export function applyWindowsBrowserPrivacy(event: NativeEvent, authority: Browse
   if (event.window?.browser !== true && !BROWSER_BUNDLE_IDS.has(String(bundleId).toLowerCase())) return;
   const window = event.window ?? (event.window = {});
   window.browser = true;
-  // An explicit native exclusion always wins, including a read which became
-  // incomplete after its initial browser-chrome observation.
-  if (window.privateBrowsing === true || window.privateBrowsingUnknown === true) {
-    delete window.url;
-    return;
-  }
+  const windowId = typeof (window.windowId ?? window.id) === "string" ? window.windowId ?? window.id : undefined;
+  const processId = Number.isSafeInteger(app.pid) ? app.pid : undefined;
+  const native = window.browserContext;
+  const nativeUrl = native && native.windowId === windowId && native.processId === processId
+    && native.documentUrl === native.url && typeof native.url === "string"
+    ? sanitizeBrowserUrl(native.url) : "";
   const result = resolveBrowserContext({
     browserName: app.name ?? bundleId,
     title: typeof window.title === "string" ? window.title : "",
     axText: typeof event.ax?.text === "string" ? event.ax.text : "",
-    nativeContext: window.browserContext,
-    windowId: typeof (window.windowId ?? window.id) === "string" ? window.windowId ?? window.id : undefined,
-    processId: Number.isSafeInteger(app.pid) ? app.pid : undefined,
+    nativeContext: native,
+    windowId,
+    processId,
     authority,
     now,
   });
-  window.privateBrowsing = result.private === true;
-  window.privateBrowsingUnknown = result.private === null;
+  // The native recorder already checked foreground identity, committed URI,
+  // secure inputs, and WeChat consent before this event reached the adapter.
+  delete window.privateBrowsing;
+  delete window.privateBrowsingUnknown;
   delete window.url;
-  if (result.private === false && result.url) window.url = result.url;
+  // A contradictory focused extension tab can invalidate an otherwise
+  // normal native URL. Private/unknown mode alone never rejects the event.
+  if (nativeUrl && result.source !== "extension_mismatch") window.url = nativeUrl;
 }
 
 const categories = new Set(["typing", "submit", "shortcut", "navigation", "delete"]);
@@ -44,6 +50,33 @@ function actionTarget(target: NativeEvent | undefined): Record<string, string> |
     if (typeof target[key] === "string") result[key] = redactSensitive(target[key].slice(0, 320));
   }
   return result;
+}
+
+/** Earlier controls are context for an input, never a verified click target. */
+export function previousControlsAtPoint(value: unknown, actionTimestamp: unknown): {
+  observedAt: string;
+  controls: Record<string, string>[];
+  interpretation: "previously_observed_not_confirmed_target";
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof actionTimestamp !== "string") return null;
+  const source = value as Record<string, unknown>;
+  if (source.interpretation !== "previously_observed_not_confirmed_target" || typeof source.observedAt !== "string"
+    || !Array.isArray(source.controls) || source.controls.length < 1 || source.controls.length > 3) return null;
+  const at = Date.parse(actionTimestamp), before = Date.parse(source.observedAt);
+  if (!Number.isFinite(at) || !Number.isFinite(before) || before > at || at - before > 5_000) return null;
+  const controls = source.controls.flatMap((control) => {
+    if (!control || typeof control !== "object" || Array.isArray(control)) return [];
+    const candidate = control as Record<string, unknown>;
+    if (candidate.role === "AXSecureTextField" || candidate.subrole === "AXSecureTextField"
+      || candidate.isPassword === true || candidate.IsPassword === true) return [];
+    const projected: Record<string, string> = {};
+    for (const field of ["role", "name", "title", "identifier"]) {
+      if (typeof candidate[field] === "string") projected[field] = redactSensitive(candidate[field].slice(0, 320));
+    }
+    return Object.keys(projected).length ? [projected] : [];
+  });
+  return controls.length ? { observedAt: new Date(before).toISOString(), controls,
+    interpretation: "previously_observed_not_confirmed_target" } : null;
 }
 
 /** Windows hooks report actions and counts; they never carry raw character data. */

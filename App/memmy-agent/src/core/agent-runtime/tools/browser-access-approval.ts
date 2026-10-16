@@ -16,13 +16,20 @@ export class BrowserAccessApproval {
   }
   clear(): void { fs.rmSync(this.filePath, { force: true }); }
 
-  private revision(): string {
-    return [this.filePath, this.sitePolicy.filePath].map(file => {
+  // Temporary approval ends when this site's effective decision changes, or
+  // when either broad allow-all switch changes. Edits that leave the site's
+  // decision unchanged, such as a grant for another site or a Debug / CDP
+  // grant here, keep it.
+  private revision(url: string, origin: string): string {
+    const policy = this.sitePolicy.resolve(url, 'access');
+    const effective = policy.decision !== 'ask' || policy.matched ? policy.decision : this.savedDecision(origin) ?? 'ask';
+    return [effective, ...[this.sitePolicy.allowAllFilePath, this.sitePolicy.nativeAllowAllFilePath].map(file => {
+      if (!file) return 'unconfigured';
       try {
-        const stat = fs.statSync(file, { bigint: true });
+        const stat = fs.lstatSync(file, { bigint: true });
         return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       } catch { return 'unavailable'; }
-    }).join('|');
+    })].join('|');
   }
 
   private savedDecision(origin: string): 'allow' | 'deny' | null {
@@ -40,7 +47,7 @@ export class BrowserAccessApproval {
       if (!['http:', 'https:'].includes(parsed.protocol)) return true;
       origin = parsed.origin;
     } catch { return false; }
-    const revision = this.revision();
+    const revision = this.revision(url, origin);
     let revisions = this.sessionRevisions.get(allowedForSession);
     if (!revisions) { revisions = new Map(); this.sessionRevisions.set(allowedForSession, revisions); }
     const previousRevision = revisions.get(origin);
@@ -65,7 +72,7 @@ export class BrowserAccessApproval {
     const decision = await pending;
     const currentPolicy = this.sitePolicy.resolve(url, 'access');
     if (currentPolicy.decision === 'block') return false;
-    if (this.revision() !== revision) {
+    if (this.revision(url, origin) !== revision) {
       allowedForSession.delete(origin);
       return currentPolicy.decision === 'allow'
         || (!currentPolicy.matched && this.savedDecision(origin) === 'allow');

@@ -89,6 +89,54 @@ describe("WeChat connection process diagnostics", () => {
       .toMatchObject({ category: "wechat_private_storage_unsafe_path", phase: "preparing_wechat_data" });
   });
 
+  it.each([
+    { category: "wechat_private_storage_clone_failed",
+      detail: { path: "/Users/fixture/Library/Containers/com.tencent.xinWeChat/Data/a.db", operation: "open", errno: "EPERM" } },
+    { category: "wechat_data_access_interrupted",
+      detail: { path: "/Users/fixture/Library/Containers/com.tencent.xinWeChat/Data", operation: "listdir", errno: "EINTR" } },
+    { category: "wechat_private_storage_unsafe_path",
+      detail: { path: "/Users/fixture/Library/Containers/com.tencent.xinWeChat/Data/link", reason: "symlink" } },
+  ])("records $category with where it happened", ({ category, detail }) => {
+    const child = connect();
+    child.stdout.write(JSON.stringify({ event: "preparing_wechat_data" }) + "\n");
+    child.stdout.write(JSON.stringify({ event: "connection_error", category, detail }) + "\n");
+    // A duplicate parent error must not overwrite the original detail or phase.
+    child.stdout.write(JSON.stringify({ event: "connection_error", category }) + "\n");
+    child.emit("close", 2, null);
+    for (let i = 0; i < 3; i++) expect(service.snapshot().wechat?.error).toBe(category);
+    expect(state.children).toEqual([child]);
+    const file = path.join(root, "wechat", "last-connection-error.json");
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(saved).toEqual({ category, phase: "preparing_wechat_data", detail, failedAt: expect.any(String) });
+    expect(fs.statSync(file).mode & 0o077).toBe(0);
+  });
+
+  it.each([
+    { label: "an array", detail: ["open", "EPERM"] },
+    { label: "a raw string", detail: "/Users/fixture/a.db" },
+    { label: "a numeric errno", detail: { path: "/Users/fixture/a.db", errno: 1 } },
+    { label: "a nested value", detail: { path: { value: "/Users/fixture/a.db" } } },
+    { label: "an unusual key", detail: { "Path Name": "/Users/fixture/a.db" } },
+    { label: "too many fields", detail: Object.fromEntries(Array.from({ length: 9 }, (_, index) => [`field_${"a".repeat(index + 1)}`, "x"])) },
+    { label: "an oversized value", detail: { path: "x".repeat(4097) } },
+    { label: "an empty map", detail: {} },
+  ])("keeps the category but not a detail with $label", ({ detail }) => {
+    const child = connect();
+    child.stdout.write(JSON.stringify({ event: "connection_error", category: "wechat_private_storage_clone_failed", detail }) + "\n");
+    child.emit("close", 2, null);
+    const saved = JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8"));
+    expect(saved.category).toBe("wechat_private_storage_clone_failed");
+    expect(saved).not.toHaveProperty("detail");
+  });
+
+  it("does not infer a data access category from a Python process interruption", () => {
+    const child = connect();
+    child.emit("close", null, "SIGINT");
+    expect(service.snapshot().wechat?.error).toBe("connection_process_crashed");
+    expect(JSON.parse(fs.readFileSync(path.join(root, "wechat", "last-connection-error.json"), "utf8")))
+      .toMatchObject({ category: "connection_process_crashed" });
+  });
+
   it("rejects Windows consent with a friendly 503 before enabling an unavailable local reader", () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     vi.spyOn(os, "release").mockReturnValue("10.0.26100");
@@ -154,11 +202,11 @@ describe("WeChat connection process diagnostics", () => {
     state.children.at(-1)!.emit("close", 2, null);
   });
 
-  it("reports missing Mac developer tools before launching Python or changing WeChat", async () => {
+  it("reports a missing bundled Mac interpreter before launching Python or changing WeChat", async () => {
     state.python = null;
-    await expect(service.prepareWeChatReader()).resolves.toMatchObject({ ready: false, error: "lldb_unavailable" });
+    await expect(service.prepareWeChatReader()).resolves.toMatchObject({ ready: false, error: "python_unavailable" });
     service.setWeChatChatAccess(true);
-    expect(service.connectWeChat().wechat?.error).toBe("lldb_unavailable");
+    expect(service.connectWeChat().wechat?.error).toBe("python_unavailable");
     expect(state.children).toHaveLength(0);
   });
 
@@ -223,10 +271,10 @@ describe("WeChat connection process diagnostics", () => {
 
   it("keeps the capture cause when a legacy parent reports only key_capture_failed", () => {
     const child = connect();
-    child.stdout.write(JSON.stringify({ event: "capture_error", category: "lldb_unavailable" }) + "\n");
+    child.stdout.write(JSON.stringify({ event: "capture_error", category: "no_encrypted_databases" }) + "\n");
     child.stdout.write(JSON.stringify({ event: "connection_error", category: "key_capture_failed" }) + "\n");
     child.emit("close", 2, null);
-    expect(service.snapshot().wechat?.error).toBe("lldb_unavailable");
+    expect(service.snapshot().wechat?.error).toBe("no_encrypted_databases");
   });
 
   it("distinguishes a Python process signal from an ordinary connection failure", () => {

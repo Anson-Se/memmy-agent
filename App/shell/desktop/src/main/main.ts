@@ -4,6 +4,7 @@ import { compareVersionSegments, parseUpdatePackageVersion } from './version-com
 import { captureMemmyScreen, computerUseApp, memmyPermissionSnapshot, resolveComputerUseBinary, runHelperCommand } from './memmy-screen-permission.js';
 import { desktopSaveFileName } from './save-file-name.js';
 import { createComputerUseOnboarding } from './computer-use-onboarding.js';
+import { createComputerUsePIPScreenPermissionGuide } from './computer-use-pip-screen-permission.js';
 import { stopComputerUseAgentForPermissionRestart } from './computer-use-agent-restart.js';
 import { createComputerUseSurfaceWindows } from './computer-use-surface-window.js';
 import { captureComputerUseWindow } from './computer-use-window-capture.js';
@@ -19,6 +20,8 @@ import { BrowserWebviewDownloads } from './browser-webview-downloads.js';
 import { attachBrowserWebviewPermissions } from './browser-webview-permissions.js';
 import { BrowserAccessStore } from './browser-access-store.js';
 import { BrowserUseSitePolicyStore } from './browser-use-site-policy-store.js';
+import { BrowserAllowAll } from './browser-allow-all.js';
+import { rememberBrowserCdpGrant } from './browser-cdp-remembered-grant.js';
 import { showBrowserAuthForm } from './browser-auth-form.js';
 import { resolveExternalBrowserExtensionDirectory } from './external-browser-extension-directory.js';
 import { createExternalBrowserExtensionDragHandler, EXTERNAL_BROWSER_EXTENSION_DRAG_CHANNEL } from './external-browser-extension-drag.js';
@@ -33,8 +36,9 @@ import { isMacPermissionSystemQuit, isMacSystemSessionQuit, MacPermissionRestart
 import { NativeAppAllowAll, nativeAppAccessDecision } from './native-app-allow-all.js';
 import { isComputerUsePermissionPanelFocused, showComputerUsePermissionPanel } from './computer-use-permission-panel.js';
 import { createHttpMemmyAgentAdminClient, createLocalBackend, loadCloudServiceEnv, syncRuntimeConfigForStartup, trackAnalyticsEvent, type BootstrapScenario, type LocalBackend } from "@memmy/backend";
-import { browserUsePatternMatches, evaluateBrowserUseSiteRule, resolveCloudServiceBaseUrl,
-  type BrowserUseSiteRule, type AccountChannel } from "@memmy/local-api-contracts";
+import { BROWSER_NATIVE_ALLOW_ALL_FILE_ENV, browserUsePatternMatches, parseBrowserTaskSitePermission, resolveCloudServiceBaseUrl,
+  type BrowserAllowAllState, type BrowserUseCapability, type BrowserUseSiteRule,
+  type AccountChannel, type ComputerUsePermissions } from "@memmy/local-api-contracts";
 import type {
   DesktopAppInfo,
   DesktopImageActionRequest,
@@ -171,6 +175,7 @@ import { attachRendererRecovery, rendererRecoveryUrl, type RendererRecoveryDiagn
 
 let mainWindow: BrowserWindow | null = null;
 let memmyPermissionOnboarding: ReturnType<typeof createComputerUseOnboarding> | null = null;
+let pipScreenPermissionGuide: ReturnType<typeof createComputerUsePIPScreenPermissionGuide> | null = null;
 let petWindow: BrowserWindow | null = null;
 let localBackend: LocalBackend | null = null;
 let menuBarTray: Tray | null = null;
@@ -185,6 +190,40 @@ let nativeAppAllowAll: NativeAppAllowAll | null = null;
 function allowAllNativeApps(): NativeAppAllowAll {
   nativeAppAllowAll ??= new NativeAppAllowAll(app.getPath('userData'));
   return nativeAppAllowAll;
+}
+
+function browserAllowAllStore(): BrowserAllowAll | null {
+  const configPath = runtimeServices?.agentGateway.configPath;
+  return configPath ? new BrowserAllowAll(dirname(configPath), () => allowAllNativeApps().isEnabled()) : null;
+}
+
+function browserAllowAllState(): BrowserAllowAllState {
+  const inherited = allowAllNativeApps().isEnabled();
+  return browserAllowAllStore()?.read() ?? { enabled: false, inherited, effective: inherited };
+}
+
+function browserSiteDecision(url: string, capability: BrowserUseCapability) {
+  return browserAllowAllStore()?.decision(url, capability) ?? 'block';
+}
+
+const pendingBrowserApprovals = new Set<AbortController>();
+function publishBrowserAllowAll(): BrowserAllowAllState {
+  const state = browserAllowAllState();
+  if (state.effective) for (const pending of pendingBrowserApprovals) pending.abort();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('memmy:browser-allow-all:changed', state);
+  }
+  return state;
+}
+
+async function showBrowserApproval(options: Electron.MessageBoxOptions, parent: BrowserWindow | null) {
+  if (browserAllowAllState().effective) return { response: -1, checkboxChecked: false };
+  const pending = new AbortController();
+  pendingBrowserApprovals.add(pending);
+  try {
+    return parent ? await dialog.showMessageBox(parent, { ...options, signal: pending.signal })
+      : await dialog.showMessageBox({ ...options, signal: pending.signal });
+  } finally { pendingBrowserApprovals.delete(pending); }
 }
 let computerUseSurfaceWindows: ReturnType<typeof createComputerUseSurfaceWindows> | null = null;
 const computerUseTrayRecovery = createPIPTrayRecovery({
@@ -223,23 +262,21 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
   origin: string, names: string[]): Promise<boolean> {
   const configPath = runtimeServices?.agentGateway.configPath;
   if (!configPath) return false;
-  let rules: BrowserUseSiteRule[];
-  try { rules = new BrowserUseSitePolicyStore(dirname(configPath)).list(); }
-  catch { return false; }
-  const decision = evaluateBrowserUseSiteRule(rules, origin,
+  const decision = browserSiteDecision(origin,
     capability === 'download' ? 'downloads' : capability === 'upload' ? 'uploads' : 'fullCdp');
   if (decision === 'block') return false;
   if (decision === 'allow') return true;
   const chinese = app.getLocale().toLowerCase().startsWith('zh');
+  const isDebug = capability === 'debug' || capability === 'debug-write';
   const direction = capability === 'upload'
     ? (chinese ? '上传' : 'upload') : capability === 'download'
       ? (chinese ? '下载' : 'download') : (chinese ? '读取 CDP 信息' : 'read CDP data');
   const detail = capability === 'debug-write'
-    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n此操作可修改当前网页或浏览器状态，仅本次有效。`
-      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation can modify the current page or browser state. Applies once.`)
+    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n此操作可修改当前网页或浏览器状态。始终允许可在浏览器设置的「网站权限」中撤销。`
+      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation can modify the current page or browser state. Revoke a saved grant in Browser settings → Website permissions.`)
     : capability === 'debug'
-    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n仅本次只读 CDP 操作有效。`
-      : `Site: ${origin}\nMethods: ${names.join(', ')}\nApplies only to this read-only CDP operation.`)
+    ? (chinese ? `站点：${origin}\n方法：${names.join('、')}\n本次操作为只读。始终允许会保存此网站的 Debug / CDP 权限，之后包括可修改页面的操作也不再询问，可在浏览器设置中撤销。`
+      : `Site: ${origin}\nMethods: ${names.join(', ')}\nThis operation is read-only. Always allow saves this site's Debug / CDP permission, so later operations that can change the page will not ask either; revoke it in Browser settings.`)
     : (chinese ? `站点：${origin}\n文件：${names.join('、')}\n仅本次${direction}有效。`
       : `Site: ${origin}\nFiles: ${names.join(', ')}\nApplies only to this ${direction}.`);
   const message = capability === 'debug-write'
@@ -252,19 +289,26 @@ async function approveBrowserCapabilityOperation(capability: 'download' | 'uploa
       : `Allow Memmy to ${direction} files on this site?`;
   const approvalWindow = presentApprovalWindow(message);
   if (!approvalWindow) return false;
-  const choice = await dialog.showMessageBox(approvalWindow, {
+  const choice = await showBrowserApproval({
     type: 'question', title: capability === 'debug-write'
       ? (chinese ? '高风险浏览器调试操作审批' : 'High-risk browser debug approval')
       : capability === 'debug'
         ? (chinese ? '浏览器调试读取审批' : 'Browser debug read approval')
       : (chinese ? '浏览器文件操作审批' : 'Browser file approval'),
-    message, detail, buttons: chinese ? ['阻止', '仅本次允许'] : ['Block', 'Allow this operation'],
+    message, detail, buttons: isDebug
+      ? (chinese ? ['阻止', '仅本次允许', '始终允许此网站'] : ['Block', 'Allow this operation', 'Always allow this site'])
+      : (chinese ? ['阻止', '仅本次允许'] : ['Block', 'Allow this operation']),
     defaultId: 0, cancelId: 0, noLink: true,
-  });
-  if (approvalWindow.isDestroyed() || choice.response !== 1) return false;
+  }, approvalWindow);
+  if (browserAllowAllState().effective) return true;
+  if (approvalWindow.isDestroyed() || (choice.response !== 1 && !(isDebug && choice.response === 2))) return false;
   try {
-    const currentRules = new BrowserUseSitePolicyStore(dirname(configPath)).list();
-    return evaluateBrowserUseSiteRule(currentRules, origin,
+    const store = new BrowserUseSitePolicyStore(dirname(configPath));
+    if (isDebug && choice.response === 2) {
+      return rememberBrowserCdpGrant(store, origin,
+        new BrowserAccessStore(dirname(configPath)).list().find(entry => entry.origin === origin)?.decision);
+    }
+    return browserSiteDecision(origin,
       capability === 'download' ? 'downloads' : capability === 'upload' ? 'uploads' : 'fullCdp') !== 'block';
   } catch { return false; }
 }
@@ -499,9 +543,16 @@ async function boot(): Promise<void> {
     }
     if (isQuitting) return;
     bootStage = "runtime-services";
+    if (process.platform === 'darwin') pipScreenPermissionGuide = createComputerUsePIPScreenPermissionGuide({
+      whenIdle: () => memmyPermissionOnboarding?.whenIdle() ?? Promise.resolve(null),
+      guide: readGranted => guideMemmySystemPermission('screenRecording', readGranted),
+      isQuitting: () => isQuitting,
+      reportError: error => console.warn('[computer-use] Native PiP screen permission guide failed:', error),
+    });
     computerUseSurfaceWindows = createComputerUseSurfaceWindows(process.platform, {
       onVisibilityChanged: () => computerUseTrayRecovery.visibilityChanged(
-        computerUseSurfaceWindows?.hasHiddenActive() ?? false)
+        computerUseSurfaceWindows?.hasHiddenActive() ?? false),
+      onScreenRecordingPermissionRequired: request => pipScreenPermissionGuide?.request(request),
     });
     embeddedBrowserHistoryStore = new BrowserHistoryStore(join(app.getPath('userData'), 'in-app-browser-history.json'));
     embeddedBrowserDriver.setHistoryStore(embeddedBrowserHistoryStore);
@@ -512,6 +563,8 @@ async function boot(): Promise<void> {
       false,
     );
     const appDatabaseFile = join(app.getPath("userData"), "app.sqlite");
+    // Read the existing parent choice live, including after an upgrade or a settings change.
+    process.env[BROWSER_NATIVE_ALLOW_ALL_FILE_ENV] = allowAllNativeApps().filePath;
     runtimeServices = await startManagedRuntimeServices({
       // Publish the service handles before waiting so quit can cancel gateway startup.
       // The first window is created only after the gateway can accept tasks.
@@ -530,18 +583,32 @@ async function boot(): Promise<void> {
         computerUseSurfaceWindows?.closeAll();
         browserSidebarBridge?.clear();
       },
-      handleEmbeddedBrowserRequest: async (request, isCurrentChild) => {
+      handleEmbeddedBrowserRequest: async (request, isCurrentChild, emitEvent) => {
+        if (request.command === 'setSitePermission') {
+          const choice = parseBrowserTaskSitePermission(request.args);
+          if (!choice || !Number.isSafeInteger(request.tabId) || !isCurrentChild()
+            || embeddedBrowserDriver.uploadOrigin(request.tabId!) !== choice.origin
+            || (choice.allow && (browserSiteDecision(choice.origin, 'access') === 'block'
+              || browserAllowAllStore()?.siteRuleDecision(choice.origin, 'access') === 'block'))) {
+            throw new Error('Browser permission target is no longer current');
+          }
+          // An Agent choice must never become one of the user's saved site permissions.
+          embeddedBrowserDriver.taskSitePermissions.set(request.tabId!, choice.origin, choice.permission,
+            choice.allow, isCurrentChild);
+          return { status: choice.allow ? 'granted' : 'revoked', origin: choice.origin,
+            permission: choice.permission, allowed: choice.allow, lasts: 'task' };
+        }
+        if (request.command === 'endSitePermissions') {
+          embeddedBrowserDriver.taskSitePermissions.end(request.tabId!);
+          return { ended: true };
+        }
         if (request.command === 'authRequest') {
           if (!mainWindow || mainWindow.isDestroyed() || !Number.isSafeInteger(request.tabId))
             return { status: 'unavailable' };
           const configPath = runtimeServices?.agentGateway.configPath;
           if (!configPath) return { status: 'unavailable' };
           const isAllowed = () => {
-            try {
-              const rules = new BrowserUseSitePolicyStore(dirname(configPath)).list();
-              return isCurrentChild() && evaluateBrowserUseSiteRule(rules,
-                String(request.args.origin ?? ''), 'access') !== 'block';
-            } catch { return false; }
+            return isCurrentChild() && browserSiteDecision(String(request.args.origin ?? ''), 'access') !== 'block';
           };
           return embeddedBrowserDriver.requestAuth(request.tabId!, request.args,
             auth => showBrowserAuthForm(mainWindow!, auth, isAllowed), isAllowed);
@@ -552,17 +619,44 @@ async function boot(): Promise<void> {
           return runApprovedEmbeddedUpload(request, workspace, embeddedBrowserDriver,
             (site, names) => approveBrowserCapabilityOperation('upload', site, names), isCurrentChild);
         }
+        if (request.command === 'setDownloadDestination') {
+          if (!browserWebviewDownloads || !Number.isSafeInteger(request.tabId))
+            throw new Error('Browser download service is unavailable');
+          return embeddedBrowserDriver.setDownloadDestination(request.tabId!, request.args,
+            (tabId, filePath, destinationId, isCurrent) => browserWebviewDownloads!.setDestination(tabId, filePath, destinationId, isCurrent),
+            isCurrentChild);
+        }
+        if (request.command === 'waitDownloadDestination') {
+          if (!browserWebviewDownloads || !Number.isSafeInteger(request.tabId))
+            throw new Error('Browser download service is unavailable');
+          return browserWebviewDownloads.waitDestination(request.tabId!,
+            String(request.args.destinationId ?? ''), isCurrentChild);
+        }
+        if (['playwrightStart', 'playwrightCdp', 'playwrightEnd'].includes(request.command)) {
+          const configPath = runtimeServices?.agentGateway.configPath;
+          if (!configPath) throw new Error('Browser page policy is unavailable');
+          const approvedOrigin = String(request.args.approvedOrigin ?? '');
+          const approvedPage = { origin: approvedOrigin, isCurrentChild, isAllowed: () => {
+            return isCurrentChild() && browserSiteDecision(approvedOrigin, 'access') !== 'block';
+          } };
+          if (request.command === 'playwrightStart' && request.args.uploadPaths !== undefined) {
+            const workspace = runtimeServices?.agentGateway.workspace;
+            if (!workspace) throw new Error('Browser upload workspace is unavailable');
+            return runApprovedEmbeddedUpload({ ...request, command: 'upload',
+              args: { ...request.args, paths: request.args.uploadPaths } }, workspace, {
+              uploadOrigin: tabId => embeddedBrowserDriver.uploadOrigin(tabId),
+              handle: (_uploadRequest, approval) => embeddedBrowserDriver.handle(request, approval, approvedPage, isCurrentChild, emitEvent),
+            }, (site, names) => approveBrowserCapabilityOperation('upload', site, names), isCurrentChild);
+          }
+          return embeddedBrowserDriver.handle(request, undefined, approvedPage, isCurrentChild, emitEvent);
+        }
         if (request.command === 'cdpCall' || request.command === 'cdpEvents'
           || request.command === 'cdpWrite') {
           const configPath = runtimeServices?.agentGateway.configPath;
           if (!configPath) throw new Error('Browser CDP policy is unavailable');
           const isAllowed = (site: string) => {
-            try {
-              const rules = new BrowserUseSitePolicyStore(dirname(configPath)).list();
-              return evaluateBrowserUseSiteRule(rules, site, 'access') !== 'block'
-                && evaluateBrowserUseSiteRule(rules, site, 'fullCdp') !== 'block';
-            }
-            catch { return false; }
+            return browserSiteDecision(site, 'access') !== 'block'
+              && browserSiteDecision(site, 'fullCdp') !== 'block';
           };
           const run = request.command === 'cdpWrite'
             ? runApprovedEmbeddedCdpWrite : runApprovedEmbeddedCdpRead;
@@ -576,29 +670,31 @@ async function boot(): Promise<void> {
         }
         if (!embeddedBrowserHistoryStore) throw new Error('In-app browser history is unavailable');
         return queryInAppBrowserHistory(embeddedBrowserHistoryStore, request, async query => {
+          if (browserAllowAllState().effective) return true;
           const chinese = app.getLocale().toLowerCase().startsWith('zh');
           const message = chinese ? '允许 Memmy 读取内置浏览器历史吗？' : 'Allow Memmy to read in-app browser history?';
           const approvalWindow = presentApprovalWindow(message);
           if (!approvalWindow) return false;
-          const choice = await dialog.showMessageBox(approvalWindow, {
+          const choice = await showBrowserApproval({
             type: 'question', title: chinese ? '浏览历史访问审批' : 'Browser history access', message,
             detail: chinese
               ? `关键词：${query.keyword}\n时间：${new Date(query.from).toISOString()} 至 ${new Date(query.to).toISOString()}\n最多 ${query.limit} 条。仅本次查询有效。`
               : `Keyword: ${query.keyword}\nTime: ${new Date(query.from).toISOString()} to ${new Date(query.to).toISOString()}\nUp to ${query.limit} entries. This approval applies only to this query.`,
             buttons: chinese ? ['仅本次允许', '阻止'] : ['Allow this query', 'Block'],
             defaultId: 1, cancelId: 1, noLink: true,
-          });
-          return !approvalWindow.isDestroyed() && choice.response === 0;
+          }, approvalWindow);
+          return browserAllowAllState().effective || (!approvalWindow.isDestroyed() && choice.response === 0);
         });
       },
       approveBrowserAccess: async (origin, url) => {
         const configPath = runtimeServices?.agentGateway.configPath;
         if (!configPath) return 'deny';
+        if (browserAllowAllState().effective) return 'allow-always';
         const store = new BrowserAccessStore(dirname(configPath));
         let policyRules: BrowserUseSiteRule[];
         try { policyRules = new BrowserUseSitePolicyStore(dirname(configPath)).list(); }
         catch { return 'deny'; }
-        const policy = evaluateBrowserUseSiteRule(policyRules, url, 'access');
+        const policy = browserSiteDecision(url, 'access');
         if (policy === 'block') return 'deny';
         if (policy === 'allow') return 'allow-always';
         const matched = policyRules.some(rule => browserUsePatternMatches(rule.pattern, url));
@@ -609,18 +705,23 @@ async function boot(): Promise<void> {
         const options = { type: 'question' as const, title: chinese ? 'Agent 网站访问权限' : 'Agent website access',
           message: chinese ? `允许 Agent 读取和操作 ${origin} 的网页吗？` : `Allow the Agent to read and interact with pages at ${origin}?`,
           detail: chinese
-            ? `允许本次会话：在当前聊天与标签连接有效期间使用。\n始终允许：记住这个网站，可在浏览器设置的「网站权限」中撤销。下载和上传文件会单独检查权限。\n\n当前页面：${url}`
-            : `Allow this session: applies while this chat and tab connection remain active.\nAlways allow: remembers this website; revoke it in Browser settings → Website permissions. Downloads and uploads are checked separately.\n\nCurrent page: ${url}`,
-          buttons: matched ? (chinese ? ['允许本次会话', '阻止'] : ['Allow this session', 'Block'])
-            : (chinese ? ['允许本次会话', '始终允许', '阻止'] : ['Allow this session', 'Always allow', 'Block']),
-          defaultId: 0, cancelId: matched ? 1 : 2, noLink: true };
+            ? `允许本次会话：在当前聊天与标签连接有效期间使用。\n始终允许此网站：记住这个网站的网页访问授权。\n允许对所有网站操作：允许内置浏览器和外部浏览器读取和操作网页、上传下载文件及查询内置浏览器历史，可在「网站权限」中关闭。网站设备权限仍单独管理。\n\n当前页面：${url}`
+            : `Allow this session: applies while this chat and tab connection remain active.\nAlways allow this site: remembers access to this website.\nAllow operations on all websites: allows page reading and actions, file uploads and downloads, and in-app history across the in-app and external browsers. Turn it off in Website permissions. Website device permissions remain separate.\n\nCurrent page: ${url}`,
+          buttons: matched ? (chinese ? ['允许本次会话', '允许对所有网站操作', '阻止'] : ['Allow this session', 'Allow operations on all websites', 'Block'])
+            : (chinese ? ['允许本次会话', '始终允许此网站', '允许对所有网站操作', '阻止'] : ['Allow this session', 'Always allow this site', 'Allow operations on all websites', 'Block']),
+          defaultId: 0, cancelId: matched ? 2 : 3, noLink: true };
         const approvalWindow = presentApprovalWindow(options.message);
-        const choice = approvalWindow
-          ? await dialog.showMessageBox(approvalWindow, options) : await dialog.showMessageBox(options);
+        const choice = await showBrowserApproval(options, approvalWindow);
+        if (browserAllowAllState().effective) return 'allow-always';
+        if (choice.response === (matched ? 1 : 2)) {
+          browserAllowAllStore()!.setEnabled(true);
+          publishBrowserAllowAll();
+          return 'allow-always';
+        }
         let currentRules: BrowserUseSiteRule[];
         try { currentRules = new BrowserUseSitePolicyStore(dirname(configPath)).list(); }
         catch { return 'deny'; }
-        if (evaluateBrowserUseSiteRule(currentRules, url, 'access') === 'block') return 'deny';
+        if (browserSiteDecision(url, 'access') === 'block') return 'deny';
         const currentlyMatched = currentRules.some(rule => browserUsePatternMatches(rule.pattern, url));
         if (!matched && !currentlyMatched && choice.response === 1) { store.set(origin, 'allow'); return 'allow-always'; }
         if (!matched && currentlyMatched && choice.response === 1) return 'allow-once';
@@ -637,8 +738,8 @@ async function boot(): Promise<void> {
         const options = { type: 'question' as const,
           title: chinese ? '应用操控审批' : 'App control approval',
           message: chinese ? `允许 Memmy 操作「${displayName}」吗？` : `Allow Memmy to control “${displayName}”?`,
-          detail: chinese ? `应用标识：${appId}\n允许一次只对当前这条消息有效。始终允许会把这个应用放进设置列表，之后不再询问。这不代表同意付款、下单、发送或删除。`
-            : `App ID: ${appId}\nAllow once applies only to the current message. Always allow adds this app to Settings, and Memmy will not ask again. This does not approve payments, orders, sending, or deletion.`,
+          detail: chinese ? `应用标识：${appId}\n允许一次只对当前这条消息有效。始终允许会把这个应用放进设置列表，之后不再询问。具体操作以你的任务要求为准。`
+            : `App ID: ${appId}\nAllow once applies only to the current message. Always allow adds this app to Settings, and Memmy will not ask again. The actions follow the task you requested.`,
           buttons: chinese ? ['允许一次', '始终允许', '阻止'] : ['Allow once', 'Always allow', 'Block'],
           defaultId: 2, cancelId: 2, noLink: true };
         const approvalWindow = presentApprovalWindow(options.message);
@@ -737,7 +838,8 @@ async function boot(): Promise<void> {
     const embeddedBrowserSession = session.fromPartition('persist:memmy-browser');
     const browserDataDirectory = dirname(runtimeServices.agentGateway.configPath);
     browserWebviewDownloads = new BrowserWebviewDownloads(embeddedBrowserSession, browserDataDirectory);
-    disposeBrowserWebviewPermissions = attachBrowserWebviewPermissions(embeddedBrowserSession, browserDataDirectory);
+    disposeBrowserWebviewPermissions = attachBrowserWebviewPermissions(embeddedBrowserSession, browserDataDirectory,
+      embeddedBrowserDriver.taskSitePermissions);
     bootStage = "local-api";
     void writePackagedStartupLog(`boot:stage:${JSON.stringify({ stage: bootStage, elapsedMs: Date.now() - bootStartedAt })}`);
     runtimeConfig = await startLocalApi(runtimeServices);
@@ -1293,7 +1395,8 @@ async function restartMemoryService(): Promise<DesktopMemoryServiceRestartResult
  * Registers the IPC handlers the renderer uses to read the runtime config.
  * @returns Nothing.
  */
-async function guideMemmySystemPermission(permission: "accessibility" | "inputMonitoring" | "screenRecording"): Promise<boolean> {
+async function guideMemmySystemPermission(permission: "accessibility" | "inputMonitoring" | "screenRecording",
+  readHostScreenGranted?: () => boolean): Promise<boolean> {
   const onboarding = memmyPermissionOnboarding;
   const binary = await resolveComputerUseBinary(app.isPackaged, process.resourcesPath, process.env.MEMMY_DEV_COMPUTER_USE_BINARY);
   const helper = binary ? computerUseApp(binary) : null;
@@ -1301,7 +1404,13 @@ async function guideMemmySystemPermission(permission: "accessibility" | "inputMo
   const reason = permission === "screenRecording" ? "screenCaptureUnavailable" : permission;
   // Read flags while Settings retains focus so enabling a switch can finish
   // this guide without requiring the user to close it first.
-  const readPermissions = async () => memmyPermissionSnapshot((await runHelperCommand(binary, ["__memmy-history", "--permissions"])).stdout);
+  const readPermissions = async (): Promise<ComputerUsePermissions> => {
+    if (permission === 'screenRecording' && readHostScreenGranted) {
+      try { return { accessibility: 'unknown', screenRecording: readHostScreenGranted() ? 'granted' : 'required' }; }
+      catch { return { accessibility: 'unknown', screenRecording: 'unknown', failure: 'unavailable' }; }
+    }
+    return memmyPermissionSnapshot((await runHelperCommand(binary, ["__memmy-history", "--permissions"])).stdout);
+  };
   return onboarding.guide(reason, helper, {
     signal: AbortSignal.timeout(120_000),
     canContinue: false,
@@ -1428,7 +1537,21 @@ function registerIpcHandlers(): void {
     if (BrowserWindow.fromWebContents(event.sender) !== mainWindow || typeof enabled !== 'boolean') {
       throw new Error('Invalid computer use request');
     }
-    return allowAllNativeApps().setEnabled(enabled);
+    const result = allowAllNativeApps().setEnabled(enabled);
+    publishBrowserAllowAll();
+    return result;
+  });
+  ipcMain.handle('memmy:browser-allow-all:get', event => {
+    if (BrowserWindow.fromWebContents(event.sender) !== mainWindow) throw new Error('Invalid browser approval request');
+    return browserAllowAllState();
+  });
+  ipcMain.handle('memmy:browser-allow-all:set', (event, enabled: unknown) => {
+    if (BrowserWindow.fromWebContents(event.sender) !== mainWindow || typeof enabled !== 'boolean')
+      throw new Error('Invalid browser approval request');
+    const store = browserAllowAllStore();
+    if (!store) throw new Error('Browser service is unavailable');
+    store.setEnabled(enabled);
+    return publishBrowserAllowAll();
   });
   ipcMain.handle('memmy:browser-downloads:settings', event => {
     if (BrowserWindow.fromWebContents(event.sender) !== mainWindow) throw new Error('Invalid browser downloads request');
@@ -5953,6 +6076,8 @@ async function cleanupBeforeQuit(): Promise<void> {
   ipcMain.removeHandler('memmy:browser-use-site-policy:list');
   ipcMain.removeHandler('memmy:browser-use-site-policy:upsert');
   ipcMain.removeHandler('memmy:browser-use-site-policy:remove');
+  ipcMain.removeHandler('memmy:browser-allow-all:get');
+  ipcMain.removeHandler('memmy:browser-allow-all:set');
   ipcMain.removeHandler("memmy:open-computer-history-markdown");
   ipcMain.removeHandler("memmy:guide-memmy-permission");
   ipcMain.removeHandler("memmy:restart-for-computer-history-permissions");
@@ -6011,6 +6136,8 @@ async function cleanupBeforeQuit(): Promise<void> {
   browserSidebarBridge?.dispose();
   browserSidebarBridge = null;
   embeddedBrowserDriver.dispose();
+  pipScreenPermissionGuide?.dispose();
+  pipScreenPermissionGuide = null;
   computerUseSurfaceWindows?.dispose();
   computerUseSurfaceWindows = null;
   await backend?.close();

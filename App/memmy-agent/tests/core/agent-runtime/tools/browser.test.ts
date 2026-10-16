@@ -369,6 +369,56 @@ describe("BrowserSessionManager", () => {
     await vi.waitFor(() => expect(save).toHaveBeenCalledWith(download, 'https://example.com/page'));
   });
 
+  it.each(['start', 'timeout', 'cancel'] as const)('waits for a managed download after its action returns and handles %s without reassigning late events', async scenario => {
+    const root = tmpRoot();
+    const { runtimeLoader, state } = fakeRuntime(root);
+    const save = vi.fn(async () => undefined);
+    const manager = new BrowserSessionManager({}, { runtimeLoader, desktopManaged: true,
+      profileStore: null, downloadStore: { save } as unknown as BrowserDownloadStore,
+      externalRouter: null, embeddedRouter: null, embeddedBridge: null });
+    managers.push(manager);
+    const scope = { sessionKey: 'managed-download', channel: 'projected-session', chatId: 'managed-download' };
+    await manager.initialize();
+    await manager.callTool(scope, 'browser_navigate', { url: 'https://example.com/' });
+    const handlers = new Map<string, (value: any) => void>();
+    const page = { isClosed: () => false, url: () => 'https://example.com/report',
+      on: (event: string, callback: (value: any) => void) => handlers.set(event, callback) };
+    (state.contexts[0] as any).pages = () => [page];
+    state.pageCreated?.(page);
+    const originalWait = (manager as any).waitManagedDownload.bind(manager);
+    if (scenario === 'timeout') vi.spyOn(manager as any, 'waitManagedDownload')
+      .mockImplementation((...args: any[]) => originalWait(args[0], args[1], args[2], 1));
+    const controller = new AbortController();
+    let returned = false;
+    const destination = path.join(root, '用户报告.pdf');
+    const operation = manager.callTool(scope, 'browser_click', { target: '#download', downloadPath: destination },
+      controller.signal).then(result => { returned = true; return result; });
+    const rejected = scenario === 'start' ? null : expect(operation).rejects.toThrow(
+      scenario === 'timeout' ? /did not start/ : /cancelled/);
+    await vi.waitFor(() => expect(state.calls.some(call => call.name === 'browser_click')).toBe(true));
+    if (scenario === 'start') {
+      expect(returned).toBe(false); expect(save).not.toHaveBeenCalled();
+      const download = { cancel: vi.fn(async () => undefined) };
+      handlers.get('download')?.(download);
+      await operation;
+      expect(save).toHaveBeenCalledWith(download, 'https://example.com/report', destination);
+      expect(download.cancel).not.toHaveBeenCalled();
+    } else {
+      if (scenario === 'cancel') controller.abort();
+      await rejected;
+      if (scenario === 'timeout') {
+        const actions = state.calls.length;
+        await expect(manager.callTool(scope, 'browser_click', { target: '#download',
+          downloadPath: path.join(root, 'second.pdf') })).rejects.toThrow(/previous download/);
+        expect(state.calls).toHaveLength(actions);
+      }
+      const late = { cancel: vi.fn(async () => undefined) };
+      handlers.get('download')?.(late);
+      expect(late.cancel).toHaveBeenCalledOnce();
+      expect(save).not.toHaveBeenCalled();
+    }
+  });
+
   it('denies each upload before the Playwright tool call unless the current page is approved', async () => {
     const root = tmpRoot();
     const { runtimeLoader, state } = fakeRuntime(root);
@@ -835,7 +885,7 @@ describe("BrowserSessionManager", () => {
       new ToolContext({ browserSessionManager: manager }),
       registry,
     );
-    expect(registry.toolNames).toEqual([...BROWSER_TOOL_NAMES].sort());
+    expect(registry.toolNames).toEqual([...BROWSER_TOOL_NAMES, 'browser_site_permission'].sort());
     const tool = registry.get("browser_navigate") as BrowserNavigateTool;
     tool.setContext(new RequestContext({
       sessionKey: "session",
@@ -958,7 +1008,7 @@ describe("BrowserSessionManager", () => {
       registry,
     );
     expect(registry.toolNames).toEqual([...BROWSER_TOOL_NAMES,
-      'browser_cdp_read', 'browser_cdp_events', 'browser_cdp_send', 'browser_auth_request', 'browser_list_tabs',
+      'browser_cdp_read', 'browser_cdp_events', 'browser_cdp_send', 'browser_auth_request', 'browser_site_permission', 'browser_list_tabs',
       'browser_select_tab'].sort());
     const tool = registry.get("browser_navigate") as BrowserNavigateTool;
     tool.setContext(new RequestContext({
@@ -995,7 +1045,7 @@ describe("browser tool wrappers", () => {
 
     loader.load(new ToolContext({ browserSessionManager: manager }), registry);
 
-    expect(registry.toolNames).toEqual([...BROWSER_TOOL_NAMES].sort());
+    expect(registry.toolNames).toEqual([...BROWSER_TOOL_NAMES, 'browser_site_permission'].sort());
 
     const subagentRegistry = new ToolRegistry();
     loader.load(

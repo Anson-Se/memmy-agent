@@ -25,6 +25,7 @@ import time
 
 
 TABLE_NAME = re.compile(r"Msg_[0-9a-f]{32}\Z")
+MESSAGE_DATABASE = re.compile(r"message_[0-9]+\.db\Z")
 
 
 class SnapshotChanged(Exception):
@@ -230,11 +231,20 @@ class BuiltinConnection:
     """Read a SQLCipher 4 database and its committed WAL with the Windows page codec."""
 
     def __init__(self, db_path, key):
-        image = windows_page_codec().database_image(Path(db_path), bytes.fromhex(key))
-        self.temporary = tempfile.NamedTemporaryFile(prefix="wechat-read-", suffix=".db", delete=False)
-        self.temporary.write(image)
-        self.temporary.close()
-        self.connection = sqlite3.connect(self.temporary.name)
+        self.temporary = None
+        self.connection = None
+        try:
+            image = windows_page_codec().database_image(Path(db_path), bytes.fromhex(key))
+            # Own the whole private directory so failed opens and SQLite sidecars
+            # are cleaned along with the decrypted copy, before __enter__ runs.
+            self.temporary = tempfile.TemporaryDirectory(prefix="wechat-read-")
+            with tempfile.NamedTemporaryFile(suffix=".db", dir=self.temporary.name, delete=False) as output:
+                output.write(image)
+                database = output.name
+            self.connection = sqlite3.connect(database)
+        except BaseException:
+            self.close()
+            raise
 
     def query(self, sql):
         try:
@@ -247,8 +257,14 @@ class BuiltinConnection:
         return [{name: row[index] for index, name in enumerate(names)} for row in cursor.fetchall()]
 
     def close(self):
-        self.connection.close()
-        os.remove(self.temporary.name)
+        try:
+            connection, self.connection = self.connection, None
+            if connection is not None:
+                connection.close()
+        finally:
+            temporary, self.temporary = self.temporary, None
+            if temporary is not None:
+                temporary.cleanup()
 
     def __enter__(self):
         return self
@@ -411,7 +427,12 @@ def scan(root, keys, sqlcipher, cursor, limit, baseline, since=None):
     message_streams = []
     next_cursor = dict(cursor)
     database_count = 0
-    for db_path in sorted((root / "message").glob("message_*.db")):
+    # Search/resource indexes are not chat shards and need no key to read text.
+    databases = sorted(path for path in (root / "message").glob("message_*.db")
+                       if MESSAGE_DATABASE.fullmatch(path.name))
+    if not databases:
+        raise RuntimeError("no_message_databases")
+    for db_path in databases:
         with sqlcipher.open(db_path, key_for(keys, root, db_path)) as db:
             database_count += 1
             try:
@@ -498,7 +519,17 @@ def main():
     cursor = private_json(args.cursor) if args.cursor else {}
     if not isinstance(cursor, dict) or any(not isinstance(value, int) for value in cursor.values()):
         raise RuntimeError("invalid_cursor")
-    result = scan(root, keys, SqlCipher(args.library), cursor, args.limit, args.mode == "baseline", args.since)
+    sqlcipher = SqlCipher(args.library)
+    for attempt in range(3):
+        try:
+            result = scan(root, keys, sqlcipher, cursor, args.limit, args.mode == "baseline", args.since)
+            break
+        except InterruptedError:
+            # Each poll is a new process whose first access to WeChat's container
+            # waits for macOS approval. A lost approval interrupts the read; a
+            # repeated read-only scan requests approval again.
+            if attempt == 2:
+                raise
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
 

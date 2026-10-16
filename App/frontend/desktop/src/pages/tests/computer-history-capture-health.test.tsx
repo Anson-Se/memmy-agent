@@ -23,7 +23,7 @@ afterEach(() => {
 });
 const health = (input: Partial<ComputerHistoryCaptureHealth> = {}): ComputerHistoryCaptureHealth => ({
   status: "healthy", lastEventAt: null, lastHeartbeatAt: "2026-10-09T10:49:00Z", issues: [],
-  limitations: ["foreground_accessibility_only", "private_and_unverifiable_browsers_excluded", "screenshots_and_audio_not_recorded"],
+  limitations: ["foreground_accessibility_only", "screenshots_and_audio_not_recorded"],
   ...input,
 });
 describe("Computer History capture coverage", () => {
@@ -38,7 +38,7 @@ describe("Computer History capture coverage", () => {
       ...snapshot.observation, captureHealth: health(),
     } }).success).toBe(true);
     expect(ComputerHistoryCaptureHealthSchema.safeParse({ ...health(), app: "Private app" }).success).toBe(false);
-    expect(ComputerHistoryCaptureHealthSchema.safeParse(health({ issues: [{ code: "privacy_unknown", count: -1 }] })).success).toBe(false);
+    expect(ComputerHistoryCaptureHealthSchema.safeParse(health({ issues: [{ code: "enrichment_backlog", count: -1 }] })).success).toBe(false);
   });
 
   it.each([
@@ -51,7 +51,7 @@ describe("Computer History capture coverage", () => {
     const snapshot: ComputerHistorySnapshot = {
       observation: { state: "running", startedAt: "2026-10-09T10:49:00Z", segmentId: "2026-10-09T10-50-00Z",
         segmentStartedAt: "2026-10-09T10:50:00Z", error: null, narrationError: null,
-        captureHealth: health({ status, issues: [{ code: "privacy_unknown", count: 1 }] }) },
+        captureHealth: health({ status, issues: [{ code: "ax_snapshot_budget_exceeded", count: 1 }] }) },
       histories: [{ id: "2026-10-09T10-50-00Z-10min-summary", title: "Recent activity", description: null,
         applications: [], summaryWindow: "10min", summaryStatus: "pending", coveredHistoryIds: [],
         sourceType: "captured", pinned: false, eventStreamPath: "/synthetic/events/events.jsonl",
@@ -69,52 +69,10 @@ describe("Computer History capture coverage", () => {
     expect(document.body.textContent).not.toContain("采集受限");
     expect(document.body.textContent).not.toContain("正在重连");
     expect(document.querySelector(".ch__capture-health")).toBeNull();
-    expect(document.querySelector(".ch__browser-privacy-notice")?.textContent).toBe(zhCNMessages["computerHistory.browserPrivacyUnknown"]);
-    expect(document.body.textContent).not.toContain("privacy_unknown");
+    expect(document.body.textContent).not.toContain("ax_snapshot_budget_exceeded");
     expect(document.body.textContent).not.toContain("部分活动可能未记录");
     expect(document.body.textContent).not.toContain("本次采集尚无已写入的活动记录");
     expect(document.querySelector(".ch-entry__body")?.textContent).toContain("原始活动已保存，摘要正在整理或更新");
-  });
-
-  it.each(["darwin", "win32"] as const)("shows the secondary browser notice in English on %s while keeping the primary recording state", async (platform) => {
-    Object.defineProperty(window, "memmy", { configurable: true, value: { platform } });
-    const snapshot: ComputerHistorySnapshot = {
-      observation: { state: "running", startedAt: null, segmentId: null, segmentStartedAt: null,
-        error: null, narrationError: null, captureHealth: health({ issues: [{ code: "privacy_unknown", count: 1 }] }) },
-      histories: [], workflows: [], privacy: { screenshots: false, audio: false, rawRetentionHours: 48,
-        markdownDirectory: "/synthetic/history", eventStreamDirectory: "/synthetic/events" },
-    };
-    const client = { getComputerHistory: async () => snapshot, getComputerHistorySettings: async () => ({
-      observation: { defaultApplicationBehavior: "observe", defaultURLBehavior: "observe", rules: [] },
-    }) } as unknown as MemmyAgentClient;
-    await act(async () => root.render(<I18nProvider language="en-US"><ComputerHistorySubPage client={client} /></I18nProvider>));
-    expect(document.querySelector(".ch__recording-status")?.textContent).toBe("Recording");
-    expect(document.querySelector(".ch__browser-privacy-notice")?.textContent).toBe(enUSMessages["computerHistory.browserPrivacyUnknown"]);
-    expect(document.querySelector('[role="alert"]')).toBeNull();
-    expect(document.body.textContent).not.toContain("privacy_unknown");
-  });
-
-  it.each((["darwin", "win32"] as const).flatMap((platform) => [
-    { platform, state: "running", captureHealth: undefined, scenario: "older snapshot without health" },
-    { platform, state: "running", captureHealth: health(), scenario: "no issue" },
-    { platform, state: "running", captureHealth: health({ issues: [{ code: "heartbeat_missing", count: 1 }] }), scenario: "another issue" },
-    ...(["paused", "stopped", "stopping"] as const).map((state) => ({ platform, state,
-      captureHealth: health({ issues: [{ code: "privacy_unknown", count: 1 }] }), scenario: state })),
-  ]))("hides the browser notice on $platform for $scenario", async ({ platform, state, captureHealth }) => {
-    Object.defineProperty(window, "memmy", { configurable: true, value: { platform } });
-    const snapshot: ComputerHistorySnapshot = {
-      observation: { state: state as ComputerHistorySnapshot["observation"]["state"], startedAt: null, segmentId: null,
-        segmentStartedAt: null, error: null, narrationError: null, ...(captureHealth ? { captureHealth } : {}) },
-      histories: [], workflows: [], privacy: { screenshots: false, audio: false, rawRetentionHours: 48,
-        markdownDirectory: "/synthetic/history", eventStreamDirectory: "/synthetic/events" },
-    };
-    const client = { getComputerHistory: async () => snapshot, getComputerHistorySettings: async () => ({
-      observation: { defaultApplicationBehavior: "observe", defaultURLBehavior: "observe", rules: [] },
-    }) } as unknown as MemmyAgentClient;
-    await act(async () => root.render(<I18nProvider language="zh-CN"><ComputerHistorySubPage client={client} /></I18nProvider>));
-    expect(document.querySelector(".ch__browser-privacy-notice")).toBeNull();
-    expect(document.body.textContent).not.toContain(zhCNMessages["computerHistory.browserPrivacyUnknown"]);
-    if (state === "running") expect(document.querySelector(".ch__recording-status")?.textContent).toBe("采集中");
   });
 
   it("limits the enable notice to readable foreground activity in both languages", () => {

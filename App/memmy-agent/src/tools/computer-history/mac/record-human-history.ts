@@ -9,12 +9,12 @@ import readline from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { redactSensitive } from "./redaction.js";
-import { nativeRecorderDiagnostic, recorderHealthReporter } from "./recorder-health.js";
+import { captureGapRecord, nativeRecorderDiagnostic, recorderHealthReporter } from "./recorder-health.js";
 import { historyNativeCommand } from "./native-helper.js";
 import { WeChatHistoryConsentStore, defaultWeChatConsentFile } from "./wechat-consent.js";
 import { isWindows11, windowsObserverCommand } from "../win/win11.js";
 import { readBrowserAuthority } from "../browser-privacy.js";
-import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction } from "../win/native-event-adapter.js";
+import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction, previousControlsAtPoint } from "../win/native-event-adapter.js";
 
 import {
   BROWSER_BUNDLE_IDS,
@@ -203,17 +203,6 @@ function isPasswordTarget(accessibility: unknown): boolean {
   return isPasswordNode(outer) || isPasswordNode(focused);
 }
 
-// When accessibility cannot identify the focused control, a key tap cannot
-// establish that it was outside a password field. Keep the activity count but
-// withhold its characters until the focused target is known.
-function isReadableTextTarget(accessibility: unknown): boolean {
-  const node = focusedTarget(accessibility);
-  if (!node || isPasswordTarget(accessibility)) return false;
-  const role = typeof node.role === "string" ? node.role : "";
-  const subrole = typeof node.subrole === "string" ? node.subrole : "";
-  return Boolean((role && role !== "AXUnknown") || (subrole && subrole !== "AXUnknown"));
-}
-
 const SEARCH_INPUT_ROLES = new Set(["AXSearchField"]);
 const SEARCHABLE_TEXT_INPUT_ROLES = new Set(["AXTextField", "AXComboBox"]);
 const SEARCH_INPUT_HINT = /(?:\bsearch\b|\bquery\b|\bfind\b|address and search|搜索|检索|查找)/iu;
@@ -313,6 +302,9 @@ export function scrubAxSnapshot(ax: unknown): unknown {
 interface AxBaseline {
   windowKey: string;
   lines: string[];
+  observedAt?: string;
+  truncated?: boolean;
+  readFailures?: number;
 }
 
 function prepareAuthorizedAxSnapshot(ax: unknown, previous: AxBaseline | null): {
@@ -320,6 +312,9 @@ function prepareAuthorizedAxSnapshot(ax: unknown, previous: AxBaseline | null): 
   baseline: AxBaseline | null;
 } {
   const current = scrubAxSnapshot(ax) as Record<string, unknown> | null;
+  // Action envelopes may carry only focus/window identity. They contain no
+  // replacement tree and must not erase an already-authorized baseline.
+  if (current && !("mode" in current) && !("text" in current)) return { snapshot: null, baseline: previous };
   // Only complete native observations can establish permission to store text.
   // Legacy/unknown diffs may contain removed text from an excluded interval.
   if (current?.mode !== "fullTree" || typeof current.text !== "string") {
@@ -327,8 +322,17 @@ function prepareAuthorizedAxSnapshot(ax: unknown, previous: AxBaseline | null): 
   }
   const lines = current.text.split("\n");
   const baseline = typeof current.windowKey === "string"
-    ? { windowKey: current.windowKey, lines } : null;
+    ? { windowKey: current.windowKey, lines,
+      ...(typeof current.observedAt === "string" && Number.isFinite(Date.parse(current.observedAt))
+        ? { observedAt: new Date(current.observedAt).toISOString() } : {}),
+      ...(typeof current.truncated === "boolean" ? { truncated: current.truncated } : {}),
+      ...(typeof current.readFailures === "number" ? { readFailures: current.readFailures } : {}) } : null;
   if (!baseline || previous?.windowKey !== baseline.windowKey) return { snapshot: current, baseline };
+  // A complete read can have the same text as an earlier partial one. Keep
+  // that change in coverage instead of deduplicating its recovery evidence.
+  if (previous.truncated !== baseline.truncated || previous.readFailures !== baseline.readFailures) {
+    return { snapshot: current, baseline };
+  }
   if (previous.lines.length === lines.length && previous.lines.every((line, index) => line === lines[index])) {
     return { snapshot: null, baseline };
   }
@@ -372,8 +376,6 @@ function observationSubject(event: HelperEvent): ObservationSubject {
     bundleId: appFrom(event).bundleId,
     browser: event.window?.browser === true,
     url: typeof event.window?.url === "string" ? event.window.url : null,
-    privateBrowsing: event.window?.privateBrowsing === true,
-    privateBrowsingUnknown: event.window?.privateBrowsingUnknown === true,
   };
 }
 
@@ -402,9 +404,8 @@ export function normalizeKeyBurst(
     && events.every((event) => event.inputContext?.purpose === "search_query")
     ? events.at(-1)!.inputContext
     : null;
-  const readableTargets = events.every((event) =>
-    !isSecureInput(event) && isReadableTextTarget(event.keyboard?.target));
-  const retainText = readableTargets && textAllowedInApplication(application, options.allowApps)
+  const retainText = events.every((event) => !isSecureInput(event))
+    && textAllowedInApplication(application, options.allowApps)
     && (options.captureText || (options.captureSearchText && searchInput));
   if (rawText && events.every(printableKey)) {
     return {
@@ -459,9 +460,9 @@ export function recordingStep(onWriteFailure: () => void, onProcessingFailure: (
     try {
       await task();
     } catch (error) {
-      onProcessingFailure();
       const code = (error as NodeJS.ErrnoException).code;
       if (!code) {
+        onProcessingFailure();
         console.error("[recorder] skipped an event after a processing failure");
         return;
       }
@@ -571,26 +572,52 @@ export async function run(
     captureScopeApplications: args.onlyApps,
     ...(contextUrl && shouldObserve(loadObservationSettings(args.observationSettings), { browser: true, url: contextUrl })
       ? { contextUrl } : {}),
-    privacy: "Text is retained from observed applications when enabled and the focused control is known not to be a password field. An explicit allow-app narrows text capture. Private windows, excluded applications and sites are skipped; credential patterns are redacted.",
+    privacy: "Text is retained from observed applications when enabled, except in password fields. An explicit allow-app narrows text capture. Excluded applications and sites are skipped; credential patterns are redacted.",
   });
 
   let sequence = 0;
-  const health = recorderHealthReporter();
+  const failWrite = () => {
+    if (!helper.killed) helper.kill("SIGTERM");
+    process.exit(1);
+  };
+  const health = recorderHealthReporter((line) => {
+    const signal = JSON.parse(line.slice("[recorder-health] ".length));
+    if (signal.code !== "heartbeat" && signal.code !== "event_recorded") {
+      // Retain content-free capture quality beside its events. Current health
+      // cannot tell a later reader which historical intervals were incomplete.
+      try { appendJsonLine(output, { recordType: "capture_health", ...signal }); }
+      catch {
+        // Do not try to report a failed write through the same failing sink.
+        console.error("[recorder] cannot persist capture health; stopping recording");
+        failWrite();
+        return;
+      }
+    }
+    console.log(line);
+  });
+  let snapshotHealthy: boolean | undefined;
+  const reportSnapshotHealth = (healthy: boolean) => {
+    if (snapshotHealthy === healthy) return;
+    snapshotHealthy = healthy;
+    health.report(healthy ? "ax_snapshot_ready" : "ax_snapshot_failed");
+  };
   let lastPageContextUrl: string | null = null;
   let axBaseline: AxBaseline | null = null;
+  let observationEpoch = 0;
+  const invalidateObservation = () => { axBaseline = null; observationEpoch += 1; };
   const weChatConsent = new WeChatHistoryConsentStore();
   let observationPolicyVersion: string | null = null;
   const canObserve = (subject: ObservationSubject) => {
     // Exclusions and the separate WeChat consent are keyed by app identity.
     // The native Mac helper uses "unknown" when it cannot resolve that key.
     if (!subject.bundleId || subject.bundleId.trim().toLowerCase() === "unknown") {
-      axBaseline = null;
+      invalidateObservation();
       return false;
     }
     const settings = loadObservationSettings(args.observationSettings);
     const version = JSON.stringify(settings);
     if (version !== observationPolicyVersion) {
-      axBaseline = null;
+      invalidateObservation();
       observationPolicyVersion = version;
     }
     const allowed = shouldObserve(settings, {
@@ -598,7 +625,7 @@ export async function run(
       ...(subject.bundleId && SENSITIVE_MESSAGE_APP_BUNDLE_IDS.has(subject.bundleId.toLowerCase())
         ? { weChatChatAccess: weChatConsent.read().enabled } : {}),
     });
-    if (!allowed) axBaseline = null;
+    if (!allowed) invalidateObservation();
     return allowed;
   };
   let pendingKeys: HelperEvent[] = [];
@@ -621,6 +648,7 @@ export async function run(
       details = {},
       ax = null,
       subjects,
+      previousControlsEpoch,
     }: {
       eventType: string;
       timestamp?: string;
@@ -628,6 +656,7 @@ export async function run(
       details?: Record<string, unknown>;
       ax?: unknown;
       subjects?: ObservationSubject[];
+      previousControlsEpoch?: number;
     },
     screenshot = false,
   ) => {
@@ -651,11 +680,22 @@ export async function run(
       if (screenshotPath) fs.rmSync(screenshotPath, { force: true });
       return;
     }
+    if (details.previousControlsAtPoint && previousControlsEpoch !== observationEpoch) {
+      details = { ...details };
+      delete details.previousControlsAtPoint;
+    }
     // There are no awaits between computing this delta and committing its
     // baseline. Thus it can only refer to permitted snapshots already on disk.
     const preparedAx = ax ? prepareAuthorizedAxSnapshot(ax, axBaseline) : null;
+    const tree = ax && typeof ax === "object" ? ax as Record<string, unknown> : null;
+    const attemptedTree = windows && tree && ("mode" in tree || "text" in tree);
+    const completeTree = attemptedTree && tree.mode === "fullTree"
+      && typeof tree.text === "string" && tree.text.trim().length > 0
+      && tree.truncated === false && tree.readFailures === 0;
+    if (attemptedTree && !completeTree) reportSnapshotHealth(false);
     if (ax && !preparedAx?.snapshot && eventType === "accessibility_snapshot") {
       axBaseline = preparedAx?.baseline ?? null;
+      if (completeTree && axBaseline) reportSnapshotHealth(true);
       return;
     }
     // Every event is written through here, so this is where accessibility
@@ -672,6 +712,7 @@ export async function run(
     });
     if (eventType !== "recording_stopped") health.report("event_recorded");
     if (preparedAx) axBaseline = preparedAx.baseline;
+    if (completeTree && preparedAx?.snapshot) reportSnapshotHealth(true);
   };
 
   const flushKeys = async () => {
@@ -686,10 +727,7 @@ export async function run(
       subjects: events.map(observationSubject) });
   };
 
-  const safely = recordingStep(() => {
-    if (!helper.killed) helper.kill("SIGTERM");
-    process.exit(1);
-  }, () => health.report("event_processing_error"));
+  const safely = recordingStep(failWrite, () => health.report("event_processing_error"));
 
   const scheduleKeyFlush = () => {
     if (pendingKeyTimer) clearTimeout(pendingKeyTimer);
@@ -702,18 +740,24 @@ export async function run(
     const application = appFrom(event);
     if (event.kind === "session.ended") return;
     if (args.onlyApps.length && !appAllowed(application, args.onlyApps)) {
-      axBaseline = null;
+      invalidateObservation();
       return;
     }
     if (windows) applyWindowsBrowserPrivacy(event,
       args.browserAuthority ? readBrowserAuthority(args.browserAuthority) : null);
     const subjects = [observationSubject(event)];
     if (!canObserve(subjects[0])) {
-      if (subjects[0].privateBrowsingUnknown && !subjects[0].privateBrowsing
-        && canObserve({ ...subjects[0], privateBrowsingUnknown: false })) health.report("privacy_unknown");
       pendingKeys = pendingKeys.filter((pending) => canObserve(observationSubject(pending)));
       return;
     }
+
+    // Native caches are not aware of application/site exclusion settings.
+    // Admit earlier labels only when their exact observation was already
+    // authorized here. Compute before this event's full tree replaces it.
+    const candidate = windows ? previousControlsAtPoint(event.mouse?.previousControlsAtPoint, event.timestamp) : null;
+    const authorizedPreviousControls = candidate && axBaseline?.observedAt === candidate.observedAt
+      && event.ax?.windowKey === axBaseline.windowKey ? candidate : null;
+    const previousControlsEpoch = observationEpoch;
 
     if (event.kind === "session.started") {
       await appendEvent({
@@ -818,11 +862,13 @@ export async function run(
         timestamp: event.timestamp,
         application,
         subjects,
+        previousControlsEpoch,
         details: {
           button: event.mouse?.button ?? "left",
           clickCount: event.mouse?.clickCount ?? 1,
           ...(event.kind === "mouse.context_menu" ? { contextMenu: true } : {}),
           ...(target ? { accessibility: target } : {}),
+          ...(authorizedPreviousControls ? { previousControlsAtPoint: authorizedPreviousControls } : {}),
         },
       }, true);
       return;
@@ -856,8 +902,7 @@ export async function run(
       const selectedText = event.selection?.selectedText;
       if (typeof selectedText !== "string" || !selectedText) return;
       if (isSecureInput(event)) return;
-      const retain = args.captureText && textAllowedInApplication(application, args.allowApps)
-        && isReadableTextTarget(event.selection?.target);
+      const retain = args.captureText && textAllowedInApplication(application, args.allowApps);
       await appendEvent({
         eventType: "selection_changed",
         timestamp: event.timestamp,
@@ -923,7 +968,18 @@ export async function run(
       }
       if (event.type === "recorder.diagnostic") {
         const signal = nativeRecorderDiagnostic(event);
-        if (signal) health.report(signal.code, signal);
+        if (signal) processing = processing.then(safely(async () => {
+          if (signal.code === "ax_snapshot_failed") snapshotHealthy = false;
+          health.report(signal.code, signal);
+        }));
+        else health.report("helper_parse_error");
+        return;
+      }
+      if (event.type === "recorder.capture_gap") {
+        const gap = captureGapRecord(event);
+        if (gap) processing = processing.then(safely(async () => {
+          appendJsonLine(output, gap);
+        }));
         else health.report("helper_parse_error");
         return;
       }

@@ -2,7 +2,8 @@ export type BrowserAuthField = { id: string; label: string; type: string; select
   autocomplete?: string; required: boolean };
 export type BrowserAuthOption = { id: string; label: string; selector?: string; field_ids?: string[] };
 export type BrowserAuthRequest = { origin: string; frame?: string; frames?: string[]; fields: BrowserAuthField[];
-  options?: BrowserAuthOption[]; submit?: { selector: string; action: 'click' | 'press_enter' } };
+  options?: BrowserAuthOption[]; submit?: { selector: string; action: 'click' | 'press_enter' };
+  provided_values?: Record<string, string>; selected_option?: string };
 export type BrowserAuthResult = { status: 'submitted' | 'declined' | 'cancelled' | 'unavailable'
   | 'expired' | 'origin_changed' | 'page_changed' | 'locator_invalid' | 'submission_failed';
   selected_option?: string; locator_error?: { field_id: string; reason: 'not_user_visible' } };
@@ -13,11 +14,11 @@ const label = (value: unknown): value is string => typeof value === 'string' && 
 const selector = (value: unknown): value is string => typeof value === 'string'
   && value.length >= 1 && value.length <= 300 && !/[\r\n\0]/.test(value);
 
-/** Only non-secret, bounded control metadata may cross the Agent/main-process IPC boundary. */
+/** Values already provided for the current task are transient and must never be returned or logged. */
 export function parseBrowserAuthRequest(value: unknown): BrowserAuthRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid browser auth request');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['origin', 'frame', 'frames', 'fields', 'options', 'submit'].includes(key)))
+  if (Object.keys(input).some(key => !['origin', 'frame', 'frames', 'fields', 'options', 'submit', 'provided_values', 'selected_option'].includes(key)))
     throw new Error('Invalid browser auth request');
   if (typeof input.origin !== 'string' || input.origin.length > 320
     || !Array.isArray(input.fields) || input.fields.length > 8) throw new Error('Invalid browser auth request');
@@ -76,8 +77,44 @@ export function parseBrowserAuthRequest(value: unknown): BrowserAuthRequest {
       throw new Error('Browser auth submit must be distinct from credential fields');
     submit = parsedSubmit;
   }
+  let providedValues: Record<string, string> | undefined;
+  if (input.provided_values !== undefined) {
+    if (!input.provided_values || typeof input.provided_values !== 'object' || Array.isArray(input.provided_values))
+      throw new Error('Invalid provided browser auth fields');
+    const entries = Object.entries(input.provided_values);
+    if (entries.some(([key, value]) => !fields.some(field => field.id === key)
+      || typeof value !== 'string' || value.length > 4096)) throw new Error('Invalid provided browser auth fields');
+    providedValues = Object.fromEntries(entries.filter(([, value]) => !/^\[redacted\]$/i.test(String(value).trim()))) as Record<string, string>;
+  }
+  if (input.selected_option !== undefined && (!options || !options.some(option => option.id === input.selected_option)))
+    throw new Error('Invalid provided browser auth option');
   if (!fields.length && !options) throw new Error('Browser auth requires visible controls');
   return { origin: input.origin, ...(input.frame ? { frame: input.frame as string } : {}),
     ...(input.frames ? { frames: input.frames as string[] } : {}),
-    fields, ...(options ? { options } : {}), ...(submit ? { submit } : {}) };
+    fields, ...(options ? { options } : {}), ...(submit ? { submit } : {}),
+    ...(providedValues ? { provided_values: providedValues } : {}),
+    ...(input.selected_option ? { selected_option: input.selected_option as string } : {}) };
+}
+
+/** Collect only missing controls; supplied values never enter the secure form document. */
+export async function collectMissingBrowserAuth(request: BrowserAuthRequest,
+  collect: (request: BrowserAuthRequest) => Promise<{ values: Record<string, string>; selected_option?: string }
+    | { status: 'expired' } | null>): Promise<{ values: Record<string, string>; selected_option?: string }
+      | { status: 'expired' } | null> {
+  const provided = request.provided_values ?? {};
+  const selected = request.options?.find(option => option.id === request.selected_option);
+  const fields = selected?.selector ? [] : selected?.field_ids
+    ? request.fields.filter(field => selected.field_ids!.includes(field.id)) : request.fields;
+  const missing = fields.filter(field => field.required && !provided[field.id]);
+  if (!missing.length && (!request.options || selected)) return {
+    values: provided, ...(selected ? { selected_option: selected.id } : {}),
+  };
+  const { provided_values: _values, selected_option: _option, options: _options, ...metadata } = request;
+  const options = selected ? undefined : request.options?.map(option => ({ ...option,
+    ...(option.field_ids ? { field_ids: option.field_ids.filter(id => missing.some(field => field.id === id)) } : {}),
+  }));
+  const answer = await collect({ ...metadata, fields: missing, ...(options ? { options } : {}) });
+  if (!answer || 'status' in answer) return answer;
+  return { values: { ...provided, ...answer.values },
+    ...(selected ? { selected_option: selected.id } : answer.selected_option ? { selected_option: answer.selected_option } : {}) };
 }

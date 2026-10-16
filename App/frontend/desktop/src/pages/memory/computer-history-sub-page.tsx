@@ -25,6 +25,7 @@ import { ComputerHistoryWeChatRiskConfirmation } from "./computer-history-wechat
 import { clearWeChatPermissionReturn, shouldReturnToWeChatSettings } from "./computer-history-wechat-permission-state.js";
 import { weChatConnectionError } from "./computer-history-wechat-error.js";
 import { ComputerHistorySources } from "./computer-history-sources.js";
+import { ComputerHistoryBrowserEnhancement } from "./computer-history-browser-enhancement.js";
 import { ComputerHistorySourceDialog } from "./computer-history-source-dialog.js";
 import {
   consumeComputerHistoryLaunchEnable,
@@ -332,8 +333,6 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
   const observationState = snapshot?.observation.state ?? "stopped";
   const recording = observationState === "running" || observationState === "stopping";
   const paused = observationState === "paused";
-  const browserPrivacyUnknown = observationState === "running"
-    && snapshot?.observation.captureHealth?.issues.some((issue) => issue.code === "privacy_unknown");
   const showIntroduction = !!snapshot && observationState === "stopped"
     && snapshot.histories.length === 0 && !permissionSetup && !weChatPermissionReturned;
 
@@ -524,11 +523,6 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
         <div className="flex-1 pr-4">
           <div id="computer-history-record-label" className="ch__setting-label">{t("computerHistory.record")}</div>
           <p id="computer-history-record-description" className="ch__setting-description">{t("computerHistory.recordDescription")}</p>
-          {browserPrivacyUnknown ? (
-            <p className="ch__browser-privacy-notice mt-1 text-xs text-text-ink/60" role="status">
-              {t("computerHistory.browserPrivacyUnknown")}
-            </p>
-          ) : null}
         </div>
         <div className="ch__head-actions">
           {quotaExhausted || recording || paused ? (
@@ -590,10 +584,10 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
       {snapshot?.wechat ? (
         <div ref={weChatSettingsRef} className="ch__recording-setting flex items-center justify-between">
           <div className="flex-1 pr-4">
-            <div id="computer-history-wechat-label" className="text-sm text-text-ink/70">
+            <div id="computer-history-wechat-label" className="ch__setting-label">
               {t("computerHistory.wechat.label")}
             </div>
-            <p id="computer-history-wechat-description" className="text-xs text-text-ink/60">
+            <p id="computer-history-wechat-description" className="ch__setting-description">
               {t("computerHistory.wechat.description")}
             </p>
             {snapshot.wechat.connection !== "disabled" && snapshot.wechat.connection !== "connected" ? (
@@ -626,6 +620,7 @@ export function ComputerHistorySubPage(props: ComputerHistorySubPageProps) {
           </button>
         </div>
       ) : null}
+      <ComputerHistoryBrowserEnhancement client={props.client} />
       <ComputerHistorySources key={sourcesRevision} client={props.client} syncStatus={snapshot?.memorySync}
         onChoose={() => setSourceSetupMode("edit")} />
       </div>}

@@ -13,9 +13,13 @@ function harness(selected = true) {
   let url = 'https://example.com/';
   let focused = false;
   let destroyed = false;
+  const guestFrame = { frameTreeNodeId: 27 };
+  let focusedFrame: { frameTreeNodeId: number } | null = guestFrame;
   const browserSession = { partition: 'persist:memmy-browser' };
   const debuggerEvents = new EventEmitter();
   const sendCommand = vi.fn(async (method: string, args?: Record<string, any>) => {
+    if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: 'target-27', type: 'page', url } };
+    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-27', url } } };
     if (method === 'Accessibility.getFullAXTree') return { nodes: [
       { backendDOMNodeId: 7, role: { value: 'link' }, name: { value: 'Learn more' }, ignored: false },
     ] };
@@ -31,22 +35,28 @@ function harness(selected = true) {
   const guest = Object.assign(new EventEmitter(), { id: 27,
     session: browserSession,
     isDestroyed: () => destroyed, isLoading: () => false,
+    mainFrame: { framesInSubtree: [guestFrame] }, backgroundThrottling: true,
+    setBackgroundThrottling: vi.fn((value: boolean) => { guest.backgroundThrottling = value; }),
     getURL: () => url, getTitle: () => 'Example', isFocused: () => focused,
     focus: vi.fn(), loadURL: vi.fn(async (target: string) => { url = target; }),
     debugger: Object.assign(debuggerEvents, { attach: vi.fn(), detach: vi.fn(), sendCommand }) });
   const host = { isDestroyed: () => false, show: vi.fn(),
-    webContents: { send: vi.fn((channel: string, target: string | number) => {
+    webContents: Object.assign(new EventEmitter(), { get focusedFrame() { return focusedFrame; },
+      executeJavaScript: vi.fn(async () => { focusedFrame = guestFrame; return true; }),
+      send: vi.fn((channel: string, target: string | number) => {
       if (channel === 'memmy:browser:close-tab' && target === 27) {
         destroyed = true;
         guest.emit('destroyed');
       } else if (typeof target === 'string') url = target;
-    }) } };
+    }) }) };
+  Object.defineProperty(host.webContents, 'focusedFrame', { get: () => focusedFrame });
   const driver = new EmbeddedBrowserDriver(() => host as any);
   driver.attach(guest as any, host as any);
   if (selected) driver.selectTab(guest.id, host as any);
   const request = (command: EmbeddedBrowserRequest['command'], args: Record<string, unknown> = {}): EmbeddedBrowserRequest =>
     ({ type: EMBEDDED_BROWSER_REQUEST, requestId: 'test', tabId: 27, command, args });
   return { driver, request, sendCommand, guest, host, browserSession,
+    focusFrame: (frame: { frameTreeNodeId: number } | null) => { focusedFrame = frame; },
     navigate: (target: string) => { url = target; }, focus: (value: boolean) => { focused = value; } };
 }
 
@@ -87,7 +97,7 @@ it('keeps inactive guests and history without selecting or losing an approved ba
 
 it('clears only a host-owned selection and never selects an arbitrary remaining guest after destruction', async () => {
   const { driver, guest, host, request } = harness();
-  const otherHost = { isDestroyed: () => false, webContents: { send: vi.fn() } };
+  const otherHost = { isDestroyed: () => false, webContents: Object.assign(new EventEmitter(), { send: vi.fn() }) };
   const other = Object.assign(new EventEmitter(), { id: 28, isDestroyed: () => false,
     getURL: guest.getURL, getTitle: guest.getTitle, debugger: guest.debugger });
   const hidden = Object.assign(new EventEmitter(), { id: 29, isDestroyed: () => false,
@@ -277,12 +287,14 @@ it('binds secure auth to an attached cross-origin iframe and rejects a changed c
   guest.debugger.emit('message', {}, 'Target.attachedToTarget', {
     sessionId: 'child-1', targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' },
   });
-  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>) => {
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
     if (method === 'Runtime.evaluate' && args?.expression?.includes('const found=doc?.querySelectorAll'))
       return { result: { objectId: 'frame-node' } };
     if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', frameId: 'frame-1' } };
-    if (method === 'Target.getTargetInfo') return { targetInfo: {
-      targetId: 'frame-1', url: 'https://identity.test/login' } };
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('child-1');
+      return { targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' } };
+    }
     if (method === 'Runtime.evaluate' && args?.expression?.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
       return { result: { value: { url: 'https://identity.test/login', timeOrigin: 123 } } };
     if (method === 'Runtime.evaluate') return { result: { value:
@@ -329,8 +341,11 @@ it('follows a bounded two-level cross-origin iframe chain without exposing crede
       return { result: { objectId: sessionId === 'child-1' ? 'node-2' : 'node-1' } };
     if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME',
       frameId: args?.objectId === 'node-2' ? 'frame-2' : 'frame-1' } };
-    if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: args?.targetId,
-      url: args?.targetId === 'frame-1' ? 'https://identity.test/' : 'https://challenge.test/' } };
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(['child-1', 'child-2']).toContain(sessionId);
+      return { targetInfo: { type: 'iframe', targetId: sessionId === 'child-1' ? 'frame-1' : 'frame-2',
+        url: sessionId === 'child-1' ? 'https://identity.test/' : 'https://challenge.test/' } };
+    }
     if (method === 'Runtime.evaluate' && args?.expression?.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
       return { result: { value: { url: sessionId === 'child-1'
         ? 'https://identity.test/' : 'https://challenge.test/', timeOrigin: sessionId === 'child-1' ? 123 : 456 } } };
@@ -564,7 +579,7 @@ it('does not fill a vault password while a timed-out CDP read is still in flight
   } finally { release(); await new Promise(resolve => setTimeout(resolve, 0)); driver.dispose(); }
 });
 
-it('sends child CDP commands only to an attached same-site session and rejects navigation races', async () => {
+it('sends child CDP commands only to the approved attached iframe and rejects probe/navigation races', async () => {
   const { driver, request, guest, sendCommand } = harness();
   await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
   const grant = { origin: 'https://example.com', isCurrentChild: () => true,
@@ -574,25 +589,44 @@ it('sends child CDP commands only to an attached same-site session and rejects n
   guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1',
     targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.com/frame' } });
   let childUrl = 'https://example.com/frame';
-  sendCommand.mockImplementation(async (method: string) => method === 'Target.getTargetInfo'
-    ? { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } } : {});
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('session-1');
+      return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+    }
+    return {};
+  });
+  let approvedTarget = await driver.cdpTarget(27, { targetId: 'child-1' });
   await driver.handle(request('cdpWrite', { method: 'Input.dispatchMouseEvent',
-    params: { type: 'mouseMoved', x: 1, y: 2 }, target: { targetId: 'child-1' } }), undefined, grant);
+    params: { type: 'mouseMoved', x: 1, y: 2 }, target: { targetId: 'child-1' } }), undefined,
+    { ...grant, target: approvedTarget });
   expect(sendCommand.mock.calls.find(([method]) => method === 'Input.dispatchMouseEvent')?.[2])
     .toBe('session-1');
   sendCommand.mockClear();
+  childUrl = 'https://silent-navigation.test/frame';
+  await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
+    .rejects.toThrow(/changed after approval/);
+  expect(sendCommand.mock.calls.some(([method]) => method === 'Page.getLayoutMetrics')).toBe(false);
+  childUrl = 'https://example.com/frame';
   guest.debugger.emit('message', {}, 'Target.targetInfoChanged', {
     targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://other.test/frame' } });
   childUrl = 'https://other.test/frame';
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
+    .rejects.toThrow(/changed after approval/);
+  expect(sendCommand.mock.calls.some(([method]) => method === 'Page.getLayoutMetrics')).toBe(false);
+  approvedTarget = await driver.cdpTarget(27, { sessionId: 'session-1' });
+  await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .resolves.toEqual({});
   expect(sendCommand.mock.calls.find(([method]) => method === 'Page.getLayoutMetrics')?.[2])
     .toBe('session-1');
-  sendCommand.mockImplementation(async (method: string) => {
-    if (method === 'Target.getTargetInfo') return { targetInfo: {
-      type: 'iframe', targetId: 'child-1', url: childUrl,
-    } };
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>, sessionId?: string) => {
+    if (method === 'Target.getTargetInfo') {
+      expect(args).toEqual({}); expect(sessionId).toBe('session-1');
+      return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+    }
     if (method === 'Page.getLayoutMetrics') {
       guest.debugger.emit('message', {}, 'Target.targetInfoChanged', {
         targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.com/frame' },
@@ -604,13 +638,36 @@ it('sends child CDP commands only to an attached same-site session and rejects n
     return {};
   });
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .rejects.toThrow(/child target site changed/);
   guest.debugger.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'session-1' });
   await expect(driver.handle(request('cdpCall', { method: 'Page.getLayoutMetrics',
-    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read' }))
+    target: { sessionId: 'session-1' } }), undefined, { ...grant, mode: 'read', target: approvedTarget }))
     .rejects.toThrow(/not attached/);
   driver.dispose();
+});
+
+it.each(['target-id', 'target-type', 'url', 'revision', 'detached'])('rejects changed child metadata (%s) on its own registered session', async change => {
+  const { driver, request, guest, sendCommand } = harness();
+  try {
+    await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
+    await driver.handle(request('viewport'));
+    const info = { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' };
+    guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'bound-child', targetInfo: info });
+    sendCommand.mockImplementation(async (method: string, params?: Record<string, any>, sessionId?: string) => {
+      expect(method).toBe('Target.getTargetInfo'); expect(params).toEqual({}); expect(sessionId).toBe('bound-child');
+      if (change === 'revision') guest.debugger.emit('message', {}, 'Target.targetInfoChanged', { targetInfo: info });
+      if (change === 'detached') guest.debugger.emit('message', {}, 'Target.detachedFromTarget', { sessionId: 'bound-child' });
+      return { targetInfo: { ...info, ...(change === 'target-id' ? { targetId: 'foreign-target' }
+        : change === 'target-type' ? { type: 'page' } : change === 'url' ? { url: 'chrome://settings/' } : {}) } } as any;
+    });
+    sendCommand.mockClear();
+    await expect(driver.cdpTarget(27, { sessionId: 'bound-child' })).rejects.toThrow();
+    expect(sendCommand).toHaveBeenCalledTimes(1);
+    sendCommand.mockClear();
+    await expect(driver.cdpTarget(27, { sessionId: 'unregistered-child' })).rejects.toThrow(/not attached/);
+    expect(sendCommand).not.toHaveBeenCalled();
+  } finally { driver.dispose(); }
 });
 
 it('rechecks selection and origin after attaching CDP but before sending autofill values', async () => {
@@ -1009,6 +1066,31 @@ it('records only navigations from the attached in-app webview', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+it('ends Agent task device choices when the tab moves to another origin or closes', () => {
+  const { driver, guest, navigate } = harness();
+  const tasks = driver.taskSitePermissions;
+  const origin = 'https://example.com';
+  try {
+    tasks.set(27, origin, 'camera', true, () => true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: `${origin}/room` });
+    navigate(`${origin}/room`);
+    guest.emit('did-navigate');
+    guest.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false, url: 'https://frame.test/' });
+    expect(tasks.decision(27, origin, 'camera')).toBe(true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: 'https://other.test/' });
+    expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+    tasks.set(27, origin, 'camera', true, () => true);
+    guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: `${origin}/redirect` });
+    navigate('https://other.test/landing');
+    guest.emit('did-navigate');
+    navigate(`${origin}/room`);
+    expect(tasks.decision(27, origin, 'camera')).toBeUndefined();
+    tasks.set(27, origin, 'microphone', true, () => true);
+    guest.emit('destroyed');
+    expect(tasks.decision(27, origin, 'microphone')).toBeUndefined();
+  } finally { driver.dispose(); }
+});
+
 it('marks Agent navigations separately from user address-bar navigation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-webview-sources-'));
   try {
@@ -1035,7 +1117,10 @@ it('opens a new visible tab for an Agent navigation while retaining the user tab
   host.webContents.send.mockImplementation((_channel: string, target: string) => {
     const next = Object.assign(new EventEmitter(), { ...guest, id: 28,
       getURL: () => target, getTitle: () => 'New tab' });
+    next.removeAllListeners();
     driver.attach(next as any, host as any);
+    next.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: target });
+    next.emit('did-finish-load');
   });
   const result = await driver.handle(request('openTab', { url: 'https://example.com/guide', scopeKey: 'chat-owner' }));
   expect(host.webContents.send).toHaveBeenCalledWith('memmy:browser:open-url', 'https://example.com/guide', { scopeKey: 'chat-owner' });
@@ -1067,10 +1152,16 @@ it('refuses an ownerless Agent open request before creating or selecting a tab',
 it('skips the initial blank webview when a new browser panel mounts before the requested tab', async () => {
   const { driver, request, host, guest } = harness();
   host.webContents.send.mockImplementation((_channel: string, target: string) => {
-    driver.attach(Object.assign(new EventEmitter(), { ...guest, id: 28,
-      getURL: () => 'about:blank', getTitle: () => '' }) as any, host as any);
-    driver.attach(Object.assign(new EventEmitter(), { ...guest, id: 29,
-      getURL: () => target, getTitle: () => 'Requested tab' }) as any, host as any);
+    const blank = Object.assign(new EventEmitter(), { ...guest, id: 28,
+      getURL: () => 'about:blank', getTitle: () => '' });
+    blank.removeAllListeners();
+    driver.attach(blank as any, host as any);
+    const requested = Object.assign(new EventEmitter(), { ...guest, id: 29,
+      getURL: () => target, getTitle: () => 'Requested tab' });
+    requested.removeAllListeners();
+    driver.attach(requested as any, host as any);
+    requested.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: target });
+    requested.emit('did-finish-load');
   });
   await expect(driver.handle(request('openTab', { url: 'https://example.com/guide', scopeKey: 'chat-owner' })))
     .resolves.toMatchObject({ tabId: 29, url: 'https://example.com/guide' });
@@ -1135,5 +1226,321 @@ it('issues an exact current tab mention and closes the addressed webview', async
   expect(await driver.handle(request('closeTab'))).toEqual({ closed: true });
   expect(host.webContents.send).toHaveBeenCalledWith('memmy:browser:close-tab', 27);
   await expect(driver.handle(request('snapshot'))).rejects.toThrow(/no longer open/);
+  driver.dispose();
+});
+
+function playwrightHarness() {
+  const test = harness();
+  let allowed = true, current = true;
+  const approval = { origin: 'https://example.com', isAllowed: () => allowed, isCurrentChild: () => current };
+  const id = 'a'.repeat(32);
+  const events: Array<{ leaseId: string; method: string; params: Record<string, unknown>; sessionId?: string }> = [];
+  const run = (command: EmbeddedBrowserRequest['command'], args: Record<string, unknown> = {}, upload?: any) =>
+    test.driver.handle(test.request(command, { approvedOrigin: 'https://example.com', leaseId: id, ...args }), upload, approval,
+      () => current, event => { events.push(event); });
+  return { ...test, id, run, approval, events, start: (input = false, args: Record<string, unknown> = {}, upload?: any) =>
+    run('playwrightStart', { input, fresh: true, ...args }, upload),
+    setAllowed: (value: boolean) => { allowed = value; }, setCurrent: (value: boolean) => { current = value; } };
+}
+
+it('focuses only the exact guest for an input lease and stops before dispatch if the host regains focus', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    test.focusFrame({ frameTreeNodeId: 99 });
+    await test.start(true);
+    expect(test.host.webContents.executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('getWebContentsId() === 27'));
+    expect(test.guest.backgroundThrottling).toBe(false);
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'exact guest' } });
+    test.sendCommand.mockClear();
+    test.focusFrame({ frameTreeNodeId: 99 });
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never sent' } }))
+      .rejects.toThrow(/input receiver changed/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await test.run('playwrightEnd');
+    expect(test.guest.backgroundThrottling).toBe(true);
+    expect(test.guest.focus).not.toHaveBeenCalled();
+    expect(test.host.show).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('does not focus or change animation throttling for observation leases', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(false);
+    expect(test.host.webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('waits for real typing in the host composer and leaves its focus alone during continued use', async () => {
+  vi.useFakeTimers();
+  const test = playwrightHarness();
+  let repeated: ReturnType<typeof setInterval> | undefined;
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    const type = () => test.host.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'a' });
+    type(); repeated = setInterval(type, 200);
+    const starting = test.start(true).then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(8_001);
+    expect((await starting)?.message).toBe('USER_ACTIVE_ON_TARGET_TAB');
+    expect(test.host.webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { clearInterval(repeated); vi.useRealTimers(); test.driver.dispose(); }
+});
+
+it('ignores its own keyboard input echoed by the host and removes host listeners on disposal', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(true);
+    const send = test.sendCommand.getMockImplementation()!;
+    test.sendCommand.mockImplementation(async (method, args) => {
+      if (method === 'Input.insertText') test.host.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'a' });
+      return send(method, args);
+    });
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'first' } });
+    await test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'second' } });
+    expect(test.sendCommand.mock.calls.filter(([method]) => method === 'Input.insertText')).toHaveLength(2);
+    test.driver.dispose();
+    expect(test.host.webContents.listenerCount('before-input-event')).toBe(0);
+  } finally { test.driver.dispose(); }
+});
+
+it.each(['focus-failed', 'cancelled', 'navigation', 'expired'] as const)('restores animation throttling when an input lease is %s', async failure => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    if (failure === 'focus-failed') test.host.webContents.executeJavaScript.mockResolvedValueOnce(false);
+    if (failure === 'cancelled') test.host.webContents.executeJavaScript.mockImplementationOnce(async () => {
+      test.setCurrent(false); return true;
+    });
+    if (failure === 'focus-failed' || failure === 'cancelled') await expect(test.start(true)).rejects.toThrow();
+    else {
+      if (failure === 'expired') vi.useFakeTimers();
+      await test.start(true);
+      if (failure === 'navigation') test.guest.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false, url: 'https://example.com/next' });
+      else await vi.advanceTimersByTimeAsync(45_001);
+    }
+    expect(test.guest.backgroundThrottling).toBe(true);
+    expect(test.guest.setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
+  } finally { vi.useRealTimers(); test.driver.dispose(); }
+});
+
+it('restores an already unthrottled guest without enabling throttling, and ignores stale lease cleanup', async () => {
+  const test = playwrightHarness();
+  test.guest.backgroundThrottling = false;
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.start(true); await test.run('playwrightEnd');
+    expect(test.guest.backgroundThrottling).toBe(false);
+    await test.start(true, { leaseId: 'b'.repeat(32) });
+    test.guest.setBackgroundThrottling.mockClear();
+    await test.run('playwrightEnd');
+    expect(test.guest.setBackgroundThrottling).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('starts the built-in executor only with current site access and a fixed explicit tab', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await expect(test.driver.handle(test.request('playwrightStart', { leaseId: test.id, approvedOrigin: 'https://example.com', input: false, fresh: true })))
+      .rejects.toThrow(/cancelled|permission/);
+    expect(test.guest.debugger.attach).not.toHaveBeenCalled();
+    expect(await test.start()).toMatchObject({ targetInfo: { targetId: 'target-27', type: 'page' },
+      frameTree: { frame: { id: 'frame-27' } }, childTargets: [], documentEpoch: 0 });
+    expect(test.sendCommand).toHaveBeenCalledWith('Runtime.disable', {});
+    await expect(test.run('playwrightCdp', { method: 'Page.captureScreenshot', params: {} }))
+      .rejects.toThrow(/Screenshots are not supported/);
+  } finally { test.driver.dispose(); }
+});
+
+it('limits observation leases, rejects browser-wide/foreign targets and cancels before sending input', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.sendCommand.mockClear();
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'forbidden' } })).rejects.toThrow(/observation cannot send input/);
+    for (const method of ['Browser.close', 'Storage.getCookies', 'Target.createTarget', 'Target.attachToTarget']) {
+      await expect(test.run('playwrightCdp', { method, params: {} })).rejects.toThrow(/method is unavailable/);
+    }
+    await expect(test.run('playwrightCdp', { method: 'Target.getTargetInfo', params: { targetId: 'another-browser-tab' } }))
+      .rejects.toThrow(/outside this tab/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await test.run('playwrightEnd'); await test.start(true); test.sendCommand.mockClear();
+    test.setAllowed(false);
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never-sent' } })).rejects.toThrow(/revoked/);
+    test.setAllowed(true); test.setCurrent(false);
+    await expect(test.run('playwrightCdp', { method: 'Input.insertText', params: { text: 'never-sent' } })).rejects.toThrow(/cancelled/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); }
+});
+
+it('revokes same-site old documents, protects the current owner from stale End and avoids duplicate debugger listeners', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.guest.emit('did-navigate');
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: 'document.title' } }))
+      .rejects.toThrow(/lease expired/);
+    await test.start(); await test.run('playwrightEnd');
+    const replacement = 'b'.repeat(32);
+    await test.run('playwrightStart', { leaseId: replacement, input: false, fresh: true });
+    await test.run('playwrightEnd', { detach: true });
+    expect(test.guest.debugger.detach).not.toHaveBeenCalled();
+    test.setCurrent(false);
+    await expect(test.run('playwrightEnd', { leaseId: replacement, detach: true })).resolves.toEqual({ ok: true });
+    expect(test.guest.debugger.detach).toHaveBeenCalledTimes(1);
+    test.setCurrent(true); await test.start();
+    expect(test.guest.debugger.listenerCount('message')).toBe(1);
+    expect(test.guest.debugger.listenerCount('detach')).toBe(1);
+  } finally { test.driver.dispose(); }
+});
+
+it.each([
+  { label: 'main frame navigation', method: 'Page.frameNavigated', params: { frame: { id: 'frame-27', url: 'https://example.com/' } } },
+  { label: 'same-process iframe reload', method: 'Page.frameNavigated', params: { frame: { id: 'iframe-1', parentId: 'frame-27', url: 'https://frame.test/form' } } },
+  { label: 'OOPIF reload', method: 'Page.frameNavigated', params: { frame: { id: 'iframe-1', parentId: 'frame-27', url: 'https://frame.test/form' } }, sessionId: 'session-1' },
+  { label: 'iframe attachment', method: 'Page.frameAttached', params: { frameId: 'iframe-1', parentFrameId: 'frame-27' } },
+  { label: 'iframe removal', method: 'Page.frameDetached', params: { frameId: 'iframe-1', reason: 'remove' } },
+])('versions idle $label without revoking an active executor for frame metadata', async event => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    await test.driver.handle(test.request('viewport'));
+    test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1',
+      targetInfo: { type: 'iframe', targetId: 'iframe-1', url: 'https://frame.test/form' } });
+    const first = await test.start(false, { fresh: false }) as any;
+    await test.run('playwrightEnd');
+    test.guest.debugger.emit('message', {}, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    const second = await test.start(false, { fresh: false }) as any;
+    expect(second.frameEpoch).toBe(first.frameEpoch + 1);
+    expect(second.documentEpoch).toBe(first.documentEpoch);
+    expect(second.cdpEpoch).toBe(first.cdpEpoch);
+    expect(second.frameTree).toEqual(first.frameTree);
+    expect(second.childTargets).toEqual(first.childTargets);
+    expect(test.events.filter(item => item.method === event.method)).toEqual([]);
+    test.guest.debugger.emit('message', {}, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    await expect(test.run('playwrightCdp', { method: 'Page.getLayoutMetrics', params: {} }))
+      .resolves.toMatchObject({ cssVisualViewport: { clientWidth: 800 } });
+  } finally { test.driver.dispose(); }
+});
+
+it('does not replace a new executor owner after an older Start finishes waiting for user idle', async () => {
+  const test = playwrightHarness();
+  let resume!: () => void, entered = false;
+  const idle = vi.spyOn(test.driver as any, 'waitForUserIdle').mockImplementationOnce(async () => {
+    entered = true;
+    await new Promise<void>(resolve => { resume = resolve; });
+  });
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' }));
+    const waiting = test.start(true);
+    const checked = expect(waiting).rejects.toThrow(/already busy/);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const replacement = 'b'.repeat(32);
+    await test.run('playwrightStart', { leaseId: replacement, input: false, fresh: false });
+    test.sendCommand.mockClear();
+    resume(); await checked;
+    expect(test.sendCommand).not.toHaveBeenCalled();
+    await expect(test.run('playwrightCdp', { leaseId: replacement, method: 'Page.getLayoutMetrics', params: {} }))
+      .resolves.toMatchObject({ cssVisualViewport: { clientWidth: 800 } });
+  } finally { resume?.(); idle.mockRestore(); test.driver.dispose(); }
+});
+
+it('pushes only current-lease executor events and reports a revoked lease to the waiting executor', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    test.guest.debugger.emit('message', {}, 'Runtime.executionContextCreated', { context: { id: 4 } });
+    expect(test.events.at(-1)).toEqual({ leaseId: test.id, method: 'Runtime.executionContextCreated', params: { context: { id: 4 } } });
+    await test.run('playwrightEnd');
+    const ended = test.events.length;
+    test.guest.debugger.emit('message', {}, 'Page.lifecycleEvent', { name: 'load', frameId: 'frame-27' });
+    expect(test.events).toHaveLength(ended);
+    await test.start();
+    test.guest.emit('did-start-navigation', { isMainFrame: true, url: 'https://example.com/reloaded' });
+    expect(test.events.at(-1)).toEqual({ leaseId: test.id, method: 'Memmy.executorRevoked', params: { reason: 'navigation' } });
+    await expect(test.run('playwrightCdp', { method: 'Page.getLayoutMetrics', params: {} })).rejects.toThrow(/page changed|lease expired/);
+  } finally { test.driver.dispose(); }
+});
+
+it('permits only an existing iframe session without a metadata round trip and detects frame replacement during a call', async () => {
+  const test = playwrightHarness();
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start();
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: '1' }, sessionId: 'foreign-session' }))
+      .rejects.toThrow(/frame changed/);
+    const info = { targetId: 'iframe-1', type: 'iframe', url: 'https://frame.test/form' };
+    test.guest.debugger.emit('message', {}, 'Target.attachedToTarget', { sessionId: 'session-1', targetInfo: info });
+    const initial = test.sendCommand.getMockImplementation()!;
+    test.sendCommand.mockImplementation(async (method, args) => {
+      if (method === 'Target.getTargetInfo') throw new Error('Executor child commands must not query metadata first');
+      if (method === 'Runtime.evaluate') {
+        test.guest.debugger.emit('message', {}, 'Page.frameNavigated', { frame: { id: 'iframe-1' } }, 'session-1');
+        return { result: { value: 1 } };
+      }
+      return initial(method, args);
+    });
+    await expect(test.run('playwrightCdp', { method: 'Runtime.evaluate', params: { expression: '1' }, sessionId: 'session-1' }))
+      .rejects.toThrow(/frame changed/);
+  } finally { test.driver.dispose(); }
+});
+
+it('retains typed upload permission only for matching stamped files and refuses mutation or ordinary leases', async () => {
+  const test = playwrightHarness(), directory = fs.mkdtempSync(path.join(os.tmpdir(), 'memmy-pw-upload-'));
+  const file = path.join(directory, 'approved.txt'); fs.writeFileSync(file, 'approved');
+  const stat = fs.lstatSync(file), upload = { origin: 'https://example.com', isCurrentChild: () => true, stamps: [{
+    path: file, realPath: fs.realpathSync(file), dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }] };
+  try {
+    await test.driver.handle(test.request('allowOrigin', { origin: 'https://example.com' })); await test.start(true);
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } }))
+      .rejects.toThrow(/not approved/);
+    await test.run('playwrightEnd');
+    await expect(test.start(true, { uploadPaths: [file] })).rejects.toThrow(/not approved/);
+    await test.start(true, { uploadPaths: [file] }, upload);
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } })).resolves.toEqual({});
+    fs.writeFileSync(file, 'file changed after approval'); test.sendCommand.mockClear();
+    await expect(test.run('playwrightCdp', { method: 'DOM.setFileInputFiles', params: { files: [file], objectId: 'file-input' } })).rejects.toThrow(/file changed/);
+    expect(test.sendCommand).not.toHaveBeenCalled();
+  } finally { test.driver.dispose(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+it.each([true, false])('fills required secure inputs (already known = %s) without changing an unspecified optional input', async known => {
+  const { driver, request, sendCommand } = harness();
+  await driver.handle(request('allowOrigin', { origin: 'https://example.com' }));
+  class Input {
+    isConnected = true; disabled = false; type = 'text';
+    constructor(private currentValue: string) {}
+    get value() { return this.currentValue; }
+    set value(value: string) { this.currentValue = value; }
+    getClientRects() { return [{}]; }
+    dispatchEvent() {}
+  }
+  const code = new Input('old code'), optional = new Input('keep this optional value');
+  const document = { URL: 'https://example.com/', defaultView: {
+    HTMLInputElement: Input, Event: class { constructor(_name: string, _options: unknown) {} },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+  }, querySelectorAll: (selector: string) => selector === '#code' ? [code] : selector === '#optional' ? [optional] : [] };
+  sendCommand.mockImplementation(async (method: string, args?: Record<string, any>) => {
+    if (method !== 'Runtime.evaluate') return {};
+    return { result: { value: runInNewContext(args?.expression, { document }) } };
+  });
+  const collect = vi.fn(async metadata => {
+    expect(metadata.fields.map((field: { id: string }) => field.id)).toEqual(['code']);
+    return { values: { code: 'collected-code' } };
+  });
+  const result = await driver.requestAuth(27, { origin: 'https://example.com', fields: [
+    { id: 'code', label: '验证码', type: 'text', required: true, selector: '#code' },
+    { id: 'optional', label: 'Optional value', type: 'text', required: false, selector: '#optional' },
+  ], provided_values: known ? { code: 'provided-code-246810' } : {} }, collect, () => true);
+  expect(result).toEqual({ status: 'submitted' });
+  expect(collect).toHaveBeenCalledTimes(known ? 0 : 1);
+  expect(code.value).toBe(known ? 'provided-code-246810' : 'collected-code');
+  expect(optional.value).toBe('keep this optional value');
+  expect(JSON.stringify(result)).not.toContain('provided-code-246810');
+  await expect(driver.handle(request('snapshot'))).rejects.toThrow(/credential protection/);
   driver.dispose();
 });

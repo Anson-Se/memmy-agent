@@ -1,5 +1,6 @@
 """Connection preflight and cleanup behavior; never launches any application."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -74,7 +75,7 @@ class ConnectPermissionTests(unittest.TestCase):
             mock.patch.object(connect.os, "geteuid", return_value=501),
             mock.patch.object(connect.os, "umask"),
             mock.patch.object(Path, "resolve", resolve),
-            mock.patch.object(connect, "lldb_python_path", return_value="/fake/lldb"),
+            mock.patch.object(connect, "wechat_application", return_value=self.app),
             mock.patch.object(connect, "consent_id", side_effect=lambda state: self.consent),
             mock.patch.object(connect, "current_database_root", return_value=self.root),
             mock.patch.object(connect, "prepare_permission_helper", side_effect=self.prepare),
@@ -94,11 +95,10 @@ class ConnectPermissionTests(unittest.TestCase):
             if isinstance(value, mock.Mock):
                 self.patched[patch.attribute] = value
 
-    def prepare(self, state, app, lldb_path):
+    def prepare(self, state, app):
         self.order.append("permission_checked")
         self.assertEqual(state, self.state)
         self.assertEqual(app, self.app)
-        self.assertEqual(lldb_path, "/fake/lldb")
         return dict(self.preparation)
 
     def emit(self, event, **fields):
@@ -131,7 +131,7 @@ class ConnectPermissionTests(unittest.TestCase):
         self.order.append("capture_spawned")
         self.assertEqual(arguments[:2], [sys.executable, str(SOURCE / "capture_keys.py")])
         self.assertEqual(arguments[arguments.index("--executable") + 1], str(self.executable))
-        self.assertEqual(options["env"]["PYTHONPATH"], "/fake/lldb")
+        self.assertNotIn("PYTHONPATH", options["env"])
         self.assertFalse(any(key.startswith("DYLD_") for key in options["env"]))
         for kind, source in zip(("CONTAINER", "GROUP"), self.storage["mappings"]):
             self.assertEqual(options["env"]["MEMMY_WECHAT_" + kind + "_SOURCE"], source)
@@ -142,7 +142,7 @@ class ConnectPermissionTests(unittest.TestCase):
     def run_subprocess(self, arguments, **options):
         if arguments[0] == "osascript":
             self.order.append("quit_requested")
-        elif arguments == ["open", "-a", "/Applications/WeChat.app"]:
+        elif arguments == ["open", str(self.app)]:
             self.order.append("original_opened")
         else:
             raise AssertionError("unexpected subprocess: " + repr(arguments))
@@ -202,7 +202,7 @@ class ConnectPermissionTests(unittest.TestCase):
         alias.symlink_to(self.state, target_is_directory=True)
         self.state = alias
 
-        def refuse(state, app, lldb_path):
+        def refuse(state, app):
             self.assertEqual(state, alias)
             self.assertTrue(state.is_symlink())
             return {"ready": False, "appPath": None, "error": "wechat_permission_helper_unavailable"}
@@ -217,7 +217,7 @@ class ConnectPermissionTests(unittest.TestCase):
         alias.symlink_to(self.state, target_is_directory=True)
         self.state = alias
 
-        def refuse(state, app, lldb_path):
+        def refuse(state, app):
             self.assertEqual(state, alias)
             self.assertTrue(state.is_symlink())
             return {"ready": False, "appPath": None, "error": "wechat_permission_helper_unavailable"}
@@ -403,6 +403,62 @@ class ConnectPermissionTests(unittest.TestCase):
         self.assertNotIn("original_opened", self.order)
         self.assertNotIn("quitting_original", self.order)
 
+    def test_data_access_interruption_before_quit_reports_where_without_disturbing_wechat(self):
+        error = RuntimeError("wechat_data_access_interrupted")
+        error.detail = {"path": "/synthetic/Containers/com.tencent.xinWeChat/Data", "operation": "listdir",
+                        "errno": "EINTR"}
+        self.storage_module.preflight_private_storage.side_effect = error
+        with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
+                                             "--library", str(self.library)]):
+            self.assertEqual(connect.run(), 2)
+        self.assertEqual(self.events[-1], ("connection_error", {
+            "category": "wechat_data_access_interrupted", "detail": error.detail}))
+        self.assert_not_disturbed()
+        self.storage_module.preflight_private_storage.assert_called_once()
+        self.storage_module.cleanup.assert_not_called()
+        self.assertEqual(self.order.count("connection_error"), 1)
+
+    def test_snapshot_clone_failure_reports_where_cleans_session_and_restores_original_once(self):
+        self.patched["running_wechat"].side_effect = [True, False, False, False]
+        error = RuntimeError("wechat_private_storage_clone_failed")
+        error.detail = {"path": "/synthetic/Containers/com.tencent.xinWeChat/Data/Documents/a.db",
+                        "operation": "open", "errno": "EPERM"}
+
+        def fail_snapshot(state, *, consent_id):
+            self.prepare_storage(state, consent_id=consent_id)
+            shutil.rmtree(self.session)
+            raise error
+
+        self.storage_module.create_private_storage.side_effect = fail_snapshot
+        with mock.patch.object(sys, "argv", ["connect.py", "--state", str(self.state),
+                                             "--library", str(self.library)]):
+            self.assertEqual(connect.run(), 2)
+        expected = {"category": "wechat_private_storage_clone_failed", "detail": error.detail}
+        self.assertEqual(self.events[-1], ("connection_error", expected))
+        self.assertTrue(all(fields == expected for event, fields in self.events if event == "connection_error"))
+        self.assertEqual(self.order.count("quit_requested"), 1)
+        self.assertEqual(self.order.count("original_opened"), 1)
+        self.storage_module.create_private_storage.assert_called_once()
+        self.patched["Popen"].assert_not_called()
+        self.assertFalse(self.session.exists())
+        self.assertEqual(self.original.read_bytes(), b"unchanged-original")
+
+    def test_connection_error_fields_keep_string_detail_and_a_safe_category(self):
+        error = RuntimeError("wechat_private_storage_unsafe_path")
+        error.detail = {"path": "/synthetic/Data/link", "reason": "symlink"}
+        self.assertEqual(connect.connection_error_fields(error), {
+            "category": "wechat_private_storage_unsafe_path", "detail": error.detail})
+        for detail in ({}, [], {"path": 1}, {"errno": errno.EINTR}, "path"):
+            with self.subTest(detail=detail):
+                error = RuntimeError("wechat_data_access_interrupted")
+                error.detail = detail
+                self.assertEqual(connect.connection_error_fields(error), {
+                    "category": "wechat_data_access_interrupted"})
+        self.assertEqual(connect.connection_error_fields(RuntimeError("free text: /private/chat.db")), {
+            "category": "connection_process_failed"})
+        self.assertEqual(connect.connection_error_fields(InterruptedError(errno.EINTR, "interrupted")), {
+            "category": "InterruptedError"})
+
     def test_final_source_change_is_rejected_after_quit_and_restores_original(self):
         self.patched["running_wechat"].side_effect = [True, False, False, False]
 
@@ -527,6 +583,135 @@ class ReaderErrorPropagationTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 2, "", stderr)):
                 with self.assertRaisesRegex(RuntimeError, "^command_failed:python3$"):
                     connect.command([sys.executable, "read_messages.py", "baseline"])
+
+
+class WeChatApplicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.app = Path(temporary.name).resolve() / "Custom Place/WeChat.app"
+        (self.app / "Contents/MacOS").mkdir(parents=True)
+
+    def test_resolves_a_non_default_install_through_launch_services(self):
+        with mock.patch.object(connect.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, str(self.app) + "/\n", "")) as run:
+            self.assertEqual(connect.wechat_application(), self.app)
+        self.assertEqual(run.call_args.args[0][0], "osascript")
+
+    def test_missing_registration_and_default_location_reports_missing(self):
+        with mock.patch.object(connect.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 1, "", "not found")), \
+                mock.patch.object(Path, "is_dir", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_application_missing$"):
+                connect.wechat_application()
+
+
+class ActiveDatabaseRootTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        base = self.home / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+        self.roots = [base / account / "db_storage" for account in ("account-one", "account-two")]
+        for root in self.roots:
+            (root / "message").mkdir(parents=True)
+            (root / "message/message_0.db").write_bytes(b"synthetic-encrypted-file")
+        self.original = self.home / "Applications/WeChat.app/Contents/MacOS/WeChat"
+        self.original.parent.mkdir(parents=True)
+        self.original.write_bytes(b"original-executable")
+        self.shadow = self.home / "connection-helper/Memmy WeChat Reader.app/Contents/MacOS/WeChat"
+        self.shadow.parent.mkdir(parents=True)
+        self.shadow.write_bytes(b"temporary-copy")
+        self.processes = f"100 {self.original}\n200 {self.shadow}\n"
+        self.opened = f"p100\nn{self.roots[1]}/message/message_0.db\n"
+        self.commands = []
+
+    def run_process(self, argv, **options):
+        self.commands.append(argv)
+        self.assertEqual(options.get("timeout"), 5)
+        if argv[0] == "pgrep":
+            return subprocess.CompletedProcess(argv, 0, "100\n200\n", "")
+        if argv[0] == "ps":
+            return subprocess.CompletedProcess(argv, 0, self.processes, "")
+        if argv[0] == "/usr/sbin/lsof":
+            self.assertEqual(argv[-1], "100")
+            return subprocess.CompletedProcess(argv, 0, self.opened, "")
+        raise AssertionError(argv)
+
+    def select(self):
+        with mock.patch.object(Path, "home", return_value=self.home), \
+                mock.patch.object(connect.subprocess, "run", side_effect=self.run_process):
+            return connect.current_database_root(self.original)
+
+    def test_selects_only_database_opened_by_original_not_temporary_copy(self):
+        self.opened += f"p200\nn{self.roots[0]}/message/message_0.db\n"
+        self.assertEqual(self.select(), self.roots[1])
+
+    @unittest.skipUnless(sys.platform == "darwin", "APFS firmlink alias is macOS-specific")
+    def test_data_volume_firmlink_alias_matches_original_directory_identity(self):
+        alias = Path("/System/Volumes/Data" + str(self.roots[1] / "message/message_0.db"))
+        if not alias.exists():
+            self.skipTest("temporary directory is not on the firmlinked data volume")
+        self.assertNotEqual(str(alias.resolve()), str(self.roots[1] / "message/message_0.db"))
+        self.opened = f"p100\nn{alias}\n"
+        self.assertEqual(self.select(), self.roots[1])
+
+    def test_open_wal_file_is_account_evidence(self):
+        wal = self.roots[0] / "message/message_0.db-wal"
+        wal.write_bytes(b"synthetic-wal")
+        self.opened = f"p100\nn{wal}\n"
+        self.assertEqual(self.select(), self.roots[0])
+
+    def test_two_open_accounts_remain_ambiguous(self):
+        self.opened += f"n{self.roots[0]}/message/message_0.db\n"
+        with self.assertRaisesRegex(RuntimeError, "^current_account_ambiguous$"):
+            self.select()
+
+    def test_non_database_files_do_not_select_an_account(self):
+        note = self.roots[1] / "note.txt"
+        note.write_text("synthetic-metadata")
+        self.opened = f"p100\nn{note}\n"
+        with self.assertRaisesRegex(RuntimeError, "^current_account_ambiguous$"):
+            self.select()
+
+    def test_temporary_copy_alone_does_not_select_an_account(self):
+        self.processes = f"200 {self.shadow}\n"
+        with self.assertRaisesRegex(RuntimeError, "^current_account_ambiguous$"):
+            self.select()
+        self.assertFalse(any(command[0] == "/usr/sbin/lsof" for command in self.commands))
+
+    def test_lsof_timeout_does_not_guess_from_directory_times(self):
+        def timeout(argv, **options):
+            if argv[0] == "/usr/sbin/lsof":
+                raise subprocess.TimeoutExpired(argv, 5)
+            return self.run_process(argv, **options)
+        with mock.patch.object(Path, "home", return_value=self.home), \
+                mock.patch.object(connect.subprocess, "run", side_effect=timeout):
+            with self.assertRaisesRegex(RuntimeError, "^current_account_ambiguous$"):
+                connect.current_database_root(self.original)
+
+
+class DatabaseRootInterruptionTests(unittest.TestCase):
+    def test_interrupted_account_listing_is_repeated(self):
+        root = Path("/synthetic/xwechat_files/account/db_storage")
+        interrupted = InterruptedError(errno.EINTR, "approval wait interrupted")
+        with mock.patch.object(connect, "_current_database_root", side_effect=[interrupted, root]) as listing:
+            self.assertEqual(connect.current_database_root(), root)
+        self.assertEqual(listing.call_count, 2)
+
+    def test_repeated_interruption_is_reported_as_unapproved_data_access(self):
+        interrupted = InterruptedError(errno.EINTR, "approval wait interrupted")
+        with mock.patch.object(connect, "_current_database_root", side_effect=interrupted) as listing:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$"):
+                connect.current_database_root()
+        self.assertEqual(listing.call_count, 3)
+
+    def test_other_account_errors_are_not_repeated(self):
+        with mock.patch.object(connect, "_current_database_root",
+                               side_effect=RuntimeError("wechat_login_required")) as listing:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_login_required$"):
+                connect.current_database_root()
+        listing.assert_called_once()
 
 
 if __name__ == "__main__":

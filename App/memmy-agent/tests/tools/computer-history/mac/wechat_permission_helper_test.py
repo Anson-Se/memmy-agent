@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import importlib.util
 import json
@@ -84,9 +85,7 @@ class PermissionHelperTests(unittest.TestCase):
         Path(destination).chmod(0o700)
 
     def prepare(self):
-        result = self.helper.prepare_permission_helper(
-            self.state, app=self.app, lldb_path="/fake/lldb-bindings"
-        )
+        result = self.helper.prepare_permission_helper(self.state, app=self.app)
         self.assertEqual(set(result), {"ready", "appPath", "error"})
         return result
 
@@ -113,7 +112,6 @@ class PermissionHelperTests(unittest.TestCase):
         for call in self.probe.call_args_list:
             self.assertEqual(Path(call.args[0]), self.shadow)
             self.assertEqual(Path(call.args[1]), self.state)
-            self.assertEqual(call.args[2], "/fake/lldb-bindings")
         self.assertEqual(self.cache.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.original_executable.read_bytes(), b"fake-original-wechat-v1")
 
@@ -199,6 +197,14 @@ class PermissionHelperTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["error"], "wechat_data_access_unavailable")
         self.assertIsNone(result["appPath"])
+        self.build.assert_not_called()
+        self.probe.assert_not_called()
+
+    def test_unapproved_host_access_keeps_its_own_category(self):
+        self.host_access.side_effect = RuntimeError("wechat_data_access_interrupted")
+        result = self.prepare()
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["error"], "wechat_data_access_interrupted")
         self.build.assert_not_called()
         self.probe.assert_not_called()
 
@@ -338,7 +344,7 @@ class PermissionHelperTests(unittest.TestCase):
             self.assertEqual(arguments[0:2], [sys.executable, "-B"])
             self.assertEqual(arguments[3], "--probe-process")
             self.assertEqual(Path(arguments[4]), self.shadow)
-            self.assertEqual(options["env"]["PYTHONPATH"], "fake")
+            self.assertNotIn("PYTHONPATH", options["env"])
             self.assertEqual(options["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(options["stdout"], subprocess.DEVNULL)
             self.assertEqual(options["stderr"], subprocess.DEVNULL)
@@ -359,7 +365,7 @@ class PermissionHelperTests(unittest.TestCase):
         with mock.patch.object(self.helper.subprocess, "Popen", side_effect=start_probe) as launch:
             with mock.patch.object(self.helper, "_exact_probe_pid", side_effect=has_exact_identity) as identity:
                 with mock.patch.object(self.helper.os, "kill") as kill:
-                    result = self.actual_probe(self.shadow, self.state, "fake")
+                    result = self.actual_probe(self.shadow, self.state)
         launch.assert_called_once()
         self.assertEqual(list(self.cache.glob("permission-probe-*")), [])
         self.assertEqual(list(self.state.glob("storage-session-*")), [])
@@ -427,82 +433,129 @@ class PermissionHelperTests(unittest.TestCase):
         kill.assert_not_called()
         child.kill.assert_called_once_with()
 
-    def run_lldb_with_delayed_exit(self, overrides=None, remove_error=False):
+    def run_direct_probe(self, overrides=None, remove_error=False, child_pid=1234, running=True):
+        if self.shadow.exists():
+            shutil.rmtree(self.shadow)
         self.cache.mkdir(mode=0o700, exist_ok=True)
         shutil.copytree(self.app, self.shadow)
         output = self.cache / "result.json"
         challenge = "a" * 64
         executable = self.shadow / "Contents/MacOS/WeChat"
         value = {"challenge": challenge, "phase": "finished", "executable": str(executable),
-                 "probePid": 1234, "ready": True, "error": None}
+                 "probePid": child_pid, "ready": True, "error": None}
         value.update(overrides or {})
         if remove_error:
             value.pop("error")
         self.helper._atomic_json(output, value)
-        process = mock.Mock()
-        process.IsValid.return_value = True
-        process.GetProcessID.return_value = 1234
-        process.GetState.return_value = 14  # Still running after the result is complete.
-        target = mock.Mock()
-        target.IsValid.return_value = True
-        target.GetTriple.return_value = "arm64-apple-macosx27.0.0"
-        target.Launch.return_value = process
-        debugger = mock.Mock()
-        debugger.CreateTarget.return_value = target
-        launch = mock.Mock()
-        lldb = types.SimpleNamespace(
-            SBDebugger=types.SimpleNamespace(Create=mock.Mock(return_value=debugger), Destroy=mock.Mock()),
-            SBCommandReturnObject=lambda: types.SimpleNamespace(Succeeded=lambda: True),
-            SBError=lambda: types.SimpleNamespace(Fail=lambda: False),
-            SBLaunchInfo=lambda args: launch,
-            eStateExited=10, eStateCrashed=11, eStateDetached=12, eStateInvalid=13,
-        )
-        bridge_environment = {
+        child = mock.Mock()
+        child.pid = child_pid
+        child.poll.return_value = None if running else 0
+        captured = {}
+
+        def start(arguments, **options):
+            captured["argv"] = arguments
+            captured["env"] = options["env"]
+            captured["cwd"] = options["cwd"]
+            return child
+
+        container_environment = {
             "MEMMY_WECHAT_CONTAINER_SOURCE": "/fake-home/Library/Containers/com.tencent.xinWeChat",
             "MEMMY_WECHAT_CONTAINER_COPY": str(self.state / "private-container"),
             "MEMMY_WECHAT_GROUP_SOURCE": "/fake-home/Library/Group Containers/5A4RE8SF68.com.tencent.xinWeChat",
             "MEMMY_WECHAT_GROUP_COPY": str(self.state / "private-group"),
         }
-        with mock.patch.dict(sys.modules, {"lldb": lldb}), \
-                mock.patch.dict(self.helper.os.environ, bridge_environment), \
+        with mock.patch.object(self.helper.subprocess, "Popen", side_effect=start) as launch, \
+                mock.patch.dict(self.helper.os.environ, {**container_environment, "DYLD_LIBRARY_PATH": "/ambient"}), \
                 mock.patch.object(self.helper.time, "monotonic", side_effect=[100, 101, 121]), \
                 mock.patch.object(self.helper.time, "sleep") as sleep:
-            code = self.helper._run_lldb_probe(self.shadow, output, challenge)
-        process.Kill.assert_called_once_with()
-        lldb.SBDebugger.Destroy.assert_called_once_with(debugger)
-        return code, sleep, launch
+            code = self.helper._run_probe(self.shadow, output, challenge)
+        launch.assert_called_once()
+        return code, sleep, captured, child, container_environment
 
-    def test_lldb_accepts_finished_result_without_waiting_for_exit_notification(self):
-        code, sleep, launch = self.run_lldb_with_delayed_exit()
+    def test_direct_probe_accepts_finished_result_and_injects_only_private_mappings(self):
+        # The probe constructor _exits before WeChat's entry point, so by the time
+        # its result is read the launched copy has already stopped.
+        code, sleep, captured, child, container = self.run_direct_probe(running=False)
         self.assertEqual(code, 0)
         sleep.assert_not_called()
-        launch.SetEnvironmentEntries.assert_called_once()
+        child.kill.assert_not_called()
+        probe = self.shadow / "Contents/Frameworks" / self.helper._PROBE_NAME
+        bridge = probe.with_name(self.helper._BRIDGE_NAME)
+        self.assertEqual(captured["argv"], [str(self.shadow / "Contents/MacOS/WeChat")])
+        self.assertEqual(captured["env"]["DYLD_INSERT_LIBRARIES"], f"{bridge}:{probe}")
+        self.assertEqual(captured["env"]["MEMMY_WECHAT_PERMISSION_CHALLENGE"], "a" * 64)
+        self.assertNotIn("DYLD_LIBRARY_PATH", captured["env"])
+        for key, value in container.items():
+            self.assertEqual(captured["env"][key], value)
 
-    def test_lldb_accepts_finished_private_storage_failure_without_waiting_for_exit_notification(self):
-        code, sleep, launch = self.run_lldb_with_delayed_exit({
-            "ready": False, "error": "wechat_private_storage_probe_failed"})
-        self.assertEqual(code, 0)  # Valid protocol completion; outer layer keeps the failure.
+    def test_direct_probe_accepts_finished_private_storage_failure(self):
+        code, sleep, captured, child, _ = self.run_direct_probe({
+            "ready": False, "error": "wechat_private_storage_probe_failed"}, running=False)
+        self.assertEqual(code, 0)  # Valid protocol completion; the outer layer keeps the failure.
         sleep.assert_not_called()
 
-    def test_lldb_does_not_accept_started_result(self):
-        code, sleep, launch = self.run_lldb_with_delayed_exit({"phase": "started"})
+    def test_direct_probe_does_not_accept_started_result_while_still_running(self):
+        code, sleep, captured, child, _ = self.run_direct_probe({"phase": "started"})
         self.assertEqual(code, 2)
         sleep.assert_called_once_with(0.025)
+        child.kill.assert_called_once_with()
 
-    def test_lldb_requires_complete_result_from_its_exact_probe(self):
+    def test_direct_probe_requires_complete_result_from_its_exact_process(self):
         for overrides, remove_error in (
             ({"challenge": "other"}, False), ({"executable": "/another/WeChat"}, False),
             ({"probePid": 9999}, False), ({"ready": True, "error": "wechat_private_storage_probe_failed"}, False),
             ({}, True),
         ):
             with self.subTest(overrides=overrides, remove_error=remove_error):
-                # Each run has its own private copy and output.
-                if self.shadow.exists():
-                    shutil.rmtree(self.shadow)
-                code, sleep, launch = self.run_lldb_with_delayed_exit(overrides, remove_error)
+                code, sleep, captured, child, _ = self.run_direct_probe(overrides, remove_error)
                 self.assertEqual(code, 2)
                 sleep.assert_called_once_with(0.025)
 
+    def test_direct_probe_fails_when_the_copy_exits_without_a_valid_result(self):
+        code, sleep, captured, child, _ = self.run_direct_probe({"phase": "started"}, running=False)
+        self.assertEqual(code, 2)
+        child.kill.assert_not_called()
+
+
+
+class HostDataAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = load_helper()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        home = Path(temporary.name).resolve()
+        configuration = home / "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/config.ini"
+        configuration.parent.mkdir(parents=True)
+        configuration.write_text("synthetic")
+        patch = mock.patch.object(self.helper.pwd, "getpwuid", return_value=types.SimpleNamespace(pw_dir=str(home)))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_interrupted_listing_is_repeated(self):
+        original = Path.glob
+        calls = []
+
+        def glob(path, pattern):
+            calls.append(pattern)
+            if len(calls) == 1:
+                raise InterruptedError(errno.EINTR, "approval wait interrupted")
+            return original(path, pattern)
+
+        with mock.patch.object(Path, "glob", glob):
+            self.helper._check_host_data_access()
+        self.assertEqual(calls, ["app_data/net*/config.ini"] * 2)
+
+    def test_repeated_interruption_is_reported_as_unapproved_data_access(self):
+        with mock.patch.object(Path, "glob", side_effect=InterruptedError(errno.EINTR, "approval wait interrupted")) as glob:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$"):
+                self.helper._check_host_data_access()
+        self.assertEqual(glob.call_count, 3)
+
+    def test_denied_access_still_asks_for_disk_access(self):
+        with mock.patch.object(Path, "glob", side_effect=PermissionError(errno.EPERM, "denied")) as glob:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_required$"):
+                self.helper._check_host_data_access()
+        glob.assert_called_once()
 
 
 class PackagedLibraryTests(unittest.TestCase):
@@ -525,7 +578,7 @@ class PackagedLibraryTests(unittest.TestCase):
         with mock.patch.object(Path, "is_file", return_value=False), \
                 mock.patch.object(Path, "glob", return_value=[]), \
                 mock.patch.object(helper.subprocess, "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "^lldb_unavailable$"):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_native_helpers_unavailable$"):
                 helper._developer_clang()
             run.assert_not_called()
 

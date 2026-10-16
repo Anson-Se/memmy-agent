@@ -362,9 +362,9 @@ describe("capture health protocol", () => {
     expect(status()).toMatchObject({ status: "degraded", issues: [{ code: `${kind}_unavailable`, count: 5 }] });
   });
 
-  it("recovers transient privacy gaps after healthy events, excluding verified-private reports", async () => {
-    active(); health("observer_ready"); health("privacy_unknown", 4); health("private_browsing", 50);
-    expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "privacy_unknown", count: 4 }] });
+  it("recovers transient capture gaps after healthy events and ignores codes the recorder never sends", async () => {
+    active(); health("observer_ready"); health("ax_snapshot_budget_exceeded", 4); health("privacy_unknown", 50);
+    expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_budget_exceeded", count: 4 }] });
     await vi.advanceTimersByTimeAsync(1_000); health("event_recorded"); health("heartbeat");
     await vi.advanceTimersByTimeAsync(30_000);
     expect(status()).toMatchObject({ status: "healthy", issues: [] });
@@ -381,7 +381,7 @@ describe("capture health protocol", () => {
 
   it("accepts only the final successfully-written event timestamp while stopping, then rejects stale children", async () => {
     active(); const child = transport.children.at(-1)!;
-    health("observer_ready"); health("event_recorded"); health("privacy_unknown");
+    health("observer_ready"); health("event_recorded"); health("ax_snapshot_budget_exceeded");
     await vi.advanceTimersByTimeAsync(5_000);
     const finalAt = new Date().toISOString();
     child.closeOnExit = false;
@@ -397,7 +397,7 @@ describe("capture health protocol", () => {
   });
 
   it("reports paused capture as inactive without its former active warnings", async () => {
-    active(); health("observer_ready"); health("privacy_unknown", 3);
+    active(); health("observer_ready"); health("ax_snapshot_budget_exceeded", 3);
     await service.pauseObservation();
     expect(status()).toMatchObject({ status: "inactive", issues: [] });
   });
@@ -416,15 +416,16 @@ describe("capture health protocol", () => {
   it("keeps legacy Windows event-only health compatible without calling idle a failure", async () => {
     await onWindows(async () => {
       active(); health("event_recorded"); await vi.advanceTimersByTimeAsync(70_000);
-      expect(status()).toMatchObject({ status: "healthy", issues: [], limitations: ["foreground_events_and_accessibility_only", "private_and_unverifiable_browsers_excluded", "screenshots_and_audio_not_recorded"] });
+      expect(status()).toMatchObject({ status: "healthy", issues: [], limitations: ["foreground_events_and_accessibility_only", "screenshots_and_audio_not_recorded"] });
     });
   });
 
-  it("discloses excluded private and unverifiable Windows browsers even with a healthy heartbeat", async () => {
+  it("discloses Windows capture limits even with a healthy heartbeat and no longer claims browsers are excluded", async () => {
     await onWindows(async () => {
       active(); health("heartbeat");
       expect(status()).toMatchObject({ status: "healthy", issues: [],
-        limitations: expect.arrayContaining(["foreground_events_and_accessibility_only", "private_and_unverifiable_browsers_excluded"]) });
+        limitations: expect.arrayContaining(["foreground_events_and_accessibility_only"]) });
+      expect(status().limitations).not.toContain("private_and_unverifiable_browsers_excluded");
     });
     expect(status().limitations).not.toContain("foreground_events_and_accessibility_only");
   });
@@ -450,12 +451,29 @@ describe("capture health protocol", () => {
     });
   });
 
+  it("does not recover missing Windows content from successful input, observer startup or heartbeats", async () => {
+    await onWindows(async () => {
+      active(); health("heartbeat"); health("ax_snapshot_failed", 1);
+      await vi.advanceTimersByTimeAsync(31_000);
+      health("heartbeat"); health("event_recorded"); health("observer_ready");
+      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_failed", count: 1 }] });
+      const failedAt = new Date().toISOString();
+      await vi.advanceTimersByTimeAsync(1_000); health("ax_snapshot_ready");
+      expect(status()).toMatchObject({ status: "healthy", issues: [] });
+      // Delayed batched failures cannot erase newer persisted-read evidence.
+      health("ax_snapshot_failed", 2, failedAt);
+      expect(status()).toMatchObject({ status: "healthy", issues: [] });
+      await vi.advanceTimersByTimeAsync(1_000); health("ax_snapshot_failed", 1);
+      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_failed", count: 4 }] });
+    });
+  });
+
   it("requires post-issue heartbeat evidence before recovering a Windows transient gap", async () => {
     await onWindows(async () => {
       active(); health("heartbeat");
-      await vi.advanceTimersByTimeAsync(1_000); health("privacy_unknown", 3);
+      await vi.advanceTimersByTimeAsync(1_000); health("ax_snapshot_budget_exceeded", 3);
       await vi.advanceTimersByTimeAsync(31_000); health("event_recorded");
-      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "privacy_unknown", count: 3 }] });
+      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_budget_exceeded", count: 3 }] });
       health("heartbeat"); expect(status()).toMatchObject({ status: "healthy", issues: [] });
     });
   });

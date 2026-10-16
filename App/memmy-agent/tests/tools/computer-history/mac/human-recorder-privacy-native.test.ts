@@ -106,115 +106,32 @@ func browserPage(window: AXUIElement) -> (url: String?, title: String?) { (pageU
 func quickPageUrl(_ window: AXUIElement) -> String? { nil }
 func address() -> AXUIElement { AXUIElement("AXTextField", title: "地址和搜索栏") }
 func normalToolbar() -> AXUIElement { AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您")]) }
-func value(_ privateState: Bool?) -> Any { privateState as Any? ?? NSNull() }
 `;
 
-test.runIf(process.platform === "darwin")("native browser privacy requires normal primary-toolbar evidence and rechecks the same window", () => {
+test.runIf(process.platform === "darwin")("native browser windows report their own page without a private-window classification", () => {
   const result = runSwift(`${axFixture}
-${production("// A title marker", "struct FocusSnapshot")}
 ${production("func currentWindow(", "func refreshFocusedElement(")}
 var outcomes: [String: Any] = [:]
-func classify(_ name: String, _ window: AXUIElement, bundle: String = "com.google.Chrome", pageDetected: Bool = false) {
-  outcomes[name] = value(frontWindowIsPrivate(window: window, bundleId: bundle, pageDetected: pageDetected))
-}
-let normal = AXUIElement("AXWindow", title: "Public page", children: [normalToolbar()])
-classify("normal", normal)
-let privateToolbar = AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "无痕模式 (2)")])
-classify("privateWithoutTitleMarker", AXUIElement("AXWindow", title: "Ordinary page title", children: [privateToolbar]))
-classify("privateTitle", AXUIElement("AXWindow", title: "Page (Incognito)", children: [normalToolbar()]))
-classify("missingTitleAndEvidence", AXUIElement("AXWindow"))
-classify("missingTitleWithNormalEvidence", AXUIElement("AXWindow", children: [normalToolbar()]))
-let webArea = AXUIElement("AXWebArea", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "无痕模式")])])
-let bookmarks = AXUIElement("AXToolbar", title: "书签栏", children: [AXUIElement("AXButton", title: "无痕模式"), AXUIElement("AXButton", title: "您")])
-let extensionEntry = AXUIElement("AXCheckBox", title: "打开新的无痕式窗口 - 已固定")
-classify("pageBookmarksExtensionDoNotChangeNormal", AXUIElement("AXWindow", title: "Public page", children: [normalToolbar(), webArea, bookmarks, extensionEntry]))
-classify("bookmarkProfileCannotAuthorize", AXUIElement("AXWindow", title: "Ordinary page title", children: [bookmarks]))
-classify("pageProfileCannotAuthorize", AXUIElement("AXWindow", title: "Ordinary page title", children: [AXUIElement("AXWebArea", children: [normalToolbar()])]))
-classify("unscopedProfileCannotAuthorize", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXButton", title: "您")]))
-classify("customProfileUnknown", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "Named profile")])]))
-classify("unknownBrowserUnknown", normal, bundle: "com.example.UnknownBrowser", pageDetected: true)
-classify("nativeApp", AXUIElement("AXWindow"), bundle: "com.example.Editor")
-let safari = AXUIElement("AXWindow", title: "HTTPS page", children: [normalToolbar()])
-safari.fields["identifier"] = "SafariWindow?IsSecure=true&UUID=synthetic"
-classify("safariIsSecureNotNormalProof", safari, bundle: "com.apple.Safari")
-let unavailable = AXUIElement("AXGroup"); unavailable.childrenError = .cannotComplete
-classify("unrelatedReadFailureDoesNotBlockNormal", AXUIElement("AXWindow", title: "Page", children: [normalToolbar(), unavailable]))
-let wide = AXUIElement("AXWindow", title: "Page", children: [normalToolbar()] + (0..<25).map { _ in AXUIElement("AXGroup") })
-classify("unrelatedWideWindowDoesNotBlockNormal", wide)
-let wideBookmarks = AXUIElement("AXToolbar", title: "Bookmarks", children: (0..<30).map { _ in AXUIElement("AXButton", title: "Bookmark") })
-classify("wideBookmarksDoNotBlockNormal", AXUIElement("AXWindow", title: "Page", children: [normalToolbar(), wideBookmarks]))
-let delayedUnrelated = AXUIElement("AXGroup", children: [AXUIElement("AXGroup")]); delayedUnrelated.childrenDelay = 0.18
-classify("unrelatedDeadlineDoesNotBlockNormal", AXUIElement("AXWindow", title: "Page", children: [normalToolbar(), delayedUnrelated]))
-let failedPrimary = AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), unavailable])
-classify("primaryReadFailureUnknown", AXUIElement("AXWindow", title: "Page", children: [failedPrimary]))
-let missingRole = AXUIElement("AXGroup"); missingRole.fields.removeValue(forKey: "role")
-classify("primaryRoleFailureUnknown", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), missingRole])]))
-let widePrimary = AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您")] + (0..<23).map { _ in AXUIElement("AXGroup") })
-classify("primaryTruncatedUnknown", AXUIElement("AXWindow", title: "Page", children: [widePrimary]))
-func budgetGroups() -> [AXUIElement] {
-  (0..<20).map { _ in AXUIElement("AXGroup", children: (0..<6).map { _ in AXUIElement("AXGroup") }) }
-}
-let budgetPrimary = AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您")] + budgetGroups())
-classify("primaryNodeBudgetUnknown", AXUIElement("AXWindow", title: "Page", children: [budgetPrimary]))
-classify("unrelatedNodeBudgetDoesNotBlockNormal", AXUIElement("AXWindow", title: "Page", children: [normalToolbar()] + budgetGroups()))
-var hiddenPrivate = AXUIElement("AXButton", title: "Incognito")
-for _ in 0..<7 { hiddenPrivate = AXUIElement("AXGroup", children: [hiddenPrivate]) }
-classify("deepPrimaryUnknown", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), hiddenPrivate])]))
-let delayedPrimary = AXUIElement("AXGroup", children: [AXUIElement("AXButton", title: "Incognito")]); delayedPrimary.childrenDelay = 0.18
-classify("primaryDeadlineUnknown", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), delayedPrimary])]))
-let both = AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), AXUIElement("AXButton", title: "Incognito")])
-classify("privateWinsOverProfile", AXUIElement("AXWindow", title: "Page", children: [both]))
-classify("otherAddressToolbarPrivateWins", AXUIElement("AXWindow", title: "Page", children: [normalToolbar(), privateToolbar]))
-let nestedBookmarkProfile = AXUIElement("AXToolbar", title: "Bookmarks", children: [AXUIElement("AXButton", title: "您")])
-classify("nestedBookmarkCannotBorrowAddress", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), nestedBookmarkProfile])]))
-var containedPrivate = AXUIElement("AXButton", title: "Incognito")
-for _ in 0..<4 { containedPrivate = AXUIElement("AXGroup", children: [containedPrivate]) }
-classify("privateInPrimaryGroupsWins", AXUIElement("AXWindow", title: "Page", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "您"), containedPrivate])]))
-var nestedNormal = normalToolbar()
-for _ in 0..<4 { nestedNormal = AXUIElement("AXGroup", children: [nestedNormal]) }
-classify("primaryDepthIsRelativeToToolbar", AXUIElement("AXWindow", title: "Page", children: [nestedNormal]))
-current = normal
-let before = currentWindow(pid: 1, bundleId: "com.google.Chrome").payload
-normal.fields["children"] = [privateToolbar]
-let after = currentWindow(pid: 1, bundleId: "com.google.Chrome").payload
-normal.fields["children"] = []
-let unknown = currentWindow(pid: 1, bundleId: "com.google.Chrome").payload
-outcomes["sameWindowNormal"] = before
-outcomes["sameWindowPrivate"] = after
-outcomes["sameWindowUnknown"] = unknown
-normal.fields["children"] = [normalToolbar()]; focusedWindowAvailable = false
-outcomes["focusedUnavailable"] = currentWindow(pid: 1, bundleId: "com.google.Chrome").payload
+current = AXUIElement("AXWindow", title: "Page (Incognito)", children: [AXUIElement("AXToolbar", children: [address(), AXUIElement("AXButton", title: "无痕模式")])])
+outcomes["privateLooking"] = currentWindow(pid: 1, bundleId: "com.google.Chrome").payload
+focusedWindowAvailable = false
+let fallback = currentWindow(pid: 1, bundleId: "com.google.Chrome")
+outcomes["focusedUnavailable"] = fallback.payload
+outcomes["focusedUnavailableHasWindow"] = fallback.element != nil
+focusedWindowAvailable = true
+outcomes["nativeApp"] = currentWindow(pid: 1, bundleId: "com.example.Editor").payload
 print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encoding: .utf8)!)
 `);
-  assert.equal(result.normal, false);
-  assert.equal(result.privateWithoutTitleMarker, true);
-  assert.equal(result.privateTitle, true);
-  assert.equal(result.missingTitleWithNormalEvidence, false);
-  assert.equal(result.pageBookmarksExtensionDoNotChangeNormal, false);
-  assert.equal(result.nativeApp, false);
-  assert.equal(result.privateWinsOverProfile, true);
-  assert.equal(result.otherAddressToolbarPrivateWins, true);
-  assert.equal(result.privateInPrimaryGroupsWins, true);
-  for (const name of ["unrelatedReadFailureDoesNotBlockNormal", "unrelatedWideWindowDoesNotBlockNormal",
-    "wideBookmarksDoNotBlockNormal", "unrelatedDeadlineDoesNotBlockNormal", "unrelatedNodeBudgetDoesNotBlockNormal",
-    "primaryDepthIsRelativeToToolbar"]) {
-    assert.equal(result[name], false, name);
-  }
-  for (const name of ["missingTitleAndEvidence", "bookmarkProfileCannotAuthorize", "pageProfileCannotAuthorize",
-    "unscopedProfileCannotAuthorize", "customProfileUnknown", "unknownBrowserUnknown", "safariIsSecureNotNormalProof",
-    "primaryReadFailureUnknown", "primaryRoleFailureUnknown", "primaryTruncatedUnknown", "deepPrimaryUnknown",
-    "primaryDeadlineUnknown", "primaryNodeBudgetUnknown", "nestedBookmarkCannotBorrowAddress"]) assert.equal(result[name], null, name);
-  assert.equal(result.sameWindowNormal.privateBrowsing, undefined);
-  assert.equal(result.sameWindowNormal.privateBrowsingUnknown, undefined);
-  assert.equal(result.sameWindowPrivate.privateBrowsing, true);
-  assert.equal(result.sameWindowUnknown.privateBrowsingUnknown, true);
-  assert.equal(result.focusedUnavailable.privateBrowsingUnknown, true);
-  assert.equal(result.focusedUnavailable.url, undefined);
+  const page = { browser: true, title: "Page (Incognito)", url: "https://public.example/" };
+  assert.deepEqual(result.privateLooking, page);
+  // A browser without a focused window falls back to its main window like any other app.
+  assert.deepEqual(result.focusedUnavailable, page);
+  assert.equal(result.focusedUnavailableHasWindow, true);
+  assert.deepEqual(result.nativeApp, { title: "Page (Incognito)" });
 }, 65_000);
 
-test.runIf(process.platform === "darwin")("queued browser keyboard input cannot inherit permission from another same-app window", () => {
+test.runIf(process.platform === "darwin")("queued browser keyboard input never borrows another same-app window's field", () => {
   const result = runSwift(`${axFixture}
-${production("// A title marker", "struct FocusSnapshot")}
 ${production("func currentWindow(", "func refreshFocusedElement(")}
 ${production("func nodePayload(", "let interactiveFocusRoles:")}
 ${production("let keyNames:", "func characters(")}
@@ -260,42 +177,45 @@ func axSnapshot(window: AXUIElement, windowKey: String, deduplicate: Bool = fals
 ${production("func emitEvent(", "func currentWindow(")}
 ${production("func resolveTarget(", "func modifierList(")}
 ${production("let callback:", "// MARK: - Entry point")}
-let publicWindow = AXUIElement("AXWindow", title: "Public page", children: [normalToolbar()])
-let privateWindow = AXUIElement("AXWindow", title: "Private page (Incognito)")
-let publicField = AXUIElement("AXTextField", title: "Search")
-publicField.fields["window"] = publicWindow; publicField.fields["tracked"] = true
-let privateField = AXUIElement("AXTextField", title: "PRIVATE_SEARCH_FIELD")
-privateField.fields["window"] = privateWindow; privateField.fields["tracked"] = true
-current = privateWindow; focusedElementCache = privateField
+let firstWindow = AXUIElement("AXWindow", title: "First page", children: [normalToolbar()])
+let otherWindow = AXUIElement("AXWindow", title: "Other page")
+let firstField = AXUIElement("AXTextField", title: "Search")
+firstField.fields["window"] = firstWindow; firstField.fields["tracked"] = true
+let otherField = AXUIElement("AXTextField", title: "OTHER_WINDOW_FIELD")
+otherField.fields["window"] = otherWindow; otherField.fields["tracked"] = true
+current = otherWindow; focusedElementCache = otherField
 let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
 enrichmentQueue.async { entered.signal(); release.wait() }; entered.wait()
-_ = callback(0, .keyDown, CGEvent("PRIVATE_TYPED_TEXT"), nil)
-current = publicWindow
+_ = callback(0, .keyDown, CGEvent("typed before the switch"), nil)
+current = firstWindow
 // The browser PID and focus generation are unchanged: its delayed focus
-// notification has not arrived yet. Actual AX-window ownership must reject.
+// notification has not arrived yet. The other window's field must not label it.
 release.signal(); enrichmentQueue.sync {}
-var outcomes: [String: Any] = ["stalePrivateInput": emitted, "staleFieldReads": trackedLabelReads]
-focusedElementCache = publicField
-_ = callback(0, .keyDown, CGEvent("public query"), nil); enrichmentQueue.sync {}
+var outcomes: [String: Any] = ["staleFocusInput": emitted, "staleFieldReads": trackedLabelReads]
+emitted.removeAll(); focusedElementCache = firstField
+_ = callback(0, .keyDown, CGEvent("query"), nil); enrichmentQueue.sync {}
 outcomes["normalKeyboard"] = emitted
 emitted.removeAll(); focusedElementCache = nil
-_ = callback(0, .keyDown, CGEvent("UNKNOWN_BROWSER_TYPED_TEXT"), nil); enrichmentQueue.sync {}
+_ = callback(0, .keyDown, CGEvent("browser input"), nil); enrichmentQueue.sync {}
 outcomes["unknownBrowserFocus"] = emitted
-focusedElementCache = publicField
-mutateLabel = { current = privateWindow }
+emitted.removeAll(); focusedElementCache = firstField
+mutateLabel = { current = otherWindow }
 _ = callback(0, .keyDown, CGEvent("SWITCHED_DURING_TARGET_READ"), nil); enrichmentQueue.sync {}
 outcomes["switchDuringTargetRead"] = emitted
-current = publicWindow; frontBundle = "com.example.Editor"; focusedElementCache = nil
+emitted.removeAll(); current = firstWindow; frontBundle = "com.example.Editor"; focusedElementCache = nil
 _ = callback(0, .keyDown, CGEvent("ordinary editor input"), nil); enrichmentQueue.sync {}
 outcomes["ordinaryEditorUnknownFocus"] = emitted
 print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encoding: .utf8)!)
 `);
-  assert.deepEqual(result.stalePrivateInput, []);
+  assert.equal(result.staleFocusInput.length, 1);
+  assert.deepEqual(result.staleFocusInput[0].keyboard.target, { role: "AXUnknown" });
   assert.equal(result.staleFieldReads, 0);
   assert.equal(result.normalKeyboard.length, 1);
-  assert.equal(result.normalKeyboard[0].keyboard.text, "public query");
+  assert.equal(result.normalKeyboard[0].keyboard.text, "query");
   assert.equal(result.normalKeyboard[0].keyboard.target.title, "Search");
-  assert.deepEqual(result.unknownBrowserFocus, []);
+  // Without a known focused element, browser input is kept like any other app's.
+  assert.equal(result.unknownBrowserFocus.length, 1);
+  assert.deepEqual(result.unknownBrowserFocus[0].keyboard.target, { role: "AXUnknown" });
   assert.deepEqual(result.switchDuringTargetRead, []);
   assert.equal(result.ordinaryEditorUnknownFocus.length, 1);
   assert.deepEqual(result.ordinaryEditorUnknownFocus[0].keyboard.target, { role: "AXUnknown" });
@@ -303,7 +223,6 @@ print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encodin
 
 test.runIf(process.platform === "darwin")("native hits and selections verify actual app/window ownership before reading labels or text", () => {
   const result = runSwift(`${axFixture}
-${production("// A title marker", "struct FocusSnapshot")}
 ${production("func currentWindow(", "func refreshFocusedElement(")}
 ${production("func nodePayload(", "let interactiveFocusRoles:")}
 struct CGPoint { var x: Double; var y: Double }
@@ -369,10 +288,11 @@ current = window; secure = true
 selectedReads = 0
 emitSelectionChanged(field); enrichmentQueue.sync {}
 outcomes["secureSelectionRead"] = selectedReads
-secure = false; frontBundle = "com.google.Chrome"
-selectedReads = 0
+secure = false; frontBundle = "com.google.Chrome"; field.fields["selectedText"] = "Browser selection"
+selectedReads = 0; emitted.removeAll()
 emitSelectionChanged(field); enrichmentQueue.sync {}
-outcomes["unknownBrowserSelectionRead"] = selectedReads
+outcomes["browserSelectionRead"] = selectedReads
+outcomes["browserSelection"] = emitted
 print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encoding: .utf8)!)
 `);
   for (const name of ["foreign", "backgroundWindow", "dock"]) {
@@ -386,10 +306,12 @@ print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encodin
   assert.equal(result.passwordSelectionRead, 0);
   assert.deepEqual(result.changedDuringRead, []);
   assert.equal(result.secureSelectionRead, 0);
-  assert.equal(result.unknownBrowserSelectionRead, 0);
+  assert.equal(result.browserSelectionRead, 1);
+  assert.equal(result.browserSelection.length, 1);
+  assert.equal(result.browserSelection[0].selection.selectedText, "Browser selection");
 }, 65_000);
 
-test.runIf(process.platform === "darwin")("native event emission discards snapshots after same-app window, URL, or privacy changes", () => {
+test.runIf(process.platform === "darwin")("native event emission discards snapshots after same-app window or URL changes", () => {
   const result = runSwift(`${axFixture}
 let emitLock = NSLock()
 var historySessionId: UInt64 = 1
@@ -426,18 +348,14 @@ func scenario(_ name: String, first: Context, latest: Context, switchApp: Bool =
 }
 scenario("normal", first: (normal, a), latest: (normal, a))
 scenario("samePidOtherWindow", first: (normal, a), latest: (normal, b))
-scenario("sameWindowPrivate", first: (normal, a), latest: (["browser": true, "url": pageUrl!, "privateBrowsing": true], a))
-scenario("sameWindowUnknown", first: (normal, a), latest: (["browser": true, "url": pageUrl!, "privateBrowsingUnknown": true], a))
 scenario("navigation", first: (normal, a), latest: (["browser": true, "url": "https://other.example/"], a))
 scenario("appSwitchDuringRead", first: (normal, a), latest: (normal, a), switchApp: true)
-scenario("initialUnknown", first: (["browser": true, "privateBrowsingUnknown": true], a), latest: (normal, a))
 print(String(data: try JSONSerialization.data(withJSONObject: outcomes), encoding: .utf8)!)
 `);
   assert.equal(result.normal.emitted, 1);
   assert.equal(result.normal.snapshotReads, 1);
-  for (const name of ["samePidOtherWindow", "sameWindowPrivate", "sameWindowUnknown", "navigation", "appSwitchDuringRead", "initialUnknown"]) {
+  for (const name of ["samePidOtherWindow", "navigation", "appSwitchDuringRead"]) {
     assert.equal(result[name].emitted, 0, name);
     assert.equal(result[name].baselineCleared, true, name);
   }
-  assert.equal(result.initialUnknown.snapshotReads, 0);
 }, 65_000);

@@ -24,13 +24,15 @@ import tempfile
 import time
 
 
-_SCHEMA = 3
+_SCHEMA = 4
 _LOCK_NAME = "permission-helper.lock"
 _APP_NAME = "Memmy WeChat Reader.app"
 _PROBE_NAME = "MemmyWeChatPermissionProbe.dylib"
 _PROBE_SOURCE = Path(__file__).with_name("permission_probe.m")
 _BRIDGE_NAME = "MemmyWeChatPrivateStorage.dylib"
 _BRIDGE_SOURCE = Path(__file__).with_name("private_storage_bridge.c")
+_KEYCAPTURE_NAME = "MemmyWeChatKeyCapture.dylib"
+_KEYCAPTURE_SOURCE = Path(__file__).with_name("key_capture_bridge.c")
 _NATIVE_DIRECTORY = Path(__file__).with_name("native") / "arm64"
 
 
@@ -44,7 +46,9 @@ def _developer_clang():
         compiler = directory / "clang"
         if compiler.is_file() and os.access(compiler, os.X_OK) and compiler.resolve() != Path("/usr/bin/clang"):
             return str(compiler)
-    raise RuntimeError("lldb_unavailable")
+    # Only reached in a source checkout with no prebuilt dylibs; packaged builds
+    # ship them. The reader's native helpers cannot be prepared without a compiler.
+    raise RuntimeError("wechat_native_helpers_unavailable")
 
 
 def _install_library(name, destination, compiler_arguments):
@@ -61,16 +65,23 @@ def _check_host_data_access():
     """The non-GUI Memmy child checks Memmy's existing access, never the copy's FDA."""
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     documents = home / "Library/Containers/com.tencent.xinWeChat/Data/Documents"
-    try:
-        descriptor = os.open(documents, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        os.close(descriptor)
-        for config in documents.glob("app_data/net*/config.ini"):
-            descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW)
+    # The first access waits for macOS to approve this process; a lost approval
+    # interrupts the call, and checking again requests approval again.
+    for attempt in range(3):
+        try:
+            descriptor = os.open(documents, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             os.close(descriptor)
-    except PermissionError:
-        raise RuntimeError("wechat_data_access_required") from None
-    except OSError:
-        raise RuntimeError("wechat_data_access_unavailable") from None
+            for config in documents.glob("app_data/net*/config.ini"):
+                descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW)
+                os.close(descriptor)
+            return
+        except InterruptedError:
+            if attempt == 2:
+                raise RuntimeError("wechat_data_access_interrupted") from None
+        except PermissionError:
+            raise RuntimeError("wechat_data_access_required") from None
+        except OSError:
+            raise RuntimeError("wechat_data_access_unavailable") from None
 
 
 def _private(path, directory=False):
@@ -184,6 +195,9 @@ def _build_copy(app, destination, probe_source):
     bridge = library.with_name(_BRIDGE_NAME)
     _install_library(_BRIDGE_NAME, bridge, ["-arch", "arm64", "-dynamiclib", "-Wall", "-Wextra", "-Werror",
                      str(_BRIDGE_SOURCE)])
+    capture = library.with_name(_KEYCAPTURE_NAME)
+    _install_library(_KEYCAPTURE_NAME, capture, ["-arch", "arm64", "-dynamiclib", "-O2", "-Wall", "-Wextra", "-Werror",
+                     str(_KEYCAPTURE_SOURCE)])
     _run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(destination)])
     _run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(destination)])
     _safe_bundle(destination)
@@ -250,16 +264,9 @@ def _valid_probe_result(value, challenge, executable, expected_pid=None):
     return (error is None or isinstance(error, str)) and error in allowed and value["ready"] == (error is None)
 
 
-def _probe_copy(shadow, state, lldb_path):
+def _probe_copy(shadow, state):
     if shadow != state / "connection-helper" / _APP_NAME:
         raise RuntimeError("permission_helper_unsafe_path")
-    if lldb_path is None:
-        # Reuse the compatibility preflight without importing connect as __main__.
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("memmy_wechat_preflight", Path(__file__).with_name("connect.py"))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        lldb_path = module.lldb_python_path()
     directory = Path(tempfile.mkdtemp(prefix="permission-probe-", dir=state / "connection-helper"))
     os.chmod(directory, 0o700)
     result_path = directory / "result.json"
@@ -270,8 +277,6 @@ def _probe_copy(shadow, state, lldb_path):
     for key in tuple(environment):
         if key.startswith("DYLD_") or key.startswith("MEMMY_WECHAT_"):
             del environment[key]
-    if lldb_path:
-        environment["PYTHONPATH"] = str(lldb_path)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # An empty private fixture proves the copy reads through the storage bridge.
     # No source data or chat contents are copied while merely checking setup.
@@ -329,7 +334,7 @@ def _probe_copy(shadow, state, lldb_path):
 
 def _public_result(result):
     error = result["error"]
-    if error in ("wechat_data_access_required", "wechat_data_access_unavailable"):
+    if error in ("wechat_data_access_required", "wechat_data_access_unavailable", "wechat_data_access_interrupted"):
         pass
     elif error in ("wechat_private_storage_probe_failed", "wechat_copy_permission_probe_failed", "wechat_copy_permission_probe_timeout",
                    "wechat_copy_permission_probe_unavailable"):
@@ -339,7 +344,7 @@ def _public_result(result):
     return {"ready": bool(result["ready"]), "appPath": result["appPath"], "error": error}
 
 
-def prepare_permission_helper(state, app=Path("/Applications/WeChat.app"), lldb_path=None):
+def prepare_permission_helper(state, app=Path("/Applications/WeChat.app")):
     state = Path(os.path.abspath(state))
     app = Path(app)
     cache = state / "connection-helper"
@@ -370,9 +375,9 @@ def prepare_permission_helper(state, app=Path("/Applications/WeChat.app"), lldb_
         expected = {"schema": _SCHEMA, "source": fingerprint,
                     "probeSource": hashlib.sha256(_PROBE_SOURCE.read_bytes()).hexdigest(),
                     "bridgeSource": hashlib.sha256(_BRIDGE_SOURCE.read_bytes()).hexdigest(),
-                    "probeEnvironment": {"macOS": platform.mac_ver()[0], "machine": platform.machine(),
-                                         "lldbPath": str(lldb_path) if lldb_path else None}}
-        for name in (_PROBE_NAME, _BRIDGE_NAME):
+                    "keyCaptureSource": hashlib.sha256(_KEYCAPTURE_SOURCE.read_bytes()).hexdigest(),
+                    "probeEnvironment": {"macOS": platform.mac_ver()[0], "machine": platform.machine()}}
+        for name in (_PROBE_NAME, _BRIDGE_NAME, _KEYCAPTURE_NAME):
             binary = _NATIVE_DIRECTORY / name
             if binary.is_file() and not binary.is_symlink():
                 expected[name] = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -420,7 +425,7 @@ def prepare_permission_helper(state, app=Path("/Applications/WeChat.app"), lldb_
         if reusable and manifest.get("probeVerified") is True:
             result.update(ready=True, error=None)
             return _public_result(result)
-        probe = _probe_copy(shadow, state, lldb_path)
+        probe = _probe_copy(shadow, state)
         if probe.get("ready") is True and probe.get("error") is None:
             if _copy_fingerprint(shadow) != manifest.get("copyFingerprint"):
                 raise RuntimeError("permission_helper_prepare_failed")
@@ -438,66 +443,51 @@ def prepare_permission_helper(state, app=Path("/Applications/WeChat.app"), lldb_
     return _public_result(result)
 
 
-def _run_lldb_probe(shadow, result_path, challenge):
-    import lldb
-
+def _run_probe(shadow, result_path, challenge):
     if shadow.name != _APP_NAME or shadow.parent.name != "connection-helper":
         return 2
     _safe_bundle(shadow)
     _private(result_path)
     _private(result_path.parent, directory=True)
     executable = shadow / "Contents/MacOS/WeChat"
-    library = shadow / "Contents/Frameworks" / _PROBE_NAME
-    debugger = lldb.SBDebugger.Create()
-    debugger.SkipLLDBInitFiles(True)
-    debugger.SetAsync(True)
-    process = None
+    probe = shadow / "Contents/Frameworks" / _PROBE_NAME
+    bridge = probe.with_name(_BRIDGE_NAME)
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("DYLD_")}
+    environment["DYLD_INSERT_LIBRARIES"] = str(bridge) + ":" + str(probe)
+    environment["MEMMY_WECHAT_PERMISSION_PROBE"] = str(result_path)
+    environment["MEMMY_WECHAT_PERMISSION_CHALLENGE"] = challenge
+    for key in ("MEMMY_WECHAT_CONTAINER_SOURCE", "MEMMY_WECHAT_CONTAINER_COPY",
+                "MEMMY_WECHAT_GROUP_SOURCE", "MEMMY_WECHAT_GROUP_COPY"):
+        environment[key] = os.environ[key]
+    child = None
     try:
-        interpreter = debugger.GetCommandInterpreter()
-        settings = lldb.SBCommandReturnObject()
-        interpreter.HandleCommand("settings set target.preload-symbols false", settings)
-        if not settings.Succeeded():
-            return 2
-        error = lldb.SBError()
-        target = debugger.CreateTarget(str(executable), None, None, False, error)
-        if error.Fail() or not target.IsValid() or not target.GetTriple().startswith("arm64-"):
-            return 2
-        launch = lldb.SBLaunchInfo([])
-        launch.SetWorkingDirectory(str(executable.parent))
-        launch.SetEnvironmentEntries([
-            "DYLD_INSERT_LIBRARIES=" + str(library.with_name(_BRIDGE_NAME)) + ":" + str(library),
-            "MEMMY_WECHAT_PERMISSION_PROBE=" + str(result_path),
-            "MEMMY_WECHAT_PERMISSION_CHALLENGE=" + challenge,
-            "MEMMY_WECHAT_CONTAINER_SOURCE=" + os.environ["MEMMY_WECHAT_CONTAINER_SOURCE"],
-            "MEMMY_WECHAT_CONTAINER_COPY=" + os.environ["MEMMY_WECHAT_CONTAINER_COPY"],
-            "MEMMY_WECHAT_GROUP_SOURCE=" + os.environ["MEMMY_WECHAT_GROUP_SOURCE"],
-            "MEMMY_WECHAT_GROUP_COPY=" + os.environ["MEMMY_WECHAT_GROUP_COPY"],
-        ], True)
-        for fd in (0, 1, 2):
-            launch.AddSuppressFileAction(fd, fd == 0, fd != 0)
-        process = target.Launch(launch, error)
-        if error.Fail() or not process.IsValid():
-            return 2
+        child = subprocess.Popen([str(executable)], cwd=str(executable.parent), env=environment,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            # AppKit/LLDB may delay their final exit notification after the
-            # pre-main probe has completed. Its private authenticated result is
-            # definitive; finally still kills this exact SBProcess if necessary.
+            # The probe constructor writes its authenticated result and _exits
+            # before WeChat's entry point, so the result file is definitive.
             try:
                 value = _read_json(result_path)
             except (OSError, ValueError, UnicodeError):
                 value = None
-            if _valid_probe_result(value, challenge, executable, process.GetProcessID()):
+            if _valid_probe_result(value, challenge, executable, child.pid):
                 return 0
-            if process.GetState() in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
-                return 0 if process.GetState() == lldb.eStateExited else 2
+            if child.poll() is not None:
+                try:
+                    value = _read_json(result_path)
+                except (OSError, ValueError, UnicodeError):
+                    value = None
+                return 0 if _valid_probe_result(value, challenge, executable, child.pid) else 2
             time.sleep(0.025)
         return 2
     finally:
-        if process and process.IsValid() and process.GetState() not in (
-                lldb.eStateExited, lldb.eStateDetached, lldb.eStateInvalid):
-            process.Kill()
-        lldb.SBDebugger.Destroy(debugger)
+        if child is not None and child.poll() is None:
+            child.kill()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 if __name__ == "__main__":
@@ -508,6 +498,6 @@ if __name__ == "__main__":
         raise SystemExit(2)
     try:
         app_path, output_path, token = arguments.probe_process
-        raise SystemExit(_run_lldb_probe(Path(app_path), Path(output_path), token))
+        raise SystemExit(_run_probe(Path(app_path), Path(output_path), token))
     except Exception:
         raise SystemExit(2)

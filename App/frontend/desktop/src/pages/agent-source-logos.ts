@@ -12,7 +12,6 @@ import memmyRiceLogoUrl from "../assets/mascot/memmy-rice.png";
 
 export const MEMORY_AGENT_SOURCE_VALUES = [
   "memmy-agent",
-  "computer_history",
   "cursor",
   "claude_code",
   "codex",
@@ -28,7 +27,7 @@ export const MEMORY_AGENT_SOURCE_VALUES = [
 const AGENT_SOURCE_DISPLAY_NAMES: Record<string, string> = {
   memmy: "Memmy",
   memmy_agent: "Memmy",
-  computer_history: "Computer History",
+  computer_history: "Memmy",
   cursor: "Cursor",
   claude_code: "Claude Code",
   codex: "Codex",
@@ -71,5 +70,5 @@ export function agentSourceLogoUrl(value: string): string | undefined {
 
 export function isMemmyAgentSource(value: string): boolean {
   const sourceId = normalizeAgentSourceId(value);
-  return sourceId === "memmy" || sourceId === "memmy_agent";
+  return sourceId === "memmy" || sourceId === "memmy_agent" || sourceId === "computer_history";
 }

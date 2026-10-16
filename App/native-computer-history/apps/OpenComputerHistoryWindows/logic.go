@@ -197,13 +197,93 @@ type workerRequest struct {
 	ConsentPath string `json:"consentPath,omitempty"`
 }
 type workerResult struct {
-	ID           uint64         `json:"id"`
-	OK           bool           `json:"ok"`
-	Skipped      bool           `json:"skipped"`
-	Reason       string         `json:"reason,omitempty"`
-	Truncated    bool           `json:"truncated,omitempty"`
-	ReadFailures int            `json:"readFailures"`
-	Event        map[string]any `json:"event,omitempty"`
+	ID                uint64         `json:"id"`
+	OK                bool           `json:"ok"`
+	Skipped           bool           `json:"skipped"`
+	Reason            string         `json:"reason,omitempty"`
+	Truncated         bool           `json:"truncated,omitempty"`
+	ReadFailures      int            `json:"readFailures"`
+	SnapshotAttempted bool           `json:"snapshotAttempted,omitempty"`
+	SnapshotDeferred  bool           `json:"snapshotDeferred,omitempty"`
+	Event             map[string]any `json:"event,omitempty"`
+}
+
+// A functioning action/heartbeat path is not proof that full UIA reads work.
+// Emit failures independently; only the Node recorder can acknowledge recovery
+// after authorizing and persisting a complete readable snapshot.
+func snapshotFailed(fullRequested bool, result workerResult, requestErr error) bool {
+	if requestErr != nil || !result.OK {
+		return fullRequested || result.SnapshotAttempted
+	}
+	// Foreground changes, consent and secure inputs intentionally skip reads.
+	if result.Skipped {
+		return false
+	}
+	ax, _ := result.Event["ax"].(map[string]any)
+	if ax["mode"] != "fullTree" {
+		return (fullRequested || result.SnapshotAttempted) && !result.SnapshotDeferred
+	}
+	text, readable := ax["text"].(string)
+	return !readable || strings.TrimSpace(text) == "" || result.ReadFailures > 0
+}
+
+func attachSnapshotQuality(result *workerResult) {
+	if ax, ok := result.Event["ax"].(map[string]any); ok && ax["mode"] == "fullTree" {
+		ax["truncated"] = result.Truncated
+		ax["readFailures"] = result.ReadFailures
+	}
+}
+
+// Only the Node recorder knows which snapshots passed current policy and were
+// persisted. Always forward full reads so it can rebuild an authorized baseline
+// after exclusions, failures or restart, even when native text is unchanged.
+func shouldForwardSample(event map[string]any, lastWindow string) bool {
+	window, _ := event["window"].(map[string]any)
+	windowID, _ := window["windowId"].(string)
+	if event["kind"] != "sampling.changed" || windowID != lastWindow {
+		return true
+	}
+	ax, _ := event["ax"].(map[string]any)
+	_, hasText := ax["text"].(string)
+	return ax["mode"] == "fullTree" && hasText
+}
+
+// Preserve the fact that input was observed when its target cannot be safely
+// recovered. Never copy coordinates, keys, labels, app identity or URLs into a
+// scope-less coverage record. Deliberate password/consent skips stay excluded.
+func actionCaptureGap(a action, result workerResult, requestErr error) map[string]any {
+	switch a.Kind {
+	case "mouse.click", "mouse.context_menu", "mouse.scroll", "keyboard.keydown":
+	default:
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, a.Timestamp)
+	if err != nil || at.IsZero() {
+		return nil
+	}
+	reason := ""
+	if requestErr != nil || !result.OK {
+		reason = "worker_failed"
+	} else if result.Skipped {
+		switch result.Reason {
+		case "action_origin_unknown", "action_origin_expired", "action_origin_changed", "foreground_changed", "navigation_changed", "focus_changed":
+			reason = result.Reason
+		}
+	}
+	if reason == "" {
+		return nil
+	}
+	count := a.Count
+	if count < 1 || count > 10000 {
+		count = 1
+	}
+	gap := map[string]any{"type": "recorder.capture_gap", "actionTimestamp": at.UTC().Format(time.RFC3339Nano),
+		"actionKind": a.Kind, "count": count, "reason": reason}
+	if (a.Kind == "mouse.click" || a.Kind == "mouse.context_menu") &&
+		(a.Button == "left" || a.Button == "right" || a.Button == "middle") {
+		gap["button"] = a.Button
+	}
+	return gap
 }
 
 func parseResult(raw []byte, expected uint64) (workerResult, error) {
@@ -255,22 +335,50 @@ func parseResult(raw []byte, expected uint64) (workerResult, error) {
 	}
 	if browser {
 		context, ok := window["browserContext"].(map[string]any)
-		if !ok || context["mode"] != "normal" || context["complete"] != true {
-			return r, fmt.Errorf("worker browser privacy")
+		if !ok {
+			return r, fmt.Errorf("worker browser context")
 		}
 		if context["windowId"] != windowID || context["processId"] != appPID {
 			return r, fmt.Errorf("worker browser foreground identity")
 		}
-		if url, ok := context["url"].(string); !ok || (!strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://")) {
+		// A page address is optional (the omnibox may be focused or the page
+		// loading), but one that is present must be the committed web URI.
+		if url, ok := context["url"].(string); !ok {
 			return r, fmt.Errorf("worker browser URL")
-		}
-		if context["documentUrl"] != context["url"] {
-			return r, fmt.Errorf("worker browser committed URI")
+		} else if url != "" {
+			if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+				return r, fmt.Errorf("worker browser URL")
+			}
+			if context["documentUrl"] != url {
+				return r, fmt.Errorf("worker browser committed URI")
+			}
 		}
 	}
+	if r.SnapshotDeferred && r.SnapshotAttempted {
+		return r, fmt.Errorf("worker deferred snapshot contradiction")
+	}
 	if ax, ok := r.Event["ax"].(map[string]any); ok {
-		if content, ok := ax["text"].(string); ok && len([]rune(content)) > maxTextCharacters {
-			return r, fmt.Errorf("worker text budget")
+		if r.SnapshotDeferred && ax["mode"] == "fullTree" {
+			return r, fmt.Errorf("worker deferred snapshot contradiction")
+		}
+		if observedAt, present := ax["observedAt"]; present {
+			at, valid := observedAt.(string)
+			if ax["mode"] != "fullTree" || !valid {
+				return r, fmt.Errorf("worker snapshot observation shape")
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, at); err != nil || parsed.IsZero() {
+				return r, fmt.Errorf("worker snapshot observation timestamp")
+			}
+		}
+		content, hasText := ax["text"]
+		if ax["mode"] != nil || hasText {
+			text, valid := content.(string)
+			if ax["mode"] != "fullTree" || !valid {
+				return r, fmt.Errorf("worker snapshot shape")
+			}
+			if len([]rune(text)) > maxTextCharacters {
+				return r, fmt.Errorf("worker text budget")
+			}
 		}
 	}
 	return r, nil

@@ -89,7 +89,8 @@ mac:
   icon: build/icon.icns
   category: public.app-category.productivity
   extendInfo:
-    NSMicrophoneUsageDescription: "Memmy uses the microphone only when you start voice input."
+    NSMicrophoneUsageDescription: "Memmy uses the microphone for voice input and for website tasks you request."
+    NSCameraUsageDescription: "Memmy uses the camera for website tasks you request."
     NSAppleEventsUsageDescription: "Memmy controls Microsoft Excel when you enable its connection, and checks whether browser windows are private before recording Computer History."
   target:
     - target: dmg

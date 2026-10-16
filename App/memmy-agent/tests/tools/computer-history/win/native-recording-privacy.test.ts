@@ -28,7 +28,7 @@ vi.mock("../../../../src/tools/computer-history/win/win11.js", () => ({
 import { run, WINDOWS_HISTORY_STREAM_DISCONNECT } from "../../../../src/tools/computer-history/mac/record-human-history.js";
 import { compactEventEvidence, writeSegmentNarrative } from "../../../../src/tools/computer-history/mac/summary-writer.js";
 
-it("keeps excluded/private/unknown content out of raw records and model input through the real Windows recorder pipeline", async () => {
+it("keeps excluded websites out of raw records and model input, whatever the browsing mode, through the real Windows recorder pipeline", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "windows-history-private-fixture-"));
   const settings = path.join(root, "settings.json"); const output = path.join(root, "events.jsonl");
   fs.writeFileSync(settings, JSON.stringify({ memory: { syncEnabled: true }, observation: {
@@ -47,11 +47,12 @@ it("keeps excluded/private/unknown content out of raw records and model input th
     const observation = (url: string, marker: string, mode: string = "normal", complete = true) => ({
       kind: "sampling.changed", timestamp: "2026-10-13T03:00:00.000Z",
       app: { name: "chrome", bundleIdentifier: "win32.chrome", pid: 45, secureInput: false },
-      window: { browser: true, windowId: "33", title: marker, browserContext: { url, mode, complete, windowId: "33", processId: 45 } },
+      window: { browser: true, windowId: "33", title: marker, browserContext: { url, documentUrl: url, mode, complete, windowId: "33", processId: 45 } },
       ax: { mode: "fullTree", windowKey: `45:33:${url}`, text: `ControlType.Text||${marker}|||` },
     });
     for (const event of [
       observation("https://company.test/finance", "EXCLUDED_COMPANY_FINANCE"),
+      observation("https://company.test/private", "EXCLUDED_PRIVATE_COMPANY", "private"),
       observation("https://allowed.test/", "PRIVATE_INCOGNITO_CONTENT", "private"),
       observation("https://allowed.test/", "UNKNOWN_MODE_CONTENT", "unknown"),
       observation("https://allowed.test/", "PARTIAL_CHROME_CONTENT", "normal", false),
@@ -64,19 +65,21 @@ it("keeps excluded/private/unknown content out of raw records and model input th
     expect(child.stopInput).toBe('{"kind":"stop"}\n');
     expect(child.killed).toBe(false);
     const raw = fs.readFileSync(output, "utf8");
-    expect(raw).toContain("ALLOWED_PRODUCT_COMPARISON");
-    expect(raw).not.toMatch(/EXCLUDED_COMPANY_FINANCE|PRIVATE_INCOGNITO_CONTENT|UNKNOWN_MODE_CONTENT|PARTIAL_CHROME_CONTENT|company\.test/);
+    for (const marker of ["ALLOWED_PRODUCT_COMPARISON", "PRIVATE_INCOGNITO_CONTENT", "UNKNOWN_MODE_CONTENT", "PARTIAL_CHROME_CONTENT"]) {
+      expect(raw).toContain(marker);
+    }
+    expect(raw).not.toMatch(/EXCLUDED_COMPANY_FINANCE|EXCLUDED_PRIVATE_COMPANY|company\.test/);
     const records = raw.trim().split("\n").map((line) => JSON.parse(line));
     const evidence = compactEventEvidence(raw.trim().split("\n"));
     const retainedEvidence = compactEventEvidence(raw.trim().split("\n"), { purpose: "retention" });
-    expect(retainedEvidence).not.toMatch(/EXCLUDED_COMPANY_FINANCE|PRIVATE_INCOGNITO_CONTENT|UNKNOWN_MODE_CONTENT|PARTIAL_CHROME_CONTENT|company\.test/);
+    expect(retainedEvidence).not.toMatch(/EXCLUDED_COMPANY_FINANCE|EXCLUDED_PRIVATE_COMPANY|company\.test/);
     const chat = vi.fn(async () => ({ content: JSON.stringify({ title: "Product comparison", description: "You compared a product." }) }));
     await writeSegmentNarrative((() => ({ model: "synthetic", provider: { chatWithRetry: chat } })) as any,
       { applications: ["chrome"], evidence, window: "10min" });
     expect(chat).toHaveBeenCalledTimes(1);
     const modelInput = JSON.stringify(chat.mock.calls);
     expect(modelInput).toContain("ALLOWED_PRODUCT_COMPARISON");
-    expect(modelInput).not.toMatch(/EXCLUDED_COMPANY_FINANCE|PRIVATE_INCOGNITO_CONTENT|UNKNOWN_MODE_CONTENT|PARTIAL_CHROME_CONTENT|company\.test|image_url/);
+    expect(modelInput).not.toMatch(/EXCLUDED_COMPANY_FINANCE|EXCLUDED_PRIVATE_COMPANY|company\.test|image_url/);
     expect(records.some((record) => record.screenshot)).toBe(false);
   } finally {
     native.child?.kill();

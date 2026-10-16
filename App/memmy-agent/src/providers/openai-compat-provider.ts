@@ -35,7 +35,7 @@ const ALLOWED_MSG_KEYS = new Set([
   "reasoning_content",
   "extra_content",
 ]);
-const STANDARD_TC_KEYS = new Set(["id", "type", "index", "function"]);
+const STANDARD_TC_KEYS = new Set(["id", "call_id", "type", "index", "function", "name", "arguments"]);
 const STANDARD_FN_KEYS = new Set(["name", "arguments"]);
 const KIMI_THINKING_MODELS = new Set(["kimi-k2.5", "kimi-k2.6", "k2.6-code-preview"]);
 const MIMO_THINKING_MODELS = new Set(["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni"]);

@@ -108,6 +108,16 @@ test("persists startup fullTree and every diff across input bursts and shortcuts
   assert.equal(events.find((event) => event.eventType === "recording_started").ax.mode, "fullTree");
 });
 
+test("keeps the authorized tree baseline across focus-only action envelopes", async () => {
+  helper.events = [
+    { kind: "session.started", app, ax: full },
+    { kind: "mouse.click", app, ax: { windowKey: full.windowKey, focused: { role: "AXButton", title: "Allowed control" } } },
+    { kind: "sampling.changed", app, ax: firstTree },
+  ];
+  const events = await record();
+  assert.deepEqual(events.filter((event) => event.ax).map((event) => event.ax), [full, first]);
+});
+
 test("excludes a blocked CLI context URL from raw metadata", async () => {
   helper.events = [];
   const events = await record({ observation: {
@@ -135,20 +145,24 @@ test("drops an excluded website and unverifiable address, then rebases on an all
   assert.deepEqual(events.filter((event) => event.eventType === "page_context").map((event) => event.details.url), ["https://example.com"]);
 });
 
-test("never persists private or unknown browser content, or secure text input", async () => {
-  const unknownBrowser = { browser: true, privateBrowsingUnknown: true,
-    title: "Private browsing probe", url: "https://private-probe.invalid/" };
+test("records browser windows whatever their private state, but never secure text input", async () => {
+  const chrome = { ...app, bundleIdentifier: "com.google.Chrome" };
+  const page = { browser: true, title: "Private browsing page", url: "https://private-page.example/" };
   helper.events = [
-    { kind: "session.started", app, window: { privateBrowsing: true }, ax: full },
-    { kind: "keyboard.text_input", app: { ...app, secureInput: true }, keyboard: { text: "sensitive" } },
-    { kind: "mouse.click", app: { ...app, bundleIdentifier: "com.google.Chrome" }, window: unknownBrowser,
-      mouse: { target: { role: "AXButton", title: "Private target probe" } }, ax: full },
-    { kind: "keyboard.text_input", app: { ...app, bundleIdentifier: "com.google.Chrome" }, window: unknownBrowser,
-      keyboard: { text: "Private typed probe" }, ax: firstTree },
+    { kind: "keyboard.text_input", app: { ...app, secureInput: true }, keyboard: { text: "SECURE_INPUT_PROBE" } },
+    { kind: "mouse.click", app: chrome, window: page,
+      mouse: { target: { role: "AXButton", title: "Page target" } }, ax: full },
+    { kind: "keyboard.text_input", app: chrome, window: page,
+      keyboard: { text: "typed in the page", target: { role: "AXTextField" } }, ax: firstTree },
   ];
   const events = await record(undefined, { flags: ["--capture-text"] });
-  assert.equal(events.some((event) => event.ax || event.eventType === "text_input"), false);
-  assert.equal(/Private .*probe|private-probe\.invalid/u.test(JSON.stringify(events)), false);
+  assert.equal(JSON.stringify(events).includes("SECURE_INPUT_PROBE"), false);
+  assert.equal(events.some((event) => event.eventType === "mouse_click"
+    && event.details?.accessibility?.title === "Page target"), true);
+  assert.deepEqual(events.filter((event) => event.eventType === "page_context").map((event) => event.details.url),
+    ["https://private-page.example/"]);
+  assert.deepEqual(events.filter((event) => event.eventType === "text_input").map((event) => event.details.text),
+    ["typed in the page"]);
 });
 
 test("does not record content when the app identity cannot be checked against exclusions", async () => {

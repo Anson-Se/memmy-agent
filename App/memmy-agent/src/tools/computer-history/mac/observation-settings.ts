@@ -41,9 +41,8 @@ export interface ObservationSubject {
   browser?: boolean;
   /** Absolute URL of the focused page, when the record has a usable one. */
   url?: string | null;
-  /** A verified private browser window is excluded whatever the rules say. */
+  /** Semantic browser sources check these before policy; native History does not exclude a whole window by mode. */
   privateBrowsing?: boolean;
-  /** Windows browser privacy state is not yet verifiable per window. */
   privateBrowsingUnknown?: boolean;
 }
 
@@ -52,7 +51,6 @@ export interface ObservationDecision {
   /** Why the record was dropped, for status output and tests. */
   reason:
     | "observed"
-    | "private_browsing"
     | "separate_source_consent"
     | "system_surface"
     | "wechat_consent_required"
@@ -67,12 +65,9 @@ export interface ObservationDecision {
 // An allowlist default fails silently in the worst possible way: the UI says
 // it is recording while nothing is written, and the gap is only discovered
 // days later when the history is asked for and turns out to be empty. What
-// protects the user here is the blocklist, pause, the exclusion of private
-// windows, secure-input suppression, local-only storage and the retention
-// window — none of which depend on which way this default points.
-//
-// Browser windows with an unknown private state are also excluded by the
-// recorder, even when the application default is otherwise permissive.
+// protects the user here is the blocklist, pause, secure-input suppression,
+// local-only storage and the retention window — none of which depend on which
+// way this default points.
 export const DEFAULT_OBSERVATION_SETTINGS: ObservationSettings = {
   memory: { syncEnabled: true },
   observation: {
@@ -162,7 +157,6 @@ export function evaluateObservation(
     && subject.weChatChatAccess !== true) {
     return { observe: false, reason: "wechat_consent_required" };
   }
-  if (subject.privateBrowsing || subject.privateBrowsingUnknown) return { observe: false, reason: "private_browsing" };
   if (subject.bundleId && SYSTEM_SURFACE_BUNDLE_IDS.has(subject.bundleId)) {
     return { observe: false, reason: "system_surface" };
   }

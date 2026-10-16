@@ -140,22 +140,26 @@ it('opens an unrelated site in a new Agent tab without replacing the user tab', 
   const scope = { sessionKey: 'new-chat', channel: 'projected-session', chatId: 'new-chat' };
   const claim = { connectionId: 'memmy-webview', tabId: 27, browser: 'memmy' as const,
     title: 'Example', url: 'https://example.com/', claimedAt: 1 };
-  const created = { ...claim, tabId: 28, url: 'https://other.example/' };
+  const created = { ...claim, tabId: 28, url: 'https://other.example/landing' };
   const bridge = { refresh: vi.fn(async () => claim), openTab: vi.fn(async () => created),
     close: vi.fn() } as unknown as EmbeddedBrowserBridge;
   const router = { hasBinding: vi.fn(() => false), select: vi.fn(() => created),
     selectClaim: vi.fn(() => created), markTab: vi.fn(), finishTurn: vi.fn(async () => undefined),
+    authorizeCurrent: vi.fn(async () => undefined),
     call: vi.fn(async () => [{ type: 'text', text: '{}' }]), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
   const accessApproval = { authorize: vi.fn(async () => true) } as unknown as BrowserAccessApproval;
   const manager = new BrowserSessionManager({ enabled: true }, {
     desktopManaged: true, embeddedBridge: bridge, embeddedRouter: router, accessApproval,
     externalRouter: null, runtimeLoader: vi.fn(async () => { throw new Error('Separate Chromium must not start'); }),
   });
-  await manager.callTool(scope, 'browser_navigate', { url: 'https://other.example/' });
+  expect(await manager.callTool(scope, 'browser_navigate', { url: 'https://other.example/' }))
+    .toEqual([{ type: 'text', text: JSON.stringify({ url: created.url }) }]);
   expect(bridge.openTab).toHaveBeenCalledWith('https://other.example/', 'new-chat');
+  expect(bridge.openTab).toHaveBeenCalledOnce();
   expect(router.selectClaim).toHaveBeenCalledWith(scope, created,
     { allowedOrigins: new Set(['https://other.example']), agentCreated: true });
-  expect(router.call).toHaveBeenCalledWith(scope, created, 'browser_navigate', { url: 'https://other.example/' });
+  expect(router.authorizeCurrent).toHaveBeenCalledWith(scope, created);
+  expect(router.call).not.toHaveBeenCalled();
   await manager.close();
 });
 
@@ -168,6 +172,7 @@ it('opens another in-app tab on request while the chat already works in one', as
     close: vi.fn() } as unknown as EmbeddedBrowserBridge;
   const router = { hasBinding: vi.fn(() => true), lastUsed: vi.fn(() => 1), select: vi.fn(() => first),
     selectClaim: vi.fn(() => second), markTab: vi.fn(), finishTurn: vi.fn(async () => undefined),
+    authorizeCurrent: vi.fn(async () => undefined),
     call: vi.fn(async () => [{ type: 'text', text: '{}' }]), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
   const external = { hasBinding: vi.fn(() => true), lastUsed: vi.fn(() => 2), select: vi.fn(),
     call: vi.fn(), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
@@ -176,11 +181,16 @@ it('opens another in-app tab on request while the chat already works in one', as
     desktopManaged: true, embeddedBridge: bridge, embeddedRouter: router, accessApproval,
     externalRouter: external, runtimeLoader: vi.fn(async () => { throw new Error('Separate Chromium must not start'); }),
   });
-  await manager.callTool(scope, 'browser_navigate', { url: 'https://second.example/', newTab: true, targetBrowser: 'memmy' });
+  expect(await manager.callTool(scope, 'browser_navigate', { url: 'https://second.example/', newTab: true,
+    targetBrowser: 'memmy', tabDisposition: 'deliverable' }))
+    .toEqual([{ type: 'text', text: JSON.stringify({ url: second.url }) }]);
   expect(bridge.openTab).toHaveBeenCalledWith('https://second.example/', 'compare');
+  expect(bridge.openTab).toHaveBeenCalledOnce();
   expect(router.selectClaim).toHaveBeenCalledWith(scope, second,
     { allowedOrigins: new Set(['https://second.example']), agentCreated: true });
-  expect(router.call).toHaveBeenCalledWith(scope, second, 'browser_navigate', { url: 'https://second.example/' });
+  expect(router.authorizeCurrent).toHaveBeenCalledWith(scope, second);
+  expect(router.call).not.toHaveBeenCalled();
+  expect(router.markTab).toHaveBeenCalledWith(scope, 'deliverable', second);
   expect(router.select).not.toHaveBeenCalled();
   expect(external.select).not.toHaveBeenCalled();
   await expect(manager.callTool(scope, 'browser_navigate', { url: 'https://x.example/', newTab: true, tabMention: 'tab' }))
@@ -196,6 +206,7 @@ it('opens the first Agent tab in its runtime chat after site approval, ignoring 
     close: vi.fn() } as unknown as EmbeddedBrowserBridge;
   const router = { hasBinding: vi.fn(() => false), select: vi.fn(() => claim),
     selectClaim: vi.fn(() => claim), markTab: vi.fn(), finishTurn: vi.fn(async () => undefined),
+    authorizeCurrent: vi.fn(async () => undefined),
     call: vi.fn(async () => [{ type: 'text', text: '{}' }]), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
   const accessApproval = { authorize: vi.fn(async (_url: string, allowed: Set<string>) => {
     allowed.add('https://example.com'); return true;
@@ -233,4 +244,83 @@ it('uses an exact tab mention and never falls back when the mention is stale', a
     .rejects.toThrow('Stale tab mention');
   expect(router.call).toHaveBeenCalledTimes(1);
   await manager.close();
+});
+
+it.each(['stop', 'abort'] as const)('does not bind or navigate a newly opened tab after %s', async interruption => {
+  const scope = { sessionKey: 'opening', channel: 'projected-session', chatId: 'opening' };
+  const claim = { connectionId: 'memmy-webview', tabId: 31, browser: 'memmy' as const,
+    title: 'Form', url: 'https://example.com/form', claimedAt: 1 };
+  let finishOpening!: (value: typeof claim) => void;
+  const opening = new Promise<typeof claim>(resolve => { finishOpening = resolve; });
+  const bridge = { refresh: vi.fn(async () => null), openTab: vi.fn(() => opening),
+    command: vi.fn(async () => ({ ok: true })), close: vi.fn() } as unknown as EmbeddedBrowserBridge;
+  const router = { hasBinding: vi.fn(() => false), selectClaim: vi.fn(() => claim),
+    authorizeCurrent: vi.fn(async () => undefined), call: vi.fn(), markTab: vi.fn(),
+    finishTurn: vi.fn(async () => undefined), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
+  const accessApproval = { authorize: vi.fn(async () => true) } as unknown as BrowserAccessApproval;
+  const manager = new BrowserSessionManager({ enabled: true }, { desktopManaged: true,
+    embeddedBridge: bridge, embeddedRouter: router, externalRouter: null, accessApproval });
+  const cancel = new AbortController();
+  try {
+    const pending = manager.callTool(scope, 'browser_navigate',
+      { url: claim.url, tabDisposition: 'deliverable' }, cancel.signal);
+    const rejected = expect(pending).rejects.toThrow(/cancel|finished turn/);
+    await vi.waitFor(() => expect(bridge.openTab).toHaveBeenCalledOnce());
+    if (interruption === 'stop') await manager.closeSurfacesForTurn(scope);
+    else cancel.abort();
+    finishOpening(claim);
+    await rejected;
+    expect(bridge.command).toHaveBeenCalledExactlyOnceWith(claim, 'closeTab');
+    expect(router.selectClaim).not.toHaveBeenCalled();
+    expect(router.authorizeCurrent).not.toHaveBeenCalled();
+    expect(router.call).not.toHaveBeenCalled();
+    expect(router.markTab).not.toHaveBeenCalled();
+  } finally { await manager.close(); }
+});
+
+it('does not report or retain a new tab if the turn stops during live-site authorization', async () => {
+  const scope = { sessionKey: 'opening-approval', channel: 'projected-session', chatId: 'opening-approval' };
+  const claim = { connectionId: 'memmy-webview', tabId: 31, browser: 'memmy' as const,
+    title: 'Form', url: 'https://example.com/form', claimedAt: 1 };
+  let finishApproval!: () => void;
+  const approval = new Promise<void>(resolve => { finishApproval = resolve; });
+  const bridge = { refresh: vi.fn(async () => null), openTab: vi.fn(async () => claim),
+    close: vi.fn() } as unknown as EmbeddedBrowserBridge;
+  const router = { hasBinding: vi.fn(() => false), selectClaim: vi.fn(() => claim),
+    authorizeCurrent: vi.fn(() => approval), call: vi.fn(), markTab: vi.fn(),
+    finishTurn: vi.fn(async () => undefined), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
+  const accessApproval = { authorize: vi.fn(async () => true) } as unknown as BrowserAccessApproval;
+  const manager = new BrowserSessionManager({ enabled: true }, { desktopManaged: true,
+    embeddedBridge: bridge, embeddedRouter: router, externalRouter: null, accessApproval });
+  try {
+    const pending = manager.callTool(scope, 'browser_navigate',
+      { url: claim.url, tabDisposition: 'deliverable' });
+    const rejected = expect(pending).rejects.toThrow(/finished turn/);
+    await vi.waitFor(() => expect(router.authorizeCurrent).toHaveBeenCalledOnce());
+    await manager.closeSurfacesForTurn(scope);
+    finishApproval();
+    await rejected;
+    expect(router.call).not.toHaveBeenCalled();
+    expect(router.markTab).not.toHaveBeenCalled();
+  } finally { await manager.close(); }
+});
+
+it.each([false, true])('preserves the new-tab download destination restriction (newTab=%s)', async newTab => {
+  const scope = { sessionKey: 'download', channel: 'projected-session', chatId: 'download' };
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'embedded-new-tab-download-'));
+  const bridge = { refresh: vi.fn(async () => null), openTab: vi.fn(), close: vi.fn() } as unknown as EmbeddedBrowserBridge;
+  const router = { hasBinding: vi.fn(() => false), call: vi.fn(), closeAll: vi.fn() } as unknown as ExternalBrowserSessionRouter;
+  const accessApproval = { authorize: vi.fn(async () => true) } as unknown as BrowserAccessApproval;
+  const manager = new BrowserSessionManager({ enabled: true }, { desktopManaged: true,
+    embeddedBridge: bridge, embeddedRouter: router, externalRouter: null, accessApproval });
+  try {
+    await expect(manager.callTool(scope, 'browser_navigate', { url: 'https://example.com/file', newTab,
+      downloadPath: path.join(directory, 'download.pdf') })).rejects.toThrow(/downloadPath requires an existing/);
+    expect(bridge.openTab).not.toHaveBeenCalled();
+    expect(accessApproval.authorize).not.toHaveBeenCalled();
+    expect(router.call).not.toHaveBeenCalled();
+  } finally {
+    await manager.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

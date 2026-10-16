@@ -20,7 +20,7 @@ const functionNames = new Set([
   "watchStartupRenderer", "handleStartupFailure", "handleRendererLoadFailure"
 ]);
 const variableNames = new Set([
-  "mainWindow", "memmyPermissionOnboarding", "petWindow", "runtimeServices", "runtimeConfig", "isBootReady", "isQuitting",
+  "mainWindow", "memmyPermissionOnboarding", "pipScreenPermissionGuide", "petWindow", "runtimeServices", "runtimeConfig", "isBootReady", "isQuitting",
   "isQuitCleanupInProgress", "isQuitCleanupComplete", "stopMemoryServiceForCurrentQuit",
   "splashWindow", "splashCloseTimer", "splashTimer", "SPLASH_MAX_VISIBLE_MS", "STARTUP_SLOW_MS",
   "UPDATE_SPLASH_MAX_VISIBLE_MS", "bootStage", "bootStartedAt", "isPetWindowReadyToShow",
@@ -120,6 +120,7 @@ function setup(options: { delay?: number; gatewayDelay?: number; apiDelay?: numb
     installPreparedRequiredUpdateBeforeBoot: async () => false,
     registerIpcHandlers: noop, installBundledCliIfNeeded: async () => {}, startPackagedRendererServerIfNeeded: async () => {},
     createDesktopScreenCapture: noop, createComputerUseOnboarding: noop, captureComputerUseWindow: noop,
+    createComputerUsePIPScreenPermissionGuide: () => ({ request: noop, dispose: noop }),
     createComputerUseSurfaceWindows: () => ({ update: noop, closeAll: noop }),
     createBrowserSidebarBridge: () => ({ update: noop, clear: noop }),
     EmbeddedBrowserDriver: class { setHistoryStore() {} },
@@ -128,6 +129,8 @@ function setup(options: { delay?: number; gatewayDelay?: number; apiDelay?: numb
     attachBrowserWebviewDownloads: () => noop,
     attachBrowserWebviewPermissions: () => noop,
     BrowserHistoryStore: class { constructor(_path: string) {} },
+    BROWSER_NATIVE_ALLOW_ALL_FILE_ENV: 'MEMMY_NATIVE_APP_ALLOW_ALL_FILE',
+    allowAllNativeApps: () => ({ filePath: 'test-user-data/computer-use/allow-all-apps.json' }),
     windowsDataLayout: null,
     startManagedRuntimeServices: async () => {
       if (options.delay) await new Promise(resolve => setTimeout(resolve, options.delay));

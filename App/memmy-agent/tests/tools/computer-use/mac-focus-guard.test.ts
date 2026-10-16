@@ -72,12 +72,25 @@ it('allows the Agent to continue in the foreground app after the user stops inte
   expect(restore).not.toHaveBeenCalled();
 });
 
-it('does not mutate the shared browser while the user has its window in front', async () => {
+it('allows an idle shared browser to remain in front while the Agent acts', async () => {
+  const invoke = vi.fn(async () => 'done');
+  const restore = vi.fn();
+  const read = vi.fn().mockResolvedValueOnce({ pid: 30, name: 'Google Chrome for Testing',
+    bundleId: 'com.google.chrome.for.testing', inputIdle: 20 })
+    .mockResolvedValueOnce({ pid: 30, name: 'Google Chrome for Testing',
+      bundleId: 'com.google.chrome.for.testing', inputIdle: 20.1 });
+  await expect(withMacFocusGuard('com.google.chrome.for.testing', 'browser_click', invoke,
+    { snapshot: read, restore })).resolves.toBe('done');
+  expect(invoke).toHaveBeenCalledOnce();
+  expect(restore).not.toHaveBeenCalled();
+});
+
+it('pauses the shared browser before acting after recent physical input', async () => {
   const invoke = vi.fn();
   await expect(withMacFocusGuard('com.google.chrome.for.testing', 'browser_click', invoke, {
     snapshot: async () => ({ pid: 30, name: 'Google Chrome for Testing',
-      bundleId: 'com.google.chrome.for.testing', inputIdle: 20 }), restore: vi.fn(),
-  }, { blockWhenTargetForeground: true })).rejects.toBeInstanceOf(OcuUserIntervened);
+      bundleId: 'com.google.chrome.for.testing', inputIdle: 0.1 }), restore: vi.fn(),
+  })).rejects.toBeInstanceOf(OcuUserIntervened);
   expect(invoke).not.toHaveBeenCalled();
 });
 

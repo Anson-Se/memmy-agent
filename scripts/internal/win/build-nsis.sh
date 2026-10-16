@@ -651,6 +651,9 @@ verify_packaged_windows_unpacked_artifacts() {
   local packaged_embedding_model="$DESKTOP_DIR/release/win-unpacked/resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/app.asar"
+  node "$ROOT_DIR/scripts/internal/shared/verify-browser-extension.mjs" \
+    "$(to_node_readable_path "$DESKTOP_DIR/extensions/memmy-browser")" \
+    "$(to_node_readable_path "$DESKTOP_DIR/release/win-unpacked/resources/browser-extension")"
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy-memory.cmd"
   require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy.cmd"
   require_packaged_runtime_file "$packaged_memory_runtime/dist/src/cli/index.js"
@@ -712,6 +715,11 @@ verify_packaged_windows_unpacked_artifacts() {
     "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1" \
     "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1" \
     "Windows 11 Computer History observer"
+  require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/app-icon.ps1"
+  verify_packaged_file_matches_runtime \
+    "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/app-icon.ps1" \
+    "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/app-icon.ps1" \
+    "Windows Computer History application icons"
   node "$ROOT_DIR/scripts/internal/win/stage-wechat-python.mjs" verify \
     "$(to_node_readable_path "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/python")"
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/mac/wechat/read_messages.py"

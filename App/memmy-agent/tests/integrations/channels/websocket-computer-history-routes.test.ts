@@ -141,7 +141,7 @@ function snapshot(): ComputerHistorySnapshot {
 
 describe("personal WeChat History HTTP boundary", () => {
   it("checks reader prerequisites through authenticated POST before any consent or connection", async () => {
-    const preparation = { ready: false, appPath: null, error: "lldb_unavailable" };
+    const preparation = { ready: false, appPath: null, error: "python_unavailable" };
     history.prepareWeChatReader.mockResolvedValue(preparation);
     const route = "/api/computer-history/wechat/prepare";
     expect((await channel().dispatchHttp({}, request({ path: route, headers: {}, body: "{}" })))?.status).toBe(401);

@@ -5,7 +5,7 @@ import type { MessageKey } from "../i18n/messages.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { ConfirmDialog } from "../components/confirm-dialog.js";
 import styles from "./computer-use-settings.module.css";
-import { ExternalBrowserSettings } from "./external-browser-settings.js";
+import { BrowserExtensionSetup } from "./browser-extension-setup.js";
 import { BROWSER_EXTENSION_SECTION_ID, EXCEL_CONNECTION_SECTION_ID, scrollSettingsSectionIntoView } from "./settings-nav.js";
 import { openExternalUrl } from "../utils/open-url.js";
 import computerUseIcon from "../assets/computer-use-plugin-icon.png";
@@ -59,6 +59,8 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   const [allowAll, setAllowAll] = useState(false);
   const [allowAllReady, setAllowAllReady] = useState(false);
   const [allowAllBusy, setAllowAllBusy] = useState(false);
+  const allowAllEpoch = useRef(0);
+  const allowAllWriting = useRef(false);
   const approvalEpoch = useRef(0);
   const excelEpoch = useRef(0);
   const failedExcelAction = useRef<boolean | null>(null);
@@ -121,15 +123,28 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
 
   useEffect(() => {
     let live = true;
-    const read = window.memmy?.getNativeAppAllowAll;
-    if (!read) {
-      setAllowAllReady(true);
-      return;
-    }
-    void read().then(value => {
-      if (live) { setAllowAll(value); setAllowAllReady(true); }
-    }).catch(() => { if (live) { setError(true); setAllowAllReady(true); } });
-    return () => { live = false; };
+    const apply = (value: boolean) => {
+      if (!live) return;
+      allowAllEpoch.current++;
+      setAllowAll(value); setAllowAllReady(true);
+    };
+    const unsubscribe = window.memmy?.onBrowserAllowAllChanged?.(state => apply(state.inherited));
+    const load = () => {
+      if (allowAllWriting.current) return;
+      const read = window.memmy?.getBrowserAllowAll
+        ? () => window.memmy!.getBrowserAllowAll!().then(state => state.inherited)
+        : window.memmy?.getNativeAppAllowAll;
+      if (!read) { setAllowAllReady(true); return; }
+      const epoch = ++allowAllEpoch.current;
+      void read().then(value => {
+        if (live && epoch === allowAllEpoch.current) apply(value);
+      }).catch(() => {
+        if (live && epoch === allowAllEpoch.current) { setError(true); setAllowAllReady(true); }
+      });
+    };
+    load();
+    window.addEventListener('focus', load);
+    return () => { live = false; allowAllEpoch.current++; unsubscribe?.(); window.removeEventListener('focus', load); };
   }, []);
 
   useEffect(() => {
@@ -204,14 +219,18 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
   }
 
   async function setAllowAllApps(enabled: boolean) {
-    if (!window.memmy?.setNativeAppAllowAll || allowAllBusy) return;
+    if (!window.memmy?.setNativeAppAllowAll || allowAllWriting.current) return;
+    const epoch = ++allowAllEpoch.current;
+    allowAllWriting.current = true;
     setAllowAllBusy(true);
     setError(false);
     try {
-      setAllowAll(await window.memmy.setNativeAppAllowAll(enabled));
+      const value = await window.memmy.setNativeAppAllowAll(enabled);
+      if (epoch === allowAllEpoch.current) setAllowAll(value);
     } catch {
-      setError(true);
+      if (epoch === allowAllEpoch.current) setError(true);
     } finally {
+      allowAllWriting.current = false;
       setAllowAllBusy(false);
     }
   }
@@ -365,80 +384,7 @@ export function ComputerUseSettings(props: { client?: MemmyAgentClient; platform
           />
         </div>
         <div id={BROWSER_EXTENSION_SECTION_ID} ref={browserExtensionSection}>
-        <ExternalBrowserSettings
-          getStatus={() => typeof props.client?.getExternalBrowserStatus === "function"
-            ? props.client.getExternalBrowserStatus()
-            : Promise.reject(new Error("Computer use browser status is unavailable"))}
-          revealExtensionFolder={async () => {
-            if (!window.memmy?.revealBrowserExtension || !await window.memmy.revealBrowserExtension()) {
-              throw new Error("Browser extension folder is unavailable");
-            }
-          }}
-          getExtensionDirectory={() => window.memmy?.getBrowserExtensionDirectory?.() ?? Promise.resolve(null)}
-          prepareInstall={async browser => {
-            if (!window.memmy?.prepareBrowserExtension) throw new Error("Browser installation preparation is unavailable");
-            return window.memmy.prepareBrowserExtension(browser, !window.memmy.dragBrowserExtension);
-          }}
-          getInstalled={() => window.memmy?.listInstalledBrowserExtensions?.() ?? Promise.resolve([])}
-          getRunning={() => window.memmy?.listRunningExternalBrowsers?.() ?? Promise.resolve(null)}
-          platform={props.platform}
-          labels={{
-            chrome: t("settings.computerUse.chrome"),
-            edge: t("settings.computerUse.edge"),
-            description: t("settings.computerUse.extensionDescription"),
-            connected: t("settings.computerUse.extensionReady"),
-            disconnected: t("settings.computerUse.notConnected"),
-            notInstalled: t("settings.computerUse.extensionNotInstalled"),
-            install: t("settings.computerUse.extensionOpenFolder"),
-            copy: t("settings.computerUse.extensionCopy"),
-            copied: t("settings.computerUse.extensionCopied"),
-            loadError: t("settings.computerUse.extensionLoadError"),
-            setupTitle: t("settings.computerUse.extensionSetupTitle"),
-            setupIntro: t("settings.computerUse.extensionSetupIntro"),
-            developerModeStep: t("settings.computerUse.extensionDeveloperModeStep"),
-            dragFolderStep: t("settings.computerUse.extensionDragFolderStep"),
-            dragCardTitle: t("settings.computerUse.extensionDragCardTitle"),
-            dragCardHint: t("settings.computerUse.extensionDragCardHint"),
-            installTarget: t("settings.computerUse.extensionInstallTarget"),
-            demo: t("settings.computerUse.extensionDemo"),
-            demoTitle: t("settings.computerUse.extensionDemoTitle"),
-            demoBack: t("settings.computerUse.extensionDemoBack"),
-            demoReplay: t("settings.computerUse.extensionDemoReplay"),
-            demoInstruction: t("settings.computerUse.extensionDemoInstruction"),
-            demoDescription: t("settings.computerUse.extensionDemoDescription"),
-            demoDragging: t("settings.computerUse.extensionDemoDragging"),
-            demoRelease: t("settings.computerUse.extensionDemoRelease"),
-            demoExtensionsHeading: t("settings.computerUse.extensionDemoExtensionsHeading"),
-            demoDeveloperMode: t("settings.computerUse.extensionDemoDeveloperMode"),
-            fallbackDragStep: t("settings.computerUse.extensionFallbackDragStep"),
-            managerStep: t("settings.computerUse.extensionManagerStep"),
-            copyAddress: t("settings.computerUse.extensionCopyAddress"),
-            unpackedStep: t("settings.computerUse.extensionUnpackedStep"),
-            folderStep: t("settings.computerUse.extensionFolderStep"),
-            macFolderHint: t("settings.computerUse.extensionMacFolderHint"),
-            folderMissing: t("settings.computerUse.extensionFolderMissing"),
-            copyPath: t("settings.computerUse.extensionCopyPath"),
-            openPage: t("settings.computerUse.extensionOpenPage"),
-            preparing: t("settings.computerUse.extensionPreparing"),
-            prepared: t("settings.computerUse.extensionPrepared"),
-            browserNotFound: t("settings.computerUse.extensionBrowserNotFound"),
-            launchFailed: t("settings.computerUse.extensionLaunchFailed"),
-            manualGuide: t("settings.computerUse.extensionManualGuide"),
-            installButton: t("settings.computerUse.extensionInstall"),
-            checkConnection: t("settings.computerUse.extensionCheckConnection"),
-            checking: t("settings.computerUse.extensionChecking"),
-            installedWaiting: t("settings.computerUse.extensionInstalledWaiting"),
-            connecting: t("settings.computerUse.extensionConnecting"),
-            browserClosed: t("settings.computerUse.extensionBrowserClosed"),
-            connectionFailed: t("settings.computerUse.extensionConnectionFailed"),
-            statusUnavailable: t("settings.computerUse.extensionStatusUnavailable"),
-            openBrowser: t("settings.computerUse.extensionOpenBrowser"),
-            repairConnection: t("settings.computerUse.extensionRepairConnection"),
-            reinstall: t("settings.computerUse.extensionReinstall"),
-            manage: t("settings.computerUse.extensionManage"),
-            done: t("common.close"),
-          }}
-        />
+        <BrowserExtensionSetup client={props.client} platform={props.platform} />
         </div>
         <div id={EXCEL_CONNECTION_SECTION_ID} ref={excelConnectionSection} className={`${styles.row} ${styles.separated}`}>
           <span className={styles.icon}><img src={excelIcon} alt="" aria-hidden="true" /></span>

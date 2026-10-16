@@ -1,3 +1,5 @@
+import ctypes
+import errno
 import importlib.util
 import json
 import os
@@ -52,7 +54,7 @@ class PrivateStorageTests(unittest.TestCase):
                                        "consentedAt": "fixture-time", "consentId": identifier}))
         consent.chmod(mode)
 
-    def copy_fixture(self, source, destination):
+    def copy_fixture(self, source, destination, root=None):
         if source.is_relative_to(self.state):
             self.assertEqual(source.parent.parent, self.state)
             self.assertTrue(source.parent.name.startswith("clone-preflight-"))
@@ -141,7 +143,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.clone.assert_not_called()
 
     def test_revocation_during_clone_cleans_partial_session(self):
-        def revoke(source, destination):
+        def revoke(source, destination, root=None):
             self.copy_fixture(source, destination)
             self.write_consent(enabled=False)
         self.clone.side_effect = revoke
@@ -151,7 +153,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
 
     def test_consent_id_change_during_clone_cleans_partial_session(self):
-        def replace_consent(source, destination):
+        def replace_consent(source, destination, root=None):
             self.copy_fixture(source, destination)
             self.write_consent(identifier="new-authorization")
         self.clone.side_effect = replace_consent
@@ -184,8 +186,9 @@ class PrivateStorageTests(unittest.TestCase):
         for target in (str(self.file), "../../../../../../outside", str(self.home / "Desktop")):
             with self.subTest(target=target):
                 link.symlink_to(target)
-                with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+                with self.assertRaisesRegex(RuntimeError, "unsafe_path") as failure:
                     self.create()
+                self.assertEqual(failure.exception.detail, {"path": str(link), "reason": "symlink"})
                 link.unlink()
                 self.assertEqual(self.sessions(), [])
 
@@ -215,8 +218,96 @@ class PrivateStorageTests(unittest.TestCase):
 
     def test_fifo_is_rejected_without_opening_it(self):
         os.mkfifo(self.data / "pipe", 0o600)
-        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path") as failure:
             self.create()
+        self.assertEqual(failure.exception.detail, {"path": str(self.data / "pipe"), "reason": "file_type"})
+        self.assertEqual(self.sessions(), [])
+
+    def test_container_manager_metadata_is_neither_opened_nor_copied(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        nested = self.data / ".com.apple.containermanagerd.metadata.plist"
+        nested.write_bytes(b"synthetic WeChat file with a similar name")
+        for root in (self.container, self.group):
+            for name in (".com.apple.containermanagerd.metadata.plist",
+                         ".com.apple.mobile_container_manager.metadata.plist"):
+                # macOS can refuse to open this record even for its owner.
+                (root / name).write_bytes(b"synthetic container record")
+                (root / name).chmod(0o000)
+        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        result = self.create()
+        for private in (Path(result["containerPath"]), Path(result["groupPath"])):
+            self.assertFalse([item for item in private.iterdir() if item.name.startswith(".com.apple.")])
+        self.assertEqual((Path(result["containerPath"]) / "Data/Documents" / nested.name).read_bytes(),
+                         nested.read_bytes())
+        cloned = [call.args[0] for call in self.clone.call_args_list]
+        self.assertIn(nested, cloned)
+        self.assertFalse([path for path in cloned if path.parent in (self.container, self.group)])
+
+    def test_interrupted_listing_is_repeated_in_preflight_and_snapshot(self):
+        original = os.listdir
+        listed = []
+
+        def interrupt_first_listing(path):
+            listed.append(Path(path))
+            if Path(path) == self.data and listed.count(self.data) % 2:
+                raise InterruptedError(errno.EINTR, "approval wait interrupted")
+            return original(path)
+
+        with mock.patch.object(self.helper.os, "listdir", side_effect=interrupt_first_listing):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+            result = self.create()
+        self.assertEqual(listed.count(self.data), 4)
+        self.assertEqual((Path(result["containerPath"]) / "Data/Documents/fixture.db").read_bytes(),
+                         b"only synthetic fixture bytes")
+
+    def test_repeated_interruption_reports_where_and_removes_partial_snapshot(self):
+        original = os.listdir
+
+        def always_interrupted(path):
+            if Path(path) == self.data:
+                raise InterruptedError(errno.EINTR, "approval wait interrupted")
+            return original(path)
+
+        with mock.patch.object(self.helper.os, "listdir", side_effect=always_interrupted) as listing:
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$") as failure:
+                self.create()
+        self.assertEqual(failure.exception.detail, {"path": str(self.data), "operation": "listdir", "errno": "EINTR"})
+        self.assertEqual([Path(call.args[0]) for call in listing.call_args_list].count(self.data),
+                         self.helper._INTERRUPTED_ATTEMPTS)
+        self.assertEqual(self.sessions(), [])
+
+    def test_interrupted_lstat_and_readlink_are_repeated(self):
+        link = self.data / "internal-link"
+        link.symlink_to("fixture.db")
+        originals = {"lstat": os.lstat, "readlink": os.readlink}
+        interrupted = set()
+
+        def once(name, paths):
+            def call(path, *arguments, **options):
+                if Path(path) in paths and (name, Path(path)) not in interrupted:
+                    interrupted.add((name, Path(path)))
+                    raise InterruptedError(errno.EINTR, "approval wait interrupted")
+                return originals[name](path, *arguments, **options)
+            return call
+
+        with mock.patch.object(self.helper.os, "lstat", side_effect=once("lstat", (self.file, link))), \
+                mock.patch.object(self.helper.os, "readlink", side_effect=once("readlink", (link,))):
+            result = self.create()
+        self.assertEqual(interrupted, {("lstat", self.file), ("lstat", link), ("readlink", link)})
+        self.assertEqual(os.readlink(Path(result["containerPath"]) / "Data/Documents/internal-link"), "fixture.db")
+
+    def test_other_source_errors_are_not_repeated(self):
+        original = os.listdir
+
+        def denied(path):
+            if Path(path) == self.data:
+                raise PermissionError(errno.EPERM, "denied")
+            return original(path)
+
+        with mock.patch.object(self.helper.os, "listdir", side_effect=denied) as listing:
+            with self.assertRaises(PermissionError):
+                self.create()
+        self.assertEqual([Path(call.args[0]) for call in listing.call_args_list].count(self.data), 1)
         self.assertEqual(self.sessions(), [])
 
     def test_unsafe_state_symlink_or_permissions_are_rejected(self):
@@ -344,7 +435,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
 
     def test_revocation_during_inert_preflight_clone_cleans_private_fixture(self):
-        def revoke(source, destination):
+        def revoke(source, destination, root=None):
             self.copy_fixture(source, destination)
             self.write_consent(enabled=False)
 
@@ -355,7 +446,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(self.sessions(), [])
 
     def test_final_snapshot_source_change_is_rejected_and_partial_session_removed(self):
-        def change(source, destination):
+        def change(source, destination, root=None):
             self.copy_fixture(source, destination)
             # This synthetic new entry exercises the strict directory check.
             (source.parent / "later-cache-entry").write_bytes(b"synthetic cache write")
@@ -434,6 +525,74 @@ class PrivateStorageTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
         destination.write_bytes(b"private copy write")
         self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clone_reports_an_unreadable_source_with_its_path_and_errno(self):
+        self.file.chmod(0o000)
+        destination = self.state / "clone-fixture.db"
+        with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_clone_failed$") as failure:
+            self.native_clone(self.file, destination)
+        self.assertEqual(failure.exception.detail, {"path": str(self.file), "operation": "open", "errno": "EACCES"})
+        self.assertFalse(destination.exists())
+
+    def interrupted_clonefile(self, failures):
+        function = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).fclonefileat
+        function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        function.restype = ctypes.c_int
+        calls = []
+
+        class Interrupted:
+            argtypes = restype = None
+
+            def __call__(self, *arguments):
+                calls.append(arguments)
+                if len(calls) <= failures:
+                    ctypes.set_errno(errno.EINTR)
+                    return -1
+                return function(*arguments)
+
+        return mock.Mock(fclonefileat=Interrupted()), calls
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clonefile_interruption_is_repeated(self):
+        library, calls = self.interrupted_clonefile(failures=1)
+        destination = self.state / "clone-fixture.db"
+        with mock.patch.object(self.helper.ctypes, "CDLL", return_value=library):
+            self.native_clone(self.file, destination, self.container)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(destination.read_bytes(), self.file.read_bytes())
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clonefile_repeated_interruption_reports_where(self):
+        library, calls = self.interrupted_clonefile(failures=self.helper._INTERRUPTED_ATTEMPTS)
+        destination = self.state / "clone-fixture.db"
+        with mock.patch.object(self.helper.ctypes, "CDLL", return_value=library):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_data_access_interrupted$") as failure:
+                self.native_clone(self.file, destination, self.container)
+        self.assertEqual(failure.exception.detail, {"path": str(self.file), "operation": "clone", "errno": "EINTR"})
+        self.assertEqual(len(calls), self.helper._INTERRUPTED_ATTEMPTS)
+        self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clone_accepts_another_hardlink_name_only_inside_the_same_root(self):
+        linked = self.data / "fixture-linked.db"
+        os.link(self.file, linked)
+        original = self.helper.fcntl.fcntl
+        reported = [linked]
+
+        def getpath(descriptor, command, argument):
+            if command == 50:
+                return os.fsencode(str(reported[0])) + b"\0"
+            return original(descriptor, command, argument)
+
+        with mock.patch.object(self.helper.fcntl, "fcntl", side_effect=getpath):
+            self.native_clone(self.file, self.state / "inside.db", self.container)
+            reported[0] = self.home / "elsewhere.db"
+            with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_unsafe_path$") as failure:
+                self.native_clone(self.file, self.state / "outside.db", self.container)
+        self.assertEqual((self.state / "inside.db").read_bytes(), self.file.read_bytes())
+        self.assertEqual(failure.exception.detail, {"path": str(self.file), "reason": "path"})
+        self.assertFalse((self.state / "outside.db").exists())
 
 
 if __name__ == "__main__":

@@ -23,6 +23,18 @@ def emit(event, **fields):
     print(json.dumps({"event": event, **fields}), flush=True)
 
 
+def connection_error_fields(error):
+    """The category the UI explains, plus where it happened when the helper knows."""
+    category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z_:0-9-]{0,127}", category):
+        category = "connection_process_failed"
+    detail = getattr(error, "detail", None)
+    if isinstance(detail, dict) and detail and all(
+            isinstance(key, str) and isinstance(value, str) for key, value in detail.items()):
+        return {"category": category, "detail": dict(detail)}
+    return {"category": category}
+
+
 def command(arguments, *, env=None):
     result = subprocess.run(arguments, capture_output=True, text=True, env=env)
     if result.returncode:
@@ -37,13 +49,13 @@ def command(arguments, *, env=None):
     return result.stdout or result.stderr
 
 
-def prepare_permission_helper(state, app, lldb_path):
+def prepare_permission_helper(state, app):
     # Resolve beside this script in both source and app.asar.unpacked builds.
     location = Path(__file__).with_name("permission_helper.py")
     spec = importlib.util.spec_from_file_location("memmy_wechat_permission_helper", location)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.prepare_permission_helper(state, app=app, lldb_path=lldb_path)
+    return module.prepare_permission_helper(state, app=app)
 
 
 def private_storage_module():
@@ -54,76 +66,17 @@ def private_storage_module():
     return module
 
 
-def storage_environment(storage, lldb_path):
+def storage_environment(storage):
+    # Drop any ambient DYLD_/injection or PYTHONPATH so the launched copy and the
+    # capture helper run with only the private mappings this connection sets.
     environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("DYLD_", "MEMMY_WECHAT_"))}
-    environment["PYTHONPATH"] = lldb_path
+                   if not key.startswith(("DYLD_", "MEMMY_WECHAT_")) and key != "PYTHONPATH"}
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     for source, copy in storage["mappings"].items():
         kind = "GROUP" if "/Group Containers/" in source else "CONTAINER"
         environment["MEMMY_WECHAT_" + kind + "_SOURCE"] = source
         environment["MEMMY_WECHAT_" + kind + "_COPY"] = copy
     return environment
-
-
-def lldb_candidates():
-    # Avoid the /usr/bin/lldb shim: it can open an installation dialog when no
-    # developer tools are installed. Resolve the selected directory read-only.
-    candidates = []
-    try:
-        selected = subprocess.run(["/usr/bin/xcode-select", "-p"],
-                                  capture_output=True, text=True, timeout=5)
-        directory = Path(selected.stdout.strip())
-        if selected.returncode == 0 and directory.is_absolute():
-            candidates.append(directory / "usr/bin/lldb")
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    candidates.append(Path("/Library/Developer/CommandLineTools/usr/bin/lldb"))
-    candidates.extend(sorted(Path("/Applications").glob("Xcode*.app/Contents/Developer/usr/bin/lldb")))
-    return [path for path in dict.fromkeys(candidates) if path.is_file() and os.access(path, os.X_OK)]
-
-
-def lldb_version(text):
-    match = re.search(r"\blldb-(\d+(?:\.\d+)*)", text)
-    return tuple(int(part) for part in match.group(1).split(".")) if match else None
-
-
-def lldb_python_path():
-    candidates = []
-    for executable in lldb_candidates():
-        try:
-            result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        version = lldb_version(result.stdout)
-        if not result.returncode and version:
-            candidates.append((version, executable))
-
-    mac_version = platform.mac_ver()[0]
-    mac_major = int(mac_version.split(".")[0]) if mac_version else 0
-    incompatible = False
-    compatible_found = False
-    for version, executable in sorted(candidates, key=lambda item: item[0], reverse=True):
-        # Xcode 27 uses Apple LLDB 2100+. The previous 1703 tools crash parsing
-        # macOS 27's shared cache, including when debugging a tiny C program.
-        # Check before importing/launching the capture helper or quitting WeChat.
-        if mac_major >= 27 and version[0] < 2100:
-            incompatible = True
-            continue
-        compatible_found = True
-        try:
-            result = subprocess.run([str(executable), "-P"], capture_output=True, text=True, timeout=10)
-            location = result.stdout.strip()
-            if result.returncode or not location or not Path(location).is_dir():
-                continue
-            environment = dict(os.environ, PYTHONPATH=location)
-            imported = subprocess.run([sys.executable, "-c", "import lldb"],
-                                      env=environment, capture_output=True, text=True, timeout=10)
-            if imported.returncode == 0:
-                return location
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-    raise RuntimeError("lldb_incompatible" if incompatible and not compatible_found else "lldb_unavailable")
 
 
 def wait_for_capture(process):
@@ -156,6 +109,26 @@ def capture_failure_category(code, output_exists, helper_category=None):
     return None
 
 
+def wechat_application():
+    # Resolve by bundle id through LaunchServices so a non-/Applications or App
+    # Store install still connects. This only reads the registration; it does not
+    # launch WeChat. Fall back to the conventional location.
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'POSIX path of (path to application id "com.tencent.xinWeChat")'],
+            capture_output=True, text=True, timeout=10)
+        candidate = Path(result.stdout.strip())
+        if (result.returncode == 0 and candidate.is_absolute()
+                and candidate.suffix == ".app" and candidate.is_dir() and not candidate.is_symlink()):
+            return candidate.resolve(strict=True)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    fallback = Path("/Applications/WeChat.app")
+    if fallback.is_dir() and not fallback.is_symlink():
+        return fallback.resolve(strict=True)
+    raise RuntimeError("wechat_application_missing")
+
+
 def running_wechat():
     result = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True)
     return bool(result.stdout.strip())
@@ -170,7 +143,18 @@ def temporary_copy_running(shadow):
     return False
 
 
-def current_database_root():
+def current_database_root(original=None):
+    # Listing WeChat's container can wait for macOS approval, and a lost approval
+    # interrupts the call; listing again requests it again.
+    for attempt in range(3):
+        try:
+            return _current_database_root(original)
+        except InterruptedError:
+            if attempt == 2:
+                raise RuntimeError("wechat_data_access_interrupted") from None
+
+
+def _current_database_root(original=None):
     home = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
     roots = []
     for candidate in home.glob("*/db_storage"):
@@ -187,20 +171,68 @@ def current_database_root():
 
     # Modification time can select the wrong account when two accounts have
     # recently synced. Identify the database opened by the running original.
-    pids = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True).stdout.split()
-    if pids:
-        opened = subprocess.run(["/usr/sbin/lsof", "-Fn", "-p", ",".join(pids)],
-                                capture_output=True, text=True)
-        active = set()
-        for line in opened.stdout.splitlines():
-            if not line.startswith("n"):
+    original = original or wechat_application() / "Contents/MacOS/WeChat"
+    try:
+        pids = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True,
+                              timeout=5).stdout.split()
+        pids = [pid for pid in pids if pid.isdecimal()]
+        if not pids:
+            raise RuntimeError("current_account_ambiguous")
+        processes = subprocess.run(["ps", "-ww", "-p", ",".join(pids), "-o", "pid=,comm="],
+                                   capture_output=True, text=True, timeout=5)
+        original_pids = set()
+        for line in processes.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or fields[0] not in pids:
                 continue
-            name = line[1:]
-            for candidate in roots:
-                if name.startswith(str(candidate) + os.sep):
+            try:
+                if Path(fields[1]).samefile(original):
+                    original_pids.add(fields[0])
+            except InterruptedError:
+                raise
+            except OSError:
+                continue
+        if not original_pids:
+            raise RuntimeError("current_account_ambiguous")
+        opened = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fpn", "-p", ",".join(sorted(original_pids))],
+                                capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        raise RuntimeError("current_account_ambiguous") from None
+
+    # Firmlinks are not symlinks: resolve() can leave lsof's /System/Volumes/Data
+    # spelling different from /Users. Match ancestor directory identities, not
+    # string prefixes, and only use database files opened by the original app.
+    root_identities = {}
+    for candidate in roots:
+        info = candidate.stat()
+        root_identities[(info.st_dev, info.st_ino)] = candidate
+    active = set()
+    current_pid = None
+    for line in opened.stdout.splitlines():
+        if line.startswith("p"):
+            current_pid = line[1:]
+            continue
+        if not line.startswith("n") or current_pid not in original_pids:
+            continue
+        name = line[1:]
+        if not name.endswith((".db", ".db-wal", ".db-shm")):
+            continue
+        try:
+            database = Path(name).resolve(strict=True)
+            if not database.is_file():
+                continue
+            for parent in database.parents:
+                info = parent.stat()
+                candidate = root_identities.get((info.st_dev, info.st_ino))
+                if candidate is not None:
                     active.add(candidate)
-        if len(active) == 1:
-            return next(iter(active))
+                    break
+        except InterruptedError:
+            raise
+        except OSError:
+            continue
+    if len(active) == 1:
+        return next(iter(active))
     raise RuntimeError("current_account_ambiguous")
 
 
@@ -288,7 +320,7 @@ def main():
     state = Path(os.path.abspath(args.state))
     if args.prepare_only:
         try:
-            result = prepare_permission_helper(state, Path("/Applications/WeChat.app"), lldb_python_path())
+            result = prepare_permission_helper(state, wechat_application())
         except RuntimeError as error:
             category = str(error)
             if not re.fullmatch(r"[a-z_]+", category):
@@ -304,23 +336,22 @@ def main():
     if args.library is None:
         raise RuntimeError("sqlcipher_library_unavailable")
     library = args.library.resolve(strict=True)
-    app = Path("/Applications/WeChat.app").resolve(strict=True)
+    app = wechat_application()
     original = app / "Contents/MacOS/WeChat"
     if not original.is_file():
         raise RuntimeError("wechat_application_missing")
-    lldb_path = lldb_python_path()
     signature = command(["codesign", "-dvv", str(app)])
     command(["codesign", "--verify", "--deep", "--strict", str(app)])
     os.umask(0o077)
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     # Memmy checks its own source access and verifies private path redirection
     # before disturbing the original. The copy needs no separate disk grant.
-    preparation = prepare_permission_helper(state, app, lldb_path)
+    preparation = prepare_permission_helper(state, app)
     if not preparation["ready"]:
         raise RuntimeError(preparation["error"] or "wechat_data_access_required")
     # A missing/inaccessible database layout is checked only after Memmy's data
     # access has been verified, so a disk-permission error is not called logout.
-    root = current_database_root()
+    root = current_database_root(original)
     if consent_id(state) != active_consent_id:
         raise RuntimeError("wechat_consent_revoked")
     shadow = Path(preparation["appPath"])
@@ -358,7 +389,7 @@ def main():
         # The only real-data snapshot is taken after normal quit has flushed
         # WeChat's databases and WAL files. Live writes are expected at preflight.
         storage = storage_module.create_private_storage(state, consent_id=active_consent_id)
-        environment = storage_environment(storage, lldb_path)
+        environment = storage_environment(storage)
         capture = Path(__file__).with_name("capture_keys.py")
         emit("awaiting_wechat_login")
         process = subprocess.Popen([
@@ -399,7 +430,7 @@ def main():
         return 0
     except Exception as error:
         # Report the cause before restoration updates the observable phase.
-        emit("connection_error", category=str(error) if isinstance(error, RuntimeError) else type(error).__name__)
+        emit("connection_error", **connection_error_fields(error))
         raise
     finally:
         if "process" in locals() and process.poll() is None:
@@ -429,7 +460,7 @@ def main():
                     cleanup_error = error
             # Retain only the inert connection executable; session data is gone.
             if restore_original and not running_wechat():
-                reopened = subprocess.run(["open", "-a", "/Applications/WeChat.app"], capture_output=True)
+                reopened = subprocess.run(["open", str(app)], capture_output=True)
                 emit("original_reopened", success=reopened.returncode == 0)
         next_keys.unlink(missing_ok=True)
         next_keys.with_suffix(".pending").unlink(missing_ok=True)
@@ -445,9 +476,13 @@ def main():
             raise RuntimeError("wechat_private_storage_cleanup_failed") from cleanup_error
 
 
-if __name__ == "__main__":
+def run():
     try:
-        raise SystemExit(main())
+        return main()
     except Exception as error:
-        emit("connection_error", category=str(error) if isinstance(error, RuntimeError) else type(error).__name__)
-        raise SystemExit(2)
+        emit("connection_error", **connection_error_fields(error))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

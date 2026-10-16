@@ -109,8 +109,9 @@ write_desktop_edition_manifest() {
   node "$ROOT_DIR/scripts/internal/shared/write-desktop-edition-manifest.mjs" "${manifest_args[@]}"
 }
 
-# Resolves NSMicrophoneUsageDescription from the package edition (cn/intl).
-resolve_microphone_usage_description() {
+# Resolves camera/microphone usage descriptions from the package edition (cn/intl).
+resolve_media_usage_description() {
+  local media="${1:-}"
   local edition="${MEMMY_APP_EDITION:-}"
 
   if [ -z "$edition" ]; then
@@ -124,18 +125,32 @@ resolve_microphone_usage_description() {
     esac
   fi
 
-  case "$edition" in
-    intl)
-      printf '%s' "Memmy uses the microphone only when you start voice input."
+  case "$edition:$media" in
+    intl:microphone)
+      printf '%s' "Memmy uses the microphone for voice input and for website tasks you request."
       ;;
-    cn)
-      printf '%s' "Memmy 仅在你开始语音输入时使用麦克风"
+    cn:microphone)
+      printf '%s' "Memmy 会在语音输入和你要求的网页任务中使用麦克风。"
+      ;;
+    intl:camera)
+      printf '%s' "Memmy uses the camera for website tasks you request."
+      ;;
+    cn:camera)
+      printf '%s' "Memmy 会在你要求的网页任务中使用摄像头。"
       ;;
     *)
-      echo "Unsupported package edition for microphone usage description: $edition" >&2
+      echo "Unsupported package edition or media type for usage description: $edition:$media" >&2
       exit 1
       ;;
   esac
+}
+
+resolve_microphone_usage_description() {
+  resolve_media_usage_description microphone
+}
+
+resolve_camera_usage_description() {
+  resolve_media_usage_description camera
 }
 
 create_cli_launcher() {
@@ -732,10 +747,13 @@ verify_computer_history_helpers() {
   done
   if [ "$2" = arm64 ]; then
     require_packaged_runtime_file "$1/../wechat_identity.py"
-    for helper in MemmyWeChatPermissionProbe.dylib MemmyWeChatPrivateStorage.dylib; do
+    for helper in MemmyWeChatPermissionProbe.dylib MemmyWeChatPrivateStorage.dylib MemmyWeChatKeyCapture.dylib; do
       require_packaged_runtime_file "$1/wechat/native/arm64/$helper"
       lipo "$1/wechat/native/arm64/$helper" -verify_arch arm64
     done
+    require_packaged_runtime_file "$1/wechat/python/runtime.json"
+    require_packaged_runtime_file "$1/wechat/python/bin/python3.13"
+    lipo "$1/wechat/python/bin/python3.13" -verify_arch arm64
   fi
 }
 
@@ -775,6 +793,8 @@ verify_packaged_mac_unpacked_artifacts() {
   local packaged_embedding_model="$app_path/Contents/Resources/embedding-models/$EMBEDDING_MODEL_ID"
 
   require_packaged_runtime_file "$app_path/Contents/Resources/app.asar"
+  node "$ROOT_DIR/scripts/internal/shared/verify-browser-extension.mjs" \
+    "$DESKTOP_DIR/extensions/memmy-browser" "$app_path/Contents/Resources/browser-extension"
   local cpu="$target_cpu"
   if [ "$cpu" = "x64" ]; then cpu=x86_64; fi
   for addon in memmy-pip menu-bar-appearance; do
@@ -1017,6 +1037,9 @@ node "$ROOT_DIR/scripts/internal/shared/check-office-slim-assets.mjs" "$RUNTIME_
 package_step_start "Build Computer History native helpers"
 bash "$ROOT_DIR/scripts/internal/mac/build-computer-history-helpers.sh" \
   "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/mac" "$TARGET_CPU"
+package_step_start "Stage self-contained WeChat Python runtime"
+bash "$ROOT_DIR/scripts/internal/mac/stage-wechat-python.sh" \
+  "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/mac/wechat/python" "$TARGET_CPU"
 package_step_start "Build Computer Use native helpers"
 bash "$ROOT_DIR/scripts/internal/mac/build-computer-use-helpers.sh" \
   "$RUNTIME_DIR/memmy-agent/dist/tools/computer-use/mac" "$TARGET_CPU"
@@ -1158,13 +1181,16 @@ cd "$DESKTOP_DIR"
 # DMG background images are committed static assets and are no longer generated during packaging.
 # For style changes, see the historical generator in git history.
 MEMMY_MICROPHONE_USAGE_DESCRIPTION="$(resolve_microphone_usage_description)"
+MEMMY_CAMERA_USAGE_DESCRIPTION="$(resolve_camera_usage_description)"
 echo "Using edition microphone usage description: $MEMMY_MICROPHONE_USAGE_DESCRIPTION"
+echo "Using edition camera usage description: $MEMMY_CAMERA_USAGE_DESCRIPTION"
 
 BUILDER_ARGS=(--config "$BUILDER_CONFIG")
 if [ -n "${MEMMY_ELECTRON_DIST:-}" ]; then
   BUILDER_ARGS+=(--config.electronDist="$MEMMY_ELECTRON_DIST")
 fi
 BUILDER_ARGS+=(--config.mac.extendInfo.NSMicrophoneUsageDescription="$MEMMY_MICROPHONE_USAGE_DESCRIPTION")
+BUILDER_ARGS+=(--config.mac.extendInfo.NSCameraUsageDescription="$MEMMY_CAMERA_USAGE_DESCRIPTION")
 
 package_step_start "Run electron-builder macOS DMG packaging"
 npx electron-builder "${BUILDER_ARGS[@]}" --mac dmg "$@"

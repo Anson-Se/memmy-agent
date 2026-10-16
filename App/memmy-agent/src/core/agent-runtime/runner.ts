@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
 import path from "node:path";
 import { LLMProvider, LLMResponse, ToolCallRequest } from "../../providers/base.js";
 import {
@@ -1700,6 +1701,7 @@ export class AgentRunner {
           () => this.executeTools(spec, response.toolCalls, externalLookupCounts, workspaceViolationCounts));
         const completed: Record<string, any>[] = [];
         for (const item of executed) {
+          item.call.arguments = redactBrowserAuthArguments(item.call.name, item.call.arguments);
           toolCalls.push(item.call);
           toolEvents.push(item.event);
           const toolMessage = { role: "tool", tool_call_id: item.call.id, name: item.call.name, content: item.result };

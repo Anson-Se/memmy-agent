@@ -72,12 +72,13 @@ describe("MemoriesSubPage", () => {
     expect(html).not.toContain("lucide-bot");
     expect(html).toContain("全部 Agent");
     expect(html).toContain("按来源 Agent 筛选");
+    expect(MEMORY_AGENT_SOURCE_VALUES).not.toContain("computer_history");
+    expect(MEMORY_SOURCE_AGENT_EXCLUSIONS).toContain("computer_history");
   });
 
   it("筛选器和详情共用统一的 Agent 名称格式", () => {
     expect(MEMORY_AGENT_SOURCE_VALUES.map(agentSourceDisplayName)).toEqual([
       "Memmy",
-      "Computer History",
       "Cursor",
       "Claude Code",
       "Codex",
@@ -90,7 +91,7 @@ describe("MemoriesSubPage", () => {
       "QwenWork"
     ]);
     expect(agentSourceDisplayName("MEMMY_AGENT")).toBe("Memmy");
-    expect(agentSourceDisplayName("computer_history")).toBe("Computer History");
+    expect(agentSourceDisplayName("computer_history")).toBe("Memmy");
     expect(agentSourceDisplayName("claude-code")).toBe("Claude Code");
     expect(agentSourceDisplayName("OPENCLAW")).toBe("OpenClaw");
   });
@@ -128,6 +129,18 @@ describe("MemoriesSubPage", () => {
     expect(html).toContain(">Codex</span>");
     expect(html).not.toContain("来源: codex");
     expect(html).not.toContain("memory-pill--source");
+  });
+
+  it("电脑历史记忆显示为 Memmy，同时保留真实来源供详情溯源", () => {
+    const item = {
+      ...memoryListItemFixture,
+      metadata: { source: "computer_history" }
+    };
+    const html = renderMemories({ status: "ready", data: panelItemsOutput([item]), detail: null });
+
+    expect(memoryDisplaySource(item)).toBe("computer_history");
+    expect(html).toContain('aria-label="来源: Memmy"');
+    expect(html).not.toContain('aria-label="来源: 电脑历史"');
   });
 
   it("摘要完成前展示用户原句，生成后把独立标题和摘要分成两行", () => {

@@ -141,7 +141,7 @@ func emitRecorderDiagnostic(code: String, count: Int? = nil, minimumInterval: Ti
 func withAXReadBudget<T>(_ seconds: TimeInterval, _ work: () -> T) -> T { work() }
 var dragOrigin: String? = "old drag", lastTreeKey: String? = "old window", lastTreeAt: Date? = Date()
 func resetAXSamplingCache() { lastTreeKey = nil; lastTreeAt = nil }
-${production("let enrichmentScheduler =", "// MARK: - Browser privacy evidence")}
+${production("let enrichmentScheduler =", "struct FocusSnapshot {")}
 enrichmentQueue.async { entered.signal(); release.wait() }; entered.wait()
 enqueueEnrichment { values.append(1000) }
 currentSession = 2

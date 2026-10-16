@@ -5,7 +5,7 @@ const { cleanup, createTestService } = createMemoryServiceFixture();
 afterEach(cleanup);
 
 describe("History source filter", () => {
-  it("finds canonical and legacy History without mixing them with the namespace owner's other sources", () => {
+  it("keeps History provenance precise while including its records in the Memmy Agent filter", () => {
     const { service } = createTestService();
     const input = {
       action: "upsert" as const, namespace: { source: "memmy", profileId: "default", userId: "local-user" },
@@ -21,7 +21,9 @@ describe("History source filter", () => {
     const history = service.panelItems({ layer: "L1", sourceAgent: "computer_history" });
     expect(history.items.map((item) => item.id).sort()).toEqual([canonical.id, legacy.id].sort());
     expect(history.items.every((item) => item.metadata?.source === "computer_history")).toBe(true);
-    expect(service.panelItems({ layer: "L1", sourceAgent: "memmy-agent" }).items.map((item) => item.id)).toEqual([unrelated.id]);
+    expect(service.panelItems({ layer: "L1", sourceAgent: "memmy-agent" }).items.map((item) => item.id).sort())
+      .toEqual([canonical.id, legacy.id, unrelated.id].sort());
     expect(service.panelItems({ layer: "L1", excludedSourceAgents: ["computer_history"] }).items.map((item) => item.id)).toEqual([unrelated.id]);
+    expect(service.panelItems({ layer: "L1", excludedSourceAgents: ["memmy-agent"] }).items).toEqual([]);
   });
 });

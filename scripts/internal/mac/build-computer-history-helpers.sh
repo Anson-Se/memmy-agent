@@ -38,5 +38,9 @@ if [ "$TARGET_CPU" = arm64 ]; then
   xcrun --sdk macosx clang -arch arm64 -isysroot "$SDK_PATH" -mmacosx-version-min=11.0 \
     -dynamiclib -Wall -Wextra -Werror "$HELPER_DIR/wechat/private_storage_bridge.c" \
     -o "$WECHAT_NATIVE_DIR/MemmyWeChatPrivateStorage.dylib"
+  # Capture and scan inside the temporary reader; ordinary Macs need no Xcode/CLT.
+  xcrun --sdk macosx clang -arch arm64 -isysroot "$SDK_PATH" -mmacosx-version-min=11.0 \
+    -dynamiclib -O2 -Wall -Wextra -Werror "$HELPER_DIR/wechat/key_capture_bridge.c" \
+    -o "$WECHAT_NATIVE_DIR/MemmyWeChatKeyCapture.dylib"
   for library in "$WECHAT_NATIVE_DIR"/*.dylib; do lipo "$library" -verify_arch arm64; done
 fi
