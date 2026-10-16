@@ -22,7 +22,8 @@ export interface RecordingDeliverables {
  *
  * Both are deliverables the user expects to keep, and neither can be recreated
  * afterwards: a plugin never sees the audio, and the transcript only exists in
- * the card's response. Returns nothing when the Host has no upload sink, so a
+ * the card's response. They are written to the default workspace's recordings
+ * folder, so the user finds them in the file tree. Returns nothing when the Host has no upload sink, so a
  * card without one still answers with the text.
  *
  * @param result Transcription result carrying the original recording.
@@ -43,13 +44,15 @@ export async function persistRecording(
       blob: result.recording,
       name: `${t("plugin.ui.audio.recordingFile", { stamp })}${audio.extension}`,
       kind: "audio",
-      mime: audio.mime
+      mime: audio.mime,
+      target: "recordings"
     },
     {
       blob: new Blob([formatTranscript(result, t)], { type: "text/plain" }),
       name: `${t("plugin.ui.audio.transcriptFile", { stamp })}.txt`,
       kind: "file",
-      mime: "text/plain"
+      mime: "text/plain",
+      target: "recordings"
     }
   ]);
   return { ...(uploaded[0] ? { audio: uploaded[0] } : {}), ...(uploaded[1] ? { transcript: uploaded[1] } : {}) };
@@ -105,7 +108,7 @@ export function recordingFormat(mimeType: string): { extension: string; mime: Ag
  * @param transcribedAt ISO timestamp from the transcription.
  * @returns Filename-safe stamp.
  */
-function recordingStamp(transcribedAt: string): string {
+export function recordingStamp(transcribedAt: string): string {
   const parsed = new Date(transcribedAt);
   const at = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
   return at.toISOString().replace(/[:.]/g, "-");

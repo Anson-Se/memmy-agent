@@ -20,6 +20,31 @@ describe("PluginUiProvider", () => {
     expect(calls.length).toBeLessThanOrEqual(51);
     expect(calls.at(-1)?.callId).toBe("done-79");
   });
+
+  it("keeps same call ids isolated when two conversations invoke a plugin", () => {
+    const base = {
+      pluginId: "legal-labor",
+      capabilityId: "session-start",
+      callId: "reused-call-id",
+      origin: "agent" as const
+    };
+    let calls: PluginUiCall[] = [];
+    calls = reducePluginUiCalls(calls, {
+      ...base,
+      conversationId: "websocket:chat-1",
+      event: { type: "interaction", request: { interactionId: "guide-1", type: "question", payload: {} } }
+    });
+    calls = reducePluginUiCalls(calls, {
+      ...base,
+      conversationId: "websocket:chat-2",
+      event: { type: "interaction", request: { interactionId: "guide-2", type: "question", payload: {} } }
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.conversationId)).toEqual(["websocket:chat-1", "websocket:chat-2"]);
+    expect(calls[0]?.events[0]).toMatchObject({ type: "interaction", request: { interactionId: "guide-1" } });
+    expect(calls[1]?.events[0]).toMatchObject({ type: "interaction", request: { interactionId: "guide-2" } });
+  });
   let container: HTMLDivElement;
   let root: Root;
 

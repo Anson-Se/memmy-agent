@@ -13,7 +13,7 @@
  * on its row. Agent-requested recording cards remain separate inputs.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronLeft, Check, Pencil, Mic, Pause, Play, Plus, Sparkles, Square, Upload, X } from "lucide-react";
+import { ChevronLeft, Check, Pencil, Mic, Pause, Play, Plus, RotateCw, Sparkles, Square, Upload, X } from "lucide-react";
 import type { AsrTranscriptSegment } from "@memmy/local-api-contracts";
 import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
@@ -26,7 +26,9 @@ import { blobToAudioBase64, isLiveAsrTimeout, useAsrRecorder } from "./asr-recor
 import { pushWaveformLevel } from "../lib/audio-pcm-tap.js";
 import { persistRecording } from "../lib/recording-deliverables.js";
 import { saveRecordingArchiveEntry, useRecordingArchive } from "../lib/recording-archive.js";
-import { RecordingWaveform } from "./recording-waveform.js";
+import { handOverRecording } from "../lib/recording-handover.js";
+import { usePluginTranscriptions } from "../app/plugin-ui-context.js";
+import { RecordingWaveform, WAVE_BARS } from "./recording-waveform.js";
 
 /**
  * Where a finished recording is sent.
@@ -56,9 +58,14 @@ export interface RecordingArchiveEntry {
   files?: UploadedAgentMedia[];
   /** The plugin acknowledged these files as diagnostic materials. */
   collected?: boolean;
+  /**
+   * The recording was staged into the diagnosis upload card before it was
+   * transcribed, so the card already lists it and delivers its transcript.
+   * Staging the transcript file again would list the same interview twice.
+   */
+  handedOver?: boolean;
   /** The row can exist before ASR has finished, or when ASR failed. */
-  status?: "transcribing" | "ready" | "failed";
-}
+  status?: "transcribing" | "ready" | "failed";}
 
 /** Everything the recording page renders. */
 export interface RecordingEntrySession {
@@ -89,6 +96,15 @@ export interface RecordingEntrySession {
   open(entry: RecordingArchiveEntry): void;
   /** Transcribes an audio file the user already has. */
   upload(file: File): void;
+  /**
+   * Transcribes a row again after its first attempt failed.
+   *
+   * The audio is kept on exactly this assumption, so a transient ASR failure
+   * does not cost the user an interview.
+   */
+  retry?(entry: RecordingArchiveEntry): void;
+  /** Row ids whose transcription is being tried again, so the row can show it. */
+  retrying?: ReadonlySet<string>;
   /** Sends a recording's transcript into the conversation. */
   deliver(entry: RecordingArchiveEntry, mode: RecordingDelivery): void;
   /** Forgets the recording that just finished, ready for the next one. */
@@ -130,7 +146,11 @@ export function useRecordingEntry(
   asrClient: AsrClient | undefined,
   uploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>,
   deliver?: RecordingDeliverFn,
-  archiveOptions?: { scope: string; sessionKey?: string; onArchived?(entry: RecordingArchiveEntry): void; resolveAudio(entry: RecordingArchiveEntry): Promise<string | null> }
+  archiveOptions?: {
+    scope: string; sessionKey?: string; onArchived?(entry: RecordingArchiveEntry): void; resolveAudio(entry: RecordingArchiveEntry): Promise<string | null>;
+    /** The recording was stored before transcription, so it can be staged for the diagnosis card now. */
+    onHandedOver?(recording: { audio: UploadedAgentMedia; transcriptName: string }): void;
+  }
 ): RecordingEntryController {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -146,9 +166,23 @@ export function useRecordingEntry(
     if (archiveOptions?.scope) saveRecordingArchiveEntry(archiveOptions.scope, entry);
     else setRecordings((current) => [entry, ...current.filter((row) => row.id !== entry.id)]);
   }, [archiveOptions?.scope]);
+  const transcriptionJobs = usePluginTranscriptions();
+  const jobStates = transcriptionJobs?.transcriptions;
   const allRecordings = useMemo(() => [...recordings.filter((row) => !archived.some((entry) => entry.id === row.id
     || (entry.audioPath && entry.audioPath === row.audioPath))), ...archived]
-    .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt)), [recordings, archived]);
+    // A handed-over recording is transcribed by a page-level job; its row
+    // follows that job, including the retries it makes on its own.
+    .map((row) => {
+      const job = row.status !== "ready" && row.audioPath ? jobStates?.get(row.audioPath) : undefined;
+      if (job?.status === "transcribing") return { ...row, status: "transcribing" as const };
+      if (job?.status === "failed" || job?.status === "skipped") return { ...row, status: "failed" as const };
+      // Saved mid-transcription and the app has since restarted: nothing is
+      // transcribing it any more, so offer the row's retry instead of a
+      // spinner that never ends.
+      if (!job && row.status === "transcribing" && row.audioPath && archived.includes(row)) return { ...row, status: "failed" as const };
+      return row;
+    })
+    .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt)), [recordings, archived, jobStates]);
   const [opened, setOpened] = useState<RecordingArchiveEntry | null>(null);
   const lastScope = useRef(archiveOptions?.scope);
   useEffect(() => {
@@ -158,6 +192,26 @@ export function useRecordingEntry(
   }, [archiveOptions?.scope]);
   const [deliverables, setDeliverables] = useState<UploadedAgentMedia[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** Rows whose transcription is being tried again, by row id. */
+  const [retrying, setRetrying] = useState<ReadonlySet<string>>(() => new Set());
+  // Guards a second click before React has re-rendered with the row marked.
+  const retryingRef = useRef<Set<string>>(new Set());
+  /**
+   * Reads back the audio of a row that only has a path, for a retry.
+   *
+   * Gateway playback URLs are bearer capabilities and are not kept in the
+   * archive, so the bytes come from the stored file rather than a stale URL.
+   *
+   * @param entry The failed row to re-transcribe.
+   * @returns The recording's audio, ready to encode.
+   */
+  const resolveArchivedAudio = useCallback(async (entry: RecordingArchiveEntry): Promise<Blob> => {
+    const url = entry.audioPath && archiveOptions ? await archiveOptions.resolveAudio(entry) : null;
+    if (!url) throw new Error(t("recording.page.retryUnavailable"));
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(t("recording.page.retryUnavailable"));
+    return response.blob();
+  }, [archiveOptions, t]);
   const startInFlight = useRef(false);
   const finishInFlight = useRef(false);
   // The transcription request outlives the click that starts it. Keeping the
@@ -167,7 +221,7 @@ export function useRecordingEntry(
   viewRef.current = view;
   const recorder = useAsrRecorder(asrClient, {
     live: {
-      onLevel: (level) => setLevels((current) => pushWaveformLevel(current, level, 40)),
+      onLevel: (level) => setLevels((current) => pushWaveformLevel(current, level, WAVE_BARS)),
       onLine: (line) => setLines((current) => mergeLiveLines(current, line)),
       // Same reasoning as the plugin's recording card: a failed live segment
       // or a streaming connection that never opens must not look like nothing
@@ -190,10 +244,68 @@ export function useRecordingEntry(
     for (const url of audioUrlsRef.current) URL.revokeObjectURL(url);
   }, []);
 
+  /**
+   * Stores the recording now and lets a page-level job transcribe it.
+   *
+   * Used when the conversation has a diagnosis to feed: the recording is
+   * staged on the upload card the moment it stops, and the row here follows
+   * the job until the transcript lands.
+   */
+  const handOver = useCallback(async (jobs: NonNullable<typeof transcriptionJobs>, sink: NonNullable<typeof uploadFiles>) => {
+    const id = `rec-${Date.now()}`;
+    const stopped = await recorder.stop();
+    const durationMs = stopped.durationMs ?? elapsedMs;
+    const localUrl = URL.createObjectURL(stopped.recording);
+    audioUrlsRef.current.push(localUrl);
+    const pending = buildEntry({ id, transcript: { text: "", segments: [] }, durationMs, audioUrl: localUrl,
+      status: "transcribing", title: t("recording.page.defaultTitle") });
+    setLive(pending);
+    setRecordings((current) => [pending, ...current.filter((row) => row.id !== id)]);
+    viewRef.current = "list";
+    setView("list");
+    const { audio, job, transcriptName } = await handOverRecording({
+      stopped, asrClient: asrClient!, uploadFiles: sink, startTranscription: jobs.startTranscription, t, diarization: true,
+      emptyAudioMessage: t("home.asrEmptyAudio")
+    }).catch((caught: unknown) => {
+      // The audio is still in hand as a local URL, so the row's own retry
+      // can transcribe it once the user asks.
+      setRecordings((current) => current.map((row) => row.id === id ? { ...row, status: "failed" } : row));
+      throw caught;
+    });
+    setRecordings((current) => current.map((row) => row.id === id ? { ...row, audioPath: audio.path } : row));
+    archiveOptions?.onHandedOver?.({ audio, transcriptName });
+    // The microphone is free again; the next interview need not wait for this
+    // one's transcript.
+    finishInFlight.current = false;
+    const result = await job.wait();
+    if (!result) {
+      setRecordings((current) => current.map((row) => row.id === id ? { ...row, status: "failed" } : row));
+      return;
+    }
+    const transcript: RecordingPanelTranscript = { text: result.text, segments: result.segments };
+    const keptFiles = [audio, result.transcriptFile].filter((file): file is UploadedAgentMedia => file !== undefined);
+    const kept: RecordingArchiveEntry = {
+      ...buildEntry({ id, transcript, durationMs, audioUrl: audio.url, title: t("recording.page.defaultTitle") }),
+      audioPath: audio.path, files: keptFiles, handedOver: true,
+      ...(archiveOptions?.sessionKey ? { sessionKey: archiveOptions.sessionKey } : {})
+    };
+    setRecordings((current) => current.map((row) => row.id === id ? kept : row));
+    setLive((current) => current?.id === id ? kept : current);
+    setDeliverables(keptFiles);
+    archive(kept);
+    archiveOptions?.onArchived?.(kept);
+  }, [archive, archiveOptions, asrClient, elapsedMs, recorder, t]);
+
   const finish = useCallback(() => {
     if (finishInFlight.current || !recorder.isRecording) return;
     finishInFlight.current = true;
     setError(null);
+    if (transcriptionJobs && uploadFiles && asrClient && archiveOptions?.sessionKey && archiveOptions.onHandedOver) {
+      void handOver(transcriptionJobs, uploadFiles)
+        .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : null))
+        .finally(() => { finishInFlight.current = false; });
+      return;
+    }
     void (async () => {
       const id = `rec-${Date.now()}`;
       let audioUrl: string | null = null;
@@ -256,7 +368,7 @@ export function useRecordingEntry(
         finishInFlight.current = false;
       }
     })();
-  }, [elapsedMs, recorder, t, uploadFiles, archive, archiveOptions?.sessionKey, archiveOptions?.onArchived]);
+  }, [elapsedMs, recorder, t, uploadFiles, archive, archiveOptions?.sessionKey, archiveOptions?.onArchived, archiveOptions?.onHandedOver, asrClient, handOver, transcriptionJobs]);
 
   const start = useCallback(() => {
     if (!asrClient || startInFlight.current || finishInFlight.current || recorder.isRecording || recorder.isStarting || recorder.isTranscribing) return;
@@ -326,8 +438,74 @@ export function useRecordingEntry(
     })();
   }, [asrClient, t, uploadFiles, archive, archiveOptions?.sessionKey, archiveOptions?.onArchived]);
 
-  const reset = useCallback(() => {
-    setLive(null);
+  const retry = useCallback((entry: RecordingArchiveEntry) => {
+    // A handed-over recording's job already owns its transcription and will
+    // finish the row itself once an attempt succeeds.
+    const job = entry.audioPath ? transcriptionJobs?.transcriptionJob(entry.audioPath) : undefined;
+    if (job?.state.status === "failed") {
+      setError(null);
+      job.retry();
+      return;
+    }
+    if (!asrClient || retryingRef.current.has(entry.id)) {
+      if (!asrClient) setError(t("plugin.ui.audio.unavailable"));
+      return;
+    }
+    setError(null);
+    // A row restored from storage is not in `recordings`, so the in-flight
+    // status lives here rather than on the row: marking the row itself would
+    // both miss archived rows and persist "transcribing" if the app closed.
+    const start = () => retryingRef.current.add(entry.id);
+    const finish = () => retryingRef.current.delete(entry.id);
+    start();
+    setRetrying((current) => new Set(current).add(entry.id));
+    void (async () => {
+      try {
+        // Rows from this session still hold their Blob URL; ones restored from
+        // the archive hold only a path, which has to be resolved back to audio.
+        const audio = entry.audioUrl
+          ? await (await fetch(entry.audioUrl)).blob()
+          : await resolveArchivedAudio(entry);
+        const encoded = await blobToAudioBase64(audio, t("home.asrEmptyAudio"));
+        const result = await asrClient.transcribe({
+          audioBase64: encoded.audioBase64,
+          mimeType: encoded.mimeType,
+          durationMs: entry.durationMs,
+          diarization: true
+        });
+        const transcript: RecordingPanelTranscript = { text: result.text, segments: result.segments ?? [] };
+        // ASR does not echo the duration back, so the row keeps the one the
+        // recorder measured unless the new segments reach further.
+        const lastSegmentMs = lastOffset(transcript.segments);
+        const updated: RecordingArchiveEntry = {
+          ...entry,
+          transcript,
+          durationMs: lastSegmentMs > 0 ? lastSegmentMs : entry.durationMs,
+          speakerCount: Math.max(new Set(transcript.segments.map((segment) => segment.speakerId ?? 0)).size, 1),
+          status: "ready"
+        };
+        archive(updated);
+        setRecordings((current) => current.map((row) => row.id === entry.id ? updated : row));
+        setLive((current) => current?.id === entry.id ? updated : current);
+        setOpened((current) => current?.id === entry.id ? updated : current);
+        archiveOptions?.onArchived?.(updated);
+      } catch (caught) {
+        // The row goes back to "failed" on its own, since it was never moved
+        // out of that status. Only the message needs saying.
+        setError(caught instanceof Error ? caught.message : null);
+      } finally {
+        finish();
+        setRetrying((current) => {
+          if (!current.has(entry.id)) return current;
+          const next = new Set(current);
+          next.delete(entry.id);
+          return next;
+        });
+      }
+    })();
+  }, [archive, archiveOptions, asrClient, resolveArchivedAudio, t, transcriptionJobs]);
+
+  const reset = useCallback(() => {    setLive(null);
     setElapsedMs(0);
     setLines([]);
     setDeliverables([]);
@@ -397,6 +575,8 @@ export function useRecordingEntry(
       setView("transcript");
     },
     upload,
+    retry,
+    retrying,
     rename: (entry, title) => {
       const cleaned = title.trim().slice(0, 80);
       if (!cleaned || cleaned === entry.title) return;
@@ -414,7 +594,7 @@ export function useRecordingEntry(
     reset
   }), [
     asrClient, deliverables, elapsedMs, error, finish, lines, levels, live, opened, recorder, allRecordings, archiveOptions,
-    reset, start, status, t, upload, deliver, view, archive
+    reset, retry, retrying, start, status, t, upload, deliver, view, archive
   ]);
 
   return {
@@ -560,16 +740,19 @@ export function RecordingEntryPage(props: {
       ) : archiveRows.length > 0 ? (
         <ul className="recording-page__list">
           {archiveRows.map((row) => {
-            const pending = row.status === "transcribing";
-            const failed = row.status === "failed";
+            // A retry is in flight for this row, whether or not the row itself
+            // carries the status (archived rows are not in `recordings`).
+            const busy = session.retrying?.has(row.id) === true;
+            const pending = row.status === "transcribing" || busy;
+            const failed = row.status === "failed" && !busy;
             return (
-              <li key={row.id} className="recording-page__list-row">
+              <li key={row.id} className="recording-page__list-row" data-busy={busy ? "true" : undefined}>
                 <button type="button" className="recording-page__list-open" onClick={() => session.open(row)}>
                   <span className="recording-page__list-icon" aria-hidden="true"><Play size={15} /></span>
                   <span className="recording-page__list-body">
                     <span className="recording-page__list-title">{renaming === row.id ? renameValue : row.title}</span>
                     <span className="recording-page__list-meta">
-                      <span>{pending ? t("plugin.ui.audio.transcribing") : failed ? t("recording.page.transcriptionFailed") : formatRecordedAt(row.recordedAt)}</span>
+                      <span data-recording-status={busy ? "transcribing" : undefined}>{pending ? t("plugin.ui.audio.transcribing") : failed ? t("recording.page.transcriptionFailed") : formatRecordedAt(row.recordedAt)}</span>
                       <span>{t("recording.page.duration", { time: formatClock(row.durationMs) })}</span>
                       {!pending && !failed ? <><span>{t("recording.page.speakers", { count: row.speakerCount })}</span><span>{t("recording.page.transcribed")}</span></> : null}
                     </span>
@@ -581,6 +764,14 @@ export function RecordingEntryPage(props: {
                   <button type="button" aria-label={t("plugin.ui.submit")} onClick={() => finishRename(row)}><Check size={14} /></button>
                   <button type="button" aria-label={t("common.close")} onClick={() => setRenaming(null)}><X size={14} /></button>
                 </div> : null}
+                {failed && session.retry ? (
+                  <div className="recording-page__list-actions">
+                    <button type="button" className="recording-page__list-action recording-page__list-action--retry" onClick={() => session.retry?.(row)}>
+                      <RotateCw size={13} aria-hidden="true" />
+                      <span>{t("recording.page.retry")}</span>
+                    </button>
+                  </div>
+                ) : null}
                 {!pending && !failed ? (
                   <div className="recording-page__list-actions">
                     {session.rename ? <button type="button" className="recording-page__list-action recording-page__rename-trigger" aria-label={`${t("common.rename")} ${row.title}`} onClick={() => { setRenaming(row.id); setRenameValue(row.title); }}><Pencil size={13} /></button> : null}
@@ -670,6 +861,10 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
         </button>
         <div className="recording-page__title"><span>{props.entry.title}</span></div>
         <div className="recording-page__controls">
+          <button type="button" className="recording-panel__action" onClick={() => props.session.deliver(props.entry, "attach")}>
+            <Plus size={13} aria-hidden="true" />
+            <span>{t("recording.page.addToChat")}</span>
+          </button>
           <button
             type="button"
             className="recording-panel__action recording-panel__action--primary"
@@ -683,16 +878,6 @@ function TranscriptView(props: { session: RecordingEntrySession; entry: Recordin
       {props.entry.audioUrl ? <RecordingPlayer src={props.entry.audioUrl} durationMs={props.entry.durationMs} seek={seek} /> : null}
       <p className="recording-panel__section">{t("plugin.ui.audio.transcript")}</p>
       <TranscriptTurns transcript={props.entry.transcript} onSeek={props.entry.audioUrl ? (ms) => setSeek((current) => ({ ms, sequence: (current?.sequence ?? 0) + 1 })) : undefined} />
-      <div className="recording-page__footer">
-        <button type="button" className="recording-panel__action" onClick={() => props.session.deliver(props.entry, "attach")}>
-          <Plus size={13} aria-hidden="true" />
-          <span>{t("recording.page.addToChat")}</span>
-        </button>
-        <button type="button" className="recording-panel__action" onClick={props.session.reset}>
-          {t("recording.page.newRecording")}
-        </button>
-      </div>
-
     </div>
   );
 }

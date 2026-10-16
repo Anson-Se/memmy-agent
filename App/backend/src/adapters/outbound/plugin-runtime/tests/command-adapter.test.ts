@@ -211,6 +211,54 @@ describe("CommandPluginAdapter", () => {
     }))).toEqual([{ type: "result", output: { host: { content: "model:conversation-1:account-deepseek-v4.1-flash" } } }]);
   });
 
+  it("brokers concurrent Host-service requests instead of serialising them", async () => {
+    // A capability that fans out — the legal diagnosis judges sections in
+    // parallel — gains nothing if the Host answers one request at a time.
+    let inFlight = 0;
+    let peak = 0;
+    const adapter = createCommandPluginAdapter({
+      hostServices: {
+        invoke: async () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          inFlight -= 1;
+          return { content: "ok" };
+        }
+      },
+      buildLaunch: async (_context, config) => ({
+        command: process.execPath,
+        args: ["-e", `
+          const rl=require('node:readline').createInterface({input:process.stdin});
+          let first=true, answered=0;
+          const ids=['a','b','c','d'];
+          rl.on('line', line => {
+            const value=JSON.parse(line);
+            if(first){
+              first=false;
+              for(const id of ids) console.log(JSON.stringify({type:'host-service-request',requestId:id,service:'model-inference',input:{}}));
+            } else if(++answered===ids.length){
+              console.log(JSON.stringify({type:'result',output:{answered}}));
+              process.exit(0);
+            }
+          });
+        `, ...config.args],
+        cwd: root!
+      })
+    });
+    const pluginContext = context("ndjson");
+    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, interactive: true };
+    const permission = { type: "host-service" as const, services: ["model-inference"] };
+    pluginContext.plugin.manifest.permissions = [permission];
+    pluginContext.plugin.approvedPermissions = [permission];
+    const session = await adapter.activate(pluginContext);
+    expect(await collect(adapter.invoke(session, {
+      callId: "call-parallel", pluginId: pluginContext.plugin.id, capabilityId: "run", conversationId: "conversation-1", input: {}
+    }))).toEqual([{ type: "result", output: { answered: 4 } }]);
+    // Serial dispatch would peak at one.
+    expect(peak).toBeGreaterThan(1);
+  });
+
   it("aborts in-flight Host services when a command-plugin run is cancelled", async () => {
     const started = Promise.withResolvers<void>();
     let hostSignal: AbortSignal | undefined;

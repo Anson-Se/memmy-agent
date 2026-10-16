@@ -367,6 +367,9 @@ const DATA_URL_MIME_RE = /^data:([^;]+);base64,/i;
 const MAX_ISSUED_TOKENS = 10_000;
 const MAX_HTTP_JSON_BODY_BYTES = 64 * 1024;
 const MAX_ARTIFACT_STAGING_BYTES = 100 * 1024 * 1024;
+/** Upload target that keeps the file in the default workspace's recordings folder. */
+const WEBUI_RECORDINGS_TARGET = "recordings";
+const WEBUI_RECORDINGS_DIR = "recordings";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function stripTrailingSlash(value: string): string {
@@ -2505,6 +2508,10 @@ export class WebSocketChannel extends BaseChannel {
 
     const files = form.getAll("files");
     if (!files.length) return httpError(400, "missing files");
+    // Parallel to `files`: a recording asks to be kept in the default
+    // workspace, where the user can find it in the file tree, instead of the
+    // private media cache.
+    const targets = form.getAll("targets").map((value) => typeof value === "string" ? value : "");
 
     const mediaDir = path.join(getMediaDir("websocket"), "webui");
     fs.mkdirSync(mediaDir, { recursive: true });
@@ -2516,7 +2523,7 @@ export class WebSocketChannel extends BaseChannel {
     };
 
     try {
-      for (const entry of files) {
+      for (const [index, entry] of files.entries()) {
         if (typeof entry === "string" || typeof (entry as any).arrayBuffer !== "function") {
           return failUpload(httpError(400, "invalid file"));
         }
@@ -2527,12 +2534,19 @@ export class WebSocketChannel extends BaseChannel {
         const classification = classifyWebuiUploadAttachment(originalName, declaredMime, bytes);
         if (!classification) return failUpload(httpError(415, "unsupported attachment mime"));
         const safeOriginalName = safeFilename(originalName).replace(/\.[^.]*$/, "") + classification.extension;
-        const filename = `${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}-${safeOriginalName}`;
-        const target = path.join(mediaDir, filename);
-        fs.writeFileSync(target, bytes);
+        const inWorkspace = targets[index] === WEBUI_RECORDINGS_TARGET;
+        let target: string;
+        if (inWorkspace) {
+          const recordingsDir = path.join(this.workspacePath, WEBUI_RECORDINGS_DIR);
+          fs.mkdirSync(recordingsDir, { recursive: true });
+          target = availableFilePath(recordingsDir, safeOriginalName);
+        } else {
+          target = path.join(mediaDir, `${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}-${safeOriginalName}`);
+        }
+        fs.writeFileSync(target, bytes, inWorkspace ? { flag: "wx" } : undefined);
         const real = fs.realpathSync(target);
         savedPaths.push(real);
-        const url = this.signMediaPath(real);
+        const url = inWorkspace ? this.signWorkspaceMediaPath(real) : this.signMediaPath(real);
         if (!url) return failUpload(httpError(500, "failed to sign attachment"));
         saved.push({
           path: real,
@@ -2906,6 +2920,8 @@ export class WebSocketChannel extends BaseChannel {
     rawPath: string,
     sessionWorkspace: string,
   ): ResolvedArtifactPath | null {
+    const recording = this.resolveWorkspaceRecordingPath(rawPath);
+    if (recording) return recording;
     const allowed = this.resolveAllowedArtifactPath(rawPath, sessionWorkspace);
     if (allowed) {
       if (allowed.kind === "directory") {
@@ -2925,6 +2941,27 @@ export class WebSocketChannel extends BaseChannel {
     }
     const staged = this.stageArtifactPath(expanded);
     return staged ? { path: staged.path, kind: artifactKindForFile(staged.path), mediaUrl: staged.url } : null;
+  }
+
+  /**
+   * A saved recording is served from the workspace in place.
+   *
+   * Staging would copy the audio into the media cache every time the
+   * recording is reopened after a restart.
+   */
+  private resolveWorkspaceRecordingPath(rawPath: string): ResolvedArtifactPath | null {
+    const expanded = expandHomePath(rawPath);
+    if (!path.isAbsolute(expanded)) return null;
+    let resolved: string;
+    try {
+      resolved = fs.realpathSync(expanded);
+      if (!fs.statSync(resolved).isFile()) return null;
+    } catch {
+      return null;
+    }
+    if (!isPathInside(resolved, realpathIfExists(path.join(this.workspacePath, WEBUI_RECORDINGS_DIR)))) return null;
+    const mediaUrl = this.signWorkspaceMediaPath(resolved);
+    return mediaUrl ? { path: resolved, kind: artifactKindForFile(resolved), mediaUrl } : null;
   }
 
   stageArtifactPath(rawPath: string): SignedMediaPath | null {
@@ -3231,6 +3268,8 @@ export class WebSocketChannel extends BaseChannel {
         return this.handleProjectDelete(request, match[1]);
       }
     }
+    match = got.match(/^\/api\/media\/ws\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)$/);
+    if (match) return this.handleWorkspaceMediaFetch(match[1], match[2]);
     match = got.match(/^\/api\/media\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)$/);
     if (match) return this.handleMediaFetch(match[1], match[2]);
     if (got === this.expectedPath() && isWebsocketUpgrade(request)) {
@@ -4658,6 +4697,48 @@ export class WebSocketChannel extends BaseChannel {
     };
   }
 
+  /** Signs a file kept in the default workspace, such as a saved recording. */
+  signWorkspaceMediaPath(absPath: string): string | null {
+    let rel: string;
+    try {
+      const workspaceRoot = comparablePath(this.workspacePath);
+      const candidate = comparablePath(absPath);
+      if (!pathIsInside(candidate, workspaceRoot) || candidate === workspaceRoot) return null;
+      rel = path.relative(workspaceRoot, candidate);
+    } catch {
+      return null;
+    }
+    const payload = b64urlEncode(rel.split(path.sep).join("/"));
+    return `/api/media/ws/${b64urlEncode(this.workspaceMediaMac(payload))}/${payload}`;
+  }
+
+  handleWorkspaceMediaFetch(sig: string, payload: string): HttpLikeResponse {
+    const expected = this.workspaceMediaMac(payload);
+    let provided: Buffer;
+    try {
+      provided = b64urlDecode(sig);
+    } catch {
+      return httpError(401, "invalid signature");
+    }
+    if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+      return httpError(401, "invalid signature");
+    }
+    let rel: string;
+    try {
+      rel = b64urlDecode(payload).toString("utf8");
+    } catch {
+      return httpError(400, "invalid payload");
+    }
+    const workspaceRoot = comparablePath(this.workspacePath);
+    const candidate = path.resolve(workspaceRoot, normalizeLocalPath(rel));
+    if (!pathIsInside(candidate, workspaceRoot)) return httpError(404, "not found");
+    return mediaFileResponse(candidate, "private, no-cache");
+  }
+
+  private workspaceMediaMac(payload: string): Buffer {
+    return crypto.createHmac("sha256", this.mediaSecret).update(`workspace:${payload}`).digest().subarray(0, 16);
+  }
+
   override async send(message: OutboundMessage): Promise<void> {
     if (message.metadata?.webuiSessionWorkspaceLost) {
       const clientRequestId = String(message.metadata.clientRequestId ?? "");
@@ -5679,6 +5760,37 @@ function boundedNumber(value: any, min: number, max: number, field: string): num
     throw new Error(`${field} must be between ${min} and ${max}`);
   }
   return parsed;
+}
+
+/** Serves a resolved media file with the headers every media route shares. */
+function mediaFileResponse(filePath: string, cacheControl = "private, max-age=31536000, immutable"): HttpLikeResponse {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return httpError(404, "not found");
+  const mime = String(lookupMime(filePath) || "application/octet-stream");
+  return {
+    status: 200,
+    headers: {
+      "content-type": DISPLAY_MEDIA_RESPONSE_MIMES.has(mime) ? mime : "application/octet-stream",
+      "cache-control": cacheControl,
+      "x-content-type-options": "nosniff",
+    },
+    body: fs.readFileSync(filePath),
+  };
+}
+
+/**
+ * A path in `dir` for `name` that does not overwrite an existing file.
+ *
+ * Saved files keep the name the user will look for; a clash gets ` (2)`,
+ * ` (3)` and so on before the extension.
+ */
+function availableFilePath(dir: string, name: string): string {
+  const extension = path.extname(name);
+  const stem = name.slice(0, name.length - extension.length) || "attachment";
+  let candidate = path.join(dir, name);
+  for (let copy = 2; fs.existsSync(candidate); copy += 1) {
+    candidate = path.join(dir, `${stem} (${copy})${extension}`);
+  }
+  return candidate;
 }
 
 function safeFilename(name: string): string {

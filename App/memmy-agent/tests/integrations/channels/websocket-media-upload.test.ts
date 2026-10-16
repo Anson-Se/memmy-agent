@@ -42,10 +42,11 @@ function tinyM4aBytes(): Buffer {
   return bytes;
 }
 
-async function multipartBody(entries: Array<{ name: string; bytes: Buffer; mime: string }>): Promise<{ body: Buffer; contentType: string }> {
+async function multipartBody(entries: Array<{ name: string; bytes: Buffer; mime: string; target?: string }>): Promise<{ body: Buffer; contentType: string }> {
   const form = new FormData();
   for (const entry of entries) {
     form.append("files", new Blob([new Uint8Array(entry.bytes)], { type: entry.mime }), entry.name);
+    if (entries.some((item) => item.target !== undefined)) form.append("targets", entry.target ?? "");
   }
   const request = new Request("http://memmy.local/upload", { method: "POST", body: form });
   return {
@@ -262,5 +263,51 @@ describe("WebUI media upload route", () => {
       body: bigPdf.body
     });
     expect(bigPdfResponse?.status).toBe(200);
+  });
+
+  it("keeps recordings in the default workspace and serves them in place", async () => {
+    const root = tmpRoot();
+    const workspace = path.join(root, "workspace");
+    const channel = new WebSocketChannel({}, new MessageBus(), { workspacePath: workspace });
+    const token = await bootstrapToken(channel);
+    const upload = async () => {
+      const { body, contentType } = await multipartBody([
+        { name: "访谈录音-2026.wav", bytes: tinyWavBytes(), mime: "audio/wav", target: "recordings" },
+        { name: "访谈转写-2026.txt", bytes: Buffer.from("[00:01] 对。", "utf8"), mime: "text/plain", target: "recordings" },
+        { name: "notes.md", bytes: Buffer.from("# Notes", "utf8"), mime: "text/markdown", target: "" }
+      ]);
+      const response = await channel.dispatchHttp({ remoteAddress: ["127.0.0.1"] }, {
+        path: "/api/webui/media/upload",
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": contentType },
+        body
+      });
+      expect(response?.status).toBe(200);
+      return jsonBody(response).attachments;
+    };
+
+    const [audio, transcript, notes] = await upload();
+    const recordingsDir = fs.realpathSync(path.join(workspace, "recordings"));
+    expect(audio.path).toBe(path.join(recordingsDir, "访谈录音-2026.wav"));
+    expect(transcript.path).toBe(path.join(recordingsDir, "访谈转写-2026.txt"));
+    expect(audio.url).toMatch(/^\/api\/media\/ws\//);
+    expect(path.relative(fs.realpathSync(getMediaDir("websocket")), notes.path).startsWith("..")).toBe(false);
+
+    const fetched = await channel.dispatchHttp({ remoteAddress: ["127.0.0.1"] }, { path: transcript.url, method: "GET", headers: {} });
+    expect(fetched?.status).toBe(200);
+    expect(String(fetched?.body)).toBe("[00:01] 对。");
+    expect(fetched?.headers?.["cache-control"]).toBe("private, no-cache");
+
+    // A media-cache signature must not open the workspace route.
+    const forged = notes.url.replace("/api/media/", "/api/media/ws/");
+    expect((await channel.dispatchHttp({ remoteAddress: ["127.0.0.1"] }, { path: forged, method: "GET", headers: {} }))?.status).toBe(401);
+
+    // A second recording with the same name does not overwrite the first.
+    const [again] = await upload();
+    expect(again.path).toBe(path.join(recordingsDir, "访谈录音-2026 (2).wav"));
+    expect(fs.readdirSync(recordingsDir).sort()).toEqual(["访谈录音-2026 (2).wav", "访谈录音-2026.wav", "访谈转写-2026 (2).txt", "访谈转写-2026.txt"]);
+
+    // Reopening after a restart resolves to the same file rather than a staged copy.
+    expect(channel.resolveOrStageArtifactPath(audio.path, workspace)).toMatchObject({ path: audio.path, mediaUrl: expect.stringMatching(/^\/api\/media\/ws\//) });
   });
 });

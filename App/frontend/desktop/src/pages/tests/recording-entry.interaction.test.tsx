@@ -47,6 +47,7 @@ function session(overrides: Partial<RecordingEntrySession> = {}): RecordingEntry
     back: vi.fn(),
     open: vi.fn(),
     upload: vi.fn(),
+    retry: vi.fn(),
     deliver: vi.fn(),
     reset: vi.fn(),
     ...overrides
@@ -134,5 +135,35 @@ describe("RecordingEntryPage", () => {
     expect(container.textContent).toContain("发言人 1");
     expect(container.textContent).toContain("发言人 3");
     expect(container.textContent).toContain("要看变量名称。");
+  });
+
+  it("offers to transcribe a failed row again", async () => {
+    const value = session({ recordings: [{ ...entry, status: "failed" }] });
+    await render(value);
+
+    expect(container.textContent).toContain("转写失败，录音已保留");
+    // A failed row has nothing to summarise or send yet, so retrying is the
+    // only action it offers.
+    const actions = [...container.querySelectorAll<HTMLButtonElement>(".recording-page__list-action")];
+    expect(actions.map((button) => button.textContent)).toEqual(["重试转写"]);
+
+    await act(async () => actions[0]!.click());
+    expect(value.retry).toHaveBeenCalledTimes(1);
+    expect(value.deliver).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed row out of the ready actions and shows a retry in flight", async () => {
+    await render(session({ recordings: [{ ...entry, status: "failed" }], retrying: new Set([entry.id]) }));
+
+    // While the retry runs the row reads as transcribing and cannot be
+    // retried a second time.
+    expect(container.textContent).toContain("正在转写录音");
+    expect(container.querySelectorAll(".recording-page__list-action--retry")).toHaveLength(0);
+  });
+
+  it("offers no retry on a row that transcribed", async () => {
+    await render(session());
+
+    expect(container.querySelectorAll(".recording-page__list-action--retry")).toHaveLength(0);
   });
 });

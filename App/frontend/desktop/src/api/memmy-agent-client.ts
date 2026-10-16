@@ -668,6 +668,8 @@ export type UploadAgentMediaInput = {
   name: string;
   kind: UploadedAgentMedia["kind"];
   mime: UploadedAgentMedia["mime"];
+  /** `recordings` keeps the file in the default workspace instead of the media cache. */
+  target?: "recordings";
 };
 
 export type MemmyAgentMediaInput = UploadedAgentMedia;
@@ -1622,6 +1624,7 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
       const form = new FormData();
       for (const attachment of attachments) {
         form.append("files", blobWithUploadMime(attachment.blob, attachment.mime), uploadFilenameForMedia(attachment.name, attachment.mime, attachment.kind));
+        form.append("targets", attachment.target ?? "");
       }
       return form;
     };
