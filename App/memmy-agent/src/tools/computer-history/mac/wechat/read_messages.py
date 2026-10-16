@@ -231,11 +231,20 @@ class BuiltinConnection:
     """Read a SQLCipher 4 database and its committed WAL with the Windows page codec."""
 
     def __init__(self, db_path, key):
-        image = windows_page_codec().database_image(Path(db_path), bytes.fromhex(key))
-        self.temporary = tempfile.NamedTemporaryFile(prefix="wechat-read-", suffix=".db", delete=False)
-        self.temporary.write(image)
-        self.temporary.close()
-        self.connection = sqlite3.connect(self.temporary.name)
+        self.temporary = None
+        self.connection = None
+        try:
+            image = windows_page_codec().database_image(Path(db_path), bytes.fromhex(key))
+            # Own the whole private directory so failed opens and SQLite sidecars
+            # are cleaned along with the decrypted copy, before __enter__ runs.
+            self.temporary = tempfile.TemporaryDirectory(prefix="wechat-read-")
+            with tempfile.NamedTemporaryFile(suffix=".db", dir=self.temporary.name, delete=False) as output:
+                output.write(image)
+                database = output.name
+            self.connection = sqlite3.connect(database)
+        except BaseException:
+            self.close()
+            raise
 
     def query(self, sql):
         try:
@@ -248,8 +257,14 @@ class BuiltinConnection:
         return [{name: row[index] for index, name in enumerate(names)} for row in cursor.fetchall()]
 
     def close(self):
-        self.connection.close()
-        os.remove(self.temporary.name)
+        try:
+            connection, self.connection = self.connection, None
+            if connection is not None:
+                connection.close()
+        finally:
+            temporary, self.temporary = self.temporary, None
+            if temporary is not None:
+                temporary.cleanup()
 
     def __enter__(self):
         return self

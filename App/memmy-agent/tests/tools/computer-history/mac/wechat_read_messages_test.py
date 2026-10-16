@@ -517,6 +517,121 @@ raise RuntimeError("termination was swallowed")
         self.assertEqual(self.source_state(), before)
 
 
+class BuiltinConnectionCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="memmy-builtin-cleanup-test-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        fixture_path = self.root / "synthetic-fixture.db"
+        fixture = sqlite3.connect(fixture_path)
+        try:
+            fixture.execute("CREATE TABLE fixture (body TEXT)")
+            fixture.execute("INSERT INTO fixture VALUES ('synthetic only')")
+            fixture.commit()
+        finally:
+            fixture.close()
+        self.image = fixture_path.read_bytes()
+        fixture_path.unlink()
+        for patch in (
+            mock.patch.object(reader.tempfile, "tempdir", self.directory.name),
+            mock.patch.object(reader, "windows_page_codec", return_value=mock.Mock(
+                database_image=mock.Mock(return_value=self.image))),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def open(self):
+        return reader.BuiltinConnection(Path("synthetic-source.db"), KEY)
+
+    def assert_clean(self):
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_normal_close_is_idempotent_and_keeps_file_reader_behavior(self):
+        database = self.open()
+        self.assertEqual(database.query("SELECT body FROM fixture"), [{"body": "synthetic only"}])
+        directory = Path(database.temporary.name)
+        if os.name != "nt":
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(next(directory.iterdir()).stat().st_mode & 0o777, 0o600)
+        database.close()
+        database.close()
+        self.assert_clean()
+
+    def test_failed_directory_or_file_creation_leaves_no_plaintext_copy(self):
+        for factory in ("TemporaryDirectory", "NamedTemporaryFile"):
+            with self.subTest(factory=factory), mock.patch.object(
+                    reader.tempfile, factory, side_effect=OSError("synthetic create failure")):
+                with self.assertRaisesRegex(OSError, "synthetic create failure"):
+                    self.open()
+            self.assert_clean()
+
+    def test_partial_write_and_file_close_failure_remove_plaintext_copy(self):
+        original = tempfile.NamedTemporaryFile
+        for phase, failure in (("write", OSError("synthetic write failure")),
+                               ("close", OSError("synthetic close failure")),
+                               ("write", SystemExit(143))):
+            class FailingOutput:
+                def __init__(self, **kwargs):
+                    self.file = original(**kwargs)
+                    self.name = self.file.name
+
+                def __enter__(self):
+                    return self
+
+                def write(self, image):
+                    if phase == "write":
+                        self.file.write(image[:len(image) // 2])
+                        self.file.flush()
+                        raise failure
+                    return self.file.write(image)
+
+                def __exit__(self, *args):
+                    self.file.__exit__(*args)
+                    if phase == "close":
+                        raise failure
+
+            with self.subTest(phase=phase, failure=type(failure).__name__), mock.patch.object(
+                    reader.tempfile, "NamedTemporaryFile", side_effect=FailingOutput):
+                with self.assertRaises(type(failure)):
+                    self.open()
+            self.assert_clean()
+
+    def test_sqlite_open_failure_or_interruption_removes_copy_and_sidecars(self):
+        for failure in (sqlite3.OperationalError("synthetic SQLite open failure"), SystemExit(143)):
+            def fail_open(database):
+                path = Path(database)
+                self.assertEqual(path.read_bytes(), self.image)
+                Path(str(path) + "-journal").write_bytes(b"synthetic sidecar")
+                raise failure
+
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                    reader.sqlite3, "connect", side_effect=fail_open):
+                with self.assertRaises(type(failure)):
+                    self.open()
+            self.assert_clean()
+
+    def test_close_failure_still_cleans_and_repeated_close_does_not_delete_reused_path(self):
+        database = self.open()
+        directory = Path(database.temporary.name)
+        connection = database.connection
+
+        def fail_close():
+            connection.close()
+            raise sqlite3.OperationalError("synthetic SQLite close failure")
+
+        database.connection = mock.Mock(close=mock.Mock(side_effect=fail_close))
+        with self.assertRaisesRegex(sqlite3.OperationalError, "synthetic SQLite close failure"):
+            database.close()
+        self.assert_clean()
+        # A later reader may reuse a now-vacant name. A second close must not
+        # retain the old path or invoke deletion on another reader's files.
+        directory.mkdir()
+        sentinel = directory / "other-reader.db"
+        sentinel.write_bytes(b"another synthetic reader")
+        database.close()
+        self.assertEqual(sentinel.read_bytes(), b"another synthetic reader")
+
+
 class EncryptedNativeSnapshotTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("MEMMY_SQLCIPHER_TEST_LIBRARY"), "SQLCipher encrypted fixture requires an explicit test library")
     def test_encrypted_committed_wal_poll_uses_private_snapshot(self):
