@@ -46,7 +46,6 @@ describe("ApiKeyPage source", () => {
     expect(source).not.toContain('t("apiKey.dailyLimit")');
     expect(source).toContain('dispatch(appActions.navigate("/api-key-models"))');
     expect(source).toContain("clients.config.getModelConfig()");
-    expect(source).toContain('capabilities: ["agent"]');
     expect(source).toContain('protocol: "openai-embeddings"');
     expect(source).toContain('capabilities: ["embedding"]');
     expect(source).toContain('assignCatalogPreset(agent.workspace, "byok", "agent"');

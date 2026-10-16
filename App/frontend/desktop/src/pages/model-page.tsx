@@ -1,6 +1,6 @@
 /** Model page module. */
 import { bindSavedValidation, chatProtocol, endpointCredentialSignature } from "./model-credentials.js";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Brain, Check, CheckCircle2, ChevronLeft, Cog, Eye, EyeOff, Lightbulb, Loader2, XCircle } from "lucide-react";
 import { useApiClients } from "../app/providers.js";
 import { useAnalytics } from "../analytics/use-analytics.js";
@@ -109,6 +109,7 @@ export function ModelPage() {
   ));
   const [savePending, setSavePending] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<{ text: string; tone: "error" | "success" } | null>(null);
+  const credentialRevision = useRef(0);
   const skillValues = createModelFormValues(skill, primaryModel);
   const evolutionModel = modelFormValuesAsPrimary(skillValues);
   const memoryValues = createModelFormValues(mem, evolutionModel);
@@ -116,11 +117,13 @@ export function ModelPage() {
 
   /** Handles patch mem. */
   function patchMem(patch: Partial<ModelConfig>) {
+    if (!patch.validation) credentialRevision.current += 1;
     setMem((current) => patchModelConfig(current, patch));
   }
 
   /** Handles patch skill. */
   function patchSkill(patch: Partial<ModelConfig>) {
+    if (!patch.validation) credentialRevision.current += 1;
     setSkill((current) => patchModelConfig(current, patch));
   }
 
@@ -132,10 +135,13 @@ export function ModelPage() {
     secretTarget: "memory" | "skill"
   ) {
     const values = createModelFormValues(config, inheritedModel);
+    const revision = credentialRevision.current;
     testModelConnection({
       configClient: clients?.config,
       values,
-      setValidation: (validation) => patch({ validation }),
+      setValidation: (validation) => {
+        if (credentialRevision.current === revision) patch({ validation });
+      },
       secretTarget,
       messages: createTestModelConnectionMessages(t)
     });

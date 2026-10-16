@@ -200,6 +200,10 @@ export function ApiKeyPage() {
       if (savedCatalogSignatureRef.current !== saveSignature) {
         const latest = await clients.config.getModelConfig();
         let workspace = createModelWorkspace(latest);
+        // Preserve explicit follow routing when rotating the primary credential.
+        // Independent role assignments must keep their existing endpoint and key.
+        const evolutionFollows = latest.memmyMemory?.evolution?.mode === "follow";
+        const summaryFollowsPrimary = evolutionFollows && latest.memmyMemory?.summary?.mode === "follow";
         const agent = upsertByokPreset(workspace, {
           provider,
           ...(modelFormValues.endpointId ? { endpointId: modelFormValues.endpointId } : {}),
@@ -208,9 +212,12 @@ export function ApiKeyPage() {
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
           ...(modelFormValues.apiKeyMasked ? { apiKeyMasked: modelFormValues.apiKeyMasked } : {}),
           model,
-          capabilities: ["agent"]
+          capabilities: ["agent", ...(evolutionFollows ? ["memory_evolution" as const] : []),
+            ...(summaryFollowsPrimary ? ["memory_summary" as const] : [])]
         });
         workspace = assignCatalogPreset(agent.workspace, "byok", "agent", agent.presetId);
+        if (evolutionFollows) workspace = assignCatalogPreset(workspace, "byok", "memory_evolution", agent.presetId);
+        if (summaryFollowsPrimary) workspace = assignCatalogPreset(workspace, "byok", "memory_summary", agent.presetId);
         const savedEmbeddingIdentity = savedEndpointIdentitiesRef.current.embedding;
         if (embeddingMode === "custom") {
           const embedding = upsertByokPreset(workspace, {

@@ -15,6 +15,7 @@ import { createInitialAppState, type AppState } from "../../state/app-reducer.js
 import { assignedCatalogEndpointId, assignCatalogPreset, createModelWorkspace, modelConfigInput, upsertByokPreset } from "../../state/model-workspace.js";
 import { ApiKeyPage } from "../api-key-page.js";
 import { ApiKeyOptionalPage } from "../api-key-optional-page.js";
+import { ModelWorkspaceSection } from "../model-workspace-section.js";
 import { ModelPage } from "../model-page.js";
 
 const mocks = vi.hoisted(() => ({ clients: null as AppClients | null, state: null as AppState | null, dispatch: vi.fn() }));
@@ -28,9 +29,10 @@ vi.mock("../../i18n/use-translation.js", () => ({ useTranslation: () => ({ t: (k
 // Only transport and the external model provider are replaced; no real keys or network calls.
 async function createServer(directory: string, independent = true) {
   const writer = createMemmyConfigWriter({ configPath: join(directory, "config.yaml") });
-  const probe = vi.fn(async (_input: ModelConfigTestInput & { apiKey: string }) => ({
-    ok: true, message: "ok", checkedAt: "2026-10-16T00:00:00.000Z"
-  }));
+  const probe = vi.fn(async (input: ModelConfigTestInput & { apiKey: string }) => {
+    void input;
+    return { ok: true, message: "ok", checkedAt: "2026-10-16T00:00:00.000Z" };
+  });
   const service = createAppConfigService({
     bootstrapRepository: {} as CreateAppConfigServiceOptions["bootstrapRepository"],
     memmyConfigWriter: writer,
@@ -73,8 +75,9 @@ async function createServer(directory: string, independent = true) {
   }).workspace;
   await client.saveModelCatalog(modelConfigInput(workspace));
   write.mockClear();
+  const saveCatalog = vi.spyOn(client, "saveModelCatalog");
   return {
-    client, probe, write, writer,
+    client, probe, write, writer, saveCatalog,
     read: () => client.getModelConfig(),
     async key(capability: ModelCapability) {
       const config = await client.getModelConfig();
@@ -114,6 +117,9 @@ describe("BYOK displayed, tested and saved credentials", () => {
     mocks.clients = { config: server.client } as AppClients;
   });
   afterEach(async () => {
+    await act(async () => {
+      await Promise.allSettled(server.saveCatalog.mock.results.map((result) => result.value));
+    });
     act(() => root.unmount());
     document.body.replaceChildren();
     vi.unstubAllGlobals();
@@ -346,6 +352,211 @@ describe("BYOK displayed, tested and saved credentials", () => {
     await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
     expect(await server.key("agent")).toBe("sk-retry-1111");
     expect((await server.read()).catalog!.providers.flatMap((provider) => provider.endpoints)).toHaveLength(endpointsAfterCreate);
+  });
+
+  async function openSettings(role: ModelCapability) {
+    const config = await server.read();
+    const workspace = createModelWorkspace(config);
+    const id = assignedCatalogEndpointId(workspace, "byok", role);
+    const index = workspace.spaces.byok.connections.findIndex((connection) => connection.endpointId === id);
+    await render(<ModelWorkspaceSection mode="byok" seedConfig={config} configClient={server.client} />);
+    await click(container.querySelectorAll<HTMLButtonElement>('[aria-label="settings.modelWorkspace.editConnection"]')[index]!);
+  }
+  function settingsSave() { return document.querySelector<HTMLButtonElement>('[aria-label="common.save"]')!; }
+  function settingsTest() { return [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+    button.textContent === "settings.modelWorkspace.test" || button.textContent === "apiKey.testSuccess" || button.textContent === "apiKey.testRetry")!; }
+  function modalField(label: string) {
+    return [...document.querySelectorAll("label")].find((node) => node.textContent === label)!.parentElement!.querySelector("input")!;
+  }
+
+  it.each(scenarios.slice(0, 4))("settings $role: URL edit blocks the saved key; retest and save preserve other connections", async (scenario) => {
+    const before = await server.read();
+    const oldId = assignedCatalogEndpointId(createModelWorkspace(before), "byok", scenario.role)!;
+    const others = before.catalog!.providers.flatMap((p) => p.endpoints).filter((e) => e.endpointId !== oldId);
+    await openSettings(scenario.role);
+    const beforeTest1 = server.probe.mock.calls.length;
+    await click(settingsTest());
+    await vi.waitFor(() => expect(server.probe.mock.calls.length).toBeGreaterThan(beforeTest1));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("settings.modelWorkspace.testSuccess"));
+    expect(server.probe.mock.calls.at(-1)![0].apiKey).toBe(scenario.expected);
+    await change(modalField("apiKey.endpoint"), "https://changed.example/v2");
+    expect(document.body.textContent).toContain("apiKey.credentialsChanged");
+    expect(modalField("apiKey.key").placeholder).toBe("sk-...");
+    expect(settingsSave().disabled).toBe(true);
+    const calls = server.probe.mock.calls.length;
+    await click(settingsTest());
+    await click(settingsSave());
+    expect(server.probe).toHaveBeenCalledTimes(calls);
+    expect(server.write).not.toHaveBeenCalled();
+    await change(modalField("apiKey.key"), `  ${scenario.expected}  `);
+    expect(settingsSave().disabled).toBe(true);
+    const beforeTest2 = server.probe.mock.calls.length;
+    await click(settingsTest());
+    await vi.waitFor(() => expect(server.probe.mock.calls.length).toBeGreaterThan(beforeTest2));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("settings.modelWorkspace.testSuccess"));
+    expect(server.probe.mock.calls.at(-1)![0]).toMatchObject({ apiKey: scenario.expected, apiBase: "https://changed.example/v2" });
+    expect(settingsSave().disabled).toBe(false);
+    await click(settingsSave());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    await vi.waitFor(async () => {
+      const config = await server.read();
+      expect(config.catalog!.providers.flatMap((p) => p.endpoints).find((e) => e.endpointId === oldId)?.apiBase).toBe("https://changed.example/v2");
+    });
+    expect(await server.key(scenario.role)).toBe(scenario.expected);
+    const saved = await server.read();
+    expect(saved.catalog!.providers.flatMap((p) => p.endpoints).filter((e) => e.endpointId !== oldId)).toEqual(others);
+    await render(null);
+    await openSettings(scenario.role);
+    expect(modalField("settings.modelWorkspace.replaceKey").value).toBe("");
+    const beforeTest3 = server.probe.mock.calls.length;
+    await click(settingsTest());
+    await vi.waitFor(() => expect(server.probe.mock.calls.length).toBeGreaterThan(beforeTest3));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("settings.modelWorkspace.testSuccess"));
+    expect(server.probe.mock.calls.at(-1)![0]).toMatchObject({ apiKey: scenario.expected, apiBase: "https://changed.example/v2" });
+  });
+
+  it("settings: normalized URL retains the key; a model-only edit requires retesting", async () => {
+    await openSettings("agent");
+    await click(settingsTest());
+    await change(modalField("apiKey.endpoint"), "  https://provider.example/v1///  ");
+    expect(modalField("settings.modelWorkspace.replaceKey").placeholder).toContain("1111");
+    await click(document.querySelector<HTMLButtonElement>('[aria-label="settings.modelWorkspace.editModel"]')!);
+    await change(modalField("apiKey.model"), "changed-model");
+    expect(settingsSave().disabled).toBe(true);
+    expect(document.body.textContent).toContain("apiKey.testStale");
+    const beforeTest4 = server.probe.mock.calls.length;
+    await click(settingsTest());
+    await vi.waitFor(() => expect(server.probe.mock.calls.length).toBeGreaterThan(beforeTest4));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("settings.modelWorkspace.testSuccess"));
+    expect(server.probe.mock.calls.at(-1)![0]).toMatchObject({ apiKey: "sk-personal-1111", modelId: "changed-model", apiBase: "https://provider.example/v1" });
+    await click(settingsSave());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    expect(await server.key("agent")).toBe("sk-personal-1111");
+  });
+
+  it.each(["address", "key", "model", "close"])("settings: a late success after %s changes cannot validate the editor", async (edit) => {
+    await openSettings("agent");
+    let finish!: (result: Awaited<ReturnType<typeof server.probe>>) => void;
+    server.probe.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await click(settingsTest());
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    if (edit === "address") await change(modalField("apiKey.endpoint"), "https://changed.example/v2");
+    if (edit === "key") await change(modalField("settings.modelWorkspace.replaceKey"), "sk-new-1111");
+    if (edit === "model") {
+      await click(document.querySelector<HTMLButtonElement>('[aria-label="settings.modelWorkspace.editModel"]')!);
+      await change(modalField("apiKey.model"), "changed-model");
+    }
+    if (edit === "close") {
+      await click(document.querySelector<HTMLButtonElement>('[aria-label="common.close"]')!);
+      await openSettings("agent");
+    }
+    await act(async () => finish({ ok: true, message: "ok", checkedAt: "2026-10-16T00:00:00.000Z" }));
+    expect(document.body.textContent).not.toContain("settings.modelWorkspace.testSuccess");
+    if (edit !== "close") expect(settingsSave().disabled).toBe(true);
+    expect(server.write).not.toHaveBeenCalled();
+  });
+
+  it.each(["model", "key", "reuse"])("roles: a late success after %s changes cannot validate the current credential", async (edit) => {
+    let finish!: (result: Awaited<ReturnType<typeof server.probe>>) => void;
+    server.probe.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await render(<ModelPage />);
+    await click(test(1));
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    if (edit === "model") await change(field("apiKey.model", 1), "changed-model");
+    if (edit === "key") await change(field("API Key", 1), "sk-new-team-1111");
+    if (edit === "reuse") {
+      const checkbox = () => container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[1]!;
+      await click(checkbox());
+      await click(checkbox());
+    }
+    await act(async () => finish({ ok: true, message: "ok", checkedAt: "2026-10-16T00:00:00.000Z" }));
+    expect(test(1).textContent).not.toBe("apiKey.testSuccess");
+    expect(next().disabled).toBe(true);
+    expect(server.write).not.toHaveBeenCalled();
+  });
+
+  it("follow chain: primary rotation flows through evolution and summary, while a fixed role keeps its own key", async () => {
+    await render(<ModelPage />);
+    await click(container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[0]!);
+    await click(container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[1]!);
+    await click(next());
+    await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
+    expect(await server.key("memory_evolution")).toBe("sk-personal-1111");
+    expect(await server.key("memory_summary")).toBe("sk-personal-1111");
+    await render(null);
+    mocks.state!.modelConfig = await server.read();
+    mocks.dispatch.mockClear();
+    await render(<ApiKeyPage />);
+    await change(field("apiKey.key"), "sk-rotated-9999");
+    await testAndSave(scenarios[0]!);
+    await render(null);
+    mocks.state!.modelConfig = await server.read();
+    await render(<ModelPage />);
+    const boxes = () => container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]');
+    expect([...boxes()].map((b) => b.getAttribute("aria-checked"))).toEqual(["true", "true"]);
+    await click(boxes()[1]!); // Copy the new primary into an independent evolution configuration.
+    expect(field("API Key").placeholder).toContain("9999");
+    await change(field("API Key"), "sk-chain-team-7777");
+    expect(next().disabled).toBe(true);
+    await testAndSave({ ...scenarios[4]!, index: 0, fieldIndex: 0 });
+    expect(await server.key("agent")).toBe("sk-rotated-9999");
+    expect(await server.key("memory_evolution")).toBe("sk-chain-team-7777");
+    expect(await server.key("memory_summary")).toBe("sk-chain-team-7777");
+    await render(null);
+    mocks.state!.modelConfig = await server.read();
+    await render(<ModelPage />);
+    expect([...boxes()].map((b) => b.getAttribute("aria-checked"))).toEqual(["true", "false"]);
+    await click(boxes()[0]!);
+    expect(field("API Key").placeholder).toContain("7777");
+    expect((await testAndSave(scenarios[5]!)).apiKey).toBe("sk-chain-team-7777");
+    expect(await server.key("agent")).toBe("sk-rotated-9999");
+  });
+
+  it("settings: changing provider cannot reuse a masked key", async () => {
+    await openSettings("agent");
+    await click(document.querySelector<HTMLButtonElement>('.model-connection-modal [role="combobox"]')!);
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((b) => b.getAttribute("aria-selected") === "false")!);
+    await change(modalField("apiKey.endpoint"), "https://provider.example/v1");
+    expect(modalField("apiKey.key").placeholder).toBe("sk-...");
+    await click(settingsTest());
+    expect(server.probe).not.toHaveBeenCalled();
+    expect(settingsSave().disabled).toBe(true);
+  });
+
+  it("shared endpoint: rotating the primary leaves fixed evolution and summary on their old saved key", async () => {
+    const before = await server.read();
+    const oldId = assignedCatalogEndpointId(createModelWorkspace(before), "byok", "agent")!;
+    let workspace = createModelWorkspace(before);
+    const shared = upsertByokPreset(workspace, { provider: before.provider, endpointId: oldId,
+      endpoint: before.endpoint, protocol: "openai-chat-completions", model: "fixed-role-model",
+      apiKeyMasked: before.apiKeyMasked, capabilities: ["memory_evolution", "memory_summary"] });
+    workspace = assignCatalogPreset(shared.workspace, "byok", "memory_evolution", shared.presetId);
+    workspace = assignCatalogPreset(workspace, "byok", "memory_summary", shared.presetId);
+    await server.client.saveModelCatalog(modelConfigInput(workspace));
+    mocks.state!.modelConfig = await server.read();
+    await render(<ApiKeyPage />);
+    await change(field("apiKey.key"), "sk-new-primary-8888");
+    await testAndSave(scenarios[0]!);
+    expect(await server.key("agent")).toBe("sk-new-primary-8888");
+    expect(await server.key("memory_evolution")).toBe("sk-personal-1111");
+    expect(await server.key("memory_summary")).toBe("sk-personal-1111");
+    await render(null);
+    mocks.state!.modelConfig = await server.read();
+    await render(<ModelPage />);
+    await click(test(0));
+    await vi.waitFor(() => expect(server.probe.mock.calls.at(-1)![0].apiKey).toBe("sk-personal-1111"));
+    expect(assignedCatalogEndpointId(createModelWorkspace(await server.read()), "byok", "memory_evolution")).toBe(oldId);
+  });
+
+  it("settings: protocol-only change on the same provider and address requires a key", async () => {
+    await openSettings("agent");
+    await click(document.querySelector<HTMLButtonElement>('[aria-label="settings.modelWorkspace.editModel"]')!);
+    await click(document.querySelector<HTMLButtonElement>('.model-capability-select [role="combobox"], button.model-capability-select')!);
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((b) => b.textContent?.includes("capability.embedding"))!);
+    expect(modalField("apiKey.key").placeholder).toBe("sk-...");
+    await click(settingsTest());
+    expect(server.probe).not.toHaveBeenCalled();
+    expect(settingsSave().disabled).toBe(true);
   });
 
 });
