@@ -120,6 +120,10 @@ func diagnostic(code string) {
 	_ = emit(map[string]any{"type": "recorder.diagnostic", "timestamp": time.Now().UTC().Format(time.RFC3339Nano), "code": code})
 }
 
+func diagnosticCount(code string, count int) {
+	_ = emit(map[string]any{"type": "recorder.diagnostic", "timestamp": time.Now().UTC().Format(time.RFC3339Nano), "code": code, "count": count})
+}
+
 func observe(parent int, consent string) error {
 	if parent <= 0 {
 		return errors.New("parent pid required")
@@ -179,7 +183,6 @@ func observe(parent int, consent string) error {
 	restartAt := time.Time{}
 	failures := 0
 	ready := false
-	lastSnapshot := ""
 	lastWindow := ""
 	for {
 		select {
@@ -192,8 +195,8 @@ func observe(parent int, consent string) error {
 				diagnostic("heartbeat")
 				lastHeartbeat = now
 			}
-			if schedule.dropped > 0 || hookDropped() > 0 {
-				diagnostic("enrichment_backlog")
+			if dropped := schedule.dropped + int(hookDropped()); dropped > 0 {
+				diagnosticCount("enrichment_backlog", dropped)
 				schedule.dropped = 0
 			}
 			if now.Before(restartAt) {
@@ -215,6 +218,12 @@ func observe(parent int, consent string) error {
 			requestCtx, requestCancel := context.WithTimeout(ctx, workerDeadline)
 			result, readErr := current.request(requestCtx, workerRequest{ID: sequence, Action: a, Full: full, ConsentPath: consent})
 			requestCancel()
+			if snapshotFailed(full, result, readErr) {
+				diagnostic("ax_snapshot_failed")
+			}
+			if gap := actionCaptureGap(a, result, readErr); gap != nil {
+				_ = emit(gap)
+			}
 			if readErr != nil {
 				current.stop()
 				current = nil
@@ -225,7 +234,6 @@ func observe(parent int, consent string) error {
 				}
 				diagnostic("observer_unavailable")
 				restartAt = now.Add(time.Duration(min(failures, 5)) * time.Second)
-				lastSnapshot = ""
 				lastWindow = ""
 				continue
 			}
@@ -246,7 +254,6 @@ func observe(parent int, consent string) error {
 				}
 				if result.Reason != "unchanged" {
 					verifiedOrigin.Store(nil)
-					lastSnapshot = ""
 					lastWindow = ""
 				}
 				continue
@@ -260,21 +267,18 @@ func observe(parent int, consent string) error {
 			if event == nil {
 				continue
 			}
+			attachSnapshotQuality(&result)
 			rememberOrigin(event)
 			window, _ := event["window"].(map[string]any)
 			windowID, _ := window["windowId"].(string)
-			ax, _ := event["ax"].(map[string]any)
-			text, _ := ax["text"].(string)
 			kind, _ := event["kind"].(string)
+			if !shouldForwardSample(event, lastWindow) {
+				continue
+			}
 			if kind == "sampling.changed" {
 				if windowID != lastWindow {
 					event["kind"] = "window.changed"
-				} else if text == "" || text == lastSnapshot {
-					continue
 				}
-			}
-			if text != "" {
-				lastSnapshot = text
 			}
 			lastWindow = windowID
 			if err := emit(event); err != nil {

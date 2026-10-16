@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -105,7 +106,7 @@ func sampleEnvelope(mode string, complete bool) map[string]any {
 	return map[string]any{"id": 1, "ok": true, "skipped": false, "readFailures": 0, "event": map[string]any{
 		"kind": "sampling.changed", "timestamp": "2026-10-13T12:00:00Z", "app": map[string]any{"bundleIdentifier": "win32.chrome", "pid": 10, "secureInput": false},
 		"window": map[string]any{"browser": true, "windowId": "100", "processId": 10, "browserContext": map[string]any{"url": "https://example.com/", "documentUrl": "https://example.com/", "mode": mode, "complete": complete, "windowId": "100", "processId": 10}},
-		"ax":     map[string]any{"text": "ControlType.Text||Example|||"},
+		"ax":     map[string]any{"mode": "fullTree", "text": "ControlType.Text||Example|||"},
 	}}
 }
 func encoded(t *testing.T, value any) []byte {
@@ -179,6 +180,183 @@ func TestSkippedWorkerNeverLeaksAttachedEvent(t *testing.T) {
 	r, err := parseResult(encoded(t, value), 1)
 	if err != nil || r.Event != nil {
 		t.Fatal("skipped event propagated")
+	}
+}
+
+func TestFullSnapshotFailuresCannotBeHiddenBySuccessfulActions(t *testing.T) {
+	complete, err := parseResult(encoded(t, sampleEnvelope("normal", true)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial := workerResult{OK: true, Event: map[string]any{"ax": map[string]any{"windowKey": "100"}}}
+	for _, failure := range []struct {
+		name   string
+		full   bool
+		result workerResult
+		err    error
+	}{
+		{"full worker exception", true, workerResult{Skipped: true, ReadFailures: 1}, nil},
+		{"worker promoted partial read to failing full read", false, workerResult{Skipped: true, SnapshotAttempted: true, ReadFailures: 1}, nil},
+		{"full timeout", true, workerResult{}, errors.New("deadline")},
+		{"full response lacks tree", true, partial, nil},
+		{"worker promoted probe lacks tree", false, workerResult{OK: true, SnapshotAttempted: true, Event: partial.Event}, nil},
+		{"partial provider read", false, workerResult{OK: true, ReadFailures: 1, Event: complete.Event}, nil},
+		{"empty tree", false, workerResult{OK: true, Event: map[string]any{"ax": map[string]any{"mode": "fullTree", "text": " "}}}, nil},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			if !snapshotFailed(failure.full, failure.result, failure.err) {
+				t.Fatal("snapshot loss was not diagnosed")
+			}
+			// Successful action-only reads emit no snapshot recovery signal.
+			// The consumer's failure remains sticky until it persists a real tree.
+			if snapshotFailed(false, partial, nil) {
+				t.Fatal("ordinary partial action was mislabeled as a full-read failure")
+			}
+			if snapshotFailed(true, complete, nil) {
+				t.Fatal("complete readable tree remained failed")
+			}
+		})
+	}
+	if snapshotFailed(true, workerResult{OK: true, Skipped: true, Reason: "secure_input"}, nil) {
+		t.Fatal("intentional privacy skip reported as broken capture")
+	}
+	partial.SnapshotDeferred = true
+	if snapshotFailed(true, partial, nil) {
+		t.Fatal("worker's completion-based full-tree throttle was reported as failure")
+	}
+	partial.OK = false
+	if !snapshotFailed(true, partial, nil) {
+		t.Fatal("defer flag masked a real worker failure")
+	}
+}
+
+func TestSnapshotQualitySurvivesNativeEventEmission(t *testing.T) {
+	result, err := parseResult(encoded(t, sampleEnvelope("normal", true)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Truncated, result.ReadFailures = true, 3
+	attachSnapshotQuality(&result)
+	ax := result.Event["ax"].(map[string]any)
+	if ax["truncated"] != true || ax["readFailures"] != 3 {
+		t.Fatal("frame quality disappeared before emitting the event")
+	}
+	partial := workerResult{OK: true, Event: map[string]any{"ax": map[string]any{"windowKey": "100"}}}
+	attachSnapshotQuality(&partial)
+	if _, present := partial.Event["ax"].(map[string]any)["truncated"]; present {
+		t.Fatal("action-only response pretended to carry a tree quality measurement")
+	}
+}
+
+func TestMalformedSnapshotCannotPassTheNativeProtocol(t *testing.T) {
+	for _, ax := range []map[string]any{
+		{"text": "content without the fullTree discriminator"},
+		{"mode": "fullTree"},
+		{"mode": "fullTree", "text": []string{"wrong type"}},
+		{"mode": "diffFromPrevious", "text": "+ unsupported native delta"},
+	} {
+		value := sampleEnvelope("normal", true)
+		value["event"].(map[string]any)["ax"] = ax
+		if _, err := parseResult(encoded(t, value), 1); err == nil {
+			t.Fatalf("invalid native snapshot accepted: %+v", ax)
+		}
+	}
+}
+
+func TestDeferredSnapshotProtocolIsExplicitAndConsistent(t *testing.T) {
+	deferred := sampleEnvelope("normal", true)
+	deferred["snapshotDeferred"] = true
+	deferred["event"].(map[string]any)["ax"] = map[string]any{"windowKey": "100"}
+	parsed, err := parseResult(encoded(t, deferred), 1)
+	if err != nil || !parsed.SnapshotDeferred || snapshotFailed(true, parsed, err) {
+		t.Fatalf("legitimately deferred full request rejected: %+v %v", parsed, err)
+	}
+	deferred["snapshotAttempted"] = true
+	if _, err := parseResult(encoded(t, deferred), 1); err == nil {
+		t.Fatal("deferred and attempted snapshot accepted together")
+	}
+	delete(deferred, "snapshotAttempted")
+	deferred["event"].(map[string]any)["ax"] = map[string]any{"mode": "fullTree", "text": "visible text"}
+	if _, err := parseResult(encoded(t, deferred), 1); err == nil {
+		t.Fatal("deferred snapshot carrying a full tree accepted")
+	}
+}
+
+func TestSnapshotObservationBindingRequiresAFullTreeAndValidTime(t *testing.T) {
+	value := sampleEnvelope("normal", true)
+	ax := value["event"].(map[string]any)["ax"].(map[string]any)
+	ax["observedAt"] = "2026-10-15T14:00:00.1234567Z"
+	result, err := parseResult(encoded(t, value), 1)
+	if err != nil || result.Event["ax"].(map[string]any)["observedAt"] != ax["observedAt"] {
+		t.Fatal("snapshot observation timestamp lost")
+	}
+	for _, invalid := range []any{"invalid", "0001-01-01T00:00:00Z", 100} {
+		ax["observedAt"] = invalid
+		if _, err := parseResult(encoded(t, value), 1); err == nil {
+			t.Fatalf("invalid snapshot observation accepted: %v", invalid)
+		}
+	}
+	value["event"].(map[string]any)["ax"] = map[string]any{"windowKey": "100", "observedAt": "2026-10-15T14:00:00Z"}
+	if _, err := parseResult(encoded(t, value), 1); err == nil {
+		t.Fatal("action-only read pretended to establish a full snapshot observation")
+	}
+}
+
+func TestFullSnapshotsReachAuthorizedConsumerAfterUnchangedOrPartialReads(t *testing.T) {
+	result, err := parseResult(encoded(t, sampleEnvelope("normal", true)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"same visible text", ""} {
+		result.Event["ax"].(map[string]any)["text"] = text
+		for _, partial := range []bool{true, false, false} {
+			result.Truncated = partial
+			result.ReadFailures = 0
+			if partial {
+				result.ReadFailures = 1
+			}
+			attachSnapshotQuality(&result)
+			if !shouldForwardSample(result.Event, "100") {
+				t.Fatal("full snapshot lost before Node authorization/persistence")
+			}
+		}
+	}
+	partial := map[string]any{"kind": "sampling.changed", "window": map[string]any{"windowId": "100"}, "ax": map[string]any{"windowKey": "100"}}
+	if shouldForwardSample(partial, "100") {
+		t.Fatal("idle probe without a snapshot needlessly forwarded")
+	}
+	if !shouldForwardSample(partial, "200") {
+		t.Fatal("window transition was discarded")
+	}
+	partial["kind"] = "mouse.click"
+	if !shouldForwardSample(partial, "100") {
+		t.Fatal("action without a full tree was discarded")
+	}
+}
+
+func TestLostActionsProduceOnlyBoundedContentFreeCoverage(t *testing.T) {
+	a := action{Kind: "mouse.click", Timestamp: "2026-10-15T14:00:00.123Z", Button: "left", Count: 1,
+		Window: "PRIVATE_WINDOW", PID: 100, X: 9876, Y: 5432, Key: "PRIVATE_KEY", ExpectedURL: "https://private.example/"}
+	for _, reason := range []string{"action_origin_unknown", "action_origin_expired", "action_origin_changed", "foreground_changed", "navigation_changed", "focus_changed"} {
+		gap := actionCaptureGap(a, workerResult{OK: true, Skipped: true, Reason: reason}, nil)
+		if gap == nil || gap["actionTimestamp"] != a.Timestamp || gap["actionKind"] != a.Kind || gap["button"] != a.Button || gap["count"] != 1 || gap["reason"] != reason {
+			t.Fatalf("lost action disappeared: %s %+v", reason, gap)
+		}
+		if len(gap) != 6 || strings.Contains(string(encoded(t, gap)), "PRIVATE") || strings.Contains(string(encoded(t, gap)), "private.example") {
+			t.Fatal("coverage exposed context that could not be authorized")
+		}
+	}
+	if gap := actionCaptureGap(a, workerResult{}, errors.New("PRIVATE_PROVIDER_ERROR")); gap["reason"] != "worker_failed" {
+		t.Fatal("worker failure was not preserved as a content-free gap")
+	}
+	for _, reason := range []string{"secure_input", "wechat_consent_required", "unchanged", "unrecognized_PRIVATE_REASON"} {
+		if actionCaptureGap(a, workerResult{OK: true, Skipped: true, Reason: reason}, nil) != nil {
+			t.Fatalf("intentional exclusion or unknown reason produced a record: %s", reason)
+		}
+	}
+	a.Timestamp = "invalid"
+	if actionCaptureGap(a, workerResult{}, errors.New("failure")) != nil {
+		t.Fatal("invalid action time accepted")
 	}
 }
 

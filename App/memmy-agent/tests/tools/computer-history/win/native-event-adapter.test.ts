@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction } from "../../../../src/tools/computer-history/win/native-event-adapter.js";
+import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction, previousControlsAtPoint } from "../../../../src/tools/computer-history/win/native-event-adapter.js";
 import { evaluateObservation, type ObservationSettings } from "../../../../src/tools/computer-history/mac/observation-settings.js";
 import { buildBrowserAuthoritySnapshot } from "../../../../src/tools/computer-history/browser-privacy.js";
 import { filterHistoryAuthorityObservations } from "../../../../src/tools/computer-history/mac/computer-history-api.js";
@@ -16,6 +16,19 @@ function browser(url = "https://company.test/finance", mode = "normal", complete
     } }, ax: { mode: "fullTree", text: "ControlType.Text||COMPANY_CONTENT|||" } } as any;
 }
 describe("Windows native recording boundary", () => {
+  it("keeps earlier control context separate, bounded, and free of values or sensitive fields", () => {
+    const before = { observedAt: "2026-10-15T12:00:00Z", interpretation: "previously_observed_not_confirmed_target",
+      controls: [{ role: "AXButton", title: "Finish", value: "PRIVATE_VALUE", x: 12 },
+        { role: "AXSecureTextField", name: "PRIVATE_PASSWORD" }] };
+    expect(previousControlsAtPoint(before, "2026-10-15T12:00:01Z")).toEqual({
+      observedAt: "2026-10-15T12:00:00.000Z", interpretation: "previously_observed_not_confirmed_target",
+      controls: [{ role: "AXButton", title: "Finish" }],
+    });
+    expect(previousControlsAtPoint(before, "2026-10-15T11:59:59Z")).toBeNull();
+    expect(previousControlsAtPoint(before, "2026-10-15T12:00:06Z")).toBeNull();
+    expect(previousControlsAtPoint({ ...before, interpretation: "confirmed" }, "2026-10-15T12:00:01Z")).toBeNull();
+    expect(previousControlsAtPoint({ ...before, controls: Array(4).fill(before.controls[0]) }, "2026-10-15T12:00:01Z")).toBeNull();
+  });
   it("uses this native window URL and honors an explicit website exclusion", () => {
     const event = browser();
     applyWindowsBrowserPrivacy(event, null);

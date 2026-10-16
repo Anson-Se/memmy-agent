@@ -52,6 +52,33 @@ function actionTarget(target: NativeEvent | undefined): Record<string, string> |
   return result;
 }
 
+/** Earlier controls are context for an input, never a verified click target. */
+export function previousControlsAtPoint(value: unknown, actionTimestamp: unknown): {
+  observedAt: string;
+  controls: Record<string, string>[];
+  interpretation: "previously_observed_not_confirmed_target";
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof actionTimestamp !== "string") return null;
+  const source = value as Record<string, unknown>;
+  if (source.interpretation !== "previously_observed_not_confirmed_target" || typeof source.observedAt !== "string"
+    || !Array.isArray(source.controls) || source.controls.length < 1 || source.controls.length > 3) return null;
+  const at = Date.parse(actionTimestamp), before = Date.parse(source.observedAt);
+  if (!Number.isFinite(at) || !Number.isFinite(before) || before > at || at - before > 5_000) return null;
+  const controls = source.controls.flatMap((control) => {
+    if (!control || typeof control !== "object" || Array.isArray(control)) return [];
+    const candidate = control as Record<string, unknown>;
+    if (candidate.role === "AXSecureTextField" || candidate.subrole === "AXSecureTextField"
+      || candidate.isPassword === true || candidate.IsPassword === true) return [];
+    const projected: Record<string, string> = {};
+    for (const field of ["role", "name", "title", "identifier"]) {
+      if (typeof candidate[field] === "string") projected[field] = redactSensitive(candidate[field].slice(0, 320));
+    }
+    return Object.keys(projected).length ? [projected] : [];
+  });
+  return controls.length ? { observedAt: new Date(before).toISOString(), controls,
+    interpretation: "previously_observed_not_confirmed_target" } : null;
+}
+
 /** Windows hooks report actions and counts; they never carry raw character data. */
 export function normalizeWindowsKeyboardAction(event: NativeEvent,
   searchContext: { purpose: string; role: string; label: string } | null,

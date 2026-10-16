@@ -143,6 +143,40 @@ function CachedClickTarget($cache,[string]$key,[long]$expected,[long]$current,[s
   return $unknown
 }
 
+function PreviousControlsAtPoint($cache,[string]$key,[bool]$originVerified,[DateTime]$actionAt,[double]$x,[double]$y) {
+  if (-not $originVerified -or $null -eq $cache -or $cache.key -ne $key) {return $null}
+  $actionAt=$actionAt.ToUniversalTime();$cacheAt=$cache.at.ToUniversalTime()
+  if ($cacheAt -gt $actionAt -or ($actionAt-$cacheAt).TotalSeconds -gt 5) {return $null}
+  $controls=@()
+  foreach ($item in $cache.targets) {
+    if ($x -ge $item.x -and $y -ge $item.y -and $x -lt ($item.x+$item.width) -and $y -lt ($item.y+$item.height)) {
+      $control=@{}
+      foreach ($field in @('role','name','title','identifier')) {
+        if ($item.target[$field] -is [string]) {$control[$field]=Clean $item.target[$field] 320}
+      }
+      $controls+=$control
+      if ($controls.Count -ge 3) {break}
+    }
+  }
+  if ($controls.Count -eq 0) {return $null}
+  return @{observedAt=$cacheAt.ToString('o');controls=$controls;
+    interpretation='previously_observed_not_confirmed_target'}
+}
+
+# The observation time also binds click candidates to the exact full snapshot
+# that the consumer previously authorized, rather than any native-only cache.
+function SnapshotCache($event,[long]$generation,$targets) {
+  $observedAt=[DateTime]::UtcNow
+  $event.ax.observedAt=$observedAt.ToString('o')
+  return @{key=$event.ax.windowKey;at=$observedAt;generation=$generation;targets=$targets}
+}
+
+function SnapshotText($value,[int]$limit,[ref]$truncated) {
+  $text=Clean $value ([int]::MaxValue)
+  if ($text.Length -gt $limit) {$truncated.Value=$true;return $text.Substring(0,$limit)}
+  return $text
+}
+
 # The browser chrome is checked before any Document content is read. It is
 # enumerated separately, excluding the complete Document subtree. A normal
 # page title is never evidence of the committed page address.
@@ -201,9 +235,9 @@ function BrowserContext($root,[string]$title,[string]$windowId,[int]$processId,[
   return $context
 }
 
-function Snapshot($root,[DateTime]$deadline) {
+function Snapshot($root,[DateTime]$deadline,$walker=$null) {
   $queue=New-Object System.Collections.Queue;$queue.Enqueue(@{node=$root;secure=$false})
-  $walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker
+  if ($null -eq $walker) {$walker=[System.Windows.Automation.TreeWalker]::ControlViewWalker}
   $lines=New-Object 'System.Collections.Generic.List[string]';$length=0;$visited=0;$failures=0;$truncated=$false
   $targets=New-Object 'System.Collections.Generic.List[object]'
   while ($queue.Count -gt 0 -and $visited -lt 400) {
@@ -215,9 +249,14 @@ function Snapshot($root,[DateTime]$deadline) {
       $secure=$entry.secure -or $current.IsPassword -or ($current.NativeWindowHandle -ne 0 -and [HistoryNative]::PasswordWindow([IntPtr]$current.NativeWindowHandle))
       $role=Clean $current.ControlType.ProgrammaticName 80;$subrole='';$name='';$id='';$value=''
       if ($secure) {$subrole='AXSecureTextField'} else {
-        $name=Clean $current.Name;$id=Clean $current.AutomationId 160
-        try {$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern);$value=Clean $pattern.Current.Value 1000} catch {}
-        if (-not $value) {try {$pattern=$element.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern);$value=Clean ($pattern.DocumentRange.GetText(1000)) 1000} catch {}}
+        $name=SnapshotText $current.Name 320 ([ref]$truncated);$id=SnapshotText $current.AutomationId 160 ([ref]$truncated)
+        try {$pattern=$element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern);$value=SnapshotText $pattern.Current.Value 1000 ([ref]$truncated)} catch {}
+        if (-not $value) {try {
+          $pattern=$element.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+          $rawText=$pattern.DocumentRange.GetText(1001)
+          if ($rawText.Length -gt 1000) {$truncated=$true}
+          $value=SnapshotText $rawText 1000 ([ref]$truncated)
+        } catch {}}
       }
       if ($subrole -or $name -or $id -or $value) {
         $line="$role|$subrole|$name||$id|$value"
@@ -246,11 +285,69 @@ function Snapshot($root,[DateTime]$deadline) {
     } catch {$failures++}
   }
   if ($queue.Count -gt 0) {$truncated=$true}
-  return @{text=[string]::Join("`n",$lines);truncated=$truncated;readFailures=$failures;targets=@($targets)}
+  # PowerShell 5.1's array-subexpression binder throws for List[object], even
+  # when empty. That discarded every full snapshot while action reads worked.
+  return @{text=[string]::Join("`n",$lines);truncated=$truncated;readFailures=$failures;targets=$targets.ToArray()}
 }
 
 if ($SelfTest) {
   # Compile the same native/UIA API declarations, then test only pure helpers.
+  # Run the real Snapshot return path with process-local nodes and walker.
+  # No FromHandle, foreground read, UIA subscription or global hook is used.
+  $fixtureWalker=New-Object PSObject
+  $fixtureWalker | Add-Member ScriptMethod GetFirstChild {param($node) return $null}
+  $fixtureWalker | Add-Member ScriptMethod GetNextSibling {param($node) return $null}
+  foreach ($withTarget in @($false,$true)) {
+    $fixture=New-Object PSObject -Property @{Current=@{
+      IsOffscreen=$false;IsPassword=$false;NativeWindowHandle=0;
+      ControlType=$(if ($withTarget) {[System.Windows.Automation.ControlType]::Button} else {[System.Windows.Automation.ControlType]::Text});
+      Name='PureSnapshotSentinel';AutomationId='pure-snapshot';
+      BoundingRectangle=@{X=0;Y=0;Width=80;Height=24}}}
+    $fixture | Add-Member ScriptMethod GetCurrentPattern {param($pattern) throw 'No pattern in pure fixture'}
+    $fixture | Add-Member ScriptMethod GetRuntimeId {return [int[]]@(1,2)}
+    $captured=Snapshot $fixture ([DateTime]::UtcNow.AddSeconds(10)) $fixtureWalker
+    if ($captured.text -notmatch 'PureSnapshotSentinel' -or $captured.truncated -or $captured.readFailures -ne 0 -or
+        $captured.targets.Count -ne [int]$withTarget) {throw 'Snapshot pure traversal or target array failed'}
+    $roundtrip=ConvertTo-Json -InputObject $captured -Depth 10 -Compress | ConvertFrom-Json
+    if ($roundtrip.text -ne $captured.text -or $roundtrip.targets.Count -ne [int]$withTarget) {throw 'Snapshot JSON roundtrip failed'}
+  }
+  $cacheFixtureEvent=@{ax=@{windowKey='pure-cache'}}
+  $cacheFixture=SnapshotCache $cacheFixtureEvent 3 @()
+  if ($cacheFixture.at.Kind -ne [DateTimeKind]::Utc -or
+      $cacheFixtureEvent.ax.observedAt -ne $cacheFixture.at.ToString('o') -or
+      $cacheFixture.key -ne $cacheFixtureEvent.ax.windowKey -or $cacheFixture.targets.Count -ne 0) {
+    throw 'Snapshot cache observation binding lost'
+  }
+  foreach ($limit in @(160,320,1000)) {
+    $clipped=$false;$exact=SnapshotText ('a'*$limit) $limit ([ref]$clipped)
+    if ($clipped -or $exact.Length -ne $limit) {throw 'Exact snapshot field limit was marked truncated'}
+    $clipped=$false;$over=SnapshotText ('a'*($limit+1)) $limit ([ref]$clipped)
+    if (-not $clipped -or $over.Length -ne $limit) {throw 'Snapshot field truncation was not reported'}
+  }
+  $fixture.Current.Name='a'*321
+  if (-not (Snapshot $fixture ([DateTime]::UtcNow.AddSeconds(10)) $fixtureWalker).truncated) {throw 'Snapshot Name truncation lost'}
+  $fixture.Current.Name='PureSnapshotSentinel'
+  $fixture | Add-Member NoteProperty FixtureValue $null
+  $fixture | Add-Member NoteProperty FixtureRange $null
+  $fixture | Add-Member ScriptMethod GetCurrentPattern {
+    param($pattern)
+    if ($pattern -eq [System.Windows.Automation.ValuePattern]::Pattern -and $null -ne $this.FixtureValue) {return @{Current=@{Value=$this.FixtureValue}}}
+    if ($pattern -eq [System.Windows.Automation.TextPattern]::Pattern -and $null -ne $this.FixtureRange) {return @{DocumentRange=$this.FixtureRange}}
+    throw 'No pattern in pure fixture'
+  } -Force
+  foreach ($patternKind in @('value','text')) {
+    foreach ($length in @(1000,1001)) {
+      $fixture.FixtureValue=$null;$fixture.FixtureRange=$null
+      if ($patternKind -eq 'value') {$fixture.FixtureValue='a'*$length} else {
+        $range=New-Object PSObject -Property @{Value=('a'*$length)}
+        $range | Add-Member ScriptMethod GetText {param($limit) return $this.Value.Substring(0,[Math]::Min($limit,$this.Value.Length))}
+        $fixture.FixtureRange=$range
+      }
+      $captured=Snapshot $fixture ([DateTime]::UtcNow.AddSeconds(10)) $fixtureWalker
+      if ($captured.truncated -ne ($length -gt 1000) -or $captured.readFailures -ne 0 -or
+          ($captured.text.Split('|')[-1]).Length -ne 1000) {throw 'Snapshot provider text truncation lost'}
+    }
+  }
   # No AutomationElement, desktop window, hooks or listener is created here.
   if ((Url 'https://user:secret@example.com/path?token=secret#fragment') -ne 'https://example.com/path') {throw 'URL sanitization failed'}
   if (Url 'chrome://settings') {throw 'Non-web URL accepted'}
@@ -274,6 +371,15 @@ if ($SelfTest) {
   if ((CachedClickTarget $cache $cache.key 3 4 'old-button' 10 10).role -ne 'AXUnknown') {throw 'Renamed control reused stale proof'}
   if ((CachedClickTarget $null $cache.key 3 3 'old-button' 10 10).role -ne 'AXUnknown') {throw 'Click labeled without earlier snapshot'}
   if ((CachedClickTarget $cache '1:100:https://company.example/' 3 3 'old-button' 10 10).role -ne 'AXUnknown') {throw 'Click cache crossed URL'}
+  $actionAt=[DateTime]::UtcNow
+  $previous=PreviousControlsAtPoint $cache $cache.key $true $actionAt 10 10
+  if ($previous.controls.Count -ne 1 -or $previous.controls[0].title -ne 'Add to cart' -or
+      $previous.interpretation -ne 'previously_observed_not_confirmed_target') {throw 'Previous controls evidence lost'}
+  if ($null -eq (PreviousControlsAtPoint $cache $cache.key $true ($actionAt.ToLocalTime()) 10 10)) {throw 'Local action time lost previous controls'}
+  if ($null -ne (PreviousControlsAtPoint $cache 'other-window' $true $actionAt 10 10) -or
+      $null -ne (PreviousControlsAtPoint $cache $cache.key $false $actionAt 10 10) -or
+      $null -ne (PreviousControlsAtPoint $cache $cache.key $true ($cache.at.AddSeconds(6)) 10 10) -or
+      $null -ne (PreviousControlsAtPoint $cache $cache.key $true ($cache.at.AddSeconds(-1)) 10 10)) {throw 'Previous controls crossed observation boundary'}
   $consentFixture=[IO.Path]::GetTempFileName()
   try {
     [IO.File]::WriteAllText($consentFixture,'{"version":1,"enabled":true,"consentId":"pure-test"}')
@@ -281,7 +387,7 @@ if ($SelfTest) {
     [IO.File]::WriteAllText($consentFixture,'{"version":1,"enabled":false,"consentId":"pure-test"}')
     if (ConsentAllowed $consentFixture) {throw 'Revoked consent cached'}
   } finally {[IO.File]::Delete($consentFixture)}
-  '{"runtimeId":"MemmyWindowsHistoryRuntimeV1","pureSelfTest":true,"desktopAccess":false,"workerApiCompiled":true}'
+  '{"runtimeId":"MemmyWindowsHistoryRuntimeV1","pureSelfTest":true,"desktopAccess":false,"workerApiCompiled":true,"snapshotTraversalChecked":true}'
   exit 0
 }
 $script:lastGeneration=0;$script:subscribedWindow='';$script:lastFull=[DateTime]::MinValue;$script:lastObservedWindow='';$script:targetCache=$null
@@ -325,6 +431,7 @@ function Capture($request) {
   $generation=[HistorySignals]::Generation
   $full=[bool]$request.full -and ([DateTime]::UtcNow-$script:lastFull).TotalSeconds -ge 1
   if ($act.kind -eq 'probe' -and $generation -ne $script:lastGeneration -and ([DateTime]::UtcNow-$script:lastFull).TotalSeconds -ge 1) {$full=$true}
+  $snapshotDeferred=[bool]$request.full -and -not $full
   $script:lastGeneration=$generation
   $event=@{timestamp=$(if ($isAction) {$act.timestamp} else {[DateTime]::UtcNow.ToString('o')});kind=$act.kind;
     app=@{name=$name;bundleIdentifier=$id;pid=[int]$processId;secureInput=$false};
@@ -333,7 +440,7 @@ function Capture($request) {
   if ($browser) {$event.window.browserContext=$context;$event.window.url=$context.url;$event.ax.windowKey+=':'+$context.url}
   $truncated=$false;$failures=0
   $snapshotGeneration=[HistorySignals]::Generation
-  if ($full) {$snapshot=Snapshot $root $deadline;$event.ax.mode='fullTree';$event.ax.text=$snapshot.text;$truncated=$snapshot.truncated;$failures=$snapshot.readFailures;$script:lastFull=[DateTime]::UtcNow}
+  if ($full) {$script:requestSnapshotAttempted=$true;$snapshot=Snapshot $root $deadline;$event.ax.mode='fullTree';$event.ax.text=$snapshot.text;$truncated=$snapshot.truncated;$failures=$snapshot.readFailures;$script:lastFull=[DateTime]::UtcNow}
   if ($null -ne $focus -and (Belongs $focus $root $processId)) {$event.ax.focused=SafeNode $focus}
   if ($act.kind -in @('mouse.click','mouse.context_menu')) {
     $target=@{role='AXUnknown'}
@@ -353,6 +460,8 @@ function Capture($request) {
       } catch {}
     }
     $event.mouse=@{button=$act.button;clickCount=1;target=$target}
+    $previousControls=PreviousControlsAtPoint $previousCache $event.ax.windowKey ([bool]$act.originVerified) $actionAt ([double]$act.x) ([double]$act.y)
+    if ($null -ne $previousControls) {$event.mouse.previousControlsAtPoint=$previousControls}
   } elseif ($act.kind -eq 'mouse.scroll') {
     $direction=if ($act.delta -eq 0) {'none'} elseif ($act.scrollAxis -eq 'horizontal') {if ($act.delta -gt 0) {'right'} else {'left'}} elseif ($act.delta -gt 0) {'up'} else {'down'}
     $event.mouse=@{direction=$direction}
@@ -387,17 +496,18 @@ function Capture($request) {
   if ($isAction -and $act.expectedScope -ne [HistorySignals]::ScopeGeneration) {return Skip 'action_origin_changed'}
   if ($act.kind -in @('mouse.click','mouse.context_menu') -and $act.expectedContent -ne [HistorySignals]::Generation) {$event.mouse.target=@{role='AXUnknown'}}
   if ($full -and $snapshotGeneration -eq [HistorySignals]::Generation) {
-    $script:targetCache=@{key=$event.ax.windowKey;at=[DateTime]::UtcNow;generation=$snapshotGeneration;targets=$snapshot.targets}
+    $script:targetCache=SnapshotCache $event $snapshotGeneration $snapshot.targets
   }
   $event.nativeScopeGeneration=[HistorySignals]::ScopeGeneration
   $event.nativeContentGeneration=[HistorySignals]::Generation
   $script:lastObservedWindow=$windowId
-  return @{ok=$true;skipped=$false;readFailures=$failures;truncated=$truncated;event=$event}
+  return @{ok=$true;skipped=$false;readFailures=$failures;truncated=$truncated;snapshotAttempted=$full;snapshotDeferred=$snapshotDeferred;event=$event}
 }
 
 '{"ready":true,"runtimeId":"MemmyWindowsHistoryRuntimeV1"}'
 while ($null -ne ($line=[Console]::ReadLine())) {
   $request=$null
+  $script:requestSnapshotAttempted=$false
   try {
     if ($line.Length -gt 8192) {exit 12}
     $request=$line | ConvertFrom-Json
@@ -406,6 +516,6 @@ while ($null -ne ($line=[Console]::ReadLine())) {
   } catch {
     # Provider exceptions and labels are not diagnostic user data.
     $requestId=if ($null -ne $request) {$request.id} else {0}
-    ConvertTo-Json -InputObject @{id=$requestId;ok=$false;skipped=$true;readFailures=1} -Compress
+    ConvertTo-Json -InputObject @{id=$requestId;ok=$false;skipped=$true;readFailures=1;snapshotAttempted=$script:requestSnapshotAttempted} -Compress
   }
 }

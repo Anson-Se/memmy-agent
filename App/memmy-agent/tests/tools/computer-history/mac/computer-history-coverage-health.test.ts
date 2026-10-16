@@ -451,6 +451,23 @@ describe("capture health protocol", () => {
     });
   });
 
+  it("does not recover missing Windows content from successful input, observer startup or heartbeats", async () => {
+    await onWindows(async () => {
+      active(); health("heartbeat"); health("ax_snapshot_failed", 1);
+      await vi.advanceTimersByTimeAsync(31_000);
+      health("heartbeat"); health("event_recorded"); health("observer_ready");
+      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_failed", count: 1 }] });
+      const failedAt = new Date().toISOString();
+      await vi.advanceTimersByTimeAsync(1_000); health("ax_snapshot_ready");
+      expect(status()).toMatchObject({ status: "healthy", issues: [] });
+      // Delayed batched failures cannot erase newer persisted-read evidence.
+      health("ax_snapshot_failed", 2, failedAt);
+      expect(status()).toMatchObject({ status: "healthy", issues: [] });
+      await vi.advanceTimersByTimeAsync(1_000); health("ax_snapshot_failed", 1);
+      expect(status()).toMatchObject({ status: "degraded", issues: [{ code: "ax_snapshot_failed", count: 4 }] });
+    });
+  });
+
   it("requires post-issue heartbeat evidence before recovering a Windows transient gap", async () => {
     await onWindows(async () => {
       active(); health("heartbeat");

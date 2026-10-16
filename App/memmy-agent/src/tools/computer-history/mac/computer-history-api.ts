@@ -44,7 +44,7 @@ import { isPersonalWeChatHistorySupported } from "../platform.js";
 import { isWindows11, listWindowsApplications } from "../win/win11.js";
 import { HistoryMemoryAdapter, type HistoryEvidence, type HistorySkillGroup } from "../memory-adapter.js";
 import { historyEvidenceSummary } from "../memory-evidence-summary.js";
-import { renderSummary } from "./summarize-history.js";
+import { isCaptureInterruptionRecord, renderSummary } from "./summarize-history.js";
 import { writeWorkflowCandidate } from "../../computer-use/extract-workflow-candidate.js";
 import { WeChatHistoryConsentStore, defaultWeChatConsentFile } from "./wechat-consent.js";
 import { WeChatMessageBatchReader, WeChatReaderError } from "./wechat-message-batch.js";
@@ -217,6 +217,7 @@ const CAPTURE_ISSUE_RECOVERY_MS = 30_000;
 const RECORDER_HEALTH_PREFIX = "[recorder-health] ";
 const CAPTURE_ISSUE_CODES = new Set([
   "observer_unavailable", "observer_notifications_unavailable", "ax_snapshot_budget_exceeded",
+  "ax_snapshot_failed",
   "enrichment_backlog", "helper_parse_error", "event_processing_error", "input_monitoring_unavailable",
 ]);
 
@@ -369,6 +370,21 @@ function isMachineSummary(sourceType: ComputerHistorySourceType): boolean {
  * excluded — is never empty. Summarizing it anyway wrote "no activity" into
  * the timeline every ten minutes for as long as nobody was there.
  */
+function rawHasEvidence(text: string): boolean {
+  return text.split("\n").some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const record = JSON.parse(line);
+      if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+      return isCaptureInterruptionRecord(record) || (record.recordType === "human_event"
+        && typeof record.eventType === "string" && record.eventType.length > 0
+        && !["recording_started", "recording_stopped"].includes(record.eventType));
+    } catch { return false; }
+  });
+}
+
+// A failed recorder may have no activity to describe. Its failure evidence
+// must still be searchable and checkpointed before raw retention expires.
 function segmentHasActivity(eventsFile: string): boolean {
   let text: string;
   try {
@@ -376,7 +392,7 @@ function segmentHasActivity(eventsFile: string): boolean {
   } catch {
     return false;
   }
-  return /"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(text);
+  return rawHasEvidence(text);
 }
 
 function lastRecordedEvent(raw: string): Record<string, unknown> | null {
@@ -461,6 +477,7 @@ export class ComputerHistoryDemoService {
   // segment rotations rather than treating new event output as liveness.
   private captureHeartbeatSupported = false;
   private captureObserverReadyAt = 0;
+  private captureSnapshotReadyAt = 0;
   private captureInputReadyAt = 0;
   private captureHealthGeneration = 0;
   private readonly captureHealthDrainingChildren = new Set<ChildProcessWithoutNullStreams>();
@@ -1663,6 +1680,7 @@ export class ComputerHistoryDemoService {
     this.captureHeartbeatSupported = false;
     this.captureIssues.clear();
     this.captureObserverReadyAt = 0;
+    this.captureSnapshotReadyAt = 0;
     this.captureInputReadyAt = 0;
   }
 
@@ -1687,6 +1705,13 @@ export class ComputerHistoryDemoService {
       if (!this.captureLastHeartbeatAt || at >= Date.parse(this.captureLastHeartbeatAt)) this.captureLastHeartbeatAt = normalized;
     } else if (code === "event_recorded") {
       if (!this.captureLastEventAt || at >= Date.parse(this.captureLastEventAt)) this.captureLastEventAt = normalized;
+    } else if (code === "ax_snapshot_ready") {
+      // Only the consumer emits this after a complete authorized tree reaches
+      // disk (or matches its persisted baseline). Input and heartbeat signals
+      // say nothing about whether window contents can be read.
+      this.captureSnapshotReadyAt = Math.max(this.captureSnapshotReadyAt, at);
+      const previous = this.captureIssues.get("ax_snapshot_failed");
+      if (previous && at >= previous.lastAt) previous.active = false;
     } else if (code === "input_monitoring_ready") {
       this.captureInputReadyAt = Math.max(this.captureInputReadyAt, at);
       const previous = this.captureIssues.get("input_monitoring_unavailable");
@@ -1703,6 +1728,7 @@ export class ComputerHistoryDemoService {
       if (count !== undefined && (!Number.isSafeInteger(count) || (count as number) < 1)) return;
       const previous = this.captureIssues.get(code);
       const readyAt = code === "input_monitoring_unavailable" ? this.captureInputReadyAt
+        : code === "ax_snapshot_failed" ? this.captureSnapshotReadyAt
         : code === "observer_unavailable" || code === "observer_notifications_unavailable" ? this.captureObserverReadyAt : 0;
       this.captureIssues.set(code, {
         count: Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + (typeof count === "number" ? count : 1)),
@@ -1719,7 +1745,7 @@ export class ComputerHistoryDemoService {
     const issues: Array<{ code: string; count: number }> = [];
     let activeIssue = false;
     for (const [code, issue] of this.captureIssues) {
-      if (issue.active && code !== "observer_unavailable" && code !== "observer_notifications_unavailable" && code !== "input_monitoring_unavailable"
+      if (issue.active && code !== "observer_unavailable" && code !== "observer_notifications_unavailable" && code !== "input_monitoring_unavailable" && code !== "ax_snapshot_failed"
         && now - issue.lastAt >= CAPTURE_ISSUE_RECOVERY_MS
         && this.captureLastEventAt && Date.parse(this.captureLastEventAt) > issue.lastAt
         && ((windows && !this.captureHeartbeatSupported)
@@ -2505,7 +2531,7 @@ export class ComputerHistoryDemoService {
     try {
       stat = fs.statSync(segment.eventsFile);
       const raw = fs.readFileSync(segment.eventsFile, "utf8");
-      if (!/"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(raw)) return;
+      if (!rawHasEvidence(raw)) return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.setNarrationError("Computer History could not read the active event stream");
       return;
@@ -2709,7 +2735,7 @@ export class ComputerHistoryDemoService {
         return { history: { ...this.currentRawCache.history, filePath }, raw: this.currentRawCache.raw };
       }
       const raw = fs.readFileSync(segment.eventsFile, "utf8");
-      if (!/"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(raw)) return null;
+      if (!rawHasEvidence(raw)) return null;
       const pending = renderSummary({ file: segment.eventsFile, ...parsedRawRecords(raw), title: `Computer History ${segment.id}` })
         .replace(/^source_type:\s*human_computer_history\s*$/mu, "source_type: captured")
         .replace(/^status:.*$/mu, "status: incomplete")

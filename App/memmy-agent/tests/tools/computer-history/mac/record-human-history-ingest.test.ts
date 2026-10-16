@@ -108,6 +108,16 @@ test("persists startup fullTree and every diff across input bursts and shortcuts
   assert.equal(events.find((event) => event.eventType === "recording_started").ax.mode, "fullTree");
 });
 
+test("keeps the authorized tree baseline across focus-only action envelopes", async () => {
+  helper.events = [
+    { kind: "session.started", app, ax: full },
+    { kind: "mouse.click", app, ax: { windowKey: full.windowKey, focused: { role: "AXButton", title: "Allowed control" } } },
+    { kind: "sampling.changed", app, ax: firstTree },
+  ];
+  const events = await record();
+  assert.deepEqual(events.filter((event) => event.ax).map((event) => event.ax), [full, first]);
+});
+
 test("excludes a blocked CLI context URL from raw metadata", async () => {
   helper.events = [];
   const events = await record({ observation: {

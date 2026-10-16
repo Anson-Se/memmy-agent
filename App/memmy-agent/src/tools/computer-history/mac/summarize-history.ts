@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSensitive } from "./redaction.js";
+import { captureGapRecord, RECORDER_HEALTH_CODES } from "./recorder-health.js";
 export { redactSensitive } from "./redaction.js";
 
 /** A parsed JSONL line. Its shape is only known through the checks made on it. */
@@ -374,8 +375,21 @@ function renderEvent(record: JsonRecord): string[] {
   return [];
 }
 
+const captureFailureCodes = new Set<string>(RECORDER_HEALTH_CODES.filter((code) =>
+  !["heartbeat", "observer_ready", "event_recorded", "input_monitoring_ready", "ax_snapshot_ready"].includes(code)));
+
+/** Failures and unbound input are evidence of capture limits, not human activity. */
+export function isCaptureInterruptionRecord(record: JsonRecord): boolean {
+  if (record.recordType === "capture_gap") return captureGapRecord(record) !== null;
+  return record.recordType === "capture_health" && captureFailureCodes.has(record.code)
+    && typeof record.timestamp === "string" && /^\d{4}-\d{2}-\d{2}T/u.test(record.timestamp)
+    && Number.isFinite(Date.parse(record.timestamp))
+    && (record.count === undefined || (Number.isSafeInteger(record.count) && record.count > 0));
+}
+
 function isHumanHistory(records: JsonRecord[]): boolean {
-  return records.some((record) => record.recordType === "human_history_metadata");
+  return records.some((record) => record.recordType === "human_history_metadata"
+    || record.recordType === "human_event" || isCaptureInterruptionRecord(record));
 }
 
 function humanApplications(records: JsonRecord[], explicitApplications: string[]): string[] {
@@ -660,19 +674,24 @@ export function renderHumanSummary({
 }: Omit<RenderOptions, "last">): string {
   const metadata: JsonRecord = records.find((record) => record.recordType === "human_history_metadata") ?? {};
   const events = records.filter((record) => record.recordType === "human_event");
-  if (!events.length) throw new Error("no human operation events found in the selected recording");
+  const hasInterruption = records.some(isCaptureInterruptionRecord);
+  if (!events.length && !hasInterruption) throw new Error("no human operation events found in the selected recording");
+  const interruptionOnly = hasInterruption && !events.some((event) =>
+    typeof event.eventType === "string" && !["recording_started", "recording_stopped"].includes(event.eventType));
   const stopped = events.some((record) => record.eventType === "recording_stopped");
   const status = stopped ? "completed" : "incomplete";
   const applications = humanApplications(events, explicitApplications);
   const artifacts = humanArtifacts(events);
   const initialTitle = title || metadata.title || "Human-operated macOS workflow";
-  const resolvedTitle = isGenericHumanTitle(initialTitle)
+  const resolvedTitle = interruptionOnly ? "采集记录存在缺口" : isGenericHumanTitle(initialTitle)
     ? derivedHumanTitle(events, initialTitle)
     : initialTitle;
-  const resolvedDescription = description || (
+  const resolvedDescription = description || (interruptionOnly
+    ? "这段记录仅包含采集失败或未能关联到可靠上下文的输入证据，无法据此还原具体活动。"
+    : (
     `用户在「${cleanInline(resolvedTitle, SUMMARY_TEXT_LIMIT)}」中完成了一组电脑操作，`
     + "已整理为可读的行为记忆。"
-  );
+  ));
   const recordingId = metadata.recordingId ?? path.basename(path.dirname(file));
 
   const output = [
