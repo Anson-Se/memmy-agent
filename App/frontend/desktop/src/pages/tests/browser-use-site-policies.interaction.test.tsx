@@ -195,7 +195,7 @@ it.each([false, true])('preserves independent website consent = %s when inherite
   await render();
   expect(allWebsitesSwitch().checked).toBe(true);
   expect(allWebsitesSwitch().disabled).toBe(true);
-  expect(container.textContent).toContain('Enabled through computer control.');
+  expect(container.querySelector('.memmy-browser-use-policies-inherited')?.textContent).toContain('Enabled through computer control.');
   expect((container.querySelector('select') as HTMLSelectElement).disabled).toBe(true);
   await act(async () => permissionChanged!({ enabled, inherited: false, effective: enabled }));
   expect(allWebsitesSwitch().checked).toBe(enabled);

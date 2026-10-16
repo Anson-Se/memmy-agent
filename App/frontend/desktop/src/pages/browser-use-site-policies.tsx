@@ -168,7 +168,7 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
           disabled={!allowAll || loading || pending || allowAll.inherited || !window.memmy?.setBrowserAllowAll}
           onChange={event => void changeAllowAll(event.target.checked)} />
       </label>
-      {allowAll?.inherited && <p>{t('browser.policy.allowAllInherited')}</p>}
+      {allowAll?.inherited && <p className="memmy-browser-use-policies-inherited">{t('browser.policy.allowAllInherited')}</p>}
       {allowAll?.effective && <p role="status">{t('browser.policy.allowAllOverrides')}</p>}
     </section>
     <p>{t('browser.policy.defaults')}</p>

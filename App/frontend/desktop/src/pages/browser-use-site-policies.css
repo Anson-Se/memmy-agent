@@ -6,6 +6,7 @@
 .memmy-browser-use-policies-all .memmy-browser-use-policies-permission { align-items: flex-start; }
 .memmy-browser-use-policies-all strong { font-weight: 600; }
 .memmy-browser-use-policies-all p { margin-top: 6px; }
+.memmy-browser-use-policies-all p.memmy-browser-use-policies-inherited { color: #c62828; }
 .memmy-browser-use-policies-all input { flex: none; width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--color-brand, #3f8178); }
 .memmy-browser-use-policies-group { margin-top: 20px; }
 .memmy-browser-use-policies-add { display: flex; gap: 8px; margin: 12px 0; }
