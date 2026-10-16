@@ -1,3 +1,4 @@
+import { bindSavedValidation, endpointCredentialSignature, resolveModelCredentials, type SavedEndpointIdentity, chatProtocol } from "./model-credentials.js";
 import { useRef, useState } from "react";
 import { Brain, ChevronLeft, Search } from "lucide-react";
 import { useAnalytics } from "../analytics/use-analytics.js";
@@ -55,10 +56,7 @@ interface ProviderOption {
   defaultModelId: string;
 }
 
-interface SavedEndpointIdentity {
-  endpointId: string;
-  credentialSignature: string;
-}
+
 
 const providerOptions: ProviderOption[] = [
   { value: "openai", labelKey: "apiKey.provider.openai", endpoint: "https://api.openai.com/v1", defaultModelId: "gpt-4o" },
@@ -82,28 +80,36 @@ export function ApiKeyPage() {
   const { clients } = useApiClients();
   const { t } = useTranslation();
   const { track } = useAnalytics();
-  const initialModelForm = hydrateModelConfigForm(state.modelConfig, "local");
-  const initialWorkspace = createModelWorkspace(state.modelConfig);
+  const [initialModelForm] = useState(() => hydrateModelConfigForm(state.modelConfig, "local"));
+  const [initialWorkspace] = useState(() => createModelWorkspace(state.modelConfig));
   const initialAgentEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "agent");
   const initialEmbeddingEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "embedding");
   const initialProvider = fromProtocol(initialModelForm.protocol);
+  const savedEndpointIdentitiesRef = useRef<Partial<Record<"agent" | "embedding", SavedEndpointIdentity>>>({
+    ...(initialAgentEndpointId
+      ? { agent: { endpointId: initialAgentEndpointId, credentialSignature: endpointCredentialSignature(initialProvider, chatProtocol(initialProvider), initialModelForm.endpoint, initialModelForm.apiKey, initialModelForm.apiKeyMasked) } }
+      : {}),
+    ...(initialEmbeddingEndpointId
+      ? { embedding: { endpointId: initialEmbeddingEndpointId, credentialSignature: endpointCredentialSignature("openai", "openai-embeddings", initialModelForm.embEndpoint, initialModelForm.embApiKey, initialModelForm.embApiKeyMasked) } }
+      : {})
+  });
   const [provider, setProvider] = useState(initialProvider);
   const selectedProvider = providerOptions.find((option) => option.value === provider) ?? defaultProvider;
   const [endpoint, setEndpoint] = useState(initialModelForm.endpoint || selectedProvider.endpoint);
   const [model, setModel] = useState(initialModelForm.modelId);
   const [apiKey, setApiKey] = useState(initialModelForm.apiKey);
-  const [apiKeyMasked, setApiKeyMasked] = useState(initialModelForm.apiKeyMasked);
+  const [apiKeyMasked] = useState(initialModelForm.apiKeyMasked);
   const [showApiKey, setShowApiKey] = useState(false);
-  const modelFormValues = {
+  const modelFormValues = resolveModelCredentials({
+    protocol: chatProtocol(provider),
     provider,
-    endpointId: !apiKey.trim() && apiKeyMasked ? initialAgentEndpointId : undefined,
     endpoint,
     model,
     apiKey,
     apiKeyMasked,
     hasExistingApiKey: Boolean(apiKeyMasked)
-  };
-  const [llmValidation, setLlmValidation] = useState<ModelConfigValidationState>(initialModelForm.llmValidation);
+  }, savedEndpointIdentitiesRef.current.agent);
+  const [llmValidation, setLlmValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.llmValidation, modelFormValues));
   const initialEmbeddingMode: EmbeddingMode = initialWorkspace.catalog.modelAssignments.byok.embedding
     ? "custom"
     : "local";
@@ -115,16 +121,16 @@ export function ApiKeyPage() {
     apiKeyMasked: initialModelForm.embApiKeyMasked
   });
   const [showEmbeddingApiKey, setShowEmbeddingApiKey] = useState(false);
-  const embeddingFormValues = {
+  const embeddingFormValues = resolveModelCredentials({
+    protocol: "openai-embeddings",
     provider: "openai",
-    endpointId: !embeddingConfig.apiKey.trim() && embeddingConfig.apiKeyMasked ? initialEmbeddingEndpointId : undefined,
     endpoint: embeddingConfig.endpoint,
     model: embeddingConfig.model,
     apiKey: embeddingConfig.apiKey,
     apiKeyMasked: embeddingConfig.apiKeyMasked,
     hasExistingApiKey: Boolean(embeddingConfig.apiKeyMasked)
-  };
-  const [embeddingValidation, setEmbeddingValidation] = useState<ModelConfigValidationState>(initialModelForm.embValidation);
+  }, savedEndpointIdentitiesRef.current.embedding);
+  const [embeddingValidation, setEmbeddingValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.embValidation, embeddingFormValues));
   const canSave = canSaveModelConfig(modelFormValues, llmValidation)
     && canSaveOptionalModelConfig(embeddingMode === "custom", embeddingFormValues, embeddingValidation);
   const [savePending, setSavePending] = useState(false);
@@ -149,14 +155,7 @@ export function ApiKeyPage() {
   );
   const saveSignature = `${embeddingMode}\n${testedKey}\n${embeddingTestKey}`;
   const savedCatalogSignatureRef = useRef<string | null>(null);
-  const savedEndpointIdentitiesRef = useRef<Partial<Record<"agent" | "embedding", SavedEndpointIdentity>>>({
-    ...(initialAgentEndpointId
-      ? { agent: { endpointId: initialAgentEndpointId, credentialSignature: agentCredentialSignature } }
-      : {}),
-    ...(initialEmbeddingEndpointId
-      ? { embedding: { endpointId: initialEmbeddingEndpointId, credentialSignature: embeddingCredentialSignature } }
-      : {})
-  });
+
 
   function changeProvider(nextProvider: string) {
     const next = providerOptions.find((option) => option.value === nextProvider) ?? defaultProvider;
@@ -164,7 +163,6 @@ export function ApiKeyPage() {
     setEndpoint(next.endpoint);
     setModel("");
     setApiKey("");
-    setApiKeyMasked("");
   }
 
   function testLlmConnection() {
@@ -202,33 +200,26 @@ export function ApiKeyPage() {
       if (savedCatalogSignatureRef.current !== saveSignature) {
         const latest = await clients.config.getModelConfig();
         let workspace = createModelWorkspace(latest);
-        const savedAgentIdentity = savedEndpointIdentitiesRef.current.agent;
-        const agentEndpointId = savedAgentIdentity?.credentialSignature === agentCredentialSignature
-          ? savedAgentIdentity.endpointId
-          : undefined;
         const agent = upsertByokPreset(workspace, {
           provider,
-          ...(agentEndpointId ? { endpointId: agentEndpointId } : {}),
+          ...(modelFormValues.endpointId ? { endpointId: modelFormValues.endpointId } : {}),
           endpoint,
           protocol: chatProtocol(provider),
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(apiKeyMasked ? { apiKeyMasked } : {}),
+          ...(modelFormValues.apiKeyMasked ? { apiKeyMasked: modelFormValues.apiKeyMasked } : {}),
           model,
           capabilities: ["agent"]
         });
         workspace = assignCatalogPreset(agent.workspace, "byok", "agent", agent.presetId);
         const savedEmbeddingIdentity = savedEndpointIdentitiesRef.current.embedding;
         if (embeddingMode === "custom") {
-          const embeddingEndpointId = savedEmbeddingIdentity?.credentialSignature === embeddingCredentialSignature
-            ? savedEmbeddingIdentity.endpointId
-            : undefined;
           const embedding = upsertByokPreset(workspace, {
             provider: "openai",
-            ...(embeddingEndpointId ? { endpointId: embeddingEndpointId } : {}),
+            ...(embeddingFormValues.endpointId ? { endpointId: embeddingFormValues.endpointId } : {}),
             endpoint: embeddingConfig.endpoint,
             protocol: "openai-embeddings",
             ...(embeddingConfig.apiKey.trim() ? { apiKey: embeddingConfig.apiKey.trim() } : {}),
-            ...(embeddingConfig.apiKeyMasked ? { apiKeyMasked: embeddingConfig.apiKeyMasked } : {}),
+            ...(embeddingFormValues.apiKeyMasked ? { apiKeyMasked: embeddingFormValues.apiKeyMasked } : {}),
             model: embeddingConfig.model,
             capabilities: ["embedding"]
           });
@@ -317,14 +308,14 @@ export function ApiKeyPage() {
               placeholder="sk-..."
               value={apiKey}
               onChange={setApiKey}
-              maskedValue={apiKeyMasked}
+              maskedValue={modelFormValues.apiKeyMasked}
               showPassword={showApiKey}
               onTogglePassword={() => setShowApiKey((value) => !value)}
             />
 
             <div className="flex min-h-9 items-center justify-end gap-3">
-              <ValidationMessage validation={llmValidation} stale={isTestStale} />
-              <TestButton status={llmValidation.status} onClick={testLlmConnection} label={t("apiKey.test")} />
+              <ValidationMessage validation={llmValidation} stale={isTestStale} credentialRequired={modelFormValues.requiresApiKey} />
+              <TestButton status={isTestStale || modelFormValues.requiresApiKey ? "idle" : llmValidation.status} onClick={testLlmConnection} label={t("apiKey.test")} />
             </div>
           </div>
         </div>
@@ -366,13 +357,13 @@ export function ApiKeyPage() {
                   placeholder="sk-..."
                   value={embeddingConfig.apiKey}
                   onChange={(value) => updateEmbeddingConfig("apiKey", value)}
-                  maskedValue={embeddingConfig.apiKeyMasked}
+                  maskedValue={embeddingFormValues.apiKeyMasked}
                   showPassword={showEmbeddingApiKey}
                   onTogglePassword={() => setShowEmbeddingApiKey((value) => !value)}
                 />
                 <div className="flex min-h-9 items-center justify-end gap-3">
-                  <ValidationMessage validation={embeddingValidation} stale={isEmbeddingTestStale} />
-                  <TestButton status={embeddingValidation.status} onClick={testEmbeddingConnection} label={t("apiKey.test")} />
+                  <ValidationMessage validation={embeddingValidation} stale={isEmbeddingTestStale} credentialRequired={embeddingFormValues.requiresApiKey} />
+                  <TestButton status={isEmbeddingTestStale || embeddingFormValues.requiresApiKey ? "idle" : embeddingValidation.status} onClick={testEmbeddingConnection} label={t("apiKey.test")} />
                 </div>
               </>
             ) : null}
@@ -393,22 +384,6 @@ export function ApiKeyPage() {
   );
 }
 
-function endpointCredentialSignature(
-  provider: string,
-  protocol: string,
-  endpoint: string,
-  apiKey: string,
-  apiKeyMasked: string
-): string {
-  const normalizedApiKey = apiKey.trim();
-  const normalizedMaskedApiKey = apiKeyMasked.trim();
-  return JSON.stringify({
-    provider: provider.trim().toLowerCase(),
-    protocol,
-    endpoint: endpoint.trim().replace(/\/+$/, ""),
-    credential: normalizedMaskedApiKey ? `masked:${normalizedMaskedApiKey}` : `raw:${normalizedApiKey}`
-  });
-}
 
 function firstStepSaveErrorText(
   error: unknown,
@@ -420,10 +395,4 @@ function firstStepSaveErrorText(
   return error instanceof Error && error.message
     ? error.message
     : t("settings.modelWorkspace.saveFailed");
-}
-
-function chatProtocol(provider: string) {
-  if (provider === "anthropic") return "anthropic-messages" as const;
-  if (provider === "gemini") return "gemini-generate-content" as const;
-  return "openai-chat-completions" as const;
 }

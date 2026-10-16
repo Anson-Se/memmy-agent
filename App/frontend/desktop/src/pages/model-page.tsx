@@ -1,4 +1,5 @@
 /** Model page module. */
+import { bindSavedValidation, chatProtocol, endpointCredentialSignature } from "./model-credentials.js";
 import { useState, type ReactNode } from "react";
 import { Brain, Check, CheckCircle2, ChevronLeft, Cog, Eye, EyeOff, Lightbulb, Loader2, XCircle } from "lucide-react";
 import { useApiClients } from "../app/providers.js";
@@ -75,6 +76,7 @@ interface TestButtonProps {
 interface ValidationMessageProps {
   validation: ModelConfigValidationState;
   stale: boolean;
+  credentialRequired?: boolean;
 }
 
 /** Handles model page. */
@@ -83,8 +85,8 @@ export function ModelPage() {
   const { clients } = useApiClients();
   const { t } = useTranslation();
   const { track } = useAnalytics();
-  const initialModelForm = hydrateModelConfigForm(state.modelConfig, "local");
-  const initialWorkspace = createModelWorkspace(state.modelConfig);
+  const [initialModelForm] = useState(() => hydrateModelConfigForm(state.modelConfig, "local"));
+  const [initialWorkspace] = useState(() => createModelWorkspace(state.modelConfig));
   const primaryEndpointId = assignedCatalogEndpointId(initialWorkspace, "byok", "agent");
   const [primaryModel] = useState<PrimaryModelValues>(() => ({
     protocol: initialModelForm.protocol,
@@ -92,33 +94,34 @@ export function ModelPage() {
     endpoint: initialModelForm.endpoint,
     apiKey: initialModelForm.apiKey,
     apiKeyMasked: state.modelConfig.apiKeyMasked,
-    configured: state.modelConfig.configured
+    configured: state.modelConfig.configured,
+    credentialSource: primaryEndpointId ? {
+      endpointId: primaryEndpointId,
+      credentialSignature: endpointCredentialSignature(initialModelForm.protocol, chatProtocol(initialModelForm.protocol), initialModelForm.endpoint, initialModelForm.apiKey, initialModelForm.apiKeyMasked)
+    } : null
   }));
-  const [mem, setMem] = useState<ModelConfig>(() => initialModelForm.memoryModel);
-  const [skill, setSkill] = useState<ModelConfig>(() => initialModelForm.skillModel);
+  const [skill, setSkill] = useState<ModelConfig>(() => bindRoleCredential(
+    initialModelForm.skillModel, primaryModel, assignedCatalogEndpointId(initialWorkspace, "byok", "memory_evolution")
+  ));
+  const [mem, setMem] = useState<ModelConfig>(() => bindRoleCredential(
+    initialModelForm.memoryModel, modelFormValuesAsPrimary(createModelFormValues(skill, primaryModel)),
+    assignedCatalogEndpointId(initialWorkspace, "byok", "memory_summary")
+  ));
   const [savePending, setSavePending] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<{ text: string; tone: "error" | "success" } | null>(null);
   const skillValues = createModelFormValues(skill, primaryModel);
   const evolutionModel = modelFormValuesAsPrimary(skillValues);
   const memoryValues = createModelFormValues(mem, evolutionModel);
-  const skillEndpointId = skill.reuse
-    ? primaryEndpointId
-    : assignedCatalogEndpointId(initialWorkspace, "byok", "memory_evolution")
-      ?? (skillValues.apiKeyMasked ? primaryEndpointId : undefined);
-  const memoryEndpointId = mem.reuse
-    ? skillEndpointId
-    : assignedCatalogEndpointId(initialWorkspace, "byok", "memory_summary")
-      ?? (memoryValues.apiKeyMasked ? skillEndpointId : undefined);
   const canContinue = canUseModelConfig(mem, memoryValues) && canUseModelConfig(skill, skillValues);
 
   /** Handles patch mem. */
   function patchMem(patch: Partial<ModelConfig>) {
-    setMem((current) => ({ ...current, ...patch }));
+    setMem((current) => patchModelConfig(current, patch));
   }
 
   /** Handles patch skill. */
   function patchSkill(patch: Partial<ModelConfig>) {
-    setSkill((current) => ({ ...current, ...patch }));
+    setSkill((current) => patchModelConfig(current, patch));
   }
 
   /** Handles test model config connection. */
@@ -131,12 +134,7 @@ export function ModelPage() {
     const values = createModelFormValues(config, inheritedModel);
     testModelConnection({
       configClient: clients?.config,
-      values: {
-        ...values,
-        endpointId: values.apiKeyMasked
-          ? secretTarget === "skill" ? skillEndpointId : memoryEndpointId
-          : undefined
-      },
+      values,
       setValidation: (validation) => patch({ validation }),
       secretTarget,
       messages: createTestModelConnectionMessages(t)
@@ -157,15 +155,9 @@ export function ModelPage() {
       let workspace = createModelWorkspace(latest);
       const evolutionValues = createModelFormValues(skill, primaryModel);
       const memoryValues = createModelFormValues(mem, modelFormValuesAsPrimary(evolutionValues));
-      const assignedEvolutionEndpointId = skill.reuse
-        ? assignedCatalogEndpointId(workspace, "byok", "agent")
-        : assignedCatalogEndpointId(workspace, "byok", "memory_evolution")
-          ?? (!evolutionValues.apiKey.trim() && evolutionValues.apiKeyMasked
-            ? assignedCatalogEndpointId(workspace, "byok", "agent")
-            : undefined);
       const evolution = upsertByokPreset(workspace, {
         provider: evolutionValues.provider,
-        ...(evolutionValues.apiKeyMasked && assignedEvolutionEndpointId ? { endpointId: assignedEvolutionEndpointId } : {}),
+        ...(evolutionValues.endpointId ? { endpointId: evolutionValues.endpointId } : {}),
         endpoint: evolutionValues.endpoint,
         protocol: chatProtocol(evolutionValues.provider),
         ...(evolutionValues.apiKey.trim() ? { apiKey: evolutionValues.apiKey.trim() } : {}),
@@ -174,15 +166,9 @@ export function ModelPage() {
         capabilities: ["memory_evolution"]
       });
       workspace = assignCatalogPreset(evolution.workspace, "byok", "memory_evolution", evolution.presetId);
-      const assignedMemoryEndpointId = mem.reuse
-        ? evolution.endpointId
-        : assignedCatalogEndpointId(workspace, "byok", "memory_summary")
-          ?? (!memoryValues.apiKey.trim() && memoryValues.apiKeyMasked
-            ? evolution.endpointId
-            : undefined);
       const memory = upsertByokPreset(workspace, {
         provider: memoryValues.provider,
-        ...(memoryValues.apiKeyMasked && assignedMemoryEndpointId ? { endpointId: assignedMemoryEndpointId } : {}),
+        ...(memoryValues.endpointId ? { endpointId: memoryValues.endpointId } : {}),
         endpoint: memoryValues.endpoint,
         protocol: chatProtocol(memoryValues.provider),
         ...(memoryValues.apiKey.trim() ? { apiKey: memoryValues.apiKey.trim() } : {}),
@@ -277,10 +263,26 @@ function modelPageSaveErrorText(
   return message || t("settings.modelWorkspace.saveFailed");
 }
 
-function chatProtocol(provider: string) {
-  if (provider === "anthropic") return "anthropic-messages" as const;
-  if (provider === "gemini" || provider === "google") return "gemini-generate-content" as const;
-  return "openai-chat-completions" as const;
+function patchModelConfig(current: ModelConfig, patch: Partial<ModelConfig>): ModelConfig {
+  return {
+    ...current,
+    ...patch,
+    ...(patch.reuse !== undefined
+      ? { validation: { status: "idle" as const, message: null, testedKey: null } }
+      : {})
+  };
+}
+
+function bindRoleCredential(config: ModelConfig, primary: PrimaryModelValues, endpointId: string | undefined): ModelConfig {
+  const next: ModelConfig = {
+    ...config,
+    credentialSource: endpointId ? {
+      endpointId,
+      credentialSignature: endpointCredentialSignature(config.protocol, chatProtocol(config.protocol), config.endpoint, config.apiKey, config.apiKeyMasked)
+    } : null
+  };
+  next.validation = bindSavedValidation(config.validation, createModelFormValues(next, primary));
+  return next;
 }
 
 /**
@@ -305,6 +307,7 @@ function ModelCard(props: ModelCardProps) {
         endpoint: props.primary.endpoint,
         apiKey: props.primary.apiKey,
         apiKeyMasked: props.primary.apiKeyMasked ?? "",
+        credentialSource: props.primary.credentialSource,
         configured: Boolean(props.primary.configured || props.primary.apiKeyMasked)
       });
       return;
@@ -385,12 +388,12 @@ function ModelCard(props: ModelCardProps) {
             value={props.cfg.apiKey}
             onChange={(value) => props.onPatch({ apiKey: value })}
             show={props.cfg.showKey}
-            maskedValue={props.cfg.apiKeyMasked}
+            maskedValue={formValues.apiKeyMasked}
             onToggle={() => props.onPatch({ showKey: !props.cfg.showKey })}
           />
           <div className="flex min-h-9 items-center justify-end gap-3">
-            <ValidationMessage validation={props.cfg.validation} stale={isTestStale} />
-            <TestButton status={props.cfg.validation.status} onClick={props.onTest} disabled={false} />
+            <ValidationMessage validation={props.cfg.validation} stale={isTestStale} credentialRequired={formValues.requiresApiKey} />
+            <TestButton status={isTestStale || formValues.requiresApiKey ? "idle" : props.cfg.validation.status} onClick={props.onTest} disabled={false} />
           </div>
         </div>
       )}
@@ -499,12 +502,12 @@ function TestButton(props: TestButtonProps) {
 function ValidationMessage(props: ValidationMessageProps) {
   const { t } = useTranslation();
 
-  if (props.validation.status === "idle" && !props.stale) {
+  if (props.validation.status === "idle" && !props.stale && !props.credentialRequired) {
     return null;
   }
 
-  const isSuccess = props.validation.status === "success" && !props.stale;
-  const message = props.stale ? t("apiKey.testStale") : props.validation.message;
+  const isSuccess = props.validation.status === "success" && !props.stale && !props.credentialRequired;
+  const message = props.credentialRequired ? t("apiKey.credentialsChanged") : props.stale ? t("apiKey.testStale") : props.validation.message;
 
   return (
     <span className={`min-w-0 flex-1 truncate text-right text-xs ${isSuccess ? "text-status-success" : "text-status-error"}`}>

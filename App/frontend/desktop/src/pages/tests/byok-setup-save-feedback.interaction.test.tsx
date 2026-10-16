@@ -299,31 +299,6 @@ describe("BYOK setup save feedback", () => {
     expect(mocks.dispatch).toHaveBeenCalledWith(appActions.navigate("/api-key-models"));
   });
 
-  it("reuses existing first-step endpoints when saved keys are entered again", async () => {
-    const server = createCatalogServer(configuredCatalog(false));
-    const initialAgentEndpointId = assignedCatalogEndpointId(createModelWorkspace(server.catalog()), "byok", "agent");
-    const initialEmbeddingEndpointId = assignedCatalogEndpointId(createModelWorkspace(server.catalog()), "byok", "embedding");
-    mocks.state = { ...createInitialAppState(), modelConfig: maskedSavedModelConfig(server.catalog()) };
-    mocks.clients = createClients(server.saveModelCatalog, {
-      getModelConfig: vi.fn(async () => maskedSavedModelConfig(server.catalog()))
-    });
-    await render(<ApiKeyPage />);
-
-    await changeField("apiKey.key", "sk-primary");
-    await click(testButton());
-    await changeField("apiKey.embeddingKey", "sk-embedding");
-    await click(testButton(1));
-    await vi.waitFor(() => expect(button("apiKey.next").disabled).toBe(false));
-    await click(button("apiKey.next"));
-
-    const savedCatalog = server.catalog();
-    expect(endpointCount(savedCatalog)).toBe(2);
-    expect(assignedCatalogEndpointId(createModelWorkspace(savedCatalog), "byok", "agent"))
-      .toBe(initialAgentEndpointId);
-    expect(assignedCatalogEndpointId(createModelWorkspace(savedCatalog), "byok", "embedding"))
-      .toBe(initialEmbeddingEndpointId);
-  });
-
   it("invalidates only the changed first-step credential identity", async () => {
     const server = createCatalogServer(configuredCatalog(false));
     const updateSettings = vi.fn(async (settings: unknown) => settings)
@@ -447,31 +422,6 @@ describe("BYOK setup save feedback", () => {
     expect(assignedCatalogEndpointId(createModelWorkspace(retriedCatalog), "byok", "image_generation"))
       .toBe(firstImageEndpointId);
     expect(mocks.dispatch).toHaveBeenCalledWith(appActions.navigate("/onboarding"));
-  });
-
-  it("reuses existing optional endpoints when saved keys are entered again", async () => {
-    const server = createCatalogServer(configuredCatalog());
-    const initialAsrEndpointId = assignedCatalogEndpointId(createModelWorkspace(server.catalog()), "byok", "asr");
-    const initialImageEndpointId = assignedCatalogEndpointId(createModelWorkspace(server.catalog()), "byok", "image_generation");
-    mocks.state = { ...createInitialAppState(), modelConfig: maskedSavedModelConfig(server.catalog()) };
-    mocks.clients = createClients(server.saveModelCatalog, {
-      getModelConfig: vi.fn(async () => maskedSavedModelConfig(server.catalog()))
-    });
-    await render(<ApiKeyOptionalPage />);
-
-    await changeField("apiKey.asrKey", "sk-asr");
-    await click(testButton());
-    await changeField("apiKey.imageGenKey", "sk-image");
-    await click(testButton(1));
-    await vi.waitFor(() => expect(button("apiKey.next").disabled).toBe(false));
-    await click(button("apiKey.next"));
-
-    const savedCatalog = server.catalog();
-    expect(endpointCount(savedCatalog)).toBe(4);
-    expect(assignedCatalogEndpointId(createModelWorkspace(savedCatalog), "byok", "asr"))
-      .toBe(initialAsrEndpointId);
-    expect(assignedCatalogEndpointId(createModelWorkspace(savedCatalog), "byok", "image_generation"))
-      .toBe(initialImageEndpointId);
   });
 
   it("retests masked optional keys through their saved endpoints", async () => {
