@@ -23,7 +23,8 @@ export function BrowserExtensionSetup({ client, platform }: {
             if (!window.memmy?.prepareBrowserExtension) throw new Error("Browser installation preparation is unavailable");
             return window.memmy.prepareBrowserExtension(browser, !window.memmy.dragBrowserExtension);
           }}
-          getInstalled={() => window.memmy?.listInstalledBrowserExtensions?.() ?? Promise.resolve([])}
+          getInstallation={() => window.memmy?.getBrowserExtensionInstallation?.()
+            ?? Promise.reject(new Error("Browser extension installation status is unavailable"))}
           getRunning={() => window.memmy?.listRunningExternalBrowsers?.() ?? Promise.resolve(null)}
           platform={platform}
           labels={{
@@ -69,15 +70,15 @@ export function BrowserExtensionSetup({ client, platform }: {
             launchFailed: t("settings.computerUse.extensionLaunchFailed"),
             manualGuide: t("settings.computerUse.extensionManualGuide"),
             installButton: t("settings.computerUse.extensionInstall"),
-            checkConnection: t("settings.computerUse.extensionCheckConnection"),
             checking: t("settings.computerUse.extensionChecking"),
             installedWaiting: t("settings.computerUse.extensionInstalledWaiting"),
             connecting: t("settings.computerUse.extensionConnecting"),
             browserClosed: t("settings.computerUse.extensionBrowserClosed"),
             connectionFailed: t("settings.computerUse.extensionConnectionFailed"),
             statusUnavailable: t("settings.computerUse.extensionStatusUnavailable"),
+            installationUnavailable: t("settings.computerUse.extensionInstallationUnavailable"),
+            disabled: t("settings.computerUse.extensionDisabled"),
             openBrowser: t("settings.computerUse.extensionOpenBrowser"),
-            repairConnection: t("settings.computerUse.extensionRepairConnection"),
             reinstall: t("settings.computerUse.extensionReinstall"),
             manage: t("settings.computerUse.extensionManage"),
             done: t("common.close"),

@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, chmodSync, rmSync } from 'node:fs';
 import { join, win32 } from 'node:path';
+import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import { installedExternalBrowsers, MEMMY_BROWSER_EXTENSION_ID } from '../src/main/installed-external-browsers.js';
+import { installedExternalBrowsers, probeExternalBrowserInstallation, MEMMY_BROWSER_EXTENSION_ID } from '../src/main/installed-external-browsers.js';
 
 const manifest = JSON.parse(readFileSync(new URL('../extensions/memmy-browser/manifest.json', import.meta.url), 'utf8'));
 const extensionPath = '/Applications/Memmy.app/Contents/Resources/browser-extension';
@@ -131,5 +132,100 @@ describe('installed external browsers', () => {
     expect(installedExternalBrowsers({ platform: 'darwin', home: '/fixture', ...files,
       readFile: path => { if (path.endsWith('manifest.json')) throw new Error('unavailable'); return files.readFile(path); },
     })).toEqual([]);
+  });
+});
+
+describe('external browser installation facts for recovery', () => {
+  it.each([undefined, '/fixture/xdg'])('retains Linux installation detection with config root %s', config => {
+    const root = join(config ?? '/fixture/.config', 'google-chrome');
+    const edge = join(config ?? '/fixture/.config', 'microsoft-edge');
+    const localState = { profile: { info_cache: { Default: {} } } };
+    for (const disabled of [false, true]) {
+      const files = io({
+        [join(root, 'Local State')]: localState,
+        [join(root, 'Default', 'Secure Preferences')]: prefs(enabled({ disable_reasons: disabled ? [1024] : [] })),
+        [join(edge, 'Local State')]: localState,
+        [join(edge, 'Default', 'Preferences')]: prefs(null),
+        [join(extensionPath, 'manifest.json')]: manifest,
+      });
+      const options = { platform: 'linux' as const, home: '/fixture', env: config ? { XDG_CONFIG_HOME: config } : {}, ...files };
+      expect(probeExternalBrowserInstallation(options)).toEqual({
+        chrome: { installed: true, enabled: !disabled }, edge: { installed: false, enabled: false },
+      });
+      expect(probeExternalBrowserInstallation({ ...options, readFile: path => {
+        if (path.startsWith(root)) throw Object.assign(new Error('Access denied'), { code: 'EACCES' });
+        return files.readFile(path);
+      } })).toEqual({ chrome: { installed: null, enabled: null }, edge: { installed: false, enabled: false } });
+    }
+  });
+
+  it.each(['darwin', 'win32'] as const)('separates valid disabled installation from absence on %s', platform => {
+    const local = 'C:\\Users\\fixture\\AppData\\Local';
+    const paths = platform === 'win32' ? win32 : { join };
+    const root = platform === 'win32' ? win32.join(local, 'Google', 'Chrome', 'User Data') : chromeRoot;
+    const payload = platform === 'win32' ? 'C:\\Memmy\\browser-extension' : extensionPath;
+    const metadata = {
+      [paths.join(root, 'Local State')]: { profile: { info_cache: { Default: {} } } },
+      [paths.join(root, 'Default', 'Secure Preferences')]: prefs(enabled({ path: payload, disable_reasons: [1024] })),
+      [paths.join(payload, 'manifest.json')]: manifest,
+    };
+    const facts = probeExternalBrowserInstallation({ platform, home: '/fixture', env: { LOCALAPPDATA: local }, ...io(metadata) });
+    expect(facts).toEqual({ chrome: { installed: true, enabled: false }, edge: { installed: false, enabled: false } });
+    expect(JSON.stringify(facts)).not.toContain(payload);
+    expect(installedExternalBrowsers({ platform, home: '/fixture', env: { LOCALAPPDATA: local }, ...io(metadata) })).toEqual([]);
+  });
+
+  it('reports a clean profile with no extension as absent and a valid payload as installed', () => {
+    const metadata = chromeRecord(enabled(), {
+      [join(chromeRoot, 'Local State')]: { profile: { info_cache: { Default: {} } } },
+      [join(edgeRoot, 'Local State')]: { profile: { info_cache: { Default: {} } } },
+      [join(edgeRoot, 'Default', 'Preferences')]: prefs(null),
+    });
+    expect(probeExternalBrowserInstallation({ platform: 'darwin', home: '/fixture', ...io(metadata) }))
+      .toEqual({ chrome: { installed: true, enabled: true }, edge: { installed: false, enabled: false } });
+  });
+
+  it.each(['Preferences', 'Local State', 'manifest.json'])('preserves failed or malformed %s reads as unknown', suffix => {
+    const metadata = chromeRecord(enabled(), {
+      [join(chromeRoot, 'Local State')]: { profile: { info_cache: { Default: {} } } },
+    });
+    const files = io(metadata);
+    for (const fail of [() => { throw new Error('unreadable'); }, () => '{malformed']) {
+      const facts = probeExternalBrowserInstallation({ platform: 'darwin', home: '/fixture', ...files,
+        readFile: path => path.endsWith(suffix) ? fail() : files.readFile(path),
+      });
+      expect(facts.chrome).toEqual({ installed: null, enabled: null });
+    }
+  });
+
+  it('does not treat incomplete metadata or an inaccessible profile root as missing installation', () => {
+    expect(probeExternalBrowserInstallation({ platform: 'darwin', home: '/fixture', ...io({
+      [join(chromeRoot, 'Default', 'Secure Preferences')]: prefs({ state: 1 }),
+    }) }).chrome).toEqual({ installed: null, enabled: null });
+    expect(probeExternalBrowserInstallation({ platform: 'darwin', home: '/fixture',
+      fileExists: () => { throw new Error('permission denied'); },
+    })).toEqual({ chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null } });
+    expect(probeExternalBrowserInstallation({ platform: 'win32', env: {} }).chrome)
+      .toEqual({ installed: null, enabled: null });
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('preserves real permission errors from the default filesystem probe as unknown', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'memmy-browser-probe-denied-'));
+    try {
+      chmodSync(directory, 0);
+      expect(probeExternalBrowserInstallation({ platform: 'darwin', home: join(directory, 'unreadable') }))
+        .toEqual({ chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null } });
+    } finally { chmodSync(directory, 0o700); rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves a positive installation when another profile is unreadable without guessing enablement', () => {
+    const files = io(chromeRecord(enabled({ state: 0 }), {
+      [join(chromeRoot, 'Local State')]: { profile: { info_cache: { Default: {}, 'Profile 2': {} } } },
+      [join(chromeRoot, 'Profile 2', 'Preferences')]: prefs(null),
+    }));
+    const facts = probeExternalBrowserInstallation({ platform: 'darwin', home: '/fixture', ...files,
+      readFile: path => { if (path.includes('Profile 2')) throw new Error('busy'); return files.readFile(path); },
+    });
+    expect(facts.chrome).toEqual({ installed: true, enabled: null });
   });
 });

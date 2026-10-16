@@ -1,9 +1,6 @@
 /* global chrome */
 "use strict";
 
-// Passive History recording runs independently from debugger-based execution.
-if (typeof importScripts === "function") importScripts("browser-history-background.js");
-
 // After installation the extension connects to Memmy and operates ordinary
 // http(s) pages. Internal browser pages stay out of reach. Keep BRIDGE_PORTS
 // aligned with EXTERNAL_BROWSER_BRIDGE_PORTS in external-browser-bridge.ts.
@@ -11,7 +8,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.11";
+const EXTENSION_VERSION = "1.0.12";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -22,7 +19,12 @@ const RECONNECT_DELAYS_MS = [2_000, 4_000, 8_000, 16_000];
 // Chrome may hold a throttled attempt for up to 5 seconds before connecting. Closing it
 // sooner counts as another failure and keeps every later attempt throttled.
 const CONNECT_TIMEOUT_MS = 6_000;
-const READY_TIMEOUT_MS = 800;
+const READY_TIMEOUT_MS = 5_000;
+const CONNECTION_IDLE_TIMEOUT_MS = 65_000;
+const ALARM_RETRY_DELAYS_MS = [2_000, 4_000, 8_000];
+const CONNECTION_DIAGNOSTICS_KEY = "memmyConnectionDiagnostics";
+const CONNECTION_DIAGNOSTICS_LIMIT = 24;
+const CONNECTION_DIAGNOSTICS_WRITE_MS = 30_000;
 // Chrome and Edge show a "started debugging this browser" bar while any tab is
 // attached, so a page is attached only while Memmy is operating it.
 const DEBUGGER_IDLE_DETACH_MS = 45_000;
@@ -78,6 +80,10 @@ let discoverScanTask = null;
 let connectTask = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
+let alarmCheckTask = null;
+let alarmRetryTimer = null;
+let alarmRetryAttempt = 0;
+let alarmActivityCheckedAt = 0;
 let reloadCheckTask = null;
 let sessionLive = false;
 const runningCommands = new Set();
@@ -89,26 +95,81 @@ let credentialProtectionLoad = null;
 let credentialProtectionWrite = Promise.resolve();
 let socket = null;
 let ready = null;
+let socketHealth = null;
 let historyFocusSequence = 0;
 let historyFocusEpoch = 0;
 const HISTORY_FOCUS_REFRESH_MS = 2_000;
 const historyInputEvidence = new Map();
-const browserHistory = globalThis.installMemmyBrowserHistoryBackground?.({
-  chrome,
-  isConnected: () => sessionLive && socket?.readyState === WebSocket.OPEN,
-  send,
-  browserName,
-  isProtected: async tabId => {
-    await loadCredentialProtection();
-    const claim = claims.get(tabId);
-    return protectedCredentialTabs.has(tabId) || !!claim?.credentialProtected || !!claim?.protectedActivity;
-  },
-  activeCommand: (tabId, observedAt) => {
-    const evidence = historyInputEvidence.get(tabId);
-    return evidence && observedAt >= evidence.at - 100 && observedAt <= evidence.at + 1_500
-      ? { commandId: evidence.commandId } : undefined;
-  },
-});
+let browserHistory = null;
+let historyInitialized = false;
+const connectionEvents = [];
+let diagnosticsLoad = null;
+let diagnosticsTimer = null;
+let diagnosticsLastWrite = 0;
+
+// Only bounded connection metadata is persisted. Error strings, browser pages,
+// titles, credentials and paths never enter this record.
+function recordConnectionEvent(stage, port, failure, closeCode) {
+  const event = { stage, at: Date.now(), extensionVersion: EXTENSION_VERSION };
+  if (BRIDGE_PORTS.includes(port)) event.port = port;
+  if (failure) event.failure = failure;
+  if (Number.isInteger(closeCode) && closeCode >= 1000 && closeCode <= 4999) event.closeCode = closeCode;
+  connectionEvents.push(event);
+  if (connectionEvents.length > CONNECTION_DIAGNOSTICS_LIMIT) connectionEvents.shift();
+  if (!chrome.storage?.local || diagnosticsTimer) return;
+  if (!diagnosticsLoad) diagnosticsLoad = Promise.resolve().then(() => chrome.storage.local.get(CONNECTION_DIAGNOSTICS_KEY)).then(value => {
+    const previous = value[CONNECTION_DIAGNOSTICS_KEY];
+    const stages = new Set(["boot", "startup", "installed", "connecting", "connected", "disconnected", "failed", "alarm_failed", "history_disabled", "reload_failed"]);
+    const failures = new Set(["connect_timeout", "ready_timeout", "socket_error", "heartbeat_timeout", "alarm_api", "history_init", "runtime_reload"]);
+    const restored = Array.isArray(previous?.events) ? previous.events.slice(-CONNECTION_DIAGNOSTICS_LIMIT).flatMap(item => {
+      if (!stages.has(item?.stage) || !Number.isFinite(item.at) || typeof item.extensionVersion !== "string"
+        || item.extensionVersion.length > 32 || !/^\d+(?:\.\d+){0,3}$/.test(item.extensionVersion)) return [];
+      const clean = { stage: item.stage, at: item.at, extensionVersion: item.extensionVersion.slice(0, 32) };
+      if (BRIDGE_PORTS.includes(item.port)) clean.port = item.port;
+      if (failures.has(item.failure)) clean.failure = item.failure;
+      if (Number.isInteger(item.closeCode) && item.closeCode >= 1000 && item.closeCode <= 4999) clean.closeCode = item.closeCode;
+      return [clean];
+    }) : [];
+    connectionEvents.unshift(...restored.slice(-CONNECTION_DIAGNOSTICS_LIMIT));
+    connectionEvents.splice(0, Math.max(0, connectionEvents.length - CONNECTION_DIAGNOSTICS_LIMIT));
+  }).catch(() => undefined);
+  // Flush the first failure promptly, then batch at most two writes per minute.
+  const delay = diagnosticsLastWrite ? Math.max(1_000, diagnosticsLastWrite + CONNECTION_DIAGNOSTICS_WRITE_MS - Date.now()) : 10_000;
+  diagnosticsTimer = setTimeout(() => {
+    diagnosticsTimer = null;
+    void diagnosticsLoad.then(() => {
+      diagnosticsLastWrite = Date.now();
+      return chrome.storage.local.set({ [CONNECTION_DIAGNOSTICS_KEY]: { version: 1, events: connectionEvents.slice(-CONNECTION_DIAGNOSTICS_LIMIT) } });
+    }).catch(() => undefined);
+  }, delay);
+}
+
+function initializeBrowserHistory() {
+  if (historyInitialized) return;
+  historyInitialized = true;
+  try {
+    if (typeof importScripts === "function") importScripts("browser-history-background.js");
+    browserHistory = globalThis.installMemmyBrowserHistoryBackground?.({
+      chrome,
+      isConnected: () => sessionLive && socket?.readyState === WebSocket.OPEN,
+      send,
+      browserName,
+      isProtected: async tabId => {
+        await loadCredentialProtection();
+        const claim = claims.get(tabId);
+        return protectedCredentialTabs.has(tabId) || !!claim?.credentialProtected || !!claim?.protectedActivity;
+      },
+      activeCommand: (tabId, observedAt) => {
+        const evidence = historyInputEvidence.get(tabId);
+        return evidence && observedAt >= evidence.at - 100 && observedAt <= evidence.at + 1_500
+          ? { commandId: evidence.commandId } : undefined;
+      },
+    }) ?? null;
+  } catch {
+    browserHistory = null;
+    recordConnectionEvent("history_disabled", undefined, "history_init");
+  }
+}
 
 function recordHistoryInput(tabId, commandId) {
   if (typeof commandId !== "string") return;
@@ -228,6 +289,7 @@ function scheduleReconnect() {
 }
 
 async function connect() {
+  checkConnectionHealth();
   if (ready && (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING)) return ready;
   if (connectTask) return connectTask;
   connectTask = (async () => {
@@ -254,6 +316,7 @@ function connectPort(port) {
     try { previous.close(); } catch { /* Starting another port. */ }
   }
   const ws = new WebSocket(`ws://127.0.0.1:${port}/extension`);
+  recordConnectionEvent("connecting", port);
   let socketKeepalive = null;
   let historyFocusRefresh = null;
   socket = ws;
@@ -265,26 +328,38 @@ function connectPort(port) {
       clearTimeout(timeout);
       reject(error);
     };
-    const giveUp = () => { ws.close(); fail(new Error("Memmy did not respond")); };
+    let opened = false;
+    const giveUp = () => {
+      recordConnectionEvent("failed", port, opened ? "ready_timeout" : "connect_timeout");
+      ws.close(4001); fail(new Error("Memmy did not respond"));
+    };
     let timeout = setTimeout(giveUp, CONNECT_TIMEOUT_MS);
     ws.addEventListener("open", () => {
       if (settled || socket !== ws) return;
+      opened = true;
       clearTimeout(timeout);
       timeout = setTimeout(giveUp, READY_TIMEOUT_MS);
-      ws.send(JSON.stringify({ type: "hello", browser: browserName(), capabilities: EXTENSION_CAPABILITIES }));
+      ws.send(JSON.stringify({ type: "hello", browser: browserName(), extensionVersion: EXTENSION_VERSION, capabilities: EXTENSION_CAPABILITIES }));
     });
     ws.addEventListener("message", event => {
+      if (socket !== ws) return;
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
+      if (socketHealth?.socket === ws) {
+        socketHealth.lastReceivedAt = Date.now();
+        clearTimeout(socketHealth.probeTimer); socketHealth.probeTimer = null;
+      }
       if (message.type === "ready") {
         if (settled) return;
         settled = true;
         sessionLive = true;
+        socketHealth = { socket: ws, port, lastReceivedAt: Date.now(), heartbeat: message.heartbeat === true, probeTimer: null };
+        recordConnectionEvent("connected", port);
         reconnectAttempt = 0;
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         clearTimeout(timeout);
         socketKeepalive = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+          if (checkConnectionHealth() && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
         }, 20000);
         void refreshHistoryFocus();
         historyFocusRefresh = setInterval(() => void refreshHistoryFocus(), HISTORY_FOCUS_REFRESH_MS);
@@ -303,16 +378,20 @@ function connectPort(port) {
         cancelledCommands.add(message.id);
       }
     });
-    ws.addEventListener("error", () => fail(new Error("Cannot connect to Memmy")));
-    ws.addEventListener("close", () => {
+    ws.addEventListener("error", () => { recordConnectionEvent("failed", port, "socket_error"); fail(new Error("Cannot connect to Memmy")); });
+    ws.addEventListener("close", event => {
       clearInterval(socketKeepalive);
       clearInterval(historyFocusRefresh);
       if (socket === ws) {
-        browserHistory?.disconnected();
+        // Optional History cleanup must not prevent execution from reconnecting.
+        try { browserHistory?.disconnected(); } catch { browserHistory = null; }
         historyInputEvidence.clear();
+        clearTimeout(socketHealth?.probeTimer);
+        socketHealth = null;
         socket = null;
         ready = null;
         for (const tabId of [...claims.keys()]) void unclaim(tabId, false);
+        recordConnectionEvent("disconnected", port, undefined, event?.code);
         if (sessionLive) {
           sessionLive = false;
           scheduleReconnect();
@@ -322,6 +401,24 @@ function connectPort(port) {
     });
   });
   return ready;
+}
+
+function checkConnectionHealth() {
+  if (!socketHealth?.heartbeat || socketHealth.socket !== socket || socket?.readyState !== WebSocket.OPEN) return true;
+  if (Date.now() - socketHealth.lastReceivedAt <= CONNECTION_IDLE_TIMEOUT_MS) return true;
+  if (!socketHealth.probeTimer) {
+    // A long interval can mean system sleep. Give a healthy socket a chance to
+    // answer before replacing it; a half-open one still has a bounded recovery.
+    const health = socketHealth;
+    health.probeTimer = setTimeout(() => {
+      if (socketHealth !== health || socket !== health.socket) return;
+      recordConnectionEvent("failed", health.port, "heartbeat_timeout");
+      socket.close(4000);
+    }, READY_TIMEOUT_MS);
+    try { socket.send(JSON.stringify({ type: "ping" })); }
+    catch { socket.close(4000); }
+  }
+  return false;
 }
 
 async function publishClaim(tabId, tab) {
@@ -696,12 +793,35 @@ async function releaseLingeringDebuggers() {
   }
 }
 
-async function ensureReconnectAlarm() {
-  if (typeof chrome.alarms?.create !== "function") return;
-  try {
-    const alarm = typeof chrome.alarms.get === "function" ? await chrome.alarms.get(RECONNECT_ALARM) : null;
-    if (!alarm) await chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: RECONNECT_ALARM_MINUTES });
-  } catch { /* A later worker wakeup will check the alarm again. */ }
+function ensureReconnectAlarm(resetRetry = false) {
+  if (typeof chrome.alarms?.create !== "function") return Promise.resolve();
+  if (resetRetry && !alarmRetryTimer) alarmRetryAttempt = 0;
+  if (alarmCheckTask) return alarmCheckTask;
+  alarmCheckTask = (async () => {
+    try {
+      const alarm = typeof chrome.alarms.get === "function" ? await chrome.alarms.get(RECONNECT_ALARM) : null;
+      // Preserve a healthy alarm's next fire time; repair one-shot/old schedules.
+      if (alarm?.periodInMinutes !== RECONNECT_ALARM_MINUTES) {
+        await chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: RECONNECT_ALARM_MINUTES });
+      }
+      if (alarmRetryTimer) clearTimeout(alarmRetryTimer);
+      alarmRetryTimer = null; alarmRetryAttempt = 0;
+    } catch {
+      recordConnectionEvent("alarm_failed", undefined, "alarm_api");
+      const delay = ALARM_RETRY_DELAYS_MS[alarmRetryAttempt];
+      if (!alarmRetryTimer && delay !== undefined) {
+        alarmRetryAttempt++;
+        alarmRetryTimer = setTimeout(() => { alarmRetryTimer = null; void ensureReconnectAlarm(); }, delay);
+      }
+    }
+  })().finally(() => { alarmCheckTask = null; });
+  return alarmCheckTask;
+}
+
+function checkReconnectAlarmAfterActivity() {
+  if (Date.now() - alarmActivityCheckedAt < 30_000) return;
+  alarmActivityCheckedAt = Date.now();
+  void ensureReconnectAlarm(true);
 }
 
 function hasPendingBrowserActivity() {
@@ -726,28 +846,43 @@ async function reloadIfUpdated() {
         await chrome.storage.local.set({ reloadedForVersion: reloadedForVersion ?? null });
         return;
       }
-      chrome.runtime.reload();
+      try { chrome.runtime.reload(); }
+      catch {
+        // A thrown reload did not update the worker; do not suppress its retry.
+        await chrome.storage.local.set({ reloadedForVersion: reloadedForVersion ?? null });
+        recordConnectionEvent("reload_failed", undefined, "runtime_reload");
+      }
     } catch { /* Retry the version check on the next alarm. */ }
   })().finally(() => { reloadCheckTask = null; });
   return reloadCheckTask;
 }
 
-function boot() {
+function recoverConnection(stage) {
   if (typeof chrome.tabs?.query !== "function") return;
+  if (stage) recordConnectionEvent(stage);
   void reloadIfUpdated();
-  void releaseLingeringDebuggers();
-  void ensureReconnectAlarm();
+  void ensureReconnectAlarm(true);
   void connect().catch(() => scheduleReconnect());
 }
 
+function boot() {
+  initializeBrowserHistory();
+  void releaseLingeringDebuggers();
+  recoverConnection("boot");
+}
+
+// Profile startup does not automatically run a dormant extension worker.
+chrome.runtime.onStartup?.addListener(() => recoverConnection("startup"));
+chrome.runtime.onInstalled?.addListener(() => recoverConnection("installed"));
+
 chrome.alarms?.onAlarm?.addListener(alarm => {
   if (alarm?.name !== RECONNECT_ALARM) return;
-  void reloadIfUpdated();
-  void connect().catch(() => scheduleReconnect());
+  recoverConnection();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.action === "status") {
+    checkReconnectAlarmAfterActivity();
     respond({ ok: true, connected: socket?.readyState === WebSocket.OPEN,
       controllableTabCount: [...tabStatuses.values()].filter(tab => tab.status === "ready").length,
       pausedTabCount: pausedTabs.size,
@@ -756,6 +891,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   }
   if (message?.action === "refresh" && sender.id === chrome.runtime.id) {
     pausedTabs.clear();
+    void ensureReconnectAlarm(true);
     void connect().then(() => discoverOpenTabs()).then(() => respond({ ok: true }),
       () => respond({ ok: false, error: "无法重新连接，请确认 Memmy 已打开。" }));
     return true;
@@ -1084,6 +1220,7 @@ chrome.tabs.onUpdated.addListener((tabId, changes, tab) => {
   } catch { if (!claims.get(tabId)?.credentialProtected) void unclaim(tabId); }
 });
 chrome.tabs.onActivated?.addListener?.(info => {
+  checkReconnectAlarmAfterActivity();
   void refreshHistoryFocus();
   refreshUserActivity();
   if (!claims.has(info.tabId)) { void discoverTab(info.tabId).catch(() => undefined); return; }
@@ -1091,6 +1228,7 @@ chrome.tabs.onActivated?.addListener?.(info => {
 });
 
 chrome.windows?.onFocusChanged?.addListener?.(() => {
+  checkReconnectAlarmAfterActivity();
   // Clear the prior window before asynchronous tabs/windows calls finish.
   void refreshHistoryFocus();
   refreshUserActivity();

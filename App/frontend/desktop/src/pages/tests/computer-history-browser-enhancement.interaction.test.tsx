@@ -1,4 +1,6 @@
 // @vitest-environment happy-dom
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,11 +32,14 @@ function fixture(platform: "darwin" | "win32", recording = false) {
   let installed: Array<"chrome" | "edge"> = [], connected: Array<"chrome" | "edge"> = [];
   const directory = platform === "darwin" ? "/Applications/Memmy.app/Contents/Resources/browser-extension" : "C:\\Program Files\\Memmy\\resources\\browser-extension";
   const prepareBrowserExtension = vi.fn(async () => ({ status: "browser-opened" as const, directory }));
-  const listInstalledBrowserExtensions = vi.fn(async () => installed);
+  const getBrowserExtensionInstallation = vi.fn(async () => ({
+    chrome: { installed: installed.includes("chrome"), enabled: installed.includes("chrome") },
+    edge: { installed: installed.includes("edge"), enabled: installed.includes("edge") },
+  }));
   const listRunningExternalBrowsers = vi.fn(async () => ["chrome", "edge"]);
   const getBrowserExtensionDirectory = vi.fn(async () => directory);
   Object.defineProperty(window, "memmy", { configurable: true, value: { platform, osRelease: platform === "win32" ? "10.0.22631" : "24.0.0",
-    prepareBrowserExtension, listInstalledBrowserExtensions, listRunningExternalBrowsers, getBrowserExtensionDirectory,
+    prepareBrowserExtension, getBrowserExtensionInstallation, listRunningExternalBrowsers, getBrowserExtensionDirectory,
     revealBrowserExtension: vi.fn(async () => true) } });
   const initial = state(recording);
   const getExternalBrowserStatus = vi.fn(async () => ({ connected, claims: [] }));
@@ -48,7 +53,7 @@ function fixture(platform: "darwin" | "win32", recording = false) {
     pauseComputerHistoryObservation: vi.fn(), resumeComputerHistoryObservation: vi.fn(), setComputerHistoryWeChatAccess: vi.fn(),
     getApplicationIcon: vi.fn(async () => null),
   } as unknown as MemmyAgentClient;
-  return { client, prepareBrowserExtension, getExternalBrowserStatus, listInstalledBrowserExtensions,
+  return { client, prepareBrowserExtension, getExternalBrowserStatus, getBrowserExtensionInstallation,
     listRunningExternalBrowsers, getBrowserExtensionDirectory, directory,
     connect(browser: "chrome" | "edge") { installed = [browser]; connected = [browser]; } };
 }
@@ -68,7 +73,7 @@ describe("shared browser extension entry in Computer History", () => {
     expect(heading.textContent).toContain("网页历史记录增强");
     expect(heading.getAttribute("aria-expanded")).toBe("false");
     expect(host.querySelector('[role="switch"]')).toBeNull();
-    for (const read of [f.getExternalBrowserStatus, f.listInstalledBrowserExtensions,
+    for (const read of [f.getExternalBrowserStatus, f.getBrowserExtensionInstallation,
       f.listRunningExternalBrowsers, f.getBrowserExtensionDirectory]) expect(read).not.toHaveBeenCalled();
     await act(async () => heading.click());
     expect(heading.getAttribute("aria-expanded")).toBe("true");
@@ -122,7 +127,13 @@ describe("shared browser extension entry in Computer History", () => {
     await render(<ComputerHistorySubPage client={f.client} />);
     const wechat = host.querySelector("#computer-history-wechat-label")!.closest(".ch__recording-setting")!;
     const enhancement = host.querySelector(".ch__browser-enhancement")!;
+    const permissions = host.querySelector(".ch__sources");
     expect(wechat.nextElementSibling).toBe(enhancement);
+    expect(enhancement.nextElementSibling).toBe(permissions);
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const sourcesRule = css.slice(css.indexOf(".ch__settings-card > section[aria-label]"), css.indexOf(".ch__sources-row"));
+    expect(sourcesRule).not.toMatch(/border\s*:\s*0/);
+    expect(css).toContain(".ch__settings-card > * + * {\n  border-top: 1px solid var(--ch-border);\n}");
     expect(enhancement.querySelector('[role="switch"]')).toBeNull();
     expect(enhancement.querySelector("button")?.getAttribute("aria-expanded")).toBe("false");
     expect(f.getExternalBrowserStatus).not.toHaveBeenCalled();

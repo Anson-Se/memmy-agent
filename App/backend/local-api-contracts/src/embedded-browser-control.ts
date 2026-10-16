@@ -16,7 +16,7 @@ export function isEmbeddedBrowserCancel(value: unknown): value is EmbeddedBrowse
 }
 
 export const EMBEDDED_BROWSER_COMMANDS = [
-  'probe', 'listTabs', 'queryHistory', 'openTab', 'closeTab', 'allowOrigin', 'snapshot', 'find', 'navigate', 'back', 'forward', 'reload',
+  'probe', 'listTabs', 'externalBrowserState', 'recoverExternalBrowser', 'queryHistory', 'openTab', 'closeTab', 'allowOrigin', 'snapshot', 'find', 'navigate', 'back', 'forward', 'reload',
   'click', 'type', 'selectOption', 'pressKey', 'scroll', 'waitFor', 'screenshot',
   'consoleMessages', 'networkRequests', 'viewport', 'historyState', 'resize', 'open',
   'fillCredential', 'fillContact',
@@ -25,6 +25,14 @@ export const EMBEDDED_BROWSER_COMMANDS = [
   'cdpCall', 'cdpEvents', 'cdpWrite',
   'playwrightStart', 'playwrightCdp', 'playwrightEnd',
 ] as const;
+
+export type ExternalBrowserInstallation = { installed: boolean | null; enabled: boolean | null };
+/** Browser/extension metadata only; no page contents, paths, or process arguments cross child IPC. */
+export type ExternalBrowserState = {
+  installation: Record<'chrome' | 'edge', ExternalBrowserInstallation>;
+  runningBrowsers: Array<'chrome' | 'edge'> | null;
+};
+export type ExternalBrowserRecovery = 'woken' | 'unavailable' | 'failed';
 
 /** Executor CDP events share the result channel, so they stay ordered with replies. */
 export const EMBEDDED_BROWSER_EVENT = 'memmy:embedded-browser:event';
@@ -106,7 +114,12 @@ export function isEmbeddedBrowserRequest(value: unknown): value is EmbeddedBrows
     && (input.tabId === undefined || (Number.isSafeInteger(input.tabId) && input.tabId! > 0))
     && ((input.command !== 'closeTab' && input.command !== 'endSitePermissions') || input.tabId !== undefined)
     && (!input.command?.startsWith('playwright') || input.tabId !== undefined)
-    && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args));
+    && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args))
+    && (input.command !== 'externalBrowserState'
+      || (input.tabId === undefined && Object.keys(input.args!).length === 0))
+    && (input.command !== 'recoverExternalBrowser'
+      || (input.tabId === undefined && Object.keys(input.args!).length === 1
+        && (input.args!.browser === 'chrome' || input.args!.browser === 'edge')));
 }
 
 export function isEmbeddedBrowserResult(value: unknown): value is EmbeddedBrowserResult {

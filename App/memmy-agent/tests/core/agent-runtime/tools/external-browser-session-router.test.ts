@@ -35,6 +35,35 @@ function bindingOf(router: ExternalBrowserSessionRouter, scope: typeof scopeA, t
 }
 
 describe("external browser session router", () => {
+  it('reports an unresponsive refresh without losing connection facts or offering stale pages', async () => {
+    const bridge = fakeBridge();
+    Object.assign(bridge, { refreshTabs: vi.fn(async () => { throw new Error('Browser extension page refresh timed out'); }),
+      listConnected: () => ['edge'] });
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
+    try {
+      const listing = await router.listTabs(scopeA, 'edge');
+      expect(listing).toMatchObject({ pageDiscoveryStatus: 'unresponsive', connectedBrowsers: ['edge'], tabs: [] });
+      expect(bridge.listClaims()).toEqual([claim]);
+      expect(router.hasBinding(scopeA)).toBe(false);
+      Object.assign(bridge, { refreshTabs: vi.fn(async () => { throw new Error('unexpected bridge error'); }) });
+      await expect(router.listTabs(scopeA, 'edge')).rejects.toThrow('unexpected bridge error');
+    } finally { router.closeAll(); }
+  });
+
+  it('waits for the requested browser without binding or claiming a page', async () => {
+    const bridge = fakeBridge([]);
+    const waitForConnection = vi.fn(async () => true);
+    Object.assign(bridge, { waitForConnection });
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
+    const signal = new AbortController().signal;
+    try {
+      await expect(router.waitForConnection('chrome', 45_000, signal)).resolves.toBe(true);
+      expect(waitForConnection).toHaveBeenCalledExactlyOnceWith('chrome', 45_000, signal);
+      expect(router.hasBinding(scopeA)).toBe(false);
+      expect(router.hasBinding(scopeB)).toBe(false);
+    } finally { router.closeAll(); }
+  });
+
   it.each(['website', 'computer'] as const)('applies %s allow-all and revocation to raw CDP attached cross-site iframe targets', async source => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-child-cdp-policy-'));
     const reader = new BrowserUseSitePolicyReader(path.join(directory, 'site-policy.json'), {

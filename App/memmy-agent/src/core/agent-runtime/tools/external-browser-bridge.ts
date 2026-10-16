@@ -71,7 +71,18 @@ type Client = {
   tabStatuses: Map<number, ExternalBrowserTabStatus>;
   historyFocus: ExternalBrowserHistoryFocus | null;
   historySequence: number;
+  extensionVersion?: string;
 };
+
+type ConnectionEvent = {
+  stage: 'listening' | 'connected' | 'disconnected';
+  at: number;
+  port: number;
+  browser?: 'chrome' | 'edge';
+  extensionVersion?: string;
+  closeCode?: number;
+};
+type ConnectionWaiter = { browser: 'chrome' | 'edge'; finish: (connected: boolean) => void };
 
 /** Internal executor events. They are never exposed as a model CDP tool. */
 export type ExternalBrowserPlaywrightEvent = {
@@ -121,12 +132,17 @@ export class ExternalBrowserBridge {
   private readonly browserHistoryInputs = new Map<string, { connectionId: string; tabId: number; sentAt: number }>();
   private nextId = 1;
   private port = 0;
+  private startTask: Promise<{ port: number }> | null = null;
+  private closing = false;
+  private closeTask: Promise<void> | null = null;
+  private readonly connectionWaiters = new Set<ConnectionWaiter>();
+  private readonly connectionEvents: ConnectionEvent[] = [];
 
   constructor(private readonly onClaimsChanged?: (claims: ExternalBrowserClaim[]) => void) {
     this.server.on("upgrade", (request, socket, head) => {
       const remote = request.socket.remoteAddress;
       const local = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-      if (!local || request.headers.origin !== EXTENSION_ORIGIN || request.url !== "/extension") {
+      if (this.closing || !local || request.headers.origin !== EXTENSION_ORIGIN || request.url !== "/extension") {
         socket.destroy();
         return;
       }
@@ -135,7 +151,14 @@ export class ExternalBrowserBridge {
   }
 
   async start(requestedPort?: number): Promise<{ port: number }> {
+    if (this.closing) throw new Error('Browser bridge closed');
     if (this.port) return { port: this.port };
+    if (this.startTask) return this.startTask;
+    this.startTask = this.startListening(requestedPort).finally(() => { this.startTask = null; });
+    return this.startTask;
+  }
+
+  private async startListening(requestedPort?: number): Promise<{ port: number }> {
     const configuredPort = process.env.MEMMY_EXTERNAL_BROWSER_BRIDGE_PORT;
     if (requestedPort === undefined && configuredPort !== undefined) {
       const port = Number(configuredPort);
@@ -147,6 +170,7 @@ export class ExternalBrowserBridge {
     const candidates = requestedPort === undefined ? [...EXTERNAL_BROWSER_BRIDGE_PORTS] : [requestedPort];
     let lastError: unknown;
     for (const candidate of candidates) {
+      if (this.closing) throw new Error('Browser bridge closed');
       try {
         await this.listen(candidate);
         return { port: this.port };
@@ -157,7 +181,42 @@ export class ExternalBrowserBridge {
 
   listConnected(): Array<"chrome" | "edge"> {
     return [...new Set([...this.clients.values()].flatMap(client =>
-      client.authorized && client.browser ? [client.browser] : []))];
+      client.authorized && client.browser && client.socket.readyState === WebSocket.OPEN ? [client.browser] : []))];
+  }
+
+  /** Wait only for a handshake; discovery never grants page access or attaches a debugger. */
+  waitForConnection(browser: 'chrome' | 'edge', timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return Promise.reject(new Error('Browser connection wait was canceled'));
+    if (this.closing) return Promise.resolve(false);
+    if (this.listConnected().includes(browser)) return Promise.resolve(true);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        this.connectionWaiters.delete(waiter);
+      };
+      const waiter: ConnectionWaiter = { browser, finish: value => { cleanup(); resolve(value); } };
+      const onAbort = () => { cleanup(); reject(new Error('Browser connection wait was canceled')); };
+      const timer = setTimeout(() => waiter.finish(false), Math.min(timeoutMs, 60_000));
+      timer.unref?.();
+      this.connectionWaiters.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      else if (this.listConnected().includes(browser)) waiter.finish(true);
+    });
+  }
+
+  connectionDiagnostics(): { port: number; events: ConnectionEvent[] } {
+    return { port: this.port, events: this.connectionEvents.map(event => ({ ...event })) };
+  }
+
+  private recordConnection(event: Omit<ConnectionEvent, 'at' | 'port'>, port = this.port): void {
+    const entry = { ...event, at: Date.now(), port };
+    this.connectionEvents.push(entry);
+    if (this.connectionEvents.length > 24) this.connectionEvents.shift();
+    // Never include page URLs, titles, payloads, credentials, or user profile paths.
+    console.info('[browser-connection]', JSON.stringify(entry));
   }
 
   private listen(port: number): Promise<void> {
@@ -168,12 +227,14 @@ export class ExternalBrowserBridge {
       };
       const onListening = () => {
         this.server.off("error", onError);
+        if (this.closing) { reject(new Error('Browser bridge closed')); return; }
         const address = this.server.address();
         if (!address || typeof address === "string") {
           reject(new Error("browser bridge failed to bind loopback"));
           return;
         }
         this.port = address.port;
+        this.recordConnection({ stage: 'listening' });
         resolve();
       };
       this.server.once("error", onError);
@@ -399,6 +460,7 @@ export class ExternalBrowserBridge {
   }
 
   private accept(socket: WebSocket): void {
+    const connectionPort = this.port;
     const connectionId = randomBytes(12).toString("hex");
     const client: Client = { socket, authorized: false, browser: null, capabilities: new Set(),
       claims: new Map(), tabStatuses: new Map(), historyFocus: null, historySequence: 0 };
@@ -419,14 +481,20 @@ export class ExternalBrowserBridge {
         clearTimeout(helloTimer);
         client.authorized = true;
         client.browser = message.browser;
+        client.extensionVersion = typeof message.extensionVersion === 'string'
+          && /^\d{1,5}(?:\.\d{1,5}){0,3}$/.test(message.extensionVersion) ? message.extensionVersion : undefined;
         client.capabilities = new Set(Array.isArray(message.capabilities)
           ? message.capabilities.filter((value): value is string => typeof value === "string").slice(0, 20) : []);
-        socket.send(JSON.stringify({ type: "ready", connectionId }));
+        socket.send(JSON.stringify({ type: "ready", connectionId, heartbeat: true }));
+        this.recordConnection({ stage: 'connected', browser: client.browser!, extensionVersion: client.extensionVersion });
+        for (const waiter of [...this.connectionWaiters]) if (waiter.browser === client.browser) waiter.finish(true);
         this.sendBrowserHistoryIntent(client);
         this.onClaimsChanged?.(this.listClaims());
         return;
       }
-      if (message.type === "browser_history_config_request") {
+      if (message.type === 'ping') {
+        socket.send(JSON.stringify({ type: 'pong' }));
+      } else if (message.type === "browser_history_config_request") {
         if (!client.capabilities.has("browserHistory")) return;
         if (typeof message.id !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/u.test(message.id)) return;
         const context = this.browserHistoryContext(client, connectionId, message);
@@ -547,8 +615,10 @@ export class ExternalBrowserBridge {
         }
       }
     });
-    socket.on("close", () => {
+    socket.on("close", (code: number) => {
       clearTimeout(helloTimer);
+      if (client.authorized && client.browser) this.recordConnection({ stage: 'disconnected',
+        browser: client.browser, extensionVersion: client.extensionVersion, closeCode: code }, connectionPort);
       this.clients.delete(connectionId);
       for (const [id, input] of this.browserHistoryInputs) if (input.connectionId === connectionId) this.browserHistoryInputs.delete(id);
       for (const [id, pending] of this.pending) {
@@ -562,7 +632,18 @@ export class ExternalBrowserBridge {
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    this.closing = true;
+    this.closeTask = this.finishClose();
+    return this.closeTask;
+  }
+
+  private async finishClose(): Promise<void> {
+    for (const waiter of [...this.connectionWaiters]) waiter.finish(false);
+    // A listen(0) may still be pending when shutdown begins. Await it before
+    // inspecting server.listening so it cannot create a listener after close.
+    await this.startTask?.catch(() => undefined);
     for (const client of this.clients.values()) client.socket.close(1001, "Memmy closed");
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

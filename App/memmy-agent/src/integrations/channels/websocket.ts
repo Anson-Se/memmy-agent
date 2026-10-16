@@ -1958,6 +1958,7 @@ export class WebSocketChannel extends BaseChannel {
         [`${tab.connectionId}:${tab.tabId}`, tab.status]));
       const response = httpJsonResponse({
         connected: externalBrowserBridge.listConnected(),
+        connectionDiagnostics: externalBrowserBridge.connectionDiagnostics(),
         controllableTabCount: claims.filter(tab => {
           const status = statusesByTab.get(`${tab.connectionId}:${tab.tabId}`);
           return status === undefined || status === "ready";

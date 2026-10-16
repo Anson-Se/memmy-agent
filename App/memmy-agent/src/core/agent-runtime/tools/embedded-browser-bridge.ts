@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserEvent, isEmbeddedBrowserResult,
   formatEmbeddedBrowserTabMention, parseEmbeddedBrowserTabMention,
-  type EmbeddedBrowserCommand } from '@memmy/local-api-contracts';
+  type EmbeddedBrowserCommand, type ExternalBrowserState, type ExternalBrowserRecovery } from '@memmy/local-api-contracts';
 import type { BrowserCommandOutcome, BrowserCommandSettle, ExternalBrowserClaim,
   ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
 
@@ -62,7 +62,9 @@ export class EmbeddedBrowserBridge {
         try { process.send?.({ type: EMBEDDED_BROWSER_CANCEL, requestId }, () => undefined); }
         catch { /* A timed-out request remains cancelled locally. */ }
         reject(new Error('Embedded browser command timed out'));
-      }, command === 'waitDownloadDestination' ? 35_000
+      }, command === 'externalBrowserState' ? 5_000
+        : command === 'recoverExternalBrowser' ? 15_000
+        : command === 'waitDownloadDestination' ? 35_000
         : command === 'queryHistory' ? 5 * 60_000
         : command === 'authRequest' ? 5 * 60_000 + 15_000
         : command === 'upload' ? 5 * 60_000 + 15_000
@@ -139,6 +141,22 @@ export class EmbeddedBrowserBridge {
       selectedTabId: this.selectedTabId,
       tabs: this.visibleTabs,
     };
+  }
+  async getExternalBrowserState(signal?: AbortSignal): Promise<ExternalBrowserState> {
+    const result = await this.request('externalBrowserState', {}, undefined, signal) as Partial<ExternalBrowserState> | null;
+    const installation = (browser: 'chrome' | 'edge') => {
+      const state = result?.installation?.[browser];
+      return { installed: typeof state?.installed === 'boolean' ? state.installed : null,
+        enabled: typeof state?.enabled === 'boolean' ? state.enabled : null };
+    };
+    const running = result?.runningBrowsers;
+    return { installation: { chrome: installation('chrome'), edge: installation('edge') },
+      runningBrowsers: Array.isArray(running) && running.every(browser => browser === 'chrome' || browser === 'edge')
+        ? [...new Set(running)] : null };
+  }
+  async recoverExternalBrowser(browser: 'chrome' | 'edge', signal?: AbortSignal): Promise<ExternalBrowserRecovery> {
+    const result = await this.request('recoverExternalBrowser', { browser }, undefined, signal);
+    return result === 'woken' || result === 'failed' ? result : 'unavailable';
   }
   async queryHistory(input: { from: string; to: string; keyword: string; limit: number }): Promise<unknown> {
     return this.request('queryHistory', input);

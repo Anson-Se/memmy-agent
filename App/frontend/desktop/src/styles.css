@@ -13756,7 +13756,9 @@ body.memmy-platform-windows :is(
 .ch__browser-enhancement-expanded { transform: rotate(180deg); }
 
 .ch__settings-card > section[aria-label] {
-  border: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
   border-radius: 0;
   padding: 0;
 }

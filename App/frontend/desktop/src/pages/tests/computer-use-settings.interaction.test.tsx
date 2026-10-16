@@ -130,7 +130,35 @@ describe("computer use settings", () => {
       expect(setNativeAppAllowAll).toHaveBeenCalledWith(true);
       expect(setComputerUseEnabled).not.toHaveBeenCalledWith(false);
       expect(toggle.checked).toBe(true);
-      expect(container.textContent).toContain("安装");
+      expect(container.textContent).toContain("暂时无法读取 Memmy 扩展状态");
+    } finally {
+      Reflect.deleteProperty(window, "memmy");
+    }
+  });
+
+  it.each(['darwin', 'win32'])('does not interpret a missing installation bridge as absent extensions on %s', async platform => {
+    const listInstalledBrowserExtensions = vi.fn().mockResolvedValue([]);
+    const prepareBrowserExtension = vi.fn().mockResolvedValue({ status: "browser-opened", directory: "/app/browser-extension" });
+    Object.defineProperty(window, "memmy", { configurable: true, value: {
+      listInstalledBrowserExtensions, prepareBrowserExtension,
+    } });
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    try {
+      await act(async () => root.render(<I18nProvider language="zh-CN">
+        <ComputerUseSettings client={client} platform={platform} />
+      </I18nProvider>));
+      const browsers = container.querySelector("#computer-use-browser-extension")!;
+      expect(browsers.textContent).toContain("暂时无法读取 Memmy 扩展状态");
+      expect(browsers.textContent).not.toContain("未安装");
+      expect(Array.from(browsers.querySelectorAll("button")).map(button => button.textContent)).toEqual(["管理", "管理"]);
+      expect(listInstalledBrowserExtensions).not.toHaveBeenCalled();
+      expect(prepareBrowserExtension).not.toHaveBeenCalled();
+      await act(async () => { browsers.querySelector("button")!.click(); });
+      expect(prepareBrowserExtension).toHaveBeenCalledExactlyOnceWith("chrome", true);
+      expect(container.querySelector("#memmy-chrome-extension-guide")).not.toBeNull();
     } finally {
       Reflect.deleteProperty(window, "memmy");
     }
@@ -172,9 +200,11 @@ describe("computer use settings", () => {
   it.each(["darwin", "win32"])("offers only manual browser installation on %s", async platform => {
     sessionStorage.setItem("memmy.browser-extension-install.v1", "retired-install");
     const prepareBrowserExtension = vi.fn().mockResolvedValue({ status: "browser-opened", directory: "/app/browser-extension" });
-    const listInstalledBrowserExtensions = vi.fn().mockResolvedValue(["chrome"]);
+    const getBrowserExtensionInstallation = vi.fn().mockResolvedValue({
+      chrome: { installed: true, enabled: true }, edge: { installed: false, enabled: false },
+    });
     Object.defineProperty(window, "memmy", { configurable: true, value: {
-      prepareBrowserExtension, listInstalledBrowserExtensions,
+      prepareBrowserExtension, getBrowserExtensionInstallation,
     } });
     const client = {
       getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
@@ -189,7 +219,11 @@ describe("computer use settings", () => {
       const browserRow = (name: string) => Array.from(container.querySelectorAll("strong"))
         .find(node => node.textContent === name)?.parentElement?.parentElement?.textContent;
       expect(browserRow("Google Chrome")).toContain("已安装，等待浏览器连接");
+      expect(browserRow("Google Chrome")).toContain("重新安装");
+      expect(browserRow("Google Chrome")).not.toContain("检查连接");
       expect(browserRow("Microsoft Edge")).toContain("未安装");
+      expect(browserRow("Microsoft Edge")).not.toContain("检查连接");
+      expect(container.textContent).not.toContain("修复连接");
       expect(container.textContent).not.toContain("Memmy帮你安装");
       expect(container.textContent).not.toContain("手动安装");
       expect(container.textContent).not.toContain("暂时无法操作浏览器窗口");
