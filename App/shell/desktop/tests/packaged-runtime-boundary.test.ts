@@ -715,7 +715,11 @@ describe("desktop packaged runtime boundaries", () => {
     expect(finishPageMacroSource).toContain('StrCmp $MemmyIsRelayedUpgrade "1"');
     expect(finishPageMacroSource).toContain("Abort");
     expect(finishPageMacroSource).toContain("Function MemmyStartAppAfterInstall");
-    expect(finishPageMacroSource).toContain('${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$1"');
+    expect(finishPageMacroSource).toContain('${If} ${UAC_IsAdmin}');
+    expect(finishPageMacroSource).toContain('${StdUtils.ExecShellAsUser} $MemmyLaunchResult "$launchLink" "open" "$1"');
+    expect(finishPageMacroSource).toContain('ExecShell "open" "$launchLink" "$1"');
+    expect(finishPageMacroSource).toContain('Call MemmyLogLaunchResult');
+    expect(finishPageMacroSource).toContain('MessageBox MB_OK|MB_ICONEXCLAMATION "$3"');
     expect(finishPageMacroSource).toContain("!define MUI_PAGE_CUSTOMFUNCTION_PRE MemmySkipRelayedFinishPage");
     expect(finishPageMacroSource).toContain("!define MUI_FINISHPAGE_RUN_FUNCTION MemmyStartAppAfterInstall");
     expect(finishPageMacroSource).toContain("!insertmacro MUI_PAGE_FINISH");
