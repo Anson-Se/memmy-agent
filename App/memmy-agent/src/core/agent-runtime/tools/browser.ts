@@ -2017,7 +2017,7 @@ export class BrowserAuthRequestTool extends BrowserCdpReadTool {
 }
 
 export class BrowserSitePermissionTool extends BrowserCdpReadTool {
-  static enabled(ctx: any): boolean { return ctx.browserSessionManager?.supportsSitePermissions() === true; }
+  static enabled(ctx: any): boolean { return ctx.browserSessionManager?.supportsSitePermissions?.() === true; }
   get name(): string { return 'browser_site_permission'; }
   get description(): string {
     return 'Grant or revoke camera or microphone permission for the HTTP(S) origin in the current task browser tab. In Memmy and managed Chromium the choice applies only to this task tab or context and origin (lasts: "task"), ends with the task, and leaves the user\'s saved site settings unchanged. Chrome/Edge returns the browser UI step for the Agent to complete with Computer Use. A granted result describes site configuration: perform the page action and verify its result.';

@@ -395,15 +395,15 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       // outstanding CDP command. Its wait is not covered by locator timeouts.
       return withDialogs(await Promise.race([perform(), session.relay.waitForInterruption()]));
     } catch (error) {
-      error = session.relay.actionError ?? error;
+      const actionError = session.relay.actionError ?? error;
       outcome = signal?.aborted ? 'cancelled' : 'failed';
-      diagnostic(outcome, error as Error);
+      diagnostic(outcome, actionError as Error);
       const dispatchState = session.relay.dispatchState();
       const replaced = session.relay.documentWasReplaced();
       await dispose(session, false);
-      const message = signal?.aborted ? 'Browser executor cancelled' : String((error as Error)?.message || error);
+      const message = signal?.aborted ? 'Browser executor cancelled' : String((actionError as Error)?.message || actionError);
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none' && replaced
-        && !(error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain) {
+        && !(actionError as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain) {
         // Input was sent and then the tab moved to a new document, as a submit or link does.
         const unverifiedText = action === 'type' && !textVerified;
         const result = withDialogs({ ok: dispatchState === 'confirmed' && !unverifiedText, dispatchState,
@@ -416,10 +416,10 @@ export async function executeExternalBrowserPlaywright(bridge: PlaywrightCommand
       if (!signal?.aborted && message !== 'USER_ACTIVE_ON_TARGET_TAB' && dispatchState !== 'none') {
         return withDialogs({ ok: false, dispatchState, inputDispatched: dispatchState === 'confirmed',
           noActionDispatched: false, freshObservationRequired: true, error: message,
-          ...((error as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain
+          ...((actionError as Error & { inputTargetUncertain?: boolean }).inputTargetUncertain
             ? { inputTargetUncertain: true } : {}) });
       }
-      const failure = error instanceof Error && !signal?.aborted ? error : new Error(message);
+      const failure = actionError instanceof Error && !signal?.aborted ? actionError : new Error(message);
       Object.assign(failure, { dispatchState, noActionDispatched: dispatchState === 'none', freshObservationRequired: true });
       if (message !== 'USER_ACTIVE_ON_TARGET_TAB') failure.message += dispatchState === 'none'
         ? ' No input was dispatched; take a fresh observation before acting.'

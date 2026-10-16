@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import ts from "typescript";
