@@ -44,7 +44,7 @@ it("serves connected browsers only through an authenticated desktop settings rou
   expect(response?.status).toBe(200);
   expect(response?.headers["cache-control"]).toBe("no-store");
   const body = JSON.parse(String(response?.body));
-  expect(body).toEqual({ connected: ["chrome"], controllableTabCount: 1, claims: [{
+  expect(body).toEqual({ connected: ["chrome"], connectionDiagnostics: { port: 0, events: [] }, controllableTabCount: 1, claims: [{
     browser: "chrome", title: "Test", url: "https://example.test/",
   }], tabStatuses: [{
     browser: "chrome", title: "Other", url: "https://other.test/",

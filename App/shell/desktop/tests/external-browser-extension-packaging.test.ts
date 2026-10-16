@@ -113,13 +113,19 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
 }
 
 function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown>>; storage?: Record<string, unknown>;
-  connectDelay?: number; onSave?: () => void;
+  connectDelay?: number; onSave?: () => void; alarmFailures?: number; reloadFailures?: number;
+  historyImportFailure?: boolean; browser?: "chrome" | "edge";
+  historyInitializeFailure?: boolean; storageReadFailure?: boolean; heartbeatSupported?: boolean;
   sendCommand?: (target: unknown, method: string) => Promise<unknown> } = {}) {
   let memmyRunning = false;
   let connectDelay = options.connectDelay ?? 0;
   let readyDelay = 0;
   let installedVersion = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8")).version;
   let onAlarm: (alarm: { name: string }) => void = () => undefined;
+  let onStartup = () => undefined, onInstalled = () => undefined;
+  const focusListeners: Array<() => void> = [];
+  let alarmFailures = options.alarmFailures ?? 0, reloadFailures = options.reloadFailures ?? 0;
+  let respondToPing = true;
   const alarms = options.alarms ?? new Map<string, Record<string, unknown>>();
   const saved = options.storage ?? {};
   const sent: Array<Record<string, unknown>> = [];
@@ -141,27 +147,38 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
       const message = JSON.parse(value); sent.push(message);
       if (message.type === "hello") {
         const acknowledge = () => {
-          if (this.readyState === 1) this.listeners.get("message")?.({ data: JSON.stringify({ type: "ready" }) });
+          if (this.readyState === 1) this.listeners.get("message")?.({ data: JSON.stringify({ type: "ready", heartbeat: options.heartbeatSupported !== false }) });
         };
         if (readyDelay) setTimeout(acknowledge, readyDelay);
         else queueMicrotask(acknowledge);
+      } else if (message.type === "ping" && respondToPing) {
+        queueMicrotask(() => this.listeners.get("message")?.({ data: JSON.stringify({ type: "pong" }) }));
       }
     }
-    close() { this.readyState = 3; this.listeners.get("close")?.(); }
+    close(code = 1000) { this.readyState = 3; this.listeners.get("close")?.({ code }); }
   }
   const events = { addListener() {} };
-  const reload = vi.fn();
-  const createAlarm = vi.fn(async (name: string, value: Record<string, unknown>) => { alarms.set(name, value); });
+  const reload = vi.fn(() => { if (reloadFailures-- > 0) throw new Error("Simulated reload failure"); });
+  const createAlarm = vi.fn(async (name: string, value: Record<string, unknown>) => {
+    if (alarmFailures-- > 0) throw new Error("Simulated alarm API failure");
+    alarms.set(name, value);
+  });
+  const save = vi.fn(async (value: Record<string, unknown>) => {
+    Object.assign(saved, value); options.onSave?.();
+  });
   const chrome = {
-    runtime: { id: "extension-id", onMessage: events, reload, getURL: (file: string) => `chrome-extension://id/${file}` },
-    storage: { local: { get: async () => saved, set: async (value: Record<string, unknown>) => {
-      Object.assign(saved, value); options.onSave?.();
-    } } },
+    runtime: { id: "extension-id", onMessage: events, reload, getURL: (file: string) => `chrome-extension://id/${file}`,
+      onStartup: { addListener(listener: typeof onStartup) { onStartup = listener; } },
+      onInstalled: { addListener(listener: typeof onInstalled) { onInstalled = listener; } } },
+    storage: { local: { get: async () => {
+      if (options.storageReadFailure) throw new Error("Simulated storage read failure");
+      return saved;
+    }, set: save } },
     alarms: { get: async (name: string) => alarms.get(name), create: createAlarm,
       onAlarm: { addListener(listener: typeof onAlarm) { onAlarm = listener; } } },
     tabs: { query: async () => [], onRemoved: events, onUpdated: events, onActivated: events,
       get: async () => ({ id: 7, active: false, windowId: 1, url: "https://example.test/page" }) },
-    windows: { onRemoved: events, get: async () => ({ focused: false }) },
+    windows: { onRemoved: events, onFocusChanged: { addListener(listener: () => void) { focusListeners.push(listener); } }, get: async () => ({ focused: false }) },
     debugger: { onDetach: events, onEvent: events, attach: async () => undefined, detach: async () => undefined,
       sendCommand: options.sendCommand ?? (async () => ({})) },
   };
@@ -170,11 +187,21 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
     expect(init.cache).toBe("no-store");
     return { json: async () => ({ version: installedVersion }) };
   };
-  const context = vm.createContext({ chrome, fetch, WebSocket: BridgeSocket, navigator: { userAgent: "Chrome/154" },
-    URL, setTimeout, clearTimeout, setInterval, clearInterval });
+  const context = vm.createContext({ chrome, fetch, WebSocket: BridgeSocket,
+    navigator: { userAgent: options.browser === "edge" ? "Edg/154" : "Chrome/154" },
+    URL, Date, setTimeout, clearTimeout, setInterval, clearInterval,
+    importScripts: (file: string) => {
+      if (options.historyImportFailure) throw new Error("Simulated History script failure");
+      vm.runInContext(fs.readFileSync(path.join(extension, file), "utf8"), context);
+      if (options.historyInitializeFailure) vm.runInContext("installMemmyBrowserHistoryBackground = () => { throw new Error('Simulated History init failure'); }", context);
+    } });
   vm.runInContext(fs.readFileSync(path.join(extension, "background.js"), "utf8"), context);
-  return { context, alarms, saved, reload, createAlarm, sockets, sent,
+  return { context, alarms, saved, save, reload, createAlarm, sockets, sent,
     fireAlarm: (name = "memmy-reconnect") => onAlarm({ name }),
+    fireStartup: () => onStartup(), fireInstalled: () => onInstalled(),
+    fireFocus: () => focusListeners.forEach(listener => listener()),
+    setAlarmFailures: (count: number) => { alarmFailures = count; },
+    setHeartbeat: (enabled: boolean) => { respondToPing = enabled; },
     setBridge: (running: boolean, connectionDelay = 0, handshakeDelay = 0) => {
       memmyRunning = running; connectDelay = connectionDelay; readyDelay = handshakeDelay;
     },
@@ -183,6 +210,147 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
 }
 
 describe("external browser connection recovery", () => {
+  it.each(["chrome", "edge"] as const)("wakes %s on profile startup and repairs a missing alarm", async browser => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ browser });
+      await vi.advanceTimersByTimeAsync(60_000);
+      test.alarms.clear();
+      test.setBridge(true);
+      test.fireStartup();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.get("memmy-reconnect")).toEqual({ periodInMinutes: 0.5 });
+      expect(test.sent).toContainEqual(expect.objectContaining({ type: "hello", browser }));
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("repairs an abnormal alarm on installation without resetting a healthy alarm", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ alarms: new Map([["memmy-reconnect", { periodInMinutes: 5 }]]) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.get("memmy-reconnect")).toEqual({ periodInMinutes: 0.5 });
+      test.createAlarm.mockClear();
+      test.fireInstalled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.createAlarm).not.toHaveBeenCalled();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("retries failed alarm setup within a bound and retries again on a later lifecycle event", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ alarmFailures: 100 });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(test.createAlarm.mock.calls.length).toBeGreaterThan(1);
+      expect(test.createAlarm.mock.calls.length).toBeLessThanOrEqual(4);
+      test.setAlarmFailures(0); test.setBridge(true); test.fireFocus();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+      test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each(["historyImportFailure", "historyInitializeFailure"] as const)("keeps execution recovery available after %s", async failure => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ [failure]: true });
+      test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+      expect(vm.runInContext("browserHistory", test.context)).toBeNull();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("accepts a bounded slow ready handshake and recovers a half-open socket", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness(); test.setBridge(true, 0, 1_200);
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.sockets).toHaveLength(1);
+      test.setHeartbeat(false); const original = test.sockets[0];
+      await vi.advanceTimersByTimeAsync(85_000);
+      expect(original.readyState).toBe(3);
+      test.setHeartbeat(true); await vi.advanceTimersByTimeAsync(6_000);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(JSON.stringify(test.saved.memmyConnectionDiagnostics)).toContain('"failure":"heartbeat_timeout"');
+      expect(JSON.stringify(test.saved.memmyConnectionDiagnostics)).toContain('"closeCode":4000');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("probes a healthy connection after sleep before deciding to reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness(); test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      const original = test.sockets[0];
+      vi.setSystemTime(Date.now() + 120_000); test.fireAlarm();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(test.sockets).toHaveLength(1);
+      expect(original.readyState).toBe(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("keeps older gateways that do not advertise heartbeat support connected", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ heartbeatSupported: false }); test.setBridge(true); test.setHeartbeat(false);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(test.sockets).toHaveLength(1);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("persists bounded metadata diagnostics in batches and discards stored content fields", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ storage: { memmyConnectionDiagnostics: { version: 1, events: [
+        { stage: "failed", at: 1, extensionVersion: "1.0.11", url: "https://private.test", title: "secret", error: "personal path", failure: "socket_error" },
+        { stage: "secret page text", at: 2, extensionVersion: "1.0.11" },
+      ] } } });
+      test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      for (let index = 0; index < 40; index++) test.fireStartup();
+      await vi.advanceTimersByTimeAsync(10_000);
+      const diagnostics = test.saved.memmyConnectionDiagnostics as { version: number; events: Array<Record<string, unknown>> };
+      expect(diagnostics.version).toBe(1);
+      expect(diagnostics.events.length).toBeLessThanOrEqual(24);
+      for (const event of diagnostics.events) {
+        expect(Object.keys(event).every(key => ["stage", "at", "extensionVersion", "port", "failure", "closeCode"].includes(key))).toBe(true);
+      }
+      expect(JSON.stringify(diagnostics)).not.toMatch(/private|secret|personal/);
+      const writes = test.save.mock.calls.length;
+      for (let index = 0; index < 40; index++) test.fireStartup();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(test.save.mock.calls.length).toBe(writes);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(test.save.mock.calls.length).toBe(writes + 1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("does not make connection recovery depend on diagnostic storage availability", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ storageReadFailure: true }); test.setBridge(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("leaves an automatic reload retryable after runtime.reload throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ reloadFailures: 1 }); await vi.advanceTimersByTimeAsync(0);
+      test.setInstalledVersion("99.0.0"); test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(test.reload).toHaveBeenCalledOnce();
+      expect(test.saved.reloadedForVersion).not.toBe("99.0.0");
+      test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(test.reload).toHaveBeenCalledTimes(2);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
   it("bounds failed quick retries and accepts a browser-delayed connection when Memmy returns", async () => {
     vi.useFakeTimers();
     try {
@@ -251,8 +419,8 @@ describe("external browser connection recovery", () => {
     vi.useFakeTimers();
     try {
       const test = reconnectHarness({ connectDelay: 3_000 });
-      test.setBridge(true, 3_000, 1_000);
-      await vi.advanceTimersByTimeAsync(3_800);
+      test.setBridge(true, 3_000, 6_000);
+      await vi.advanceTimersByTimeAsync(8_000);
       expect(test.sockets).toHaveLength(2);
       expect(vm.runInContext("sessionLive", test.context)).toBe(false);
       const abandoned = test.sockets[0];
@@ -382,7 +550,7 @@ describe("external browser page discovery", () => {
     try {
       const test = discoveryHarness({ browser, boot: true });
       await vi.advanceTimersByTimeAsync(0);
-      expect(test.sent).toContainEqual({ type: "hello", browser, capabilities: ["openTab", "playwright", "browserHistory"] });
+      expect(test.sent).toContainEqual({ type: "hello", browser, extensionVersion: "1.0.12", capabilities: ["openTab", "playwright", "browserHistory"] });
       expect(test.attaches).toEqual([]);
       expect(test.sent).toContainEqual(expect.objectContaining({ type: "claim", browser, tabId: 7 }));
       expect((await test.message({ action: "status" })).controllableTabCount).toBe(1);
@@ -737,7 +905,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.11");
+    expect(manifest.version).toBe("1.0.12");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");

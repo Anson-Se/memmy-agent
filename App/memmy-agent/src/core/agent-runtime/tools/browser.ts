@@ -6,7 +6,7 @@ import path from "node:path";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { BROWSER_EXTENSION_SETTINGS_LINK, BROWSER_PROFILE_CLEAR_RESULT, isBrowserProfileClearRequest,
   isComputerUseSurfaceAction, parseBrowserTaskSitePermission,
-  type ComputerUseSurfaceAction } from '@memmy/local-api-contracts';
+  type ComputerUseSurfaceAction, type ExternalBrowserState, type ExternalBrowserRecovery } from '@memmy/local-api-contracts';
 import type { BrowserToolsConfig } from "../../../config/schema.js";
 import { Tool, type ToolExecutionContext } from "./base.js";
 import {
@@ -290,6 +290,29 @@ export class BrowserSessionManager {
   private clearingData = false;
   private clearDataPromise: Promise<void> | null = null;
   private readonly embeddedTurns = new Map<string, symbol>();
+  private readonly browserDiscoveryControllers = new Map<string, Set<AbortController>>();
+
+  private invalidateEmbeddedTurn(key: string): void {
+    this.embeddedTurns.delete(key);
+    for (const controller of this.browserDiscoveryControllers.get(key) ?? []) controller.abort();
+    this.browserDiscoveryControllers.delete(key);
+  }
+
+  private beginBrowserDiscovery(scope: BrowserScope, signal?: AbortSignal | null) {
+    const key = browserScopeKey(scope);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const controllers = this.browserDiscoveryControllers.get(key) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.browserDiscoveryControllers.set(key, controllers);
+    return { signal: controller.signal, cleanup: () => {
+      signal?.removeEventListener('abort', abort);
+      controllers.delete(controller);
+      if (!controllers.size && this.browserDiscoveryControllers.get(key) === controllers) this.browserDiscoveryControllers.delete(key);
+    } };
+  }
 
   private captureEmbeddedTurn(scope: BrowserScope, signal?: AbortSignal | null): () => void {
     const key = browserScopeKey(scope);
@@ -317,25 +340,73 @@ export class BrowserSessionManager {
   supportsTabListing(): boolean {
     return this.config.enabled && this.desktopManaged && Boolean(this.embeddedBridge || this.externalRouter);
   }
-  async listBrowserTabs(scope: BrowserScope, targetBrowser?: TargetBrowser): Promise<string> {
+  async listBrowserTabs(scope: BrowserScope, targetBrowser?: TargetBrowser, signal?: AbortSignal | null,
+    allowRecovery = true): Promise<string> {
     this.validateTargetBrowser(targetBrowser);
     if (!this.supportsTabListing()) throw new Error('Desktop browser tabs are unavailable');
-    const assertTurn = this.captureEmbeddedTurn(scope);
-    const embedded = targetBrowser === 'chrome' || targetBrowser === 'edge' || !this.embeddedBridge
-      ? null : await this.embeddedBridge.listTabs();
-    assertTurn();
-    const external = targetBrowser === 'memmy' || !this.externalRouter
-      ? null : await this.externalRouter.listTabs(scope, targetBrowser);
-    assertTurn();
-    const tabs = [...(embedded?.tabs ?? []).map(tab => ({ ...tab, browser: 'memmy' })), ...(external?.tabs ?? [])];
-    const connectedBrowsers = external?.connectedBrowsers ?? [];
-    const wanted: Array<'chrome' | 'edge'> = targetBrowser === 'chrome' || targetBrowser === 'edge' ? [targetBrowser]
-      : targetBrowser === undefined && connectedBrowsers.length === 0 ? ['chrome', 'edge'] : [];
-    const notConnected = external ? wanted.filter(browser => !connectedBrowsers.includes(browser)) : [];
-    return JSON.stringify({ browserId: embedded?.browserId ?? null, selectedTabId: embedded?.selectedTabId ?? null,
-      tabs, count: tabs.length, connectedBrowsers, tabStatuses: external?.tabStatuses ?? [],
-      ...(notConnected.length ? { extensionSetup: { notConnected, settingsLink: BROWSER_EXTENSION_SETTINGS_LINK,
-        note: 'The Memmy extension is not connected in these browsers: it is not installed, or the browser is not running. It is optional. Offer settingsLink to the user once as a Markdown link, then continue without waiting: prefer the Memmy in-app browser, or use Computer Use on the user\'s browser.' } } : {}) });
+    const discovery = this.beginBrowserDiscovery(scope, signal);
+    const assertTurn = this.captureEmbeddedTurn(scope, discovery.signal);
+    try {
+      assertTurn();
+      const explicitExternal = targetBrowser === 'chrome' || targetBrowser === 'edge' ? targetBrowser : null;
+      const embedded = explicitExternal || !this.embeddedBridge ? null : await this.embeddedBridge.listTabs();
+      assertTurn();
+      let external = targetBrowser === 'memmy' || !this.externalRouter
+        ? null : await this.externalRouter.listTabs(scope, explicitExternal ?? undefined);
+      assertTurn();
+      let state: ExternalBrowserState | null = null;
+      let recovery: ExternalBrowserRecovery | 'not_attempted' = 'not_attempted';
+      let waitTimeoutMs = 0;
+      const canRecover = allowRecovery && !['system', 'cron'].includes(scope.channel);
+      if (explicitExternal && external && (!external.connectedBrowsers.includes(explicitExternal)
+        || external.pageDiscoveryStatus === 'unresponsive')) {
+        try { state = await this.embeddedBridge?.getExternalBrowserState(discovery.signal) ?? null; }
+        catch { /* Preserve unavailable metadata as unknown. */ }
+        assertTurn();
+        const installed = state?.installation[explicitExternal].installed ?? null;
+        const enabled = state?.installation[explicitExternal].enabled ?? null;
+        const running = state?.runningBrowsers === null || !state ? null : state.runningBrowsers.includes(explicitExternal);
+        if (canRecover && installed !== false && enabled !== false && running !== false) {
+          if (installed === true && enabled === true && running === true && this.embeddedBridge) {
+            assertTurn();
+            try { recovery = await this.embeddedBridge.recoverExternalBrowser(explicitExternal, discovery.signal); }
+            catch { recovery = 'failed'; }
+            assertTurn();
+          }
+          waitTimeoutMs = installed === true && enabled === true && running === true ? 45_000 : 2_000;
+          await this.externalRouter!.waitForConnection(explicitExternal, waitTimeoutMs, discovery.signal);
+          assertTurn();
+          external = await this.externalRouter!.listTabs(scope, explicitExternal);
+          assertTurn();
+        }
+      }
+      const tabs = [...(embedded?.tabs ?? []).map(tab => ({ ...tab, browser: 'memmy' })), ...(external?.tabs ?? [])];
+      const connectedBrowsers = external?.connectedBrowsers ?? [];
+      const wanted: Array<'chrome' | 'edge'> = explicitExternal ? [explicitExternal]
+        : targetBrowser === undefined && connectedBrowsers.length === 0 ? ['chrome', 'edge'] : [];
+      const statuses = explicitExternal ? [explicitExternal] : connectedBrowsers.length ? connectedBrowsers : wanted;
+      const connectionStatus = statuses.map(browser => {
+        const connected = connectedBrowsers.includes(browser);
+        const installed = connected ? true : state?.installation[browser].installed ?? null;
+        const enabled = connected ? true : state?.installation[browser].enabled ?? null;
+        const running = connected ? true : !state || state.runningBrowsers === null ? null : state.runningBrowsers.includes(browser);
+        const reason = external?.pageDiscoveryStatus === 'unresponsive' ? 'page_discovery_unresponsive'
+          : connected ? undefined : installed === false ? 'not_installed'
+          : enabled === false ? 'extension_disabled' : running === false ? 'browser_not_running'
+          : !canRecover ? 'recovery_not_allowed' : waitTimeoutMs === 45_000 ? 'connection_timeout' : 'state_unknown';
+        return { browser, installed, enabled, running, connected,
+          recovery: connected && waitTimeoutMs === 0 && external?.pageDiscoveryStatus !== 'unresponsive' ? 'not_needed' : recovery, waitTimeoutMs,
+          ...(reason ? { reason } : {}) };
+      });
+      const notConnected = external ? wanted.filter(browser => !connectedBrowsers.includes(browser)) : [];
+      return JSON.stringify({ browserId: embedded?.browserId ?? null, selectedTabId: embedded?.selectedTabId ?? null,
+        tabs, count: tabs.length, connectedBrowsers, connectionStatus, tabStatuses: external?.tabStatuses ?? [],
+        ...(external ? { pageDiscoveryStatus: external.pageDiscoveryStatus ?? 'ready' } : {}),
+        ...(notConnected.length ? { extensionSetup: { notConnected,
+          installRequired: connectionStatus.filter(status => status.installed === false).map(status => status.browser),
+          settingsLink: BROWSER_EXTENSION_SETTINGS_LINK,
+          note: 'Connection, installation, enabled state, and browser process state are separate facts. Suggest installation only for installRequired; null means unknown. If enabled is false, the existing extension needs enabling. An installed but disconnected extension may be starting or reconnecting. Preserve the requested browser, account, and page when continuing with another available interface.' } } : {}) });
+    } finally { discovery.cleanup(); }
   }
   supportsExternalTabSelection(): boolean {
     return this.config.enabled && this.desktopManaged && this.externalRouter !== null;
@@ -1536,7 +1607,7 @@ export class BrowserSessionManager {
   }
 
   async closeSession(scope: BrowserScope): Promise<void> {
-    this.embeddedTurns.delete(browserScopeKey(scope));
+    this.invalidateEmbeddedTurn(browserScopeKey(scope));
     this.embeddedRouter?.closeSession(scope);
     this.externalRouter?.closeSession(scope);
     const key = browserScopeKey(scope);
@@ -1547,7 +1618,7 @@ export class BrowserSessionManager {
   async closeChat(channel: string, chatId: string): Promise<void> {
     for (const key of this.embeddedTurns.keys()) {
       const [, boundChannel, boundChatId] = JSON.parse(key);
-      if (boundChannel === channel && boundChatId === chatId) this.embeddedTurns.delete(key);
+      if (boundChannel === channel && boundChatId === chatId) this.invalidateEmbeddedTurn(key);
     }
     this.embeddedRouter?.closeChat(channel, chatId);
     this.externalRouter?.closeChat(channel, chatId);
@@ -1577,7 +1648,7 @@ export class BrowserSessionManager {
 
   private async clearBrowsingDataOnce(): Promise<void> {
     this.clearingData = true;
-    this.embeddedTurns.clear();
+    for (const key of this.embeddedTurns.keys()) this.invalidateEmbeddedTurn(key);
     try {
       await Promise.allSettled([...this.creations.values()]);
       const sessions = [...this.sessions.values()];
@@ -1600,7 +1671,7 @@ export class BrowserSessionManager {
       channel: 'projected-session', chatId: scope.sessionKey };
     const turnScopes = browserScopeKey(scope) === browserScopeKey(projectedScope)
       ? [scope] : [scope, projectedScope];
-    for (const item of turnScopes) this.embeddedTurns.delete(browserScopeKey(item));
+    for (const item of turnScopes) this.invalidateEmbeddedTurn(browserScopeKey(item));
     await Promise.allSettled(turnScopes.map(item => this.embeddedRouter?.finishTurn(item)));
     await Promise.allSettled(turnScopes.map(async item => this.externalRouter?.finishTurn(item)));
     const session = this.sessions.get(browserScopeKey(scope))
@@ -1641,7 +1712,7 @@ export class BrowserSessionManager {
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
-    this.embeddedTurns.clear();
+    for (const key of this.embeddedTurns.keys()) this.invalidateEmbeddedTurn(key);
     this.externalRouter?.closeAll();
     this.embeddedRouter?.closeAll();
     this.embeddedBridge?.close();
@@ -1805,14 +1876,14 @@ export class BrowserListTabsTool extends Tool {
 
   get name(): string { return 'browser_list_tabs'; }
   get description(): string {
-    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. Chrome/Edge discovery refreshes the installed extension and reports connected browsers, controllable tabs, and page connection failures separately; extensionSetup appears when the requested browser has no connected extension. Resolve the user-requested title or URL to its matching tabMention internally; never ask the user to copy it. A connected extension with no controllable tab is not a usable page. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
+    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. For an explicitly requested Chrome/Edge with an installed enabled extension and running process, interactive discovery may bring that browser forward without navigation and waits up to 45 seconds for reconnection. Untargeted, Memmy, and non-interactive discovery never wake an external browser. Unknown metadata gets a short grace period; confirmed absent, disabled, or stopped states return immediately. connectionStatus separates installed/enabled/running/connected facts; null means unknown. Only extensionSetup.installRequired confirms missing installation. Connected extensions with no controllable tabs remain connected; pageDiscoveryStatus unresponsive is a page-list reply failure, not proof of disconnection. Resolve the requested page to its tabMention internally; never ask the user to copy it. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
   }
   get parameters(): Record<string, any> { return { type: 'object', properties: { targetBrowser: targetBrowserParameter }, additionalProperties: false }; }
-  override get readOnly(): boolean { return true; }
+  override get readOnly(): boolean { return false; }
 
   setContext(context: RequestContext): void { this.requestContext.set(context); }
 
-  async execute(params: Record<string, any> = {}): Promise<string> {
+  async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string> {
     const request = this.requestContext.get();
     if (!request?.sessionKey?.trim() || !request.channel?.trim()
         || !request.chatId?.trim() || !request.workspace?.trim()) {
@@ -1820,7 +1891,8 @@ export class BrowserListTabsTool extends Tool {
     }
     return this.manager.listBrowserTabs(request.browserScope ?? {
       sessionKey: request.sessionKey, channel: request.channel, chatId: request.chatId,
-    }, params.targetBrowser);
+    }, params.targetBrowser, context?.abortSignal,
+      request.metadata.computerUseInteractive !== false && !['system', 'cron'].includes(request.channel));
   }
 }
 

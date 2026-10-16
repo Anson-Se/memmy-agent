@@ -22,6 +22,7 @@ export type ClaimedBrowserBridge = {
   listConnected?(): Array<'chrome' | 'edge'>;
   listTabStatuses?(): ExternalBrowserTabStatus[];
   refreshTabs?(browser?: 'chrome' | 'edge'): Promise<void>;
+  waitForConnection?(browser: 'chrome' | 'edge', timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
   openBrowserTab?(browser: 'chrome' | 'edge', url: string,
     source?: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): Promise<ExternalBrowserClaim>;
   getClaim(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): ExternalBrowserClaim | null;
@@ -133,18 +134,27 @@ export class ExternalBrowserSessionRouter {
   }
 
   async listTabs(scope: BrowserScope, browser?: 'chrome' | 'edge') {
-    await this.bridge.refreshTabs?.(browser);
+    let pageDiscoveryStatus: 'ready' | 'unresponsive' = 'ready';
+    try { await this.bridge.refreshTabs?.(browser); }
+    catch (error) {
+      // Keep a slow/half-open bridge distinct from an absent extension. Do not
+      // disconnect a shared client and cancel another chat's work to rescan it.
+      if (!(error instanceof Error) || !['Browser extension page refresh timed out', 'External browser disconnected']
+        .includes(error.message)) throw error;
+      pageDiscoveryStatus = 'unresponsive';
+    }
     const key = scopeKey(scope);
     const chat = this.chats.get(key);
     const claims = this.controllableClaims().filter(claim => claim.browser !== 'memmy'
       && (!browser || claim.browser === browser));
     return {
+      pageDiscoveryStatus,
       connectedBrowsers: (this.bridge.listConnected?.() ?? [])
         .filter(name => !browser || name === browser),
       tabStatuses: (this.bridge.listTabStatuses?.() ?? [])
         .filter(tab => !browser || tab.browser === browser)
         .map(({ connectionId: _connectionId, ...tab }) => tab),
-      tabs: claims.map(claim => {
+      tabs: (pageDiscoveryStatus === 'ready' ? claims : []).map(claim => {
         const owner = this.otherOwner(key, claim);
         return { browser: claim.browser, tabId: claim.tabId,
           title: claim.title, url: claim.url, active: claim.active === true,
@@ -153,6 +163,11 @@ export class ExternalBrowserSessionRouter {
           tabMention: formatExternalBrowserTabReference({ ...claim, browser: claim.browser as 'chrome' | 'edge' }) };
       }),
     };
+  }
+
+  waitForConnection(browser: 'chrome' | 'edge', timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    return this.bridge.waitForConnection?.(browser, timeoutMs, signal)
+      ?? Promise.resolve((this.bridge.listConnected?.() ?? []).includes(browser));
   }
 
   async selectBrowser(scope: BrowserScope, browser: 'chrome' | 'edge', mention?: string,

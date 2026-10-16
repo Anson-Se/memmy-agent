@@ -26,8 +26,9 @@ import { showBrowserAuthForm } from './browser-auth-form.js';
 import { resolveExternalBrowserExtensionDirectory } from './external-browser-extension-directory.js';
 import { createExternalBrowserExtensionDragHandler, EXTERNAL_BROWSER_EXTENSION_DRAG_CHANNEL } from './external-browser-extension-drag.js';
 import { launchExternalBrowserExtensionManager, type ExternalBrowserInstallPreparation } from './external-browser-extension-install.js';
-import { installedExternalBrowsers } from './installed-external-browsers.js';
+import { installedExternalBrowsers, probeExternalBrowserInstallation } from './installed-external-browsers.js';
 import { runningExternalBrowsers } from './running-external-browsers.js';
+import { wakeExternalBrowser } from './wake-external-browser.js';
 import { retireLockedMacConsent } from './retire-locked-mac-consent.js';
 import { hasFullDiskAccess } from './full-disk-access.js';
 import { isMacPermissionSystemQuit, isMacSystemSessionQuit, MacPermissionRestartIntent,
@@ -584,6 +585,25 @@ async function boot(): Promise<void> {
         browserSidebarBridge?.clear();
       },
       handleEmbeddedBrowserRequest: async (request, isCurrentChild, emitEvent) => {
+        if (request.command === 'externalBrowserState') {
+          if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
+          const installation = probeExternalBrowserInstallation();
+          const runningBrowsers = await runningExternalBrowsers();
+          if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
+          return { installation, runningBrowsers };
+        }
+        if (request.command === 'recoverExternalBrowser') {
+          if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
+          const browser = request.args.browser;
+          if (browser !== 'chrome' && browser !== 'edge') throw new Error('Invalid external browser');
+          const running = await runningExternalBrowsers();
+          if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
+          const installation = probeExternalBrowserInstallation()[browser];
+          if (installation.installed !== true || installation.enabled !== true || !running?.includes(browser)) return 'unavailable';
+          const recovery = await wakeExternalBrowser(browser);
+          if (!isCurrentChild()) throw new Error('Browser operation belongs to a finished turn');
+          return recovery;
+        }
         if (request.command === 'setSitePermission') {
           const choice = parseBrowserTaskSitePermission(request.args);
           if (!choice || !Number.isSafeInteger(request.tabId) || !isCurrentChild()
