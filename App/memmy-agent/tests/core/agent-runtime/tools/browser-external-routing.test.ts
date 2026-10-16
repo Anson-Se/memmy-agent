@@ -127,18 +127,56 @@ it('keeps discovery bounded and reports a reconnect timeout without suggesting r
   } finally { await f.manager.close(); }
 });
 
-it('uses only a short grace when installation is known but enablement is unknown', async () => {
+it.each((['chrome', 'edge'] as const).flatMap(browser => [
+  { browser, installed: null, enabled: null },
+  { browser, installed: true, enabled: null },
+  { browser, installed: null, enabled: true },
+]))('recovers a requested running $browser when installation metadata is unreadable: $installed/$enabled', async ({ browser, installed, enabled }) => {
+  const f = discoveryFixture(browser);
+  f.bridge.getExternalBrowserState.mockResolvedValue({ installation: {
+    chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null },
+    [browser]: { installed, enabled },
+  }, runningBrowsers: [browser] });
+  try {
+    const result = JSON.parse(await f.manager.listBrowserTabs(f.scope, browser));
+    expect(f.bridge.recoverExternalBrowser).toHaveBeenCalledWith(browser, expect.any(AbortSignal));
+    expect(f.router.waitForConnection).toHaveBeenCalledWith(browser, 45_000, expect.any(AbortSignal));
+    // Only the authenticated extension handshake promotes unknown metadata to true.
+    expect(result.connectionStatus).toEqual([{ browser, installed: true, enabled: true, running: true,
+      connected: true, recovery: 'woken', waitTimeoutMs: 45_000 }]);
+    expect(result.extensionSetup).toBeUndefined();
+  } finally { await f.manager.close(); }
+});
+
+it.each(['woken', 'failed', 'unavailable', 'throw'] as const)('waits for a live handshake after %s recovery with unreadable installation metadata', async outcome => {
   const f = discoveryFixture();
   f.bridge.getExternalBrowserState.mockResolvedValue({ installation: {
-    chrome: { installed: true, enabled: null }, edge: { installed: null, enabled: null },
+    chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null },
   }, runningBrowsers: ['chrome'] });
+  if (outcome === 'throw') f.bridge.recoverExternalBrowser.mockRejectedValue(new Error('launch failed'));
+  else f.bridge.recoverExternalBrowser.mockResolvedValue(outcome);
+  f.router.waitForConnection.mockResolvedValue(false);
+  try {
+    const result = JSON.parse(await f.manager.listBrowserTabs(f.scope, 'chrome'));
+    expect(f.bridge.recoverExternalBrowser).toHaveBeenCalledOnce();
+    expect(f.router.waitForConnection).toHaveBeenCalledWith('chrome', 45_000, expect.any(AbortSignal));
+    expect(result.connectionStatus).toEqual([{ browser: 'chrome', installed: null, enabled: null, running: true,
+      connected: false, recovery: outcome === 'throw' ? 'failed' : outcome, waitTimeoutMs: 45_000, reason: 'connection_timeout' }]);
+    expect(result.extensionSetup.installRequired).toEqual([]);
+  } finally { await f.manager.close(); }
+});
+
+it('keeps recovery passive when only the running-browser probe is unavailable', async () => {
+  const f = discoveryFixture();
+  f.bridge.getExternalBrowserState.mockResolvedValue({ installation: {
+    chrome: { installed: true, enabled: true }, edge: { installed: null, enabled: null },
+  }, runningBrowsers: null });
   f.router.waitForConnection.mockResolvedValue(false);
   try {
     const result = JSON.parse(await f.manager.listBrowserTabs(f.scope, 'chrome'));
     expect(f.bridge.recoverExternalBrowser).not.toHaveBeenCalled();
     expect(f.router.waitForConnection).toHaveBeenCalledWith('chrome', 2_000, expect.any(AbortSignal));
-    expect(result.connectionStatus[0]).toMatchObject({ installed: true, enabled: null, connected: false,
-      recovery: 'not_attempted', waitTimeoutMs: 2_000, reason: 'state_unknown' });
+    expect(result.connectionStatus[0]).toMatchObject({ running: null, recovery: 'not_attempted', reason: 'state_unknown' });
   } finally { await f.manager.close(); }
 });
 
