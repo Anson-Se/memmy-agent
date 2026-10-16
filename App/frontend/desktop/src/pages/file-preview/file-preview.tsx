@@ -3,10 +3,12 @@ import {
   lazy,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
   type ComponentPropsWithoutRef,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type RefObject
@@ -31,17 +33,26 @@ import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n/use-translation.js";
 import { resolveFileType } from "../../lib/file-type.js";
 import {
+  docxLineHeightCss,
   readDocxBlocks,
   readXlsxSheets,
   type DocxBlock,
+  type DocxDrawingShape,
+  type DocxParagraphFormat,
   type DocxTextSpan,
   type XlsxSheet
 } from "../../lib/office-preview.js";
+import { XlsxPreview } from "./xlsx-preview.js";
 import type { FilePreviewResource, FilePreviewViewState } from "./file-preview-types.js";
 
 const PdfPreview = lazy(async () => {
   const module = await import("./pdf-preview.js");
   return { default: module.PdfPreview };
+});
+
+const PptxPreview = lazy(async () => {
+  const module = await import("./pptx-preview.js");
+  return { default: module.PptxPreview };
 });
 
 const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
@@ -135,6 +146,18 @@ export function FilePreview(props: FilePreviewProps): ReactNode {
   }
   if (loadedFileType.kind === "spreadsheet" && props.resource.name.toLowerCase().endsWith(".xlsx")) {
     return searchable(<OfficePreview kind="xlsx" blob={state.blob} />);
+  }
+  if (loadedFileType.kind === "presentation" && props.resource.name.toLowerCase().endsWith(".pptx")) {
+    return (
+      <Suspense fallback={<PreviewStatus label={t("filePreview.loading")} />}>
+        <PptxPreview
+          blob={state.blob}
+          resource={props.resource}
+          viewState={props.viewState}
+          onViewStateChange={props.onViewStateChange}
+        />
+      </Suspense>
+    );
   }
   if (
     loadedFileType.kind === "spreadsheet"
@@ -690,41 +713,180 @@ function OfficePreview(props: { kind: "docx" | "xlsx"; blob: Blob }) {
 function DocxPreview(props: { blocks: DocxBlock[] }) {
   return (
     <article className="file-preview__office-document">
-      {props.blocks.map((block, index) => {
-        if (block.kind === "table") {
-          return <table key={index}><tbody>{block.rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell.map((span, spanIndex) => <DocxSpan key={spanIndex} span={span} />)}</td>)}</tr>)}</tbody></table>;
-        }
-        if (!block.spans.length) return <div key={index} className="file-preview__office-space" />;
-        const content = block.spans.map((span, spanIndex) => <DocxSpan key={spanIndex} span={span} />);
-        if (block.headingLevel === null) return <p key={index}>{content}</p>;
-        const Heading = `h${Math.min(6, block.headingLevel + 1)}` as "h2";
-        return <Heading key={index}>{content}</Heading>;
-      })}
+      <DocxBlocks blocks={props.blocks} />
     </article>
+  );
+}
+
+function DocxBlocks(props: { blocks: DocxBlock[] }) {
+  return props.blocks.map((block, index) => {
+    if (block.kind === "table") return <DocxTable key={index} block={block} />;
+    if (block.kind === "image") return <DocxImage key={index} block={block} />;
+    if (block.kind === "drawing") return <DocxDrawing key={index} block={block} />;
+    if (!block.spans.length && !block.format) return <div key={index} className="file-preview__office-space" />;
+    const content = block.spans.length
+      ? block.spans.map((span, spanIndex) => <DocxSpan key={spanIndex} span={span} />)
+      : "\u00a0";
+    const style = docxParagraphStyle(block.format);
+    if (block.headingLevel === null) return <p key={index} style={style}>{content}</p>;
+    const Heading = `h${Math.min(6, block.headingLevel + 1)}` as "h2";
+    return <Heading key={index} style={style}>{content}</Heading>;
+  });
+}
+
+function docxParagraphStyle(format: DocxParagraphFormat | undefined): CSSProperties | undefined {
+  if (!format) return undefined;
+  const style: CSSProperties = {};
+  if (format.align) style.textAlign = format.align;
+  const left = characterOrTwip(format.indentLeftChars, format.indentLeft);
+  const right = characterOrTwip(format.indentRightChars, format.indentRight);
+  const firstLine = characterOrTwip(format.firstLineChars, format.firstLine);
+  const before = characterOrTwip(format.beforeLines, format.before);
+  const after = characterOrTwip(format.afterLines, format.after);
+  if (left) style.paddingLeft = left;
+  if (right) style.paddingRight = right;
+  if (firstLine) style.textIndent = firstLine;
+  if (before) style.marginTop = before;
+  if (after) style.marginBottom = after;
+  if (format.line != null) {
+    const lineHeight = docxLineHeightCss(format.line, format.lineRule);
+    if (lineHeight != null) style.lineHeight = lineHeight;
+  }
+  return Object.keys(style).length ? style : undefined;
+}
+
+/** Character measurements are hundredths of an em. Twips are twentieths of a point. */
+function characterOrTwip(characters: number | undefined, twips: number | undefined): string | undefined {
+  if (characters != null && characters !== 0) return `${characters / 100}em`;
+  if (twips != null && twips !== 0) return `${twips / 20}pt`;
+  return undefined;
+}
+
+function DocxImage(props: { block: Extract<DocxBlock, { kind: "image" }> }) {
+  return (
+    <img
+      className="file-preview__office-image"
+      alt=""
+      src={props.block.src}
+      style={{ width: `min(100%, ${props.block.widthPt}pt)` }}
+    />
+  );
+}
+
+function DocxDrawing(props: { block: Extract<DocxBlock, { kind: "drawing" }> }) {
+  const markerId = `office-arrow-${useId().replace(/:/g, "")}`;
+  const { widthPt, heightPt, shapes } = props.block;
+  const connectors = shapes.filter((shape) => shape.role === "line" || shape.role === "elbow" || shape.role === "arrow-h" || shape.role === "arrow-v");
+  const boxes = shapes.filter((shape) => !connectors.includes(shape));
+  return (
+    <div className="file-preview__office-drawing" style={{ width: `min(100%, ${widthPt}pt)`, aspectRatio: `${widthPt} / ${heightPt}` }}>
+      <svg className="file-preview__office-drawing-svg" viewBox={`0 0 ${widthPt} ${heightPt}`}>
+        <defs>
+          <marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0 L8,3.2 L0,6.4 Z" />
+          </marker>
+          <marker id={`${markerId}-start`} markerWidth="8" markerHeight="8" refX="1" refY="3.2" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+            <path d="M8,0 L0,3.2 L8,6.4 Z" />
+          </marker>
+        </defs>
+        {connectors.map((shape, index) => (
+          <DocxConnector key={index} shape={shape} widthPt={widthPt} heightPt={heightPt} markerId={markerId} />
+        ))}
+      </svg>
+      {boxes.map((shape, index) => <DocxDrawingBox key={index} shape={shape} />)}
+    </div>
+  );
+}
+
+function DocxConnector(props: { shape: DocxDrawingShape; widthPt: number; heightPt: number; markerId: string }) {
+  const points = connectorPoints(props.shape).map(([u, v]) => mapDrawingPoint(props.shape, u, v, props.widthPt, props.heightPt));
+  const common = {
+    fill: props.shape.role === "arrow-h" || props.shape.role === "arrow-v" ? "#fff" : "none",
+    stroke: "#222",
+    strokeWidth: 1.1,
+    strokeLinejoin: "round" as const,
+    markerEnd: props.shape.endArrow ? `url(#${props.markerId})` : undefined,
+    markerStart: props.shape.startArrow ? `url(#${props.markerId}-start)` : undefined
+  };
+  if (props.shape.role === "arrow-h" || props.shape.role === "arrow-v") {
+    return <polygon points={points.map(([x, y]) => `${x},${y}`).join(" ")} {...common} />;
+  }
+  return <polyline points={points.map(([x, y]) => `${x},${y}`).join(" ")} {...common} />;
+}
+
+function DocxDrawingBox(props: { shape: DocxDrawingShape }) {
+  const { shape } = props;
+  return (
+    <div
+      className={`file-preview__office-shape is-${shape.role}`}
+      style={{ left: `${shape.left}%`, top: `${shape.top}%`, width: `${shape.width}%`, height: `${shape.height}%` }}
+    >
+      {shape.role === "diamond" ? (
+        <svg className="file-preview__office-diamond" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <polygon points="50,1.5 98.5,50 50,98.5 1.5,50" />
+        </svg>
+      ) : null}
+      {shape.text ? <span className="file-preview__office-shape-text">{shape.text}</span> : null}
+    </div>
+  );
+}
+
+/** Unit-box points of a connector, before its flip and rotation. */
+function connectorPoints(shape: DocxDrawingShape): Array<[number, number]> {
+  if (shape.role === "arrow-h") {
+    return [[0, 0.5], [0.22, 0.16], [0.22, 0.38], [0.78, 0.38], [0.78, 0.16], [1, 0.5], [0.78, 0.84], [0.78, 0.62], [0.22, 0.62], [0.22, 0.84]];
+  }
+  if (shape.role === "arrow-v") {
+    return [[0.5, 0], [0.84, 0.22], [0.62, 0.22], [0.62, 0.78], [0.84, 0.78], [0.5, 1], [0.16, 0.78], [0.38, 0.78], [0.38, 0.22], [0.16, 0.22]];
+  }
+  if (shape.role === "elbow") return [[0, 0], [shape.adj, 0], [shape.adj, 1], [1, 1]];
+  return [[0, 0], [1, 1]];
+}
+
+function mapDrawingPoint(shape: DocxDrawingShape, u: number, v: number, widthPt: number, heightPt: number): [number, number] {
+  const x = shape.flipX ? 1 - u : u;
+  const y = shape.flipY ? 1 - v : v;
+  const boxW = shape.width / 100 * widthPt;
+  const boxH = shape.height / 100 * heightPt;
+  const cx = shape.left / 100 * widthPt + boxW / 2;
+  const cy = shape.top / 100 * heightPt + boxH / 2;
+  const dx = (x - 0.5) * boxW;
+  const dy = (y - 0.5) * boxH;
+  const rad = shape.rotation * Math.PI / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+}
+
+function DocxTable(props: { block: Extract<DocxBlock, { kind: "table" }> }) {
+  const widths = props.block.columnWidths.some((width) => width > 0) ? props.block.columnWidths : [];
+  return (
+    <div className="file-preview__table-scroll">
+      <table>
+        {widths.length ? (
+          <colgroup>
+            {widths.map((width, index) => <col key={index} style={{ width: `${width / 20}pt` }} />)}
+          </colgroup>
+        ) : null}
+        <tbody>
+          {props.block.rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {row.map((cell, cellIndex) => (
+                <td key={cellIndex} colSpan={cell.colSpan > 1 ? cell.colSpan : undefined} rowSpan={cell.rowSpan > 1 ? cell.rowSpan : undefined}>
+                  <DocxBlocks blocks={cell.content} />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
 function DocxSpan(props: { span: DocxTextSpan }) {
   if (!props.span.bold && !props.span.italic) return <>{props.span.text}</>;
   return <span className={`${props.span.bold ? "font-semibold" : ""} ${props.span.italic ? "italic" : ""}`.trim()}>{props.span.text}</span>;
-}
-
-function XlsxPreview(props: { sheets: XlsxSheet[] }) {
-  const [activeIndex, setActiveIndex] = useState(0);
-  const sheet = props.sheets[Math.min(activeIndex, props.sheets.length - 1)];
-  if (!sheet) return null;
-  const [header, ...body] = sheet.rows;
-  return (
-    <div className="file-preview__spreadsheet">
-      {props.sheets.length > 1 ? <div className="file-preview__sheet-tabs">{props.sheets.map((item, index) => <button key={`${item.name}:${index}`} type="button" className={index === activeIndex ? "is-active" : ""} onClick={() => setActiveIndex(index)}>{item.name}</button>)}</div> : null}
-      <div className="file-preview__table-scroll">
-        <table>
-          {header ? <thead><tr>{header.map((cell, index) => <th key={index}>{cell}</th>)}</tr></thead> : null}
-          <tbody>{body.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody>
-        </table>
-      </div>
-    </div>
-  );
 }
 
 function useObjectUrl(blob: Blob): string | null {

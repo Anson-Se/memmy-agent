@@ -19,17 +19,22 @@ import {
 } from "lucide-react";
 import {
   GlobalWorkerOptions,
+  PDFWorker,
   TextLayer,
   getDocument,
   type PDFDocumentProxy,
   type PDFPageProxy
 } from "pdfjs-dist";
+import PdfJsWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "pdfjs-dist/web/pdf_viewer.css";
 import { useTranslation } from "../../i18n/use-translation.js";
 import { computePdfDisplayScale, highlightPdfTextLayer, nextPdfMatchIndex } from "./pdf-preview-state.js";
 import type { FilePreviewViewState } from "./file-preview-types.js";
 
+// Fallback if the dedicated worker fails to boot. The primary path below
+// constructs the worker from the bundled module, so a packaged server that
+// labels `.mjs` as a download cannot block PDF rendering.
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const MIN_SCALE = 0.5;
@@ -75,7 +80,12 @@ export function PdfPreview(props: PdfPreviewProps): ReactNode {
 
   useEffect(() => {
     let active = true;
-    const loadingTask = getDocument({ data: new Uint8Array(props.data.slice(0)) });
+    const port = new PdfJsWorker();
+    const worker = PDFWorker.create({ port });
+    const loadingTask = getDocument({
+      data: new Uint8Array(props.data.slice(0)),
+      worker
+    });
     setDocument(null);
     setFailed(false);
     void loadingTask.promise.then((next) => {
@@ -87,6 +97,7 @@ export function PdfPreview(props: PdfPreviewProps): ReactNode {
     return () => {
       active = false;
       void loadingTask.destroy();
+      worker.destroy();
     };
   }, [props.data]);
 

@@ -1,0 +1,440 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+SOURCE = Path(__file__).resolve().parents[4] / "src/tools/computer-history/mac/wechat/private_storage.py"
+
+
+class PrivateStorageTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("wechat_private_storage", SOURCE)
+        self.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.helper)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.home = self.root / "home"
+        self.home.mkdir(mode=0o700)
+        self.state = self.root / "state"
+        self.state.mkdir(mode=0o700)
+        self.container = self.home / self.helper._CONTAINER
+        self.container.mkdir(parents=True, mode=0o700)
+        self.data = self.container / "Data/Documents"
+        self.data.mkdir(parents=True, mode=0o700)
+        self.file = self.data / "fixture.db"
+        self.file.write_bytes(b"only synthetic fixture bytes")
+        self.file.chmod(0o600)
+        self.group = self.home / self.helper._GROUP
+        self.native_clone = self.helper._clone_file
+        self.write_consent()
+        patches = [
+            mock.patch.object(self.helper, "_real_home", return_value=self.home),
+            mock.patch.object(self.helper, "_clone_file", side_effect=self.copy_fixture),
+        ]
+        self.clone = None
+        for patch in patches:
+            value = patch.start()
+            self.addCleanup(patch.stop)
+            if patch.attribute == "_clone_file":
+                self.clone = value
+
+    def write_consent(self, enabled=True, identifier="authorized", mode=0o600):
+        consent = self.state / "consent.json"
+        consent.write_text(json.dumps({"version": 1, "enabled": enabled,
+                                       "consentedAt": "fixture-time", "consentId": identifier}))
+        consent.chmod(mode)
+
+    def copy_fixture(self, source, destination):
+        if source.is_relative_to(self.state):
+            self.assertEqual(source.parent.parent, self.state)
+            self.assertTrue(source.parent.name.startswith("clone-preflight-"))
+            self.assertEqual(source.read_bytes(), b"Memmy private storage clone preflight\n")
+        else:
+            source.relative_to(self.home)
+        shutil.copyfile(source, destination)
+
+    def create(self, **options):
+        return self.helper.create_private_storage(self.state, consent_id="authorized", **options)
+
+    def sessions(self):
+        return list(self.state.glob("storage-session-*"))
+
+    def test_clones_fixed_container_into_private_layout_and_maps_original(self):
+        original = self.file.read_bytes()
+        result = self.create()
+        session = Path(result["sessionPath"])
+        copied = Path(result["containerPath"])
+        self.assertEqual(copied, Path(result["privateHome"]) / self.helper._CONTAINER)
+        self.assertEqual(result["mappings"], {str(self.container): str(copied), str(self.group): result["groupPath"]})
+        private_group = Path(result["groupPath"])
+        self.assertEqual(private_group, Path(result["privateHome"]) / self.helper._GROUP)
+        self.assertTrue(private_group.is_dir())
+        self.assertEqual(list(private_group.iterdir()), [])
+        self.assertFalse(self.group.exists())
+        self.assertEqual((copied / "Data/Documents/fixture.db").read_bytes(), original)
+        for item in (session, *session.rglob("*")):
+            if item.is_dir():
+                self.assertEqual(stat.S_IMODE(item.stat().st_mode), 0o700, item)
+            elif item.is_file():
+                self.assertEqual(stat.S_IMODE(item.stat().st_mode), 0o600, item)
+        (copied / "Data/Documents/fixture.db").write_bytes(b"private modification")
+        self.assertEqual(self.file.read_bytes(), original)
+        self.assertTrue(self.helper.cleanup(session, self.state))
+        self.assertFalse(session.exists())
+        self.assertFalse(self.helper.cleanup(session, self.state))
+
+    def test_optional_fixed_group_is_cloned_when_present(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        (self.group / "fixture.plist").write_text("synthetic group")
+        result = self.create(optional_group=self.group)
+        self.assertEqual(result["mappings"][str(self.group)], result["groupPath"])
+        self.assertEqual((Path(result["groupPath"]) / "fixture.plist").read_text(), "synthetic group")
+
+    def test_standard_group_application_scripts_alias_becomes_empty_private_directory(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        alias = self.group / self.helper._GROUP_SCRIPT_ALIAS
+        alias.parent.mkdir(parents=True)
+        external = self.home / self.helper._GROUP_SCRIPT_ALIAS
+        alias.symlink_to(os.path.relpath(external, alias.parent))
+        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        result = self.create()
+        placeholder = Path(result["groupPath"]) / self.helper._GROUP_SCRIPT_ALIAS
+        self.assertTrue(placeholder.is_dir())
+        self.assertFalse(placeholder.is_symlink())
+        self.assertEqual(list(placeholder.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(placeholder.stat().st_mode), 0o700)
+        self.assertFalse(external.exists())
+
+    def test_group_scripts_alias_with_another_destination_is_rejected_before_copy(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        alias = self.group / self.helper._GROUP_SCRIPT_ALIAS
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(os.path.relpath(self.home / "Desktop", alias.parent))
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+
+    def test_source_paths_cannot_be_changed_to_other_personal_data(self):
+        for argument in ("original_container", "optional_group"):
+            with self.subTest(argument=argument), self.assertRaisesRegex(RuntimeError, "source_refused"):
+                self.create(**{argument: self.home})
+        self.assertEqual(self.sessions(), [])
+        self.clone.assert_not_called()
+
+    def test_initial_consent_must_be_enabled_private_and_have_exact_id(self):
+        for enabled, identifier, mode in ((False, "authorized", 0o600), (True, "other", 0o600),
+                                          (True, "authorized", 0o644)):
+            with self.subTest(enabled=enabled, identifier=identifier, mode=mode):
+                self.write_consent(enabled, identifier, mode)
+                with self.assertRaisesRegex(RuntimeError, "^wechat_consent_required$"):
+                    self.create()
+                self.assertEqual(self.sessions(), [])
+        self.clone.assert_not_called()
+
+    def test_revocation_during_clone_cleans_partial_session(self):
+        def revoke(source, destination):
+            self.copy_fixture(source, destination)
+            self.write_consent(enabled=False)
+        self.clone.side_effect = revoke
+        with self.assertRaisesRegex(RuntimeError, "^wechat_consent_revoked$"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_consent_id_change_during_clone_cleans_partial_session(self):
+        def replace_consent(source, destination):
+            self.copy_fixture(source, destination)
+            self.write_consent(identifier="new-authorization")
+        self.clone.side_effect = replace_consent
+        with self.assertRaisesRegex(RuntimeError, "^wechat_consent_revoked$"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+
+    def test_clone_failure_has_no_copy_fallback_and_cleans_partial_session(self):
+        self.clone.side_effect = RuntimeError("wechat_private_storage_clone_failed")
+        with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_clone_failed$"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_keyboard_interrupt_cleans_partial_session(self):
+        self.clone.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+
+    def test_internal_relative_symlink_is_retained_inside_private_container(self):
+        (self.data / "internal-link").symlink_to("fixture.db")
+        result = self.create()
+        link = Path(result["containerPath"]) / "Data/Documents/internal-link"
+        self.assertEqual(os.readlink(link), "fixture.db")
+        self.assertEqual(link.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_unknown_external_or_absolute_symlink_is_rejected(self):
+        link = self.data / "unexpected"
+        for target in (str(self.file), "../../../../../../outside", str(self.home / "Desktop")):
+            with self.subTest(target=target):
+                link.symlink_to(target)
+                with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+                    self.create()
+                link.unlink()
+                self.assertEqual(self.sessions(), [])
+
+    def test_regular_hardlinks_are_cloned_as_independent_private_files(self):
+        os.link(self.file, self.data / "hardlink")
+        result = self.create()
+        copied = Path(result["containerPath"]) / "Data/Documents"
+        for name in ("fixture.db", "hardlink"):
+            item = copied / name
+            self.assertNotEqual(item.stat().st_ino, self.file.stat().st_ino)
+            self.assertEqual(item.stat().st_nlink, 1)
+            self.assertEqual(stat.S_IMODE(item.stat().st_mode), 0o600)
+        (copied / "hardlink").write_bytes(b"private change")
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+        self.assertEqual((copied / "fixture.db").read_bytes(), b"only synthetic fixture bytes")
+
+    def test_wechat_shared_file_and_cache_modes_stay_private_in_the_copy(self):
+        self.file.chmod(0o664)
+        self.data.chmod(0o777)
+        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        result = self.create()
+        copied = Path(result["containerPath"]) / "Data/Documents"
+        self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((copied / "fixture.db").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.file.stat().st_mode), 0o664)
+        self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o777)
+
+    def test_fifo_is_rejected_without_opening_it(self):
+        os.mkfifo(self.data / "pipe", 0o600)
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+
+    def test_unsafe_state_symlink_or_permissions_are_rejected(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.state, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.helper.create_private_storage(alias, consent_id="authorized")
+        self.state.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.create()
+        self.clone.assert_not_called()
+
+    def test_source_directory_symlink_is_rejected(self):
+        moved = self.container.with_name("other-container")
+        self.container.rename(moved)
+        self.container.symlink_to(moved, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.create()
+        self.clone.assert_not_called()
+
+    def test_foreign_owned_source_is_rejected(self):
+        with mock.patch.object(self.helper.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+                self.create()
+        self.assertEqual(self.sessions(), [])
+
+    def test_standard_sandbox_aliases_become_empty_private_placeholders(self):
+        aliases = {Path("Data") / name: self.home / name for name in self.helper._HOME_ALIASES}
+        aliases.update({Path("Data/Library") / name: self.home / "Library" / name
+                        for name in self.helper._LIBRARY_ALIASES})
+        file_aliases = {Path("Data/Library") / name for name in self.helper._LIBRARY_FILE_ALIASES}
+        aliases.update({relative: self.home / "Library" / relative.relative_to("Data/Library")
+                        for relative in file_aliases})
+        for relative, target in aliases.items():
+            link = self.container / relative
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(os.path.relpath(target, link.parent))
+        result = self.create()
+        private = Path(result["containerPath"])
+        for relative in aliases:
+            item = private / relative
+            self.assertFalse(item.is_symlink(), relative)
+            if relative.name == ".CFUserTextEncoding" or relative in file_aliases:
+                self.assertEqual(item.read_bytes(), b"")
+                self.assertEqual(stat.S_IMODE(item.stat().st_mode), 0o600)
+            else:
+                self.assertTrue(item.is_dir(), relative)
+                self.assertEqual(list(item.iterdir()), [])
+                self.assertEqual(stat.S_IMODE(item.stat().st_mode), 0o700)
+
+    def test_standard_alias_with_wrong_destination_is_not_whitelisted(self):
+        (self.container / "Data/Desktop").symlink_to("../../../../Documents")
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+
+    def test_preflight_checks_metadata_and_clones_only_inert_private_bytes(self):
+        link = self.container / "Data/Library/Application Support/AddressBook"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(os.path.relpath(self.home / "Library/Application Support/AddressBook", link.parent))
+        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_called_once()
+        source, destination = self.clone.call_args.args
+        self.assertEqual(source.parent.parent, self.state)
+        self.assertEqual(source.parent, destination.parent)
+        self.assertFalse(source.parent.exists())
+        self.assertEqual(self.sessions(), [])
+        self.assertFalse((self.home / "Library/Application Support/AddressBook").exists())
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_preflight_skips_live_child_that_disappears_after_enumeration(self):
+        disappearing = self.data / "live-cache"
+        disappearing.mkdir(mode=0o700)
+        original_item = self.helper._source_item
+
+        def remove_cache(path, root, home):
+            if path == disappearing:
+                path.rmdir()
+            return original_item(path, root, home)
+
+        with mock.patch.object(self.helper, "_source_item", side_effect=remove_cache):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_called_once()
+        self.assertEqual(self.sessions(), [])
+
+    def test_preflight_missing_fixed_root_is_not_skipped(self):
+        shutil.rmtree(self.container)
+        with self.assertRaises(FileNotFoundError):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+
+    def test_preflight_does_not_swallow_permission_errors_on_live_children(self):
+        original_item = self.helper._source_item
+
+        def deny(path, root, home):
+            if path == self.file:
+                raise PermissionError("synthetic permission denial")
+            return original_item(path, root, home)
+
+        with mock.patch.object(self.helper, "_source_item", side_effect=deny), self.assertRaises(PermissionError):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+
+    def test_preflight_requires_each_fixed_source_on_the_state_volume(self):
+        self.group.mkdir(parents=True, mode=0o700)
+        original_directory = self.helper._directory
+        for other_volume in (self.container, self.group):
+            with self.subTest(source=other_volume):
+                def directory(path, private=False):
+                    info = original_directory(path, private=private)
+                    return mock.Mock(st_dev=info.st_dev + 1) if path == other_volume else info
+
+                with mock.patch.object(self.helper, "_directory", side_effect=directory):
+                    with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_clone_failed$"):
+                        self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+        self.assertEqual(list(self.state.glob("clone-preflight-*")), [])
+
+    def test_failed_inert_preflight_clone_cleans_private_fixture(self):
+        self.clone.side_effect = RuntimeError("wechat_private_storage_clone_failed")
+        with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_clone_failed$"):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(list(self.state.glob("clone-preflight-*")), [])
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_revocation_during_inert_preflight_clone_cleans_private_fixture(self):
+        def revoke(source, destination):
+            self.copy_fixture(source, destination)
+            self.write_consent(enabled=False)
+
+        self.clone.side_effect = revoke
+        with self.assertRaisesRegex(RuntimeError, "^wechat_consent_revoked$"):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.assertEqual(list(self.state.glob("clone-preflight-*")), [])
+        self.assertEqual(self.sessions(), [])
+
+    def test_final_snapshot_source_change_is_rejected_and_partial_session_removed(self):
+        def change(source, destination):
+            self.copy_fixture(source, destination)
+            # This synthetic new entry exercises the strict directory check.
+            (source.parent / "later-cache-entry").write_bytes(b"synthetic cache write")
+
+        self.clone.side_effect = change
+        with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_source_changed$"):
+            self.create()
+        self.assertEqual(self.sessions(), [])
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    def test_preflight_rejects_unknown_external_symlink_without_creating_a_session(self):
+        (self.data / "external").symlink_to(self.home / "Desktop")
+        with self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        self.clone.assert_not_called()
+        self.assertEqual(self.sessions(), [])
+
+    def test_cleanup_rejects_other_paths_symlinks_and_unmarked_sessions(self):
+        unmarked = self.state / ("storage-session-" + "a" * 32)
+        unmarked.mkdir(mode=0o700)
+        alias = self.state / ("storage-session-" + "b" * 32)
+        alias.symlink_to(self.container, target_is_directory=True)
+        for candidate in (self.state, self.container, self.root, unmarked, alias):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(RuntimeError, "unsafe_path"):
+                self.helper.cleanup(candidate, self.state)
+        self.assertTrue(self.file.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_preflight_clone_uses_only_its_own_synthetic_fixture(self):
+        with mock.patch.object(self.helper, "_clone_file", side_effect=self.native_clone) as clone:
+            self.helper.preflight_private_storage(self.state, consent_id="authorized")
+        source, destination = clone.call_args.args
+        self.assertEqual(source.parent.parent, self.state)
+        self.assertEqual(source.parent, destination.parent)
+        self.assertFalse(source.parent.exists())
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clone_rejects_source_metadata_change(self):
+        destination = self.state / "clone-fixture.db"
+        original_fstat = self.helper.os.fstat
+        observations = 0
+
+        def changed_metadata(descriptor):
+            nonlocal observations
+            info = original_fstat(descriptor)
+            observations += 1
+            if observations == 2:
+                return mock.Mock(st_size=info.st_size, st_mtime_ns=info.st_mtime_ns + 1,
+                                 st_ctime_ns=info.st_ctime_ns)
+            return info
+
+        with mock.patch.object(self.helper.os, "fstat", side_effect=changed_metadata):
+            with self.assertRaisesRegex(RuntimeError, "^wechat_private_storage_source_changed$"):
+                self.native_clone(self.file, destination)
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clonefile_uses_copy_on_write_only_on_small_synthetic_fixture(self):
+        destination = self.state / "clone-fixture.db"
+        self.native_clone(self.file, destination)
+        self.assertEqual(destination.read_bytes(), self.file.read_bytes())
+        self.assertNotEqual(destination.stat().st_ino, self.file.stat().st_ino)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        destination.write_bytes(b"private fixture change")
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "public APFS clone API is Darwin-only")
+    def test_native_clone_accepts_owned_source_hardlinks_and_shared_modes_without_sharing_inode(self):
+        self.file.chmod(0o664)
+        os.link(self.file, self.data / "fixture-linked.db")
+        destination = self.state / "cloned-hardlink.db"
+        self.native_clone(self.file, destination)
+        self.assertNotEqual(destination.stat().st_ino, self.file.stat().st_ino)
+        self.assertEqual(destination.stat().st_nlink, 1)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        destination.write_bytes(b"private copy write")
+        self.assertEqual(self.file.read_bytes(), b"only synthetic fixture bytes")
+
+
+if __name__ == "__main__":
+    unittest.main()

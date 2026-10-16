@@ -19,15 +19,15 @@ describe("prototype style alignment", () => {
     expect(tokenCss).toContain("--radius-card: 12px");
     expect(tokenCss).toContain("--radius-card-lg: 10px");
     expect(tokenCss).toContain("--radius-pill: 9999px");
-    expect(tokenCss).toContain('"Nunito"');
-    expect(tokenCss).toContain('--font-sans: "Nunito", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC"');
+    expect(tokenCss).toContain("--font-sans: ui-sans-serif, system-ui");
+    expect(tokenCss).toContain('"PingFang SC"');
     expect(tokenCss).toContain('"Apple Color Emoji"');
     expect(tokenCss).toContain('"Segoe UI Emoji"');
     expect(tokenCss).toContain("--codex-toolbar-height: 46px");
     expect(tokenCss).toContain("--codex-sidebar-nav-icon-inset: 20px");
     expect(tokenCss).toContain("--codex-window-control-inset: 84px");
     expect(tokenCss).toContain("--codex-sidebar-hidden-topbar-padding: 124px");
-    expect(tokenCss).toContain("--codex-sidebar-width: 250px");
+    expect(tokenCss).toContain("--codex-sidebar-width: 264px");
     expect(tokenCss).toContain("--codex-sidebar-min-width: 240px");
     expect(tokenCss).toContain("--codex-content-padding-x: 32px");
     expect(tokenCss).toContain("--codex-text-base: 14px");
@@ -101,10 +101,10 @@ describe("prototype style alignment", () => {
     const sidebarToolbarPositionRule = globalCss.match(/\.sidebar-toolbar-button\s*\{[^}]*\}/)?.[0] ?? "";
     const sidebarRestoreButtonRule = Array.from(globalCss.matchAll(/\.sidebar-restore-button\s*\{[^}]*\}/g)).at(-1)?.[0] ?? "";
     const dragRegionRule = globalCss.match(/\.window-drag-region\s*\{[^}]*\}/)?.[0] ?? "";
-    const leadingDragRegionRule = globalCss.match(/\.window-drag-region--leading\s*\{[^}]*\}/)?.[0] ?? "";
-    const trailingDragRegionRule = globalCss.match(/\.window-drag-region--trailing\s*\{[^}]*\}/)?.[0] ?? "";
-    const appShellDragRegionRule = globalCss.match(/body:has\(\.sidebar-shell\)\s+\.window-drag-region\s*\{[^}]*\}/)?.[0] ?? "";
+    const dragExclusionRule = globalCss.match(/\.window-drag-exclusion\s*\{[^}]*\}/)?.[0] ?? "";
+    const sidebarToggleExclusionRule = globalCss.match(/\.window-drag-exclusion--sidebar-toggle\s*\{[^}]*\}/)?.[0] ?? "";
     const edgeAlignedWindowControlsRule = globalCss.match(/body\.memmy-platform-windows,\s*body\.memmy-window-fullscreen\s*\{[^}]*\}/)?.[0] ?? "";
+    const memoryDrawerDragTrimRule = globalCss.match(/body:has\(\.memory-drawer\)\s+\.window-drag-region\s*\{[^}]*\}/)?.[0] ?? "";
     const resizeHandleRule = Array.from(globalCss.matchAll(/^\.sidebar-resize-handle\s*\{[^}]*\}/gm)).at(-1)?.[0] ?? "";
 
     expect(appSidebarRule).toContain("width: var(--codex-sidebar-width);");
@@ -112,11 +112,11 @@ describe("prototype style alignment", () => {
     expect(appSidebarRule).toContain("font-family: var(--font-sans);");
     expect(appSidebarRule).toContain("font-size: var(--codex-text-base);");
     expect(appSidebarRule).toContain("line-height: var(--codex-leading-base);");
-    expect(appNavButtonRule).toContain("font-size: 13px;");
-    expect(appNavButtonRule).toContain("line-height: 18px;");
+    expect(appNavButtonRule).toContain("font-size: 14px;");
+    expect(appNavButtonRule).toContain("line-height: 21px;");
     expect(appNavButtonLayoutRule).toContain("width: calc(100% - 24px);");
     expect(appNavButtonLayoutRule).toContain("margin: 0 12px;");
-    expect(appNavButtonLayoutRule).toContain("padding: 8px 8px;");
+    expect(appNavButtonLayoutRule).toContain("padding: 5px 12px;");
     const appNavButtonActiveRule = globalCss.match(/\.app-frame-nav-button--active\s*\{[^}]*\}/)?.[0] ?? "";
     expect(appNavButtonActiveRule).toContain("color: var(--color-action-sky-hover);");
     expect(appNavButtonActiveRule).toContain("background: var(--color-nav-active-bg);");
@@ -129,7 +129,7 @@ describe("prototype style alignment", () => {
     expect(appSearchBoxRule).toContain("padding: 0 16px;");
     expect(appNavIconRule).toContain("width: var(--codex-icon-xs);");
     expect(appNavIconRule).toContain("height: var(--codex-icon-xs);");
-    expect(appTaskTitleRule).toContain("font-size: 13px;");
+    expect(appTaskTitleRule).toContain("font-size: 14px;");
     expect(globalCss).not.toContain(".app-frame-brand");
     expect(sidebarWindowToolbarRule).toContain("flex: 0 0 var(--codex-toolbar-height);");
     expect(sidebarWindowToolbarRule).toContain("min-height: var(--codex-toolbar-height);");
@@ -176,6 +176,8 @@ describe("prototype style alignment", () => {
     expect(memoryBackButtonRule).toContain("font-size: var(--codex-text-base);");
     expect(memorySectionHeaderRule).toContain("padding: 0 14px 0 20px;");
     expect(dragRegionRule).toContain("position: fixed;");
+    expect(dragRegionRule).toContain("right: 0;");
+    expect(dragRegionRule).toContain("left: 0;");
     expect(dragRegionRule).toContain("z-index: 9998;");
     expect(dragRegionRule).toContain("height: var(--codex-toolbar-height);");
     expect(dragRegionRule).toContain("pointer-events: none;");
@@ -183,12 +185,14 @@ describe("prototype style alignment", () => {
     expect(dragRegionRule).not.toContain("background:");
     expect(dragRegionRule).not.toContain("backdrop-filter:");
     expect(dragRegionRule).toContain("-webkit-app-region: drag;");
-    expect(leadingDragRegionRule).toContain("left: calc(var(--codex-window-control-inset) + var(--codex-toolbar-button-size));");
-    expect(leadingDragRegionRule).toContain("right: 50%;");
-    expect(trailingDragRegionRule).toContain("left: 50%;");
-    expect(trailingDragRegionRule).toContain("right: 120px;");
-    expect(appShellDragRegionRule).toContain("display: none;");
-    expect(globalCss).not.toContain(".window-drag-exclusion");
+    expect(dragExclusionRule).toContain("position: fixed;");
+    expect(dragExclusionRule).toContain("z-index: 9999;");
+    expect(dragExclusionRule).toContain("height: var(--codex-toolbar-height);");
+    expect(dragExclusionRule).toContain("pointer-events: none;");
+    expect(dragExclusionRule).toContain("-webkit-app-region: no-drag;");
+    expect(sidebarToggleExclusionRule).toContain("left: var(--codex-window-control-inset);");
+    expect(sidebarToggleExclusionRule).toContain("width: var(--codex-toolbar-button-size);");
+    expect(memoryDrawerDragTrimRule).toContain("right: min(680px, calc(100vw - 24px));");
     expect(resizeHandleRule).toContain("flex: 0 0 8px;");
     expect(resizeHandleRule).toContain("margin-right: -4px;");
     expect(resizeHandleRule).toContain("margin-left: -4px;");
@@ -201,16 +205,14 @@ describe("prototype style alignment", () => {
     const conversationPanelFontRule = conversationPanelRules.find((rule) => rule.includes("font-family")) ?? "";
     const messageContentRule = globalCss.match(/^\.agent-message-content\s*\{[^}]*\}/m)?.[0] ?? "";
     const contentTopbarRule = globalCss.match(/^\.app-frame-content-topbar\s*\{[^}]*\}/m)?.[0] ?? "";
-    const contentTopbarDragSpaceRule = globalCss.match(/\.app-frame-content-topbar__drag-space\s*\{[^}]*\}/)?.[0] ?? "";
     const contentTopbarBorderedRule = globalCss.match(/\.app-frame-content-topbar--bordered\s*\{[^}]*\}/)?.[0] ?? "";
     const conversationTitleRule = globalCss.match(/\.agent-conversation-title\s*\{[^}]*\}/)?.[0] ?? "";
     const conversationScrollRule = globalCss.match(/\.agent-conversation-scroll\s*\{[^}]*\}/)?.[0] ?? "";
 
     expect(conversationPanelRules.join("\n")).not.toContain("padding-top:");
     expect(conversationPanelFontRule).toContain("font-family: var(--font-sans);");
-    // The chat interaction surface (answers, bubbles, activity timeline) uses
-    // the dedicated --font-chat pairing so Latin/CJK stay consistent, while
-    // the shell around it keeps the Nunito brand font.
+    // Latin and CJK share the system stack. Nunito is reserved for the
+    // login wordmark.
     expect(tokenCss).toContain("--font-chat:");
     expect(messageContentRule).toContain("font-family: var(--font-chat);");
     expect(globalCss).toContain(".agent-conversation-panel .agent-chat-bubble,");
@@ -245,27 +247,31 @@ describe("prototype style alignment", () => {
     expect(contentTopbarRule).toContain("align-items: center;");
     expect(contentTopbarRule).toContain("overflow: hidden;");
     expect(contentTopbarRule).toContain("padding: 0 var(--codex-content-padding-x);");
-    expect(contentTopbarRule).toContain("-webkit-app-region: no-drag;");
-    expect(contentTopbarDragSpaceRule).toContain("pointer-events: auto;");
-    expect(contentTopbarDragSpaceRule).toContain("-webkit-app-region: drag;");
+    expect(contentTopbarRule).toContain("-webkit-app-region: drag;");
     expect(contentTopbarRule).not.toContain("border-bottom:");
     expect(contentTopbarBorderedRule).toContain("background: transparent");
     expect(contentTopbarBorderedRule).toContain("border-bottom: none");
     expect(globalCss).not.toContain(".agent-conversation-titlebar");
     expect(conversationTitleRule).toContain("flex: 1 1 auto;");
-    expect(conversationTitleRule).toContain("font-size: var(--codex-text-base);");
-    expect(conversationTitleRule).toContain("font-weight: 500;");
-    expect(conversationTitleRule).toContain("line-height: var(--codex-leading-base);");
+    expect(conversationTitleRule).toContain("font-size: 16px;");
+    expect(conversationTitleRule).toContain("font-weight: 600;");
+    expect(conversationTitleRule).toContain("line-height: 24px;");
     expect(conversationTitleRule).toContain("max-width: 100%;");
     expect(conversationTitleRule).toContain("text-overflow: ellipsis;");
     expect(conversationTitleRule).toContain("user-select: none;");
     expect(conversationTitleRule).toContain("white-space: nowrap;");
-    expect(conversationTitleRule).toContain("pointer-events: auto;");
-    expect(conversationTitleRule).toContain("-webkit-app-region: drag;");
-    expect(conversationScrollRule).toContain("padding-top: 12px;");
+    expect(conversationScrollRule).toContain("padding-top: 16px;");
     expect(conversationScrollRule).toContain("padding-bottom: calc(var(--agent-composer-overlay-height, 120px) + 8px);");
     expect(conversationScrollRule).not.toContain("var(--color-action-sky)");
     expect(globalCss).not.toContain(".agent-conversation-scroll::-webkit-scrollbar");
+  });
+
+  it("clips content glows without turning their surfaces into scroll containers", () => {
+    const glowSurfaceRule = globalCss.match(/^\.bg-content-bg,\n\.agent-conversation-panel\s*\{[^}]*\}/m)?.[0] ?? "";
+    const conversationPanelRules = Array.from(globalCss.matchAll(/^\.agent-conversation-panel\s*\{[^}]*\}/gm), (match) => match[0]);
+
+    expect(glowSurfaceRule).toContain("overflow: clip;");
+    expect(conversationPanelRules.join("\n")).not.toContain("overflow: hidden;");
   });
 
   it("keeps modal utility shims available for connection dialog alignment", () => {
@@ -298,20 +304,27 @@ describe("prototype style alignment", () => {
     expect(memorySummaryRule).toContain("-webkit-line-clamp: 2;");
   });
 
-  it("keeps the Windows memory refresh action below the native title-bar overlay", () => {
+  it("keeps memory page headers inside the shared Windows chrome body without another spacer", () => {
     const windowsMemoryHeaderRule = globalCss.match(
       /body\.memmy-platform-windows \.memory-panel__header\s*\{[^}]*\}/
     )?.[0] ?? "";
 
-    expect(windowsMemoryHeaderRule).toContain("padding-top: var(--codex-toolbar-height);");
+    expect(windowsMemoryHeaderRule).toBe("");
   });
 
-  it("keeps the Windows memory drawer close action below the native title-bar overlay", () => {
-    const windowsMemoryDrawerRule = globalCss.match(
-      /body\.memmy-platform-windows \.memory-drawer\s*\{[^}]*\}/
+  it("keeps the Windows memory drawer below the title bar instead of padding over it", () => {
+    const windowsOverlayRule = globalCss.match(
+      /body\.memmy-platform-windows :is\([\s\S]*?\)\s*\{[^}]*\}/
+    )?.[0] ?? "";
+    const windowsDrawerCloseRule = globalCss.match(
+      /body\.memmy-platform-windows \.memory-drawer-backdrop__close\s*\{[^}]*\}/
     )?.[0] ?? "";
 
-    expect(windowsMemoryDrawerRule).toContain("padding-top: var(--codex-toolbar-height);");
+    expect(windowsOverlayRule).toContain(".memory-drawer-backdrop");
+    expect(windowsOverlayRule).toContain("top: var(--codex-toolbar-height);");
+    expect(windowsOverlayRule).toContain("backdrop-filter: none;");
+    expect(globalCss).not.toMatch(/body\.memmy-platform-windows \.memory-drawer\s*\{[^}]*padding-top:\s*var\(--codex-toolbar-height\)/);
+    expect(windowsDrawerCloseRule).toContain("top: 0;");
   });
 
   it("keeps memory drawer IDs selectable inside the window drag area", () => {

@@ -7,6 +7,8 @@ import {
   IMPORT_SUMMARY_PROCESSING_TAG
 } from "../import/memory-import-pipeline.js";
 import { panelDateKey, panelRoundDecimal } from "./model-costs.js";
+import { observedActivitySummary } from "./display-fields.js";
+import { externalEvidenceSourceMatchesMemory } from "../external-evidence-source.js";
 
 export function panelListItemFromMemory(
   item: MemoryListItem,
@@ -14,12 +16,19 @@ export function panelListItemFromMemory(
   processing?: MemoryProcessingRecord
 ): MemoryListItem {
   const spanGoal = panelSpanGoalForMemory(memory);
+  const observationSummary = observedActivitySummary(memory);
+  const observation = isRecord(memory.properties.internal_info.observation_memory)
+    ? memory.properties.internal_info.observation_memory : {};
   return {
     ...item,
+    ...(observationSummary ? { summary: observationSummary } : {}),
     processing,
     metadata: {
       ...(item.metadata ?? {}),
       source: panelSourceForMemory(memory),
+      ...(memory.properties.internal_info.memory_kind === "observed_activity" && observation.schema_version === 1
+        ? { observationStatus: observation.status, observationSkipReason: observation.skip_reason }
+        : {}),
       ...(spanGoal ? { spanGoal } : {})
     },
     tags: panelTagsForMemory(memory, processing)
@@ -80,6 +89,14 @@ export function panelSourceForMemory(memory: MemoryRow): string {
   const internalInfo: Record<string, unknown> = isRecord(memory.properties.internal_info)
     ? memory.properties.internal_info
     : {};
+  const external = isRecord(internalInfo.external_evidence) ? internalInfo.external_evidence : {};
+  const provenance = isRecord(external.provenance) ? external.provenance : {};
+  if (memory.memoryLayer === "Skill" && externalEvidenceSourceMatchesMemory(memory, "computer_history")) {
+    return "computer_history";
+  }
+  if (internalInfo.memory_kind === "observed_activity" && (
+    external.source === "computer_history" || typeof provenance.historyId === "string"
+  )) return "computer_history";
   return panelSourceForStatsRow({
     conversationId: memory.conversationId,
     sessionId: memory.sessionId,

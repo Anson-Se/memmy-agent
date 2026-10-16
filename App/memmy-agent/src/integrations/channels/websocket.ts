@@ -1,9 +1,12 @@
-import { staticLlmRuntime } from "../../utils/llm-runtime.js";
+import { historySummaryRuntime } from "../../providers/history-summary-runtime.js";
 import crypto from "node:crypto";
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { nativeExcelControl } from "../../tools/computer-use/excel-native-control.js";
+import { nativeAppApprovalStore } from "../../tools/computer-use/native-app-approvals.js";
+import { externalBrowserBridge } from "../../core/agent-runtime/tools/external-browser-bridge.js";
 import os from "node:os";
 import path from "node:path";
 import { lookup as lookupMime } from "mime-types";
@@ -13,6 +16,7 @@ import {
 } from "@memmy/local-api-contracts";
 import { requestMcpReload } from "../../core/agent-runtime/tools/mcp.js";
 import { BaseChannel, type ChannelHandleMessageOptions } from "./base.js";
+import { CronNotificationOutbox } from "./cron-notification-outbox.js";
 import {
   OUTBOUND_META_AGENT_UI,
   OutboundMessage,
@@ -43,7 +47,7 @@ import type {
   WebuiQueueMessageDescriptor,
   WebuiQueueSnapshotDescriptor,
 } from "../../core/agent-runtime/loop.js";
-import { getMediaDir, getWorkspacePath } from "../../config/paths.js";
+import { getDataDir, getMediaDir, getStandaloneTaskWorkspacesDir, getWorkspacePath } from "../../config/paths.js";
 import type { CronService } from "../../cron/service.js";
 import { goalStateWsBlob, type GoalStatus } from "../../core/session/goal-state.js";
 import { taskPlanStateWsBlob } from "../../core/session/task-plan-state.js";
@@ -58,6 +62,7 @@ import { websocketTurnWallStartedAt, websocketTurnWallStartTimes } from "../../c
 import type { WebuiTitleService } from "../../core/session/webui-title.js";
 import { visibleWebuiUserContent } from "../../core/session/webui-user-content.js";
 import { TerminalRunControl } from "../../core/session/terminal-session-control.js";
+import { createStandaloneTaskWorkspace } from "../../core/session/standalone-task-workspace.js";
 import {
   createOrCheckoutWorkspaceBranch,
   readWorkspaceEnvironment,
@@ -210,10 +215,12 @@ type WebSocketChannelOptions = {
   projectStore?: ProjectStore | null;
   staticDistPath?: string | null;
   workspacePath?: string | null;
+  standaloneTaskRoot?: string | null;
   runtimeModelName?: RuntimeModelNameResolver;
   runtimeToolNames?: RuntimeToolNamesResolver;
   modelSelectionResolver?: ((input: ModelSelectionInput) => ResolvedModelSelection | null) | null;
   cancelActiveTasks?: (sessionKey: string) => Promise<number>;
+  stopCurrentTurn?: (sessionKey: string, expectedTurnId: string | null) => Promise<number>;
   closeBrowserChat?: (channel: string, chatId: string) => Promise<void>;
   fileMemoryEnabled?: boolean;
   goalControlHandler?: (request: GoalControlRequest) => Promise<GoalControlResult>;
@@ -744,15 +751,20 @@ export class WebSocketChannel extends BaseChannel {
   guiSessionProjection: GuiSessionProjection | null = null;
   transcriptMonitor: GatewayTranscriptMonitor | null = null;
   private lastWebuiTranscriptCreatedAt = 0;
+  private pendingCronOutbox: CronNotificationOutbox | null = null;
+  private flushingPendingCron = false;
   terminalRunControl: TerminalRunControl | null = null;
   staticDistPath: string | null = null;
   runtimeModelName: RuntimeModelNameResolver = null;
   runtimeToolNames: RuntimeToolNamesResolver = null;
   private computerHistoryModelSignature: string | null = null;
+  private computerHistoryModelTimer: ReturnType<typeof setInterval> | null = null;
   modelSelectionResolver: WebSocketChannelOptions["modelSelectionResolver"] = null;
   workspacePath: string;
+  readonly standaloneTaskRoot: string | null;
   readonly fileMemoryEnabled: boolean;
   cancelActiveTasks: ((sessionKey: string) => Promise<number>) | null = null;
+  stopCurrentTurn: WebSocketChannelOptions["stopCurrentTurn"] = undefined;
   sessionTurnBarrier: (<T>(sessionKey: string, operation: () => Promise<T>) => Promise<T>) | null = null;
   sessionDeletionBarrier: (<T>(
     sessionKey: string,
@@ -803,6 +815,7 @@ export class WebSocketChannel extends BaseChannel {
       ?? null;
     this.fileMemoryEnabled = options.fileMemoryEnabled === true;
     this.cancelActiveTasks = options.cancelActiveTasks ?? config?.cancelActiveTasks ?? null;
+    this.stopCurrentTurn = options.stopCurrentTurn ?? config?.stopCurrentTurn;
     this.closeBrowserChat = options.closeBrowserChat ?? config?.closeBrowserChat ?? null;
     this.goalControlHandler = options.goalControlHandler ?? config?.goalControlHandler;
     this.activeGoalStopHandler = options.activeGoalStopHandler ?? config?.activeGoalStopHandler;
@@ -812,7 +825,12 @@ export class WebSocketChannel extends BaseChannel {
     this.stopExpectedTurn = options.stopExpectedTurn ?? config?.stopExpectedTurn;
     const workspacePath = options.workspacePath ?? config?.workspacePath ?? getWorkspacePath();
     this.workspacePath = path.resolve(String(workspacePath));
+    const standaloneTaskRoot = options.standaloneTaskRoot ?? config?.standaloneTaskRoot ?? null;
+    this.standaloneTaskRoot = standaloneTaskRoot ? path.resolve(String(standaloneTaskRoot)) : null;
     this.computerHistory = getComputerHistoryDemoService();
+    if (process.env.MEMMY_COMPUTER_HISTORY !== "0" && isComputerHistorySupported()) {
+      void this.computerHistory.restoreObservationOnLaunch();
+    }
   }
 
   setChannelAdmin(admin: ChannelAdminApi | null): void {
@@ -821,6 +839,40 @@ export class WebSocketChannel extends BaseChannel {
 
   setWebuiTitleService(service: WebuiTitleService | null): void {
     this.webuiTitleService = service;
+  }
+
+  /** Re-read the global summary assignment; task model selections are irrelevant. */
+  refreshComputerHistorySummaryModel(): boolean {
+    if (!isComputerHistorySupported()) return false;
+    try {
+      const selection = this.modelSelectionResolver?.({ capability: "memory_summary" });
+      if (!selection) throw new Error("summary_model_selection_unavailable");
+      // Include credentials through the provider signature, retaining only a
+      // digest so unchanged polling does not restart summaries or expose keys.
+      const signature = crypto.createHash("sha256").update(JSON.stringify([
+        selection.presetId, selection.source, selection.ownerAccountId, selection.snapshot.signature,
+      ])).digest("hex");
+      if (signature !== this.computerHistoryModelSignature) {
+        this.computerHistory.setLlmRuntime(historySummaryRuntime(selection), selection.source);
+        this.computerHistoryModelSignature = signature;
+      }
+      return true;
+    } catch {
+      if (this.computerHistoryModelSignature !== "unavailable") {
+        this.computerHistory.setLlmRuntime(null, null,
+          "Computer History summary model is unavailable. Configure a Memory summary model in Memmy settings.");
+        this.computerHistoryModelSignature = "unavailable";
+      }
+      return false;
+    }
+  }
+
+  private startComputerHistoryModelSync(): void {
+    if (!isComputerHistorySupported()) return;
+    this.refreshComputerHistorySummaryModel();
+    if (this.computerHistoryModelTimer) return;
+    this.computerHistoryModelTimer = setInterval(() => this.refreshComputerHistorySummaryModel(), 30_000);
+    this.computerHistoryModelTimer.unref();
   }
 
   setProjectStore(projectStore: ProjectStore): void {
@@ -1195,9 +1247,10 @@ export class WebSocketChannel extends BaseChannel {
     }
     let binding: { projectId: string | null; cwd: string };
     if (target.kind === "standalone") {
+      const reserved = this.sessionManager.peekWebuiSessionBindingReservation?.(sessionKey) ?? null;
       binding = {
         projectId: null,
-        cwd: assertWebuiWorkspaceAvailable(this.workspacePath),
+        cwd: reserved?.cwd ?? this.createStandaloneTaskCwd(),
       };
     } else {
       const store = this.requireProjectStore();
@@ -1225,6 +1278,16 @@ export class WebSocketChannel extends BaseChannel {
       binding: this.sessionManager.reserveWebuiSessionBinding(sessionKey, binding),
       created: true,
     };
+  }
+
+  private createStandaloneTaskCwd(): string {
+    const root = this.standaloneTaskRoot ?? getStandaloneTaskWorkspacesDir();
+    try {
+      return assertWebuiWorkspaceAvailable(createStandaloneTaskWorkspace(root));
+    } catch (error) {
+      console.warn("[websocket] task workspace unavailable; using the profile workspace", { root, error });
+      return assertWebuiWorkspaceAvailable(this.workspacePath);
+    }
   }
 
   async maybePushActiveGoalState(chatId: string): Promise<void> {
@@ -1546,7 +1609,7 @@ export class WebSocketChannel extends BaseChannel {
 
     let cwd: string;
     try {
-      cwd = assertWebuiWorkspaceAvailable(this.workspacePath);
+      cwd = this.createStandaloneTaskCwd();
     } catch {
       return httpError(422, "workspace_unavailable");
     }
@@ -1896,6 +1959,91 @@ export class WebSocketChannel extends BaseChannel {
       const message = error?.message ?? String(error);
       const status = error?.status ?? (message.includes("MCP settings payload") ? 400 : 500);
       return httpError(status, message);
+    }
+  }
+
+  async handleExcelAddinStatus(request: any): Promise<HttpLikeResponse> {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    const method = String(request?.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "POST") return httpError(405, "Method Not Allowed");
+    let result;
+    if (method === "POST") {
+      // This app-level grant may trigger macOS Automation consent. URL tokens cannot authorize it.
+      if (!bearerToken(request?.headers)) return httpError(401, "Unauthorized");
+      const body = requestBodyText(request).trim();
+      let enabled = true;
+      if (body) {
+        try {
+          const parsed = JSON.parse(body) as { enabled?: unknown; reveal?: unknown };
+          // Retain the old reveal request as a harmless status read during upgrades.
+          if (parsed.reveal === true) return httpJsonResponse(await nativeExcelControl.status());
+          if (typeof parsed.enabled !== "boolean") return httpError(400, "Invalid Excel connection settings payload");
+          enabled = parsed.enabled;
+        } catch { return httpError(400, "Invalid Excel connection settings payload"); }
+      }
+      try { result = await nativeExcelControl.setEnabled(enabled); }
+      catch (error) {
+        const message = String(error instanceof Error ? error.message : error).slice(0, 500);
+        return httpJsonResponse({ error: message }, { status: 503 });
+      }
+    } else result = await nativeExcelControl.status();
+    const response = httpJsonResponse(result);
+    response.headers["cache-control"] = "no-store";
+    return response;
+  }
+
+  handleNativeAppApprovals(request: any): HttpLikeResponse {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    const method = String(request?.method ?? "GET").toUpperCase();
+    try {
+      if (method === "GET") {
+        const response = httpJsonResponse({ apps: nativeAppApprovalStore.list() });
+        response.headers["cache-control"] = "no-store";
+        return response;
+      }
+      if (method !== "POST") return httpError(405, "Method Not Allowed");
+      // A query-string bootstrap token must not be enough to change approvals.
+      if (!bearerToken(request?.headers)) return httpError(401, "Unauthorized");
+      const query = parseQuery(String(request?.path ?? "/"));
+      const platform = queryFirst(query, "platform");
+      const appId = queryFirst(query, "app_id");
+      if ((platform !== "darwin" && platform !== "win32") || !appId) return httpError(400, "Invalid app identity");
+      const response = httpJsonResponse({ apps: nativeAppApprovalStore.remove(platform, appId) });
+      response.headers["cache-control"] = "no-store";
+      return response;
+    } catch {
+      return httpError(400, "Invalid app identity");
+    }
+  }
+
+  async handleExternalBrowserStatus(request: any): Promise<HttpLikeResponse> {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    if (String(request?.method ?? "GET").toUpperCase() !== "GET") return httpError(405, "Method Not Allowed");
+    if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return httpError(503, "Desktop browser bridge unavailable");
+    try {
+      await externalBrowserBridge.start();
+      const claims = externalBrowserBridge.listClaims();
+      const tabStatuses = externalBrowserBridge.listTabStatuses();
+      const statusesByTab = new Map(tabStatuses.map(tab =>
+        [`${tab.connectionId}:${tab.tabId}`, tab.status]));
+      const response = httpJsonResponse({
+        connected: externalBrowserBridge.listConnected(),
+        controllableTabCount: claims.filter(tab => {
+          const status = statusesByTab.get(`${tab.connectionId}:${tab.tabId}`);
+          return status === undefined || status === "ready";
+        }).length,
+        claims: claims.map(
+          ({ browser, title, url }) => ({ browser, title, url }),
+        ),
+        tabStatuses: tabStatuses.map(
+          ({ browser, title, url, active, status, reason, updatedAt }) =>
+            ({ browser, title, url, active, status, reason, updatedAt }),
+        ),
+      });
+      response.headers["cache-control"] = "no-store";
+      return response;
+    } catch {
+      return httpError(503, "External browser bridge unavailable");
     }
   }
 
@@ -2498,6 +2646,10 @@ export class WebSocketChannel extends BaseChannel {
         const del = this.sessionManager?.deleteSession
           ?? this.sessionManager?.delete;
         if (typeof del === "function") del.call(this.sessionManager, key);
+        const deletedChatId = toGuiChatId(key);
+        for (const pending of this.cronNotificationOutbox().list()) {
+          if (pending.chat_id === deletedChatId) this.cronNotificationOutbox().remove(pending.deliveryId);
+        }
       };
       if (this.sessionDeletionBarrier) {
         await this.sessionDeletionBarrier(key, cancelRunning, deleteOne);
@@ -2736,11 +2888,11 @@ export class WebSocketChannel extends BaseChannel {
     rawPath: string,
     sessionWorkspace: string,
   ): AllowedArtifactPath | null {
-    const expanded = expandHomePath(rawPath);
+    const expanded = normalizeLocalPath(expandHomePath(rawPath));
     const isAbsoluteRequest = path.isAbsolute(expanded) || rawPath.startsWith("~/");
     const candidate = path.isAbsolute(expanded)
       ? path.resolve(expanded)
-      : path.resolve(sessionWorkspace, rawPath);
+      : path.resolve(sessionWorkspace, expanded);
     let resolved: string;
     let stat: fs.Stats;
     try {
@@ -2816,7 +2968,7 @@ export class WebSocketChannel extends BaseChannel {
     let resolved: string;
     let stat: fs.Stats;
     try {
-      resolved = fs.realpathSync(path.resolve(expandHomePath(rawPath)));
+      resolved = fs.realpathSync(path.resolve(normalizeLocalPath(expandHomePath(rawPath))));
       stat = fs.statSync(resolved);
     } catch {
       return null;
@@ -2828,8 +2980,18 @@ export class WebSocketChannel extends BaseChannel {
     try {
       const mediaDir = getMediaDir("websocket");
       fs.mkdirSync(mediaDir, { recursive: true });
-      const staged = path.join(mediaDir, `${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}-${safeFilename(path.basename(resolved)) || "artifact"}`);
-      fs.copyFileSync(resolved, staged);
+      const fingerprint = crypto.createHash("sha256")
+        .update(`${resolved}\0${stat.size}\0${stat.mtimeMs}`)
+        .digest("hex")
+        .slice(0, 12);
+      const staged = path.join(mediaDir, `${fingerprint}-${safeFilename(path.basename(resolved)) || "artifact"}`);
+      if (!isStagedCopyCurrent(staged, stat.size)) {
+        try {
+          copyFileAtomically(resolved, staged);
+        } catch (error) {
+          if (!isStagedCopyCurrent(staged, stat.size)) throw error;
+        }
+      }
       const stagedReal = fs.realpathSync(staged);
       const url = this.signMediaPath(stagedReal);
       return url ? { url, name: path.basename(resolved), path: stagedReal } : null;
@@ -3021,8 +3183,14 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/settings") return this.handleSettings(request);
     if (got === "/api/commands") return this.handleCommands(request);
     if (got === "/api/computer-history") return this.handleComputerHistory(request, "snapshot");
+    if (got === "/api/computer-history/observation/status") return this.handleComputerHistory(request, "observation-status");
+    if (got === "/api/computer-history/settings") return this.handleComputerHistory(request, "settings");
+    if (got === "/api/computer-history/apps") return this.handleComputerHistory(request, "apps");
     if (got === "/api/computer-history/permissions/check") return this.handleComputerHistory(request, "permissions-check");
     if (got === "/api/computer-history/permissions/open") return this.handleComputerHistory(request, "permissions-open");
+    if (got === "/api/computer-history/wechat/consent") return this.handleComputerHistory(request, "wechat-consent");
+    if (got === "/api/computer-history/wechat/prepare") return this.handleComputerHistory(request, "wechat-prepare");
+    if (got === "/api/computer-history/wechat/connect") return this.handleComputerHistory(request, "wechat-connect");
     if (got === "/api/computer-history/delete") return this.handleComputerHistory(request, "history-delete");
     if (got === "/api/computer-history/model") return this.handleComputerHistory(request, "model-select");
     if (got === "/api/computer-history/clear") return this.handleComputerHistory(request, "history-clear");
@@ -3047,6 +3215,9 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/settings/web-search/update") return this.handleSettingsWebSearchUpdate(request);
     if (got === "/api/settings/image-generation/update") return this.handleSettingsImageGenerationUpdate(request);
     if (got === "/api/settings/mcp-presets") return this.handleSettingsMcpPresets(request);
+    if (got === "/api/settings/computer-use/excel") return this.handleExcelAddinStatus(request);
+    if (got === "/api/settings/computer-use/apps") return this.handleNativeAppApprovals(request);
+    if (got === "/api/settings/computer-use/browsers") return this.handleExternalBrowserStatus(request);
     if (MCP_PRESET_ACTIONS_BY_PATH[got]) return this.handleSettingsMcpPresets(request, MCP_PRESET_ACTIONS_BY_PATH[got]);
     let match = got.match(/^\/api\/sessions\/([^/]+)\/messages$/);
     if (match) return this.handleSessionMessages(request, match[1]);
@@ -3113,6 +3284,15 @@ export class WebSocketChannel extends BaseChannel {
 
   override async start(): Promise<void> {
     this.running = true;
+    this.startComputerHistoryModelSync();
+    await nativeExcelControl.start();
+    if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY === "1") {
+      try { await externalBrowserBridge.start(); }
+      catch (error) {
+        console.warn("[websocket] Chrome/Edge extension bridge could not start; check whether another Memmy gateway is using its local ports. Gateway startup will continue.",
+          { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     const factory = this.config.serverFactory;
     if (factory) {
       this.server = await factory(this);
@@ -3161,8 +3341,11 @@ export class WebSocketChannel extends BaseChannel {
   }
 
   override async stop(): Promise<void> {
+    if (this.computerHistoryModelTimer) clearInterval(this.computerHistoryModelTimer);
+    this.computerHistoryModelTimer = null;
     if (!this.running && !this.server) return;
     this.running = false;
+    nativeExcelControl.stop();
     // Recording is scoped to the app: closing it finalizes the open segment
     // rather than leaving a recorder running behind the user's back.
     await this.computerHistory.shutdown();
@@ -3196,7 +3379,7 @@ export class WebSocketChannel extends BaseChannel {
    */
   async handleComputerHistoryAppIcon(request: any): Promise<HttpLikeResponse> {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
-    if (!isComputerHistorySupported()) return httpError(400, "Computer History is available only on macOS");
+    if (!isComputerHistorySupported()) return httpError(400, "Computer History requires macOS or Windows 11");
     if ((request.method ?? "GET").toUpperCase() !== "GET") return httpError(405, "method not allowed");
     // The router carries the path, query and all, on `request.path`; there is
     // no `request.url` here, and reading one silently loses every parameter.
@@ -3212,15 +3395,31 @@ export class WebSocketChannel extends BaseChannel {
 
   async handleComputerHistory(
     request: any,
-    action: "snapshot" | "model-select" | "permissions-check" | "permissions-open" | "history-delete" | "history-clear" | "history-pin" | "import" | "observation-start" | "observation-pause" | "observation-resume" | "observation-stop" | "workflow-create",
+    action: "snapshot" | "observation-status" | "settings" | "apps" | "model-select" | "permissions-check" | "permissions-open" | "wechat-consent" | "wechat-connect" | "wechat-prepare" | "history-delete" | "history-clear" | "history-pin" | "import" | "observation-start" | "observation-pause" | "observation-resume" | "observation-stop" | "workflow-create",
   ): Promise<HttpLikeResponse> {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
-    if (!isComputerHistorySupported()) return httpError(400, "Computer History is available only on macOS");
+    if (!isComputerHistorySupported()) return httpError(400, "Computer History requires macOS or Windows 11");
     const method = (request.method ?? "GET").toUpperCase();
     if (action === "snapshot") {
       return method === "GET"
         ? httpJsonResponse(clientSnapshot(this.computerHistory.snapshot()) as unknown as Record<string, any>)
         : httpError(405, "method not allowed");
+    }
+    if (action === "observation-status") {
+      return method === "GET"
+        ? httpJsonResponse(this.computerHistory.observationStatus())
+        : httpError(405, "method not allowed");
+    }
+    if (action === "apps") {
+      if (method !== "GET") return httpError(405, "method not allowed");
+      try {
+        return httpJsonResponse({ applications: await this.computerHistory.listApplications() });
+      } catch (error) {
+        return httpError(500, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (action === "settings" && method === "GET") {
+      return httpJsonResponse(this.computerHistory.getObservationSettings() as unknown as Record<string, any>);
     }
     if (method !== "POST") return httpError(405, "method not allowed");
 
@@ -3240,22 +3439,28 @@ export class WebSocketChannel extends BaseChannel {
     try {
       let snapshot;
       switch (action) {
+        case "wechat-consent":
+          if (typeof body.enabled !== "boolean") {
+            throw new ComputerHistoryApiError(422, "enabled must be a boolean");
+          }
+          snapshot = this.computerHistory.setWeChatChatAccess(body.enabled);
+          break;
+        case "wechat-prepare":
+          return httpJsonResponse(await this.computerHistory.prepareWeChatReader());
+        case "wechat-connect":
+          snapshot = this.computerHistory.connectWeChat();
+          break;
+        case "settings":
+          return httpJsonResponse(this.computerHistory.updateObservationSettings(body.settings) as unknown as Record<string, any>);
         case "model-select": {
-          if (body.model_preset !== null && (typeof body.model_preset !== "string" || !body.model_preset.trim())) {
+          if (body.model_preset !== undefined && body.model_preset !== null
+            && (typeof body.model_preset !== "string" || !body.model_preset.trim())) {
             throw new ComputerHistoryApiError(422, "model_preset must be a preset ID or null");
           }
-          const selection = this.modelSelectionResolver?.({ requestedPreset: body.model_preset });
-          if (!selection) throw new ComputerHistoryApiError(422, "model_selection_unavailable");
-          // Include credentials/configuration through the provider signature, but
-          // retain only a digest. Repeated syncs must not restart model requests.
-          const signature = crypto.createHash("sha256").update(JSON.stringify([
-            selection.presetId, selection.source, selection.ownerAccountId, selection.snapshot.signature,
-          ])).digest("hex");
-          if (signature !== this.computerHistoryModelSignature) {
-            this.computerHistory.setLlmRuntime(
-              staticLlmRuntime(selection.snapshot.provider, selection.snapshot.model), selection.source,
-            );
-            this.computerHistoryModelSignature = signature;
+          // Legacy clients send their task preset. Accept it for compatibility,
+          // but only the saved memory_summary assignment participates in routing.
+          if (!this.refreshComputerHistorySummaryModel()) {
+            throw new ComputerHistoryApiError(422, "summary_model_selection_unavailable");
           }
           snapshot = this.computerHistory.snapshot();
           break;
@@ -3329,6 +3534,14 @@ export class WebSocketChannel extends BaseChannel {
       this.connectionDefaultChats.set(connection, defaultChatId);
       this.attachConnection(connection, defaultChatId);
       await this.hydrateAfterSubscribe(defaultChatId);
+      if (surface === "gui") {
+        try { await this.flushPendingCronNotifications(); }
+        catch {
+          // Preserve an unreadable queue without making every GUI connection
+          // fail its ready handshake. The original file remains available.
+          console.warn("[websocket] pending cron notifications could not be recovered; queue preserved");
+        }
+      }
 
       for await (let raw of connection) {
         if (Buffer.isBuffer(raw)) {
@@ -3509,6 +3722,9 @@ export class WebSocketChannel extends BaseChannel {
       }
       const legacyMetadata: Record<string, any> = {
         remote: connection?.remoteAddress ?? null,
+        // This accepted user-message boundary owns the identity. Never import
+        // message IDs or interactive flags from arbitrary envelope metadata.
+        message_id: crypto.randomUUID(),
       };
       const language = normalizeWebuiLanguage(envelope.language);
       if (language) legacyMetadata.webui_language = language;
@@ -3735,6 +3951,7 @@ export class WebSocketChannel extends BaseChannel {
     }
     const metadata: Record<string, any> = {
       remote: connection?.remoteAddress ?? null,
+      message_id: clientRequestId ?? crypto.randomUUID(),
       webui: envelope.webui === true,
       model_preset: modelSelection.preset,
       model_provider: modelSelection.provider,
@@ -3835,6 +4052,15 @@ export class WebSocketChannel extends BaseChannel {
         ok: result.ok,
         ...(!result.ok ? { error: result.error } : {}),
       });
+      return;
+    }
+    if (type === "cron_delivery_ack") {
+      const deliveryId = envelope.delivery_id;
+      if ((this.connectionSurface.get(connection) ?? "gui") !== "gui"
+        || !this.connectionChats.has(connection)
+        || typeof deliveryId !== "string" || !deliveryId.trim() || deliveryId.length > 256) return;
+      try { this.cronNotificationOutbox().remove(deliveryId); }
+      catch { console.warn("[websocket] cron notification acknowledgement could not be saved; queue preserved"); }
       return;
     }
     if (type === "queue_snapshot_request") {
@@ -4310,16 +4536,23 @@ export class WebSocketChannel extends BaseChannel {
       const turnId = this.activeTurnIdByChatId.get(chatId) ?? null;
       let stopped = 0;
       try {
-        const goalHandled = await (this.activeGoalStopHandler?.(sessionKey) ?? Promise.resolve(false));
-        stopped = goalHandled
-          ? 1
-          : await (this.cancelActiveTasks?.(sessionKey) ?? Promise.resolve(0));
+        if (this.stopCurrentTurn) {
+          stopped = await this.stopCurrentTurn(sessionKey, turnId);
+        } else {
+          const goalHandled = await (this.activeGoalStopHandler?.(sessionKey) ?? Promise.resolve(false));
+          stopped = goalHandled
+            ? 1
+            : await (this.cancelActiveTasks?.(sessionKey) ?? Promise.resolve(0));
+        }
       } catch {
         await this.sendEvent(connection, "error", { chat_id: chatId, detail: "stop_failed" });
         return;
       }
       await this.transcriptMonitor?.drain();
-      this.activeTurnIdByChatId.delete(chatId);
+      if (turnId && this.activeTurnIdByChatId.get(chatId) === turnId) {
+        this.activeTurnIdByChatId.delete(chatId);
+        this.activeTurnSourceByChatId.delete(chatId);
+      }
       await this.sendTurnPayload(chatId, {
         event: "stop_result",
         chat_id: chatId,
@@ -4369,14 +4602,14 @@ export class WebSocketChannel extends BaseChannel {
     let rel: string;
     try {
       const mediaDir = getMediaDir();
-      const mediaRoot = realpathIfExists(mediaDir);
-      const candidate = path.resolve(expandHomePath(absPath));
-      let resolved = realpathIfExists(candidate);
-      if (!isPathInside(resolved, mediaRoot) && isPathInside(candidate, mediaDir)) {
-        resolved = path.join(mediaRoot, path.relative(path.resolve(mediaDir), candidate));
+      const mediaRoot = comparablePath(mediaDir);
+      const candidate = path.resolve(normalizeLocalPath(expandHomePath(absPath)));
+      let resolved = comparablePath(candidate);
+      if (!pathIsInside(resolved, mediaRoot) && pathIsInside(candidate, path.resolve(mediaDir))) {
+        resolved = path.resolve(mediaRoot, path.relative(path.resolve(mediaDir), candidate));
       }
       rel = path.relative(mediaRoot, resolved);
-      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+      if (!rel || !pathIsInside(resolved, mediaRoot)) return null;
     } catch {
       return null;
     }
@@ -4389,7 +4622,7 @@ export class WebSocketChannel extends BaseChannel {
     filePath: string,
     workspacePath: string = this.workspacePath,
   ): SignedMediaPath | null {
-    const expanded = expandHomePath(filePath);
+    const expanded = normalizeLocalPath(expandHomePath(filePath));
     const candidate = path.isAbsolute(expanded)
       ? path.resolve(expanded)
       : path.resolve(workspacePath, expanded);
@@ -4448,23 +4681,30 @@ export class WebSocketChannel extends BaseChannel {
     } catch {
       return httpError(400, "invalid payload");
     }
-    const mediaRoot = path.resolve(getMediaDir());
-    const candidate = path.resolve(mediaRoot, rel);
-    if (path.relative(mediaRoot, candidate).startsWith("..")) return httpError(404, "not found");
-    return mediaFileResponse(candidate);
+    const mediaRoot = comparablePath(getMediaDir());
+    const candidate = path.resolve(mediaRoot, normalizeLocalPath(rel));
+    if (!pathIsInside(candidate, mediaRoot)) return httpError(404, "not found");
+    if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) return httpError(404, "not found");
+    const mime = String(lookupMime(candidate) || "application/octet-stream");
+    return {
+      status: 200,
+      headers: {
+        "content-type": DISPLAY_MEDIA_RESPONSE_MIMES.has(mime) ? mime : "application/octet-stream",
+        "cache-control": "private, max-age=31536000, immutable",
+        "x-content-type-options": "nosniff",
+      },
+      body: fs.readFileSync(candidate),
+    };
   }
 
-  /**
-   * Signs a file kept in the default workspace, such as a saved recording.
-   *
-   * Its own MAC domain keeps a media-cache signature from being replayed
-   * against the workspace route, and the reverse.
-   */
+  /** Signs a file kept in the default workspace, such as a saved recording. */
   signWorkspaceMediaPath(absPath: string): string | null {
     let rel: string;
     try {
-      rel = path.relative(realpathIfExists(this.workspacePath), realpathIfExists(path.resolve(absPath)));
-      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+      const workspaceRoot = comparablePath(this.workspacePath);
+      const candidate = comparablePath(absPath);
+      if (!pathIsInside(candidate, workspaceRoot) || candidate === workspaceRoot) return null;
+      rel = path.relative(workspaceRoot, candidate);
     } catch {
       return null;
     }
@@ -4489,10 +4729,9 @@ export class WebSocketChannel extends BaseChannel {
     } catch {
       return httpError(400, "invalid payload");
     }
-    const workspaceRoot = realpathIfExists(this.workspacePath);
-    const candidate = realpathIfExists(path.resolve(workspaceRoot, rel));
-    if (!isPathInside(candidate, workspaceRoot)) return httpError(404, "not found");
-    // Workspace files can be edited in place, so the URL is not immutable.
+    const workspaceRoot = comparablePath(this.workspacePath);
+    const candidate = path.resolve(workspaceRoot, normalizeLocalPath(rel));
+    if (!pathIsInside(candidate, workspaceRoot)) return httpError(404, "not found");
     return mediaFileResponse(candidate, "private, no-cache");
   }
 
@@ -4869,7 +5108,10 @@ export class WebSocketChannel extends BaseChannel {
     }
     if (message.metadata?.webuiGoalCreateAck === true) return;
 
-    const targets = message.chatId === "*" ? [...this.connectionChats.keys()] : [...(this.subscriptions.get(message.chatId) ?? [])];
+    const proactiveCron = message.metadata?.proactiveDelivery === "cron";
+    const targets = proactiveCron
+      ? this.guiNotificationConnections()
+      : message.chatId === "*" ? [...this.connectionChats.keys()] : [...(this.subscriptions.get(message.chatId) ?? [])];
     const wireText = this.rewriteLocalMarkdownImages(message.content, `websocket:${message.chatId}`);
     const turnId = this.turnIdFromMetadata(message.metadata);
     const publicMetadata = { ...(message.metadata ?? {}) };
@@ -4923,10 +5165,15 @@ export class WebSocketChannel extends BaseChannel {
       content: message.content,
       ...(source ? { source } : {}),
     });
-    await this.sendTurnPayload(message.chatId, payload, {
-      appendTranscript: false,
-      targets,
-    });
+    if (proactiveCron) {
+      await this.sendCronNotification(payload, {
+        ...payload, text: message.content, content: message.content,
+        ...(message.media?.length ? { media_paths: [...message.media] } : {}),
+      });
+    } else {
+      await this.sendTurnPayload(message.chatId, payload, { appendTranscript: false, targets });
+    }
+    if (proactiveCron) this.queueGlobalSessionUpdated(message.chatId, "thread");
   }
 
   async sendDelta(chatId: string, delta: string, metadata: Record<string, any> = {}): Promise<void> {
@@ -5095,7 +5342,59 @@ export class WebSocketChannel extends BaseChannel {
         if (mediaUrls.length) payload.media_urls = mediaUrls;
       }
     }
-    await this.sendTurnPayload(chatId, payload, { appendTranscript: false });
+    const proactiveCron = payload.metadata?.proactiveDelivery === "cron";
+    if (proactiveCron) await this.sendCronNotification(payload, record);
+    else await this.sendTurnPayload(chatId, payload, { appendTranscript: false });
+    if (proactiveCron) this.queueGlobalSessionUpdated(chatId, "thread");
+  }
+
+  private guiNotificationConnections(): any[] {
+    // A scheduled result belongs to its chat, but must also reach GUI windows
+    // that have only subscribed to another chat since connecting or restarting.
+    return [...this.connectionChats.keys()].filter(
+      (connection) => (this.connectionSurface.get(connection) ?? "gui") === "gui",
+    );
+  }
+
+  private cronNotificationOutbox(): CronNotificationOutbox {
+    return this.pendingCronOutbox ??= new CronNotificationOutbox(
+      path.join(getDataDir(), "webui", "pending-cron-notifications.json"),
+    );
+  }
+
+  private async sendCronNotification(payload: Record<string, any>, persisted = payload): Promise<void> {
+    const deliveryId = payload.metadata?.deliveryId;
+    const outbox = typeof deliveryId === "string" && deliveryId
+      ? this.cronNotificationOutbox() : null;
+    // Persist before broadcasting. Restart recovery can finish before the GUI
+    // connects; failed/disconnected sockets must not turn that into a silent replay.
+    outbox?.enqueue({ ...persisted, deliveryId, chat_id: String(payload.chat_id) });
+    for (const connection of this.guiNotificationConnections()) {
+      await this.safeSendTo(connection, payload);
+    }
+  }
+
+  async flushPendingCronNotifications(): Promise<void> {
+    if (this.flushingPendingCron || !this.guiNotificationConnections().length) return;
+    this.flushingPendingCron = true;
+    try {
+      for (const record of this.cronNotificationOutbox().list()) {
+        const { deliveryId, ...payload } = record;
+        const sessionKey = this.canonicalSessionKeyForChatId(record.chat_id) ?? `websocket:${record.chat_id}`;
+        const text = String(payload.text ?? payload.content ?? "");
+        payload.text = this.rewriteLocalMarkdownImages(text, sessionKey);
+        payload.content = payload.text;
+        if (Array.isArray(payload.media_paths)) {
+          payload.media_urls = this.augmentTranscriptUserMedia(payload.media_paths, sessionKey);
+        }
+        payload.metadata = { ...(payload.metadata ?? {}), deliveryId, replayed: false };
+        for (const connection of this.guiNotificationConnections()) {
+          await this.safeSendTo(connection, payload);
+        }
+      }
+    } finally {
+      this.flushingPendingCron = false;
+    }
   }
 
   private queueGlobalSessionUpdated(chatId: string, scope: string): void {
@@ -5253,16 +5552,46 @@ function expandHomePath(value: string): string {
 }
 
 function realpathIfExists(value: string): string {
+  const normalized = normalizeLocalPath(value);
   try {
-    return fs.realpathSync(value);
+    return fs.realpathSync(normalized);
   } catch {
-    return path.resolve(value);
+    return path.resolve(normalized);
   }
 }
 
+export function normalizeLocalPath(value: string, platform: NodeJS.Platform = process.platform): string {
+  const trimmed = value.trim();
+  if (platform !== "win32" && !/^(?:[a-z]:[\\/]|\\\\|\/\/)/iu.test(trimmed)) return trimmed;
+  const slashed = trimmed.replace(/\\/gu, "/").replace(/^\/([a-z]:\/)/iu, "$1");
+  if (/^\/\/\?\/unc\//iu.test(slashed)) return `//${slashed.slice("//?/UNC/".length)}`;
+  if (/^\/\/\?\//iu.test(slashed)) {
+    const rest = slashed.slice(4);
+    if (/^[a-z]:\//iu.test(rest)) return rest;
+    if (/^unc\//iu.test(rest)) return `//${rest.slice(4)}`;
+  }
+  return slashed;
+}
+
+export function pathIsInside(
+  child: string,
+  parent: string,
+  pathApi: Pick<typeof path, "resolve" | "relative" | "isAbsolute" | "sep"> = path,
+): boolean {
+  const parentPath = pathApi.resolve(normalizeLocalPath(parent, pathApi.sep === "\\" ? "win32" : "linux"));
+  const childPath = pathApi.resolve(normalizeLocalPath(child, pathApi.sep === "\\" ? "win32" : "linux"));
+  const relative = pathApi.relative(parentPath, childPath);
+  if (!relative) return true;
+  if (pathApi.isAbsolute(relative)) return false;
+  return relative !== ".." && !relative.startsWith(`..${pathApi.sep}`) && !relative.startsWith("../");
+}
+
+function comparablePath(value: string): string {
+  return path.resolve(normalizeLocalPath(realpathIfExists(value)));
+}
+
 function isPathInside(child: string, parent: string): boolean {
-  const relative = path.relative(path.resolve(parent), path.resolve(child));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return pathIsInside(comparablePath(child), comparablePath(parent));
 }
 
 function openPathWithSystemDefault(filePath: string): { ok: true } | { ok: false; message: string } {
@@ -5467,6 +5796,36 @@ function availableFilePath(dir: string, name: string): string {
 function safeFilename(name: string): string {
   const base = path.basename(name || "attachment").replace(UNSAFE_FILENAME_CHARS, "_").trim();
   return base && base !== "." && base !== ".." ? base : "attachment";
+}
+
+function isStagedCopyCurrent(stagedPath: string, size: number): boolean {
+  try {
+    const stat = fs.statSync(stagedPath);
+    return stat.isFile() && stat.size === size;
+  } catch {
+    return false;
+  }
+}
+
+function copyFileAtomically(source: string, target: string): void {
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+  fs.copyFileSync(source, temporary);
+  try {
+    try {
+      fs.renameSync(temporary, target);
+    } catch (error) {
+      // Windows refuses to rename onto an existing file, and a shared-folder
+      // source can also make the rename cross volumes. The bytes are already
+      // in the temp file, so copy them onto the destination instead.
+      try {
+        fs.copyFileSync(temporary, target);
+      } catch {
+        throw error;
+      }
+    }
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
 
 function extensionForImageMime(mime: string): string {

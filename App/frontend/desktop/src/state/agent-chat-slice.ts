@@ -26,6 +26,7 @@ import type {
 } from "../api/memmy-agent-client.js";
 import {
   chatIdToSessionKey,
+  isCronProactiveMessage,
   isAgentGoalState,
   isAgentGoalStatus,
   isAgentTaskPlanState,
@@ -78,7 +79,7 @@ export interface AgentRecoveryChatRequest {
  */
 export type AgentMessageKind = "message" | "trace" | "narration" | "context_compaction";
 export type AgentCompactionStatus = "running" | "done" | "error";
-export type AgentChatMediaKind = "image" | "video" | "file";
+export type AgentChatMediaKind = "image" | "video" | "audio" | "file";
 export type AgentChatMediaAttachment = {
   kind: AgentChatMediaKind;
   url?: string;
@@ -134,6 +135,10 @@ export interface AgentChatMessage {
   stoppedByUser?: boolean;
   modelError?: MemmyAgentModelError;
   clientRequestId?: string;
+  proactiveDeliveryId?: string;
+  proactiveDelivery?: "cron";
+  /** Name captured when the scheduled result was sent, independent of the current job. */
+  proactiveTaskName?: string;
   queueSteerPending?: boolean;
 }
 
@@ -146,7 +151,7 @@ export type AgentQueuedMessage = {
   queueSurface: "chat_composer" | null;
   turnAdmission?: "steer";
   turnId?: string;
-  status: "queued" | "removing" | "steering";
+  status: "sending" | "queued" | "removing" | "steering";
 };
 
 export type AgentQueueDesync = {
@@ -197,6 +202,7 @@ export interface AgentState {
     presetId: string | null;
   }>;
   chatViewVisible: boolean;
+  chatWindowFocused: boolean;
   currentChatId: string | null;
   currentSessionKey: string | null;
   projectRegistryState: "ready" | "corrupt";
@@ -235,6 +241,12 @@ export interface AgentState {
   // Agent chat slice module.
   // Last task completion.
   lastTaskCompletion: { chatId: string; at: number } | null;
+  proactiveDeliveryIdsByChatId: Record<string, string[]>;
+  proactiveLiveDeliveryIdsByChatId: Record<string, string[]>;
+  proactiveHistoryStartIdsByRequestId: Record<string, string[]>;
+  proactiveUnseenByChatId: Record<string, number>;
+  proactiveDeliveredAtByChatId: Record<string, number>;
+  proactiveNotifications: Array<{ deliveryId: string; chatId: string; content: string }>;
   goalStatesByChatId: Record<string, AgentGoalState>;
   goalState: AgentGoalState | null;
   taskPlanStatesByChatId: Record<string, AgentTaskPlanState>;
@@ -276,6 +288,8 @@ export type AgentAction =
   | { type: "agent/connectionFailed"; message: string }
   | { type: "agent/connectionDisposed" }
   | { type: "agent/chatViewVisibilityChanged"; visible: boolean }
+  | { type: "agent/chatWindowFocusChanged"; focused: boolean }
+  | { type: "agent/proactiveNotificationsAcknowledged"; deliveryIds: string[] }
   | { type: "agent/operationFailed"; surface: AgentOperationSurface; error: AgentOperationError }
   | { type: "agent/operationErrorDismissed"; surface: AgentOperationSurface; id: string }
   | { type: "agent/sessionsLoading"; requestId?: string }
@@ -300,8 +314,9 @@ export type AgentAction =
   | { type: "agent/blankDraftReopened" }
   | { type: "agent/newChatCreated"; chatId: string }
   | { type: "agent/transientSendFailed"; chatId: string }
-  | { type: "agent/userMessageQueued"; chatId: string; content: string; media?: AgentChatMediaAttachment[]; focus?: boolean; deliveryUncertain?: boolean; target?: WebuiSessionTarget; clientRequestId?: string }
   | { type: "agent/pluginFeedbackRecorded"; chatId: string; content: string; clientRequestId: string }
+  | { type: "agent/optimisticMessageRejected"; chatId: string; clientRequestId: string }
+  | { type: "agent/userMessageQueued"; chatId: string; content: string; media?: AgentChatMediaAttachment[]; focus?: boolean; deliveryUncertain?: boolean; target?: WebuiSessionTarget; clientRequestId?: string; queueIfBusy?: boolean }
   | { type: "agent/queueItemRemoveStarted"; chatId: string; clientRequestId: string }
   | { type: "agent/queueItemRemoveFailed"; chatId: string; clientRequestId: string; error: AgentOperationError }
   | { type: "agent/queueItemSteerStarted"; chatId: string; clientRequestId: string }
@@ -364,6 +379,7 @@ export const initialAgentState: AgentState = {
   pendingPresetByScope: {},
   pendingModelCommitByRequestId: {},
   chatViewVisible: false,
+  chatWindowFocused: true,
   currentChatId: null,
   currentSessionKey: null,
   projectRegistryState: "ready",
@@ -400,6 +416,12 @@ export const initialAgentState: AgentState = {
   optimisticTasksByChatId: {},
   completedUnseenByChatId: {},
   lastTaskCompletion: null,
+  proactiveDeliveryIdsByChatId: {},
+  proactiveLiveDeliveryIdsByChatId: {},
+  proactiveHistoryStartIdsByRequestId: {},
+  proactiveUnseenByChatId: {},
+  proactiveDeliveredAtByChatId: {},
+  proactiveNotifications: [],
   goalStatesByChatId: {},
   goalState: null,
   taskPlanStatesByChatId: {},
@@ -496,6 +518,7 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
         currentSessionsRequestRunStatusVersionByChatId: null,
         currentHistoryRequestIdByChatId: {},
         currentHistoryHydrateRequestIdByChatId: {},
+        proactiveHistoryStartIdsByRequestId: {},
         queuedMessagesByChatId: {},
         queueRevisionByChatId: {},
         queueDesyncedByChatId: {},
@@ -504,6 +527,12 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       };
     case "agent/chatViewVisibilityChanged":
       return updateChatViewVisibility(state, action.visible);
+    case "agent/chatWindowFocusChanged":
+      return updateChatViewVisibility({ ...state, chatWindowFocused: action.focused }, state.chatViewVisible);
+    case "agent/proactiveNotificationsAcknowledged": {
+      const acknowledged = new Set(action.deliveryIds);
+      return { ...state, proactiveNotifications: state.proactiveNotifications.filter((item) => !acknowledged.has(item.deliveryId)) };
+    }
     case "agent/operationFailed":
       return setOperationError(state, action.surface, action.error);
     case "agent/operationErrorDismissed":
@@ -591,6 +620,8 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       return switchCurrentChat({ ...state, blankDraftActive: false }, action.chatId, chatIdToSessionKey(action.chatId));
     case "agent/transientSendFailed":
       return clearTransientSend(state, action.chatId);
+    case "agent/optimisticMessageRejected":
+      return clearOptimisticSend(state, action.chatId, action.clientRequestId);
     case "agent/userMessageQueued":
       return queueOptimisticUserMessage(state, action);
     case "agent/pluginFeedbackRecorded":
@@ -637,8 +668,12 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       };
     case "agent/tasksMarkedRead": {
       const completedUnseenByChatId = { ...state.completedUnseenByChatId };
-      for (const chatId of action.chatIds) delete completedUnseenByChatId[chatId];
-      return deriveTasks({ ...state, completedUnseenByChatId });
+      const proactiveUnseenByChatId = { ...state.proactiveUnseenByChatId };
+      for (const chatId of action.chatIds) {
+        delete completedUnseenByChatId[chatId];
+        delete proactiveUnseenByChatId[chatId];
+      }
+      return deriveTasks({ ...state, completedUnseenByChatId, proactiveUnseenByChatId });
     }
     case "agent/composerScopeCleared":
       return clearComposerScope(state, action.scopeKey);
@@ -946,7 +981,17 @@ function applyQueueSnapshot(state: AgentState, event: MemmyAgentWsEvent): AgentS
   const waiting = event.items
     .map(queuedMessageFromWire)
     .filter((item): item is AgentQueuedMessage => item !== null && !startedIds.has(item.clientRequestId));
-  let nextState = setQueuedMessagesForChat(state, event.chat_id, sortedQueuedMessages(waiting));
+  const confirmedIds = new Set([...startedIds, ...waiting.map((item) => item.clientRequestId)]);
+  // A snapshot can have been captured before a just-submitted message reaches
+  // the server. Keep its local queue row until that request is acknowledged.
+  const pending = (state.queuedMessagesByChatId[event.chat_id] ?? []).filter(
+    (item) => item.status === "sending" && !confirmedIds.has(item.clientRequestId)
+  );
+  let nextState = state;
+  for (const item of waiting) {
+    nextState = clearOptimisticSend(nextState, event.chat_id, item.clientRequestId);
+  }
+  nextState = setQueuedMessagesForChat(nextState, event.chat_id, sortedQueuedMessages([...waiting, ...pending]));
   for (const item of sortedQueuedMessages(started)) {
     nextState = promoteQueuedMessage(
       nextState,
@@ -1005,9 +1050,35 @@ function queueOptimisticUserMessage(
   action: Extract<AgentAction, { type: "agent/userMessageQueued" }>
 ): AgentState {
   const shouldFocus = action.focus !== false;
-  const selectedState = shouldFocus
+  const selectedState = shouldFocus && (state.currentChatId !== action.chatId || state.blankDraftActive)
     ? switchCurrentChat(state, action.chatId, chatIdToSessionKey(action.chatId))
     : state;
+  if (
+    action.queueIfBusy
+    && action.clientRequestId
+    && (
+      isChatBusy(selectedState, action.chatId)
+      || chatHasLiveStream(selectedState, action.chatId)
+      || (selectedState.queuedMessagesByChatId[action.chatId]?.length ?? 0) > 0
+    )
+  ) {
+    const items = selectedState.queuedMessagesByChatId[action.chatId] ?? [];
+    if (
+      items.some((item) => item.clientRequestId === action.clientRequestId)
+      || chatMessagesForId(selectedState, action.chatId).some(
+        (message) => message.clientRequestId === action.clientRequestId
+      )
+    ) return selectedState;
+    return setQueuedMessagesForChat(selectedState, action.chatId, [...items, {
+      clientRequestId: action.clientRequestId,
+      content: action.content,
+      media: action.media ?? [],
+      queuedAt: Date.now(),
+      source: { kind: "gui", channel: "websocket" },
+      queueSurface: "chat_composer",
+      status: "sending"
+    }]);
+  }
   const nextState = clearSuppressAssistantStreamUntilTurnEnd(selectedState, action.chatId);
   const now = Date.now();
   const existingMessages = chatMessagesForId(nextState, action.chatId);
@@ -1127,6 +1198,7 @@ function failHistoryOpen(
   return setOperationError({
     ...state,
     currentHistoryRequestIdByChatId,
+    proactiveHistoryStartIdsByRequestId: clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, requestId),
     isLoadingHistory: false
   }, "chat", error);
 }
@@ -1137,7 +1209,8 @@ function beginRecoveryChatLoad(state: AgentState, request: AgentRecoveryChatRequ
     || request.chatSelectionEpoch !== state.chatSelectionEpoch) {
     return state;
   }
-  return { ...state, currentRecoveryChatRequest: request, isLoadingHistory: true };
+  return { ...rememberProactiveHistoryStart(state, request.chatId, request.requestId, state.currentRecoveryChatRequest?.requestId),
+    currentRecoveryChatRequest: request, isLoadingHistory: true };
 }
 
 function completeRecoveryChatLoad(
@@ -1180,7 +1253,8 @@ function completeRecoveryChatLoad(
   if (snapshotMessages
     && !runVersionChanged
     && (idleSnapshotHasClosedHistory || runningSnapshotCompletedBeforeHistory)) {
-    nextState = replaceChatMessages(nextState, action.chatId, snapshotMessages);
+    nextState = replaceChatMessages(nextState, action.chatId,
+      preserveConcurrentProactiveDeliveries(state, action.chatId, action.requestId, snapshotMessages, localMessages));
     nextState = markChatIdle(nextState, action.chatId, {
       source: "session_hydrate",
       turnId: action.thread?.last_turn_id ?? recoveryActiveTurnId,
@@ -1245,7 +1319,7 @@ function completeRecoveryChatLoad(
       action.completedAt
     ));
   }
-  return nextState;
+  return { ...nextState, proactiveHistoryStartIdsByRequestId: clearChatMapValue(nextState.proactiveHistoryStartIdsByRequestId, action.requestId) };
 }
 
 function finishRecovery(state: AgentState, generation: number): AgentState {
@@ -1273,11 +1347,11 @@ function finishRecovery(state: AgentState, generation: number): AgentState {
 }
 
 function replaceChatMessages(state: AgentState, chatId: string, messages: AgentChatMessage[]): AgentState {
-  return {
+  return rememberProactiveDeliveries({
     ...state,
     messagesByChatId: { ...state.messagesByChatId, [chatId]: messages },
     ...(state.currentChatId === chatId && !state.blankDraftActive ? { messages } : {})
-  };
+  }, chatId, messages);
 }
 
 function applyRecoveryRunningSnapshot(
@@ -1678,6 +1752,10 @@ function completeSessionsLoad(state: AgentState, sessions: MemmyAgentSessionSumm
     queueDesyncedByChatId,
     retryWaitStatusByChatId: pruneOptionalMap(state.retryWaitStatusByChatId, knownChatIds),
     completedUnseenByChatId: pruneNumberMap(state.completedUnseenByChatId, knownChatIds),
+    proactiveUnseenByChatId: pruneNumberMap(state.proactiveUnseenByChatId, knownChatIds),
+    proactiveDeliveredAtByChatId: pruneNumberMap(state.proactiveDeliveredAtByChatId, knownChatIds),
+    proactiveDeliveryIdsByChatId: pruneChatMap(state.proactiveDeliveryIdsByChatId, knownChatIds),
+    proactiveLiveDeliveryIdsByChatId: pruneChatMap(state.proactiveLiveDeliveryIdsByChatId, knownChatIds),
     runStartedAtByChatId: reconcileSessionRunStartedOverrides(state.runStartedAtByChatId, sessions, knownChatIds, preserveRunChatIds),
     goalRunClockByChatId: pruneNullableMap(state.goalRunClockByChatId, knownChatIds),
     runStatusVersionByChatId: pruneNumberMap(state.runStatusVersionByChatId, knownChatIds),
@@ -1757,6 +1835,7 @@ function failSessionsLoad(state: AgentState, requestId: string | undefined): Age
 }
 
 function beginHistoryLoad(state: AgentState, sessionKey: string, chatId: string, requestId: string): AgentState {
+  state = rememberProactiveHistoryStart(state, chatId, requestId, state.currentHistoryRequestIdByChatId[chatId]);
   const nextState = switchCurrentChat(state, chatId, sessionKey);
   const currentHistoryHydrateRequestIdByChatId = { ...nextState.currentHistoryHydrateRequestIdByChatId };
   delete currentHistoryHydrateRequestIdByChatId[chatId];
@@ -1822,13 +1901,14 @@ function completeHistoryLoad(state: AgentState, thread: MemmyAgentWebuiThread, r
     || (snapshot.length === 0 && chatBusy && currentMessages.length > 0)
     || (chatBusy && isSnapshotMissingLatestUserMessage(currentMessages, snapshot));
   const messages = shouldKeepCurrent
-    ? reconcileQueueSteerPendingMessages(
+    ? mergeProactiveHistory(reconcileQueueSteerPendingMessages(
         currentMessages,
         snapshot,
         activeTurnId,
         historyTurnClosed
-      )
-    : snapshot;
+      ), snapshot)
+    : preserveConcurrentProactiveDeliveries(state, chatId, requestId, snapshot, currentMessages);
+  state = rememberProactiveDeliveries(state, chatId, messages);
   const pendingCanonicalHydrateByChatId = { ...state.pendingCanonicalHydrateByChatId };
   const currentHistoryRequestIdByChatId = { ...state.currentHistoryRequestIdByChatId };
   const currentHistoryHydrateRequestIdByChatId = { ...state.currentHistoryHydrateRequestIdByChatId };
@@ -1851,6 +1931,7 @@ function completeHistoryLoad(state: AgentState, thread: MemmyAgentWebuiThread, r
     pendingCanonicalHydrateByChatId,
     currentHistoryRequestIdByChatId,
     currentHistoryHydrateRequestIdByChatId,
+    proactiveHistoryStartIdsByRequestId: clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, requestId),
     blankDraftActive: false,
     isSending: isChatBusy(state, chatId) || hasLiveStreamingMessage(messages),
     isLoadingHistory: false,
@@ -1875,6 +1956,7 @@ function completeHistoryOpenMissing(state: AgentState, sessionKey: string, chatI
     ...state,
     pendingCanonicalHydrateByChatId,
     currentHistoryRequestIdByChatId,
+    proactiveHistoryStartIdsByRequestId: clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, requestId),
     isLoadingHistory: false,
     isSending: isChatBusy(state, chatId),
     refreshRequested: true
@@ -1883,6 +1965,7 @@ function completeHistoryOpenMissing(state: AgentState, sessionKey: string, chatI
 }
 
 function beginHistoryHydrateLoad(state: AgentState, chatId: string, requestId: string): AgentState {
+  state = rememberProactiveHistoryStart(state, chatId, requestId, state.currentHistoryHydrateRequestIdByChatId[chatId]);
   return deriveTasks({
     ...state,
     pendingCanonicalHydrateByChatId: { ...state.pendingCanonicalHydrateByChatId, [chatId]: true },
@@ -1909,13 +1992,14 @@ function completeHistoryHydrateLoad(state: AgentState, thread: MemmyAgentWebuiTh
     || (snapshot.length === 0 && chatBusy && currentMessages.length > 0)
     || (chatBusy && isSnapshotMissingLatestUserMessage(currentMessages, snapshot));
   const messages = shouldKeepCurrent
-    ? reconcileQueueSteerPendingMessages(
+    ? mergeProactiveHistory(reconcileQueueSteerPendingMessages(
         currentMessages,
         snapshot,
         activeTurnId,
         hydrateTurnClosed
-      )
-    : snapshot;
+      ), snapshot)
+    : preserveConcurrentProactiveDeliveries(state, chatId, requestId, snapshot, currentMessages);
+  state = rememberProactiveDeliveries(state, chatId, messages);
   const pendingCanonicalHydrateByChatId = { ...state.pendingCanonicalHydrateByChatId };
   const currentHistoryHydrateRequestIdByChatId = { ...state.currentHistoryHydrateRequestIdByChatId };
   const historyVersionByChatId = { ...state.historyVersionByChatId };
@@ -1932,6 +2016,7 @@ function completeHistoryHydrateLoad(state: AgentState, thread: MemmyAgentWebuiTh
     transcriptOffsetByChatId: clearChatMapValue(state.transcriptOffsetByChatId, chatId),
     pendingCanonicalHydrateByChatId,
     currentHistoryHydrateRequestIdByChatId,
+    proactiveHistoryStartIdsByRequestId: clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, requestId),
     ...(chatId === state.currentChatId && !state.blankDraftActive
       ? { messages, isSending: isChatBusy(state, chatId) || hasLiveStreamingMessage(messages) }
       : {})
@@ -1959,7 +2044,8 @@ function failHistoryHydrateLoad(
   const nextState = deriveTasks({
     ...state,
     pendingCanonicalHydrateByChatId,
-    currentHistoryHydrateRequestIdByChatId
+    currentHistoryHydrateRequestIdByChatId,
+    proactiveHistoryStartIdsByRequestId: clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, requestId),
   });
   return error ? setOperationError(nextState, "chat", error) : nextState;
 }
@@ -1985,10 +2071,14 @@ function syncCurrentMessages(state: AgentState): AgentState {
 function switchCurrentChat(state: AgentState, chatId: string, sessionKey = chatIdToSessionKey(chatId)): AgentState {
   const cachedState = cacheCurrentMessages(state);
   const completedUnseenByChatId = clearChatMapValue(cachedState.completedUnseenByChatId, chatId);
+  const proactiveUnseenByChatId = state.chatWindowFocused && state.chatViewVisible
+    ? clearChatMapValue(cachedState.proactiveUnseenByChatId, chatId)
+    : cachedState.proactiveUnseenByChatId;
   if (cachedState.currentChatId === chatId && cachedState.currentSessionKey === sessionKey) {
     return deriveTasks({
       ...cachedState,
       completedUnseenByChatId,
+      proactiveUnseenByChatId,
       chatSelectionEpoch: cachedState.blankDraftActive ? cachedState.chatSelectionEpoch + 1 : cachedState.chatSelectionEpoch,
       blankDraftActive: false,
       goalState: cachedState.goalStatesByChatId[chatId] ?? cachedState.goalState,
@@ -1999,6 +2089,7 @@ function switchCurrentChat(state: AgentState, chatId: string, sessionKey = chatI
   return deriveTasks({
     ...cachedState,
     completedUnseenByChatId,
+    proactiveUnseenByChatId,
     chatSelectionEpoch: cachedState.chatSelectionEpoch + 1,
     currentChatId: chatId,
     currentSessionKey: sessionKey,
@@ -2066,13 +2157,14 @@ function effectiveRunStartedAtForChat(state: AgentState, chatId: string): number
 }
 
 function isChatVisible(state: AgentState, chatId: string): boolean {
-  return state.chatViewVisible && state.currentChatId === chatId && !state.blankDraftActive;
+  return state.chatWindowFocused && state.chatViewVisible && state.currentChatId === chatId && !state.blankDraftActive;
 }
 
 function isTaskCompletedUnseen(state: AgentState, chatId: string): boolean {
-  return state.completedUnseenByChatId[chatId] != null
-    && effectiveRunStartedAtForChat(state, chatId) == null
-    && !isChatVisible(state, chatId);
+  return !isChatVisible(state, chatId) && (
+    state.proactiveUnseenByChatId[chatId] != null
+    || (state.completedUnseenByChatId[chatId] != null && effectiveRunStartedAtForChat(state, chatId) == null)
+  );
 }
 
 function updateChatViewVisibility(state: AgentState, visible: boolean): AgentState {
@@ -2082,7 +2174,8 @@ function updateChatViewVisibility(state: AgentState, visible: boolean): AgentSta
   }
   return deriveTasks({
     ...nextState,
-    completedUnseenByChatId: clearChatMapValue(nextState.completedUnseenByChatId, nextState.currentChatId)
+    completedUnseenByChatId: clearChatMapValue(nextState.completedUnseenByChatId, nextState.currentChatId),
+    proactiveUnseenByChatId: clearChatMapValue(nextState.proactiveUnseenByChatId, nextState.currentChatId)
   });
 }
 
@@ -2362,11 +2455,12 @@ function finishActivityProgressForTurnEnd(message: AgentChatMessage): AgentChatM
   };
 }
 
-function finishStreamingMessages(messages: AgentChatMessage[], latencyMs?: number): AgentChatMessage[] {
+function finishStreamingMessages(messages: AgentChatMessage[], latencyMs?: number, finishedAt?: number): AgentChatMessage[] {
   let lastAssistantIndex = -1;
-  if (latencyMs != null) {
+  if (latencyMs != null || finishedAt != null) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index]?.role === "assistant") {
+      const message = messages[index];
+      if (message?.role === "assistant" && message.kind !== "trace" && message.kind !== "narration" && message.proactiveDelivery !== "cron") {
         lastAssistantIndex = index;
         break;
       }
@@ -2377,8 +2471,9 @@ function finishStreamingMessages(messages: AgentChatMessage[], latencyMs?: numbe
   const nextMessages = messages.map((message, index) => {
     const finishedMessage = finishActivityProgressForTurnEnd(message);
     const shouldFinishStreaming = Boolean(message.isStreaming || message.reasoningStreaming);
-    const shouldSetLatency = index === lastAssistantIndex;
-    if (finishedMessage === message && !shouldFinishStreaming && !shouldSetLatency) {
+    const shouldSetLatency = latencyMs != null && index === lastAssistantIndex;
+    const shouldStampFinishedAt = finishedAt != null && index === lastAssistantIndex && message.createdAt !== finishedAt;
+    if (finishedMessage === message && !shouldFinishStreaming && !shouldSetLatency && !shouldStampFinishedAt) {
       return message;
     }
 
@@ -2386,20 +2481,21 @@ function finishStreamingMessages(messages: AgentChatMessage[], latencyMs?: numbe
     return {
       ...finishedMessage,
       ...(shouldFinishStreaming ? { isStreaming: false, reasoningStreaming: false } : {}),
-      ...(shouldSetLatency ? { latencyMs } : {})
+      ...(shouldSetLatency ? { latencyMs } : {}),
+      ...(shouldStampFinishedAt ? { createdAt: finishedAt } : {})
     };
   });
 
   return changed ? nextMessages : messages;
 }
 
-function finishChatStreaming(state: AgentState, chatId: string, latencyMs?: number): AgentState {
+function finishChatStreaming(state: AgentState, chatId: string, latencyMs?: number, finishedAt?: number): AgentState {
   const messages = state.currentChatId === chatId ? state.messages : state.messagesByChatId[chatId];
   if (!messages) {
     return state;
   }
 
-  const finishedMessages = finishStreamingMessages(messages, latencyMs);
+  const finishedMessages = finishStreamingMessages(messages, latencyMs, finishedAt);
   if (finishedMessages === messages) {
     return state;
   }
@@ -2669,21 +2765,16 @@ function reduceWsEvent(state: AgentState, event: MemmyAgentWsEvent): AgentState 
       if (!event.chat_id || !event.item) return state;
       const item = queuedMessageFromWire(event.item);
       if (!item) return state;
+      // A revision gap delays the full projection, but this request's own
+      // acknowledgement still proves it is queued. A later goal-inbox
+      // acceptance must not promote that row as an immediately started turn.
+      if (state.queuedMessagesByChatId[event.chat_id]?.some(
+        (candidate) => candidate.clientRequestId === item.clientRequestId && candidate.status === "sending"
+      )) {
+        state = updateQueuedMessageStatus(state, event.chat_id, item.clientRequestId, "queued");
+      }
       return applyQueueIncrement(state, event, (currentState) => {
-        const currentMessages = chatMessagesForId(currentState, event.chat_id!);
-        const withoutSteerPending = currentMessages.filter((message) => !(
-          message.clientRequestId === item.clientRequestId
-          && message.queueSteerPending === true
-        ));
-        if (withoutSteerPending.length !== currentMessages.length) {
-          currentState = syncCurrentMessages({
-            ...currentState,
-            messagesByChatId: {
-              ...currentState.messagesByChatId,
-              [event.chat_id!]: withoutSteerPending
-            }
-          });
-        }
+        currentState = clearOptimisticSend(currentState, event.chat_id!, item.clientRequestId);
         const current = currentState.queuedMessagesByChatId[event.chat_id!] ?? [];
         const index = current.findIndex(
           (candidate) => candidate.clientRequestId === item.clientRequestId
@@ -2847,6 +2938,15 @@ function reduceWsEvent(state: AgentState, event: MemmyAgentWsEvent): AgentState 
     case "message_accepted":
       if (!event.chat_id || !event.client_request_id) return state;
       {
+        const item = state.queuedMessagesByChatId[event.chat_id]?.find(
+          (candidate) => candidate.clientRequestId === event.client_request_id
+        );
+        // Goal inbox acceptance also acknowledges durable queued messages.
+        // Only a local row that has not received a queue acknowledgement can
+        // be an immediately started turn, even during unrelated queue recovery.
+        if (item?.status === "sending") {
+          state = promoteQueuedMessage(state, event.chat_id, item);
+        }
         const pending = state.pendingModelCommitByRequestId[event.client_request_id];
         const selection = parseMemmyAgentModelSelection(event.model_selection);
         if (
@@ -2882,6 +2982,7 @@ function reduceChatContentEvent(state: AgentState, event: MemmyAgentWsEvent): Ag
   if (!chatId) {
     return state;
   }
+  if (isCronProactiveMessage(event)) return appendCronProactiveMessage(state, chatId, event);
   const offsetApplied = applyTranscriptOffset(state, chatId, event);
   if (offsetApplied === null) {
     return state;
@@ -2987,19 +3088,47 @@ function appendExternalUserMessage(
   event: MemmyAgentWsEvent
 ): AgentState {
   const turnId = eventTurnId(event);
-  if (turnId && state.messages.some((message) => message.role === "user" && message.turnId === turnId)) {
-    return state;
-  }
   const content = typeof event.text === "string"
     ? event.text
     : typeof event.content === "string"
       ? event.content
       : "";
   const normalizedMedia = Array.isArray(event.media_urls) ? normalizeMedia(event.media_urls) : [];
+  const clientRequestId = typeof event.client_request_id === "string" ? event.client_request_id : null;
+  if (clientRequestId) {
+    state = removeQueuedMessageFromChat(state, chatId, clientRequestId).state;
+  }
+  const optimisticIndex = clientRequestId
+    ? state.messages.findIndex((message) => (
+        message.role === "user"
+        && message.clientRequestId === clientRequestId
+      ))
+    : -1;
+  if (optimisticIndex >= 0) {
+    const messages = [...state.messages];
+    messages[optimisticIndex] = {
+      ...messages[optimisticIndex]!,
+      content: content || messages[optimisticIndex]!.content,
+      ...(turnId ? { turnId } : {}),
+      ...(normalizedMedia.length ? { media: normalizedMedia } : {})
+    };
+    return {
+      ...state,
+      messages,
+      messagesByChatId: {
+        ...state.messagesByChatId,
+        [chatId]: messages
+      }
+    };
+  }
+  if (turnId && state.messages.some((message) => message.role === "user" && message.turnId === turnId)) {
+    return state;
+  }
   const message: AgentChatMessage = {
     id: nextMessageId(state.messages, "user"),
     role: "user",
     content,
+    ...(clientRequestId ? { clientRequestId } : {}),
     ...(turnId ? { turnId } : {}),
     ...(normalizedMedia.length ? { media: normalizedMedia } : {})
   };
@@ -3103,7 +3232,7 @@ function handleTransportMessageTooBig(state: AgentState, event: MemmyAgentWsEven
   if (!chatId) {
     return setOperationError(state, "chat", operationErrorForChat("home.media.error.messageTooBig", undefined, "send"));
   }
-  const nextState = clearRejectedOptimisticSend(state, chatId);
+  const nextState = clearOptimisticSend(state, chatId, event.client_request_id);
   return setOperationError(nextState, "chat", operationErrorForChat("home.media.error.messageTooBig", chatId, "send"));
 }
 
@@ -3114,7 +3243,7 @@ function handleMediaRejected(state: AgentState, event: MemmyAgentWsEvent): Agent
   }
 
   return setOperationError(
-    clearRejectedOptimisticSend(state, chatId),
+    clearOptimisticSend(state, chatId, event.client_request_id),
     "chat",
     operationErrorForChat(mediaRejectedMessageKey(event.reason), chatId, "send")
   );
@@ -3122,7 +3251,7 @@ function handleMediaRejected(state: AgentState, event: MemmyAgentWsEvent): Agent
 
 function handleMissingContent(state: AgentState, event: MemmyAgentWsEvent): AgentState {
   const chatId = event.chat_id;
-  const nextState = chatId ? clearRejectedOptimisticSend(state, chatId) : state;
+  const nextState = chatId ? clearOptimisticSend(state, chatId, event.client_request_id) : state;
   return setOperationError(nextState, "chat", operationErrorFromEvent(event, "send"));
 }
 
@@ -3134,15 +3263,27 @@ function handleStopFailed(state: AgentState, event: MemmyAgentWsEvent): AgentSta
   return setOperationError(nextState, "chat", operationErrorFromEvent(event, "gateway-command"));
 }
 
-function clearRejectedOptimisticSend(state: AgentState, chatId: string): AgentState {
-  if (!state.optimisticSendingByChatId[chatId]) {
+function clearOptimisticSend(state: AgentState, chatId: string, clientRequestId?: string): AgentState {
+  if (clientRequestId && state.queuedMessagesByChatId[chatId]?.some(
+    (item) => item.clientRequestId === clientRequestId && item.status === "sending"
+  )) {
+    state = removeQueuedMessageFromChat(state, chatId, clientRequestId).state;
+  }
+  const currentMessages = chatMessagesForId(state, chatId);
+  const messages = clientRequestId
+    ? currentMessages.filter((message) => message.clientRequestId !== clientRequestId)
+    : removeLatestOptimisticUser(currentMessages);
+  const removedMessage = messages.length !== currentMessages.length;
+  if (
+    (clientRequestId && !removedMessage)
+    || (!clientRequestId && !state.optimisticSendingByChatId[chatId])
+  ) {
     return state;
   }
   const optimisticSendingByChatId = clearChatMapValue(state.optimisticSendingByChatId, chatId);
   const optimisticTasksByChatId = hasCanonicalSession(state, chatId)
     ? state.optimisticTasksByChatId
     : clearChatMapValue(state.optimisticTasksByChatId, chatId);
-  const messages = removeLatestOptimisticUser(chatMessagesForId(state, chatId));
   return deriveTasks({
     ...state,
     optimisticSendingByChatId,
@@ -3206,11 +3347,9 @@ function completeRestartAfterReconnect(state: AgentState): AgentState {
  * untouched, so the real answer never restyles at the end of the turn.
  */
 function latestMessageIndexForTurn(messages: AgentChatMessage[], turnId: string | null): number {
-  if (!turnId) {
-    return messages.length - 1;
-  }
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.turnId === turnId) {
+    if (messages[index]?.proactiveDelivery === "cron") continue;
+    if (!turnId || messages[index]?.turnId === turnId) {
       return index;
     }
   }
@@ -3218,11 +3357,9 @@ function latestMessageIndexForTurn(messages: AgentChatMessage[], turnId: string 
 }
 
 function previousMessageIndexForTurn(messages: AgentChatMessage[], beforeIndex: number, turnId: string | null): number {
-  if (!turnId) {
-    return beforeIndex - 1;
-  }
   for (let index = beforeIndex - 1; index >= 0; index -= 1) {
-    if (messages[index]?.turnId === turnId) {
+    if (messages[index]?.proactiveDelivery === "cron") continue;
+    if (!turnId || messages[index]?.turnId === turnId) {
       return index;
     }
   }
@@ -3756,6 +3893,7 @@ function findLatestFoldableAssistantAnswerIndex(
   const startIndex = turnId ? 0 : currentTurnStartIndex(messages);
   for (let index = messages.length - 1; index >= startIndex; index -= 1) {
     const message = messages[index];
+    if (message?.proactiveDelivery === "cron") continue;
     if (turnId && message?.turnId !== turnId) {
       continue;
     }
@@ -3832,7 +3970,7 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".
 const VIDEO_ATTACHMENT_EXTENSIONS = new Set([".mp4", ".webm", ".mov", ".m4v"]);
 
 function isAgentChatMediaKind(value: unknown): value is AgentChatMediaKind {
-  return value === "image" || value === "video" || value === "file";
+  return value === "image" || value === "video" || value === "audio" || value === "file";
 }
 
 function extensionOf(value: string | undefined): string {
@@ -3907,6 +4045,99 @@ function isCronProactiveEvent(event: MemmyAgentWsEvent): boolean {
     !Array.isArray(metadata) &&
     (metadata as Record<string, unknown>).proactiveDelivery === "cron"
   );
+}
+
+function proactiveDeliveryId(metadata: unknown): string | null {
+  if (!isRecord(metadata) || metadata.proactiveDelivery !== "cron") return null;
+  return typeof metadata.deliveryId === "string" && metadata.deliveryId.trim()
+    ? metadata.deliveryId.trim()
+    : null;
+}
+
+function proactiveTaskName(metadata: unknown): string | undefined {
+  if (!isRecord(metadata) || metadata.proactiveDelivery !== "cron" || typeof metadata.cronJobName !== "string") return undefined;
+  return metadata.cronJobName.replace(/\s+/gu, " ").trim() || undefined;
+}
+
+function proactiveDeliveredAt(metadata: unknown): number | undefined {
+  if (!isRecord(metadata) || metadata.proactiveDelivery !== "cron") return undefined;
+  return typeof metadata.deliveredAtMs === "number" && Number.isFinite(metadata.deliveredAtMs) && metadata.deliveredAtMs > 0
+    ? metadata.deliveredAtMs : undefined;
+}
+
+function rememberProactiveDeliveries(state: AgentState, chatId: string, messages: AgentChatMessage[]): AgentState {
+  const deliveryIds = messages.flatMap((message) => message.proactiveDeliveryId ? [message.proactiveDeliveryId] : []);
+  if (!deliveryIds.length) return state;
+  const previous = state.proactiveDeliveryIdsByChatId[chatId] ?? [];
+  const next = [...new Set([...previous, ...deliveryIds])].slice(-1024);
+  return { ...state, proactiveDeliveryIdsByChatId: { ...state.proactiveDeliveryIdsByChatId, [chatId]: next } };
+}
+
+function mergeProactiveHistory(current: AgentChatMessage[], snapshot: AgentChatMessage[]): AgentChatMessage[] {
+  const known = new Set(current.flatMap((message) => message.proactiveDeliveryId ? [message.proactiveDeliveryId] : []));
+  return [...current, ...snapshot.filter((message) => message.proactiveDeliveryId && !known.has(message.proactiveDeliveryId))];
+}
+
+function rememberProactiveHistoryStart(state: AgentState, chatId: string, requestId: string, previousRequestId?: string): AgentState {
+  return { ...state, proactiveHistoryStartIdsByRequestId: {
+    ...clearChatMapValue(state.proactiveHistoryStartIdsByRequestId, previousRequestId ?? ""),
+    [requestId]: [...(state.proactiveLiveDeliveryIdsByChatId[chatId] ?? [])],
+  } };
+}
+
+function preserveConcurrentProactiveDeliveries(state: AgentState, chatId: string, requestId: string, snapshot: AgentChatMessage[], current: AgentChatMessage[]): AgentChatMessage[] {
+  const beforeRequest = new Set(state.proactiveHistoryStartIdsByRequestId[requestId] ?? []);
+  const live = new Set(state.proactiveLiveDeliveryIdsByChatId[chatId] ?? []);
+  return mergeProactiveHistory(snapshot, current.filter((message) => (
+    message.proactiveDeliveryId && live.has(message.proactiveDeliveryId) && !beforeRequest.has(message.proactiveDeliveryId)
+  )));
+}
+
+function appendCronProactiveMessage(state: AgentState, chatId: string, event: MemmyAgentWsEvent): AgentState {
+  const deliveryId = proactiveDeliveryId(event.metadata);
+  const previous = chatMessagesForId(state, chatId);
+  const replayed = event.replayed === true || event.metadata?.replayed === true;
+  const alreadyLive = deliveryId && (state.proactiveLiveDeliveryIdsByChatId[chatId] ?? []).includes(deliveryId);
+  const alreadyRecorded = deliveryId && ((state.proactiveDeliveryIdsByChatId[chatId] ?? []).includes(deliveryId)
+    || previous.some((message) => message.proactiveDeliveryId === deliveryId));
+  if (alreadyLive || (alreadyRecorded && replayed)) return state;
+  const content = typeof event.text === "string" ? event.text : typeof event.content === "string" ? event.content : "";
+  const media = Array.isArray(event.media_urls) ? normalizeMedia(event.media_urls) : [];
+  if (!content.trim() && !media.length) return state;
+  const deliveredAt = proactiveDeliveredAt(event.metadata) ?? Date.now();
+  const taskName = proactiveTaskName(event.metadata);
+  const message: AgentChatMessage = {
+    id: deliveryId ? `cron:${deliveryId}` : nextMessageId(previous, "assistant"),
+    role: "assistant",
+    proactiveDelivery: "cron",
+    ...(taskName ? { proactiveTaskName: taskName } : {}),
+    content,
+    createdAt: deliveredAt,
+    ...(deliveryId ? { proactiveDeliveryId: deliveryId } : {}),
+    ...(media.length ? { media } : {}),
+  };
+  const messages = alreadyRecorded ? previous : [...previous, message];
+  const unseen = !replayed && !isChatVisible(state, chatId);
+  const nextState = rememberProactiveDeliveries({
+    ...state,
+    messagesByChatId: { ...state.messagesByChatId, [chatId]: messages },
+    ...(chatId === state.currentChatId ? { messages } : {}),
+    proactiveLiveDeliveryIdsByChatId: deliveryId && !replayed ? {
+      ...state.proactiveLiveDeliveryIdsByChatId,
+      [chatId]: [...(state.proactiveLiveDeliveryIdsByChatId[chatId] ?? []), deliveryId].slice(-1024),
+    } : state.proactiveLiveDeliveryIdsByChatId,
+    proactiveUnseenByChatId: unseen ? { ...state.proactiveUnseenByChatId,
+      [chatId]: Math.max(deliveredAt, state.proactiveUnseenByChatId[chatId] ?? 0),
+    } : state.proactiveUnseenByChatId,
+    proactiveDeliveredAtByChatId: !replayed ? { ...state.proactiveDeliveredAtByChatId,
+      [chatId]: Math.max(deliveredAt, state.proactiveDeliveredAtByChatId[chatId] ?? 0),
+    } : state.proactiveDeliveredAtByChatId,
+    // Legacy records without an identity remain readable but cannot safely notify.
+    proactiveNotifications: unseen && deliveryId
+      ? [...state.proactiveNotifications, { deliveryId, chatId, content }]
+      : state.proactiveNotifications,
+  }, chatId, [message]);
+  return deriveTasks(nextState);
 }
 
 function assistantMessageHasMedia(event: MemmyAgentWsEvent): boolean {
@@ -4369,7 +4600,12 @@ function markChatIdle(state: AgentState, chatId: string, options: {
   const wasBusy = isChatBusy(state, chatId) || Boolean(state.stopInFlightByChatId[chatId]);
   const countsAsCompletion = options.countsAsCompletion ?? true;
   const finishedState = shouldClearStreamingFlags(options.source)
-    ? finishChatStreaming(state, chatId, latencyForSource(options.source, options.latencyMs))
+    ? finishChatStreaming(
+        state,
+        chatId,
+        latencyForSource(options.source, options.latencyMs),
+        options.source === "turn_end" ? Date.now() : undefined
+      )
     : state;
   const retryFinishedState = finishRetryWaitStatusForTurn(finishedState, chatId, options.turnId ?? null);
   const optimisticSendingByChatId = { ...state.optimisticSendingByChatId };
@@ -4629,7 +4865,8 @@ function normalizeThreadMessage(message: Record<string, unknown>, index: number)
       : typeof message.compaction_id === "string" && message.compaction_id.trim()
         ? message.compaction_id.trim()
         : String(message.id ?? `context-compaction-${index}`);
-    const createdAt = typeof message.createdAt === "number" ? message.createdAt : undefined;
+    const createdAt = proactiveDeliveredAt(message.metadata)
+      ?? (typeof message.createdAt === "number" ? message.createdAt : undefined);
     const latencyMs = typeof message.latencyMs === "number"
       ? message.latencyMs
       : typeof message.latency_ms === "number"
@@ -4654,6 +4891,13 @@ function normalizeThreadMessage(message: Record<string, unknown>, index: number)
     const modelError = normalizeModelError(message.modelError ?? message.model_error);
     const agentUi = message.agentUi ?? message.agent_ui;
     const questionResponse = message.questionResponse ?? message.question_response;
+    const deliveryId = proactiveDeliveryId(message.metadata)
+      ?? (typeof message.proactiveDeliveryId === "string" ? message.proactiveDeliveryId : null);
+    const isProactive = (isRecord(message.metadata) && message.metadata.proactiveDelivery === "cron")
+      || message.proactiveDelivery === "cron";
+    const taskName = isProactive ? proactiveTaskName(message.metadata)
+      ?? (typeof message.proactiveTaskName === "string" ? message.proactiveTaskName.replace(/\s+/gu, " ").trim() || undefined : undefined)
+      : undefined;
     const content = kind === "context_compaction"
       ? String(message.content ?? "") || contextCompactionFallbackText(compactionStatus)
       : String(message.content ?? "");
@@ -4663,6 +4907,9 @@ function normalizeThreadMessage(message: Record<string, unknown>, index: number)
       content,
       ...(turnId ? { turnId } : {}),
       ...(clientRequestId ? { clientRequestId } : {}),
+      ...(deliveryId ? { proactiveDeliveryId: deliveryId } : {}),
+      ...(isProactive ? { proactiveDelivery: "cron" as const } : {}),
+      ...(taskName ? { proactiveTaskName: taskName } : {}),
       ...(kind ? { kind } : {}),
       ...(typeof message.reasoning === "string" ? { reasoning: message.reasoning } : {}),
       ...(typeof message.reasoningStreaming === "boolean" ? { reasoningStreaming: message.reasoningStreaming } : {}),

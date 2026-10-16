@@ -61,6 +61,7 @@ export class ChannelManager {
   }) => any | null) | null = null;
   workspacePath: string | null = null;
   cancelActiveTasks: ((sessionKey: string) => Promise<number>) | null = null;
+  stopCurrentTurn: ((sessionKey: string, expectedTurnId: string | null) => Promise<number>) | null = null;
   closeBrowserChat: ((channel: string, chatId: string) => Promise<void>) | null = null;
   goalControlHandler: ((request: any) => Promise<any>) | null = null;
   activeGoalStopHandler: ((sessionKey: string) => Promise<boolean>) | null = null;
@@ -82,6 +83,7 @@ export class ChannelManager {
       }) => any | null) | null;
       workspacePath?: string | null;
       cancelActiveTasks?: ((sessionKey: string) => Promise<number>) | null;
+      stopCurrentTurn?: ((sessionKey: string, expectedTurnId: string | null) => Promise<number>) | null;
       closeBrowserChat?: ((channel: string, chatId: string) => Promise<void>) | null;
       goalControlHandler?: ((request: any) => Promise<any>) | null;
       activeGoalStopHandler?: ((sessionKey: string) => Promise<boolean>) | null;
@@ -106,6 +108,7 @@ export class ChannelManager {
       ? path.resolve(options.workspacePath)
       : null;
     this.cancelActiveTasks = options.cancelActiveTasks ?? null;
+    this.stopCurrentTurn = options.stopCurrentTurn ?? null;
     this.closeBrowserChat = options.closeBrowserChat ?? null;
     this.goalControlHandler = options.goalControlHandler ?? null;
     this.activeGoalStopHandler = options.activeGoalStopHandler ?? null;
@@ -181,6 +184,7 @@ export class ChannelManager {
       options.modelSelectionResolver = this.webuiModelSelectionResolver;
     }
     if (this.cancelActiveTasks) options.cancelActiveTasks = this.cancelActiveTasks;
+    if (this.stopCurrentTurn) options.stopCurrentTurn = this.stopCurrentTurn;
     if (this.closeBrowserChat) options.closeBrowserChat = this.closeBrowserChat;
     if (this.goalControlHandler) options.goalControlHandler = this.goalControlHandler;
     if (this.activeGoalStopHandler) options.activeGoalStopHandler = this.activeGoalStopHandler;
