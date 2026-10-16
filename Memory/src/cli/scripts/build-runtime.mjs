@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { npmInvocation } from "../../../../scripts/internal/shared/npm-invocation.mjs";
+import { memoryRuntimeBuildIdentity } from "../../../../scripts/internal/shared/memory-runtime-build-identity.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -7,6 +9,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { bundleRuntime } from "../../../../scripts/internal/shared/bundle-runtime.mjs";
 
 const require = createRequire(import.meta.url);
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -54,7 +57,9 @@ try {
     await verifyEmbeddingModel(runtimeRoot);
   }
   await verifyRuntimeDependencies(runtimeRoot, target, platform, arch, workspaceDependencies);
+  const buildIdentity = await memoryRuntimeBuildIdentity(repositoryRoot);
   await writeJson(join(runtimeRoot, "memory-runtime.json"), {
+    ...buildIdentity,
     name: "memmy-memory-runtime",
     version,
     protocolVersion: 1,
@@ -65,10 +70,16 @@ try {
     builtAt: new Date().toISOString()
   });
 
+  const bundledRoot = join(temporaryRoot, "bundled");
+  await bundleRuntime({ source: runtimeRoot, destination: bundledRoot, packageDirectory: ".", kind: "memory", target: { platform, arch } });
+  // Workspace code is in the bundle now; native libraries and model files remain external.
+  await verifyRuntimeDependencies(bundledRoot, target, platform, arch, []);
+  if (process.env.MEMMY_MEMORY_SKIP_EMBEDDING_MODEL !== "1") await verifyEmbeddingModel(bundledRoot);
+
   await mkdir(outputRoot, { recursive: true });
   const assetPath = join(outputRoot, assetName);
-  run("tar", ["-czf", assetPath, "-C", runtimeRoot, "."], repositoryRoot);
-  const descriptor = { name: assetName, sha256: await sha256File(assetPath), size: (await stat(assetPath)).size };
+  run("tar", ["-czf", assetPath, "-C", bundledRoot, "."], repositoryRoot);
+  const descriptor = { ...buildIdentity, name: assetName, sha256: await sha256File(assetPath), size: (await stat(assetPath)).size };
   await updateReleaseManifest(outputRoot, version, target, descriptor);
   process.stdout.write(`${assetPath}\n`);
 } finally {
@@ -113,7 +124,8 @@ function npmPlatformFlags(platform, arch) {
 }
 
 function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, stdio: "inherit", env: process.env, shell: process.platform === "win32" });
+  if (command === "npm") ({ command, args } = npmInvocation(args));
+  const result = spawnSync(command, args, { cwd, stdio: "inherit", env: process.env });
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed`);
 }
 

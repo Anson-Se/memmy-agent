@@ -71,6 +71,7 @@ import type {
   SynthesizeDecisionRepairDraft
 } from "../feedback/feedback-experience.js";
 import { recordApiLog } from "../model-audit/model-call-audit.js";
+import { deduplicateCrossAccountMemoryCandidates } from "../retrieval/cross-account-candidate-dedup.js";
 import {
   namespaceForRawTurn,
   namespaceForSession,
@@ -288,9 +289,6 @@ function endTopicDecisionFromRawTurn(rawTurn: RawTurnRecord): EndTopicDecision |
 }
 
 function rawTurnIsExcludedFromL1(rawTurn: RawTurnRecord): boolean {
-  if (endTopicDecisionFromRawTurn(rawTurn)) {
-    return true;
-  }
   const turnStart = isRecord(rawTurn.messagePayload?.turn_start)
     ? rawTurn.messagePayload.turn_start
     : undefined;
@@ -1264,8 +1262,8 @@ export class SessionTurnService {
       toolCalls: normalizeCompleteTurnToolCalls(normalized), toolResults: normalizeCompleteTurnToolResults(normalized)
     });
     return this.deps.repos.transaction(() => {
-      // A durable source identity is checked before touching an open Session. Deleted memories
-      // and closed Sessions therefore cannot turn a retry into a second capture.
+      // Native captures belong to the local source conversation, not the cloud account
+      // currently sending them. Check before opening a Session or scheduling any work.
       const existing = this.deps.repos.runtime.getSourceTurnCapture(scope, identity.turnId);
       if (existing) {
         if (existing.contentHash !== contentHash) {
@@ -1313,6 +1311,12 @@ export class SessionTurnService {
       const adoptedImport = this.adoptLegacyImport(request, namespace, normalized, scope, contentHash);
       if (adoptedImport) return adoptedImport;
       const previous = this.deps.repos.runtime.latestSourceTurnCapture(scope);
+      if (previous) {
+        namespace.userId = previous.userId;
+        scope.userId = previous.userId;
+      }
+      normalized.namespace = namespace;
+      request = { ...request, namespace };
       let gapEpisode: EpisodeRecord | undefined;
       let targetSessionId = previous?.sessionId;
       const legacyBackfill = allowsLegacyHistoryCapture(request);
@@ -1350,6 +1354,10 @@ export class SessionTurnService {
           : resolved;
       }
       const session = resolved as SessionRecord;
+      // A scan may be the first completion of a Hook Session opened by another account.
+      // Keep the Session owner and all persisted capture references consistent.
+      namespace.userId = session.userId;
+      scope.userId = session.userId;
       const observed = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, identity.turnId);
       if (observed && this.deps.repos.runtime.getEpisode(observed.episodeId)?.status !== "open") {
         return detachLegacyHistory("source_episode_closed");
@@ -1584,7 +1592,7 @@ export class SessionTurnService {
   ): SessionRecord | { status: "pending"; reason: string } {
     const namespace = normalizeNamespace(request.namespace);
     const inScope = (candidate: SessionRecord): boolean =>
-      candidate.userId === namespace.userId && candidate.source === identity.source && candidate.profileId === identity.profileId &&
+      candidate.source === identity.source && candidate.profileId === identity.profileId &&
       (!candidate.conversationId || candidate.conversationId === identity.conversationId) &&
       (candidate.hostSessionKey === identity.conversationId || candidate.conversationId === identity.conversationId ||
         candidate.hostSessionKey === `${identity.source}-memory-${identity.conversationId}`) &&
@@ -1736,7 +1744,7 @@ export class SessionTurnService {
       const requestSourceMemoryIds = normalizeCompleteTurnSourceMemoryIds(request);
       const sourceMemoryIds = requestSourceMemoryIds.length > 0
         ? requestSourceMemoryIds
-        : turnStartRecall?.injectedMemoryIds ?? [];
+        : request.recallApplied === false ? [] : turnStartRecall?.injectedMemoryIds ?? [];
       const completionRequest = sourceMemoryIds === requestSourceMemoryIds
         ? request
         : { ...request, sourceMemoryIds };
@@ -2930,13 +2938,18 @@ export class SessionTurnService {
       : undefined;
     const query = buildRepairSuggestionQuery(input);
     const repairLayers = retrievalLayersForMode("decision_repair");
-    const candidates = this.deps.repos.memories.list(
+    const loadedCandidates = this.deps.repos.memories.list(
       {
         memoryLayer: repairLayers,
         status: ["activated", "resolving"]
       },
       500
     ).filter((memory) => this.deps.isMemoryReadyForRetrieval(memory));
+    const candidates = deduplicateCrossAccountMemoryCandidates({
+      memories: loadedCandidates,
+      repos: this.deps.repos,
+      preferredUserId: session.userId
+    }).memories;
     const retrieval = retrievePluginMemories({
       query,
       queryVector: await this.deps.queryVector(query),
@@ -3046,7 +3059,9 @@ export class SessionTurnService {
         Boolean(rawTurn && (rawTurn.id === currentRawTurn.id || !seenRawTurnIds.has(rawTurn.id)))
       )
       .filter((rawTurn) => isRecord(rawTurn.messagePayload?.turn_complete))
-      .filter((rawTurn) => !endTopicDecisionFromRawTurn(rawTurn))
+      // A bare end-topic command has nothing to remember. Any other end_topic turn can still
+      // carry feedback or instructions, so it goes through the same capture decision.
+      .filter((rawTurn) => !explicitEndTopicDecision(rawTurn.userText ?? ""))
       .filter((rawTurn) => this.deps.llm.isConfigured() || !rawTurnIsExcludedFromL1(rawTurn))
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     return rawTurns.flatMap((rawTurn) =>

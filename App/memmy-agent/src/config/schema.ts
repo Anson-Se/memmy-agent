@@ -1028,14 +1028,12 @@ export class HeartbeatConfig extends Base {
 export class ApiConfig extends Base {
   host = "127.0.0.1";
   port = 18990;
-  timeout = 120;
   apiKey: string | null = null;
 
   constructor(init: Dict = {}) {
     super();
     this.host = pick(init, ["host"], this.host);
     this.port = pick(init, ["port"], this.port);
-    this.timeout = pick(init, ["timeout"], this.timeout);
     this.apiKey = pick(init, ["apiKey"], null);
   }
 
@@ -1043,7 +1041,6 @@ export class ApiConfig extends Base {
     return {
       host: this.host,
       port: this.port,
-      timeout: this.timeout,
       apiKey: this.apiKey,
     };
   }
@@ -1168,6 +1165,7 @@ export class FileMemoryConfig extends Base {
 
 export class Config extends Base {
   app: Dict;
+  agentHooks: string[];
   agents: AgentsConfig;
   providers: ProvidersConfig;
   channels: ChannelsConfig;
@@ -1208,6 +1206,7 @@ export class Config extends Base {
     if (appUserId) {
       this.app.userId = appUserId;
     }
+    this.agentHooks = assertStringArray("agentHooks", pick(init, ["agentHooks"], []));
     this.agents =
       init.agents instanceof AgentsConfig ? init.agents : new AgentsConfig(init.agents ?? {});
     this.providers =
@@ -1456,6 +1455,7 @@ export class Config extends Base {
     delete this.app.user_id;
     this.memmyMemory.userId = appUserId ?? this.memmyMemory.userId ?? "local-user";
     const data: Dict = {
+      agentHooks: this.agentHooks,
       agents: this.agents,
       providers: this.providers,
       channels: this.channels,
