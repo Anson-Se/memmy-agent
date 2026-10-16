@@ -40,18 +40,57 @@ public static class MemmyWindowsHistoryIcon {
     private static extern IntPtr SHGetFileInfo(string path, uint attributes,
         ref SHFILEINFO info, uint size, uint flags);
 
+    [DllImport("shell32.dll", EntryPoint = "SHDefExtractIconW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int SHDefExtractIcon(string path, int index, uint flags,
+        out IntPtr largeIcon, IntPtr smallIcon, uint size);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyIcon(IntPtr icon);
 
-    // SHGFI_ICON | SHGFI_LARGEICON. Ask the Shell instead of assuming an .ico
-    // resource exists: many apps provide their icon through Shell registration.
-    public static string Png64(string path) {
+    private static IntPtr ExtractResource64(string path, int index) {
+        string resource = Environment.ExpandEnvironmentVariables(path ?? "").Trim('"');
+        string extension = Path.GetExtension(resource).ToLowerInvariant();
+        if (resource.Length < 3 || !Char.IsLetter(resource[0]) || resource[1] != ':'
+            || (resource[2] != '\\' && resource[2] != '/')
+            || (extension != ".exe" && extension != ".dll" && extension != ".ico")
+            || !File.Exists(resource)) return IntPtr.Zero;
+        IntPtr extracted;
+        int result = SHDefExtractIcon(resource, index, 0, out extracted, IntPtr.Zero, 64);
+        if (result == 0 && extracted != IntPtr.Zero) return extracted;
+        if (extracted != IntPtr.Zero) DestroyIcon(extracted);
+        return IntPtr.Zero;
+    }
+
+    private static IntPtr Extract64(string path) {
+        // SHGFI_LARGEICON uses the system metric (often 32px), not the PNG's
+        // desired size. Resolve the Shell's resource/index first, including a
+        // shortcut's .ico/.dll IconLocation, then request a real 64px HICON.
+        SHFILEINFO location = new SHFILEINFO();
+        if (SHGetFileInfo(path, 0, ref location, (uint)Marshal.SizeOf(typeof(SHFILEINFO)), 0x1000) != IntPtr.Zero) {
+            IntPtr resourceIcon = ExtractResource64(location.szDisplayName, location.iIcon);
+            if (resourceIcon != IntPtr.Zero) return resourceIcon;
+        }
+        // Executable handlers can report a successful but empty IconLocation.
+        // Their primary resource is still extractable at the requested size.
+        if (String.Equals(Path.GetExtension(path), ".exe", StringComparison.OrdinalIgnoreCase)) {
+            IntPtr executableIcon = ExtractResource64(path, 0);
+            if (executableIcon != IntPtr.Zero) return executableIcon;
+        }
+
+        // Some Shell handlers do not expose a file-backed resource. Preserve
+        // their registered icon instead of turning a quality miss into no icon.
         SHFILEINFO info = new SHFILEINFO();
         if (SHGetFileInfo(path, 0, ref info, (uint)Marshal.SizeOf(typeof(SHFILEINFO)), 0x100) == IntPtr.Zero
-            || info.hIcon == IntPtr.Zero) return null;
+            || info.hIcon == IntPtr.Zero) return IntPtr.Zero;
+        return info.hIcon;
+    }
+
+    public static string Png64(string path) {
+        IntPtr handle = Extract64(path);
+        if (handle == IntPtr.Zero) return null;
         try {
-            using (Icon icon = (Icon)Icon.FromHandle(info.hIcon).Clone())
+            using (Icon icon = (Icon)Icon.FromHandle(handle).Clone())
             using (Bitmap output = new Bitmap(64, 64, PixelFormat.Format32bppArgb))
             using (MemoryStream stream = new MemoryStream()) {
                 // DrawIcon preserves the HICON alpha/mask. Icon.ToBitmap can
@@ -66,7 +105,7 @@ public static class MemmyWindowsHistoryIcon {
                 return Convert.ToBase64String(stream.ToArray());
             }
         } finally {
-            DestroyIcon(info.hIcon);
+            DestroyIcon(handle);
         }
     }
 }

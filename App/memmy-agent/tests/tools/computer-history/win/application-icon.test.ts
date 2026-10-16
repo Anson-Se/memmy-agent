@@ -20,7 +20,7 @@ function requestedIds(args: string[]): string[] {
 }
 
 describe("Windows Computer History application icons", () => {
-  it.runIf(process.platform === "win32")("resolves Squirrel shortcut icons with real Windows PowerShell and Shell APIs", async () => {
+  it.runIf(process.platform === "win32")("resolves sharp Squirrel shortcut icons and preserves alpha with real Windows PowerShell and Shell APIs", async () => {
     const powershell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const harness = fileURLToPath(new URL("./application-icon-shortcuts.ps1", import.meta.url));
     const source = fileURLToPath(new URL("../../../../src/tools/computer-history/win/app-icon.ps1", import.meta.url));
@@ -28,7 +28,9 @@ describe("Windows Computer History application icons", () => {
       "-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-File", harness, "-HelperPath", source,
     ], { timeout: 20_000, maxBuffer: 1024 * 1024, windowsHide: true });
     expect(JSON.parse(stdout.trim())).toMatchObject({
-      sameNameIco: true, sameNameExe: true, differentNameIco: true, customIconPixels: true,
+      sameNameIco: true, sameNameExe: true, differentNameIco: true, highResolutionFrame: true,
+      onePixelDetail: true, transparentPixels: true, semitransparentPixels: true, smallFrameFallback: true,
+      directExeHighResolution: true,
     });
   }, 25_000);
 
@@ -110,7 +112,9 @@ describe("Windows Computer History application icons", () => {
     expect(script).toContain("GetFolderPath('StartMenu')");
     expect(script).toContain("GetFolderPath('CommonStartMenu')");
     expect(script).toContain("SHGetFileInfoW");
-    expect(script).toContain("DestroyIcon(info.hIcon)");
+    expect(script).toContain("SHDefExtractIconW");
+    expect(script).toContain("DestroyIcon(handle)");
+    expect(script).toContain("if (extracted != IntPtr.Zero) DestroyIcon(extracted)");
     expect(script).toContain("$source.Count -ne 1");
     expect(script).toContain("$runningCandidates.ContainsKey($id)");
     expect(script).toContain("[IO.Path]::IsPathRooted($expanded)");
