@@ -2009,18 +2009,10 @@ export class MemoryService {
     const deletedMemoryIds: string[] = [];
 
     this.repos.transaction(() => {
-      const spanIds = new Set<string>();
-      for (const memoryId of episode.l1MemoryIds) {
-        const memory = this.repos.memories.get(memoryId);
-        const trace = memory?.properties.internal_info.trace;
-        if (!isRecord(trace) || !Array.isArray(trace.span_ids)) continue;
-        for (const spanId of trace.span_ids) {
-          if (typeof spanId === "string") spanIds.add(spanId);
-        }
-      }
+      const spanIds = new Set(this.repos.memories.listTaskSpanIds(
+        episode.userId, episode.id, episode.l1MemoryIds
+      ));
       for (const spanId of spanIds) {
-        const span = this.repos.memories.get(spanId);
-        if (!span || kindFromMemory(span) !== "span") continue;
         this.deleteMemory(spanId, request);
         deletedMemoryIds.push(spanId);
       }
