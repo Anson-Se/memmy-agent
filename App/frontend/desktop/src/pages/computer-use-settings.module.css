@@ -22,11 +22,11 @@
 .copy { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
 .copy strong { font-size: 14px; font-weight: 650; }
 .copy small { font-size: 12px; line-height: 1.4; opacity: .62; }
-.revokeButton { flex: none; border: 0; border-radius: 9px; padding: 7px 12px; background: rgba(90, 110, 130, .09); color: inherit; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; cursor: pointer; }
+.revokeButton { flex: none; border: 0; border-radius: 9px; padding: 7px 12px; background: rgba(90, 110, 130, .09); color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
 .revokeButton:hover:not(:disabled) { background: rgba(90, 110, 130, .17); }
 .revokeButton:disabled { opacity: .5; cursor: default; }
 .addinLink { width: fit-content; font-size: 12px; color: var(--color-link, #2563eb); }
-.setupButton { width: fit-content; border: 0; border-radius: 8px; padding: 7px 11px; background: #3478f6; color: white; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; cursor: pointer; }
+.setupButton { width: fit-content; border: 0; border-radius: 8px; padding: 7px 11px; background: #3478f6; color: white; font: inherit; font-size: 12px; cursor: pointer; }
 .setupButton:disabled { opacity: .55; cursor: default; }
 .switch { width: 20px; height: 20px; flex: none; accent-color: #3b82f6; cursor: pointer; }
 .switch:disabled { cursor: default; opacity: .5; }
@@ -40,7 +40,7 @@
 .guide ol { display: grid; gap: 10px; margin: 8px 0 0; padding-left: 18px; }
 .guideActions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
 .guideActions code { max-width: 100%; border-radius: 6px; padding: 5px 7px; background: rgba(90, 110, 130, .08); font-size: 11px; user-select: all; }
-.guide button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d7d9df; border-radius: 8px; padding: 7px 10px; background: transparent; color: inherit; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; cursor: pointer; }
+.guide button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d7d9df; border-radius: 8px; padding: 7px 10px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
 .guide button:disabled { opacity: .55; cursor: default; }
 .extensionFocus { animation: extension-focus-flash 1.6s ease; }
 @keyframes extension-focus-flash {

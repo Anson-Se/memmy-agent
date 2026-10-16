@@ -7,9 +7,9 @@
 .browserCopy small { overflow: hidden; color: #73777f; text-overflow: ellipsis; white-space: nowrap; }
 .statusDot { display: inline-block; width: 7px; height: 7px; margin: 0 6px 1px 0; border-radius: 50%; background: #e63946; }
 .badge { color: #73777f; font-size: 12px; white-space: nowrap; }
-.guide button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; border: 1px solid #d7d9df; border-radius: 8px; padding: 0 12px; background: transparent; color: inherit; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; white-space: nowrap; cursor: pointer; }
+.guide button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; border: 1px solid #d7d9df; border-radius: 8px; padding: 0 12px; background: transparent; color: inherit; font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer; }
 .rowActions { display: flex; align-items: center; flex: none; gap: 8px; margin-left: auto; }
-.primaryButton, .secondaryButton { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; flex: none; border-radius: 8px; padding: 7px 11px; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; white-space: nowrap; cursor: pointer; }
+.primaryButton, .secondaryButton { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; flex: none; border-radius: 8px; padding: 7px 11px; font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer; }
 .primaryButton { border: 1px solid #3478f6; background: #3478f6; color: #fff; }
 .secondaryButton { border: 1px solid #d0d5dd; background: #fff; color: #1a1a1a; }
 .secondaryButton:hover:not(:disabled) { background: #f4f5f7; }

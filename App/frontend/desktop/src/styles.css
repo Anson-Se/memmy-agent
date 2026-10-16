@@ -4918,7 +4918,6 @@ button.agent-activity-file-link.agent-activity-timeline-item__detail {
 
 button {
   letter-spacing: 0;
-  font-family: var(--font-sans);
 }
 
 .composer-media-preview-strip {
@@ -8435,10 +8434,8 @@ input[type="checkbox"].check-sky:checked::after {
   border: 1px solid transparent;
   border-radius: var(--radius-btn);
   cursor: pointer;
-  font-family: var(--font-sans);
-  font-weight: 400;
-  font-size: 12px;
-  line-height: 16px;
+  font-weight: 750;
+  line-height: 1;
   white-space: nowrap;
   transition:
     background var(--duration-fast),
@@ -13787,10 +13784,8 @@ body.memmy-platform-windows :is(
   white-space: nowrap;
   background: var(--ch-chip);
   color: var(--ch-title);
-  font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 16px;
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -14078,10 +14073,6 @@ body.memmy-platform-windows :is(
   padding: 0 12px;
   background: var(--ch-surface);
   color: var(--ch-title);
-  font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 16px;
   cursor: pointer;
 }
 
@@ -14729,10 +14720,8 @@ body.memmy-platform-windows :is(
   border: none;
   border-radius: 999px;
   padding: 6px 16px;
-  font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 16px;
+  font-size: 13px;
+  font-weight: 500;
   box-shadow: none;
   background: color-mix(in srgb, var(--color-action-sky) 14%, white);
   color: var(--color-action-sky);
@@ -14783,10 +14772,6 @@ body.memmy-platform-windows :is(
   min-width: 28px;
   min-height: 28px;
   border-radius: 7px;
-  font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 16px;
   cursor: pointer;
 }
 
@@ -14867,7 +14852,7 @@ body.memmy-platform-windows :is(
 .memmy-browser-page-action { margin-top: 12px; height: 32px; padding: 0 12px; border-radius: 8px; }
 .memmy-browser-history-toolbar { display: flex; align-items: center; gap: 8px; min-height: 32px; }
 .memmy-browser-history-toolbar select { height: 32px; padding: 0 8px; border: 1px solid var(--color-border-stone, #ddd); border-radius: 8px; background: transparent; color: inherit; font-size: 13px; }
-.memmy-browser-history-toolbar button { display: inline-flex; align-items: center; margin-left: auto; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: transparent; color: inherit; font-family: var(--font-sans); font-size: 12px; font-weight: 400; line-height: 16px; cursor: pointer; }
+.memmy-browser-history-toolbar button { display: inline-flex; align-items: center; margin-left: auto; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: transparent; color: inherit; font-size: 13px; cursor: pointer; }
 .memmy-browser-history-toolbar button:hover:not(:disabled) { background: var(--color-canvas-oat, #f2f2f2); }
 .memmy-browser-history-toolbar button:disabled { opacity: .4; cursor: default; }
 .memmy-browser-history-list { display: flex; flex-direction: column; }
