@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MEMMY_CONFIG,
   MemoryDb,
@@ -16,6 +16,7 @@ import {
   updateMemoryVectorField
 } from "../../../src/service/embedding/embedding-pipeline.js";
 import { ModelHttpError } from "../../../src/model/http.js";
+import { createEmbedder } from "../../../src/model/embedder.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import {
   addAgentSourceImport,
@@ -32,9 +33,105 @@ const {
   createTestService
 } = createMemoryServiceFixture();
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("MemoryService / embedding / processing", () => {
+  for (const queue of ["fresh", "retry"] as const) {
+    for (const format of ["code", "message"] as const) {
+      it.each([
+        ["OperationNotSupported", "The embeddings operation does not work with the specified model.", false],
+        ["insufficient_quota", "Insufficient balance.", false],
+        ["rate_limit_exceeded", "Rate limit exceeded.", true]
+      ] as const)(`${queue} queue does not fan out shared HTTP 400 %s (${format})`, async (code, message, transient) => {
+        const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: {
+          code: format === "code" ? code : undefined,
+          message: format === "message" ? message : "Request rejected"
+        } }), { status: 400 }));
+        vi.stubGlobal("fetch", fetchMock);
+        const { db, service } = createTestService({
+          embedder: createHttpTestEmbedder(),
+          llm: createBatchReflectionLlm([], "Synthetic summary.")
+        });
+        const repos = new Repositories(db.db);
+        if (queue === "fresh") {
+          const session = service.openSession({ namespace: { source: "codex", profileId: "shared-error", userId: "test" } });
+          const ids = ["GOOD_A", "GOOD_B", "GOOD_C"].map((answer, i) => service.completeTurn(`turn-${i}`, {
+            sessionId: session.sessionId, query: "Remember this.", answer
+          }).l1MemoryId);
+          await service.runWorkerOnce(20, { priorityCohortOnly: true });
+          await service.runWorkerOnce(20, { priorityCohortOnly: true });
+          for (const id of ids) expect(repos.processing.get(id)).toMatchObject({
+            state: transient ? "embedding_pending" : "failed",
+            errorCode: transient ? "transient_provider_error" : "model_configuration",
+            retryAction: transient ? "retry" : "open_settings"
+          });
+        } else {
+          const retries = ["GOOD_A", "GOOD_B", "GOOD_C"].map((content, i) => {
+            const memory = skillMemory(undefined, { id: `shared-${i}`, content });
+            repos.memories.insert(memory);
+            return repos.runtime.enqueueEmbeddingRetry({ targetKind: "skill", targetId: memory.id,
+              vectorField: "vec", sourceText: embeddingTextForMemory(memory), embedRole: "query", now: Date.now() - 1 });
+          });
+          await service.runWorkerOnce(10);
+          for (const retry of retries) {
+            const stored = repos.runtime.getEmbeddingRetry(retry.id)!;
+            expect(stored).toMatchObject({ status: transient ? "pending" : "failed", attempts: 1 });
+            if (transient) expect(stored.nextAttemptAt).toBeGreaterThan(Date.now());
+          }
+        }
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(db.db.prepare("SELECT count(*) AS n FROM memory_vector_entries").get()).toEqual({ n: 0 });
+      });
+    }
+
+    it.each([
+      ["context_length_exceeded", "maximum context length exceeded"],
+      ["20015", "The parameter is invalid."]
+    ])(`${queue} queue preserves valid siblings through the HTTP adapter (%s)`, async (code, message) => {
+      const fetchMock = vi.fn(async (_url, init) => {
+        const { input } = JSON.parse(String(init?.body)) as { input: string[] };
+        const bad = input.some(text => text.includes("BAD_EMBEDDING_ITEM"));
+        return new Response(JSON.stringify(bad ? { code, message } : {
+          data: input.map(() => ({ embedding: [1, 0, 0] }))
+        }), { status: bad ? 400 : 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const { db, service } = createTestService({ embedder: createHttpTestEmbedder(),
+        llm: createBatchReflectionLlm([], "Synthetic summary.") });
+      const repos = new Repositories(db.db);
+      const texts = ["GOOD_A", "GOOD_B", "GOOD_C", "BAD_EMBEDDING_ITEM"];
+      if (queue === "fresh") {
+        const session = service.openSession({ namespace: { source: "codex", profileId: "isolation", userId: "test" } });
+        const ids = texts.map((answer, i) => service.completeTurn(`turn-${i}`, {
+          sessionId: session.sessionId, query: "Remember this.", answer
+        }).l1MemoryId);
+        await service.runWorkerOnce(20, { priorityCohortOnly: true });
+        await service.runWorkerOnce(20, { priorityCohortOnly: true });
+        expect(ids.map(id => repos.processing.get(id)?.state)).toEqual([
+          "ready", "ready", "ready", code === "context_length_exceeded" ? "ready_text_only" : "failed"
+        ]);
+      } else {
+        const retries = texts.map((content, i) => {
+          const memory = skillMemory(undefined, { id: `isolated-${i}`, content });
+          repos.memories.insert(memory);
+          return repos.runtime.enqueueEmbeddingRetry({ targetKind: "skill", targetId: memory.id,
+            vectorField: "vec", sourceText: embeddingTextForMemory(memory), embedRole: "query", now: Date.now() - 1 });
+        });
+        await service.runWorkerOnce(10);
+        expect(retries.map(retry => repos.runtime.getEmbeddingRetry(retry.id)?.status)).toEqual([
+          "succeeded", "succeeded", "succeeded", "failed"
+        ]);
+      }
+      expect(db.db.prepare("SELECT count(*) AS n FROM memory_vector_entries").get()).toEqual({ n: 3 });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    });
+  }
+
   it("embeds Skill retrieval metadata instead of the full SKILL.md when short metadata exists", () => {
     const text = embeddingTextForMemory(skillMemory({
       retrievalBlurb: "Use for safe SQLite schema migrations.",
@@ -739,6 +836,12 @@ function worldModelMemory(): MemoryRow {
     createdAt: now,
     updatedAt: now
   };
+}
+
+function createHttpTestEmbedder(): Embedder {
+  return createEmbedder({ ...DEFAULT_MEMMY_CONFIG.embedding, provider: "openai_compatible",
+    model: "custom-alias", endpoint: "https://embedding.test/v1", cache: false, maxRetries: 0 },
+    { usageRecorder: { record() { return "skipped"; } } });
 }
 
 function createFlakyEmbedder(): Embedder {

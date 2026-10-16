@@ -89,6 +89,12 @@ for input-related HTTP 400/413/422 failures, including generic parameter errors.
 Successful siblings are saved; a still-invalid item stops automatic retries.
 Authentication/configuration, quota, rate-limit and server errors do not trigger
 this fan-out. This applies to both new jobs and the embedding retry queue.
+Provider codes and messages for unsupported operations, insufficient quota/balance,
+and rate limits are classified before generic HTTP 400 errors. Rate limits retain
+delayed retry behavior; model/account configuration failures require intervention.
+Decoded empty chunks are removed from the embedding plan before requests and
+aggregation. If an original has no usable chunks, `(empty)` is embedded under the
+same input budgets so output vectors remain aligned with the originals.
 Previously failed records require an explicit retry/reindex; updating the code
 does not automatically reset their failed state.
 

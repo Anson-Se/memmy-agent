@@ -598,6 +598,18 @@ export function classifyProcessingError(error: unknown): {
   if (!hasStructuredCode && /\b40309\b/.test(normalized)) {
     return { code: "40309", retryAction: "open_settings" };
   }
+  // Providers can report shared model/account failures as HTTP 400. Classify
+  // their reason before generic 4xx handling, which permits item isolation.
+  if (error instanceof ModelHttpError) {
+    const providerCode = error.errorCode?.toLowerCase().replace(/[\s_-]/g, "");
+    if (providerCode === "operationnotsupported" || providerCode === "insufficientquota" ||
+      /operation.{0,80}(?:does not work|not supported)|insufficient[\s_-]+(?:quota|balance)/.test(normalized)) {
+      return { code: "model_configuration", retryAction: "open_settings" };
+    }
+    if (providerCode === "ratelimitexceeded" || /rate[\s_-]*limit/.test(normalized)) {
+      return { code: "transient_provider_error", retryAction: "retry" };
+    }
+  }
   if (/api.?key|unauthorized|forbidden|\b401\b|\b403\b|\b404\b|model.+not configured|missing.+model|expected json|html instead of json|configured model endpoint/.test(normalized)) {
     return { code: "model_configuration", retryAction: "open_settings" };
   }

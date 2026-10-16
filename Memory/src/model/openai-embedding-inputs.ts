@@ -50,10 +50,9 @@ export function planOpenAiEmbeddingInputs(
   );
   const totalTokens = inputs.reduce((sum, item) => sum + item.tokens.length, 0);
   if (inputs.length === texts.length && totalTokens <= OPENAI_EMBEDDING_BATCH_TOKEN_BUDGET &&
-    inputs.every((item) => item.tokens.length <= inputTokenBudget)) return null;
+    inputs.every((item) => item.tokens.length > 0 && item.tokens.length <= inputTokenBudget)) return null;
 
-  const chunks = inputs.flatMap(({ tokens, originalIndex }) => {
-    if (tokens.length === 0) return [{ originalIndex, tokens, input: useTokenIds ? tokens : "" }];
+  const chunkTokensForInput = (tokens: number[], originalIndex: number): OpenAiEmbeddingChunk[] => {
     const tokenBytes = useTokenIds
       ? undefined
       : tokens.map((token) => encoder.decode_single_token_bytes(token));
@@ -69,14 +68,24 @@ export function planOpenAiEmbeddingInputs(
         }
       }
       const chunkTokens = tokens.slice(offset, end);
-      items.push({
-        originalIndex,
-        tokens: chunkTokens,
-        input: useTokenIds ? chunkTokens : decodeTokenBytes(tokenBytes!.slice(offset, end))
-      });
+      const input = useTokenIds ? chunkTokens : decodeTokenBytes(tokenBytes!.slice(offset, end));
+      // A standalone BOM can decode to an empty string. Filter in the plan,
+      // so the request and vector aggregation retain the same chunk order.
+      if (input.length > 0) items.push({ originalIndex, tokens: chunkTokens, input });
       offset = end;
     }
     return items;
+  };
+  const chunksByOriginal: OpenAiEmbeddingChunk[][] = texts.map(() => []);
+  for (const { tokens, originalIndex } of inputs) {
+    chunksByOriginal[originalIndex]!.push(...chunkTokensForInput(tokens, originalIndex));
+  }
+  const chunks = chunksByOriginal.flatMap((items, originalIndex) => {
+    if (items.length > 0) return items;
+    // Keep one output vector per original, respecting even a small configured
+    // budget when the placeholder itself needs multiple chunks.
+    const parts = useTokenIds ? ["(empty)"] : splitUtf8Input("(empty)", inputByteBudget);
+    return parts.flatMap(part => chunkTokensForInput(Array.from(encoder.encode(part, [], [])), originalIndex));
   });
   return {
     batches: batchChunks(chunks),

@@ -5,6 +5,34 @@ import { createEmbedder } from "../src/model/embedder.js";
 afterEach(() => vi.unstubAllGlobals());
 
 it.each([
+  { name: "trailing decoded empty chunk", texts: ["a".repeat(12_000) + "\uFEFF", "xyz"], budget: undefined,
+    expected: ["a".repeat(12_000), "xyz"] },
+  { name: "middle decoded empty chunk", texts: ["aaa\uFEFFbbb", "xyz"], budget: 3,
+    expected: ["aaa", "bbb", "xyz"] },
+  { name: "all chunks of one original decode empty", texts: ["\uFEFF\uFEFF", "xyz"], budget: 3,
+    expected: ["(em", "pty", ")", "xyz"] },
+  { name: "empty original", texts: ["", "xyz"], budget: undefined,
+    expected: ["(empty)", "xyz"] },
+  { name: "meaningful whitespace", texts: ["   aaa", "xyz"], budget: 3,
+    expected: ["   ", "aaa", "xyz"] }
+])("keeps vectors aligned after handling $name", async ({ texts, budget, expected }) => {
+  const sent: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+    const { input } = JSON.parse(String(init?.body)) as { input: string[] };
+    sent.push(...input);
+    return new Response(JSON.stringify({ data: input.map(part => ({
+      embedding: part === "xyz" ? [0, 1] : [1, 0]
+    })) }), { status: 200 });
+  }));
+  const embedder = createEmbedder({ ...DEFAULT_MEMMY_CONFIG.embedding, provider: "openai_compatible",
+    model: "custom-alias", endpoint: "https://example.test/v1", maxInputBytes: budget, cache: false, maxRetries: 0 },
+    { usageRecorder: { record() { return "skipped"; } } });
+  await expect(embedder.embed(texts)).resolves.toEqual([[1, 0], [0, 1]]);
+  expect(sent).toEqual(expected);
+  expect(sent.every(part => part.length > 0 && Buffer.byteLength(part) <= (budget ?? 12_000))).toBe(true);
+});
+
+it.each([
   ["ASCII boundary", "a".repeat(27_447)],
   ["mixed Unicode", "中文🙂 café\n".repeat(5_000)]
 ])("guards opaque-model %s inputs by bytes without truncation", async (_name, text) => {
