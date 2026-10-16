@@ -1192,10 +1192,14 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
       const observer = newInputObserver({ targetId: data.targetInfo.targetId,
         parentSessionId: source.sessionId || '' });
       claim.inputObservers.set(data.sessionId, observer);
-      observer.task = Promise.race([
-        installChildInputObserver(source.tabId, claim, data.sessionId, observer),
-        new Promise(resolve => { observer.removed = resolve; }),
-      ]);
+      // Ignore late attachment events after the debugger lease ended. They
+      // cannot start new observer commands against an unattached page.
+      if (claim.inputObserverToken && (claim.attached || debuggerTasks.has(source.tabId))) {
+        observer.task = Promise.race([
+          installChildInputObserver(source.tabId, claim, data.sessionId, observer),
+          new Promise(resolve => { observer.removed = resolve; }),
+        ]);
+      }
     } else if (method === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
       const detached = new Set([data.sessionId]);
       for (const id of detached) {

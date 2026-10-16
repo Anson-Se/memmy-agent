@@ -423,11 +423,14 @@ describe("external browser real input guard", () => {
       targetInfo: { type: "iframe", targetId: "child-target", url: `${ORIGIN}/frame` } });
     await vi.waitFor(() => expect(browser.evaluate(
       "claims.get(7).inputObservers.get('child-session').ready")).toBe(true));
-    await expect(browser.run("cdpWrite", { approvedOrigin: ORIGIN,
+    const approvedTarget = await browser.run("cdpTarget", {
+      approvedOrigin: ORIGIN, target: { sessionId: "child-session" },
+    });
+    await expect(browser.run("cdpWrite", { approvedOrigin: ORIGIN, approvedTarget,
       target: { sessionId: "child-session" }, method: "Runtime.evaluate",
       params: { expression: "document.body" } }))
       .resolves.toMatchObject({ result: { objectId: "page-object-1" } });
-    await expect(browser.run("cdpWrite", { approvedOrigin: ORIGIN,
+    await expect(browser.run("cdpWrite", { approvedOrigin: ORIGIN, approvedTarget,
       target: { sessionId: "child-session" }, method: "Runtime.callFunctionOn",
       params: { objectId: "page-object-1", functionDeclaration: "function(){ return this.tagName }" } }))
       .resolves.toEqual({});

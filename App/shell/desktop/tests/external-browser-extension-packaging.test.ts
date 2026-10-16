@@ -737,7 +737,7 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
-    expect(manifest.version).toBe("1.0.10");
+    expect(manifest.version).toBe("1.0.11");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
@@ -1384,6 +1384,7 @@ it.each([true, false])('fills external required auth inputs (already known = %s)
     navigator: { userAgent: 'Chrome' }, URL, setTimeout, clearTimeout, setInterval, clearInterval });
   vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
   vm.runInContext("connect = async () => undefined; collectAuth = collect; claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpEvents: [], cdpWaiters: new Set(), cdpSessions: new Map(), console: [], requests: [], protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, documentEpoch: 0}); runningCommands.add('auth-optional')", context);
+  markObserverReady(context);
   (context as Record<string, unknown>).authInput = { origin: 'https://example.test', fields: [
     { id: 'code', label: 'Code', type: 'text', required: true, selector: '#code' },
     { id: 'optional', label: 'Optional value', type: 'text', required: false, selector: '#optional' },
