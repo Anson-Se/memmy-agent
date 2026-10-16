@@ -172,7 +172,7 @@ Var pid
       GetDlgItem $2 $HWNDPARENT 1
       StrCpy $3 "Starting Memmy..."
       StrCmp $LANGUAGE ${MEMMY_LANG_SIMPCHINESE} 0 +2
-      StrCpy $3 "正在启动 Memmy..."
+      StrCpy $3 "启动中"
       SendMessage $2 ${WM_SETTEXT} 0 "STR:$3"
       EnableWindow $2 0
       StrCpy $0 $HWNDPARENT
@@ -658,7 +658,7 @@ Function MemmyShowInstallCheckingFeedback
   ${NSD_GetText} $MemmyInstallNextButton $MemmyInstallNextText
   StrCpy $0 "Checking..."
   StrCmp $LANGUAGE ${MEMMY_LANG_SIMPCHINESE} 0 +2
-  StrCpy $0 "正在检查..."
+  StrCpy $0 "检查中"
   SendMessage $MemmyInstallNextButton ${WM_SETTEXT} 0 "STR:$0"
   EnableWindow $MemmyInstallNextButton 0
   ; Paint the wizard and its child controls before synchronous preflight work.
