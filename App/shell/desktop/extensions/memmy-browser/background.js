@@ -11,7 +11,7 @@ const BRIDGE_PORTS = [47321, 47322, 47323];
 // Memmy updates replace these files in place, but Chrome keeps running the worker script it
 // registered at install, even across browser restarts, until the extension reloads.
 // Must equal "version" in manifest.json.
-const EXTENSION_VERSION = "1.0.10";
+const EXTENSION_VERSION = "1.0.11";
 // Chrome stops an idle MV3 worker about 30 seconds after Memmy goes away, which ends
 // the setTimeout retries. The alarm wakes the worker so it reconnects once Memmy is back.
 const RECONNECT_ALARM = "memmy-reconnect";
@@ -46,7 +46,7 @@ let inputObserverGeneration = 0;
 // sends keys, field values, coordinates, or page content to the extension.
 function inputObserverSource(token) { return `(() => {
   globalThis.__memmyInputObserverToken = ${JSON.stringify(token)};
-  if (globalThis.__memmyInputObserverReady) return;
+  if (globalThis.__memmyInputObserverReady) return true;
   Object.defineProperty(globalThis, '__memmyInputObserverReady', { value: true });
   const report = event => {
     if (!event.isTrusted || (event.type === 'keydown'
@@ -63,6 +63,7 @@ function inputObserverSource(token) { return `(() => {
   for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
     addEventListener(type, report, { capture: true, passive: true });
   }
+  return true;
 })()`; }
 const pageOpens = [];
 const createdTabs = new Map();
@@ -374,12 +375,11 @@ function generatedInputTypes(method, params) {
     if (params.type === "mouseWheel") return ["wheel"];
   }
   if (method === "Input.dispatchKeyEvent"
-    && ["keyDown", "rawKeyDown"].includes(params.type)) return ["keydown"];
+    && ["keyDown", "rawKeyDown"].includes(params.type)
+    && !["Alt", "Control", "Meta", "Shift"].includes(params.key)) return ["keydown"];
   if (method === "Input.dispatchTouchEvent" && params.type === "touchStart") {
-    return ["touchstart", "pointerdown"];
+    return ["touchstart", ...Array(params.touchPoints?.length || 1).fill("pointerdown")];
   }
-  if (method === "Input.synthesizeTapGesture") return ["pointerdown", "touchstart"];
-  if (method === "Input.synthesizeScrollGesture") return ["wheel"];
   if (method === "Input.emulateTouchFromMouseEvent" && params.type === "mousePressed") {
     return ["touchstart", "pointerdown"];
   }
@@ -396,12 +396,12 @@ async function command(tabId, method, params = {}, sessionId) {
   const types = generatedInputTypes(method, params);
   const supportsTimestamp = ["Input.dispatchMouseEvent", "Input.dispatchKeyEvent",
     "Input.dispatchTouchEvent", "Input.emulateTouchFromMouseEvent"].includes(method);
-  const sentParams = supportsTimestamp && !Number.isFinite(params.timestamp)
+  const sentParams = supportsTimestamp
     ? { ...params, timestamp: Date.now() / 1000 } : params;
   // CDP input also creates trusted DOM events. Keep its type and event time so
   // delayed binding notifications do not look like later physical input.
   const generated = claim && types.length ? {
-    types: new Set(types), sessionId, endedAt: Infinity,
+    types, sessionId, endedAt: Infinity,
     eventAt: supportsTimestamp && Number.isFinite(sentParams.timestamp)
       ? sentParams.timestamp * 1000 : null,
   } : null;
@@ -433,35 +433,48 @@ async function installInputObserver(tabId, sessionId) {
   }
   // runImmediately is not available in every supported Chromium build. Install
   // in the current document and each same-process frame as well.
-  const tree = await command(tabId, "Page.getFrameTree", {}, sessionId).catch(() => null);
+  const tree = await command(tabId, "Page.getFrameTree", {}, sessionId);
+  if (!tree?.frameTree?.frame?.id) throw new Error("INPUT_OBSERVER_UNAVAILABLE");
   const pending = tree?.frameTree ? [tree.frameTree] : [];
-  for (let count = 0; pending.length && count < 100; count++) {
+  while (pending.length) {
     const frame = pending.shift();
+    // Out-of-process frames have their own flattened CDP session and barrier.
+    if ([...claim.inputObservers.entries()].some(([id, state]) =>
+      id !== (sessionId || '') && state.targetId === frame.frame?.id)) continue;
     if (Array.isArray(frame.childFrames)) pending.push(...frame.childFrames);
-    if (typeof frame.frame?.id !== "string") continue;
-    try {
-      const world = await command(tabId, "Page.createIsolatedWorld", {
-        frameId: frame.frame.id, worldName: INPUT_OBSERVER_WORLD,
-      }, sessionId);
-      if (Number.isInteger(world?.executionContextId)) {
-        await command(tabId, "Runtime.evaluate", {
-          expression: source, contextId: world.executionContextId,
-        }, sessionId);
-      }
-    } catch { /* A navigating frame gets the registered script on its next document. */ }
+    if (typeof frame.frame?.id !== "string") throw new Error("INPUT_OBSERVER_UNAVAILABLE");
+    const world = await command(tabId, "Page.createIsolatedWorld", {
+      frameId: frame.frame.id, worldName: INPUT_OBSERVER_WORLD,
+    }, sessionId);
+    if (!Number.isInteger(world?.executionContextId)) throw new Error("INPUT_OBSERVER_UNAVAILABLE");
+    const result = await command(tabId, "Runtime.evaluate", {
+      expression: source, contextId: world.executionContextId, returnByValue: true,
+    }, sessionId);
+    if (result?.exceptionDetails || result?.result?.value !== true) throw new Error("INPUT_OBSERVER_UNAVAILABLE");
   }
 }
 
-async function installChildInputObserver(tabId, claim, sessionId) {
+function autoAttachFrames(tabId, sessionId) {
+  return command(tabId, 'Target.setAutoAttach', { autoAttach: true, flatten: true,
+    waitForDebuggerOnStart: false, filter: [{ type: 'iframe', exclude: false }] }, sessionId);
+}
+
+function newInputObserver(extra = {}) {
+  return { ready: false, objects: new Set(), contexts: new Map(), ...extra };
+}
+
+async function installChildInputObserver(tabId, claim, sessionId, state) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (claims.get(tabId) !== claim || !claim.cdpSessions.has(sessionId)) return;
+    if (claims.get(tabId) !== claim || claim.inputObservers.get(sessionId) !== state) return;
     try {
       await Promise.all([
         command(tabId, 'Page.enable', {}, sessionId),
         command(tabId, 'Runtime.enable', {}, sessionId),
       ]);
+      await autoAttachFrames(tabId, sessionId);
       await installInputObserver(tabId, sessionId);
-      return true;
+      state.ready = true;
+      return;
     } catch {
       // A child frame can navigate as it is attached. Its replacement session
       // gets another installation attempt; retry this one while it remains live.
@@ -469,6 +482,32 @@ async function installChildInputObserver(tabId, claim, sessionId) {
     }
   }
   return false;
+}
+
+function observersReady(claim) {
+  return claim?.attached && claim.inputObservers?.get('')?.ready
+    && [...claim.inputObservers.values()].every(state => state.ready);
+}
+
+async function waitForInputObservers(tabId, commandId) {
+  const claim = claims.get(tabId);
+  if (observersReady(claim)) return;
+  // A frame may attach while another one is installing. Recheck the complete
+  // live set before allowing a root input (which can land in a focused iframe).
+  const work = (async () => {
+    while (!observersReady(claim)) {
+      if (claims.get(tabId) !== claim || !claim?.attached) throw new Error('INPUT_OBSERVER_UNAVAILABLE');
+      const pending = [...claim.inputObservers.values()].filter(state => !state.ready);
+      if (!pending.length || pending.some(state => !state.task)) throw new Error('INPUT_OBSERVER_UNAVAILABLE');
+      await Promise.all(pending.map(state => state.task));
+      if (pending.some(state => [...claim.inputObservers.values()].includes(state) && !state.ready)) {
+        throw new Error('INPUT_OBSERVER_UNAVAILABLE');
+      }
+    }
+  })();
+  try { await withCdpTimeout(work, 3_000); }
+  catch { throw new Error('INPUT_OBSERVER_UNAVAILABLE'); }
+  if (claims.get(tabId) !== claim || cancelledCommands.has(commandId)) throw new Error('Browser operation cancelled');
 }
 
 function wakeCdpWaiters(claim) {
@@ -502,6 +541,8 @@ function markDebuggerDetached(claim) {
   // Detaching the debugger does not make recent physical input disappear.
   claim.inputObserverToken = "";
   claim.generatedInput = [];
+  for (const observer of claim.inputObservers?.values() || []) observer.removed?.();
+  claim.inputObservers?.clear();
   claim.cdpSessions?.clear();
   claim.cdpEpoch = (claim.cdpEpoch || 0) + 1;
   wakeCdpWaiters(claim);
@@ -530,7 +571,7 @@ function newClaim(tabId, origin) {
     cdpReadDepth: 0, cdpWriteDepth: 0, credentialProtected: protectedCredentialTabs.has(tabId),
     credentialRecoveryOrigin: protectedCredentialOrigins.get(tabId) || origin,
     recoveryNavigationPending: false, documentEpoch: 0, frameEpoch: 0,
-    lastUserInputAt: 0, generatedInput: [], inputObserverToken: "" };
+    lastUserInputAt: 0, generatedInput: [], inputObserverToken: "", inputObservers: new Map() };
 }
 
 async function discoverTab(tabId) {
@@ -594,6 +635,9 @@ async function ensureAttached(tabId) {
   return queueDebuggerTask(tabId, async () => {
     if (current.attached) return;
     current.inputObserverToken = `${Date.now()}-${++inputObserverGeneration}`;
+    current.inputObservers.clear();
+    const observer = newInputObserver();
+    current.inputObservers.set('', observer);
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (error) {
       // Chrome reports a session this extension already holds as "Another debugger is already attached".
@@ -605,13 +649,20 @@ async function ensureAttached(tabId) {
         command(tabId, "Runtime.enable"),
         command(tabId, "Network.enable"),
       ]);
-      try {
-        await command(tabId, 'Target.setAutoAttach', { autoAttach: true, flatten: true,
-          waitForDebuggerOnStart: false, filter: [{ type: 'iframe', exclude: false }] });
-      } catch { /* Unsupported child targets remain unavailable. */ }
-      await installInputObserver(tabId);
+      await autoAttachFrames(tabId);
+      // A frame can disappear or acquire an OOPIF session between the tree and
+      // world calls. Re-read the tree on retry; never ignore a live uncovered frame.
+      for (let attempt = 0; ; attempt++) {
+        try { await installInputObserver(tabId); break; }
+        catch (error) {
+          if (attempt >= 2 || claims.get(tabId) !== current || pausedTabs.has(tabId)) throw error;
+          await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+        }
+      }
+      observer.ready = true;
       if (claims.get(tabId) !== current || pausedTabs.has(tabId)) throw new Error("Page detached during attachment");
     } catch (error) {
+      markDebuggerDetached(current);
       await chrome.debugger.detach({ tabId }).catch(() => undefined);
       throw pausedTabs.has(tabId) ? new Error(USER_CANCELLED_REASON) : error;
     }
@@ -950,6 +1001,8 @@ async function requestAuth(tabId, raw, commandId) {
     const revalidated = await validateAuthControls(tabId, request, frame);
     if (revalidated.length) return { status: 'locator_invalid', locator_error: { field_id: revalidated[0], reason: 'not_user_visible' } };
     if (!await current()) return { status: 'page_changed' };
+    await waitForInputObservers(tabId, commandId);
+    await assertUserIsNotUsingTab(tabId);
     await protectCredentialTab(tabId, request.origin);
     const expression = `(() => { const doc=${frame.documentExpression}; const view=doc?.defaultView;
       if(!doc||!view || doc.URL!==${JSON.stringify(frame.url)}
@@ -973,10 +1026,14 @@ async function requestAuth(tabId, raw, commandId) {
       if (!await current() || frame.children.some(child => claim.cdpSessions.get(child.sessionId) !== child.info
         || child.info.revision !== child.revision || child.info.url !== child.url))
         return { status: 'page_changed' };
+      await assertUserIsNotUsingTab(tabId);
       const result = await command(tabId, 'Runtime.evaluate', { expression, returnByValue: true }, frame.sessionId);
       if (result.exceptionDetails || result.result?.value !== true) return { status: 'submission_failed' };
       return { status: 'submitted', ...(selected ? { selected_option: selected.id } : {}) };
-    } catch { return { status: 'submission_failed' }; }
+    } catch (error) {
+      if (['USER_ACTIVE_ON_TARGET_TAB', 'INPUT_OBSERVER_UNAVAILABLE'].includes(error?.message)) throw error;
+      return { status: 'submission_failed' };
+    }
   });
 }
 
@@ -1050,16 +1107,16 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
       || input[0] !== claim.inputObserverToken
       || !["pointerdown", "keydown", "wheel", "touchstart"].includes(input[1])
       || !Number.isFinite(input[2])
-      || (source.sessionId && !claim.cdpSessions.has(source.sessionId))) return;
+      || (source.sessionId && !claim.inputObservers.has(source.sessionId))) return;
     const [,, occurredAt] = input;
     pruneGeneratedInput(claim);
     // CDP supplies the event timestamp. Allow only clock rounding, and consume
     // each expected event once: a nearby second physical click is never covered
     // by the same Agent input. Root input may be routed into an OOP iframe.
-    const generated = claim.generatedInput.find(entry => entry.types.has(input[1])
+    const generated = claim.generatedInput.find(entry => entry.types.includes(input[1])
       && (!entry.sessionId || entry.sessionId === source.sessionId)
       && entry.eventAt !== null && Math.abs(occurredAt - entry.eventAt) <= 1);
-    if (generated) generated.types.delete(input[1]);
+    if (generated) generated.types.splice(generated.types.indexOf(input[1]), 1);
     if (!generated && occurredAt <= Date.now() + 1_000) {
       claim.lastUserInputAt = Math.max(claim.lastUserInputAt, occurredAt);
       refreshUserActivity();
@@ -1076,6 +1133,27 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
     && !claim.protectedActivity && !pausedTabs.has(source.tabId)) {
     send({ type: 'playwright_event', tabId: source.tabId, leaseId: executorLease.id,
       method, params: data || {}, ...(source.sessionId ? { sessionId: source.sessionId } : {}) });
+  }
+  const observer = claim.inputObservers?.get(source.sessionId || '');
+  if (observer) {
+    if (method === 'Runtime.executionContextCreated' && data?.context?.auxData?.isDefault === true
+      && data.context.name !== INPUT_OBSERVER_WORLD && Number.isInteger(data.context.id)) {
+      observer.contexts.set(data.context.id, { uniqueId: data.context.uniqueId,
+        frameId: data.context.auxData.frameId });
+    } else if (method === 'Runtime.executionContextDestroyed') {
+      observer.contexts.delete(data.executionContextId);
+      for (const [id, context] of observer.contexts) {
+        if (context.uniqueId && context.uniqueId === data.executionContextUniqueId) observer.contexts.delete(id);
+      }
+    } else if (method === 'Runtime.executionContextsCleared') observer.contexts.clear();
+    else if (method === 'Page.frameNavigated') {
+      for (const [id, context] of observer.contexts) {
+        if (context.frameId === data?.frame?.id) observer.contexts.delete(id);
+      }
+    }
+    if (['Page.frameNavigated', 'Runtime.executionContextsCleared', 'Runtime.executionContextDestroyed'].includes(method)) {
+      observer.objects = new Set();
+    }
   }
   if (method === 'Page.windowOpen' && !source.sessionId && typeof data?.url === 'string') {
     pageOpens.push({ sourceTabId: source.tabId, url: data.url, at: Date.now() });
@@ -1108,19 +1186,26 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
     if (method === 'Target.attachedToTarget' && typeof data?.sessionId === 'string'
       && data.targetInfo?.type === 'iframe' && typeof data.targetInfo.targetId === 'string') {
       const childUrl = String(data.targetInfo.url || '');
-      const child = { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
-        inputObserverState: "pending",
-        ...(source.sessionId ? { parentSessionId: source.sessionId } : {}) };
-      claim.cdpSessions.set(data.sessionId, child);
-      if (claim.inputObserverToken && (claim.attached || debuggerTasks.has(source.tabId))) {
-        void installChildInputObserver(source.tabId, claim, data.sessionId).then(ready => {
-          if (claims.get(source.tabId) === claim && claim.cdpSessions.get(data.sessionId) === child) {
-            child.inputObserverState = ready ? "ready" : "failed";
-          }
-        });
-      }
+      claim.cdpSessions.set(data.sessionId,
+        { targetId: data.targetInfo.targetId, url: childUrl, revision: 0,
+          ...(source.sessionId ? { parentSessionId: source.sessionId } : {}) });
+      const observer = newInputObserver({ targetId: data.targetInfo.targetId,
+        parentSessionId: source.sessionId || '' });
+      claim.inputObservers.set(data.sessionId, observer);
+      observer.task = Promise.race([
+        installChildInputObserver(source.tabId, claim, data.sessionId, observer),
+        new Promise(resolve => { observer.removed = resolve; }),
+      ]);
     } else if (method === 'Target.detachedFromTarget' && typeof data?.sessionId === 'string') {
-      claim.cdpSessions.delete(data.sessionId);
+      const detached = new Set([data.sessionId]);
+      for (const id of detached) {
+        for (const [childId, observer] of claim.inputObservers || []) {
+          if (observer.parentSessionId === id) detached.add(childId);
+        }
+        claim.cdpSessions.delete(id);
+        claim.inputObservers?.get(id)?.removed?.();
+        claim.inputObservers?.delete(id);
+      }
     } else if (method === 'Page.frameNavigated' && source.sessionId && claim.cdpSessions.has(source.sessionId)) {
       claim.cdpSessions.get(source.sessionId).revision++;
     } else if (method === 'Target.targetInfoChanged' && typeof data?.targetInfo?.targetId === 'string') {
@@ -1162,6 +1247,7 @@ chrome.debugger.onEvent.addListener((source, method, data) => {
 
 function resetCdpOrigin(claim, nextOrigin) {
   if (claim.cdpOrigin !== nextOrigin) {
+    for (const observer of claim.inputObservers?.values() || []) observer.objects = new Set();
     claim.cdpEvents = []; claim.cdpSessions.clear(); claim.cdpOrigin = nextOrigin;
     claim.cdpEpoch = (claim.cdpEpoch || 0) + 1; wakeCdpWaiters(claim);
   }
@@ -1290,7 +1376,7 @@ function normalizeCdpWrite(method, params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)
     || JSON.stringify(params).length > 24000) throw new Error('Invalid CDP write parameters');
   const domain = method.split('.')[0];
-  const allowed = new Set(['Accessibility', 'Audits', 'Console', 'CSS', 'Debugger', 'DOM',
+  const allowed = new Set(['Accessibility', 'Audits', 'Console', 'CSS', 'DOM',
     'DOMDebugger', 'DOMSnapshot', 'Emulation', 'Fetch', 'IO', 'Input', 'Inspector', 'Log',
     'Network', 'Overlay', 'Page', 'Performance', 'Profiler', 'Runtime', 'Tracing', 'WebAudio']);
   const denied = new Set(['DOM.getFileInfo', 'DOM.setFileInputFiles', 'Input.dispatchKeyEvent',
@@ -1304,15 +1390,21 @@ function normalizeCdpWrite(method, params) {
     'Page.setRPHRegistrationMode', 'Page.setSPCTransactionMode', 'Tracing.requestMemoryDump',
     'Fetch.disable', 'Input.dispatchDragEvent', 'Network.continueInterceptedRequest',
     'Network.getCertificate', 'Network.loadNetworkResource', 'Network.replayXHR',
-    'Page.navigate', 'Page.navigateToHistoryEntry', 'Runtime.disable', 'Runtime.removeBinding',
-    'Page.removeScriptToEvaluateOnNewDocument', 'Input.synthesizeTapGesture',
-    'Input.synthesizeScrollGesture', 'Input.synthesizePinchGesture']);
+    'Page.navigate', 'Page.navigateToHistoryEntry', 'Page.removeScriptToEvaluateOnNewDocument',
+    'Page.setDocumentContent',
+    'Runtime.addBinding', 'Runtime.removeBinding', 'Runtime.disable', 'Runtime.terminateExecution',
+    'Runtime.compileScript', 'Runtime.runScript', 'DOMDebugger.getEventListeners',
+    'Emulation.setScriptExecutionDisabled', 'Emulation.setVirtualTimePolicy',
+    // These gestures produce an unbounded series without caller-owned event
+    // timestamps. Use timestamped dispatchMouseEvent/dispatchTouchEvent instead.
+    'Input.synthesizeTapGesture', 'Input.synthesizeScrollGesture', 'Input.synthesizePinchGesture']);
   if (!/^[A-Za-z]+\.[A-Za-z]+$/.test(method) || !allowed.has(domain) || denied.has(method)) {
     throw new Error('CDP write method is unavailable');
   }
-  if (method === 'Runtime.addBinding' && params.name === INPUT_OBSERVER_BINDING
-    || method === 'Page.createIsolatedWorld' && params.worldName === INPUT_OBSERVER_WORLD) {
-    throw new Error('CDP input observer is reserved');
+  // Raw scripts execute in the page's default world. Keep the extension's
+  // isolated observer inaccessible, including indirect object resolution.
+  if (method === 'Page.createIsolatedWorld' && params.worldName === INPUT_OBSERVER_WORLD) {
+    throw new Error('CDP observer context is unavailable');
   }
   if ((method === 'Fetch.continueResponse' || method === 'Fetch.fulfillRequest')
     && params.binaryResponseHeaders != null
@@ -1334,6 +1426,43 @@ function normalizeCdpWrite(method, params) {
       || Array.isArray(pattern) || typeof pattern.resourceType !== 'string'
       || pattern.resourceType === 'Document'))) throw new Error('CDP Fetch patterns are unavailable');
   return params;
+}
+
+function checkCdpObjects(claim, sessionId, params) {
+  const observer = claim.inputObservers?.get(sessionId || '');
+  // Same-process iframes need context targeting. Admit only contexts that CDP
+  // identified as page default worlds in this live session, never isolated worlds.
+  for (const key of ['contextId', 'executionContextId']) {
+    if (Object.hasOwn(params, key) && !observer?.contexts?.has(params[key])) {
+      throw new Error('CDP observer context is unavailable');
+    }
+  }
+  if (Object.hasOwn(params, 'uniqueContextId') && (!params.uniqueContextId
+    || ![...(observer?.contexts?.values() || [])].some(context => context.uniqueId === params.uniqueContextId))) {
+    throw new Error('CDP observer context is unavailable');
+  }
+  const objects = observer?.objects;
+  const ids = ['objectId', 'prototypeObjectId', 'promiseObjectId'].map(key => params[key]);
+  if (Array.isArray(params.arguments)) ids.push(...params.arguments.map(arg => arg?.objectId));
+  if (ids.some(id => id !== undefined && !objects?.has(id))) throw new Error('CDP object is unavailable; resolve it in the current page');
+}
+
+function rememberCdpObjects(claim, sessionId, method, result) {
+  if (!['Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.getProperties',
+    'Runtime.awaitPromise', 'Runtime.queryObjects', 'DOM.resolveNode'].includes(method)) return;
+  const objects = claim.inputObservers?.get(sessionId || '')?.objects;
+  if (!objects) return;
+  // Read protocol RemoteObjects only. A page-supplied returnByValue payload
+  // containing an "objectId" string must never mint a callable CDP handle.
+  const remoteObjects = [result?.result, result?.object, result?.objects];
+  if (method === 'Runtime.getProperties') {
+    for (const property of [...(result?.result || []), ...(result?.internalProperties || []),
+      ...(result?.privateProperties || [])]) {
+      remoteObjects.push(property.value, property.get, property.set, property.symbol);
+    }
+  }
+  for (const remote of remoteObjects) if (typeof remote?.objectId === 'string') objects.add(remote.objectId);
+  while (objects.size > 1000) objects.delete(objects.values().next().value);
 }
 
 function cdpTargetUrls(method, params) {
@@ -1436,7 +1565,11 @@ async function cdpRead(tabId, name, args, commandId) {
       || child.info.revision !== child.revision || pageOrigin(child.info.url) !== child.origin)) {
       throw new Error('CDP child target changed');
     }
-    if (name === 'cdpWrite') await assertUserIsNotUsingTab(tabId);
+    if (name === 'cdpWrite') {
+      await assertUserIsNotUsingTab(tabId);
+      checkCdpObjects(claim, sessionId, params);
+    }
+    const objectScope = claim.inputObservers?.get(sessionId || '')?.objects;
     const result = await command(tabId, method, params, sessionId);
     if (child) {
       const live = await attachedChildMetadata(tabId, claim, sessionId, child.info);
@@ -1450,6 +1583,9 @@ async function cdpRead(tabId, name, args, commandId) {
     if (await check() !== claim || claim.cdpEpoch !== approvedEpoch
       || (child && (claim.cdpSessions.get(sessionId) !== child.info
         || child.info.revision !== child.revision))) throw new Error('CDP claim changed');
+    if (name === 'cdpWrite' && claim.inputObservers?.get(sessionId || '')?.objects === objectScope) {
+      rememberCdpObjects(claim, sessionId, method, result);
+    }
     return result;
     })().finally(() => {
       if (name === 'cdpWrite') claim.cdpWriteDepth--;
@@ -1725,12 +1861,9 @@ async function history(tabId, direction) {
 }
 
 function assertInputObserversReady(claim) {
-  // Child attachment is asynchronous. A write into any part of the tab must
-  // wait for all its input observers, including when root CDP routes to a child.
-  if (claim && [...claim.cdpSessions.values()].some(child =>
-    child.inputObserverState === "pending" || child.inputObserverState === "failed")) {
-    throw new Error("USER_INPUT_OBSERVER_NOT_READY");
-  }
+  // Playwright dispatch must remain synchronous to preserve CDP reply/event
+  // ordering. Refuse input until every live frame has a ready observer.
+  if (!observersReady(claim)) throw new Error('INPUT_OBSERVER_UNAVAILABLE');
 }
 
 async function assertUserIsNotUsingTab(tabId) {
@@ -1910,7 +2043,10 @@ async function run(tabId, name, args, commandId) {
     throw new Error('Browser page observation is unavailable during credential protection or autofill');
   }
   if (["navigate", "back", "forward", "reload", "click", "type", "selectOption",
-    "pressKey", "scroll", "resize", "fillCredential", "fillContact", "cdpWrite"].includes(name)) await assertUserIsNotUsingTab(tabId);
+    "pressKey", "scroll", "resize", "fillCredential", "fillContact", "authRequest", "upload", "cdpWrite"].includes(name)) {
+    await waitForInputObservers(tabId, commandId);
+    await assertUserIsNotUsingTab(tabId);
+  }
   switch (name) {
     case 'playwrightStart':
     case 'playwrightCdp':
