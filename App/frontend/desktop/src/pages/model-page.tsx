@@ -109,7 +109,7 @@ export function ModelPage() {
   ));
   const [savePending, setSavePending] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<{ text: string; tone: "error" | "success" } | null>(null);
-  const credentialRevision = useRef(0);
+  const testRevisions = useRef({ skill: 0, memory: 0 });
   const skillValues = createModelFormValues(skill, primaryModel);
   const evolutionModel = modelFormValuesAsPrimary(skillValues);
   const memoryValues = createModelFormValues(mem, evolutionModel);
@@ -117,14 +117,24 @@ export function ModelPage() {
 
   /** Handles patch mem. */
   function patchMem(patch: Partial<ModelConfig>) {
-    if (!patch.validation) credentialRevision.current += 1;
-    setMem((current) => patchModelConfig(current, patch));
+    const changed = modelConnectionChanged(mem, patch, evolutionModel);
+    if (changed) testRevisions.current.memory += 1;
+    setMem((current) => patchModelConfig(current, patch, changed ? t("apiKey.testStale") : null));
   }
 
   /** Handles patch skill. */
   function patchSkill(patch: Partial<ModelConfig>) {
-    if (!patch.validation) credentialRevision.current += 1;
-    setSkill((current) => patchModelConfig(current, patch));
+    const changed = modelConnectionChanged(skill, patch, primaryModel);
+    if (changed) {
+      testRevisions.current.skill += 1;
+      const nextEvolution = modelFormValuesAsPrimary(createModelFormValues({ ...skill, ...patch }, primaryModel));
+      if (mem.reuse && createModelConfigValidationKey(memoryValues)
+        !== createModelConfigValidationKey(createModelFormValues(mem, nextEvolution))) {
+        testRevisions.current.memory += 1;
+        setMem((current) => patchModelConfig(current, {}, t("apiKey.testStale")));
+      }
+    }
+    setSkill((current) => patchModelConfig(current, patch, changed ? t("apiKey.testStale") : null));
   }
 
   /** Handles test model config connection. */
@@ -135,12 +145,14 @@ export function ModelPage() {
     secretTarget: "memory" | "skill"
   ) {
     const values = createModelFormValues(config, inheritedModel);
-    const revision = credentialRevision.current;
+    // Each card owns its request. A newer request also invalidates an older one
+    // when the user edits a value and then returns to the original configuration.
+    const revision = ++testRevisions.current[secretTarget];
     testModelConnection({
       configClient: clients?.config,
       values,
       setValidation: (validation) => {
-        if (credentialRevision.current === revision) patch({ validation });
+        if (testRevisions.current[secretTarget] === revision) patch({ validation });
       },
       secretTarget,
       messages: createTestModelConnectionMessages(t)
@@ -269,12 +281,18 @@ function modelPageSaveErrorText(
   return message || t("settings.modelWorkspace.saveFailed");
 }
 
-function patchModelConfig(current: ModelConfig, patch: Partial<ModelConfig>): ModelConfig {
+function modelConnectionChanged(current: ModelConfig, patch: Partial<ModelConfig>, primary: PrimaryModelValues): boolean {
+  return (patch.reuse !== undefined && patch.reuse !== current.reuse)
+    || createModelConfigValidationKey(createModelFormValues(current, primary))
+      !== createModelConfigValidationKey(createModelFormValues({ ...current, ...patch }, primary));
+}
+
+function patchModelConfig(current: ModelConfig, patch: Partial<ModelConfig>, staleMessage: string | null): ModelConfig {
   return {
     ...current,
     ...patch,
-    ...(patch.reuse !== undefined
-      ? { validation: { status: "idle" as const, message: null, testedKey: null } }
+    ...(staleMessage
+      ? { validation: { status: "idle" as const, message: staleMessage, testedKey: null } }
       : {})
   };
 }
@@ -508,7 +526,7 @@ function TestButton(props: TestButtonProps) {
 function ValidationMessage(props: ValidationMessageProps) {
   const { t } = useTranslation();
 
-  if (props.validation.status === "idle" && !props.stale && !props.credentialRequired) {
+  if (props.validation.status === "idle" && !props.validation.message && !props.stale && !props.credentialRequired) {
     return null;
   }
 

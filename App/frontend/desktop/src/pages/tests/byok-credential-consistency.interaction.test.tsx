@@ -473,6 +473,106 @@ describe("BYOK displayed, tested and saved credentials", () => {
     expect(test(1).textContent).not.toBe("apiKey.testSuccess");
     expect(next().disabled).toBe(true);
     expect(server.write).not.toHaveBeenCalled();
+    await testAndSave(scenarios[4]!);
+  });
+
+  function deferProbe() {
+    let finish!: (result: Awaited<ReturnType<typeof server.probe>>) => void;
+    server.probe.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    return async (ok = true) => {
+      await act(async () => finish({ ok, message: ok ? "ok" : "old request failed", checkedAt: "2026-10-17T00:00:00.000Z" }));
+    };
+  }
+
+  it.each([0, 1].flatMap((index) => ["model", "key"].map((edit) => ({ index, edit }))))(
+    "role $index: editing $edit during a test unlocks retry and allows saving the new configuration",
+    async ({ index, edit }) => {
+      const finishOld = deferProbe();
+      await render(<ModelPage />);
+      await click(test(index));
+      await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+      expect(test(index).disabled).toBe(true);
+      await change(field(edit === "model" ? "apiKey.model" : "API Key", index), edit === "model" ? "corrected-model" : "sk-corrected-9999");
+      expect(test(index).disabled).toBe(false);
+      expect(test(index).textContent).toBe("apiKey.test");
+      expect(next().disabled).toBe(true);
+      await finishOld();
+      expect(test(index).disabled).toBe(false);
+      expect(test(index).textContent).toBe("apiKey.test");
+      const scenario = scenarios[index === 0 ? 5 : 4]!;
+      const tested = await testAndSave(scenario);
+      expect(tested).toMatchObject(edit === "model" ? { modelId: "corrected-model" } : { apiKey: "sk-corrected-9999" });
+    }
+  );
+
+  it.each([0, 1])("role %i: showing and hiding a key does not invalidate a pending test", async (index) => {
+    const finish = deferProbe();
+    await render(<ModelPage />);
+    await click(test(index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await click(container.querySelectorAll<HTMLButtonElement>('[aria-label="apiKey.showKey"]')[index]!);
+    await click(container.querySelector<HTMLButtonElement>('[aria-label="apiKey.hideKey"]')!);
+    expect(test(index).disabled).toBe(true);
+    await finish();
+    expect(test(index).textContent).toBe("apiKey.testSuccess");
+    expect(next().disabled).toBe(false);
+    await click(next());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+  });
+
+  it.each([0, 1])("role %i: editing the other independent card leaves this request valid", async (index) => {
+    const finish = deferProbe();
+    await render(<ModelPage />);
+    await click(test(index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await change(field("apiKey.model", 1 - index), "other-model");
+    await finish();
+    expect(test(index).textContent).toBe("apiKey.testSuccess");
+    expect(next().disabled).toBe(true);
+    await testAndSave(scenarios[index === 0 ? 4 : 5]!);
+    expect(await server.key("memory_evolution")).toBe("sk-team-1111");
+    expect(await server.key("memory_summary")).toBe("sk-summary-1111");
+  });
+
+  it.each(["old-first", "new-first", "return-to-original"])("roles: overlapping requests (%s) cannot overwrite the latest result", async (order) => {
+    const finishOld = deferProbe();
+    const finishNew = deferProbe();
+    await render(<ModelPage />);
+    await click(test(1));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await change(field("apiKey.model", 1), "new-model");
+    if (order === "return-to-original") await change(field("apiKey.model", 1), "same-model");
+    await click(test(1));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(2));
+    if (order === "old-first") {
+      await finishOld();
+      expect(test(1).textContent).toBe("apiKey.testing");
+      expect(next().disabled).toBe(true);
+      await finishNew();
+    } else {
+      await finishNew();
+      await finishOld(false);
+    }
+    expect(test(1).textContent).toBe("apiKey.testSuccess");
+    expect(next().disabled).toBe(false);
+    await click(next());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    expect(await server.key("memory_evolution")).toBe("sk-team-1111");
+  });
+
+  it("roles: upstream edits invalidate a following summary and recover after retesting", async () => {
+    const finishOld = deferProbe();
+    await render(<ModelPage />);
+    await click(test(0));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await click(container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[0]!);
+    await change(field("API Key"), "sk-updated-team-9999");
+    expect(next().disabled).toBe(true);
+    await finishOld();
+    expect(next().disabled).toBe(true);
+    await testAndSave({ ...scenarios[4]!, index: 0, fieldIndex: 0 });
+    expect(await server.key("memory_evolution")).toBe("sk-updated-team-9999");
+    expect(await server.key("memory_summary")).toBe("sk-updated-team-9999");
   });
 
   it("follow chain: primary rotation flows through evolution and summary, while a fixed role keeps its own key", async () => {
