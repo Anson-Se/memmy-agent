@@ -1,3 +1,4 @@
+import { useModelConnectionTest } from "./use-model-connection-test.js";
 import { bindSavedValidation, endpointCredentialSignature, resolveModelCredentials, type SavedEndpointIdentity, chatProtocol } from "./model-credentials.js";
 import { useRef, useState } from "react";
 import { Brain, ChevronLeft, Search } from "lucide-react";
@@ -30,14 +31,12 @@ import {
 import {
   canSaveOptionalModelConfig,
   canSaveModelConfig,
-  createModelConfigValidationKey,
-  type ModelConfigValidationState
+  createModelConfigValidationKey
 } from "./model-config-validation.js";
 import {
   createTestModelConnectionMessages,
   fromProtocol,
-  hydrateModelConfigForm,
-  testModelConnection
+  hydrateModelConfigForm
 } from "./model-config.js";
 
 type EmbeddingMode = "local" | "custom";
@@ -109,7 +108,13 @@ export function ApiKeyPage() {
     apiKeyMasked,
     hasExistingApiKey: Boolean(apiKeyMasked)
   }, savedEndpointIdentitiesRef.current.agent);
-  const [llmValidation, setLlmValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.llmValidation, modelFormValues));
+  const { validation: llmValidation, isStale: isTestStale, testConnection: testLlmConnection } = useModelConnectionTest({
+    configClient: clients?.config,
+    values: modelFormValues,
+    initialValidation: () => bindSavedValidation(initialModelForm.llmValidation, modelFormValues),
+    secretTarget: "primary",
+    messages: createTestModelConnectionMessages(t)
+  });
   const initialEmbeddingMode: EmbeddingMode = initialWorkspace.catalog.modelAssignments.byok.embedding
     ? "custom"
     : "local";
@@ -130,15 +135,21 @@ export function ApiKeyPage() {
     apiKeyMasked: embeddingConfig.apiKeyMasked,
     hasExistingApiKey: Boolean(embeddingConfig.apiKeyMasked)
   }, savedEndpointIdentitiesRef.current.embedding);
-  const [embeddingValidation, setEmbeddingValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.embValidation, embeddingFormValues));
+  const { validation: embeddingValidation, isStale: isEmbeddingTestStale, testConnection: testEmbeddingConnection } = useModelConnectionTest({
+    configClient: clients?.config,
+    values: embeddingFormValues,
+    initialValidation: () => bindSavedValidation(initialModelForm.embValidation, embeddingFormValues),
+    secretTarget: "embedding",
+    capability: "embedding",
+    enabled: embeddingMode === "custom",
+    messages: createTestModelConnectionMessages(t)
+  });
   const canSave = canSaveModelConfig(modelFormValues, llmValidation)
     && canSaveOptionalModelConfig(embeddingMode === "custom", embeddingFormValues, embeddingValidation);
   const [savePending, setSavePending] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const testedKey = createModelConfigValidationKey(modelFormValues);
-  const isTestStale = Boolean(llmValidation.testedKey && llmValidation.testedKey !== testedKey);
   const embeddingTestKey = createModelConfigValidationKey(embeddingFormValues);
-  const isEmbeddingTestStale = Boolean(embeddingValidation.testedKey && embeddingValidation.testedKey !== embeddingTestKey);
   const agentCredentialSignature = endpointCredentialSignature(
     provider,
     chatProtocol(provider),
@@ -163,27 +174,6 @@ export function ApiKeyPage() {
     setEndpoint(next.endpoint);
     setModel("");
     setApiKey("");
-  }
-
-  function testLlmConnection() {
-    testModelConnection({
-      configClient: clients?.config,
-      values: modelFormValues,
-      setValidation: setLlmValidation,
-      secretTarget: "primary",
-      messages: createTestModelConnectionMessages(t)
-    });
-  }
-
-  function testEmbeddingConnection() {
-    testModelConnection({
-      configClient: clients?.config,
-      values: embeddingFormValues,
-      setValidation: setEmbeddingValidation,
-      capability: "embedding",
-      secretTarget: "embedding",
-      messages: createTestModelConnectionMessages(t)
-    });
   }
 
   function updateEmbeddingConfig(field: keyof EmbeddingCustomConfig, value: string) {

@@ -1,3 +1,4 @@
+import { useModelConnectionTest } from "./use-model-connection-test.js";
 import { bindSavedValidation, endpointCredentialSignature, resolveModelCredentials, type SavedEndpointIdentity } from "./model-credentials.js";
 import { useRef, useState } from "react";
 import { ChevronLeft, Image as ImageIcon, Mic } from "lucide-react";
@@ -34,8 +35,7 @@ import {
 } from "./optional-model-missing-warning-modal.js";
 import {
   canSaveModelConfig,
-  createModelConfigValidationKey,
-  type ModelConfigValidationState
+  createModelConfigValidationKey
 } from "./model-config-validation.js";
 import {
   ASR_DEFAULT_ENDPOINT,
@@ -47,7 +47,6 @@ import {
   createImageGenModelFormValues,
   createTestModelConnectionMessages,
   hydrateModelConfigForm,
-  testModelConnection,
   type ImageProtocol
 } from "./model-config.js";
 
@@ -81,10 +80,16 @@ export function ApiKeyOptionalPage() {
     ...createAsrModelFormValues(asrModel, asrEndpoint, asrApiKey, asrApiKeyMasked),
     protocol: "dashscope-input-audio-chat"
   }, savedEndpointIdentitiesRef.current.asr);
-  const [asrValidation, setAsrValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.asrValidation, asrFormValues));
+  const { validation: asrValidation, isStale: isAsrTestStale, testConnection: testAsrConnection } = useModelConnectionTest({
+    configClient: clients?.config,
+    values: asrFormValues,
+    initialValidation: () => bindSavedValidation(initialModelForm.asrValidation, asrFormValues),
+    secretTarget: "asr",
+    capability: "asr",
+    messages: createTestModelConnectionMessages(t)
+  });
   const isAsrUsable = canSaveModelConfig(asrFormValues, asrValidation);
   const asrTestKey = createModelConfigValidationKey(asrFormValues);
-  const isAsrTestStale = Boolean(asrValidation.testedKey && asrValidation.testedKey !== asrTestKey);
   const [imageGenProtocol, setImageGenProtocol] = useState<ImageProtocol>(initialModelForm.imageGenProtocol);
   const [imageGenModel, setImageGenModel] = useState(initialModelForm.imageGenModelId);
   const [imageGenEndpoint, setImageGenEndpoint] = useState(initialModelForm.imageGenEndpoint);
@@ -96,10 +101,16 @@ export function ApiKeyOptionalPage() {
     ...createImageGenModelFormValues(imageGenProtocol, imageGenModel, imageGenEndpoint, imageGenApiKey, imageGenApiKeyMasked),
     protocol: imageGenProtocol === "qwen" ? "dashscope-multimodal-generation" : "openai-images"
   }, savedEndpointIdentitiesRef.current.imageGeneration);
-  const [imageGenValidation, setImageGenValidation] = useState<ModelConfigValidationState>(() => bindSavedValidation(initialModelForm.imageGenValidation, imageGenFormValues));
+  const { validation: imageGenValidation, isStale: isImageGenTestStale, testConnection: testImageGenConnection } = useModelConnectionTest({
+    configClient: clients?.config,
+    values: imageGenFormValues,
+    initialValidation: () => bindSavedValidation(initialModelForm.imageGenValidation, imageGenFormValues),
+    secretTarget: "image",
+    capability: "image",
+    messages: createTestModelConnectionMessages(t)
+  });
   const isImageGenUsable = canSaveModelConfig(imageGenFormValues, imageGenValidation);
   const imageGenTestKey = createModelConfigValidationKey(imageGenFormValues);
-  const isImageGenTestStale = Boolean(imageGenValidation.testedKey && imageGenValidation.testedKey !== imageGenTestKey);
   const imageGenEndpointProtocol = imageGenProtocol === "qwen"
     ? "dashscope-multimodal-generation"
     : "openai-images";
@@ -135,28 +146,6 @@ export function ApiKeyOptionalPage() {
     setImageGenModel("");
     setImageGenApiKey("");
     setImageGenWarningAcknowledged(false);
-  }
-
-  function testAsrConnection() {
-    testModelConnection({
-      configClient: clients?.config,
-      values: asrFormValues,
-      setValidation: setAsrValidation,
-      capability: "asr",
-      secretTarget: "asr",
-      messages: createTestModelConnectionMessages(t)
-    });
-  }
-
-  function testImageGenConnection() {
-    testModelConnection({
-      configClient: clients?.config,
-      values: imageGenFormValues,
-      setValidation: setImageGenValidation,
-      capability: "image",
-      secretTarget: "image",
-      messages: createTestModelConnectionMessages(t)
-    });
   }
 
   function closeOptionalModelMissingWarning() {

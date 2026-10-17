@@ -484,6 +484,135 @@ describe("BYOK displayed, tested and saved credentials", () => {
     };
   }
 
+  it.each(scenarios.slice(0, 4))("onboarding $role: new success survives an older failure and saves the new key", async (scenario) => {
+    const finishOld = deferProbe();
+    const finishNew = deferProbe();
+    await render(scenario.page());
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await change(field(scenario.endpoint), "https://changed.example/v1");
+    // Exact review reproduction: validate the now-missing credential before re-entry.
+    await click(test(scenario.index));
+    expect(server.probe).toHaveBeenCalledTimes(1);
+    await change(field(scenario.key), "sk-new-onboarding-9999");
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(2));
+    await finishNew();
+    expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
+    await finishOld(false);
+    expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
+    await click(next());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    expect(await server.key(scenario.role)).toBe("sk-new-onboarding-9999");
+  });
+
+  it.each(scenarios.slice(0, 4).flatMap((scenario) =>
+    ["old-first", "new-first-success", "new-first-rejection", "new-failure", "return-to-original"].map((order) => ({ scenario, order }))
+  ))("onboarding $scenario.role: overlapping requests $order preserve the latest result", async ({ scenario, order }) => {
+    let rejectOld!: (error: Error) => void;
+    let finishOld: (ok?: boolean) => Promise<void>;
+    if (order === "new-first-rejection") {
+      server.probe.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+      finishOld = async () => { await act(async () => rejectOld(new Error("old transport failure"))); };
+    } else finishOld = deferProbe();
+    const finishNew = deferProbe();
+    await render(scenario.page());
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await change(field(scenario.key), "sk-new-onboarding-9999");
+    if (order === "return-to-original") await change(field(scenario.key), "");
+    expect(test(scenario.index).disabled).toBe(false);
+    expect(test(scenario.index).textContent).toBe("apiKey.test");
+    await click(next());
+    expect(server.write).not.toHaveBeenCalled();
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(2));
+    if (order === "old-first") {
+      await finishOld();
+      expect(test(scenario.index).textContent).toBe("apiKey.testing");
+      expect(test(scenario.index).disabled).toBe(true);
+      await finishNew();
+    } else {
+      await finishNew(order !== "new-failure");
+      await finishOld();
+    }
+    if (order === "new-failure") {
+      expect(test(scenario.index).textContent).toBe("apiKey.testRetry");
+      await click(next());
+      expect(server.write).not.toHaveBeenCalled();
+      await testAndSave(scenario);
+    } else {
+      expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
+      await click(next());
+      await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    }
+    expect(await server.key(scenario.role)).toBe(order === "return-to-original" ? scenario.expected : "sk-new-onboarding-9999");
+  });
+
+  it.each(scenarios.slice(0, 4).flatMap((scenario) =>
+    (scenario.role === "asr" ? ["key"] : ["key", "model"]).map((edit) => ({ scenario, edit }))
+  ))("onboarding $scenario.role: $edit edit unlocks retry before the old response", async ({ scenario, edit }) => {
+    const finishOld = deferProbe();
+    await render(scenario.page());
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await change(field(edit === "key" ? scenario.key : scenario.model), edit === "key" ? "sk-new-onboarding-9999" : "new-model");
+    expect(test(scenario.index).disabled).toBe(false);
+    await finishOld();
+    expect(test(scenario.index).textContent).toBe("apiKey.test");
+    await click(next());
+    expect(server.write).not.toHaveBeenCalled();
+    const tested = await testAndSave(scenario);
+    expect(tested).toMatchObject(edit === "key" ? { apiKey: "sk-new-onboarding-9999" } : { modelId: "new-model" });
+  });
+
+  it.each(scenarios.slice(0, 4))("onboarding $role: visibility, normalized URL and other-card edits preserve the pending request", async (scenario) => {
+    const finish = deferProbe();
+    await render(scenario.page());
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await click(container.querySelectorAll<HTMLButtonElement>('[aria-label="apiKey.showKey"]')[scenario.index]!);
+    await click(container.querySelector<HTMLButtonElement>('[aria-label="apiKey.hideKey"]')!);
+    await change(field(scenario.endpoint), "  https://provider.example/v1///  ");
+    const other = scenarios[(scenario.role === "agent" || scenario.role === "embedding" ? 0 : 2) + 1 - scenario.index]!;
+    await change(field(other.key), "sk-independent-8888");
+    expect(test(scenario.index).disabled).toBe(true);
+    await finish();
+    expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
+    await testAndSave(other);
+    expect(await server.key(scenario.role)).toBe(scenario.expected);
+  });
+
+  it.each([scenarios[0]!, scenarios[3]!])("onboarding $role: changing protocol during a request invalidates it and permits retry", async (scenario) => {
+    const finishOld = deferProbe();
+    await render(scenario.page());
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    await click(container.querySelector<HTMLButtonElement>('button[role="combobox"]')!);
+    await click([...container.querySelectorAll<HTMLButtonElement>('button[role="option"]')].find((item) => item.getAttribute("aria-selected") === "false")!);
+    await change(field(scenario.model), "new-protocol-model");
+    expect(test(scenario.index).disabled).toBe(false);
+    await finishOld();
+    expect(test(scenario.index).textContent).not.toBe("apiKey.testSuccess");
+    await change(field(scenario.key), "sk-new-onboarding-9999");
+    await testAndSave(scenario);
+  });
+
+  it("onboarding embedding: disabling and reenabling invalidates the pending request", async () => {
+    const finish = deferProbe();
+    await render(<ApiKeyPage />);
+    await click(test(1));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    for (let i = 0; i < 2; i++) {
+      await click(container.querySelectorAll<HTMLButtonElement>('button[role="combobox"]')[1]!);
+      await click([...container.querySelectorAll<HTMLButtonElement>('button[role="option"]')].find((item) => item.getAttribute("aria-selected") === "false")!);
+    }
+    await finish();
+    expect(test(1).textContent).toBe("apiKey.test");
+    expect(next().disabled).toBe(true);
+    await testAndSave(scenarios[1]!);
+  });
+
   it.each([0, 1].flatMap((index) => ["model", "key"].map((edit) => ({ index, edit }))))(
     "role $index: editing $edit during a test unlocks retry and allows saving the new configuration",
     async ({ index, edit }) => {
