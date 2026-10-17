@@ -484,6 +484,62 @@ describe("BYOK displayed, tested and saved credentials", () => {
     };
   }
 
+  it.each(scenarios.flatMap((scenario) =>
+    ["success", "failure", "rejection"].flatMap((outcome) =>
+      ["while-away", "new-pending", "new-succeeded"].map((timing) => ({ scenario, outcome, timing }))
+    )
+  ))("$scenario.role: leaving during a request isolates its $outcome ($timing) from reentry and save", async ({ scenario, outcome, timing }) => {
+    let finishOld: () => Promise<void>;
+    if (outcome === "rejection") {
+      let rejectOld!: (error: Error) => void;
+      server.probe.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+      finishOld = async () => { await act(async () => rejectOld(new Error("request from unmounted page rejected"))); };
+    } else {
+      const finish = deferProbe();
+      finishOld = () => finish(outcome === "success");
+    }
+    const finishNew = deferProbe();
+    await render(scenario.page());
+    await change(field(scenario.key, scenario.fieldIndex), "sk-before-leaving-7777");
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
+    expect(test(scenario.index).textContent).toBe("apiKey.testing");
+
+    // Route departure unmounts the page, while the real client/server promise stays pending.
+    await render(null);
+    expect(container.childElementCount).toBe(0);
+    if (timing === "while-away") await finishOld();
+    expect(server.write).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+    await render(scenario.page());
+    expect(test(scenario.index).disabled).toBe(false);
+    expect(test(scenario.index).textContent).toBe("apiKey.test");
+    expect(field(scenario.key, scenario.fieldIndex).value).toBe("");
+    expect(field(scenario.key, scenario.fieldIndex).placeholder).toContain(scenario.expected.slice(-4));
+
+    await change(field(scenario.key, scenario.fieldIndex), "sk-after-reentry-9999");
+    await click(next());
+    expect(server.write).not.toHaveBeenCalled();
+    await click(test(scenario.index));
+    await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(2));
+    expect(server.probe.mock.calls[0]![0].apiKey).toBe("sk-before-leaving-7777");
+    expect(server.probe.mock.calls[1]![0].apiKey).toBe("sk-after-reentry-9999");
+    if (timing === "new-pending") await finishOld();
+    expect(test(scenario.index).textContent).toBe("apiKey.testing");
+    expect(test(scenario.index).disabled).toBe(true);
+    await click(next());
+    expect(server.write).not.toHaveBeenCalled();
+    await finishNew();
+    if (timing === "new-succeeded") await finishOld();
+    expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
+    expect(next().disabled).toBe(false);
+    expect(server.write).not.toHaveBeenCalled();
+    await click(next());
+    await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
+    expect(await server.key(scenario.role)).toBe("sk-after-reentry-9999");
+  });
+
   it.each(scenarios.slice(0, 4))("onboarding $role: new success survives an older failure and saves the new key", async (scenario) => {
     const finishOld = deferProbe();
     const finishNew = deferProbe();
