@@ -505,6 +505,7 @@ export class MemoryService {
       buildTurnJudgeSnapshot: this.evolutionJobs.buildTurnJudgeSnapshot.bind(this.evolutionJobs),
       judgeTurnForCapture: this.evolutionJobs.judgeTurnForCapture.bind(this.evolutionJobs),
       applyTurnJudgment: (input) => this.sessionTurns.applyTurnJudgment(input),
+      withEpisodeSelection: (context, operation) => this.sessionTurns.withEpisodeSelection(context, operation),
       turnJudgeKeepInput: () => this.config.algorithm.session.turnJudgeKeepInput,
       finalizeClosedEpisode: (episode, at) => this.workerHandlers.finalizeClosedEpisode(episode, at, "capture_decided")
     });
@@ -671,6 +672,7 @@ export class MemoryService {
         llm: this.skillLlm
       }),
       shouldDeferBudgetedEvolutionLlm: () => this.shouldDeferBudgetedEvolutionLlm(),
+      shouldDeferEpisodeSelection: () => this.isMemoryBudgetPaused() && this.memoryBudgetJobConsumes("episode_title"),
       firstLine,
       memoryLayersForIntent,
       turnStartMemoryLayers,
@@ -1278,7 +1280,7 @@ export class MemoryService {
     return this.l3WorldModelContextReadModel.load(session);
   }
 
-  compactSession(sessionId: string, request: SessionCompactRequest = {}): {
+  async compactSession(sessionId: string, request: SessionCompactRequest = {}): Promise<{
     memorySnapshot: {
       summary: string;
       sourceTurnIds: string[];
@@ -1292,8 +1294,11 @@ export class MemoryService {
     syncCursor?: string;
     jobs: JobRef[];
     serverTime: string;
-  } {
-    return this.sessionTurns.compactSession(sessionId, this.withTimeZone(request));
+  }> {
+    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.summary ?? "" },
+      () => this.sessionTurns.compactSession(sessionId, this.withTimeZone(request))
+    ));
   }
 
   async startTurn(request: TurnStartRequest & Record<string, unknown>): Promise<{
@@ -1317,19 +1322,22 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
-  completeSourceTurn(request: SourceTurnCompleteRequest): SourceTurnCompleteResponse {
+  async completeSourceTurn(request: SourceTurnCompleteRequest): Promise<SourceTurnCompleteResponse> {
     // Native scans have no Hook envelope. Use the configured owner only when
     // the request (including authenticated scope) did not provide one.
-    const response = this.sessionTurns.completeSourceTurn(this.withTimeZone({
-      ...request,
-      namespace: {
-        source: request.sourceTurn?.source,
-        profileId: request.sourceTurn?.profileId,
-        sessionKey: request.sourceTurn?.conversationId,
-        ...request.namespace,
-        userId: request.namespace?.userId ?? this.config.userId
-      }
-    }));
+    const response = await this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.query, turnId: request.sourceTurn?.turnId },
+      () => this.sessionTurns.completeSourceTurn(this.withTimeZone({
+        ...request,
+        namespace: {
+          source: request.sourceTurn?.source,
+          profileId: request.sourceTurn?.profileId,
+          sessionKey: request.sourceTurn?.conversationId,
+          ...request.namespace,
+          userId: request.namespace?.userId ?? this.config.userId
+        }
+      }))
+    ));
     serviceLogger.info("source_turn.complete", {
       source: request.sourceTurn?.source,
       profileId: request.sourceTurn?.profileId,
@@ -1346,8 +1354,11 @@ export class MemoryService {
     return response;
   }
 
-  completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): CompleteTurnResponse {
-    return this.sessionTurns.completeTurn(turnId, this.withTimeZone(request));
+  async completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): Promise<CompleteTurnResponse> {
+    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.query, turnId },
+      () => this.sessionTurns.completeTurn(turnId, this.withTimeZone(request))
+    ));
   }
 
   async observeTool(input: ToolObserveRequest): Promise<{
@@ -1363,7 +1374,7 @@ export class MemoryService {
   }
 
 
-  subagentStart(input: SubagentStartRequest): {
+  async subagentStart(input: SubagentStartRequest): Promise<{
     ok: true;
     eventId: string;
     childSessionId?: string;
@@ -1371,12 +1382,18 @@ export class MemoryService {
     changeSeq: number;
     syncCursor: string;
     serverTime: string;
-  } {
-    return this.sessionTurns.subagentStart(this.withTimeZone(input));
+  }> {
+    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: input.task ?? "" },
+      () => this.sessionTurns.subagentStart(this.withTimeZone(input))
+    ));
   }
 
-  subagentComplete(input: SubagentCompleteRequest): CompleteTurnResponse {
-    return this.sessionTurns.subagentComplete(this.withTimeZone(input));
+  async subagentComplete(input: SubagentCompleteRequest): Promise<CompleteTurnResponse> {
+    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: input.summary ?? "Subagent completed" },
+      () => this.sessionTurns.subagentComplete(this.withTimeZone(input))
+    ));
   }
 
   async repairSuggestion(input: RepairSuggestionRequest): Promise<{
@@ -1570,7 +1587,7 @@ export class MemoryService {
     return this.skillReadModel.getSkill(skillId, this.withTimeZone(request));
   }
 
-  useSkill(skillId: string, request: SkillUseRequest): {
+  async useSkill(skillId: string, request: SkillUseRequest): Promise<{
     skillId: string;
     trialId: string;
     status: "pending";
@@ -1578,8 +1595,11 @@ export class MemoryService {
     syncCursor: string;
     serverTime: string;
     duplicate?: boolean;
-  } {
-    return this.skillReadModel.useSkill(skillId, this.withTimeZone(request));
+  }> {
+    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: `Use skill ${skillId}` },
+      () => this.skillReadModel.useSkill(skillId, this.withTimeZone(request))
+    ));
   }
 
   async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
@@ -2741,7 +2761,7 @@ export class MemoryService {
     });
   }
 
-  private subagentStartNoWrite(input: SubagentStartRequest): ReturnType<MemoryService["subagentStart"]> {
+  private subagentStartNoWrite(input: SubagentStartRequest): Awaited<ReturnType<MemoryService["subagentStart"]>> {
     const cursor = this.readOnlyCursor(input.namespace);
     const rawTurnId = `raw_${stableHash(`readonly:subagent:${input.sessionId}:${input.subagentId ?? input.task}`).slice(0, 20)}`;
     return {

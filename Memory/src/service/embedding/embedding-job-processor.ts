@@ -1,3 +1,4 @@
+import type { EpisodeSelectionContext } from "../session/episode-selection.js";
 import { isRecord } from "../../utils/json.js";
 
 export class SummaryModelUnconfiguredError extends Error {
@@ -188,6 +189,7 @@ export interface EmbeddingJobProcessorDeps {
   }): Promise<TurnJudgment>;
   finalizeClosedEpisode(episode: EpisodeRecord, at: string): EvolutionJobRecord[];
   // turn.judge.v1 (PR-2): files the judged turn and records its feedback.
+  withEpisodeSelection?<T>(context: EpisodeSelectionContext, operation: () => T): Promise<T>;
   applyTurnJudgment?(input: {
     rawTurnId: string;
     relation: TurnJudgment["relation"];
@@ -472,7 +474,7 @@ export class EmbeddingJobProcessor {
       });
       if (applied) affectedEpisodeIds.push(...applied.affectedEpisodeIds);
     };
-    this.deps.repos.transaction(() => {
+    const commitCapture = () => this.deps.repos.transaction(() => {
       let userMemoryCapture = userMemoryCaptureFromJob(job);
       if (decision?.createUserMemory && job.payload.captureUserMemory === true) {
         userMemoryCapture = this.captureUserMemoryFromDecision(current, currentTrace, decision, job, at);
@@ -517,6 +519,15 @@ export class EmbeddingJobProcessor {
       if (decision) finalizedEpisodeId = currentTrace.episodeId ?? job.episodeId;
       applyJudgment();
     });
+    if (this.deps.withEpisodeSelection) {
+      const raw = currentTrace.rawTurnId ? this.deps.repos.runtime.getRawTurn(currentTrace.rawTurnId) : undefined;
+      await this.deps.withEpisodeSelection({ userText: raw?.userText ?? "", rawTurnId: raw?.id }, () => {
+        affectedEpisodeIds.length = 0;
+        commitCapture();
+      });
+    } else {
+      commitCapture();
+    }
     const movedTo = judged && currentTrace.rawTurnId
       ? this.deps.repos.runtime.getRawTurn(currentTrace.rawTurnId)?.episodeId
       : undefined;

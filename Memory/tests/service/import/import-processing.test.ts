@@ -439,6 +439,7 @@ describe("MemoryService / import / processing", () => {
         messages: LlmMessage[],
         options: LlmCompletionOptions
       ): Promise<T> {
+      if (options.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as T;
         summaryCalls.push({ messages, options });
         throw new Error("summary endpoint returned HTTP 405");
       }
@@ -498,6 +499,7 @@ describe("MemoryService / import / processing", () => {
         messages: LlmMessage[],
         options: LlmCompletionOptions
       ): Promise<T> {
+      if (options.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as T;
         if (failureMessage) throw new Error(failureMessage);
         return baseLlm.completeJson<T>(messages, options);
       }
@@ -614,7 +616,8 @@ describe("MemoryService / import / processing", () => {
     const baseLlm = createFailingLlm();
     const llm: LlmClient = {
       ...baseLlm,
-      async completeJson() {
+      async completeJson(_selectionMessages: unknown, selectionOptions: { operation: string }) {
+      if (selectionOptions.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as any;
         throw new ModelHttpError(
           "openai_compatible HTTP 403: quota exhausted",
           "openai_compatible",
@@ -678,7 +681,8 @@ describe("MemoryService / import / processing", () => {
     const baseLlm = createFailingLlm();
     const llm: LlmClient = {
       ...baseLlm,
-      async completeJson() {
+      async completeJson(_selectionMessages: unknown, selectionOptions: { operation: string }) {
+      if (selectionOptions.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as any;
         throw new Error(
           "openai_compatible HTTP 200: expected JSON but received HTML instead of a model API response; check the configured model endpoint"
         );
@@ -1392,11 +1396,11 @@ describe("MemoryService / import / processing", () => {
       "2026-06-10T12:00:00.000Z"
     );
     const session = service.openSession({ namespace });
-    const live = service.completeTurn("turn-live-priority", {
+    const live = (await service.completeTurn("turn-live-priority", {
       sessionId: session.sessionId,
       query: "Remember the new interactive preference.",
       answer: "The new interactive preference is dark mode."
-    });
+    }));
 
     const summaryRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const embeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
@@ -1441,11 +1445,11 @@ describe("MemoryService / import / processing", () => {
       "first-report-priority-scan"
     );
     const session = service.openSession({ namespace });
-    const live = service.completeTurn("turn-first-report-priority-live", {
+    const live = (await service.completeTurn("turn-first-report-priority-live", {
       sessionId: session.sessionId,
       query: "Remember this interactive task.",
       answer: "The interactive task is queued."
-    });
+    }));
     const firstReport = service.addMemory({
       namespace,
       adapterId: "agent-source:memmy-onboarding",

@@ -62,7 +62,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm, judgeCalls, otherCalls } = createTurnJudgeLlm();
     const { service } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-start");
-    service.completeTurn("t1", { sessionId: session.sessionId, query: "写部署脚本", answer: "好的。" });
+    (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写部署脚本", answer: "好的。" }));
     const started = await service.startTurn({ turnId: "t2", sessionId: session.sessionId, query: "接下来加回滚" });
 
     expect(started.status).toContain("relation:pending:proposed");
@@ -74,9 +74,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm } = createTurnJudgeLlm({ "第二轮": [judged("follow_up", "neutral", l1For("第二轮：加回滚"))] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-follow-up");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写部署脚本", answer: "脚本如下。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写部署脚本", answer: "脚本如下。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：加回滚", answer: "已加。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：加回滚", answer: "已加。" }));
     await settle(service);
 
     expect(episodeOf(db, second.rawTurnId)).toBe(first.episodeId);
@@ -106,9 +106,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
       l3WorldModelTransition: "resume_only",
       namespace: { source: "codex", profileId: "default", userId: "route-new-task", sessionKey: "route-new-task-session" }
     });
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：订高铁", answer: "订了 8 点的。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：订高铁", answer: "订了 8 点的。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：换个事，写求职信", answer: "初稿如下。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：换个事，写求职信", answer: "初稿如下。" }));
     expect(second.episodeId).toBe(first.episodeId);
     await settle(service);
 
@@ -160,10 +160,10 @@ describe("turn.judge.v1 routing (switch on)", () => {
     });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-backlog");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：旧任务", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：旧任务", answer: "好。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：开新任务", answer: "好。" });
-    const third = service.completeTurn("t3", { sessionId: session.sessionId, query: "第三轮：接着新任务", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：开新任务", answer: "好。" }));
+    const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "第三轮：接着新任务", answer: "好。" }));
     expect(third.episodeId).toBe(first.episodeId);
     await settle(service);
 
@@ -182,15 +182,15 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm } = createTurnJudgeLlm({ "今天就到这": [judged("end_topic", "positive", null)] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-end-topic");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" }));
     await settle(service);
 
     expect(episodeOf(db, second.rawTurnId)).toBe(first.episodeId);
     expect(episodeRow(db, first.episodeId)).toMatchObject({ status: "closed" });
     expect(episodeRow(db, first.episodeId).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
-    const third = service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题", answer: "好。" });
+    const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题", answer: "好。" }));
     expect(third.episodeId).not.toBe(first.episodeId);
   });
 
@@ -198,9 +198,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm, judgeCalls } = createTurnJudgeLlm({ "结束会话": [judged("end_topic", "neutral", null)] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-end-command");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "结束会话", answer: "好的。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "结束会话", answer: "好的。" }));
     expect(second.closedEpisodeIds).toEqual([]);
     await settle(service);
 
@@ -212,11 +212,11 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-after-closed");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" }));
     await settle(service);
     db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'idle_timeout') WHERE id = ?`)
       .run(first.episodeId);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：接着做", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：接着做", answer: "好。" }));
     expect(second.episodeId).not.toBe(first.episodeId);
     await settle(service);
 
@@ -225,7 +225,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(episodeOf(db, second.rawTurnId)).toBe(second.episodeId);
     expect(episodeRow(db, first.episodeId).status).toBe("closed");
     expect(episodeRow(db, second.episodeId).meta).toMatchObject({ relation: "new_task", previousEpisodeId: first.episodeId });
-    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.route).toMatchObject({ action: "filed_by_rule", reason: "previous_task_closed" });
+    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.route).toMatchObject({ action: "selected_before_capture" });
     expect(feedbackRows(db, session.sessionId)).toHaveLength(0);
   });
 
@@ -233,10 +233,10 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm } = createTurnJudgeLlm({ "今天就到这": [judged("end_topic", "positive", null)] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-after-end-topic");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" });
-    const third = service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题：订机票", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" }));
+    const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题：订机票", answer: "好。" }));
     expect(third.episodeId).toBe(first.episodeId);
     await settle(service);
 
@@ -257,9 +257,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm } = createTurnJudgeLlm({ "好的，现在": [judged("new_task", "positive", null)] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-no-l1");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "规划京都三日游", answer: "行程如下。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "规划京都三日游", answer: "行程如下。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "好的，现在聊点别的", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "好的，现在聊点别的", answer: "好。" }));
     await settle(service);
 
     const rejected = memoryProperties(db, second.l1MemoryId);
@@ -278,9 +278,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-feedback-no-l1");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "好的", answer: "收到。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "好的", answer: "收到。" }));
     await settle(service);
-    service.completeTurn("t2", { sessionId: session.sessionId, query: "下一步：跑测试", answer: "测试通过。" });
+    (await service.completeTurn("t2", { sessionId: session.sessionId, query: "下一步：跑测试", answer: "测试通过。" }));
     await settle(service);
 
     const rows = feedbackRows(db, session.sessionId);
@@ -292,14 +292,14 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm } = createTurnJudgeLlm({ "迟到": [judged("new_task", "neutral", l1For("迟到的一轮"))] });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-late");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮", answer: "好。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮", answer: "好。" }));
     db.db.prepare("UPDATE raw_turns SET created_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", first.rawTurnId);
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮", answer: "好。" }));
     db.db.prepare("UPDATE raw_turns SET created_at = ? WHERE id = ?").run("2020-01-03T00:00:00.000Z", second.rawTurnId);
     await settle(service);
     // A turn that happened between the two, delivered after both were judged.
-    const late = service.completeTurn("t-late", { sessionId: session.sessionId, query: "迟到的一轮", answer: "好。" });
+    const late = (await service.completeTurn("t-late", { sessionId: session.sessionId, query: "迟到的一轮", answer: "好。" }));
     db.db.prepare("UPDATE raw_turns SET created_at = ? WHERE id = ?").run("2020-01-02T00:00:00.000Z", late.rawTurnId);
     await settle(service);
 
@@ -314,13 +314,13 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-noise");
-    service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
+    (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
     await settle(service);
-    const noise = service.completeTurn("t2", {
+    const noise = (await service.completeTurn("t2", {
       sessionId: session.sessionId,
       query: "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
       answer: "后台任务完成了。"
-    });
+    }));
     await settle(service);
 
     expect(captureJob(db, noise.l1MemoryId)).toMatchObject({ turnJudge: true, turnJudgeNoise: "task_notification" });
@@ -336,10 +336,10 @@ describe("turn.judge.v1 routing (switch on)", () => {
     });
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-failed");
-    service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" });
+    (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" }));
     await settle(service);
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：不对，重做", answer: "好。" });
-    const third = service.completeTurn("t3", { sessionId: session.sessionId, query: "第三轮：再加日志", answer: "好。" });
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：不对，重做", answer: "好。" }));
+    const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "第三轮：再加日志", answer: "好。" }));
     await settle(service, 8);
 
     expect(memoryProperties(db, second.l1MemoryId).internal_info.capture_decision).toMatchObject({ status: "failed", prompt_version: "turn.judge.v1" });
@@ -364,8 +364,8 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
     const { service, db } = createTestService({ llm, config: DEFAULT_MEMMY_CONFIG });
     const session = openSession(service, "route-off");
-    const first = service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" });
-    const second = service.completeTurn("t2", { sessionId: session.sessionId, query: "结束会话", answer: "好的。" });
+    const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
+    const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "结束会话", answer: "好的。" }));
     await settle(service);
 
     expect(judgeCalls).toHaveLength(0);

@@ -31,21 +31,21 @@ describe("Codex scan and Hook share the actual Memory lifecycle", () => {
     writeFileSync(path, records(true).map(record => JSON.stringify(record)).join("\n") + "\n");
     const messages: RawCodexMessage[] = []; for await (const value of readCodexRollout(path)) messages.push(value);
     const turn = sourceTurnFromMessages(messages)!;
-    const hook = () => service.completeSourceTurn({ ...buildSourceTurnRequest(turn, "hook"), namespace: { source: "codex", profileId: "default", userId: "scan-owner" } });
+    const hook = async () => (await service.completeSourceTurn({ ...buildSourceTurnRequest(turn, "hook"), namespace: { source: "codex", profileId: "default", userId: "scan-owner" } }));
     const add = vi.spyOn(service, "addMemory");
     const executor = createAgentSourceExecutor({ service, configPath: join(root, "config.yaml"),
       resolveAgentSkillRoot: () => null,
       sourceRegistry: createSourceRegistry([{ descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: root },
         detect: async () => true, async *scan() { for (const message of messages) yield { ...message, sourceId: "codex", workspacePath: null, gitRoot: null }; } }]) });
     try {
-      if (first === "hook") expect(hook().status).toBe("stored");
+      if (first === "hook") expect((await hook()).status).toBe("stored");
       await executor.startScan({ sourceId: "codex", mode: "full" }); await wait(executor);
       expect(executor.scanStatus().error).toBeNull();
-      expect(hook().status).toBe("existing");
+      expect((await hook()).status).toBe("existing");
       expect(add).not.toHaveBeenCalled();
       for (const table of ["raw_turns", "source_turn_captures"]) expect(db.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 1 });
       expect(db.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE memory_layer = 'L1'").get()).toEqual({ n: 1 });
-      const captured = hook().result!;
+      const captured = (await hook()).result!;
       const repos = new Repositories(db.db);
       expect(repos.runtime.getSession(captured.sessionId)?.userId).toBe("scan-owner");
       expect(repos.memories.get(captured.l1MemoryId)?.userId).toBe("scan-owner");

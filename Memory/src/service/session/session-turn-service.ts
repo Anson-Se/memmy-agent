@@ -1,3 +1,4 @@
+import { EpisodeSelectionRequired, selectionInput, selectionKey, selectEpisode, type EpisodeSelectionContext, type EpisodeSelectionResult } from "./episode-selection.js";
 import {
   captureTurnSteps,
   classifyIntent,
@@ -503,6 +504,31 @@ export class SessionTurnService {
   private readonly toolStepCounters = new Map<string, number>();
 
   constructor(private readonly deps: SessionTurnDependencies) {}
+
+  private selectionScope?: { context: EpisodeSelectionContext; results: Map<string, EpisodeSelectionResult>; selectedEpisodeId?: string };
+
+  // Retry only database work. No model request runs inside a SQLite transaction;
+  // each retry rebuilds candidates, so stale results cannot be committed.
+  async withEpisodeSelection<T>(context: EpisodeSelectionContext, operation: () => T): Promise<T> {
+    const results = new Map<string, EpisodeSelectionResult>();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        this.selectionScope = { context, results };
+        return this.deps.repos.transaction(operation);
+      } catch (error) {
+        if (!(error instanceof EpisodeSelectionRequired)) throw error;
+        this.selectionScope = undefined;
+        if (this.deps.shouldDeferEpisodeSelection?.()) {
+          throw new MemoryServiceError("conflict", "episode selection is waiting for the summary model token budget");
+        }
+        results.set(error.key, await selectEpisode(this.deps.llm, error.input));
+      } finally {
+        this.selectionScope = undefined;
+      }
+    }
+    throw new MemoryServiceError("conflict", "episode candidates kept changing; retry the turn");
+  }
+
 
   openSession(request: SessionOpenRequest, options: { createNew?: boolean; at?: string } = {}): {
     sessionId: string;
@@ -1894,6 +1920,7 @@ export class SessionTurnService {
       const requestToolResults = normalizeCompleteTurnToolResults(completionRequest);
       const requestArtifacts = normalizeCompleteTurnArtifacts(completionRequest);
       const turnStartPayload = {
+        ...(this.selectionScope?.selectedEpisodeId === episode.id ? { episodeSelection: { episodeId: episode.id } } : {}),
         intent_decision: intentDecision,
         routeProposal: recalledProposal ?? route.proposal,
         ...(route.proposalStale ? { routeProposalStale: true } : {}),
@@ -2402,85 +2429,89 @@ export class SessionTurnService {
     }
     const session = this.deps.requireOpenSession(input.sessionId);
     this.deps.assertSessionInScope(session, input.namespace);
-    const episode = this.ensureEpisode(session, input.episodeId);
     const at = nowIso();
     const observation = toolObservationEvent(input);
     const turnId = input.turnId ?? `observe:${stableHash(`${session.id}:${at}:${stableStringify(observation.event)}`).slice(0, 16)}`;
-    const existing = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
-    if (existing) {
-      this.deps.assertRawTurnInScope(existing, input.namespace);
-      if (existing.sessionId !== session.id) {
-        throw new MemoryServiceError("conflict", "observed raw turn belongs to a different session");
-      }
-      if (input.episodeId && existing.episodeId !== input.episodeId) {
-        throw new MemoryServiceError("conflict", "observed raw turn belongs to a different episode");
-      }
-    }
-    const createdRawTurn = !existing;
-    const rawTurn = existing ?? this.deps.repos.runtime.insertRawTurn({
-      id: `raw_${stableHash(`${session.id}:${turnId}`).slice(0, 20)}`,
-      sessionId: session.id,
-      episodeId: episode.id,
-      turnId,
-      userId: session.userId,
-      conversationId: session.conversationId,
-      toolCalls: [],
-      toolResults: [],
-      sourceMemoryIds: [],
-      usage: {},
-      messagePayload: {
-        observe: {
-          requestId: input.requestId,
-          adapterId: input.adapterId
+    const { episode, rawTurn, updatedRawTurn, eventId } = await this.withEpisodeSelection({ userText: "", turnId }, () => {
+      this.deps.requireOpenSession(session.id);
+      const episode = this.ensureEpisode(session, input.episodeId);
+      const existing = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
+      if (existing) {
+        this.deps.assertRawTurnInScope(existing, input.namespace);
+        if (existing.sessionId !== session.id) {
+          throw new MemoryServiceError("conflict", "observed raw turn belongs to a different session");
         }
-      },
-      status: "observed",
-      createdAt: at
-    });
-    const nextToolCalls = rawTurn.toolCalls.some((call) =>
-      isToolCallPayload(call) &&
-      ((input.toolCallId && call.id === input.toolCallId) || call.name === input.toolName)
-    )
-      ? rawTurn.toolCalls
-      : [...rawTurn.toolCalls, observation.toolCall];
-    const updatedRawTurn: RawTurnRecord = {
-      ...rawTurn,
-      toolCalls: nextToolCalls,
-      toolResults: observation.toolResult === undefined ? rawTurn.toolResults : [...rawTurn.toolResults, observation.toolResult],
-      messagePayload: {
-        ...(rawTurn.messagePayload ?? {}),
-        last_observation: {
+        if (input.episodeId && existing.episodeId !== input.episodeId) {
+          throw new MemoryServiceError("conflict", "observed raw turn belongs to a different episode");
+        }
+      }
+      const createdRawTurn = !existing;
+      const rawTurn = existing ?? this.deps.repos.runtime.insertRawTurn({
+        id: `raw_${stableHash(`${session.id}:${turnId}`).slice(0, 20)}`,
+        sessionId: session.id,
+        episodeId: episode.id,
+        turnId,
+        userId: session.userId,
+        conversationId: session.conversationId,
+        toolCalls: [],
+        toolResults: [],
+        sourceMemoryIds: [],
+        usage: {},
+        messagePayload: {
+          observe: {
+            requestId: input.requestId,
+            adapterId: input.adapterId
+          }
+        },
+        status: "observed",
+        createdAt: at
+      });
+      const nextToolCalls = rawTurn.toolCalls.some((call) =>
+        isToolCallPayload(call) &&
+        ((input.toolCallId && call.id === input.toolCallId) || call.name === input.toolName)
+      )
+        ? rawTurn.toolCalls
+        : [...rawTurn.toolCalls, observation.toolCall];
+      const updatedRawTurn: RawTurnRecord = {
+        ...rawTurn,
+        toolCalls: nextToolCalls,
+        toolResults: observation.toolResult === undefined ? rawTurn.toolResults : [...rawTurn.toolResults, observation.toolResult],
+        messagePayload: {
+          ...(rawTurn.messagePayload ?? {}),
+          last_observation: {
+            phase: observation.phase,
+            observed_at: at
+          }
+        }
+      };
+      this.deps.repos.runtime.updateRawTurn(updatedRawTurn);
+      this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
+      const eventId = this.deps.repos.runtime.insertArtifact({
+        sessionId: session.id,
+        episodeId: episode.id,
+        rawTurnId: rawTurn.id,
+        userId: session.userId,
+        kind: "tool_call",
+        payload: {
           phase: observation.phase,
-          observed_at: at
-        }
-      }
-    };
-    this.deps.repos.runtime.updateRawTurn(updatedRawTurn);
-    this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
-    const eventId = this.deps.repos.runtime.insertArtifact({
-      sessionId: session.id,
-      episodeId: episode.id,
-      rawTurnId: rawTurn.id,
-      userId: session.userId,
-      kind: "tool_call",
-      payload: {
-        phase: observation.phase,
-        value: observation.event
-      },
-      createdAt: at
-    });
-    this.deps.repos.runtime.appendChange({
-      memoryId: rawTurn.id,
-      namespaceId: this.deps.namespaceIdFromSession(session),
-      kind: "raw_turn",
-      op: createdRawTurn ? "created" : "updated",
-      entityId: rawTurn.id,
-      userId: session.userId,
-      changeType: createdRawTurn ? "raw_turn_created" : "raw_turn_update",
-      before: createdRawTurn ? undefined : rawTurn,
-      after: updatedRawTurn,
-      source: "tools.observe",
-      createdAt: at
+          value: observation.event
+        },
+        createdAt: at
+      });
+      this.deps.repos.runtime.appendChange({
+        memoryId: rawTurn.id,
+        namespaceId: this.deps.namespaceIdFromSession(session),
+        kind: "raw_turn",
+        op: createdRawTurn ? "created" : "updated",
+        entityId: rawTurn.id,
+        userId: session.userId,
+        changeType: createdRawTurn ? "raw_turn_created" : "raw_turn_update",
+        before: createdRawTurn ? undefined : rawTurn,
+        after: updatedRawTurn,
+        source: "tools.observe",
+        createdAt: at
+      });
+      return { episode, rawTurn, updatedRawTurn, eventId };
     });
     const repair = await this.recordToolOutcomeForRepair(input, session, episode, rawTurn, updatedRawTurn, at);
     const responseChangeSeq = this.deps.repos.runtime.latestChangeSeq(session.userId, this.deps.namespaceIdFromSession(session));
@@ -3302,7 +3333,11 @@ export class SessionTurnService {
       ? { relation: input.relation, reason: input.reason, signals: ["llm", TURN_JUDGE_PROMPT_VERSION] }
       : undefined;
     let route: Record<string, unknown> = { action: "filed_by_rule" };
-    if (input.filedByRule === "previous_task_closed") {
+    const turnStartSelection = isRecord(rawTurn.messagePayload?.turn_start) ? rawTurn.messagePayload.turn_start.episodeSelection : undefined;
+    const selectedBeforeCapture = isRecord(turnStartSelection) && turnStartSelection.episodeId === rawTurn.episodeId;
+    if (selectedBeforeCapture && (decision?.relation === "new_task" || input.filedByRule === "previous_task_closed")) {
+      route = { action: "selected_before_capture", episodeId: rawTurn.episodeId };
+    } else if (input.filedByRule === "previous_task_closed") {
       route = this.startTaskAfterClosedOne(session, rawTurn, input.at, affected);
     } else if (decision && input.baseEpisodeId) {
       route = this.deps.repos.runtime.sessionHasJudgedTurnAfter(rawTurn.id)
@@ -3664,7 +3699,8 @@ export class SessionTurnService {
       if (latest && episode.id !== latest.id) {
         episode = this.deps.repos.runtime.updateEpisodeMeta(episode.id, {
           previousEpisodeId: latest.id,
-          relationRouting: { action: "provisional_new_episode" }
+          relation: "new_task",
+          relationRouting: { action: "selected_before_capture" }
         }, at) ?? episode;
       }
     }
@@ -4118,10 +4154,39 @@ export class SessionTurnService {
     });
   }
 
+  private writeSelectionTitle(episode: EpisodeRecord, selection: EpisodeSelectionResult, at: string): EpisodeRecord {
+    this.selectionScope!.selectedEpisodeId = episode.id;
+    const context = this.selectionScope!.context;
+    const current = context.rawTurnId ? this.deps.repos.runtime.getRawTurn(context.rawTurnId) : undefined;
+    const before = current ? new Set(this.deps.repos.runtime.completedRawTurnsBefore(current.id).map(t => t.id)) : undefined;
+    const coveredUserTurns = episode.rawTurnIds.map(id => this.deps.repos.runtime.getRawTurn(id))
+      .filter((t): t is RawTurnRecord => Boolean(t && (!before || before.has(t.id))))
+      .map(t => ({ id: t.id, hash: stableHash(t.userText ?? "") }));
+    const currentId = context.rawTurnId ?? (context.turnId ? rawTurnIdForSessionTurn(episode.sessionId, context.turnId) : undefined);
+    if (currentId) coveredUserTurns.push({ id: currentId, hash: stableHash(context.userText) });
+    const saved = this.deps.repos.runtime.updateEpisodeTitle(episode.id, {
+      title: selection.title, summary: selection.summary,
+      // Selection sees user messages, not the complete assistant outcomes. Never
+      // mark it final or suppress the normal final title pass.
+      meta: { episodeSelection: { model: this.deps.llm.config.model ?? "", at, episodeId: selection.episodeId },
+        episodeTitle: { stage: "provisional", generatedAt: at, model: this.deps.llm.config.model ?? "",
+          sourceTurnCount: coveredUserTurns.length, sourceHash: stableHash({ selection, coveredUserTurns }), coveredUserTurns } }
+    }, at) ?? episode;
+    const session = this.deps.requireSession(episode.sessionId);
+    this.deps.repos.runtime.appendChange({
+      memoryId: saved.id, namespaceId: this.deps.namespaceIdFromSession(session),
+      kind: "episode", op: "updated", entityId: saved.id, userId: saved.userId,
+      changeType: "episode_title_update", before: episode, after: saved,
+      source: "episode.select.v1", createdAt: at
+    });
+    return saved;
+  }
+
   ensureEpisode(session: SessionRecord, episodeId?: string, at = nowIso()): EpisodeRecord {
     if (episodeId) {
       const existing = this.deps.repos.runtime.getEpisode(episodeId);
       if (existing) {
+        if (existing.sessionId !== session.id) throw new MemoryServiceError("forbidden", "episode belongs to another session");
         return existing;
       }
     }
@@ -4131,6 +4196,33 @@ export class SessionTurnService {
       return latest;
     }
 
+    let selection: EpisodeSelectionResult | undefined;
+    if (this.deps.config.algorithm.session.turnJudge && !this.deps.llm.isConfigured()) {
+      throw new MemoryServiceError("conflict", "episode selection requires a configured summary model");
+    }
+    // Keep the legacy, explicitly non-model routing mode usable offline.
+    if (this.deps.llm.isConfigured()) {
+      const scope = this.selectionScope;
+      if (!scope) throw new Error("episode creation requires withEpisodeSelection");
+      const input = selectionInput(this.deps.repos, session, scope.context);
+      const key = selectionKey(session, input);
+      selection = scope.results.get(key);
+      if (!selection) throw new EpisodeSelectionRequired(key, input);
+      if (selection.episodeId) {
+        const matched = this.deps.requireEpisode(selection.episodeId);
+        if (matched.sessionId !== session.id) throw new MemoryServiceError("conflict", "episode selection crossed sessions");
+        const reopened = matched.status === "open" ? matched : this.deps.repos.runtime.reopenEpisode(matched.id, {
+          reopenedAt: at, reopenReason: "episode_selection",
+          rewardDirty: { reason: "episode_reopened", at }
+        }, at)!;
+        this.deps.repos.runtime.appendChange({
+          memoryId: reopened.id, namespaceId: this.deps.namespaceIdFromSession(session), kind: "episode", op: "updated",
+          entityId: reopened.id, userId: reopened.userId, changeType: "episode_reopened", before: matched, after: reopened,
+          source: "episode.select", createdAt: at
+        });
+        return this.writeSelectionTitle(reopened, selection, at);
+      }
+    }
     const episode = this.deps.repos.runtime.createEpisode({
       id: episodeId ?? newId("episode"),
       sessionId: session.id,
@@ -4164,7 +4256,7 @@ export class SessionTurnService {
       source: "session.episode",
       createdAt: at
     });
-    return episode;
+    return selection ? this.writeSelectionTitle(episode, selection, at) : episode;
   }
 }
 
