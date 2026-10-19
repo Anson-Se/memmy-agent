@@ -210,9 +210,20 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const forwardWheelOverflow = useCallback((event: ReactWheelEvent<HTMLElement>) => {
     const handler = wheelOverflowRef.current;
     if (!handler) return;
+    const element = event.currentTarget;
+    // A card with its own scrolling list — the question card, the upload card —
+    // owns the wheel while the pointer is anywhere over it. Reaching the end of
+    // the list does not hand the rest of the gesture to the conversation: the
+    // user is reading the card, and the chat moving underneath it loses their
+    // place. Over the card's header or footer the wheel drives that list, so
+    // the whole card scrolls as one thing.
+    const scroller = cardScroller(event.target, element);
+    if (scroller) {
+      if (!(event.target instanceof Node && scroller.contains(event.target))) scroller.scrollTop += event.deltaY;
+      return;
+    }
     // Only the part of the gesture the card could not use travels on, so the
     // transcript picks up exactly where the card left off.
-    const element = event.currentTarget;
     const atTop = element.scrollTop <= 0;
     const atBottom = element.scrollTop + element.clientHeight >= element.scrollHeight - 1;
     if ((event.deltaY < 0 && atTop) || (event.deltaY > 0 && atBottom)) handler(event.deltaY);
@@ -1925,6 +1936,28 @@ export function occludeUserRaisedCalls(calls: PluginUiCall[], pinnedCapabilities
     || isBarePresentation(call)
     || !call.events.some((event) => event.type === "interaction")
   ));
+}
+
+/**
+ * Finds the scrolling list of the card under the pointer, if it has one.
+ *
+ * @param target The element the wheel gesture started on.
+ * @param region The pinned region; only its cards are searched.
+ * @returns The card's scroll container, or null when the card does not scroll.
+ */
+function cardScroller(target: EventTarget | null, region: HTMLElement): HTMLElement | null {
+  const scrolls = (node: Element): node is HTMLElement => {
+    if (!(node instanceof HTMLElement) || node.scrollHeight <= node.clientHeight) return false;
+    const overflowY = window.getComputedStyle(node).overflowY;
+    return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  };
+  let card: Element | null = null;
+  for (let node = target instanceof Element ? target : null; node && node !== region; node = node.parentElement) {
+    if (scrolls(node)) return node;
+    card = node;
+  }
+  // Over the header or footer: the list is elsewhere in the same card.
+  return card ? [...card.querySelectorAll("*")].find(scrolls) ?? null : null;
 }
 
 /**
