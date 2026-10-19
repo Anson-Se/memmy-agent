@@ -11,7 +11,6 @@ import {
   type ModelConfigInput,
   type ModelConfigView,
   type AccountChannel,
-  type Language,
   resolveMemoryLanguage,
   type ModelProvider,
   type ModelSelectionResolution,
@@ -124,7 +123,7 @@ export interface MemmyConfigWriter {
   writeUserMode?(mode: UserMode): Promise<void>;
 
   /** Publish the interface language so Memory can write memories in it. */
-  writeMemoryLanguage?(language: Language): Promise<void>;
+  writeMemoryLanguage?(language: string): Promise<void>;
 
   /** Publish custom-key memory pipeline token caps so the Memory worker can pause. */
   writeMemoryTokenBudget?(budget: { dailyLimitM: number; totalLimitM: number }): Promise<void>;

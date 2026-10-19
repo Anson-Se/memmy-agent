@@ -29,7 +29,7 @@ export const DEFAULT_NAMESPACE_SOURCE = "unknown";
 export type Cursor = string;
 export type MemoryLayer = "L1" | "L2" | "L3" | "Skill";
 export type RecallMemoryLayer = MemoryLayer | "UserMemory";
-export type MemoryKind = "user_memory" | "trace" | "span" | "policy" | "world_model" | "skill" | "work_memory";
+export type MemoryKind = "user_memory" | "trace" | "span" | "policy" | "world_model" | "skill" | "work_memory" | "observed_activity";
 export type MemoryStatus = "activated" | "resolving" | "archived" | "deleted";
 export type RetrievalMode =
   | "search"
@@ -71,6 +71,7 @@ export type JobType =
   | "trace_summary"
   | "user_memory_embedding"
   | "import_summary"
+  | "observation_extract"
   | "reflection"
   | "embedding"
   | "reward"
@@ -354,6 +355,8 @@ export interface TurnStartRequest extends RequestEnvelope {
 }
 
 export interface TurnCompleteRequest extends RequestEnvelope {
+  /** False when automatic recall was not delivered to the model (for example, a host timeout). */
+  recallApplied?: boolean;
   sessionId: string;
   episodeId?: string;
   query: string;
@@ -517,6 +520,40 @@ export interface MemoryAddRequest extends RequestEnvelope {
   sourceContentHash?: string;
 }
 
+/** Passive source evidence. This is deliberately not an agent conversation. */
+export interface ExternalEvidenceSyncRequest extends RequestEnvelope {
+  action: "upsert" | "delete";
+  source: string;
+  sourceRecordId: string;
+  /** ISO instant; older revisions cannot replace newer evidence. */
+  revision: string;
+  title?: string;
+  /** A source's actual summary, separate from the title and complete evidence body. */
+  summary?: string;
+  content?: string;
+  startedAt?: string;
+  endedAt?: string;
+  provenance?: Record<string, unknown>;
+  parentSourceRecordIds?: string[];
+}
+
+/** Read-only reconciliation for an optional external evidence producer. */
+export interface ExternalEvidenceStatusRequest extends RequestEnvelope {
+  source: string;
+  sourceRecordIds: string[];
+  skillIds?: string[];
+}
+
+/** Candidate-only Skill proposal grounded in several passive evidence records. */
+export interface ExternalEvidenceSkillSuggestionRequest extends RequestEnvelope {
+  source: string;
+  groupId: string;
+  revision: string;
+  sourceRecordIds: string[];
+  /** Semantic actions observed locally; each action retains its source record. */
+  actions: Array<{ sourceRecordId: string; text: string }>;
+}
+
 export interface FeedbackTarget {
   kind: "memory" | "raw_turn" | "recall";
   id: string;
@@ -573,6 +610,7 @@ export interface RawTurnRedactRequest extends RequestEnvelope {
 
 export interface HealthResponse {
   ok: boolean;
+  buildId?: string;
   serviceVersion: string;
   protocolVersion: number;
   viewerVersion: string;

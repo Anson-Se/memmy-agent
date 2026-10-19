@@ -2,7 +2,7 @@ import { get_encoding } from "tiktoken";
 import { MEMORY_SUMMARY_MAX_TOKENS, type LlmConfig } from "../config/index.js";
 import { createMemoryLogger, memoryErrorFields } from "../logging/logger.js";
 import { resolveMemoryAgentRegion } from "./agent-region.js";
-import { bearer, postJsonWithRetry, trimTrailingSlash } from "./http.js";
+import { bearer, ModelHttpError, postJsonWithRetry, trimTrailingSlash } from "./http.js";
 import {
   HttpByokTokenUsageRecorder,
   extractModelTokenUsage,
@@ -69,6 +69,8 @@ interface LlmCallResult {
   finishReason?: "stop" | "length" | "other";
 }
 
+const MEMMY_ACCOUNT_PROVIDER = "memmy_account";
+const MEMMY_ACCOUNT_GATEWAY_PATH = "/api/agentexternal/";
 const OPENAI_COMPAT_THINKING_EFFORT = "medium";
 const ANTHROPIC_THINKING_BUDGET_TOKENS = 4096;
 const ANTHROPIC_MIN_THINKING_OUTPUT_TOKENS = ANTHROPIC_THINKING_BUDGET_TOKENS + 4096;
@@ -102,6 +104,7 @@ export function createLlmClient(config: LlmConfig, options: CreateLlmClientOptio
 class HttpLlmClient implements LlmClient {
   private lastOkAt: string | undefined;
   private lastError: string | undefined;
+  private openAiJsonResponseFormat: "json_object" | "text" = "json_object";
   private readonly usageRecorder: MemoryTokenUsageSink;
 
   constructor(readonly config: LlmConfig, private readonly options: CreateLlmClientOptions = {}) {
@@ -193,12 +196,16 @@ class HttpLlmClient implements LlmClient {
     let malformedRetriesRemaining = Math.max(0, this.config.malformedRetries);
     let lengthRetryUsed = false;
     let previousWasTruncated = false;
+    let previousRetryWasCapped = false;
     let maxTokens = this.outputTokenBudget(options.maxTokens);
+    const retryTokenCeiling = typeof options.retryTokenCeiling === "number"
+      && Number.isFinite(options.retryTokenCeiling) && options.retryTokenCeiling > 0
+      ? Math.floor(options.retryTokenCeiling) : undefined;
     let jsonAttempt = 0;
 
     while (true) {
       jsonAttempt += 1;
-      const withJsonHint = jsonMessages(messages, lastError, previousWasTruncated);
+      const withJsonHint = jsonMessages(messages, lastError, previousWasTruncated, previousRetryWasCapped);
       const result = await this.completeResult(withJsonHint, {
         ...options,
         maxTokens,
@@ -216,9 +223,13 @@ class HttpLlmClient implements LlmClient {
         parseError !== undefined && looksLikeTruncatedJson(result.text, parseError)
       );
       const expandedMaxTokens = truncated && !lengthRetryUsed
-        ? doubleMaxTokens(maxTokens, this.options.modelRole === "memory_summary" ? SUMMARY_OUTPUT_TOKEN_LIMIT : undefined)
+        ? doubleMaxTokens(maxTokens, Math.min(retryTokenCeiling ?? Number.MAX_SAFE_INTEGER,
+          this.options.modelRole === "memory_summary" ? SUMMARY_OUTPUT_TOKEN_LIMIT : Number.MAX_SAFE_INTEGER))
         : undefined;
-      if (expandedMaxTokens !== undefined) {
+      const cappedLengthRetry = truncated && !lengthRetryUsed && retryTokenCeiling !== undefined
+        && maxTokens !== undefined && Number.isFinite(maxTokens) && maxTokens > 0;
+      if (expandedMaxTokens !== undefined || cappedLengthRetry) {
+        const nextMaxTokens = expandedMaxTokens ?? Math.min(maxTokens!, retryTokenCeiling!);
         logger.warn("json.truncated_retry", {
           role: this.options.modelRole ?? "unspecified",
           operation: options.operation,
@@ -228,12 +239,14 @@ class HttpLlmClient implements LlmClient {
           finishReason: result.finishReason ?? "unknown",
           outputChars: result.text.length,
           previousMaxTokens: maxTokens,
-          nextMaxTokens: expandedMaxTokens,
+          nextMaxTokens,
+          ...(retryTokenCeiling !== undefined ? { retryTokenCeiling } : {}),
           ...(parseError ? memoryErrorFields(parseError) : {})
         });
         lengthRetryUsed = true;
         previousWasTruncated = true;
-        maxTokens = expandedMaxTokens;
+        previousRetryWasCapped = expandedMaxTokens === undefined;
+        maxTokens = nextMaxTokens;
         lastError = parseError ?? new Error("LLM output reached the max token limit");
         continue;
       }
@@ -326,48 +339,70 @@ class HttpLlmClient implements LlmClient {
   private async completeOpenAiCompatible(messages: LlmMessage[], options: LlmCompletionOptions): Promise<LlmCallResult> {
     const base = trimTrailingSlash(this.config.endpoint || "https://api.openai.com/v1");
     const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+    const memmyAccount = this.config.sourceProvider === MEMMY_ACCOUNT_PROVIDER || isMemmyAccountEndpoint(base);
     const thinking = openAiCompatibleThinkingControl({
       vendor: this.config.vendor ?? "",
       endpoint: base,
       model: this.config.model ?? "",
-      requested: resolveThinkingEnabled(this.config.enableThinking, options.thinkingMode)
+      requested: resolveThinkingEnabled(this.config.enableThinking, options.thinkingMode),
+      memmyAccount
     });
     const model = this.config.model ?? "";
+    const usesEnableThinking = memmyAccount || thinkingUsesEnableThinking(this.config.vendor ?? "", base, model);
     const omitTemperature = isKimiImmutableTemperatureModel(model) ||
-      (thinking.enabled && shouldOmitOpenAiCompatibleTemperature(this.config.vendor ?? "", base, model));
-    const omitJsonMode = thinking.enabled && (
-      thinkingUsesEnableThinking(this.config.vendor ?? "", base, model) ||
-      isAlibabaCompatibleEndpoint(base)
-    );
-    const thinkingBudget = thinking.enabled && thinkingUsesEnableThinking(this.config.vendor ?? "", base, model)
+      (thinking.enabled && !memmyAccount && shouldOmitOpenAiCompatibleTemperature(this.config.vendor ?? "", base, model));
+    const omitJsonMode = thinking.enabled && (usesEnableThinking || isAlibabaCompatibleEndpoint(base));
+    const thinkingBudget = thinking.enabled && usesEnableThinking
       ? this.config.thinkingBudget
       : undefined;
     const agentRegion = resolveMemoryAgentRegion(this.config.sourceProvider);
-    const response = await postJsonWithRetry<OpenAiChatResponse>({
-      actualModelContext: this.config.actualModelContext,
-      provider: "openai_compatible",
-      operation: options.operation,
-      model: this.config.model,
-      url,
-      headers: {
-        ...bearer(this.config.apiKey),
-        ...(this.config.extraHeaders ?? {}),
-        ...(agentRegion ? { "X-Agent-Region": agentRegion } : {})
-      },
-      timeoutMs: options.timeoutMs ?? this.config.timeoutMs,
-      maxRetries: options.maxRetries ?? this.config.maxRetries,
-      body: {
+    const explicitResponseFormat = this.config.extraBody?.response_format;
+    const automaticResponseFormat = options.jsonMode && !omitJsonMode && explicitResponseFormat === undefined
+      ? this.openAiJsonResponseFormat
+      : undefined;
+    const request = (responseFormat: "json_object" | "text" | undefined) =>
+      postJsonWithRetry<OpenAiChatResponse>({
+        actualModelContext: this.config.actualModelContext,
+        provider: "openai_compatible",
+        operation: options.operation,
         model: this.config.model,
-        messages,
-        ...(!omitTemperature ? { temperature: options.temperature ?? this.config.temperature } : {}),
-        max_tokens: options.maxTokens ?? this.config.maxTokens,
-        stream: false,
-        ...thinking.fields,
-        ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
-        ...(options.jsonMode && !omitJsonMode ? { response_format: { type: "json_object" } } : {}),
-        ...(this.config.extraBody ?? {})
+        url,
+        headers: {
+          ...bearer(this.config.apiKey),
+          ...(this.config.extraHeaders ?? {}),
+          ...(agentRegion ? { "X-Agent-Region": agentRegion } : {})
+        },
+        timeoutMs: options.timeoutMs ?? this.config.timeoutMs,
+        maxRetries: options.maxRetries ?? this.config.maxRetries,
+        body: {
+          model: this.config.model,
+          messages,
+          ...(!omitTemperature ? { temperature: options.temperature ?? this.config.temperature } : {}),
+          max_tokens: options.maxTokens ?? this.config.maxTokens,
+          stream: false,
+          ...thinking.fields,
+          ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
+          ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
+          ...(this.config.extraBody ?? {})
+        }
+      });
+    let response: OpenAiChatResponse;
+    try {
+      response = await request(automaticResponseFormat);
+    } catch (error) {
+      if (automaticResponseFormat !== "json_object" || !requiresTextResponseFormat(error)) {
+        throw error;
       }
-    });
+      this.openAiJsonResponseFormat = "text";
+      logger.warn("json.response_format_fallback", {
+        operation: options.operation,
+        provider: "openai_compatible",
+        model: this.config.model,
+        responseFormat: "text",
+        ...memoryErrorFields(error)
+      });
+      response = await request("text");
+    }
     const choice = response.choices?.[0];
     const text = choice?.message?.content;
     if (typeof text !== "string" || !text.trim()) {
@@ -640,6 +675,16 @@ class HttpLlmClient implements LlmClient {
   }
 }
 
+function requiresTextResponseFormat(error: unknown): boolean {
+  if (!(error instanceof ModelHttpError) || (error.httpStatus !== 400 && error.httpStatus !== 422)) {
+    return false;
+  }
+  const detail = error.detail.toLowerCase().replace(/['"`]/g, "");
+  return /response[_ ]format(?:\.type)?/.test(detail)
+    && detail.includes("json_schema")
+    && /\btext\b/.test(detail);
+}
+
 function constrainSummaryMessages(
   messages: LlmMessage[],
   outputTokens: number,
@@ -717,7 +762,19 @@ function openAiCompatibleThinkingControl(input: {
   endpoint: string;
   model: string;
   requested: boolean;
+  memmyAccount?: boolean;
 }): ThinkingControl {
+  if (input.memmyAccount) {
+    // The account gateway forwards to Bailian models whose switch field varies
+    // by model family, and it does not translate between them.
+    return {
+      enabled: input.requested,
+      fields: {
+        enable_thinking: input.requested,
+        thinking: { type: input.requested ? "enabled" : "disabled" }
+      }
+    };
+  }
   const style = openAiCompatibleThinkingStyle(input.vendor, input.endpoint, input.model);
   const enabled = input.requested || isOpenAiCompatibleThinkingOnlyModel(input.vendor, input.endpoint, input.model);
   if (isAlwaysOnModelWithoutThinkingToggle(input.model)) {
@@ -1021,6 +1078,11 @@ function isMiniMaxM3Model(model: string): boolean {
   return /^minimax-m3(?:[.\-]|$)/.test(modelSlug(model));
 }
 
+// Custom presets can point at the account gateway under another provider name.
+function isMemmyAccountEndpoint(endpoint: string): boolean {
+  return endpoint.toLowerCase().includes(MEMMY_ACCOUNT_GATEWAY_PATH);
+}
+
 function isAlibabaCompatibleEndpoint(endpoint: string): boolean {
   const normalized = endpoint.toLowerCase();
   return normalized.includes("dashscope") ||
@@ -1058,12 +1120,15 @@ function modelSlug(model: string): string {
 function jsonMessages(
   messages: LlmMessage[],
   previousError?: unknown,
-  previousWasTruncated = false
+  previousWasTruncated = false,
+  previousRetryWasCapped = false
 ): LlmMessage[] {
   const hint = [
     "Return exactly one valid JSON object. Do not include markdown fences or explanatory text.",
     previousWasTruncated
-      ? "The previous output was truncated. Return the complete object within the expanded output budget."
+      ? previousRetryWasCapped
+        ? "The previous output was truncated. Shorten the JSON wording and number of items so the complete object fits within the reserved output budget. Preserve required fields and grounded evidence."
+        : "The previous output was truncated. Return the complete object within the expanded output budget."
       : undefined,
     previousError ? `Previous JSON parse error: ${previousError instanceof Error ? previousError.message : String(previousError)}` : undefined
   ].filter(Boolean).join("\n");
