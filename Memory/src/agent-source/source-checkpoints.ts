@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { setImmediate as yieldEventLoop } from "node:timers/promises";
 import Database from "better-sqlite3";
 import type { ConversationCheckpoint, ConversationMessage } from "@memmy/agent-source-core";
+import type { MemoryAgentSourceScanStore } from "./scan-store.js";
 
 /** Source-wide progress survives individual job cleanup, cancellation and retries. */
 export function openSourceCheckpoints(path: string) {
@@ -30,9 +32,17 @@ export function openSourceCheckpoints(path: string) {
     ON CONFLICT(source_id, conversation_id) DO UPDATE SET
       last_message_id=excluded.last_message_id, last_created_at=excluded.last_created_at,
       content_hash=excluded.content_hash, updated_at=excluded.updated_at`);
-  const saveCheckpoints = db.transaction((values: Iterable<ConversationCheckpoint>) => {
-    for (const value of values) checkpoint.run(value.sourceId, value.conversationId,
-      value.lastMessageId, value.lastCreatedAt, value.contentHash, value.updatedAt);
+  const saveCheckpointBatch = db.transaction((values: readonly ConversationCheckpoint[]) => {
+    const startedAt = performance.now();
+    let written = 0;
+    for (const value of values) {
+      checkpoint.run(value.sourceId, value.conversationId,
+        value.lastMessageId, value.lastCreatedAt, value.contentHash, value.updatedAt);
+      written += 1;
+      // Cooperative budget: a single synchronous write/commit can still take longer.
+      if (written >= 100 || performance.now() - startedAt >= 16) break;
+    }
+    return written;
   });
   return {
     hasSource(sourceId: string): boolean {
@@ -49,7 +59,7 @@ export function openSourceCheckpoints(path: string) {
         .get(sourceId, conversationId) as ConversationCheckpoint | undefined ?? null;
     },
     markMessages,
-    saveCheckpoints,
+    saveCheckpointBatch,
     messageCount(sourceId: string): number {
       return (db.prepare("SELECT COUNT(*) AS count FROM messages WHERE source_id=?")
         .get(sourceId) as { count: number }).count;
@@ -59,3 +69,23 @@ export function openSourceCheckpoints(path: string) {
 }
 
 export type SourceCheckpoints = ReturnType<typeof openSourceCheckpoints>;
+
+/** Call only after raw records and required background jobs are durable for this source. */
+export async function publishSourceCheckpoints(
+  store: Pick<MemoryAgentSourceScanStore, "checkpointPage">,
+  checkpoints: Pick<SourceCheckpoints, "saveCheckpointBatch">,
+  sourceId: string,
+  cooperate: () => Promise<void>
+): Promise<void> {
+  let cursor: string | undefined;
+  while (true) {
+    // Always yield, including before the first batch and after the last commit.
+    // The runtime's unit counter counts calls, not rows in a checkpoint batch.
+    await yieldEventLoop();
+    await cooperate();
+    const page = store.checkpointPage(sourceId, cursor);
+    if (page.length === 0) return;
+    const written = checkpoints.saveCheckpointBatch(page);
+    cursor = page[written - 1]!.conversationId;
+  }
+}

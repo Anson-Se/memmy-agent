@@ -13,7 +13,7 @@ export interface MemoryAgentSourceScanStore extends ScanStore { readonly path: s
   beginAttempt(attemptId: string, startedAt?: string): void;
   resolveItem(sourceId: string, conversationId: string, itemKey: string): void;
   saveResult(result: ScanStoredResult & { itemKey?: string }): void;
-  checkpoints(sourceId: string): Iterable<ConversationCheckpoint>;
+  checkpointPage(sourceId: string, afterConversationId?: string): ConversationCheckpoint[];
   unresolvedSourceIds(): string[];
   errorDetails(sourceId: string): Array<{ conversationId: string; reason: string }>;
   resultSummary(sourceId: string): { conversations: number; memories: number; errors: number };
@@ -112,7 +112,14 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
     },
     saveCheckpoint(c){db.prepare("INSERT INTO checkpoints(source_id,conversation_id,last_message_id,last_created_at,content_hash,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id,conversation_id) DO UPDATE SET last_message_id=excluded.last_message_id,last_created_at=excluded.last_created_at,content_hash=excluded.content_hash,updated_at=excluded.updated_at").run(c.sourceId,c.conversationId,c.lastMessageId,c.lastCreatedAt,c.contentHash,c.updatedAt);},
     getCheckpoint(s,c){return (db.prepare("SELECT source_id AS sourceId,conversation_id AS conversationId,last_message_id AS lastMessageId,last_created_at AS lastCreatedAt,content_hash AS contentHash,updated_at AS updatedAt FROM checkpoints WHERE source_id=? AND conversation_id=?").get(s,c) as ConversationCheckpoint|undefined)??null;},
-    checkpoints(sourceId) { return db.prepare("SELECT source_id AS sourceId,conversation_id AS conversationId,last_message_id AS lastMessageId,last_created_at AS lastCreatedAt,content_hash AS contentHash,updated_at AS updatedAt FROM checkpoints WHERE source_id=?").iterate(sourceId) as Iterable<ConversationCheckpoint>; },
+    checkpointPage(sourceId, afterConversationId) {
+      const after = afterConversationId === undefined ? "" : " AND conversation_id > ?";
+      return db.prepare(`SELECT source_id AS sourceId,conversation_id AS conversationId,
+        last_message_id AS lastMessageId,last_created_at AS lastCreatedAt,
+        content_hash AS contentHash,updated_at AS updatedAt FROM checkpoints
+        WHERE source_id=?${after} ORDER BY conversation_id LIMIT 100`)
+        .all(...(afterConversationId === undefined ? [sourceId] : [sourceId, afterConversationId])) as ConversationCheckpoint[];
+    },
     saveConversationMeta(m){db.prepare("INSERT INTO conversation_meta(source_id,conversation_id,last_message_id,last_created_at,content_hash,selected) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id,conversation_id) DO UPDATE SET last_message_id=excluded.last_message_id,last_created_at=excluded.last_created_at,content_hash=excluded.content_hash,selected=excluded.selected").run(m.sourceId,m.conversationId,m.lastMessageId,m.lastCreatedAt,m.contentHash,m.selected?1:0);},
     getConversationMeta(s,c){const row=db.prepare("SELECT source_id AS sourceId,conversation_id AS conversationId,last_message_id AS lastMessageId,last_created_at AS lastCreatedAt,content_hash AS contentHash,selected FROM conversation_meta WHERE source_id=? AND conversation_id=?").get(s,c) as (Omit<PreparedConversation,"selected">&{selected:number})|undefined; return row?{...row,selected:row.selected===1}:null;}, selectAllConversations(s){db.prepare("UPDATE conversation_meta SET selected=1 WHERE source_id=?").run(s);},
     saveTurnMeta(m){db.prepare("INSERT INTO turn_meta(source_id,conversation_id,turn_id,first_message_id,first_created_at,last_message_id,last_created_at,selected) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source_id,conversation_id,turn_id) DO UPDATE SET first_message_id=excluded.first_message_id,first_created_at=excluded.first_created_at,last_message_id=excluded.last_message_id,last_created_at=excluded.last_created_at,selected=excluded.selected").run(m.sourceId,m.conversationId,m.turnId,m.firstMessageId,m.firstCreatedAt,m.lastMessageId,m.lastCreatedAt,m.selected?1:0);},

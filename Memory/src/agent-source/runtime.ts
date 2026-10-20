@@ -1,5 +1,5 @@
 import { readLegacyScanState } from "./legacy-state.js";
-import { openSourceCheckpoints, type SourceCheckpoints } from "./source-checkpoints.js";
+import { openSourceCheckpoints, publishSourceCheckpoints, type SourceCheckpoints } from "./source-checkpoints.js";
 import { setImmediate as yieldEventLoop } from "node:timers/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, readdirSync, rmSync } from "node:fs";
@@ -430,7 +430,9 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         signal.throwIfAborted();
         if (sourceErrorCount === 0 && !result.hasUncommittedSkips) {
           // Raw records and required jobs are durable now; model outcomes cannot invalidate this checkpoint.
-          checkpoints.saveCheckpoints(store.checkpoints(sourceId));
+          // Cancellation may retain committed batches. Keep source-wide completion below
+          // publication so an interrupted scan can safely replay the remaining conversations.
+          await publishSourceCheckpoints(store, checkpoints, sourceId, () => waitWhilePaused(signal));
         }
         const nextSourceState: PersistedSourceState = {
           ...stored,
