@@ -41,7 +41,7 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
       currentParts.clear();
       let parentID = "";
       let agent = "";
-      let lastAssistant: Row | undefined;
+      let turnAssistants: Row[] = [];
       const result: Array<{ id: string; data: Row }> = [];
       for (const row of rows) {
         const data = parse(row.data);
@@ -50,12 +50,13 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
         if (type === "agent-switched") { agent = String(data.agent || ""); continue; }
         if (type === "user") {
           parentID = id;
-          lastAssistant = undefined;
+          turnAssistants = [];
           result.push({ id, data: { role: "user", time: data.time || { created: row.time_created } } });
           currentParts.set(id, [{ id: id + ":text", data: { type: "text", text: data.text } }]);
         } else if (type === "assistant" && parentID) {
-          lastAssistant = { ...data, role: "assistant", parentID, agent: data.agent || agent };
-          result.push({ id, data: lastAssistant });
+          const assistant = { ...data, nativeTurnPending: true, role: "assistant", parentID, agent: data.agent || agent };
+          turnAssistants.push(assistant);
+          result.push({ id, data: assistant });
           const content = Array.isArray(data.content) ? data.content.map(record) : [];
           currentParts.set(id, content.map((part, index) => {
             if (part.type !== "tool") return { id: `${id}:${index}`, data: part };
@@ -68,13 +69,18 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
               state: { ...state, output: state.status === "error" ? record(state.error).message || output : output, time: part.time }
             } };
           }));
-        } else if (type === "idle" && lastAssistant) {
+        } else if (type === "idle") {
           // V2 persists an explicit terminal boundary, including tool-only and
           // interrupted turns. Do not infer completion from an intermediate step.
-          lastAssistant.nativeTurnCompleted = true;
-          if (data.outcome === "failed" || data.outcome === "interrupted") lastAssistant.nativeStatus = "failed";
-          if (data.outcome === "interrupted") lastAssistant.error = { name: "MessageAbortedError" };
-          lastAssistant.time = { ...record(lastAssistant.time), completed: record(data.time).created || row.time_created };
+          // A final failed/empty assistant can be filtered by the shared parser.
+          // Close all steps so the last useful text/tool still has the terminal status.
+          for (const assistant of turnAssistants) {
+            assistant.nativeTurnCompleted = true;
+            assistant.nativeTurnPending = false;
+            if (data.outcome === "failed" || data.outcome === "interrupted") assistant.nativeStatus = "failed";
+            if (data.outcome === "interrupted") assistant.error = { name: "MessageAbortedError" };
+            assistant.time = { ...record(assistant.time), completed: record(data.time).created || row.time_created };
+          }
         }
       }
       return result;

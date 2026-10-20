@@ -26,7 +26,7 @@ const DISPLAY_LIMIT = 5;
 const RESUME_STATE_TTL_MS = 10 * 60 * 1000;
 const RESUME_CONTEXT_MAX_CHARS = 24000;
 const TOOL_OUTPUT_MAX_CHARS = 12000;
-const PLUGIN_REVISION = "opencode-v2-1";
+const PLUGIN_REVISION = "opencode-v2-2";
 
 // A single default export prevents V1 from registering the same plugin twice.
 // The schema helper is bundled in our bridge; neither host needs the other SDK.
@@ -90,12 +90,16 @@ export default {
         try {
           for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
             if (controller.signal.aborted) break;
-            if (!["session.created", "session.compacted", "session.deleted", "session.idle", "session.status"].includes(event.type)) continue;
             const properties = event.data || {};
             if (properties.parentID) continue;
-            if (event.type === "session.status" && properties.status?.type !== "idle") continue;
+            // V2 terminal events contain a session ID, not a user message ID.
+            // The pending native messages and durable DB boundaries select the turns.
+            const terminal = ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"].includes(event.type);
+            // Shutdown preserves V2's execution claim: it is not a completed turn.
+            if (event.type === "session.execution.interrupted" && properties.reason === "shutdown") continue;
+            if (!terminal && !["session.created", "session.compacted", "session.deleted"].includes(event.type)) continue;
             try {
-              await hooks.event({ event: { type: event.type === "session.status" ? "session.idle" : event.type, properties } });
+              await hooks.event({ event: { type: terminal ? "session.idle" : event.type, properties } });
             } catch (error) {
               console.warn("Memmy event failed: " + formatError(error));
             }
@@ -196,7 +200,11 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
         input.sessionID,
         cleanQuery
       ].join("\u0000"));
-      pendingTurns.set(input.sessionID, {
+      // A new prompt must not replace a previous native user message. Retry older
+      // persisted turns even when the host missed an earlier completion event.
+      queueTurnCompletion(input.sessionID);
+      const key = JSON.stringify([input.sessionID, requestedTurnId || turnId]);
+      if (!pendingTurns.has(key)) pendingTurns.set(key, {
         externalSessionId: input.sessionID,
         sessionId,
         turnId,
@@ -228,35 +236,51 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     }
   }
 
-  function queueTurnCompletion(sessionID) {
-    const pending = pendingTurns.get(sessionID);
-    if (!pending) {
-      return;
+  function latestPendingTurn(sessionID) {
+    let latest;
+    for (const pending of pendingTurns.values()) {
+      if (pending.externalSessionId === sessionID) latest = pending;
     }
-    pendingTurns.delete(sessionID);
-    const job = completeTurn(pending)
-      .catch((error) => {
-        log("warn", "Memmy turn capture failed", { error: formatError(error), sessionID });
-      })
-      .finally(() => {
-        captureJobs.delete(job);
-      });
-    captureJobs.add(job);
+    return latest;
   }
 
-  // Capture reads the turn back from opencode.db so the plugin and the offline scan submit
-  // the same identity, text and tools. A turn that is not on disk yet is left for the scan.
+  function queueTurnCompletion(sessionID) {
+    for (const [key, pending] of pendingTurns) {
+      if (pending.externalSessionId !== sessionID || pending.capturing) continue;
+      pending.capturing = true;
+      const job = completeTurn(pending)
+        .then((done) => { if (done) pendingTurns.delete(key); })
+        .catch((error) => {
+          log("warn", "Memmy turn capture failed", { error: formatError(error), sessionID });
+        })
+        .finally(() => {
+          pending.capturing = false;
+          captureJobs.delete(job);
+        });
+      captureJobs.add(job);
+    }
+  }
+
+  // Event delivery can precede the database projection. Retry briefly without
+  // blocking prompts or the event subscription; retain unresolved records for the
+  // next terminal event / prompt / cleanup and leave durable recovery to scanning.
   async function completeTurn(pending) {
     const conversationId = normalizeText(pending.externalSessionId);
     const turnId = normalizeText(pending.userMessageId);
     if (!conversationId || !turnId) {
       log("warn", "Memmy turn capture skipped", { reason: "identity_unresolved", sessionID: pending.externalSessionId });
-      return;
+      return true;
     }
-    const parsed = await readOpencodeHookSourceTurn({ conversationId, turnId });
+    let parsed;
+    for (const wait of [0, 50, 100, 200, 400, 800, 1600]) {
+      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      parsed = await readOpencodeHookSourceTurn({ conversationId, turnId });
+      if (parsed.turn) break;
+      if (!["source_store_unavailable", "turn_incomplete", "turn_content_incomplete", "identity_unresolved"].includes(parsed.reason)) break;
+    }
     if (!parsed.turn) {
-      log("warn", "Memmy turn capture skipped", { reason: parsed.reason || "identity_unresolved", sessionID: conversationId });
-      return;
+      log("warn", "Memmy turn capture deferred", { reason: parsed.reason || "identity_unresolved", sessionID: conversationId, turnId });
+      return false;
     }
     const result = await completeSourceTurn({
       configUrl: CONFIG_URL,
@@ -267,9 +291,9 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       adapterId: "memmy-opencode-plugin"
     });
     const status = normalizeText(result && result.status);
-    if (status !== "stored" && status !== "existing" && status !== "rejected") {
-      log("warn", "Memmy turn capture failed", { reason: normalizeText(result && result.reason) || status || "unexpected_response", sessionID: conversationId });
-    }
+    if (status === "stored" || status === "existing" || status === "rejected") return true;
+    log("warn", "Memmy turn capture failed", { reason: normalizeText(result && result.reason) || status || "unexpected_response", sessionID: conversationId, turnId });
+    return false;
   }
 
   async function handleResumeSearch(sessionID, query, parts) {
@@ -417,7 +441,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       if (isMemmyTool(input.tool)) {
         return;
       }
-      const pending = pendingTurns.get(input.sessionID);
+      const pending = latestPendingTurn(input.sessionID);
       if (!pending) {
         return;
       }
@@ -436,7 +460,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       if (isMemmyTool(input.tool)) {
         return;
       }
-      const pending = pendingTurns.get(input.sessionID);
+      const pending = latestPendingTurn(input.sessionID);
       if (!pending) {
         return;
       }
@@ -449,7 +473,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     },
 
     "experimental.text.complete": async (input, output) => {
-      const pending = pendingTurns.get(input.sessionID);
+      const pending = latestPendingTurn(input.sessionID);
       if (!pending || normalizeText(input.messageID) === normalizeText(pending.userMessageId)) {
         return;
       }
@@ -484,7 +508,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       }
       if (event && event.type === "message.part.updated") {
         const part = properties.part && typeof properties.part === "object" ? properties.part : {};
-        const pending = pendingTurns.get(normalizeText(part.sessionID));
+        const pending = latestPendingTurn(normalizeText(part.sessionID));
         if (
           pending &&
           part.type === "text" &&
@@ -497,24 +521,25 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       // An interrupted turn is not dropped here: the database decides whether it produced
       // usable text or a finished tool, and the scan can still fill it in later.
       if (event && event.type === "session.error") {
-        const pending = pendingTurns.get(normalizeText(properties.sessionID));
+        const pending = latestPendingTurn(normalizeText(properties.sessionID));
         if (pending) {
           pending.status = "failed";
           pending.error = errorText(properties.error);
         }
         return;
       }
-      if (event && event.type === "session.idle") {
+      if (event && (event.type === "session.idle" || (event.type === "session.status" && properties.status?.type === "idle"))) {
         queueTurnCompletion(normalizeText(properties.sessionID));
       }
     },
 
     dispose: async () => {
-      for (const sessionID of [...pendingTurns.keys()]) {
+      for (const sessionID of new Set([...pendingTurns.values()].map((pending) => pending.externalSessionId))) {
         queueTurnCompletion(sessionID);
       }
       await Promise.allSettled([...captureJobs]);
       await Promise.allSettled([...sessionCache.values()].map((session) => closeRuntimeSession(session)));
+      pendingTurns.clear();
       sessionCache.clear();
       l3InjectOnce.clear();
       pendingResumeSelections.clear();

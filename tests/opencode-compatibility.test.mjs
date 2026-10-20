@@ -122,9 +122,9 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s OpenCode upgrade",
       await promptHook(event);
       expect(event.prompt.text).toContain("Remembered preference");
       expect(event.prompt.files).toHaveLength(1);
-      deliver({ type: "session.status", data: { sessionID: "session-1", status: { type: "idle" } } });
+      deliver({ type: "session.execution.succeeded", data: { sessionID: "session-1" } });
       await vi.waitFor(() => expect(requests.filter(r => r.path === "/api/v1/source-turns/complete")).toHaveLength(1));
-      deliver({ type: "session.idle", data: { sessionID: "session-1" } });
+      deliver({ type: "session.execution.succeeded", data: { sessionID: "session-1" } });
       const capture = requests.find(r => r.path === "/api/v1/source-turns/complete").body;
       expect(capture).toMatchObject({ query: "Inspect README", answer: "Verified", toolCalls: [expect.objectContaining({ name: "read", output: "README contents" })] });
       const scanned = await selectSourceTurn(readOpencodeDatabase(dbPath), { conversationId: "session-1", turnId: "user-1" });
@@ -147,7 +147,7 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s OpenCode upgrade",
 });
 
 describe("V2 native completion boundaries", () => {
-  it.each(["unfinished", "tool-only", "interrupted", "subagent", "reverted"])("handles %s without capturing an invalid turn", async (kind) => {
+  it.each(["unfinished", "tool-only", "interrupted", "failed-after-tool", "subagent", "reverted"])("handles %s without capturing an invalid turn", async (kind) => {
     const { root } = fixture(memory);
     const dbPath = writeV2Fixture(root);
     const db = new DatabaseSync(dbPath);
@@ -156,13 +156,17 @@ describe("V2 native completion boundaries", () => {
       db.exec("ALTER TABLE session_v2 ADD COLUMN revert TEXT");
       db.prepare("UPDATE session_v2 SET revert = ?").run(JSON.stringify({ messageID: "user-1" }));
     }
-    if (["unfinished", "tool-only", "interrupted"].includes(kind)) db.exec("DELETE FROM session_message WHERE id = 'assistant-2'");
+    if (["unfinished", "tool-only", "interrupted"].includes(kind)) db.exec("DELETE FROM session_message WHERE id IN ('assistant-2', 'idle')");
     if (["tool-only", "interrupted"].includes(kind)) db.prepare("INSERT INTO session_message VALUES ('idle', 'session-1', 'idle', ?, 4, ?)").run(
       JSON.stringify({ outcome: kind === "interrupted" ? "interrupted" : "succeeded", time: { created: 1792371600010 } }), 1792371600010);
+    if (kind === "failed-after-tool") {
+      db.prepare("UPDATE session_message SET data = ? WHERE id = 'assistant-2'").run(JSON.stringify({ type: "assistant", agent: "build", content: [] }));
+      db.prepare("UPDATE session_message SET data = ? WHERE id = 'idle'").run(JSON.stringify({ outcome: "failed", time: { created: 1792371600010 } }));
+    }
     db.close();
     const { turn } = await selectSourceTurn(readOpencodeDatabase(dbPath), { conversationId: "session-1", turnId: "user-1" });
-    if (["tool-only", "interrupted"].includes(kind)) {
-      expect(turn.status).toBe(kind === "interrupted" ? "failed" : "succeeded");
+    if (["tool-only", "interrupted", "failed-after-tool"].includes(kind)) {
+      expect(turn.status).toBe(kind === "tool-only" ? "succeeded" : "failed");
       expect(turn.toolCalls).toHaveLength(1);
     } else expect(turn).toBeNull();
   });
@@ -178,5 +182,125 @@ function writeV2Fixture(dataHome) {
   insert.run("user-1", "user", JSON.stringify({ type: "user", text: "Inspect README", time: { created: start } }), 1, start);
   insert.run("assistant-1", "assistant", JSON.stringify({ type: "assistant", agent: "build", finish: "tool-calls", time: { created: start + 1, completed: start + 2 }, content: [{ type: "tool", id: "call-1", name: "read", state: { status: "completed", input: { path: "README.md" }, content: [{ type: "text", text: "README contents" }] } }] }), 2, start + 1);
   insert.run("assistant-2", "assistant", JSON.stringify({ type: "assistant", agent: "build", finish: "stop", time: { created: start + 3, completed: start + 4 }, content: [{ type: "text", text: "Verified" }] }), 3, start + 3);
+  insert.run("idle", "idle", JSON.stringify({ type: "idle", outcome: "succeeded", time: { created: start + 5 } }), 4, start + 5);
   db.close(); return path;
 }
+
+// This harness exercises installed artifacts with exact V2 event names. The
+// separate real-host script guards the contract against changes in OpenCode.
+async function lifecycleHarness(factory) {
+  const { root, target } = fixture(factory);
+  await target.installPlugin("opencode");
+  const plugin = await load(root);
+  const dataHome = join(root, "data"); vi.stubEnv("XDG_DATA_HOME", dataHome);
+  const dbPath = writeV2Fixture(dataHome);
+  const requests = [];
+  vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+    const path = new URL(url).pathname, body = init?.body ? JSON.parse(init.body) : {};
+    requests.push({ path, body });
+    return Response.json(path === "/api/v1/sessions/open" ? { sessionId: "memmy-session" }
+      : path === "/api/v1/turns/start" ? { turnId: body.turnId } : { status: "stored" });
+  }));
+  const buffer = []; let wake; let prompt; let aborted = false;
+  const ctx = {
+    location: { directory: root },
+    tool: { async transform() { return { dispose() {} }; } },
+    command: { async transform() { return { dispose() {} }; } },
+    session: { async get() { return { agent: "build" }; }, async hook(_, fn) { prompt = fn; return { dispose() {} }; } },
+    event: { async *subscribe({ signal }) {
+      signal.addEventListener("abort", () => { aborted = true; wake?.(); }, { once: true });
+      while (!aborted) { if (!buffer.length) await new Promise(r => wake = r); while (buffer.length) yield buffer.shift(); }
+    } }
+  };
+  const cleanup = await plugin.setup(ctx);
+  return {
+    dbPath, cleanup, plugin,
+    captures: () => requests.filter(r => r.path === "/api/v1/source-turns/complete").map(r => r.body),
+    prompt: id => prompt({ sessionID: "session-1", messageID: id, prompt: { text: "Native request " + id } }),
+    emit: (type, extra = {}) => { buffer.push({ type, data: { sessionID: "session-1", ...extra } }); wake?.(); }
+  };
+}
+function appendTurn(dbPath, id, { outcome = "succeeded", terminal = true } = {}) {
+  const db = new DatabaseSync(dbPath);
+  const seq = db.prepare("SELECT MAX(seq) AS n FROM session_message").get().n + 1;
+  const time = 1792371600000 + seq;
+  const insert = db.prepare("INSERT INTO session_message VALUES (?, 'session-1', ?, ?, ?, ?)");
+  insert.run(id, "user", JSON.stringify({ type: "user", text: "Native request " + id, time: { created: time } }), seq, time);
+  insert.run(id + "-assistant", "assistant", JSON.stringify({ type: "assistant", agent: "build", finish: "stop", content: [{ type: "text", text: "Native answer " + id }], time: { created: time + 1, completed: time + 2 } }), seq + 1, time + 1);
+  if (terminal) insert.run(id + "-idle", "idle", JSON.stringify({ type: "idle", outcome, time: { created: time + 3 } }), seq + 2, time + 3);
+  db.close();
+}
+
+describe.each([["Backend", backend], ["Memory", memory]])("%s turn lifecycle", (_, factory) => {
+  it("captures success, failure and user interruption once with the scan identity, never again on exit", async () => {
+    const h = await lifecycleHarness(factory);
+    try {
+      for (const [index, outcome] of ["succeeded", "failed", "interrupted"].entries()) {
+        const id = "native-" + index;
+        appendTurn(h.dbPath, id, { outcome });
+        await h.prompt(id);
+        h.emit("session.execution." + outcome, outcome === "interrupted" ? { reason: "user" } : {});
+        await vi.waitFor(() => expect(h.captures()).toHaveLength(index + 1));
+        h.emit("session.execution." + outcome, { reason: "user" });
+        const capture = h.captures().at(-1);
+        const { turn } = await selectSourceTurn(readOpencodeDatabase(h.dbPath), { conversationId: "session-1", turnId: id });
+        expect(capture.sourceTurn.turnId).toBe(turn.turnId);
+        expect(capture.answer).toBe(turn.answer);
+        expect(turn.status).toBe(outcome === "succeeded" ? "succeeded" : "failed");
+      }
+    } finally { await h.cleanup(); }
+    expect(h.captures()).toHaveLength(3);
+  });
+
+  it("waits for the durable terminal boundary and retains overlapping native messages", async () => {
+    const h = await lifecycleHarness(factory);
+    const db = new DatabaseSync(h.dbPath);
+    // Even a final-looking assistant is not complete until V2 persists its idle row.
+    db.exec("DELETE FROM session_message WHERE id = 'idle'"); db.close();
+    try {
+      await h.prompt("user-1");
+      h.emit("session.execution.succeeded");
+      await new Promise(r => setTimeout(r, 80));
+      expect(h.captures()).toHaveLength(0);
+      await h.prompt("user-2"); // must not replace user-1 while capture retries
+      h.emit("session.execution.succeeded"); // duplicate must not capture user-2 early
+      const writer = new DatabaseSync(h.dbPath);
+      writer.prepare("INSERT INTO session_message VALUES ('idle', 'session-1', 'idle', ?, 4, ?)").run(JSON.stringify({ outcome: "succeeded", time: { created: 1792371600010 } }), 1792371600010);
+      writer.close();
+      await vi.waitFor(() => expect(h.captures()).toHaveLength(1));
+      expect(h.captures()[0].sourceTurn.turnId).toBe("user-1");
+      appendTurn(h.dbPath, "user-2");
+      h.emit("session.execution.succeeded");
+      await vi.waitFor(() => expect(h.captures()).toHaveLength(2));
+    } finally { await h.cleanup(); }
+    expect(h.captures().map(c => c.sourceTurn.turnId).sort()).toEqual(["user-1", "user-2"]);
+  });
+
+  it("does not capture unfinished shutdown or empty failed turns", async () => {
+    const h = await lifecycleHarness(factory);
+    try {
+      appendTurn(h.dbPath, "shutdown", { terminal: false });
+      await h.prompt("shutdown");
+      h.emit("session.execution.interrupted", { reason: "shutdown" });
+      await new Promise(r => setTimeout(r, 80));
+      expect(h.captures()).toHaveLength(0);
+      // Failure with no assistant output remains ineligible for memory storage.
+      const db = new DatabaseSync(h.dbPath);
+      db.exec("DELETE FROM session_message WHERE id = 'shutdown-assistant'"); db.close();
+      h.emit("session.execution.failed", { error: { message: "No model output" } });
+    } finally { await h.cleanup(); }
+    expect(h.captures()).toHaveLength(0);
+  });
+
+  it("keeps V1 idle/status lifecycle working and duplicate terminal events idempotent", async () => {
+    const h = await lifecycleHarness(factory);
+    const hooks = await h.plugin.server({ directory: "fixture" });
+    try {
+      await hooks["chat.message"]({ sessionID: "session-1", messageID: "user-1", agent: "build" }, { message: { id: "user-1" }, parts: [{ type: "text", text: "Inspect README" }] });
+      await hooks.event({ event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } } });
+      await vi.waitFor(() => expect(h.captures()).toHaveLength(1));
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-1" } } });
+    } finally { await hooks.dispose(); await h.cleanup(); }
+    expect(h.captures()).toHaveLength(1);
+  });
+});

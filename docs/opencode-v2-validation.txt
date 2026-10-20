@@ -47,7 +47,37 @@ an unavailable model: the model error is expected and no model call is made. The
 script prints the evidence directory containing process logs and fixture requests.
 This proves host integration, not complete model conversation or packaged GUI behavior.
 
-Packaged acceptance (next phase, after user confirmation)
+Real V2 lifecycle check (required in addition to the loader check)
+  OPENCODE_V2_BINARY=/absolute/v2/bin/opencode node --import tsx scripts/test-opencode-lifecycle.mjs
+
+This starts the official 2.0.26 server with an isolated profile and local model /
+Memory HTTP fixtures. The observer only reports real host events; it never calls
+Memmy's internal hooks or fabricates terminal events. Both installation paths run
+consecutive successful turns in the same live session: capture counts must be 1,
+then 2 before exit. A model failure with no output must not create empty memory;
+a real user interruption of a streaming answer captures its useful partial text.
+Normal shutdown must not repeat any completed capture. Native identity fields and
+answers are compared to the historical scanner. Memory service tests separately
+verify that hook-first and scan-first submissions create only one L1 per turn.
+Use --reproduce on the pre-fix code to record counts without requiring captures.
+
+Lifecycle implementation and review regression
+- V2 success/failure/user-interruption events map to the internal completion path.
+  Shutdown interruption is not a final boundary: official V2 keeps that execution
+  resumable. See the pinned upstream contract and projection:
+  https://github.com/anomalyco/opencode/blob/v2.0.26/packages/schema/src/session-event.ts
+  https://github.com/anomalyco/opencode/blob/v2.0.26/packages/core/src/session/message-updater.ts
+- Pending captures are keyed by session plus native user message, not session alone.
+  In-flight jobs are exclusive per message; successful captures are removed. New
+  prompts and late/duplicate terminal events cannot overwrite the earlier record.
+- Read-only capture waits for V2's persisted idle row, including for a final-looking
+  assistant response. Bounded retries (up to 3.15 seconds) cover projection delay.
+  An unresolved record stays pending for the next event/prompt/cleanup; historical
+  scanning remains the recovery path if the process exits before persistence.
+- Both plugin and bridge revisions advance to v2-2 so installed v2-1 artifacts are
+  updated. Save work and fully restart OpenCode, including any separate server.
+
+Packaged acceptance
 1. Prepare an isolated old-plugin installation with a valid test Memmy connection,
    a separate third-party plugin, custom OpenCode settings and AGENTS.md content.
 2. Install/start the packaged repaired Memmy. Confirm the already-connected OpenCode
@@ -56,7 +86,7 @@ Packaged acceptance (next phase, after user confirmation)
 3. Save work, fully quit and reopen OpenCode. If it uses a separate server, restart
    the server that loads the plugin too. Do not treat a new chat/window refresh as
    sufficient until verified on that exact version.
-4. Look for "Memmy plugin loaded: revision=opencode-v2-1, entry=v1/v2" in stderr or
+4. Look for "Memmy plugin loaded: revision=opencode-v2-2, entry=v1/v2" in stderr or
    host logs. Lifecycle diagnostics use stderr because V2 can consume stdout.
 5. Exercise search/get/add, pre-turn recall, completed conversation capture and
    /memmy-resume search plus selection. Verify one completed turn is stored once,

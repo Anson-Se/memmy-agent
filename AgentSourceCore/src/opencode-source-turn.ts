@@ -60,6 +60,7 @@ interface OpencodeAssistant {
   hasOrdinaryTool: boolean;
   hasStructuredOutput: boolean;
   nativeTurnCompleted: boolean;
+  nativeTurnPending: boolean;
   nativeStatus?: "succeeded" | "failed";
 }
 
@@ -116,6 +117,7 @@ export async function* readOpencodeSession(
       hasOrdinaryTool: collected.hasOrdinaryTool,
       hasStructuredOutput: data.structured !== undefined,
       nativeTurnCompleted: data.nativeTurnCompleted === true,
+      nativeTurnPending: data.nativeTurnPending === true,
       nativeStatus: data.nativeStatus === "failed" ? "failed" : undefined
     };
     // An assistant with neither text nor a tool is idle bookkeeping (`step-finish` only).
@@ -138,7 +140,7 @@ export async function* readOpencodeSession(
     const profileId = user.userAgent || assistantProfileId(assistants);
     let reason = "";
     if (!user.query.trim()) reason = "turn_content_incomplete";
-    else if (!last) reason = "turn_incomplete";
+    else if (!last || last.nativeTurnPending) reason = "turn_incomplete";
     else if (assistants.some((assistant) => assistant.pendingTool)) reason = "turn_incomplete";
     else if (!last.aborted && opencodeAssistantStillOpen(last)) reason = "turn_incomplete";
     // An interrupted turn still counts when it produced text or a finished tool.
