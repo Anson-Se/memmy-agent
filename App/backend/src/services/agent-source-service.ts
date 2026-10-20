@@ -53,6 +53,7 @@ import {
   sourceTurnFromMessages,
   sourceTurnFailureReason,
   sourceTurnSkipBlocksWatermark,
+  sourceTurnSkipWatermarkEffect,
   buildSourceTurnRequest,
   renderTurnClipped,
   stableTurnIdentity,
@@ -736,7 +737,7 @@ async function ingestPersistentStagedSource(
   options.agentSourceRepository.setLastScannedAt(sourceId, scannedAt);
   const skillResult = await ingestSourceSkills(options, sourceId, scanOptions, store, mode);
   if (stage.errors.length === 0 && ingestion.errors.length === 0 && skillResult.errorCount === 0 && !ingestion.hasUncommittedSkips) {
-    updatePersistentWatermark(options, sourceId, mode, ingestion.latestSeenAt, scannedAt, since);
+    updatePersistentWatermark(options, sourceId, mode, ingestion.latestSeenAt, scannedAt, since, ingestion.retryFrom);
   }
   const allErrors = [...stage.errors, ...ingestion.errors, ...skillResult.errors];
   const errorCount = stage.scanErrorCount + ingestion.errorCount + skillResult.errorCount;
@@ -842,7 +843,7 @@ async function ingestPersistentSource(
   sourceId: string,
   scanOptions: AgentSourceScanOptions,
   initialErrors: readonly { conversationId: string; reason: string }[]
-): Promise<{ memoryIds: string[]; memoryIdCount: number; deduped: number; errorCount: number; errors: Array<{ conversationId: string; reason: string }>; latestSeenAt: string | null; hasUncommittedSkips: boolean }> {
+): Promise<{ memoryIds: string[]; memoryIdCount: number; deduped: number; errorCount: number; errors: Array<{ conversationId: string; reason: string }>; latestSeenAt: string | null; retryFrom: string | null; hasUncommittedSkips: boolean }> {
   const memoryIds: string[] = [];
   let memoryIdCount = 0;
   const pendingIds: string[] = [];
@@ -850,12 +851,21 @@ async function ingestPersistentSource(
   let errorCount = initialErrors.length;
   let deduped = 0;
   let latestSeenAt: string | null = null;
+  let retryFrom: string | null = null;
   let activeConversationId: string | null = null;
   let activeConversationFailed = false;
   let hasUncommittedSkips = false;
   let processed = 0;
-  const noteUncommittedSkip = (reason: string) => {
+  const noteUncommittedSkip = (reason: string, latestActivityAt: string | null) => {
     if (!sourceTurnSkipBlocksWatermark(reason)) return;
+    activeConversationFailed = true;
+    const effect = sourceTurnSkipWatermarkEffect(reason, latestActivityAt);
+    if (effect === "rescan") hasUncommittedSkips = true;
+    else if (effect === "retry" && latestActivityAt && (!retryFrom || Date.parse(latestActivityAt) < Date.parse(retryFrom))) {
+      retryFrom = latestActivityAt;
+    }
+  };
+  const noteCaptureFailure = () => {
     activeConversationFailed = true;
     hasUncommittedSkips = true;
   };
@@ -925,7 +935,7 @@ async function ingestPersistentSource(
         if (!sourceTurn) {
           const reason = sourceTurnFailureReason(turn.messages);
           skipPersistentTurn(store, sourceId, turn.conversationId, reason);
-          noteUncommittedSkip(reason);
+          noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           emitAddProgress("Capturing conversation turns");
           continue;
@@ -946,7 +956,7 @@ async function ingestPersistentSource(
         if (result.status === "pending" || result.status === "conflict") {
           const reason = result.reason ?? result.status;
           skipPersistentTurn(store, sourceId, turn.conversationId, reason);
-          noteUncommittedSkip(reason);
+          noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           emitAddProgress("Capturing conversation turns");
           continue;
@@ -971,7 +981,7 @@ async function ingestPersistentSource(
       } catch (error) {
         const reason = error instanceof Error ? error.message : "native turn ingestion failed";
         skipPersistentTurn(store, sourceId, turn.conversationId, reason);
-        noteUncommittedSkip(reason);
+        noteCaptureFailure();
         if (addAnalyticsBase && !reportedAdd) {
           options.memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
           options.memoryAddAnalytics?.trackAddFailed({
@@ -1062,7 +1072,7 @@ async function ingestPersistentSource(
     for (const failure of failures) recordScanItemSkip(store, sourceId, failure.memoryId, failure.reason);
   }
   commitConversation();
-  return { memoryIds, memoryIdCount, deduped, errorCount, errors, latestSeenAt, hasUncommittedSkips };
+  return { memoryIds, memoryIdCount, deduped, errorCount, errors, latestSeenAt, retryFrom, hasUncommittedSkips };
 }
 
 function readScanPage(store: AppAgentSourceScanStore, sourceId: string, cursor?: { conversationId: string; createdAt: string; messageId: string; ordinal: number }): ConversationMessage[] {
@@ -1090,9 +1100,11 @@ function firstTurnLine(messages: readonly ConversationMessage[]): string | undef
   return line ? (line.length <= 120 ? line : `${line.slice(0, 117)}...`) : undefined;
 }
 
-function updatePersistentWatermark(options: CreateAgentSourceServiceOptions, sourceId: string, mode: AgentSourceScanMode, latestSeenAt: string | null, scannedAt: string, since?: string): void {
+function updatePersistentWatermark(options: CreateAgentSourceServiceOptions, sourceId: string, mode: AgentSourceScanMode, latestSeenAt: string | null, scannedAt: string, since?: string, retryFrom?: string | null): void {
   const existing = options.agentSourceRepository.getScanWatermark(sourceId);
-  options.agentSourceRepository.upsertScanWatermark({ sourceId, mode, baselineAt: existing?.baselineAt ?? since ?? scannedAt, latestSeenCreatedAt: maxIso(existing?.latestSeenCreatedAt ?? null, latestSeenAt), updatedAt: scannedAt });
+  // The next cursor is the later of both fields; neither may pass an unfinished recent turn.
+  const baselineAt = existing?.baselineAt ?? since ?? (retryFrom && Date.parse(retryFrom) < Date.parse(scannedAt) ? retryFrom : scannedAt);
+  options.agentSourceRepository.upsertScanWatermark({ sourceId, mode, baselineAt, latestSeenCreatedAt: maxIso(existing?.latestSeenCreatedAt ?? null, retryFrom ?? latestSeenAt), updatedAt: scannedAt });
 }
 
 export interface CollectedSourceScan {

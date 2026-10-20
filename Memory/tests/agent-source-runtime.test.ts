@@ -703,7 +703,7 @@ describe("standalone Agent source executor", () => {
 });
 
 async function waitForScan(executor: ReturnType<typeof createAgentSourceExecutor>): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
     if (!executor.scanStatus().running) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }

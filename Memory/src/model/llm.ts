@@ -187,12 +187,16 @@ class HttpLlmClient implements LlmClient {
     let malformedRetriesRemaining = Math.max(0, this.config.malformedRetries);
     let lengthRetryUsed = false;
     let previousWasTruncated = false;
+    let previousRetryWasCapped = false;
     let maxTokens = this.outputTokenBudget(options.maxTokens);
+    const retryTokenCeiling = typeof options.retryTokenCeiling === "number"
+      && Number.isFinite(options.retryTokenCeiling) && options.retryTokenCeiling > 0
+      ? Math.floor(options.retryTokenCeiling) : undefined;
     let jsonAttempt = 0;
 
     while (true) {
       jsonAttempt += 1;
-      const withJsonHint = jsonMessages(messages, lastError, previousWasTruncated);
+      const withJsonHint = jsonMessages(messages, lastError, previousWasTruncated, previousRetryWasCapped);
       const result = await this.completeResult(withJsonHint, {
         ...options,
         maxTokens,
@@ -210,9 +214,13 @@ class HttpLlmClient implements LlmClient {
         parseError !== undefined && looksLikeTruncatedJson(result.text, parseError)
       );
       const expandedMaxTokens = truncated && !lengthRetryUsed
-        ? doubleMaxTokens(maxTokens, this.options.modelRole === "memory_summary" ? SUMMARY_OUTPUT_TOKEN_LIMIT : undefined)
+        ? doubleMaxTokens(maxTokens, Math.min(retryTokenCeiling ?? Number.MAX_SAFE_INTEGER,
+          this.options.modelRole === "memory_summary" ? SUMMARY_OUTPUT_TOKEN_LIMIT : Number.MAX_SAFE_INTEGER))
         : undefined;
-      if (expandedMaxTokens !== undefined) {
+      const cappedLengthRetry = truncated && !lengthRetryUsed && retryTokenCeiling !== undefined
+        && maxTokens !== undefined && Number.isFinite(maxTokens) && maxTokens > 0;
+      if (expandedMaxTokens !== undefined || cappedLengthRetry) {
+        const nextMaxTokens = expandedMaxTokens ?? Math.min(maxTokens!, retryTokenCeiling!);
         logger.warn("json.truncated_retry", {
           role: this.options.modelRole ?? "unspecified",
           operation: options.operation,
@@ -222,12 +230,14 @@ class HttpLlmClient implements LlmClient {
           finishReason: result.finishReason ?? "unknown",
           outputChars: result.text.length,
           previousMaxTokens: maxTokens,
-          nextMaxTokens: expandedMaxTokens,
+          nextMaxTokens,
+          ...(retryTokenCeiling !== undefined ? { retryTokenCeiling } : {}),
           ...(parseError ? memoryErrorFields(parseError) : {})
         });
         lengthRetryUsed = true;
         previousWasTruncated = true;
-        maxTokens = expandedMaxTokens;
+        previousRetryWasCapped = expandedMaxTokens === undefined;
+        maxTokens = nextMaxTokens;
         lastError = parseError ?? new Error("LLM output reached the max token limit");
         continue;
       }
@@ -1077,12 +1087,15 @@ function modelSlug(model: string): string {
 function jsonMessages(
   messages: LlmMessage[],
   previousError?: unknown,
-  previousWasTruncated = false
+  previousWasTruncated = false,
+  previousRetryWasCapped = false
 ): LlmMessage[] {
   const hint = [
     "Return exactly one valid JSON object. Do not include markdown fences or explanatory text.",
     previousWasTruncated
-      ? "The previous output was truncated. Return the complete object within the expanded output budget."
+      ? previousRetryWasCapped
+        ? "The previous output was truncated. Shorten the JSON wording and number of items so the complete object fits within the reserved output budget. Preserve required fields and grounded evidence."
+        : "The previous output was truncated. Return the complete object within the expanded output budget."
       : undefined,
     previousError ? `Previous JSON parse error: ${previousError instanceof Error ? previousError.message : String(previousError)}` : undefined
   ].filter(Boolean).join("\n");

@@ -1217,15 +1217,18 @@ export class SessionTurnService {
     const turnJudgeRouting = this.turnJudgeRouting();
     const endTopicDecision = turnJudgeRouting ? undefined : explicitEndTopicDecision(request.query);
     const latestEpisode = this.deps.repos.runtime.latestEpisodeForSession(session.id);
+    const skipsRetrieval = intentDecision.kind === "chitchat" || intentDecision.kind === "meta";
     // With turn.judge.v1 the relation is judged after the turn; the start of a
     // turn calls no model and only records where the turn will be filed for now.
     const routeProposalPromise = turnJudgeRouting
       ? Promise.resolve(provisionalTurnRouteProposal(latestEpisode, turnId, nowIso()))
-      : this.proposeEpisodeRouteWithLlm(
-          latestEpisode,
-          request.query,
-          endTopicDecision
-        );
+      : skipsRetrieval
+        ? Promise.resolve(this.proposeEpisodeRoute(session, request.query, endTopicDecision))
+        : this.proposeEpisodeRouteWithLlm(
+            latestEpisode,
+            request.query,
+            endTopicDecision
+          );
     const contextHints = turnStartContextHints(request);
     const requestedLayers: MemoryLayer[] = this.deps.turnStartMemoryLayers(
       this.deps.memoryLayersForIntent(intentDecision.kind),
@@ -1271,7 +1274,7 @@ export class SessionTurnService {
       droppedDueToBudget: search.droppedDueToBudget,
       status: [
         ...search.status,
-        ...(intentDecision.kind === "chitchat" || intentDecision.kind === "meta"
+        ...(skipsRetrieval
           ? [`intent:${intentDecision.kind}:retrieval_skipped`]
           : []),
         `relation:${turnJudgeRouting && routeProposal.relationDecision.signals.includes("pending")
