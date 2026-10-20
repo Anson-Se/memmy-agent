@@ -48,8 +48,8 @@ describe("recording deliverables", () => {
     expect(stored.audio?.kind).toBe("audio");
     expect(stored.transcript?.mime).toBe("text/plain");
     // The stamp comes from the transcription, so both files share it and sort together.
-    expect(stored.audio?.name).toBe("访谈录音-2026-03-04T05-06-07-008Z.m4a");
-    expect(stored.transcript?.name).toBe("访谈转写-2026-03-04T05-06-07-008Z.txt");
+    expect(stored.audio?.name).toBe("录音-2026-03-04T05-06-07-008Z.m4a");
+    expect(stored.transcript?.name).toBe("录音转写-2026-03-04T05-06-07-008Z.txt");
   });
 
   it("declares a media type the upload contract accepts", async () => {

@@ -2039,6 +2039,14 @@ body.memmy-thread-panel-fullscreen .sidebar-restore-button {
   transition: right 200ms cubic-bezier(0, 0, 0.2, 1);
 }
 
+/* The conversation toolbar is the only populated grid lane in the normal
+   chat state. Collapse the two empty lanes (and their 12px gaps) so its last
+   action uses the same 12px right inset as the open panel header. */
+.app-frame-content-topbar.thread-topbar:not(:has(.memory-token-budget-capsule)) {
+  grid-template-columns: minmax(0, 1fr) 0 0;
+  column-gap: 0;
+}
+
 .app-frame-main--sidebar-hidden .app-frame-content-topbar.thread-topbar {
   padding-left: var(--codex-sidebar-hidden-topbar-padding);
 }
@@ -2394,7 +2402,7 @@ body.memmy-thread-panel-fullscreen .app-frame-main {
   justify-content: space-between;
   gap: 8px;
   padding: 0 12px;
-  border-bottom: 1px solid color-mix(in srgb, var(--color-border-stone) 36%, transparent);
+  box-shadow: inset 0 -1px color-mix(in srgb, var(--color-border-stone) 36%, transparent);
 }
 
 .thread-panel--fullscreen .thread-panel__header {
@@ -17025,6 +17033,9 @@ body:has(.sidebar-shell) .window-drag-region {
 .recording-page > .recording-panel__turns,
 .recording-page > .recording-panel__flat-text {
   margin: 0 12px 8px;
+}
+.recording-page > .recording-panel__status {
+  margin-top: 8px;
 }
 .recording-page > .recording-panel__section {
   margin-top: 12px;
