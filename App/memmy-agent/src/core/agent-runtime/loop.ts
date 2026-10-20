@@ -1,5 +1,6 @@
 import { requestTiming } from "../../utils/request-timing.js";
 import { initializeDesktopScreenCapture } from '../../tools/computer-use/desktop-screen-capture.js';
+import { closeNativeSurfacesForTurn, registerComputerUseTurnInterrupt } from '../../tools/computer-use/surface-preview.js';
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -465,6 +466,43 @@ function turnMetadata(turnId: string | null | undefined): Record<string, string>
   return turnId ? { turnId, turn_id: turnId } : {};
 }
 
+function computerUseRequestContext(message: InboundMessage, turnId?: string | null): {
+  messageId: string | null; metadata: Record<string, any>;
+} {
+  const rawId = message.metadata?.message_id ?? message.metadata?.messageId;
+  const nativeId = typeof rawId === 'string' && rawId.trim() && rawId.length <= 512
+    ? rawId.trim() : typeof rawId === 'number' && Number.isSafeInteger(rawId) && rawId > 0 ? String(rawId) : null;
+  // GUI source is supplied by the accepted channel boundary, not envelope
+  // metadata. Recover an older durable GUI request's validated UUID, retaining
+  // its original identity rather than substituting a generated execution turn.
+  const source = message.turnSource;
+  const guiSource = message.channel === 'websocket' && source?.channel === 'websocket'
+    && (source.kind === 'gui' || source.kind === 'tui');
+  const requestId = message.metadata?.client_request_id;
+  const messageId = nativeId ?? (guiSource && typeof requestId === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId) ? requestId : null);
+  let reason = 'interactive-user-message';
+  if (message.internal || message.role !== 'user') reason = 'internal-message';
+  else if (['system', 'cron'].includes(message.channel)
+    || ['subagent', 'goal-runtime', 'system', 'cron'].includes(message.senderId.toLowerCase())) reason = 'background-source';
+  else if (message.channel === 'websocket' && !guiSource) reason = 'gui-source-unverified';
+  else if (message.metadata?.computerUseInteractive === false) reason = 'background-context';
+  else if (!messageId) reason = 'user-message-id-missing';
+  return { messageId, metadata: { ...message.metadata,
+    ...(source ? { turn_source: source } : {}), ...turnMetadata(turnId),
+    ...(messageId ? { message_id: messageId } : {}),
+    computerUseInteractive: reason === 'interactive-user-message',
+    computerUseInteractiveReason: reason,
+  } };
+}
+
+function restoredComputerUseMetadata(metadata: Record<string, any>): Record<string, any> {
+  // Older durable records lost role and refusals. Keep task scheduling intact,
+  // but require a fresh user message before granting native access from them.
+  return ['user', 'assistant', 'tool', 'system', 'non-user'].includes(metadata.computerUseMessageRole)
+    ? metadata : { ...metadata, computerUseInteractive: false };
+}
+
 function withoutTurnMetadata(metadata: Record<string, any>): Record<string, any> {
   const copy = { ...metadata };
   delete copy.turnId;
@@ -540,19 +578,26 @@ export function hasReportedInOutUsage(
 }
 
 class AsyncMutex {
-  private tail: Promise<void> = Promise.resolve();
+  private locked = false;
+  private waiters: Array<{ priority: number; resume: () => void }> = [];
 
-  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.tail;
-    let release!: () => void;
-    this.tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
+  async runExclusive<T>(fn: () => Promise<T>, priority = Date.now()): Promise<T> {
+    if (this.locked) {
+      await new Promise<void>((resume) => {
+        const index = this.waiters.findIndex((waiter) => waiter.priority > priority);
+        const waiter = { priority, resume };
+        if (index < 0) this.waiters.push(waiter);
+        else this.waiters.splice(index, 0, waiter);
+      });
+    } else {
+      this.locked = true;
+    }
     try {
       return await fn();
     } finally {
-      release();
+      const next = this.waiters.shift();
+      if (next) next.resume();
+      else this.locked = false;
     }
   }
 }
@@ -769,6 +814,9 @@ export class AgentLoop {
   mcpConnected: boolean;
   mcpConnecting: boolean;
   private browserRegistryInitialized = false;
+  private runtimeToolsInitialization: Promise<void> | null = null;
+  private runtimeToolsClosed = false;
+  private messageLoopReady = false;
   private readonly memmyMemoryIntegration: MemmyMemoryIntegration;
   subagentPendingWaitMs = 300_000;
   static readonly RUNTIME_CHECKPOINT_KEY = "runtimeCheckpoint";
@@ -884,6 +932,8 @@ export class AgentLoop {
       maxToolResultChars: this.maxToolResultChars,
       llmWallTimeoutForSession: (sessionKey) => runnerWallLlmTimeoutS(this.sessions, sessionKey),
       lifecycleHook: () => this.lifecycleHook(),
+      computerUseTools: () => [...this.tools].map(([, tool]) => tool)
+        .filter(tool => (tool as any).supportsSubagentComputerUse === true),
     });
     this.context = new ContextBuilder({
       workspace: this.workspace,
@@ -1089,6 +1139,18 @@ export class AgentLoop {
     return Object.freeze([...new Set(roots)]);
   }
 
+  private usesExternalSessionWorkspace(projectId: string | null, sessionWorkspace: string): boolean {
+    if (projectId !== null) return true;
+    const canonical = (value: string) => {
+      try {
+        return fs.realpathSync(value);
+      } catch {
+        return path.resolve(value);
+      }
+    };
+    return canonical(sessionWorkspace) !== canonical(this.workspace);
+  }
+
   private copyConnectedMcpTools(registry: ToolRegistryInstance): void {
     if (!this.tools) return;
     for (const [name, tool] of this.tools) {
@@ -1104,7 +1166,7 @@ export class AgentLoop {
     sessionKey: string | null = null,
     capturedSessionWorkspace: string = this.workspace,
     tools: ToolRegistryInstance = this.tools,
-  ): void {
+  ): RequestContext {
     const effectiveKey = sessionKey ?? (this.unifiedSession ? UNIFIED_SESSION_KEY : `${channel}:${chatId}`);
     const projectedBrowserScope = metadata?.webui === true
       && !effectiveKey.startsWith("websocket:")
@@ -1127,6 +1189,7 @@ export class AgentLoop {
       const tool: any = tools.get(name);
       if (typeof tool?.setContext === "function") tool.setContext(ctx);
     }
+    return ctx;
   }
 
   registerDefaultTools(): void {
@@ -1137,21 +1200,57 @@ export class AgentLoop {
     await connectMissingServers(this as any, this.tools);
   }
 
-  async initializeRuntimeTools(): Promise<void> {
-    await this.ensureExternalHooksLoaded();
-    await initializeDesktopScreenCapture();
-    await this.connectMcp();
-    await this.browserSessionManager.initialize();
-    if (!this.browserRegistryInitialized) {
-      this.tools = this.createToolRegistry("runtime-init", this.workspace, {
-        includeConnectedMcp: true,
-      });
-      this.browserRegistryInitialized = true;
-    }
+  /** True only once startup recovery is complete and inbound messages can be consumed. */
+  get isReady(): boolean {
+    return this.messageLoopReady && this.running && !this.runtimeToolsClosed;
+  }
+
+  private reportStartupStage(stage: string, startedAt: number): void {
+    if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return;
+    try {
+      console.info("[agent-startup] " + JSON.stringify({ stage, elapsedMs: Date.now() - startedAt }));
+    } catch { /* Diagnostics cannot interrupt startup. */ }
+  }
+
+  initializeRuntimeTools(): Promise<void> {
+    if (this.runtimeToolsClosed) return Promise.reject(new Error("Agent runtime tools are closed"));
+    if (this.runtimeToolsInitialization) return this.runtimeToolsInitialization;
+    // Cron/direct turns can arrive while run() is initializing MCP. They must
+    // await the same connection attempt before building or using the registry.
+    const startedAt = Date.now();
+    const reportStage = (stage: string) => {
+      if (!this.messageLoopReady) this.reportStartupStage(stage, startedAt);
+    };
+    const initialization = (async () => {
+      await this.ensureExternalHooksLoaded();
+      reportStage("external-hooks-ready");
+      await initializeDesktopScreenCapture();
+      reportStage("screen-capture-ready");
+      await this.connectMcp();
+      reportStage("mcp-settled");
+      await this.browserSessionManager.initialize();
+      reportStage("browser-tools-ready");
+      if (!this.browserRegistryInitialized) {
+        this.tools = this.createToolRegistry("runtime-init", this.workspace, {
+          includeConnectedMcp: true,
+        });
+        this.browserRegistryInitialized = true;
+      }
+    })();
+    this.runtimeToolsInitialization = initialization;
+    const clearInitialization = () => {
+      if (this.runtimeToolsInitialization === initialization) this.runtimeToolsInitialization = null;
+    };
+    void initialization.then(clearInitialization, clearInitialization);
+    return initialization;
   }
 
   async closeRuntimeTools(): Promise<void> {
+    this.messageLoopReady = false;
+    this.runtimeToolsClosed = true;
     try {
+      // A failed attempt may still have opened some resources; clean those up too.
+      await this.runtimeToolsInitialization?.catch(() => undefined);
       await this.browserSessionManager.close();
       await this.closeMcp();
       await this.memmyMemoryIntegration.dispose?.();
@@ -1238,6 +1337,7 @@ export class AgentLoop {
     } = {},
   ): InboundMessage {
     return new InboundMessage({
+      role: message.role,
       channel: message.channel,
       chatId: message.chatId,
       senderId: message.senderId,
@@ -1516,13 +1616,14 @@ export class AgentLoop {
           return;
         }
         const metadata = {
-          ...entry.metadata,
+          ...restoredComputerUseMetadata(entry.metadata),
           ...turnMetadata(turnId),
           ...(entry.metadata.webui_queue_surface === WEBUI_CHAT_COMPOSER_QUEUE_SURFACE
             ? { webui_queue_dequeued: true }
             : {}),
         };
         const inboxMessage = new InboundMessage({
+          role: typeof entry.metadata.computerUseMessageRole === 'string' ? entry.metadata.computerUseMessageRole : 'user',
           channel: entry.channel,
           chatId: entry.chatId,
           senderId: entry.senderId,
@@ -1633,17 +1734,24 @@ export class AgentLoop {
           && message?.client_request_id === transfer.clientRequestId
           && firstString(message?.turn_id, message?.turnId) === transfer.expectedTurnId
         ));
-        if (persisted) {
+        const restoredConsumed = !persisted && Boolean(transfer.consumedAt)
+          && this.persistConsumedQueueSteerTransfer(session, transfer);
+        if (persisted || restoredConsumed) {
           await this.goalRuntime.completeQueueSteerTransfer(
             session.key,
             transfer.clientRequestId,
           );
+          if (restoredConsumed) {
+            await this.publishWebuiMessageAccepted(
+              this.messageFromQueueSteerTransfer(transfer, transfer.expectedTurnId),
+            );
+          }
           continue;
         }
         let recovered: InboundMessage | null = null;
         let revision = this.queueRevision(session.key);
         await this.queueMutationLockFor(session.key).runExclusive(async () => {
-          const queuedAt = this.nextQueuedAt(session.key);
+          const queuedAt = transfer.descriptor.queuedAt;
           recovered = this.recoveredQueueMessage(transfer, queuedAt);
           if (transfer.store === "goal") {
             await this.goalRuntime.restoreGoalQueueSteerTransfer(
@@ -1793,7 +1901,8 @@ export class AgentLoop {
         senderId: message.senderId,
         content: message.content,
         media: [...message.media],
-        metadata: structuredClone(message.metadata ?? {}),
+        metadata: { ...structuredClone(computerUseRequestContext(message).metadata),
+          computerUseMessageRole: ['user', 'assistant', 'tool', 'system'].includes(message.role) ? message.role : 'non-user' },
         timestamp: message.timestamp.toISOString(),
         sessionKey,
         turnSource: sharedTurnSource(message),
@@ -1807,13 +1916,14 @@ export class AgentLoop {
   ): InboundMessage {
     const fields = transfer.messageFields;
     return new InboundMessage({
+      role: typeof fields.metadata.computerUseMessageRole === 'string' ? fields.metadata.computerUseMessageRole : 'user',
       channel: fields.channel,
       chatId: fields.chatId,
       senderId: fields.senderId,
       content: fields.content,
       media: [...fields.media],
       metadata: {
-        ...structuredClone(fields.metadata),
+        ...structuredClone(restoredComputerUseMetadata(fields.metadata)),
         ...turnMetadata(turnId),
         webui_queue_steer_origin: true,
         webui_queue_steer_recovery: {
@@ -1860,7 +1970,7 @@ export class AgentLoop {
   ): InboundMessage {
     const fields = transfer.messageFields;
     const metadata: Record<string, any> = {
-      ...structuredClone(fields.metadata),
+      ...structuredClone(restoredComputerUseMetadata(fields.metadata)),
       queued_at: queuedAt,
     };
     delete metadata.turn_id;
@@ -1869,6 +1979,7 @@ export class AgentLoop {
     delete metadata.webui_queue_steer_origin;
     delete metadata.webui_queue_steer_recovery;
     return new InboundMessage({
+      role: typeof metadata.computerUseMessageRole === 'string' ? metadata.computerUseMessageRole : 'user',
       channel: fields.channel,
       chatId: fields.chatId,
       senderId: fields.senderId,
@@ -1892,11 +2003,23 @@ export class AgentLoop {
     slot.announcementGate = createTurnSlotAnnouncementGate();
     slot.announcedToWebui = true;
     const slots = this.turnSlots.get(sessionKey) ?? [];
-    slots.push(slot);
+    const queuedAt = Date.parse(String(root.metadata?.queued_at ?? root.timestamp.toISOString()));
+    const index = slots.findIndex((candidate) => candidate.state === "queued" && (
+      Date.parse(String(candidate.root.metadata?.queued_at ?? candidate.root.timestamp.toISOString())) > queuedAt
+    ));
+    if (index < 0) slots.push(slot);
+    else slots.splice(index, 0, slot);
     this.turnSlots.set(sessionKey, slots);
     const task = makeCancelableDispatchTask(
       async (isCancelled, signal) => {
-        await slot.announcementGate!.promise;
+        const releaseOnCancel = () => slot.announcementGate!.open();
+        signal.addEventListener("abort", releaseOnCancel, { once: true });
+        try {
+          if (isCancelled()) return;
+          await slot.announcementGate!.promise;
+        } finally {
+          signal.removeEventListener("abort", releaseOnCancel);
+        }
         if (isCancelled()) return;
         await this.dispatchSlot(sessionKey, slot, isCancelled, signal);
       },
@@ -1935,6 +2058,10 @@ export class AgentLoop {
     const metadata = {
       ...(message.metadata ?? {}),
       turn_source: source,
+      // UI projections may recover a display source from metadata. That is
+      // not proof of a live user message at the native app-access boundary.
+      ...(message.channel === 'websocket' && !message.turnSource
+        ? { computerUseInteractive: false } : {}),
       ...(
         source.kind === "im" && typeof message.metadata?.client_request_id !== "string"
           ? { client_request_id: randomUUID() }
@@ -1942,6 +2069,7 @@ export class AgentLoop {
       ),
     };
     return new InboundMessage({
+      role: message.role,
       channel: message.channel,
       chatId: message.chatId,
       senderId: message.senderId,
@@ -2574,16 +2702,33 @@ export class AgentLoop {
     if (outcome !== "stopped") return outcome;
     if (!task || task.done() || task.cancel() === false) return "already_finished";
     await Promise.resolve(task).catch(() => undefined);
-    const subagents = this.subagents as any;
-    if (typeof subagents?.cancelBySession === "function") {
-      await subagents.cancelBySession(sessionKey);
-    } else if (typeof subagents?.cancel_by_session === "function") {
-      await subagents.cancel_by_session(sessionKey);
-    }
     return "stopped";
   }
 
-  private async pendingToUserMessage(msg: InboundMessage): Promise<Record<string, any> | null> {
+  async stopCurrentTurn(sessionKey: string, expectedTurnId: string | null = null): Promise<number> {
+    const slot = (this.turnSlots.get(sessionKey) ?? []).find((candidate) => (
+      (candidate.state === "running" || candidate.state === "settling")
+      && (!expectedTurnId || candidate.turnId === expectedTurnId)
+    ));
+    if (!slot) return 0;
+    let stopped = 0;
+    const cancelCurrent = async (): Promise<number> => {
+      const source = sharedTurnSource(slot.root)?.kind ?? "gui";
+      stopped = await this.stopExpectedTurn(sessionKey, slot.turnId, source) === "stopped" ? 1 : 0;
+      return stopped;
+    };
+    const goal = this.goalRuntime.get(sessionKey);
+    if (goal?.status === "active") {
+      await this.goalRuntime.pauseAndCancel(sessionKey, goal.goalId, { cancelActiveTasks: cancelCurrent });
+      await this.goalRuntime.flushEffects(sessionKey);
+      void this.dispatchNextGoalWork(sessionKey);
+    } else {
+      await cancelCurrent();
+    }
+    return stopped;
+  }
+
+  private pendingUserMessage(msg: InboundMessage): Record<string, any> | null {
     const content = msg.content;
     const media = msg.media ?? [];
     const hasText = typeof content === "string" && content.trim().length > 0;
@@ -2593,12 +2738,6 @@ export class AgentLoop {
       : null;
     const queueSteerOrigin = msg.metadata?.webui_queue_steer_origin === true
       && clientRequestId !== null;
-    if (queueSteerOrigin) {
-      const admission = this.queueSteerAdmissionsBySession
-        .get(this.effectiveSessionKey(msg))
-        ?.get(clientRequestId);
-      if (admission?.phase === "pending") admission.phase = "consumed";
-    }
     return {
       role: "user",
       content: this.context.buildUserContent(content, media),
@@ -2619,6 +2758,38 @@ export class AgentLoop {
     };
   }
 
+  private async pendingToUserMessage(msg: InboundMessage): Promise<Record<string, any> | null> {
+    const userMessage = this.pendingUserMessage(msg);
+    if (!userMessage || msg.metadata?.webui_queue_steer_origin !== true) return userMessage;
+    const clientRequestId = msg.metadata?.client_request_id;
+    const sessionKey = this.effectiveSessionKey(msg);
+    const admission = typeof clientRequestId === "string"
+      ? this.queueSteerAdmissionsBySession.get(sessionKey)?.get(clientRequestId)
+      : null;
+    if (admission?.phase === "pending") {
+      // Persist consumption before returning the injection to the runner. A stop
+      // skips stateSave, and a restart cannot rely on the in-memory admission.
+      await this.goalRuntime.markQueueSteerTransferConsumed(sessionKey, clientRequestId, admission.turnId);
+      admission.phase = "consumed";
+    }
+    return userMessage;
+  }
+
+  private persistConsumedQueueSteerTransfer(
+    session: Session,
+    transfer: WebuiQueueSteerTransferRecord,
+  ): boolean {
+    const message = this.pendingUserMessage(
+      this.messageFromQueueSteerTransfer(transfer, transfer.expectedTurnId),
+    );
+    if (!message) return false;
+    // Keep the durable user identity even when cancellation only restores an
+    // assistant/tool checkpoint. Normal completion already saved this user.
+    this.saveTurn(session, [{ ...message, timestamp: transfer.consumedAt }], 0);
+    this.sessions.save(session, { fsync: true });
+    return true;
+  }
+
   private async waitForPendingMessage(queue: AsyncQueue<InboundMessage>, timeoutMs: number): Promise<InboundMessage | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -2629,25 +2800,40 @@ export class AgentLoop {
     return queue.getNowait() ?? null;
   }
 
-  private async drainPendingQueue(queue?: AsyncQueue<InboundMessage> | null, limit = 3, sessionKey?: string | null): Promise<Record<string, any>[]> {
+  private async drainPendingQueue(queue?: AsyncQueue<InboundMessage> | null, limit = 3, sessionKey?: string | null,
+    onUserMessage?: (message: InboundMessage) => void): Promise<Record<string, any>[]> {
     if (!queue) return [];
     const injections: Record<string, any>[] = [];
+    const appendPendingMessage = async (msg: InboundMessage): Promise<boolean> => {
+      try {
+        const userMessage = await this.pendingToUserMessage(msg);
+        if (userMessage) {
+          injections.push(userMessage);
+          onUserMessage?.(msg);
+        }
+        return true;
+      } catch {
+        // Return any earlier durable injections to the runner even if this
+        // message fails to persist. Retry the failed message first next time.
+        const remaining = this.drainInboundQueue(queue);
+        queue.put(msg);
+        for (const message of remaining) queue.put(message);
+        return false;
+      }
+    };
     while (injections.length < limit) {
       const msg = queue.getNowait();
       if (!msg) break;
-      const userMessage = await this.pendingToUserMessage(msg);
-      if (userMessage) injections.push(userMessage);
+      if (!await appendPendingMessage(msg)) return injections;
     }
     if (!injections.length && sessionKey && this.subagents?.getRunningCountBySession?.(sessionKey) > 0) {
       const timeoutMs = Number(this.subagentPendingWaitMs ?? 300_000);
       const msg = await this.waitForPendingMessage(queue, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 300_000);
-      const userMessage = msg ? await this.pendingToUserMessage(msg) : null;
-      if (userMessage) injections.push(userMessage);
+      if (msg && !await appendPendingMessage(msg)) return injections;
       while (injections.length < limit) {
         const next = queue.getNowait();
         if (!next) break;
-        const nextUserMessage = await this.pendingToUserMessage(next);
-        if (nextUserMessage) injections.push(nextUserMessage);
+        if (!await appendPendingMessage(next)) return injections;
       }
     }
     return injections;
@@ -3131,6 +3317,17 @@ export class AgentLoop {
   ): Promise<FollowupModelContextUpdate> {
     if (request.inputTokenBudget == null || request.inputTokenBudget <= 0) return null;
     try {
+      // The current turn is protected from DAG compaction. If it alone exceeds
+      // the input budget, archiving older turns cannot make this request fit.
+      const protectedMessages = descriptor.rebuildProjection(
+        session,
+        request.currentTurnMessages,
+        {
+          visibleMessageStart: descriptor.protectedSessionMessageStart,
+          summaryOverride: null,
+        },
+      );
+      if (request.estimatePromptTokens(protectedMessages) >= request.inputTokenBudget) return null;
       const result = await consolidator.maybeConsolidateByTokens(session, {
         replayMaxMessages: this.maxMessages,
         inputTokenBudget: request.inputTokenBudget,
@@ -3616,7 +3813,13 @@ export class AgentLoop {
         abortSignal,
         hook,
         concurrentTools: true,
-        injectionCallback: ({ limit = 3 } = {}) => this.drainPendingQueue(pendingQueue, limit, session?.key ?? sessionKey),
+        injectionCallback: ({ limit = 3 } = {}) => this.drainPendingQueue(pendingQueue, limit, session?.key ?? sessionKey, msg => {
+          const request = computerUseRequestContext(msg, turnId);
+          // A real user steer replaces the blocked/approved message scope.
+          // Automatic subagent notices never confer a new user authorization.
+          if (request.metadata.computerUseInteractive === true) loopHook.updateRequestContext(
+            msg.channel, msg.chatId, request.messageId, request.metadata, activeSessionKey);
+        }),
         internalTurnContext,
         actualModelContext: modelSelection ? persistedModelSelection(modelSelection) : null,
         onMaxFinalizationStarting,
@@ -3743,6 +3946,7 @@ export class AgentLoop {
         )
       : this.consolidator;
     msg = ctx.msg = new InboundMessage({
+      role: msg.role,
       channel: msg.channel,
       chatId: msg.chatId,
       senderId: msg.senderId,
@@ -3789,6 +3993,7 @@ export class AgentLoop {
     }
     if (projectedBinding && msg.metadata?.webui !== true) {
       msg = ctx.msg = new InboundMessage({
+        role: msg.role,
         channel: msg.channel,
         chatId: msg.chatId,
         senderId: msg.senderId,
@@ -3890,6 +4095,7 @@ export class AgentLoop {
           (session, entry) => {
             const source = entry
               ? new InboundMessage({
+                  role: typeof entry.metadata.computerUseMessageRole === 'string' ? entry.metadata.computerUseMessageRole : 'user',
                   channel: entry.channel,
                   chatId: entry.chatId,
                   senderId: entry.senderId,
@@ -3975,20 +4181,17 @@ export class AgentLoop {
     ctx.tools = this.createToolRegistry("turn", sessionWorkspace, {
       includeConnectedMcp: true,
       messageSendCallback: ctx.messageSendCallback,
-      ...(ctx.sessionProjectId !== null
+      ...(this.usesExternalSessionWorkspace(ctx.sessionProjectId, sessionWorkspace)
         ? { readonlySkillRoots: this.projectReadonlySkillRoots() }
         : {}),
       modelSelection: ctx.modelSelection,
     });
+    const toolRequest = computerUseRequestContext(ctx.msg, ctx.turnId);
     this.setToolContext(
       ctx.msg.channel,
       ctx.msg.chatId,
-      ctx.msg.metadata?.message_id ?? ctx.msg.metadata?.messageId ?? null,
-      {
-        ...(ctx.msg.metadata ?? {}),
-        ...(sharedTurnSource(ctx.msg) ? { turn_source: sharedTurnSource(ctx.msg)! } : {}),
-        ...turnMetadata(ctx.turnId),
-      },
+      toolRequest.messageId,
+      toolRequest.metadata,
       ctx.sessionKey,
       sessionWorkspace,
       ctx.tools,
@@ -4110,8 +4313,7 @@ export class AgentLoop {
       session: ctx.session,
       channel: ctx.msg.channel,
       chatId: ctx.msg.chatId,
-      messageId: ctx.msg.metadata?.message_id ?? ctx.msg.metadata?.messageId,
-      metadata: { ...ctx.msg.metadata, ...(ctx.msg.internal ? { computerUseInteractive: false } : {}) },
+      ...computerUseRequestContext(ctx.msg, ctx.turnId),
       sessionKey: ctx.sessionKey,
       pendingQueue: ctx.pendingQueue,
       abortSignal: ctx.abortSignal,
@@ -4343,6 +4545,7 @@ export class AgentLoop {
         )
       : this.consolidator;
     msg = new InboundMessage({
+      role: msg.role,
       channel: msg.channel,
       chatId: msg.chatId,
       senderId: msg.senderId,
@@ -4396,7 +4599,7 @@ export class AgentLoop {
       sessionWorkspace,
       {
         includeConnectedMcp: true,
-        ...(sessionBinding.projectId !== null
+        ...(this.usesExternalSessionWorkspace(sessionBinding.projectId, sessionWorkspace)
           ? { readonlySkillRoots: this.projectReadonlySkillRoots() }
           : {}),
         modelSelection,
@@ -4406,11 +4609,12 @@ export class AgentLoop {
     const isSubagent = msg.senderId === "subagent";
     const subagentFollowupPersisted = isSubagent && this.persistSubagentFollowup(session, msg);
     if (subagentFollowupPersisted) this.sessions.save(session);
+    const toolRequest = computerUseRequestContext(msg);
     this.setToolContext(
       channel,
       chatId,
-      msg.metadata?.message_id ?? msg.metadata?.messageId ?? null,
-      msg.metadata ?? {},
+      toolRequest.messageId,
+      toolRequest.metadata,
       key,
       sessionWorkspace,
       tools,
@@ -4497,8 +4701,7 @@ export class AgentLoop {
       session,
       channel,
       chatId,
-      messageId: msg.metadata?.message_id ?? msg.metadata?.messageId ?? null,
-      metadata: { ...msg.metadata, computerUseInteractive: false },
+      ...computerUseRequestContext(msg),
       sessionKey: key,
       pendingQueue,
       abortSignal,
@@ -4905,25 +5108,28 @@ export class AgentLoop {
       const session = this.sessions.get(sessionKey);
       for (const [clientRequestId, admission] of admissions) {
         if (admission.turnId !== turnId) continue;
+        const transfer = this.goalRuntime.queueSteerTransfers(sessionKey)
+          .find((item) => item.clientRequestId === clientRequestId);
         const persisted = session?.messages.some((message) => (
           message?.role === "user"
           && message?.client_request_id === clientRequestId
           && firstString(message?.turn_id, message?.turnId) === turnId
         ));
-        if (persisted) {
+        const consumed = admission.phase === "consumed" || Boolean(transfer?.consumedAt);
+        const restoredConsumed = !persisted && consumed && session && transfer
+          && this.persistConsumedQueueSteerTransfer(session, transfer);
+        if (persisted || restoredConsumed) {
           await this.goalRuntime.completeQueueSteerTransfer(sessionKey, clientRequestId);
           admissions.delete(clientRequestId);
           accepted.push(admission);
           continue;
         }
 
-        const queuedAt = this.nextQueuedAt(sessionKey);
-        const transfer = this.goalRuntime.queueSteerTransfers(sessionKey)
-          .find((item) => item.clientRequestId === clientRequestId);
         if (!transfer) {
           admissions.delete(clientRequestId);
           continue;
         }
+        const queuedAt = transfer.descriptor.queuedAt;
         const message = this.recoveredQueueMessage(transfer, queuedAt);
         if (admission.store === "goal") {
           await this.goalRuntime.restoreGoalQueueSteerTransfer(
@@ -4953,6 +5159,12 @@ export class AgentLoop {
         revision: item.revision,
       });
       if (item.store === "goal") void this.dispatchNextGoalWork(sessionKey);
+      else {
+        const slot = (this.turnSlots.get(sessionKey) ?? []).find((candidate) => (
+          candidate.root === item.message
+        ));
+        slot?.announcementGate?.open();
+      }
     }
   }
 
@@ -4971,6 +5183,10 @@ export class AgentLoop {
     });
     let effectiveAbortSignal = abortSignal;
     let boundary = createTurnCancellationBoundary({ turnId, signal: effectiveAbortSignal });
+    const releaseComputerUseInterrupt = slot && sharedTurnSource(effectiveMsg)?.kind === "gui"
+      ? registerComputerUseTurnInterrupt({ sessionKey, channel: effectiveMsg.channel,
+        chatId: effectiveMsg.chatId, turnId }, () => this.stopExpectedTurn(sessionKey, turnId, "gui"))
+      : null;
     const publishRunStatus = shouldPublishWebuiRunStatus(effectiveMsg);
     let didPublishRunning = false;
     let goalTurnResult: { goalId: string; goalOutcome: GoalStatus } | null = null;
@@ -5150,6 +5366,10 @@ export class AgentLoop {
       }
       throw error;
     } finally {
+      releaseComputerUseInterrupt?.();
+      const surfaceScope = { sessionKey, channel: effectiveMsg.channel, chatId: effectiveMsg.chatId };
+      await closeNativeSurfacesForTurn({ ...surfaceScope, turnId });
+      await this.browserSessionManager.closeSurfacesForTurn(surfaceScope);
       if (slot && slot.state !== "closed") {
         slot.acceptingSteer = false;
         slot.state = "settling";
@@ -5178,6 +5398,9 @@ export class AgentLoop {
     abortSignal: AbortSignal,
   ): Promise<void> {
     try {
+      // A recovered, unconsumed steer keeps its original place ahead of later
+      // messages that are already waiting for this session lock.
+      const queuedAt = Date.parse(String(initialSlot.root.metadata?.queued_at ?? initialSlot.root.timestamp.toISOString()));
       await this.lockFor(sessionKey).runExclusive(async () => {
         let slot = initialSlot;
         while (!isCancelled()) {
@@ -5222,7 +5445,7 @@ export class AgentLoop {
           }
           return;
         }
-      });
+      }, queuedAt);
     } finally {
       await this.cleanupOwnedSlots(
         sessionKey,
@@ -5269,11 +5492,32 @@ export class AgentLoop {
   }
 
   async run(): Promise<void> {
+    const startedAt = Date.now();
+    this.messageLoopReady = false;
     this.running = true;
+    try {
+      await this.runMessageLoop(startedAt);
+    } catch (error) {
+      this.reportStartupStage("message-loop-failed", startedAt);
+      throw error;
+    } finally {
+      this.messageLoopReady = false;
+      this.running = false;
+    }
+  }
+
+  private async runMessageLoop(startedAt: number): Promise<void> {
     await this.initializeRuntimeTools();
-    if (!this.running) return;
+    this.reportStartupStage("runtime-tools-ready", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
     await this.recoverQueueSteerTransfers();
+    this.reportStartupStage("queue-steer-recovered", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
     await this.recoverGoalWork();
+    this.reportStartupStage("goals-recovered", startedAt);
+    if (!this.running || this.runtimeToolsClosed) return;
+    this.messageLoopReady = true;
+    this.reportStartupStage("message-loop-ready", startedAt);
     while (this.running) {
       const inbound = this.bus.inbound.getNowait();
       if (!inbound) {
@@ -5486,6 +5730,7 @@ export class AgentLoop {
   }
 
   stop(): void {
+    this.messageLoopReady = false;
     this.running = false;
   }
 

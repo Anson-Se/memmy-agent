@@ -1,5 +1,8 @@
 /** Memmy local API contract. */
 import { z } from "zod";
+import { normalizeOutputLanguage } from "./output-language.js";
+
+export { normalizeOutputLanguage } from "./output-language.js";
 
 export * from "./model-catalog-resolver.js";
 
@@ -10,6 +13,19 @@ export * from "./memory-l3-world-model.js";
 export * from "./endpoints.js";
 export * from "./cloud-service.js";
 export * from "./desktop-runtime-manifest.js";
+export * from "./computer-use-surface.js";
+export * from "./browser-profile-control.js";
+export * from "./embedded-browser-control.js";
+export * from "./browser-playwright-control.js";
+export * from "./browser-access-approval.js";
+export * from "./native-app-approval.js";
+export * from "./browser-download-approval.js";
+export * from "./browser-capability-approval.js";
+export * from "./browser-global-approval.js";
+export * from "./browser-task-site-permission.js";
+export * from "./browser-use-site-policy.js";
+export * from "./browser-cdp-readonly.js";
+export * from "./browser-cdp-write.js";
 
 export const MANAGED_AGENT_DISCOVERY_PENDING_DATA_PATH = "memmy-agent://history-discovery-pending";
 
@@ -1167,9 +1183,8 @@ export type AccountChannel = z.infer<typeof AccountChannelSchema>;
 export function resolveMemoryLanguage(
   language: string | undefined,
   accountChannel?: AccountChannel | string
-): "zh-CN" | "en-US" {
-  if (language === "zh-CN" || language === "en-US") return language;
-  return accountChannel === "email" ? "en-US" : "zh-CN";
+): string {
+  return normalizeOutputLanguage(language) ?? (accountChannel === "email" ? "en-US" : "zh-CN");
 }
 
 export const AccountLocaleSchema = z.enum(["zh", "en"]);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global console */
 import { npmInvocation } from "../../../scripts/internal/shared/npm-invocation.mjs";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

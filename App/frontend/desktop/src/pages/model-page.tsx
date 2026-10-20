@@ -173,9 +173,15 @@ export function ModelPage() {
       let workspace = createModelWorkspace(latest);
       const evolutionValues = createModelFormValues(skill, primaryModel);
       const memoryValues = createModelFormValues(mem, modelFormValuesAsPrimary(evolutionValues));
+      const assignedEvolutionEndpointId = skill.reuse
+        ? assignedCatalogEndpointId(workspace, "byok", "agent")
+        : assignedCatalogEndpointId(workspace, "byok", "memory_evolution")
+          ?? (!evolutionValues.apiKey.trim() && evolutionValues.apiKeyMasked
+            ? assignedCatalogEndpointId(workspace, "byok", "agent")
+            : undefined);
       const evolution = upsertByokPreset(workspace, {
         provider: evolutionValues.provider,
-        ...(evolutionValues.endpointId ? { endpointId: evolutionValues.endpointId } : {}),
+        ...(evolutionValues.apiKeyMasked && assignedEvolutionEndpointId ? { endpointId: assignedEvolutionEndpointId } : {}),
         endpoint: evolutionValues.endpoint,
         protocol: chatProtocol(evolutionValues.provider),
         ...(evolutionValues.apiKey.trim() ? { apiKey: evolutionValues.apiKey.trim() } : {}),
@@ -184,9 +190,15 @@ export function ModelPage() {
         capabilities: ["memory_evolution"]
       });
       workspace = assignCatalogPreset(evolution.workspace, "byok", "memory_evolution", evolution.presetId);
+      const assignedMemoryEndpointId = mem.reuse
+        ? evolution.endpointId
+        : assignedCatalogEndpointId(workspace, "byok", "memory_summary")
+          ?? (!memoryValues.apiKey.trim() && memoryValues.apiKeyMasked
+            ? evolution.endpointId
+            : undefined);
       const memory = upsertByokPreset(workspace, {
         provider: memoryValues.provider,
-        ...(memoryValues.endpointId ? { endpointId: memoryValues.endpointId } : {}),
+        ...(memoryValues.apiKeyMasked && assignedMemoryEndpointId ? { endpointId: assignedMemoryEndpointId } : {}),
         endpoint: memoryValues.endpoint,
         protocol: chatProtocol(memoryValues.provider),
         ...(memoryValues.apiKey.trim() ? { apiKey: memoryValues.apiKey.trim() } : {}),

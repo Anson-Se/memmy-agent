@@ -1160,11 +1160,12 @@ export class SessionTurnService {
     const intentDecision = classifyIntent(request.query);
     const endTopicDecision = explicitEndTopicDecision(request.query);
     const latestEpisode = this.deps.repos.runtime.latestEpisodeForSession(session.id);
-    const routeProposalPromise = this.proposeEpisodeRouteWithLlm(
-      latestEpisode,
-      request.query,
-      endTopicDecision
-    );
+    const skipsRetrieval = intentDecision.kind === "chitchat" || intentDecision.kind === "meta";
+    // A turn that needs no memory should not wait for a remote relation model
+    // merely because this session already has an episode.
+    const routeProposalPromise = skipsRetrieval
+      ? Promise.resolve(this.proposeEpisodeRoute(session, request.query, endTopicDecision))
+      : this.proposeEpisodeRouteWithLlm(latestEpisode, request.query, endTopicDecision);
     const contextHints = turnStartContextHints(request);
     const requestedLayers: MemoryLayer[] = this.deps.turnStartMemoryLayers(
       this.deps.memoryLayersForIntent(intentDecision.kind),
@@ -1210,7 +1211,7 @@ export class SessionTurnService {
       droppedDueToBudget: search.droppedDueToBudget,
       status: [
         ...search.status,
-        ...(intentDecision.kind === "chitchat" || intentDecision.kind === "meta"
+        ...(skipsRetrieval
           ? [`intent:${intentDecision.kind}:retrieval_skipped`]
           : []),
         `relation:${routeProposal.relationDecision.relation}:proposed`

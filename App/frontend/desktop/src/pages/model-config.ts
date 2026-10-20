@@ -327,10 +327,17 @@ export function hydrateModelConfigForm(
     imageGenApiKey,
     imageGenApiKeyMasked
   );
-  const skillModel = hydrateRoleModelConfig(saved.memmyMemory?.evolution, primary);
+  const byokAssignments = saved.catalog?.modelAssignments.byok;
+  const hasAssignedByokPrimary = Boolean(byokAssignments?.agent?.default || byokAssignments?.agent?.candidates?.length);
+  const skillModel = hydrateRoleModelConfig(
+    saved.memmyMemory?.evolution,
+    primary,
+    Boolean(byokAssignments?.memoryEvolution || hasAssignedByokPrimary)
+  );
   const memoryModel = hydrateRoleModelConfig(
     saved.memmyMemory?.summary,
-    modelFormValuesAsPrimary(createModelFormValues(skillModel, primary))
+    modelFormValuesAsPrimary(createModelFormValues(skillModel, primary)),
+    Boolean(byokAssignments?.memorySummary || hasAssignedByokPrimary)
   );
 
   return {
@@ -489,9 +496,17 @@ function toRoleModelProviderConfig(values: ModelConfigFormValues): RoleModelProv
   };
 }
 
-function hydrateRoleModelConfig(role: RoleModelProviderConfig | undefined, primary: PrimaryModelValues): ModelConfig {
-  if (!role || role.mode === "follow" || (role.mode !== "fixed" && !role.configured && !role.apiKeyMasked && !role.apiKey.trim())) {
+function hydrateRoleModelConfig(
+  role: RoleModelProviderConfig | undefined,
+  primary: PrimaryModelValues,
+  _inherited = false
+): ModelConfig {
+  if (_inherited && (!role || role.mode === "follow")) {
     return createModelConfig(primary.protocol);
+  }
+
+  if (!role || role.mode === "follow" || (role.mode !== "fixed" && !role.configured && !role.apiKeyMasked && !role.apiKey.trim())) {
+    return { ...createModelConfig(primary.protocol), reuse: false };
   }
 
   const protocol = toProtocol(role.provider);
