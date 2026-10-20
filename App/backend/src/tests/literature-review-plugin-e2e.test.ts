@@ -512,7 +512,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
                       includedPaperIds: paperCardIds,
                       excludedPaperIds: []
                     }
-                    : {} 
+                    : {}
           };
       interactionResponses.push(service.respond(manifest.id, event.callId, request.interactionId, response));
     });
