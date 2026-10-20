@@ -74,9 +74,11 @@ for (const [name, factory] of [["Backend", backend], ["Memory", memory]]) {
     await h.prompt(second, "Review custom default agent without an explicit selection.", undefined, true);
     check(h.latestCapture()?.namespace?.profileId === "plan", name + " configured default plan is respected");
     check(h.lastRequest().includes("MEMMY_L3_RESTARTED"), name + " new session initializes current L3");
+    h.scanFirstNext();
     const third = await h.session("build");
     await h.prompt(third, "Review explicit build overrides default plan.");
     check(h.latestCapture()?.namespace?.profileId === "build", name + " explicit build overrides configured default");
+    check(h.scanFirstResults()[0]?.status === "stored" && h.captureResponses().at(-1)?.status === "existing", name + " actual scan-first stores once and live plugin capture deduplicates");
     check(h.captureResponses().every(r => ["stored", "existing"].includes(r.status)), name + " all live captures accepted by real Memory");
     console.log(name, "V2 real stored turns", h.stored());
   } finally { await h.close(); }
@@ -120,7 +122,8 @@ async function harness(name, factory) {
   const memoryServer = createMemoryHttpServer({ service, startAgentSourceAutomation: false, auth: { mode: "dev", allowAnonymous: true } });
   await listen(memoryServer);
   const memoryEndpoint = `http://127.0.0.1:${memoryServer.address().port}`;
-  const calls = [], events = [], turns = [];
+  const calls = [], events = [], turns = [], scanFirstResults = [];
+  let scanFirstPending = false;
   const seededProjects = new Set(); let seedValue = "MEMMY_L3_INITIAL";
   let mode = "success", serial = 0, generation = 2, child, closed, output = "", port, cursor = 0, hostBinary;
   const fixture = createServer(async (req, res) => {
@@ -140,6 +143,13 @@ async function harness(name, factory) {
         chunk({ role: "assistant", content: answer });
         chunk({}, "stop"); res.end("data: [DONE]\n\n"); return;
       }
+      if (req.url === "/api/v1/source-turns/complete" && scanFirstPending) {
+        scanFirstPending = false;
+        const scanned = await scanTurn(nativePath, body.sourceTurn.conversationId, body.sourceTurn.turnId);
+        const turn = scanned.turn;
+        assert(turn, "Scan-first must read the actual persisted native turn: " + scanned.reason);
+        scanFirstResults.push(service.completeSourceTurn({ ...buildSourceTurnRequest(turn, "agent_source_scan"), namespace: body.namespace }));
+      }
       const response = await fetch(memoryEndpoint + req.url, { method: req.method, headers: { ...req.headers, host: new URL(memoryEndpoint).host }, body: raw || undefined });
       const text = await response.text(); call.response = { code: response.status, body: JSON.parse(text) };
       const projectId = call.response.body.projectId;
@@ -148,7 +158,7 @@ async function harness(name, factory) {
         repos.l3WorldModels.upsertField({ userId: "local-user", projectId, targetField: "project_contract", value: seedValue });
       }
       res.writeHead(response.status, { "content-type": "application/json" }); res.end(text);
-    } catch (error) { res.writeHead(500); res.end(JSON.stringify({ error: String(error) })); }
+    } catch (error) { console.error("Review fixture request failed:", String(error)); res.writeHead(500); res.end(JSON.stringify({ error: String(error) })); }
   });
   await listen(fixture);
   const endpoint = `http://127.0.0.1:${fixture.address().port}`;
@@ -162,6 +172,8 @@ async function harness(name, factory) {
   };
   const h = {
     nativePath, turns, api,
+    scanFirstNext: () => { scanFirstPending = true; },
+    scanFirstResults: () => scanFirstResults,
     async configure(defaultAgent) { await writeFile(join(config, "opencode.json"), JSON.stringify({ ...(defaultAgent ? { default_agent: defaultAgent } : {}), provider: { fixture: { npm: "@ai-sdk/openai-compatible", options: { baseURL: endpoint + "/v1", apiKey: "local-fixture" }, models: { fixture: { name: "fixture", limit: { context: 32768, output: 256 } } } } } })); },
     seed(value) {
       seedValue = value;
@@ -236,7 +248,7 @@ async function harness(name, factory) {
       await waitFor(() => events.slice(cursor).some(e => e.type === (success ? "session.compaction.ended" : "session.compaction.failed") && e.data.sessionID === session), 25000);
       await delay(500); mode = "success";
     },
-    async scanned(session, turnId) { return (await selectSourceTurn(readOpencodeDatabase(nativePath), { conversationId: session, turnId })).turn; },
+    async scanned(session, turnId) { return (await scanTurn(nativePath, session, turnId)).turn; },
     async scan(session, turnId) {
       const turn = await h.scanned(session, turnId); check(Boolean(turn), name + " scanner finds completed turn");
       if (!turn) return;
@@ -245,7 +257,7 @@ async function harness(name, factory) {
     },
     async close() {
       await h.stop();
-      await writeFile(join(dir, "evidence.json"), JSON.stringify({ stored: h.stored(), turns, calls, events }, null, 2));
+      await writeFile(join(dir, "evidence.json"), JSON.stringify({ stored: h.stored(), turns, calls, events, scanFirstResults }, null, 2));
       await shutdown(fixture); await shutdown(memoryServer); mf.cleanup();
     }
   };
@@ -258,4 +270,15 @@ async function waitFor(predicate, timeout) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { if (await predicate()) return; await delay(50); }
   throw new Error("Timed out waiting for official host lifecycle");
+}
+
+async function scanTurn(path, conversationId, turnId) {
+  // selectSourceTurn deliberately rejects mixed conversations. The production
+  // scanner partitions by conversation before passing messages to this parser.
+  async function* conversation() {
+    for await (const message of readOpencodeDatabase(path)) {
+      if (message.conversationId === conversationId) yield message;
+    }
+  }
+  return selectSourceTurn(conversation(), { conversationId, turnId });
 }
