@@ -124,6 +124,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
   const pendingResumeSelections = new Map();
   const latestRequests = new Map();
   const captureJobs = new Set();
+  const captureStop = new AbortController();
 
   function log(level, message, extra = {}) {
     try {
@@ -261,6 +262,19 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     }
   }
 
+  function waitForCaptureRead(ms) {
+    if (captureStop.signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        captureStop.signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      captureStop.signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
   // Event delivery can precede the database projection. Retry briefly without
   // blocking prompts or the event subscription; retain unresolved records for the
   // next terminal event / prompt / cleanup and leave durable recovery to scanning.
@@ -273,7 +287,8 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     }
     let parsed;
     for (const wait of [0, 50, 100, 200, 400, 800, 1600]) {
-      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      if (wait && captureStop.signal.aborted) break;
+      if (wait) await waitForCaptureRead(wait);
       parsed = await readOpencodeHookSourceTurn({ conversationId, turnId });
       if (parsed.turn) break;
       if (!["source_store_unavailable", "turn_incomplete", "turn_content_incomplete", "identity_unresolved"].includes(parsed.reason)) break;
@@ -534,6 +549,9 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     },
 
     dispose: async () => {
+      // Host shutdown has a short cleanup budget. Wake retries for one last read;
+      // never wait through the whole projection backoff while the host is exiting.
+      captureStop.abort();
       for (const sessionID of new Set([...pendingTurns.values()].map((pending) => pending.externalSessionId))) {
         queueTurnCompletion(sessionID);
       }

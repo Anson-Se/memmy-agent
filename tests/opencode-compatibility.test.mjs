@@ -288,6 +288,10 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s turn lifecycle", (
       const db = new DatabaseSync(h.dbPath);
       db.exec("DELETE FROM session_message WHERE id = 'shutdown-assistant'"); db.close();
       h.emit("session.execution.failed", { error: { message: "No model output" } });
+      await new Promise(r => setTimeout(r, 80));
+      const started = performance.now();
+      await h.cleanup();
+      expect(performance.now() - started).toBeLessThan(1000);
     } finally { await h.cleanup(); }
     expect(h.captures()).toHaveLength(0);
   });

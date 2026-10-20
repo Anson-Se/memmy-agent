@@ -74,6 +74,8 @@ Lifecycle implementation and review regression
   assistant response. Bounded retries (up to 3.15 seconds) cover projection delay.
   An unresolved record stays pending for the next event/prompt/cleanup; historical
   scanning remains the recovery path if the process exits before persistence.
+  Shutdown cancels retry delays and performs one last read, rather than spending
+  the host's short cleanup budget waiting through the full projection backoff.
 - Both plugin and bridge revisions advance to v2-2 so installed v2-1 artifacts are
   updated. Save work and fully restart OpenCode, including any separate server.
 
