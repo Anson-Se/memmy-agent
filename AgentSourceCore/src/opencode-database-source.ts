@@ -1,0 +1,86 @@
+import type { OpencodeSource, OpencodeSession } from "./opencode-source-turn.js";
+
+interface Database {
+  prepare(sql: string): { all(...parameters: string[]): unknown[]; get(...parameters: string[]): unknown };
+}
+type Row = Record<string, unknown>;
+const record = (value: unknown): Row => value && typeof value === "object" && !Array.isArray(value) ? value as Row : {};
+const parse = (value: unknown): Row => {
+  if (typeof value !== "string") return record(value);
+  try { return record(JSON.parse(value)); } catch { return {}; }
+};
+
+/** Adapt both native database generations to the same turn parser. Only one
+ * session is materialised at a time; all callers open the database read-only. */
+export function createOpencodeDatabaseSource(db: Database, conversationId?: string): OpencodeSource | null {
+  const hasTable = (name: string) => Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+  const v2 = hasTable("session_v2") && hasTable("session_message");
+  if (!v2 && !(hasTable("session") && hasTable("message") && hasTable("part"))) return null;
+  const table = v2 ? "session_v2" : "session";
+  const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => record(row).name));
+  const sessions = db.prepare(`SELECT id, parent_id AS parentId, directory${columns.has("agent") ? ", agent" : ""}${columns.has("revert") ? ", revert" : ""} FROM ${table}${conversationId ? " WHERE id = ?" : ""} ORDER BY time_created ASC, id ASC`);
+  const messages = db.prepare(v2
+    ? "SELECT id, type, data, time_created FROM session_message WHERE session_id = ? ORDER BY seq ASC, id ASC"
+    : "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC");
+  const parts = v2 ? null : db.prepare("SELECT id, data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC");
+  const currentParts = new Map<string, Array<{ id: string; data: unknown }>>();
+  return {
+    sessions: () => sessions.all(...(conversationId ? [conversationId] : [])).map(value => {
+      const row = record(value);
+      const revert = parse(row.revert);
+      return {
+        id: String(row.id), parentId: row.parentId == null ? null : String(row.parentId),
+        directory: row.directory == null ? null : String(row.directory),
+        agent: typeof row.agent === "string" ? row.agent : null,
+        revertMessageId: typeof revert.messageID === "string" ? revert.messageID : null
+      } satisfies OpencodeSession;
+    }),
+    messages(sessionId) {
+      const rows = messages.all(sessionId).map(record);
+      if (!v2) return rows.map(row => ({ id: String(row.id), data: parse(row.data) }));
+      currentParts.clear();
+      let parentID = "";
+      let agent = "";
+      let lastAssistant: Row | undefined;
+      const result: Array<{ id: string; data: Row }> = [];
+      for (const row of rows) {
+        const data = parse(row.data);
+        const type = data.type || row.type;
+        const id = String(row.id);
+        if (type === "agent-switched") { agent = String(data.agent || ""); continue; }
+        if (type === "user") {
+          parentID = id;
+          lastAssistant = undefined;
+          result.push({ id, data: { role: "user", time: data.time || { created: row.time_created } } });
+          currentParts.set(id, [{ id: id + ":text", data: { type: "text", text: data.text } }]);
+        } else if (type === "assistant" && parentID) {
+          lastAssistant = { ...data, role: "assistant", parentID, agent: data.agent || agent };
+          result.push({ id, data: lastAssistant });
+          const content = Array.isArray(data.content) ? data.content.map(record) : [];
+          currentParts.set(id, content.map((part, index) => {
+            if (part.type !== "tool") return { id: `${id}:${index}`, data: part };
+            const state = record(part.state);
+            const output = Array.isArray(state.content)
+              ? state.content.map(record).filter(item => item.type === "text").map(item => item.text).join("\n") : "";
+            return { id: `${id}:${index}`, data: {
+              type: "tool", callID: part.id, tool: part.name,
+              metadata: { providerExecuted: part.executed === true },
+              state: { ...state, output: state.status === "error" ? record(state.error).message || output : output, time: part.time }
+            } };
+          }));
+        } else if (type === "idle" && lastAssistant) {
+          // V2 persists an explicit terminal boundary, including tool-only and
+          // interrupted turns. Do not infer completion from an intermediate step.
+          lastAssistant.nativeTurnCompleted = true;
+          if (data.outcome === "failed" || data.outcome === "interrupted") lastAssistant.nativeStatus = "failed";
+          if (data.outcome === "interrupted") lastAssistant.error = { name: "MessageAbortedError" };
+          lastAssistant.time = { ...record(lastAssistant.time), completed: record(data.time).created || row.time_created };
+        }
+      }
+      return result;
+    },
+    parts: messageId => parts
+      ? parts.all(messageId).map(value => { const row = record(value); return { id: String(row.id), data: parse(row.data) }; })
+      : currentParts.get(messageId) || []
+  };
+}

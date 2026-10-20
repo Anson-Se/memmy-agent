@@ -11,7 +11,7 @@ import {
   readOpencodeSourceTurn,
   type CursorVscdbSource,
   type OpenclawTranscriptSource,
-  type OpencodeSource,
+  createOpencodeDatabaseSource,
   type SourceTurn
 } from "@memmy/agent-source-core";
 export { readClaudeCodeSourceTurn, readCodexSourceTurn } from "@memmy/agent-source-core";
@@ -28,6 +28,14 @@ import { homedir } from "node:os";
 import { isAbsolute, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import YAML from "yaml";
+import { z } from "zod";
+
+/** OpenCode V1 tools are plain definitions containing real Zod schemas. Bundle them
+ * locally so installing Memmy never depends on the host's SDK package resolution. */
+export const opencodeTool = Object.assign(<T>(definition: T): T => definition, { schema: z });
+export function opencodeToolJsonSchema(args: Record<string, z.ZodType>): Record<string, unknown> {
+  return z.toJSONSchema(z.object(args));
+}
 import {
   normalizeWorkspaceUri,
   renderL3WorldModelContext,
@@ -412,37 +420,8 @@ export async function readOpencodeHookSourceTurn(input: {
     return { turn: null, reason: "source_store_unavailable" };
   }
   try {
-    const columns = new Set((db.prepare("PRAGMA table_info(session)").all() as Array<{ name: string }>).map((row) => row.name));
-    const sessions = db.prepare(`SELECT id, parent_id AS parentId, directory${columns.has("agent") ? ", agent" : ""}${columns.has("revert") ? ", revert" : ""} FROM session WHERE id = ?`);
-    const messages = db.prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC");
-    const parts = db.prepare("SELECT id, data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC");
-    const parse = (value: unknown): unknown => {
-      if (typeof value !== "string") return undefined;
-      try {
-        return JSON.parse(value);
-      } catch {
-        return undefined;
-      }
-    };
-    const source: OpencodeSource = {
-      sessions: () => (sessions.all(input.conversationId) as unknown as Array<Record<string, unknown>>).map((row) => {
-        const revert = typeof row.revert === "string" ? parse(row.revert) : row.revert;
-        const messageId = revert && typeof revert === "object" && !Array.isArray(revert)
-          ? (revert as { messageID?: unknown }).messageID
-          : undefined;
-        return {
-          id: String(row.id),
-          parentId: row.parentId == null ? null : String(row.parentId),
-          directory: row.directory == null ? null : String(row.directory),
-          agent: typeof row.agent === "string" ? row.agent : null,
-          revertMessageId: typeof messageId === "string" && messageId ? messageId : null
-        };
-      }),
-      messages: (sessionId) => (messages.all(sessionId) as unknown as Array<{ id: string; data: string }>)
-        .map((row) => ({ id: row.id, data: parse(row.data) })),
-      parts: (messageId) => (parts.all(messageId) as unknown as Array<{ id: string; data: string }>)
-        .map((row) => ({ id: row.id, data: parse(row.data) }))
-    };
+    const source = createOpencodeDatabaseSource(db, input.conversationId);
+    if (!source) return { turn: null, reason: "source_store_unavailable" };
     return await readOpencodeSourceTurn(source, input);
   } finally {
     db.close();

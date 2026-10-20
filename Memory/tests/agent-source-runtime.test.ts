@@ -22,6 +22,39 @@ afterEach(() => {
 });
 
 describe("standalone Agent source executor", () => {
+  it.each([[false, true], [true, true], [false, false]])("refreshes installed OpenCode with auto injection disabled, removal=%s, storedState=%s", async (removed, storedState) => {
+    const root = tempRoot();
+    const configPath = join(root, "config.yaml");
+    const statePath = join(root, "agent-sources.json");
+    writeFileSync(configPath, JSON.stringify({ memmyMemory: { agentAccess: {
+      autoScanKnownAgents: false, watchFileChanges: false, autoInjectSkill: false
+    } } }));
+    writeFileSync(statePath, JSON.stringify({ version: 2, sources: storedState ? { opencode: {
+      status: "plugin_installed", autoInjectSuppressed: removed, messageCount: 0, lastScannedAt: null, latestSeenAt: null
+    } } : {} }));
+    const installPlugin = vi.fn(async () => {});
+    const isInstalledHookCurrent = vi.fn(async () => installPlugin.mock.calls.length > 0);
+    const target: SkillTarget = {
+      targetId: "opencode", displayName: "OpenCode", async resolveRootDirectory() { return root; },
+      async install() {}, async uninstall() {}, async isInstalled() { return true; },
+      installPlugin, isInstalledHookCurrent
+    };
+    const executor = createAgentSourceExecutor({
+      service: {} as MemoryService, configPath, statePath, initialScanDelayMs: 0, scheduledScanIntervalMs: 10,
+      sourceRegistry: createSourceRegistry([{
+        descriptor: { sourceId: "opencode", displayName: "OpenCode", builtin: true, dataPath: root },
+        detect: async () => true, async *scan() {}
+      }]),
+      integrationRegistry: createSkillTargetRegistry([target])
+    });
+    try {
+      executor.startAutomation();
+      if (!removed) await vi.waitFor(() => expect(isInstalledHookCurrent.mock.calls.length).toBeGreaterThan(1));
+      else await new Promise(resolve => setTimeout(resolve, 60));
+      expect(installPlugin).toHaveBeenCalledTimes(removed ? 0 : 1);
+    } finally { await executor.dispose(); }
+  });
+
   it("also waits for a canceled scan when a replacement scan starts before disposal", async () => {
     const root = tempRoot();
     let finishFirst!: () => void;

@@ -554,6 +554,29 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   async function runAutomation(startup: boolean): Promise<void> {
     if (disposed || scan.running) return;
     const config = loadMemmyConfig(configPath).config.agentAccess;
+    // Refresh an existing connection even when automatic *new* connections are
+    // disabled. Explicit removal remains authoritative.
+    const refreshTarget = integrationRegistry.get("opencode");
+    if (registry.get("opencode") && refreshTarget?.isInstalledHookCurrent) {
+      const stateBeforeRefresh = await readState();
+      if (!stateBeforeRefresh.sources.opencode?.autoInjectSuppressed
+        && (stateBeforeRefresh.sources.opencode?.status === "plugin_installed" || await refreshTarget.isInstalled("opencode"))) {
+        try {
+          if (!(await refreshTarget.isInstalledHookCurrent())) {
+            const latestState = await readState();
+            if (!disposed && !latestState.sources.opencode?.autoInjectSuppressed) {
+              await mutateConnection("opencode", "plugin", "POST", "auto_inject");
+              const installedState = await readState();
+              if (installedState.sources.opencode?.autoInjectSuppressed) {
+                await mutateConnection("opencode", "plugin", "DELETE", "auto_inject");
+              }
+            }
+          }
+        } catch (error) {
+          logger.warn("connection.auto_update_failed", { sourceId: "opencode", ...memoryErrorFields(error) });
+        }
+      }
+    }
     if (config.autoInjectSkill) {
       const state = await readState();
       const discovered = await list();

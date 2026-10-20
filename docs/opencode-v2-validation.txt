@@ -1,0 +1,72 @@
+Bug 678 — OpenCode V1/V2 compatibility and upgrade validation
+
+Support scope
+V1 minimum target: 1.18.29. Regression binaries: 1.18.29, 1.19.2, V2 2.0.26.
+Earlier V1 and other V2 releases are not claimed as verified.
+Official migration reference: https://dev.opencode.ai/v2/docs/build/plugins/migrate-v1
+
+Implementation
+- One default export: V1 calls server(), V2 calls setup(). The V2 adapter registers
+  JSON Schema tools, the prompt hook, the memmy-resume command and event subscription.
+- The bridge bundles real Zod schemas. No runtime import of either host's SDK is
+  necessary. V1 receives Zod arguments; V2 receives JSON Schema and structured output.
+- Plugin capture and offline scanning use the same V1/V2 database adapter. V2 uses
+  session_v2/session_message; native user message IDs remain the source-turn identity.
+- Backend and Memory installers preserve existing connection config and unknown
+  fields. Malformed config aborts the update without overwriting the old plugin.
+- plugin_revision combines plugin/command content with OPENCODE_BRIDGE_REVISION.
+  Bump OPENCODE_BRIDGE_REVISION in BOTH targets whenever the OpenCode bridge contract
+  changes. plugin_integrity verifies the actual installed artifacts. This allows
+  Backend and Memory bundles to differ without repeatedly replacing each other.
+- Revision/integrity are written last. Missing or modified managed files trigger
+  repair. User removal suppression remains authoritative.
+- Both UIs show a restart instruction for connected OpenCode. This is guidance,
+  not a claim that the currently running OpenCode process has reloaded the plugin.
+
+Automated checks
+  npm run test:opencode
+  npm run lint
+  npm run typecheck
+  npm test
+
+The ordinary compatibility tests exercise real installed bridge/schema code with
+controlled HTTP/event fixtures. They do NOT replace the real-loader check below.
+
+Real loader check (macOS/Linux shell; substitute actual absolute binary paths)
+Install official pinned CLIs into separate temporary prefixes, not the user's
+global OpenCode installation. V1 package: opencode-ai. V2 package: @opencode/cli.
+Set OPENCODE_TEST_BINARIES to a JSON map such as:
+  {"1.18.29":"/absolute/v1/bin/opencode","1.19.2":"/absolute/recent-v1/bin/opencode","2.0.26":"/absolute/v2/bin/opencode"}
+Then run:
+  node --import tsx scripts/test-opencode-loader.mjs
+
+The script uses independent XDG/config/project directories and a local fixture
+Memory HTTP service. It checks the reported CLI version, actual plugin initialization,
+and V2's real tool registry, prompt recall request and cleanup. It deliberately uses
+an unavailable model: the model error is expected and no model call is made. The
+script prints the evidence directory containing process logs and fixture requests.
+This proves host integration, not complete model conversation or packaged GUI behavior.
+
+Packaged acceptance (next phase, after user confirmation)
+1. Prepare an isolated old-plugin installation with a valid test Memmy connection,
+   a separate third-party plugin, custom OpenCode settings and AGENTS.md content.
+2. Install/start the packaged repaired Memmy. Confirm the already-connected OpenCode
+   plugin is refreshed without removing/reconnecting it. Compare endpoint, token,
+   config path and other user files locally; never print tokens in evidence logs.
+3. Save work, fully quit and reopen OpenCode. If it uses a separate server, restart
+   the server that loads the plugin too. Do not treat a new chat/window refresh as
+   sufficient until verified on that exact version.
+4. Look for "Memmy plugin loaded: revision=opencode-v2-1, entry=v1/v2" in stderr or
+   host logs. Lifecycle diagnostics use stderr because V2 can consume stdout.
+5. Exercise search/get/add, pre-turn recall, completed conversation capture and
+   /memmy-resume search plus selection. Verify one completed turn is stored once,
+   including after a history scan. Check non-Memmy tools still work.
+6. Fully quit/reopen again. On V2 verify the disposed log and no duplicate tools,
+   callbacks or captures. A forced process kill is not a graceful cleanup test.
+7. Repeat update: no duplicate config sections, no repeated replacement across the
+   Backend/Memory installation paths. Remove the integration and restart Memmy:
+   it must remain removed. Also test missing bridge and malformed config recovery.
+8. Run the Windows OpenCode Desktop 2.0.26 reproduction separately; macOS CLI
+   results do not constitute Windows Desktop acceptance.
+
+No data migration or user-database writes are needed for the read-only V2 adapter.
