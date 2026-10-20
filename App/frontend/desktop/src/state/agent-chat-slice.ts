@@ -18,6 +18,7 @@ import type {
   MemmyAgentWsEvent,
   AgentGoalState,
   AgentGoalControlAction,
+  AgentTaskPlanState,
   WebuiSessionTarget,
   WebuiQueuedMessage,
   ChatModelPreset,
@@ -28,10 +29,11 @@ import {
   isCronProactiveMessage,
   isAgentGoalState,
   isAgentGoalStatus,
+  isAgentTaskPlanState,
   parseAgentTurnSource,
   parseMemmyAgentModelSelection
 } from "../api/memmy-agent-client.js";
-import type { PendingAttachment } from "./agent-composer-state.js";
+import type { ComposerContextReference, PendingAttachment } from "./agent-composer-state.js";
 import {
   mergeFileEdits,
   mergeToolProgressEvents,
@@ -77,7 +79,7 @@ export interface AgentRecoveryChatRequest {
  */
 export type AgentMessageKind = "message" | "trace" | "narration" | "context_compaction";
 export type AgentCompactionStatus = "running" | "done" | "error";
-export type AgentChatMediaKind = "image" | "video" | "file";
+export type AgentChatMediaKind = "image" | "video" | "audio" | "file";
 export type AgentChatMediaAttachment = {
   kind: AgentChatMediaKind;
   url?: string;
@@ -85,6 +87,7 @@ export type AgentChatMediaAttachment = {
   path?: string;
 };
 export type { AgentGoalState } from "../api/memmy-agent-client.js";
+export type { AgentTaskPlanState } from "../api/memmy-agent-client.js";
 
 export interface AgentTaskView {
   sessionKey: string;
@@ -121,6 +124,8 @@ export interface AgentChatMessage {
   traces?: string[];
   toolEvents?: AgentToolProgressEvent[];
   fileEdits?: AgentFileEdit[];
+  agentUi?: unknown;
+  questionResponse?: unknown;
   activitySegmentId?: string;
   compactionId?: string;
   compactionStatus?: AgentCompactionStatus;
@@ -244,6 +249,8 @@ export interface AgentState {
   proactiveNotifications: Array<{ deliveryId: string; chatId: string; content: string }>;
   goalStatesByChatId: Record<string, AgentGoalState>;
   goalState: AgentGoalState | null;
+  taskPlanStatesByChatId: Record<string, AgentTaskPlanState>;
+  taskPlanState: AgentTaskPlanState | null;
   goalRunClockByChatId: Record<string, AgentGoalRunClock | null>;
   goalMutationPendingByChatId: Record<string, {
     requestId: string;
@@ -252,6 +259,7 @@ export interface AgentState {
   }>;
   composerDraftsByScope: Record<string, string>;
   composerPendingAttachmentsByScope: Record<string, PendingAttachment[]>;
+  composerContextReferencesByScope: Record<string, ComposerContextReference[]>;
   draftTargetsByScope: Record<string, WebuiSessionTarget>;
   draftTargetRevisionByScope: Record<string, number>;
   messageSendInFlightByScope: Record<string, string>;
@@ -306,6 +314,7 @@ export type AgentAction =
   | { type: "agent/blankDraftReopened" }
   | { type: "agent/newChatCreated"; chatId: string }
   | { type: "agent/transientSendFailed"; chatId: string }
+  | { type: "agent/pluginFeedbackRecorded"; chatId: string; content: string; clientRequestId: string }
   | { type: "agent/optimisticMessageRejected"; chatId: string; clientRequestId: string }
   | { type: "agent/userMessageQueued"; chatId: string; content: string; media?: AgentChatMediaAttachment[]; focus?: boolean; deliveryUncertain?: boolean; target?: WebuiSessionTarget; clientRequestId?: string; queueIfBusy?: boolean }
   | { type: "agent/queueItemRemoveStarted"; chatId: string; clientRequestId: string }
@@ -315,6 +324,7 @@ export type AgentAction =
   | { type: "agent/queueItemSteerFailed"; chatId: string; clientRequestId: string; error: AgentOperationError }
   | { type: "agent/composerDraftUpdated"; scopeKey: string; value: string }
   | { type: "agent/composerPendingAttachmentsUpdated"; scopeKey: string; attachments: PendingAttachment[] }
+  | { type: "agent/composerContextReferencesUpdated"; scopeKey: string; references: ComposerContextReference[] }
   | { type: "agent/draftTargetUpdated"; scopeKey: string; target: WebuiSessionTarget }
   | { type: "agent/messageSendLockUpdated"; scopeKey: string; clientRequestId: string | null }
   | { type: "agent/tasksMarkedRead"; chatIds: string[] }
@@ -414,10 +424,13 @@ export const initialAgentState: AgentState = {
   proactiveNotifications: [],
   goalStatesByChatId: {},
   goalState: null,
+  taskPlanStatesByChatId: {},
+  taskPlanState: null,
   goalRunClockByChatId: {},
   goalMutationPendingByChatId: {},
   composerDraftsByScope: {},
   composerPendingAttachmentsByScope: {},
+  composerContextReferencesByScope: {},
   draftTargetsByScope: {},
   draftTargetRevisionByScope: {},
   messageSendInFlightByScope: {},
@@ -611,6 +624,8 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       return clearOptimisticSend(state, action.chatId, action.clientRequestId);
     case "agent/userMessageQueued":
       return queueOptimisticUserMessage(state, action);
+    case "agent/pluginFeedbackRecorded":
+      return recordPluginFeedbackMessage(state, action);
     case "agent/queueItemRemoveStarted":
       return updateQueuedMessageStatus(state, action.chatId, action.clientRequestId, "removing");
     case "agent/queueItemRemoveFailed":
@@ -633,6 +648,8 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       return updateComposerDraft(state, action.scopeKey, action.value);
     case "agent/composerPendingAttachmentsUpdated":
       return updateComposerPendingAttachments(state, action.scopeKey, action.attachments);
+    case "agent/composerContextReferencesUpdated":
+      return updateComposerContextReferences(state, action.scopeKey, action.references);
     case "agent/draftTargetUpdated":
       return {
         ...state,
@@ -1105,6 +1122,32 @@ function queueOptimisticUserMessage(
   });
 }
 
+function recordPluginFeedbackMessage(
+  state: AgentState,
+  action: Extract<AgentAction, { type: "agent/pluginFeedbackRecorded" }>
+): AgentState {
+  const existingMessages = chatMessagesForId(state, action.chatId);
+  if (existingMessages.some((message) => message.clientRequestId === action.clientRequestId)) {
+    return state;
+  }
+  const message: AgentChatMessage = {
+    id: nextMessageId(existingMessages, "user"),
+    role: "user",
+    content: action.content,
+    createdAt: Date.now(),
+    clientRequestId: action.clientRequestId
+  };
+  const messages = [...existingMessages, message];
+  const nextState = {
+    ...state,
+    messagesByChatId: { ...state.messagesByChatId, [action.chatId]: messages },
+    completedUnseenByChatId: clearChatMapValue(state.completedUnseenByChatId, action.chatId)
+  };
+  return action.chatId === state.currentChatId && !state.blankDraftActive
+    ? { ...nextState, messages }
+    : nextState;
+}
+
 function settleTaskState(
   state: AgentState,
   action: Extract<AgentAction, { type: "agent/taskStateSettled" }>
@@ -1392,23 +1435,51 @@ function updateComposerPendingAttachments(state: AgentState, scopeKey: string, a
   };
 }
 
+function updateComposerContextReferences(
+  state: AgentState,
+  scopeKey: string,
+  references: ComposerContextReference[]
+): AgentState {
+  if (!references.length) {
+    if (!(scopeKey in state.composerContextReferencesByScope)) {
+      return state;
+    }
+    const composerContextReferencesByScope = { ...state.composerContextReferencesByScope };
+    delete composerContextReferencesByScope[scopeKey];
+    return { ...state, composerContextReferencesByScope };
+  }
+  if (state.composerContextReferencesByScope[scopeKey] === references) {
+    return state;
+  }
+  return {
+    ...state,
+    composerContextReferencesByScope: {
+      ...state.composerContextReferencesByScope,
+      [scopeKey]: references
+    }
+  };
+}
+
 function clearComposerScope(state: AgentState, scopeKey: string): AgentState {
   const hasDraft = scopeKey in state.composerDraftsByScope;
   const hasPendingAttachments = scopeKey in state.composerPendingAttachmentsByScope;
+  const hasContextReferences = scopeKey in state.composerContextReferencesByScope;
   const hasTarget = scopeKey in state.draftTargetsByScope;
   const hasTargetRevision = scopeKey in state.draftTargetRevisionByScope;
   const hasSendLock = scopeKey in state.messageSendInFlightByScope;
-  if (!hasDraft && !hasPendingAttachments && !hasTarget && !hasTargetRevision && !hasSendLock) {
+  if (!hasDraft && !hasPendingAttachments && !hasContextReferences && !hasTarget && !hasTargetRevision && !hasSendLock) {
     return state;
   }
 
   const composerDraftsByScope = { ...state.composerDraftsByScope };
   const composerPendingAttachmentsByScope = { ...state.composerPendingAttachmentsByScope };
+  const composerContextReferencesByScope = { ...state.composerContextReferencesByScope };
   const draftTargetsByScope = { ...state.draftTargetsByScope };
   const draftTargetRevisionByScope = { ...state.draftTargetRevisionByScope };
   const messageSendInFlightByScope = { ...state.messageSendInFlightByScope };
   delete composerDraftsByScope[scopeKey];
   delete composerPendingAttachmentsByScope[scopeKey];
+  delete composerContextReferencesByScope[scopeKey];
   delete draftTargetsByScope[scopeKey];
   delete draftTargetRevisionByScope[scopeKey];
   delete messageSendInFlightByScope[scopeKey];
@@ -1416,6 +1487,7 @@ function clearComposerScope(state: AgentState, scopeKey: string): AgentState {
     ...state,
     composerDraftsByScope,
     composerPendingAttachmentsByScope,
+    composerContextReferencesByScope,
     draftTargetsByScope,
     draftTargetRevisionByScope,
     messageSendInFlightByScope
@@ -1431,6 +1503,7 @@ function enterBlankDraft(state: AgentState, newChatRequestId: number): AgentStat
     isSending: false,
     isLoadingHistory: false,
     goalState: null,
+    taskPlanState: null,
     blankDraftActive: true,
     chatSelectionEpoch: state.chatSelectionEpoch + 1,
     newChatRequestId
@@ -2009,6 +2082,7 @@ function switchCurrentChat(state: AgentState, chatId: string, sessionKey = chatI
       chatSelectionEpoch: cachedState.blankDraftActive ? cachedState.chatSelectionEpoch + 1 : cachedState.chatSelectionEpoch,
       blankDraftActive: false,
       goalState: cachedState.goalStatesByChatId[chatId] ?? cachedState.goalState,
+      taskPlanState: cachedState.taskPlanStatesByChatId[chatId] ?? cachedState.taskPlanState,
       isSending: isChatBusy(cachedState, chatId)
     });
   }
@@ -2021,6 +2095,7 @@ function switchCurrentChat(state: AgentState, chatId: string, sessionKey = chatI
     currentSessionKey: sessionKey,
     messages: cachedState.messagesByChatId[chatId] ?? [],
     goalState: cachedState.goalStatesByChatId[chatId] ?? null,
+    taskPlanState: cachedState.taskPlanStatesByChatId[chatId] ?? null,
     isSending: isChatBusy(cachedState, chatId),
     blankDraftActive: false
   });
@@ -2454,7 +2529,9 @@ function stoppedMessagePayloadEquivalent(left: AgentChatMessage, right: AgentCha
     && JSON.stringify(left.media ?? []) === JSON.stringify(right.media ?? [])
     && JSON.stringify(left.traces ?? []) === JSON.stringify(right.traces ?? [])
     && JSON.stringify(left.toolEvents ?? []) === JSON.stringify(right.toolEvents ?? [])
-    && JSON.stringify(left.fileEdits ?? []) === JSON.stringify(right.fileEdits ?? []);
+    && JSON.stringify(left.fileEdits ?? []) === JSON.stringify(right.fileEdits ?? [])
+    && JSON.stringify(left.agentUi ?? null) === JSON.stringify(right.agentUi ?? null)
+    && JSON.stringify(left.questionResponse ?? null) === JSON.stringify(right.questionResponse ?? null);
 }
 
 function isSnapshotMissingLatestUserMessage(currentMessages: AgentChatMessage[], snapshot: AgentChatMessage[]): boolean {
@@ -2493,6 +2570,8 @@ function messagesEquivalent(left: AgentChatMessage, right: AgentChatMessage | un
     && JSON.stringify(left.traces ?? []) === JSON.stringify(right.traces ?? [])
     && JSON.stringify(left.toolEvents ?? []) === JSON.stringify(right.toolEvents ?? [])
     && JSON.stringify(left.fileEdits ?? []) === JSON.stringify(right.fileEdits ?? [])
+    && JSON.stringify(left.agentUi ?? null) === JSON.stringify(right.agentUi ?? null)
+    && JSON.stringify(left.questionResponse ?? null) === JSON.stringify(right.questionResponse ?? null)
     && left.activitySegmentId === right.activitySegmentId;
 }
 
@@ -2846,6 +2925,8 @@ function reduceWsEvent(state: AgentState, event: MemmyAgentWsEvent): AgentState 
       return updateRunStatus(state, event);
     case "goal_state":
       return updateGoalState(state, event.chat_id, event.goal_state);
+    case "task_plan_state":
+      return updateTaskPlanState(state, event.chat_id, event.task_plan_state);
     case "turn_end":
       return event.chat_id
         ? endTurn(state, event.chat_id, event.latency_ms, eventTurnId(event), event)
@@ -2951,6 +3032,8 @@ function reduceChatContentEvent(state: AgentState, event: MemmyAgentWsEvent): Ag
             ? setSuppressAssistantStreamUntilTurnEnd(nextState, chatId, true)
             : nextState;
         }
+      case "agent_question_response":
+        return applyAgentQuestionResponse(activeState, event);
       case "file_edit":
         return appendFileEditTrace(activeState, event);
       case "context_compaction":
@@ -2964,6 +3047,7 @@ function reduceChatContentEvent(state: AgentState, event: MemmyAgentWsEvent): Ag
 function isChatContentEvent(event: string): boolean {
   return [
     "user",
+    "agent_question_response",
     "delta",
     "stream_end",
     "reasoning_delta",
@@ -2973,6 +3057,29 @@ function isChatContentEvent(event: string): boolean {
     "context_compaction",
     "retry_wait"
   ].includes(event);
+}
+
+function agentQuestionRequestId(agentUi: unknown): string | null {
+  if (!agentUi || typeof agentUi !== "object" || Array.isArray(agentUi)) return null;
+  const card = (agentUi as Record<string, unknown>).questionCard;
+  if (!card || typeof card !== "object" || Array.isArray(card)) return null;
+  const requestId = (card as Record<string, unknown>).requestId;
+  return typeof requestId === "string" && requestId.trim() ? requestId.trim() : null;
+}
+
+function applyAgentQuestionResponse(state: AgentState, event: MemmyAgentWsEvent): AgentState {
+  const requestId = typeof event.request_id === "string" ? event.request_id.trim() : "";
+  if (!requestId || !Array.isArray(event.answers)) return state;
+  const index = state.messages.findIndex(
+    (message) => agentQuestionRequestId(message.agentUi) === requestId,
+  );
+  if (index < 0) return state;
+  const messages = [...state.messages];
+  messages[index] = {
+    ...messages[index]!,
+    questionResponse: { requestId, answers: event.answers },
+  };
+  return syncCurrentMessages({ ...state, messages });
 }
 
 function appendExternalUserMessage(
@@ -3052,7 +3159,8 @@ function withScopedChatMessages(
     messages: state.messagesByChatId[chatId] ?? [],
     isSending: isChatBusy(state, chatId),
     blankDraftActive: false,
-    goalState: state.goalStatesByChatId[chatId] ?? null
+    goalState: state.goalStatesByChatId[chatId] ?? null,
+    taskPlanState: state.taskPlanStatesByChatId[chatId] ?? null
   };
   const reduced = reducer(scopedState);
   const messagesByChatId = {
@@ -3071,7 +3179,10 @@ function withScopedChatMessages(
         || chatHasLiveStream({ ...reduced, currentChatId: state.currentChatId, messages: state.messages, messagesByChatId }, currentChatId)
       : false,
     blankDraftActive: state.blankDraftActive,
-    goalState: currentChatId ? reduced.goalStatesByChatId[currentChatId] ?? null : null
+    goalState: currentChatId ? reduced.goalStatesByChatId[currentChatId] ?? null : null,
+    taskPlanState: currentChatId
+      ? reduced.taskPlanStatesByChatId[currentChatId] ?? null
+      : null
   };
   return deriveTasks(nextState);
 }
@@ -3859,7 +3970,7 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".
 const VIDEO_ATTACHMENT_EXTENSIONS = new Set([".mp4", ".webm", ".mov", ".m4v"]);
 
 function isAgentChatMediaKind(value: unknown): value is AgentChatMediaKind {
-  return value === "image" || value === "video" || value === "file";
+  return value === "image" || value === "video" || value === "audio" || value === "file";
 }
 
 function extensionOf(value: string | undefined): string {
@@ -4073,8 +4184,9 @@ function appendAssistantMessage(state: AgentState, event: MemmyAgentWsEvent): Ag
   const text = typeof event.text === "string" ? event.text : typeof event.content === "string" ? event.content : "";
   const media = Array.isArray(event.media_urls) ? normalizeMedia(event.media_urls) : undefined;
   const modelError = normalizeModelError(event.model_error);
+  const agentUi = event.agent_ui;
   const messages = [...state.messages];
-  const forceNewAssistant = isCronProactiveEvent(event);
+  const forceNewAssistant = isCronProactiveEvent(event) || agentUi != null;
   const lastIndex = latestMessageIndexForTurn(messages, turnId);
   const last = lastIndex >= 0 ? messages[lastIndex] : undefined;
   let closedActivity = false;
@@ -4113,12 +4225,13 @@ function appendAssistantMessage(state: AgentState, event: MemmyAgentWsEvent): Ag
       content: modelError ? text : text || target.content,
       ...(media?.length ? { media } : {}),
       ...(modelError ? { modelError } : {}),
+      ...(agentUi != null ? { agentUi } : {}),
       ...(typeof event.latency_ms === "number" ? { latencyMs: event.latency_ms } : {}),
       ...(turnId ? { turnId } : {}),
       isStreaming: true
     };
   } else {
-    if (!text.trim() && !media?.length && !modelError) {
+    if (!text.trim() && !media?.length && !modelError && agentUi == null) {
       return closedActivity ? syncCurrentMessages({ ...state, messages }) : state;
     }
     const next: AgentChatMessage = {
@@ -4129,6 +4242,7 @@ function appendAssistantMessage(state: AgentState, event: MemmyAgentWsEvent): Ag
       createdAt: Date.now(),
       ...(media?.length ? { media } : {}),
       ...(modelError ? { modelError } : {}),
+      ...(agentUi != null ? { agentUi } : {}),
       ...(typeof event.latency_ms === "number" ? { latencyMs: event.latency_ms } : {})
     };
     messages.push(next);
@@ -4695,6 +4809,23 @@ function updateGoalState(state: AgentState, chatId: string | null | undefined, r
   };
 }
 
+function updateTaskPlanState(
+  state: AgentState,
+  chatId: string | null | undefined,
+  rawTaskPlanState: unknown,
+): AgentState {
+  if (!chatId || !isAgentTaskPlanState(rawTaskPlanState)) return state;
+  const taskPlanState: AgentTaskPlanState = rawTaskPlanState;
+  return {
+    ...state,
+    taskPlanStatesByChatId: {
+      ...state.taskPlanStatesByChatId,
+      [chatId]: taskPlanState,
+    },
+    taskPlanState: chatId === state.currentChatId ? taskPlanState : state.taskPlanState,
+  };
+}
+
 function endTurn(
   state: AgentState,
   chatId: string | null | undefined,
@@ -4758,6 +4889,8 @@ function normalizeThreadMessage(message: Record<string, unknown>, index: number)
         : undefined;
     const fileEdits = Array.isArray(message.fileEdits) ? normalizeFileEdits(message.fileEdits) : undefined;
     const modelError = normalizeModelError(message.modelError ?? message.model_error);
+    const agentUi = message.agentUi ?? message.agent_ui;
+    const questionResponse = message.questionResponse ?? message.question_response;
     const deliveryId = proactiveDeliveryId(message.metadata)
       ?? (typeof message.proactiveDeliveryId === "string" ? message.proactiveDeliveryId : null);
     const isProactive = (isRecord(message.metadata) && message.metadata.proactiveDelivery === "cron")
@@ -4785,6 +4918,8 @@ function normalizeThreadMessage(message: Record<string, unknown>, index: number)
       ...(kind !== "context_compaction" && Array.isArray(message.traces) ? { traces: message.traces.map(String) } : {}),
       ...(kind !== "context_compaction" && rawToolEvents ? { toolEvents: normalizeToolProgressEvents(rawToolEvents) } : {}),
       ...(kind !== "context_compaction" && fileEdits?.length ? { fileEdits } : {}),
+      ...(kind !== "context_compaction" && agentUi != null ? { agentUi } : {}),
+      ...(kind !== "context_compaction" && questionResponse != null ? { questionResponse } : {}),
       ...(kind !== "context_compaction" && typeof message.activitySegmentId === "string" ? { activitySegmentId: message.activitySegmentId } : {}),
       ...(kind === "context_compaction" ? { compactionId, compactionStatus } : {}),
       ...(createdAt == null ? {} : { createdAt }),

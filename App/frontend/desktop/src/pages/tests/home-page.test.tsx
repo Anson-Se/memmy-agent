@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { Window } from "happy-dom";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import { InstalledPluginSchema } from "@memmy/local-api-contracts";
+import type { PluginUiCall } from "../../app/plugin-ui-context.js";
 import { MemmyAgentMessageRejectedError } from "../../api/memmy-agent-client.js";
 import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
 import { agentReducer, initialAgentState } from "../../state/agent-chat-slice.js";
@@ -25,6 +27,11 @@ import {
   agentChatScopeKey,
   attachmentFilesFromDataTransfer,
   buildComposerCommandDraft,
+  collectPluginCommandTargets,
+  selectConversationPinnedCommands,
+  selectPluginCallsForConversation,
+  selectRecordingDeliveryFiles,
+  selectRecordingMaterialFiles,
   clipboardAttachmentFilesFromDataTransfer,
   dataTransferHasAttachmentFiles,
   hasActiveAgentConversation,
@@ -70,6 +77,53 @@ function mockCallOrder(fn: { mock: { invocationCallOrder: readonly number[] } },
 }
 
 describe("HomePage", () => {
+  it("keeps plugin cards scoped to the active chat during navigation", () => {
+    const calls: PluginUiCall[] = [
+      { pluginId: "legal-labor", capabilityId: "session-start", callId: "chat-1-call", conversationId: "websocket:chat-1", origin: "agent", events: [] },
+      { pluginId: "legal-labor", capabilityId: "material-collect", callId: "chat-2-call", conversationId: "websocket:chat-2", origin: "agent", events: [] },
+    ];
+
+    expect(selectPluginCallsForConversation(calls, "chat-1", "websocket:chat-1", "draft-1").map((call) => call.callId))
+      .toEqual(["chat-1-call"]);
+    expect(selectPluginCallsForConversation(calls, "chat-2", "websocket:chat-1", "draft-1").map((call) => call.callId))
+      .toEqual(["chat-2-call"]);
+  });
+
+  it("stages only the transcript of a recording as a diagnosis material", () => {
+    const files = selectRecordingMaterialFiles({
+      id: "rec-1", title: "访谈录音", recordedAt: "2026-10-13T11:35:16Z", durationMs: 4000, speakerCount: 1,
+      transcript: { text: "对。", segments: [] }, status: "ready", sessionKey: "websocket:chat-1", collected: true,
+      files: [
+        { kind: "audio", path: "/media/interview.webm", name: "访谈录音.webm", mime: "audio/webm", bytes: 10, url: "/audio" },
+        { kind: "file", path: "/media/interview.txt", name: "访谈转写.txt", mime: "text/plain", bytes: 20, url: "/text" }
+      ]
+    });
+
+    expect(files.map((file) => [file.name, file.collected])).toEqual([["访谈转写.txt", true]]);
+  });
+
+  it("hands over this conversation's finished recordings, oldest first", () => {
+    const entry = (id: string, recordedAt: string, sessionKey: string, status?: "transcribing") => ({
+      id, title: id, recordedAt, durationMs: 1000, speakerCount: 1, transcript: { text: "", segments: [] }, audioUrl: null, sessionKey,
+      ...(status ? { status } : {}),
+      files: [
+        { kind: "audio" as const, path: `/ws/recordings/${id}.webm`, name: `${id}.webm`, mime: "audio/webm" as const, bytes: 10, url: `/a/${id}` },
+        { kind: "file" as const, path: `/ws/recordings/${id}.txt`, name: `${id}.txt`, mime: "text/plain" as const, bytes: 10, url: `/t/${id}` }
+      ]
+    });
+    const recordings = [
+      entry("later", "2026-10-13T12:00:00Z", "websocket:chat-1"),
+      entry("earlier", "2026-10-13T11:00:00Z", "chat-1"),
+      entry("pending", "2026-10-13T13:00:00Z", "websocket:chat-1", "transcribing"),
+      entry("other", "2026-10-13T10:00:00Z", "websocket:chat-2")
+    ];
+
+    expect(selectRecordingDeliveryFiles(recordings, "chat-1").map((file) => file.name))
+      .toEqual(["earlier.webm", "earlier.txt", "later.webm", "later.txt"]);
+    expect(selectRecordingDeliveryFiles(recordings, "chat-1")[1]).toMatchObject({ path: "/ws/recordings/earlier.txt", mediaType: "text/plain" });
+    expect(selectRecordingDeliveryFiles(recordings, null)).toEqual([]);
+  });
+
   it("allows Goal steering when source metadata is missing without opening TUI or IM turns", () => {
     expect(isSteerableCurrentTurn(null, true)).toBe(true);
     expect(isSteerableCurrentTurn(null, false)).toBe(false);
@@ -2121,3 +2175,17 @@ class MemoryStorage implements SlashCommandStorageLike {
     this.values.delete(key);
   }
 }
+
+
+it("hides legal composer shortcuts until the current conversation actually invokes the legal plugin", () => {
+  const legal=InstalledPluginSchema.parse({ id:"legal-labor", version:"1.0.0", state:"active", approvedPermissions:[], config:{}, lastError:null,
+    createdAt:"2026-10-13T00:00:00Z", updatedAt:"2026-10-13T00:00:00Z", manifest:{ apiVersion:"memmy/v1", id:"legal-labor", name:"Legal", version:"1.0.0",
+      runtime:{adapter:"http"}, permissions:[], capabilities:[{id:"session-start",name:"Guide",description:"Guide",inputSchema:{},outputSchema:{},execution:"job"}],
+      commands:[{command:"/legal-guide",name:"诊断指引",description:"Guide",capabilityId:"session-start",pinned:true},
+        {command:"/legal-record",name:"访谈录音",description:"Record",capabilityId:"session-start",pinned:true,topbar:true}] } });
+  const targets=collectPluginCommandTargets([legal]);
+  expect(selectConversationPinnedCommands(targets, [])).toEqual([]);
+  const invocation: PluginUiCall={pluginId:"legal-labor", capabilityId:"session-start",callId:"starting",conversationId:"law-chat",origin:"agent",events:[]};
+  expect(selectConversationPinnedCommands(targets,[invocation])).toHaveLength(2);
+  expect(selectConversationPinnedCommands(targets,[{...invocation,pluginId:"another-plugin"}])).toEqual([]);
+});

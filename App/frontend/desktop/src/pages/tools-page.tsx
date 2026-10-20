@@ -137,8 +137,8 @@ export function ToolsPageView(props: ToolsPageViewProps) {
         <div className="mb-6 flex items-center gap-3 border-b border-border-stone/30 pb-4">
           <Memmy pose="connect" size={56} />
           <div>
-            <h1 className="text-lg font-bold text-text-ink">{t("tools.title")}</h1>
-            <p className="text-xs text-text-ink/65">{t("tools.subtitle")}</p>
+            <h1>{t("tools.title")}</h1>
+            <p>{t("tools.subtitle")}</p>
           </div>
         </div>
 

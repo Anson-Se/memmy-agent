@@ -86,16 +86,15 @@ export type AgentThreadPanelController = ReturnType<typeof useAgentThreadPanel>;
 type PanelSession = {
   phase: ThreadPanelPhase; fullscreen: boolean; view: ThreadPanelView; tabState: ThreadTabState;
   pinned: boolean; artifactsCollapsed: boolean; listWidth: number; resizing: boolean;
-  closingWidth: number | null; clearTabsOnClose: boolean;
+  closingWidth: number | null;
 };
 const EMPTY_PANEL_SESSION: PanelSession = {
   phase: 'closed', fullscreen: false, view: 'overview', tabState: EMPTY_TABS, pinned: false,
   artifactsCollapsed: false, listWidth: THREAD_LIST_DEFAULT_WIDTH, resizing: false,
-  closingWidth: null, clearTabsOnClose: false,
+  closingWidth: null,
 };
 function finishPanelClose(state: PanelSession): PanelSession {
-  return { ...state, phase: 'closed', closingWidth: null, resizing: false,
-    ...(state.clearTabsOnClose ? { tabState: EMPTY_TABS, pinned: false } : {}), clearTabsOnClose: false };
+  return { ...state, phase: 'closed', closingWidth: null, resizing: false };
 }
 
 export function useAgentThreadPanel(options: { scopeKey: string; containerRef: RefObject<HTMLElement | null>; enabled: boolean }) {
@@ -186,8 +185,7 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
   }, [ownerKey]);
   const open = useCallback(() => {
     cancelCloseTimer();
-    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null, clearTabsOnClose: false,
-      ...(state.clearTabsOnClose ? { tabState: EMPTY_TABS, pinned: false } : {}) }));
+    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null }));
   }, [ownerKey, updateSession, cancelCloseTimer]);
 
   const close = useCallback(() => {
@@ -211,8 +209,8 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
 
   const openTab = useCallback((tab: ThreadPanelTab) => {
     cancelCloseTimer();
-    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null, clearTabsOnClose: false,
-      tabState: openThreadTab(state.clearTabsOnClose ? EMPTY_TABS : state.tabState, tab),
+    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null,
+      tabState: openThreadTab(state.tabState, tab),
       pinned: liveWidthRef.current < THREAD_PANEL_NARROW_WIDTH ? false : state.pinned }));
     ensureContentWidth();
   }, [ownerKey, updateSession, cancelCloseTimer, ensureContentWidth]);
@@ -223,14 +221,13 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
   }, [ownerKey, updateSession]);
 
   const closeTab = useCallback((id: string) => {
-    const next = closeThreadTab((sessionsRef.current.get(ownerKey) ?? EMPTY_PANEL_SESSION).tabState, id);
-    if (next.tabs.length) {
-      updateSession(ownerKey, state => ({ ...state, tabState: next }));
-      return;
-    }
-    updateSession(ownerKey, state => ({ ...state, clearTabsOnClose: true }));
-    close();
-  }, [ownerKey, updateSession, close]);
+    updateSession(ownerKey, state => {
+      const tabState = closeThreadTab(state.tabState, id);
+      if (tabState === state.tabState) return state;
+      // With no previews left, keep the panel open on its file list.
+      return { ...state, tabState, pinned: tabState.tabs.length > 0 && state.pinned };
+    });
+  }, [ownerKey, updateSession]);
 
   const resize = useCallback((nextWidth: number) => {
     const clamped = clampThreadPanelWidth(nextWidth, containerWidthRef.current);
@@ -347,6 +344,11 @@ export function AgentThreadPanel(props: {
   }, []);
   const setBrowserOpen = (open: boolean) => updateBrowser(ownerKey, state => ({ ...state, open }));
   const setActiveBrowserTabId = (activeId: number) => updateBrowser(ownerKey, state => ({ ...state, activeId }));
+  const closeFileTab = (id: string) => {
+    const closingLastFile = panel.tabState.tabs.length === 1 && panel.tabState.tabs[0]?.id === id;
+    panel.closeTab(id);
+    if (closingLastFile && browserMounted && browserTabs.length > 0) setBrowserOpen(true);
+  };
   const addBrowserTab = useCallback((url?: string, owner = ownerKey, fromPagePopup = false) => {
     const id = nextBrowserTabId.current++;
     updateBrowser(owner, state => {
@@ -648,7 +650,7 @@ export function AgentThreadPanel(props: {
                 setBrowserOpen(false);
                 panel.activateTab(id);
               }}
-              onClose={panel.closeTab}
+              onClose={closeFileTab}
               browserTabs={browserMounted ? browserTabs : []}
               activeBrowserTabId={activeBrowserTabId}
               onActivateBrowser={(id) => {

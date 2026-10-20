@@ -449,6 +449,32 @@ describe("AgentThreadPanel", () => {
     expect(panel.tabState.tabs).toHaveLength(1);
   });
 
+  it("shows all six artifacts in both the overview popover and the pinned list", async () => {
+    const names = ["review.pdf", "review.docx", "review.md", "review.tex", "neurips_2024.sty", "references.bib"];
+    render({ messages: [{ id: "six", role: "assistant", content: names.map(name => `[${name}](/work/${name})`).join(" ") }],
+      context: { ...emptyContext(), artifactClient: artifactClient(), fetchFn: textFetch({ "/work/review.md": "# Review" }) } });
+    await act(async () => clickText(".thread-overview-item", "review.md"));
+    act(() => document.querySelector<HTMLButtonElement>(".thread-panel__overview-button")!.click());
+    expect(document.querySelectorAll(".thread-popover .thread-overview-item")).toHaveLength(6);
+    expect(document.querySelector(".thread-overview__more")).toBeNull();
+    expect(document.querySelector<HTMLElement>(".thread-popover")!.style.height).toBe("");
+    expect(document.querySelector<HTMLElement>(".thread-popover")!.style.maxHeight).not.toBe("");
+    act(() => document.querySelector<HTMLButtonElement>('.thread-popover [aria-label="固定侧栏"]')!.click());
+    expect(document.querySelectorAll(".thread-panel__list .thread-overview-item")).toHaveLength(6);
+    expect(document.querySelector(".thread-overview__more")).toBeNull();
+  });
+
+  it("opens the overview by hover and click with only browser tabs", () => {
+    render({ messages: [], context: emptyContext() });
+    act(() => document.querySelector<HTMLButtonElement>('[aria-label="浏览器"]')!.click());
+    const overview = document.querySelector<HTMLButtonElement>(".thread-panel__overview-button")!;
+    act(() => overview.dispatchEvent(new PointerEvent("pointerover", { bubbles: true })));
+    expect(document.querySelector(".thread-popover")).not.toBeNull();
+    act(() => overview.click());
+    expect(document.querySelector(".thread-popover")).not.toBeNull();
+    expect(document.querySelectorAll(".thread-tabs [data-browser-tab]")).toHaveLength(1);
+  });
+
   it("opens an artifact in a tab, widens to half the workspace and keeps the list behind the hover overview", async () => {
     const client = artifactClient();
     render({
