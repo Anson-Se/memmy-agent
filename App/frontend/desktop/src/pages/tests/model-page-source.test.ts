@@ -21,7 +21,7 @@ describe("ModelPage source", () => {
     expect(messagesSource).toContain('"apiKey.modelPage.reusePrevious": "沿用上一步的 Agent 任务模型"');
     expect(messagesSource).toContain('"apiKey.modelPage.memoryHint": "可用更轻量的模型（如 30B），性价比更高"');
     expect(pageSource).toContain('t("apiKey.modelPage.title")');
-    expect(pageSource.indexOf('title={t("apiKey.modelPage.skillTitle")}')).toBeLessThan(pageSource.indexOf('title={t("apiKey.modelPage.memoryTitle")}'));
+    expect(pageSource.indexOf('title={t("apiKey.modelPage.memoryTitle")}')).toBeLessThan(pageSource.indexOf('title={t("apiKey.modelPage.skillTitle")}'));
     expect(pageSource).toContain('dispatch(appActions.navigate("/api-key"))');
     expect(pageSource).toContain('dispatch(appActions.navigate("/api-key-optional"))');
     expect(pageSource).not.toContain("resolveByokModelCompletion");

@@ -469,7 +469,7 @@ describe("BYOK setup save feedback", () => {
 
     const reuseButtons = () => [...container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')];
     await click(reuseButtons()[1]!);
-    await click(testButton());
+    await click(testButton(0));
     await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ endpointId: agentEndpointId, apiKey: "" }),
@@ -478,7 +478,7 @@ describe("BYOK setup save feedback", () => {
     ));
 
     await click(reuseButtons()[0]!);
-    await click(testButton());
+    await click(testButton(0));
     await vi.waitFor(() => expect(testModelConfig).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ endpointId: agentEndpointId, apiKey: "" }),
@@ -494,8 +494,10 @@ describe("BYOK setup save feedback", () => {
       .mockResolvedValueOnce(savedModelConfig());
     mocks.clients = createClients(saveModelCatalog);
     await render(<ModelPage />);
-    await click(button("apiKey.modelPage.reuseAgentChat"));
-    await click(button("apiKey.modelPage.reuseEvolution"));
+    for (const label of ["apiKey.modelPage.reuseAgentChat", "apiKey.modelPage.reuseEvolution"]) {
+      const reuse = button(label);
+      if (reuse.getAttribute("aria-checked") !== "true") await click(reuse);
+    }
     const nextButton = button("apiKey.next");
 
     await click(nextButton);

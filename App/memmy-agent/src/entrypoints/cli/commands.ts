@@ -926,7 +926,7 @@ export async function serve({
   const appServer = createApp(
     loop,
     resolved.model,
-
+    timeout == null ? loaded.api.timeout : Number(timeout),
   );
   const bindHost = host ?? loaded.api.host;
   const bindPort = port == null ? loaded.api.port : Number(port);

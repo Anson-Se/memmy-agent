@@ -2349,21 +2349,6 @@ export function HomePage() {
     }
   }
 
-  function resetComposerDraftUi(scopeKey = chatScopeKey) {
-    setSelectedComposerCommandForScope(scopeKey, null);
-    for (const item of pendingAttachmentsRef.current[scopeKey] ?? []) {
-      revokePendingAttachment(item);
-    }
-    const nextDrafts = { ...composerDraftsRef.current };
-    const nextPendingAttachments = { ...pendingAttachmentsRef.current };
-    delete nextDrafts[scopeKey];
-    delete nextPendingAttachments[scopeKey];
-    composerDraftsRef.current = nextDrafts;
-    pendingAttachmentsRef.current = nextPendingAttachments;
-    dispatch(agentActions.composerScopeCleared(scopeKey));
-    resetComposerHeight();
-  }
-
   function closeLastCompactionPanel() {
     lastCompactionRequestIdRef.current += 1;
     pendingLastCompactionChatRef.current = null;
@@ -2783,7 +2768,7 @@ export function HomePage() {
           }
         : item));
       return true;
-    } catch (error) {
+    } catch {
       setPendingAttachmentsForScope(scopeKey, (current) => {
         const failed = current.find((item) => item.id === id);
         if (failed) revokePendingAttachment(failed);
@@ -4106,10 +4091,6 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function isMessageKey(value: string): value is MessageKey {
-  return Object.prototype.hasOwnProperty.call(zhCNMessages, value);
 }
 
 export function hasCompletedAssistantAnswer(messages: AgentChatMessage[]): boolean {

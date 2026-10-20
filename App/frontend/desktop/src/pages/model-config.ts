@@ -328,15 +328,16 @@ export function hydrateModelConfigForm(
     imageGenApiKeyMasked
   );
   const byokAssignments = saved.catalog?.modelAssignments.byok;
+  const hasAssignedByokPrimary = Boolean(byokAssignments?.agent?.default || byokAssignments?.agent?.candidates?.length);
   const skillModel = hydrateRoleModelConfig(
     saved.memmyMemory?.evolution,
     primary,
-    Boolean(byokAssignments?.memoryEvolution)
+    Boolean(byokAssignments?.memoryEvolution || hasAssignedByokPrimary)
   );
   const memoryModel = hydrateRoleModelConfig(
     saved.memmyMemory?.summary,
     modelFormValuesAsPrimary(createModelFormValues(skillModel, primary)),
-    Boolean(byokAssignments?.memorySummary)
+    Boolean(byokAssignments?.memorySummary || hasAssignedByokPrimary)
   );
 
   return {
@@ -500,8 +501,12 @@ function hydrateRoleModelConfig(
   primary: PrimaryModelValues,
   _inherited = false
 ): ModelConfig {
-  if (!role || role.mode === "follow" || (role.mode !== "fixed" && !role.configured && !role.apiKeyMasked && !role.apiKey.trim())) {
+  if (_inherited && (!role || role.mode === "follow")) {
     return createModelConfig(primary.protocol);
+  }
+
+  if (!role || role.mode === "follow" || (role.mode !== "fixed" && !role.configured && !role.apiKeyMasked && !role.apiKey.trim())) {
+    return { ...createModelConfig(primary.protocol), reuse: false };
   }
 
   const protocol = toProtocol(role.provider);

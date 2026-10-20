@@ -95,8 +95,8 @@ const scenarios: Scenario[] = [
   { role: "embedding", page: () => <ApiKeyPage />, endpoint: "apiKey.embeddingEndpoint", model: "apiKey.embeddingModel", key: "apiKey.embeddingKey", expected: "sk-embedding-2222", index: 1 },
   { role: "asr", page: () => <ApiKeyOptionalPage />, endpoint: "apiKey.asrEndpoint", model: "apiKey.asrModel", key: "apiKey.asrKey", expected: "sk-asr-3333", index: 0 },
   { role: "image_generation", page: () => <ApiKeyOptionalPage />, endpoint: "apiKey.imageGenEndpoint", model: "apiKey.imageGenModel", key: "apiKey.imageGenKey", expected: "sk-image-4444", index: 1 },
-  { role: "memory_evolution", page: () => <ModelPage />, endpoint: "apiKey.endpoint", model: "apiKey.model", key: "API Key", expected: "sk-team-1111", index: 0, fieldIndex: 0 },
-  { role: "memory_summary", page: () => <ModelPage />, endpoint: "apiKey.endpoint", model: "apiKey.model", key: "API Key", expected: "sk-summary-1111", index: 1, fieldIndex: 1 }
+  { role: "memory_evolution", page: () => <ModelPage />, endpoint: "apiKey.endpoint", model: "apiKey.model", key: "API Key", expected: "sk-team-1111", index: 1, fieldIndex: 1 },
+  { role: "memory_summary", page: () => <ModelPage />, endpoint: "apiKey.endpoint", model: "apiKey.model", key: "API Key", expected: "sk-summary-1111", index: 0, fieldIndex: 0 }
 ];
 
 describe("BYOK displayed, tested and saved credentials", () => {
@@ -149,9 +149,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     const writes = server.write.mock.calls.length;
     await click(next());
     await vi.waitFor(() => expect(server.write.mock.calls.length).toBeGreaterThan(writes));
-    if (mocks.dispatch.mock.calls.length > 0) {
-      await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
-    }
+    await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
     expect(await server.key(scenario.role)).toBe(tested.apiKey);
     return tested;
   }
@@ -213,7 +211,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     await render(<ModelPage />);
     const checkbox = () => [...container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')][index]!;
     expect(checkbox().getAttribute("aria-checked")).toBe("false");
-    const scenario = scenarios[index === 0 ? 4 : 5]!;
+    const scenario = scenarios[index === 0 ? 5 : 4]!;
     await click(test(index));
     await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
     expect(server.probe.mock.calls[0]![0].apiKey).toBe(scenario.expected);
@@ -254,7 +252,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     await click([...container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')][index]!);
     await click(next());
     await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
-    expect(await server.key(index === 0 ? "memory_evolution" : "memory_summary")).toBe(index === 0 ? "sk-personal-1111" : "sk-team-1111");
+    expect(await server.key(index === 0 ? "memory_summary" : "memory_evolution")).toBe(index === 0 ? "sk-team-1111" : "sk-personal-1111");
   });
 
   it.each([0, 1])("role %i: disabling explicit follow copies the displayed inherited key and its actual source", async (index) => {
@@ -265,7 +263,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     const checkbox = [...container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')][index]!;
     expect(checkbox.getAttribute("aria-checked")).toBe("true");
     await click(checkbox);
-    const scenario = { ...scenarios[index === 0 ? 4 : 5]!, index: 0, fieldIndex: 0 };
+    const scenario = { ...scenarios[index === 0 ? 5 : 4]!, index: 0, fieldIndex: 0 };
     expect(field("API Key").placeholder).toContain("1111");
     expect((await testAndSave(scenario)).apiKey).toBe("sk-personal-1111");
   });
@@ -305,7 +303,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
   it("a rejected independent key cannot fall back to the valid primary key or be saved", async () => {
     await render(<ModelPage />);
     server.probe.mockResolvedValueOnce({ ok: false, message: "rejected team key", checkedAt: "2026-10-16T00:00:00.000Z" });
-    await click(test(0));
+    await click(test(1));
     await vi.waitFor(() => expect(container.textContent).toContain("rejected team key"));
     expect(server.probe.mock.calls[0]![0].apiKey).toBe("sk-team-1111");
     expect(next().disabled).toBe(true);
@@ -462,17 +460,17 @@ describe("BYOK displayed, tested and saved credentials", () => {
     let finish!: (result: Awaited<ReturnType<typeof server.probe>>) => void;
     server.probe.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
     await render(<ModelPage />);
-    await click(test(0));
+    await click(test(1));
     await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
-    if (edit === "model") await change(field("apiKey.model", 0), "changed-model");
-    if (edit === "key") await change(field("API Key", 0), "sk-new-team-1111");
+    if (edit === "model") await change(field("apiKey.model", 1), "changed-model");
+    if (edit === "key") await change(field("API Key", 1), "sk-new-team-1111");
     if (edit === "reuse") {
-      const checkbox = () => container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[0]!;
+      const checkbox = () => container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[1]!;
       await click(checkbox());
       await click(checkbox());
     }
     await act(async () => finish({ ok: true, message: "ok", checkedAt: "2026-10-16T00:00:00.000Z" }));
-    expect(test(0).textContent).not.toBe("apiKey.testSuccess");
+    expect(test(1).textContent).not.toBe("apiKey.testSuccess");
     expect(next().disabled).toBe(true);
     expect(server.write).not.toHaveBeenCalled();
     await testAndSave(scenarios[4]!);
@@ -686,7 +684,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
       await finishOld();
       expect(test(index).disabled).toBe(false);
       expect(test(index).textContent).toBe("apiKey.test");
-      const scenario = scenarios[index === 0 ? 4 : 5]!;
+      const scenario = scenarios[index === 0 ? 5 : 4]!;
       const tested = await testAndSave(scenario);
       expect(tested).toMatchObject(edit === "model" ? { modelId: "corrected-model" } : { apiKey: "sk-corrected-9999" });
     }
@@ -725,22 +723,22 @@ describe("BYOK displayed, tested and saved credentials", () => {
     const finishOld = deferProbe();
     const finishNew = deferProbe();
     await render(<ModelPage />);
-    await click(test(0));
+    await click(test(1));
     await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(1));
-    await change(field("apiKey.model", 0), "new-model");
-    if (order === "return-to-original") await change(field("apiKey.model", 0), "same-model");
-    await click(test(0));
+    await change(field("apiKey.model", 1), "new-model");
+    if (order === "return-to-original") await change(field("apiKey.model", 1), "same-model");
+    await click(test(1));
     await vi.waitFor(() => expect(server.probe).toHaveBeenCalledTimes(2));
     if (order === "old-first") {
       await finishOld();
-      expect(test(0).textContent).toBe("apiKey.testing");
+      expect(test(1).textContent).toBe("apiKey.testing");
       expect(next().disabled).toBe(true);
       await finishNew();
     } else {
       await finishNew();
       await finishOld(false);
     }
-    expect(test(0).textContent).toBe("apiKey.testSuccess");
+    expect(test(1).textContent).toBe("apiKey.testSuccess");
     expect(next().disabled).toBe(false);
     await click(next());
     await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
@@ -781,7 +779,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     await render(<ModelPage />);
     const boxes = () => container.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]');
     expect([...boxes()].map((b) => b.getAttribute("aria-checked"))).toEqual(["true", "true"]);
-    await click(boxes()[0]!); // Copy the new primary into an independent evolution configuration.
+    await click(boxes()[1]!); // Copy the new primary into an independent evolution configuration.
     expect(field("API Key").placeholder).toContain("9999");
     await change(field("API Key"), "sk-chain-team-7777");
     expect(next().disabled).toBe(true);
