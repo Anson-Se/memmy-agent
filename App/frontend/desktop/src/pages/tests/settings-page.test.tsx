@@ -253,6 +253,8 @@ describe("resolveSettingsTabFromHash", () => {
     expect(resolveSettingsTabFromHash("#token-usage")).toBe("tokens");
     expect(resolveSettingsTabFromHash("#token-usage-memory-budget")).toBe("tokens");
     expect(resolveSettingsTabFromHash("#about")).toBe("about");
+    expect(resolveSettingsTabFromHash("#computer-use-browser-extension")).toBe("computer-use");
+    expect(resolveSettingsTabFromHash("#computer-use-excel")).toBe("computer-use");
     expect(resolveSettingsTabFromHash("#unknown")).toBeNull();
   });
 });

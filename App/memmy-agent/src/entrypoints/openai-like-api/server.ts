@@ -441,7 +441,7 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
       return { text: textResponse, usage };
     });
     return Response.json(chatCompletionResponse(reply.text, context.modelName, reply.usage));
-  } catch (err) {
+  } catch {
     if (controller.signal.aborted) return errorJson(409, "Task cancelled by user.", "cancelled");
     return errorJson(500, "Internal server error", "server_error");
   } finally {

@@ -1,3 +1,4 @@
+/* global console */
 import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { npmInvocation } from "../../../scripts/internal/shared/npm-invocation.mjs";
 import { dirname, join, resolve } from "node:path";

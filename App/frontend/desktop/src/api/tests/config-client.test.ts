@@ -245,9 +245,9 @@ describe("config-client canonical model catalog", () => {
         endpointId: "chat-duplicate",
         apiBase: "https://api.openai.com/v1/",
         protocol: "openai-chat-completions",
-        ...(keyLocation === "endpoint apiKey" ? { apiKey: "  sk-live1234  " } : {})
+        ...(keyLocation === "endpoint apiKey" ? { apiKey: "  fixture-live-key-1234  " } : {})
       });
-      if (keyLocation === "provider apiKey") input.providers[0]!.apiKey = "  sk-live1234  ";
+      if (keyLocation === "provider apiKey") input.providers[0]!.apiKey = "  fixture-live-key-1234  ";
       input.providers[0]!.models.push({
         presetId: clientPresetId,
         endpointId: "chat-duplicate",
@@ -303,7 +303,7 @@ describe("config-client canonical model catalog", () => {
       input.providers[0]!.endpoints.push({
         ...input.providers[0]!.endpoints[0]!,
         endpointId: "chat-copy",
-        apiKey: "sk-different-secret1234"
+        apiKey: "fixture-different-key-1234"
       });
       input.providers[0]!.models.push({
         presetId: clientId,

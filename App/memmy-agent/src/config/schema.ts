@@ -3,6 +3,7 @@ import { getModelTokenDefaults } from "../providers/model-token-defaults.js";
 import { PROVIDERS, findByName } from "../providers/registry.js";
 import { DEFAULT_MAX_TOKENS } from "../token-budget.js";
 import { normalizeTimeZoneOffset, systemUtcOffset } from "../utils/time-zone.js";
+import { MEMMY_COMPUTER_USE_MCP_SERVER } from "./computer-use-server.js";
 
 type Dict<T = any> = Record<string, T>;
 export type ContextCompactionSummaryMode = "text" | "dag";
@@ -969,7 +970,7 @@ export class ToolsConfig extends Base {
     this.restrictToWorkspace = pick(init, ["restrictToWorkspace"], false);
     this.ssrfWhitelist = assertStringArray("ssrfWhitelist", pick(init, ["ssrfWhitelist"], []));
     const mcp = pick(init, ["mcpServers"], {
-      open_computer_use: {
+      [MEMMY_COMPUTER_USE_MCP_SERVER]: {
         type: "stdio",
         command: "open-computer-use",
         args: ["mcp"],
@@ -1028,12 +1029,14 @@ export class HeartbeatConfig extends Base {
 export class ApiConfig extends Base {
   host = "127.0.0.1";
   port = 18990;
+  timeout = 120;
   apiKey: string | null = null;
 
   constructor(init: Dict = {}) {
     super();
     this.host = pick(init, ["host"], this.host);
     this.port = pick(init, ["port"], this.port);
+    this.timeout = pick(init, ["timeout"], this.timeout);
     this.apiKey = pick(init, ["apiKey"], null);
   }
 
@@ -1041,6 +1044,7 @@ export class ApiConfig extends Base {
     return {
       host: this.host,
       port: this.port,
+      timeout: this.timeout,
       apiKey: this.apiKey,
     };
   }
