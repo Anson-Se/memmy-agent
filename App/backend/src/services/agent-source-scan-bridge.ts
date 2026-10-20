@@ -1,3 +1,4 @@
+import { agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
 import type { AgentSourceScanInput, AgentSourceScanStatusResponse, MemoryAgentSourceScanState } from "@memmy/local-api-contracts";
 import type { AgentSourceScanClient } from "../adapters/outbound/memory-client/types.js";
 import { MemoryLayerError, memoryScanUnavailable } from "../adapters/outbound/memory-client/errors.js";
@@ -14,18 +15,30 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
     if (!client) throw new MemoryLayerError("memory_layer_unavailable", 503, "Memory scanning API is unavailable");
     return client;
   };
+  function identity(state: MemoryAgentSourceScanState) {
+    return { jobId: state.jobId!, ...(state.attemptId ? { attemptId: state.attemptId } : {}),
+      ...(state.startedAt ? { attemptStartedAt: state.startedAt } : {}) };
+  }
+  function desktopProgress(progress: NonNullable<MemoryAgentSourceScanState["progress"]>) {
+    const phase = ["discover", "read", "redact", "emit", "prepare"].includes(progress.phase)
+      ? "scan" as const : progress.phase as "scan" | "add" | "summarize" | "done" | "stopped";
+    return { ...progress, phase };
+  }
+  function succeeded(state: MemoryAgentSourceScanState) {
+    return !state.error && (state.results ?? []).every((result) => (result.errorCount ?? result.errors.length) === 0 && result.errors.length === 0);
+  }
   function publish(state: MemoryAgentSourceScanState) {
     if (stopped || !state.jobId || !state.sourceId) return;
     if (state.progress && (state.running || state.progress.phase === "stopped")) {
-      const progress = { ...state.progress, jobId: state.jobId };
+      const progress = { ...desktopProgress(state.progress), ...identity(state) };
       const key = JSON.stringify(progress);
       if (key !== lastProgress) {
         lastProgress = key;
         bus.emit("agent_source.scan_progress", progress);
       }
     }
-    if (!state.running && state.completedAt && state.jobId !== lastCompletion) {
-      lastCompletion = state.jobId;
+    if (!state.running && state.completedAt && agentSourceScanExecutionKey(identity(state)) !== lastCompletion) {
+      lastCompletion = agentSourceScanExecutionKey(identity(state));
       const results = state.results?.length ? state.results : [{
         sourceId: state.sourceId, discoveredConversations: 0, emittedMessages: 0, skipped: 0, errors: []
       }];
@@ -33,7 +46,8 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
         results[0] = { ...results[0]!, errors: [{ conversationId: "scan", reason: state.error }] };
       }
       bus.emit("agent_source.scan_completed", {
-        jobId: state.jobId,
+        ...identity(state),
+        succeeded: succeeded(state),
         sourceId: state.sourceId,
         results
       });
@@ -55,7 +69,7 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
   return {
     async start(input: AgentSourceScanInput) {
       const current = await snapshot();
-      if (current.running && current.sourceId === input.sourceId && current.mode === (input.mode ?? null) && current.jobId) return { jobId: current.jobId };
+      if (current.running && current.sourceId === input.sourceId && current.mode === (input.mode ?? null) && current.jobId) return identity(current);
       const job = await requireClient().start(input);
       await snapshot();
       return job;
@@ -73,11 +87,11 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
       return {
         active: state.running,
         progress: state.jobId && (state.running || state.progress?.phase === "stopped") ? {
-          jobId: state.jobId,
-          ...(state.progress ?? { sourceId: state.sourceId ?? "all", phase: "scan" as const, current: 0, total: 0 })
+          ...identity(state),
+          ...desktopProgress(state.progress ?? { sourceId: state.sourceId ?? "all", phase: "scan" as const, current: 0, total: 0 })
         } : null,
         ...(state.jobId && state.sourceId && state.completedAt ? { completion: {
-          jobId: state.jobId, sourceId: state.sourceId, succeeded: !state.error, completedAt: state.completedAt
+          ...identity(state), sourceId: state.sourceId, succeeded: succeeded(state), completedAt: state.completedAt
         } } : {})
       };
     },

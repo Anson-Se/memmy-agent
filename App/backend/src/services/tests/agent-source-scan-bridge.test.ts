@@ -56,3 +56,35 @@ describe("transport failure", () => {
     finally { await bridge.dispose(); }
   });
 });
+
+it("maps every raw scan phase at the desktop boundary", async () => {
+  let state = { ...empty(), running: true, jobId: "job", sourceId: "all" };
+  const bus = createProgressBus();
+  const progress = vi.fn(); bus.on("agent_source.scan_progress", progress);
+  const bridge = createAgentSourceScanBridge({ status: async () => state } as AgentSourceScanClient, bus, 60_000);
+  try {
+    for (const phase of ["discover", "read", "redact", "emit", "prepare"] as const) {
+      state = { ...state, progress: { sourceId: "all", phase, current: 1, total: 2 } };
+      expect((await bridge.status()).progress?.phase).toBe("scan");
+    }
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({ phase: "scan" }));
+  } finally { await bridge.dispose(); }
+});
+
+it("reports complete error counts and emits each retry once for SSE and polling", async () => {
+  let state: MemoryAgentSourceScanState = { ...empty(), jobId: "same-job", attemptId: "first", sourceId: "all", completedAt: new Date().toISOString(),
+    results: [{ sourceId: "fixture", emittedMessages: 1000, discoveredConversations: 500, skipped: 0, errors: [], errorCount: 1, detailsTruncated: true }] };
+  const bus = createProgressBus(); const completed = vi.fn(); bus.on("agent_source.scan_completed", completed);
+  const bridge = createAgentSourceScanBridge({ status: async () => state } as AgentSourceScanClient, bus, 60_000);
+  try {
+    expect((await bridge.status()).completion?.succeeded).toBe(false);
+    await bridge.status();
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(completed.mock.calls[0]![0].succeeded).toBe(false);
+    state = { ...state, attemptId: "second", results: [{ ...state.results![0]!, errorCount: 0 }] };
+    expect((await bridge.status()).completion?.succeeded).toBe(true);
+    await bridge.status();
+    expect(completed).toHaveBeenCalledTimes(2);
+    expect(completed.mock.calls[1]![0]).toMatchObject({ jobId: "same-job", attemptId: "second", succeeded: true });
+  } finally { await bridge.dispose(); }
+});

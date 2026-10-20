@@ -144,7 +144,7 @@ export function createHttpMemoryClient(
   return {
     agentSources: {
       list: () => request("GET", "agentSources", MemoryAgentSourceListSchema),
-      start: (input) => request("POST", "agentSourceScan", AgentSourceScanJobResponseSchema, { body: { ...input, waitForProcessing: true }, maxRetries: 0 }),
+      start: (input) => request("POST", "agentSourceScan", AgentSourceScanJobResponseSchema, { body: input, maxRetries: 0 }),
       status: () => request("GET", "agentSourceStatus", MemoryAgentSourceScanStateSchema),
       results: (jobId, cursor = "0", limit = 100) => request("GET", "agentSourceResults", ScanResultPageSchema, { params: { jobId }, query: { cursor, limit } }),
       pause: () => request("POST", "agentSourcePause", OkResponseSchema, { body: {}, maxRetries: 0 }),

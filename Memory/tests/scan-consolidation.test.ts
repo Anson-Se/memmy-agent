@@ -107,33 +107,28 @@ describe("unified scan behavior", () => {
     expect(memory.addMemory).not.toHaveBeenCalled();
   });
 
-  it("waits for only the imported generic cohort before declaring desktop completion", async () => {
-    const directory = root(); let release!: () => void;
-    const worker = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
-    const memory = service({ runWorkerOnce: worker, memoryProcessingStatus: (ids: string[]) => ({ items: ids.map((memoryId) => ({ memoryId, state: "ready" })) }) });
-    const scan = executor(directory, adapter(), memory);
+  it("completes after durable handoff even with legacy waitForProcessing requests", async () => {
+    const worker = vi.fn();
+    const processing = vi.fn(() => { throw new Error("model unavailable"); });
+    const memory = service({ runWorkerOnce: worker, memoryProcessingStatus: processing });
+    const scan = executor(root(), adapter(), memory);
     await scan.startScan({ sourceId: "all", waitForProcessing: true });
-    await vi.waitFor(() => expect(worker).toHaveBeenCalledOnce());
-    expect(scan.scanStatus().running).toBe(true);
-    expect(worker.mock.calls[0]).toEqual([1, { targetMemoryIds: ["memory-one"], priorityCohortOnly: true }]);
-    release(); expect((await done(scan)).error).toBeNull();
+    expect((await done(scan)).error).toBeNull();
+    expect(memory.enqueuePendingImportSummaries).toHaveBeenCalledWith(1000, ["memory-one"]);
+    expect(worker).not.toHaveBeenCalled();
+    expect(processing).not.toHaveBeenCalled();
   });
 
-  it("cancels scanning promptly while an already-started summary worker finishes in the background", async () => {
-    let release!: () => void;
-    const worker = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
-    const scan = executor(root(), adapter(), service({ runWorkerOnce: worker, memoryProcessingStatus: () => ({ items: [{ memoryId: "memory-one", state: "summarizing" }] }) }));
-    try {
-      await scan.startScan({ sourceId: "all", waitForProcessing: true });
-      await vi.waitFor(() => expect(worker).toHaveBeenCalledOnce());
-      await scan.cancelScan();
-      expect(scan.scanStatus().jobId).toBeNull();
-      await scan.startScan({ sourceId: "all" });
-      expect((await done(scan)).error).toBeNull();
-    } finally { release?.(); }
+  it("does not advance the watermark when creating background jobs fails", async () => {
+    const directory = root();
+    const memory = service({ enqueuePendingImportSummaries: () => { throw new Error("queue unavailable"); } });
+    const scan = executor(directory, adapter(), memory);
+    await scan.startScan({ sourceId: "all" });
+    expect((await done(scan)).error).toContain("queue unavailable");
+    expect((await scan.list()).sources[0]!.lastScannedAt).toBeNull();
   });
 
-  it("includes replayed skills in targeted processing and preserves immutable provenance", async () => {
+  it("hands off replayed skills without waiting for indexing and preserves immutable provenance", async () => {
     const directory = root();
     mkdirSync(join(directory, "skills", "sample"), { recursive: true });
     writeFileSync(join(directory, "skills", "sample", "SKILL.md"), "---\nname: Sample\nversion: 1\n---\nA sample skill.");
@@ -144,7 +139,7 @@ describe("unified scan behavior", () => {
     await scan.startScan({ sourceId: "fixture", waitForProcessing: true });
     expect((await done(scan)).error).toBeNull();
     expect(add).toHaveBeenCalledWith(expect.objectContaining({ layer: "Skill", sourceAgentId: "fixture", sourceSkillId: "sample", sourceSkillVersion: "1", sourceSkillPath: join(directory, "skills", "sample", "SKILL.md") }));
-    expect(worker).toHaveBeenCalledWith(1, { targetMemoryIds: ["skill-one"], priorityCohortOnly: true });
+    expect(worker).not.toHaveBeenCalled();
   });
 
   it("reports a skill write failure instead of advancing the scan watermark", async () => {
@@ -158,12 +153,12 @@ describe("unified scan behavior", () => {
     expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8")).sources.fixture.latestSeenAt).toBeNull();
   });
 
-  it("reports terminal summary failure and leaves the source watermark unchanged", async () => {
+  it("keeps background summary failure separate from scan success", async () => {
     const directory = root();
     const scan = executor(directory, adapter(), service({ runWorkerOnce: async () => ({}), memoryProcessingStatus: () => ({ items: [{ memoryId: "memory-one", state: "failed", errorMessage: "embedding rejected" }] }) }));
     await scan.startScan({ sourceId: "all", waitForProcessing: true });
-    expect((await done(scan)).error).toContain("embedding rejected");
-    expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8")).sources.fixture.latestSeenAt).toBeNull();
+    expect((await done(scan)).error).toBeNull();
+    expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8")).sources.fixture.latestSeenAt).not.toBeNull();
   });
 
   it("restores an interrupted job after restart and lets the user cancel it", async () => {
@@ -185,4 +180,184 @@ describe("unified scan behavior", () => {
     expect(await scan.scanResults!(jobId)).toEqual(first);
     await expect(scan.scanResults!("../other")).rejects.toThrow("Invalid scan job");
   });
+});
+
+describe("scan repair regressions", () => {
+  it("keeps retries isolated, resolves only successful items, and restores completion", async () => {
+    const directory = root();
+    let fail = true;
+    const memory = service({ addMemory: (input: { requestId: string }) => {
+      if (fail) throw new Error("fixture write failure");
+      return { id: input.requestId, duplicate: false };
+    } });
+    const scan = executor(directory, adapter([...turn("one"), ...turn("two")]), memory);
+    const first = await scan.startScan({ sourceId: "fixture", mode: "full" });
+    expect((await done(scan)).results?.[0]?.errorCount).toBe(2);
+    const page = await scan.scanResults!(first.jobId, "0", 1);
+    expect(page.nextCursor).not.toBeNull();
+    fail = false;
+    const second = await scan.startScan({ sourceId: "fixture", mode: "full" });
+    expect(second.jobId).toBe(first.jobId);
+    expect(second.attemptId).not.toBe(first.attemptId);
+    const completed = await done(scan);
+    expect(completed.error).toBeNull();
+    expect(completed.results?.[0]).toMatchObject({ errorCount: 0, errors: [], memoryIdCount: 2 });
+    expect((await scan.scanResults!(first.jobId)).items.every((item) => !item.error)).toBe(true);
+    await expect(scan.scanResults!(first.jobId, page.nextCursor!)).rejects.toThrow("attempt changed");
+    const db = new Database(join(directory, "scans", `${first.jobId}.sqlite`), { readonly: true });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM scan_results WHERE error IS NOT NULL AND active=0").get()).toEqual({ count: 2 });
+    db.close();
+    await scan.dispose();
+    const restored = executor(directory);
+    expect(restored.scanStatus()).toMatchObject({ jobId: first.jobId, attemptId: second.attemptId, running: false, error: null, completedAt: expect.any(String) });
+  });
+
+  it("never clears another turn's unresolved error in the same conversation", async () => {
+    const store = await openMemoryAgentSourceScanStore(join(root(), "scan.sqlite"), { jobId: "retry", sourceId: "fixture", mode: "full", phase: "ingest", createdAt: "2026-10-20", updatedAt: "2026-10-20" });
+    try {
+      store.beginAttempt("first");
+      store.saveResult({ sourceId: "fixture", conversationId: "shared", itemKey: "turn:one", error: "failed one" });
+      store.saveResult({ sourceId: "fixture", conversationId: "shared", itemKey: "turn:two", error: "failed two" });
+      store.beginAttempt("second");
+      expect(store.resultSummary("fixture").errors).toBe(2);
+      store.saveResult({ sourceId: "fixture", conversationId: "shared", itemKey: "turn:one", memoryId: "memory-one" });
+      expect(store.resultSummary("fixture").errors).toBe(1);
+      expect([...store.results("fixture")].filter((item) => item.error)).toMatchObject([{ error: "failed two" }]);
+    } finally { store.close(); }
+  });
+
+  it("yields during ingestion so pause and cancel run before the full dataset finishes", async () => {
+    const directory = root();
+    let writes = 0;
+    let pauseRequested = false;
+    const memory = service({ addMemory: () => {
+      if (++writes === 1) setTimeout(() => { pauseRequested = true; void scan.pauseScan(); }, 0);
+      return { id: `memory-${writes}`, duplicate: false };
+    } });
+    const scan = executor(directory, adapter(Array.from({ length: 500 }, (_, i) => turn(String(i))).flat()), memory);
+    const first = await scan.startScan({ sourceId: "all", mode: "full" });
+    await vi.waitFor(() => expect(pauseRequested && !scan.scanStatus().running).toBe(true));
+    expect(writes).toBeLessThan(500);
+    expect(scan.scanStatus().progress?.phase).toBe("stopped");
+    const resumed = await scan.startScan({ sourceId: "all", mode: "full" });
+    expect(resumed.attemptId).toBe(first.attemptId);
+    await scan.cancelScan();
+    expect(scan.scanStatus().jobId).toBeNull();
+  });
+
+  it("counts all staged messages, with duplicate skips measured in messages", async () => {
+    const scan = executor(root(), adapter(Array.from({ length: 1001 }, (_, i) => turn(String(i))).flat()), service({ addMemory: () => ({ id: "duplicate", duplicate: true }) }));
+    await scan.startScan({ sourceId: "fixture", mode: "initial_subset" });
+    expect((await done(scan)).results?.[0]).toMatchObject({ emittedMessages: 2002, skipped: 2000 });
+  });
+
+  it("persists real background jobs and commits the watermark without running the worker", async () => {
+    const { service: memory, db } = fixture.createTestService();
+    const worker = vi.spyOn(memory, "runWorkerOnce");
+    const directory = root();
+    const scan = executor(directory, adapter(), memory);
+    await scan.startScan({ sourceId: "fixture", waitForProcessing: true });
+    const status = await done(scan);
+    expect(status.error).toBeNull();
+    const ids = status.results![0]!.memoryIds!;
+    expect(memory.memoryProcessingStatus(ids).items[0]?.state).toBe("summary_pending");
+    expect(db.db.prepare("SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type='import_summary'").get()).toEqual({ count: 1 });
+    expect(worker).not.toHaveBeenCalled();
+    expect((await scan.list()).sources[0]!.lastScannedAt).not.toBeNull();
+  });
+});
+
+it("ignores a persisted legacy wait flag while recovering the same interrupted attempt", async () => {
+  const directory = root();
+  const store = await openMemoryAgentSourceScanStore(join(directory, "scans", "legacy.sqlite"), { jobId: "legacy", sourceId: "fixture", mode: "full", phase: "ingest", createdAt: "2026-10-20T00:00:00.000Z", updatedAt: "2026-10-20T00:00:00.000Z" });
+  store.beginAttempt("interrupted", "2026-10-20T01:00:00.000Z");
+  store.setWaitForProcessing();
+  store.close();
+  const memory = service({ runWorkerOnce: vi.fn(), memoryProcessingStatus: vi.fn() });
+  const scan = executor(directory, adapter(), memory);
+  const resumed = await scan.startScan({ sourceId: "fixture", mode: "full", waitForProcessing: true });
+  expect(resumed).toMatchObject({ jobId: "legacy", attemptId: "interrupted", attemptStartedAt: "2026-10-20T01:00:00.000Z" });
+  expect((await done(scan)).error).toBeNull();
+  expect(memory.runWorkerOnce).not.toHaveBeenCalled();
+  expect(memory.memoryProcessingStatus).not.toHaveBeenCalled();
+});
+
+it("does not hide unresolved errors when the failed source disappears before retry", async () => {
+  const source = adapter();
+  const scan = executor(root(), source, service({ addMemory: () => { throw new Error("write failed"); } }));
+  await scan.startScan({ sourceId: "all", mode: "full" });
+  expect((await done(scan)).error).not.toBeNull();
+  source.detect = async () => false;
+  await scan.startScan({ sourceId: "all", mode: "full" });
+  expect((await done(scan)).results?.[0]?.errorCount).toBe(1);
+  expect(scan.scanStatus().error).not.toBeNull();
+});
+
+it("rolls back Skill capture if its embedding job cannot be created, then retries cleanly", async () => {
+  const { service: memory, db } = fixture.createTestService();
+  const directory = root();
+  mkdirSync(join(directory, "skills", "sample"), { recursive: true });
+  writeFileSync(join(directory, "skills", "sample", "SKILL.md"), "# Sample\nRun a sample procedure.");
+  db.db.exec("CREATE TRIGGER reject_scan_embedding BEFORE INSERT ON evolution_jobs WHEN NEW.job_type='embedding' BEGIN SELECT RAISE(ABORT, 'queue rejected'); END");
+  const scan = executor(directory, adapter([]), memory, { resolveAgentSkillRoot: () => directory });
+  await scan.startScan({ sourceId: "fixture" });
+  expect((await done(scan)).error).toContain("queue rejected");
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM memories WHERE memory_layer='Skill'").get()).toEqual({ count: 0 });
+  db.db.exec("DROP TRIGGER reject_scan_embedding");
+  await scan.startScan({ sourceId: "fixture" });
+  expect((await done(scan)).error).toBeNull();
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type='embedding'").get()).toEqual({ count: 1 });
+});
+
+it("services pause during preparation before any ingestion and preserves the execution identity", async () => {
+  const memory = service();
+  const scan = executor(root(), adapter(Array.from({ length: 300 }, (_, i) => turn(String(i))).flat()), memory);
+  const started = await scan.startScan({ sourceId: "fixture", mode: "full" });
+  let paused = false;
+  const timer = setInterval(() => {
+    if (!paused && scan.scanStatus().progress?.phase === "prepare") {
+      paused = true;
+      void scan.pauseScan();
+    }
+  }, 0);
+  try {
+    await vi.waitFor(() => expect(paused).toBe(true));
+    expect(memory.addMemory).not.toHaveBeenCalled();
+    expect(scan.scanStatus()).toMatchObject({ running: false, attemptId: started.attemptId, progress: { phase: "stopped" } });
+    await scan.cancelScan();
+    expect(scan.scanStatus().jobId).toBeNull();
+  } finally { clearInterval(timer); }
+});
+
+it("does not restart an already failed summary when rescanning identical raw history", async () => {
+  const { service: memory, db } = fixture.createTestService();
+  const scan = executor(root(), adapter(), memory);
+  await scan.startScan({ sourceId: "fixture", mode: "full" });
+  const completed = await done(scan);
+  const memoryId = completed.results![0]!.memoryIds![0]!;
+  db.db.prepare("UPDATE evolution_jobs SET status='failed', last_error='model rejected' WHERE target_memory_id=?").run(memoryId);
+  db.db.prepare("UPDATE memory_processing_state SET state='failed', error_message='model rejected', failed_at=? WHERE memory_id=?").run(new Date().toISOString(), memoryId);
+  await scan.startScan({ sourceId: "fixture", mode: "full", waitForProcessing: true });
+  expect((await done(scan)).error).toBeNull();
+  expect(memory.memoryProcessingStatus([memoryId]).items[0]).toMatchObject({ state: "failed", errorMessage: "model rejected" });
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM evolution_jobs WHERE target_memory_id=?").get(memoryId)).toEqual({ count: 1 });
+});
+
+it("returns every error below the shared 500-detail cap", async () => {
+  const scan = executor(root(), adapter(Array.from({ length: 101 }, (_, i) => turn(String(i))).flat()), service({ addMemory: () => { throw new Error("write failed"); } }));
+  await scan.startScan({ sourceId: "fixture", mode: "full" });
+  const result = (await done(scan)).results![0]!;
+  expect(result.errorCount).toBe(101);
+  expect(result.errors).toHaveLength(101);
+  expect(result.detailsTruncated).toBe(false);
+});
+
+it("does not turn an infrastructure exception with an empty message into success", async () => {
+  const directory = root();
+  const scan = executor(directory, adapter(), service({ enqueuePendingImportSummaries: () => { throw new Error(""); } }));
+  await scan.startScan({ sourceId: "fixture" });
+  const completed = await done(scan);
+  expect(completed.error).toBe("Agent source import failed");
+  await scan.dispose();
+  expect(executor(directory).scanStatus().error).toBe(completed.error);
 });

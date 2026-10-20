@@ -94,17 +94,17 @@ describe("backend scan behavior preserved in Memory", () => {
     expect(state(root).sources.fixture.messageCount).toBe(4);
   });
 
-  it("does not publish checkpoints before failed indexing can be retried", async () => {
+  it("publishes scan checkpoints after enqueue regardless of background indexing outcome", async () => {
     const root = fixture.createTestRoot(); let fail = true;
     const service = stub({ runWorkerOnce: vi.fn(async () => ({})), memoryProcessingStatus: (ids: string[]) => ({
       items: ids.map(memoryId => ({ memoryId, state: fail ? "failed" : "ready", errorMessage: "indexing rejected" })) }) });
     const scan = create(root, service, [adapter(turn("one"))]);
-    expect((await run(scan, "fixture", "full", true)).error).toContain("indexing rejected");
-    expect(state(root).sources.fixture.latestSeenAt).toBeNull();
+    expect((await run(scan, "fixture", "full", true)).error).toBeNull();
+    expect(state(root).sources.fixture.latestSeenAt).not.toBeNull();
     fail = false;
     expect((await run(scan, "fixture", "incremental", true)).error).toBeNull();
-    expect(service.addMemory).toHaveBeenCalledTimes(2);
-    expect(service.runWorkerOnce).toHaveBeenCalledTimes(2);
+    expect(service.addMemory).toHaveBeenCalledTimes(1);
+    expect(service.runWorkerOnce).not.toHaveBeenCalled();
     expect(state(root).sources.fixture.messageCount).toBe(2);
   });
 

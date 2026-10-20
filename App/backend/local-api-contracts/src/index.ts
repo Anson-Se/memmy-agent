@@ -515,11 +515,15 @@ export type OnboardingInsightReportStreamEvent = z.infer<typeof OnboardingInsigh
 
 /** Schema for agent source scan job response. */
 export const AgentSourceScanJobResponseSchema = z.object({
+    attemptId: z.string().min(1).optional(),
+    attemptStartedAt: z.string().optional(),
     jobId: z.string().min(1)
 });
 export type AgentSourceScanJobResponse = z.infer<typeof AgentSourceScanJobResponseSchema>;
 
 export const AgentSourceScanProgressPayloadSchema = z.object({
+    attemptId: z.string().min(1).optional(),
+    attemptStartedAt: z.string().optional(),
     jobId: z.string().min(1),
     sourceId: z.string().min(1),
     phase: ScanPhaseSchema,
@@ -540,6 +544,8 @@ export const AgentSourceScanStatusResponseSchema = z.object({
     active: z.boolean(),
     progress: AgentSourceScanProgressPayloadSchema.nullable(),
     completion: z.object({
+        attemptId: z.string().min(1).optional(),
+        attemptStartedAt: z.string().optional(),
         jobId: z.string().min(1),
         sourceId: z.string().min(1),
         succeeded: z.boolean(),
@@ -600,6 +606,7 @@ export type ScanResult = z.infer<typeof ScanResultSchema>;
 
 /** Schema for paged persisted scan details. */
 export const ScanResultPageSchema = z.object({
+    attemptId: z.string().optional(),
     items: z.array(z.object({
         sourceId: z.string().min(1),
         conversationId: z.string().min(1),
@@ -1649,6 +1656,9 @@ export const ScanCompletedSseEventSchema = z.object({
     type: z.literal("agent_source.scan_completed"),
     timestamp: z.string().datetime(),
     payload: z.object({
+        attemptId: z.string().min(1).optional(),
+        attemptStartedAt: z.string().optional(),
+        succeeded: z.boolean().optional(),
         jobId: z.string().min(1),
         sourceId: z.string().min(1),
         results: z.array(ScanResultSchema)
@@ -1706,10 +1716,13 @@ export * from './computer-use-onboarding.js';
 /** Memory owns scan execution; desktop translates this state into its existing events. */
 export const MemoryAgentSourceScanStateSchema = z.object({
     running: z.boolean(),
+    attemptId: z.string().optional(),
     jobId: z.string().nullable(),
     sourceId: z.string().nullable(),
     mode: AgentSourceScanModeSchema.nullable(),
-    progress: AgentSourceScanProgressPayloadSchema.omit({ jobId: true }).nullable(),
+    progress: AgentSourceScanProgressPayloadSchema.omit({ jobId: true, attemptId: true, attemptStartedAt: true }).extend({
+        phase: z.enum(["discover", "read", "redact", "emit", "scan", "prepare", "add", "summarize", "done", "stopped"])
+    }).nullable(),
     startedAt: z.string().nullable(),
     completedAt: z.string().nullable(),
     error: z.string().nullable(),
@@ -1721,3 +1734,8 @@ export const MemoryAgentSourceListSchema = z.object({
     sources: z.array(AgentSourceViewSchema)
 });
 export type MemoryAgentSourceList = z.infer<typeof MemoryAgentSourceListSchema>;
+
+/** A retry keeps its job storage but has a new execution identity. */
+export function agentSourceScanExecutionKey(scan: { jobId: string; attemptId?: string }): string {
+    return scan.attemptId ? JSON.stringify([scan.jobId, scan.attemptId]) : scan.jobId;
+}

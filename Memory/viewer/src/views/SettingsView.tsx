@@ -76,11 +76,12 @@ interface MemoryServiceHealth {
 interface AgentSourceScanState {
   running: boolean;
   jobId: string | null;
+  attemptId?: string;
   sourceId: string | null;
   mode: "initial_subset" | "incremental" | "full" | null;
   progress: {
     sourceId: string;
-    phase: "discover" | "read" | "redact" | "emit" | "scan" | "add" | "summarize" | "done" | "stopped";
+    phase: "discover" | "read" | "redact" | "emit" | "scan" | "prepare" | "add" | "summarize" | "done" | "stopped";
     current: number;
     total: number;
     message?: string;
@@ -1059,6 +1060,9 @@ function AgentAccessTab({
   const [automationBusy, setAutomationBusy] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
   const activeScanJob = useRef<string | null>(null);
+  const latestScanStartedAt = useRef("");
+  const scanIdentity = (scan: { jobId: string | null; attemptId?: string }) => scan.attemptId
+    ? JSON.stringify([scan.jobId, scan.attemptId]) : scan.jobId;
   const scannableSources = visibleAgentSources(sources);
   const scanPaused = scanStatus?.progress?.phase === "stopped";
   const scanSessionActive = scanStatus?.running === true || scanPaused;
@@ -1102,15 +1106,16 @@ function AgentAccessTab({
     const refreshScan = async () => {
       try {
         const next = await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status");
-        if (!active) return;
+        if (!active || (next.startedAt && next.startedAt < latestScanStartedAt.current)) return;
+        latestScanStartedAt.current = next.startedAt ?? latestScanStartedAt.current;
         const paused = next.progress?.phase === "stopped";
         if (next.running || paused) {
-          activeScanJob.current = next.jobId;
+          activeScanJob.current = scanIdentity(next);
           setScanStatus(next);
           setBusySource(next.running ? next.sourceId ?? next.progress?.sourceId ?? "all" : null);
           return;
         }
-        if (activeScanJob.current && next.jobId === activeScanJob.current) {
+        if (activeScanJob.current && scanIdentity(next) === activeScanJob.current) {
           const completedSourceId = next.sourceId ?? next.progress?.sourceId ?? "all";
           activeScanJob.current = null;
           setScanStatus(null);
@@ -1187,14 +1192,16 @@ function AgentAccessTab({
     setMessage(null);
     setScanCompletion(null);
     try {
-      const result = await api.post<{ accepted: true; jobId: string }>(
+      const result = await api.post<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }>(
         "/api/v1/agent-sources/scan",
         { sourceId, ...(mode ? { mode } : {}) },
       );
-      activeScanJob.current = result.jobId;
+      activeScanJob.current = scanIdentity(result);
+      latestScanStartedAt.current = result.attemptStartedAt ?? new Date().toISOString();
       setScanStatus({
         running: true,
         jobId: result.jobId,
+        attemptId: result.attemptId,
         sourceId,
         mode: mode ?? null,
         progress: {
@@ -1203,7 +1210,7 @@ function AgentAccessTab({
           current: 0,
           total: 0,
         },
-        startedAt: new Date().toISOString(),
+        startedAt: latestScanStartedAt.current,
         completedAt: null,
         error: null,
       });
@@ -1798,6 +1805,7 @@ function scanProgressPhaseKey(phase: AgentSourceScanPhase):
     redact: "settings.agents.scanProgress.phase.redact",
     emit: "settings.agents.scanProgress.phase.emit",
     scan: "settings.agents.scanProgress.phase.scan",
+    prepare: "settings.agents.scanProgress.phase.scan",
     add: "settings.agents.scanProgress.phase.add",
     summarize: "settings.agents.scanProgress.phase.summarize",
     done: "settings.agents.scanProgress.phase.done",

@@ -1,3 +1,4 @@
+import { agentSourceScanExecutionKey, type AgentSourceScanStatusResponse, type ScanResult } from "@memmy/local-api-contracts";
 import { useComputerHistoryModelSync } from "./app/computer-history-model-sync.js";
 import { isComputerHistorySupported } from "./app/computer-history-platform.js";
 /** App module. */
@@ -173,13 +174,47 @@ function RuntimeApp() {
     let isActive = true;
     const scanCompletionTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
-    function scheduleScanCompletionExpiry(jobId: string) {
+    function scheduleScanCompletionExpiry(scan: { jobId: string; attemptId?: string }) {
+      const jobId = agentSourceScanExecutionKey(scan);
       const existingTimeout = scanCompletionTimeouts.get(jobId);
       if (existingTimeout) clearTimeout(existingTimeout);
       scanCompletionTimeouts.set(jobId, setTimeout(() => {
         scanCompletionTimeouts.delete(jobId);
-        dispatch(appActions.agentSourceScanCompletionExpired(jobId));
+        dispatch(appActions.agentSourceScanCompletionExpired(scan.jobId, scan.attemptId));
       }, AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS));
+    }
+
+    const handledCompletions = new Set<string>();
+    let latestAttemptStartedAt = "";
+    function acceptAttempt(scan: { attemptStartedAt?: string }) {
+      if (scan.attemptStartedAt && scan.attemptStartedAt < latestAttemptStartedAt) return false;
+      latestAttemptStartedAt = scan.attemptStartedAt ?? latestAttemptStartedAt;
+      return true;
+    }
+    function handleScanCompletion(
+      completion: NonNullable<AgentSourceScanStatusResponse["completion"]>,
+      client: ReturnType<typeof createAppClients>["agentSources"],
+      scanResults?: ScanResult[]
+    ) {
+      if (!isActive || !acceptAttempt(completion)) return;
+      const key = agentSourceScanExecutionKey(completion);
+      if (handledCompletions.has(key)) return;
+      handledCompletions.add(key);
+      trackAgentSourceScanOutcome(completion);
+      clearMemoryPanelCache();
+      dispatch(appActions.agentSourceScanCompleted(completion));
+      scheduleScanCompletionExpiry(completion);
+      if (!completion.succeeded) dispatch(appActions.agentSourcesFailed(translationRef.current("memory.scanFailed")));
+      void client.listSources().then((nextSources) => {
+        if (!isActive || !acceptAttempt(completion)) return;
+        dispatch(appActions.agentSourcesLoaded(nextSources));
+        const error = scanResults ? formatScanCompletedError(scanResults, nextSources, translationRef.current) : null;
+        if (!completion.succeeded) dispatch(appActions.agentSourcesFailed(error ?? translationRef.current("memory.scanFailed")));
+      }).catch((error) => {
+        if (isActive && acceptAttempt(completion)) dispatch(appActions.agentSourcesFailed(
+          formatAgentSourceScanRequestError(error, undefined, translationRef.current)
+        ));
+      });
     }
 
     async function reconcileAgentSourceScanStatus(agentSourceClient: ReturnType<typeof createAppClients>["agentSources"]) {
@@ -189,13 +224,11 @@ function RuntimeApp() {
         dispatch(appActions.agentSourceScanAvailability(status.unavailable ?? null));
         if (status.unavailable) return;
         if (status.progress) {
-          dispatch(appActions.agentSourceScanProgressReceived(status.progress));
+          if (acceptAttempt(status.progress)) dispatch(appActions.agentSourceScanProgressReceived(status.progress));
           return;
         }
         if (status.completion) {
-          trackAgentSourceScanOutcome(status.completion);
-          dispatch(appActions.agentSourceScanCompleted(status.completion));
-          scheduleScanCompletionExpiry(status.completion.jobId);
+          handleScanCompletion(status.completion, agentSourceClient);
           return;
         }
         dispatch(appActions.agentSourceScanCompleted());
@@ -272,11 +305,9 @@ function RuntimeApp() {
         dispatch(appActions.agentSourcesLoaded(sources));
         dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
         if (scanStatus.progress) {
-          dispatch(appActions.agentSourceScanProgressReceived(scanStatus.progress));
+          if (acceptAttempt(scanStatus.progress)) dispatch(appActions.agentSourceScanProgressReceived(scanStatus.progress));
         } else if (scanStatus.completion) {
-          trackAgentSourceScanOutcome(scanStatus.completion);
-          dispatch(appActions.agentSourceScanCompleted(scanStatus.completion));
-          scheduleScanCompletionExpiry(scanStatus.completion.jobId);
+          handleScanCompletion(scanStatus.completion, clients.agentSources);
         }
         if (accountSession.authenticated) {
           dispatch(appActions.accountUpdated({
@@ -310,7 +341,7 @@ function RuntimeApp() {
         events.addEventListener("agent_source.scan_progress", (event) => {
           const parsed = parseSseEvent(event);
           if (parsed?.type === "agent_source.scan_progress") {
-            dispatch(appActions.agentSourceScanProgressReceived(parsed.payload));
+            if (acceptAttempt(parsed.payload)) dispatch(appActions.agentSourceScanProgressReceived(parsed.payload));
           }
         });
         events.addEventListener("agent_source.scan_completed", (event) => {
@@ -318,28 +349,9 @@ function RuntimeApp() {
           if (parsed?.type !== "agent_source.scan_completed") {
             return;
           }
-          const { jobId, sourceId, results: scanResults } = parsed.payload;
-          const scanSucceeded = scanResults.every((result) => result.errors.length === 0);
-          trackAgentSourceScanOutcome({ jobId, sourceId, succeeded: scanSucceeded });
-          clearMemoryPanelCache();
-          dispatch(appActions.agentSourceScanCompleted({ jobId, sourceId, succeeded: scanSucceeded }));
-          scheduleScanCompletionExpiry(jobId);
-          void clients.agentSources
-            .listSources()
-            .then((nextSources) => {
-              dispatch(appActions.agentSourcesLoaded(nextSources));
-              const scanError = scanResults
-                ? formatScanCompletedError(scanResults, nextSources, translationRef.current)
-                : null;
-              if (scanError) {
-                dispatch(appActions.agentSourcesFailed(scanError));
-              }
-            })
-            .catch((error) =>
-              dispatch(appActions.agentSourcesFailed(
-                formatAgentSourceScanRequestError(error, undefined, translationRef.current)
-              ))
-            );
+          const { results: scanResults, ...completion } = parsed.payload;
+          const succeeded = completion.succeeded ?? scanResults.every((result) => (result.errorCount ?? result.errors.length) === 0 && result.errors.length === 0);
+          handleScanCompletion({ ...completion, succeeded, completedAt: parsed.timestamp }, clients.agentSources, scanResults);
         });
         events.onerror = () => dispatch(appActions.eventStatusChanged("reconnecting"));
       } catch (error) {

@@ -37,6 +37,8 @@ export type EventConnectionStatus = "pending" | "connecting" | "connected" | "he
 /** Contract for agent source scan progress. */
 export interface AgentSourceScanProgress {
   jobId: string;
+  attemptId?: string;
+  attemptStartedAt?: string;
   sourceId: string;
   phase: ScanPhase;
   current: number;
@@ -45,7 +47,10 @@ export interface AgentSourceScanProgress {
 }
 
 export interface AgentSourceScanCompletion {
+  succeeded?: boolean;
   jobId: string;
+  attemptId?: string;
+  attemptStartedAt?: string;
   sourceId: string;
 }
 
@@ -102,7 +107,7 @@ export type AppAction =
   | { type: "agentSources/scanCancelRequested"; jobId: string }
   | { type: "agentSources/scanCancelFailed"; message: string }
   | { type: "agentSources/scanCompleted"; scan?: AgentSourceScanFinished }
-  | { type: "agentSources/scanCompletionExpired"; jobId: string }
+  | { type: "agentSources/scanCompletionExpired"; jobId: string; attemptId?: string }
   | { type: "scanPreferences/updated"; preferences: Partial<ScanPreferences> }
   | { type: "preferredMode/updated"; preferredMode: PreferredMode }
   | { type: "account/updated"; userId?: string; email?: string; phoneNumber?: string | null; nickname?: string; registeredAt?: string | null }
@@ -218,8 +223,8 @@ export const appActions = {
     return { type: "agentSources/scanCompleted", scan };
   },
 
-  agentSourceScanCompletionExpired(jobId: string): AppAction {
-    return { type: "agentSources/scanCompletionExpired", jobId };
+  agentSourceScanCompletionExpired(jobId: string, attemptId?: string): AppAction {
+    return { type: "agentSources/scanCompletionExpired", jobId, attemptId };
   },
 
   /** Handles scan preferences updated. */

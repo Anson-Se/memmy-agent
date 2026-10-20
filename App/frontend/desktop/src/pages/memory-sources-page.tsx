@@ -122,7 +122,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const scanProgress = state.agentSources.scanProgress;
   const isScanning = state.agentSources.isScanning;
   const scanTargetSourceId = scanProgress?.sourceId ?? state.agentSources.activeScanSourceId;
-  const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.map((item) => item.sourceId));
+  const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
   const scanCancelling = Boolean(state.agentSources.cancellingScanJobId);
   const showScanProgress = isScanning || scanStopped || scanCancelling;

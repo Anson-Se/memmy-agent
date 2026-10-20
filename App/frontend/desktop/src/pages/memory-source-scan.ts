@@ -58,6 +58,7 @@ export async function startAgentSourceScan(input: StartAgentSourceScanInput): Pr
       ...(input.mode ? { mode: input.mode } : {})
     });
     recordScanStarted(job.jobId, {
+      attemptId: job.attemptId,
       sourceId,
       scanMode: input.mode,
       pagePath: analyticsContext.pagePath,
@@ -93,7 +94,7 @@ async function resolveStartedScanProgress(
   queuedMessage: string
 ) {
   const queuedProgress = {
-    jobId: job.jobId,
+    ...job,
     sourceId,
     phase: "scan" as const,
     current: 0,

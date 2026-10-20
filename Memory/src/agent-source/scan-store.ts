@@ -8,9 +8,14 @@ import type { ConversationCheckpoint, ConversationMessage, MessageCursor, Prepar
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const MAX_PAGE_BYTES = 8 * 1024 * 1024;
 
-export interface MemoryScanJobMeta { jobId: string; sourceId: string; mode: string; phase: string; createdAt: string; updatedAt: string; error?: string; }
+export interface MemoryScanJobMeta { jobId: string; sourceId: string; mode: string; phase: string; createdAt: string; updatedAt: string; error?: string; attemptId?: string; attemptStartedAt?: string; completion?: string; }
 export interface MemoryAgentSourceScanStore extends ScanStore { readonly path: string;
+  beginAttempt(attemptId: string, startedAt?: string): void;
+  resolveItem(sourceId: string, conversationId: string, itemKey: string): void;
+  saveResult(result: ScanStoredResult & { itemKey?: string }): void;
   checkpoints(sourceId: string): Iterable<ConversationCheckpoint>;
+  unresolvedSourceIds(): string[];
+  errorDetails(sourceId: string): Array<{ conversationId: string; reason: string }>;
   resultSummary(sourceId: string): { conversations: number; memories: number; errors: number };
   setWaitForProcessing(): void;
   waitForProcessing(): boolean;
@@ -43,6 +48,19 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
   backfillEmptyStagedJobId(db, job.jobId);
   db.exec("CREATE INDEX IF NOT EXISTS staged_order ON staged_messages(job_id,source_id,conversation_id,created_at,message_id,ordinal)");
   if (!db.prepare("SELECT 1 FROM scan_meta WHERE id=1").get()) db.prepare("INSERT INTO scan_meta(id,job_id,source_id,mode,phase,created_at,updated_at,error) VALUES(1,@jobId,@sourceId,@mode,@phase,@createdAt,@updatedAt,@error)").run({ ...job, error: job.error ?? null });
+  // Additive migration: retain historical failures while exposing only unresolved results.
+  for (const [table, column, definition] of [
+    ["scan_meta", "attempt_id", "TEXT"], ["scan_meta", "attempt_started_at", "TEXT"], ["scan_meta", "completion", "TEXT"],
+    ["scan_results", "attempt_id", "TEXT"], ["scan_results", "item_key", "TEXT NOT NULL DEFAULT 'legacy'"],
+    ["scan_results", "active", "INTEGER NOT NULL DEFAULT 1"]
+  ] as const) {
+    if (!scanTableHasColumn(db, table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+  db.prepare("UPDATE scan_meta SET attempt_id=? WHERE attempt_id IS NULL").run(`${job.jobId}:legacy`);
+  db.prepare("UPDATE scan_results SET attempt_id=(SELECT attempt_id FROM scan_meta) WHERE attempt_id IS NULL").run();
+  db.exec("UPDATE schema_meta SET version=4 WHERE version<4");
+  db.exec("CREATE INDEX IF NOT EXISTS scan_active_item ON scan_results(source_id,conversation_id,item_key,active)");
+  let attemptId = (db.prepare("SELECT attempt_id FROM scan_meta").get() as { attempt_id: string }).attempt_id;
   let ordinal = Number((db.prepare("SELECT COALESCE(MAX(ordinal),-1) AS value FROM staged_messages WHERE job_id=?").get(job.jobId) as { value: number }).value) + 1;
   const insert = db.prepare("INSERT OR IGNORE INTO staged_messages(job_id,source_id,conversation_id,message_id,role,content,created_at,workspace_path,git_root,raw_meta_json,ordinal) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
   const refreshStaged = db.prepare(`UPDATE staged_messages
@@ -57,6 +75,13 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
   );
   const store: MemoryAgentSourceScanStore = {
     path,
+    beginAttempt(id, startedAt) {
+      attemptId = id;
+      db.prepare("UPDATE scan_meta SET attempt_id=?, attempt_started_at=?, phase='stage', updated_at=?, completion=NULL, error=NULL").run(id, startedAt ?? new Date().toISOString(), new Date().toISOString());
+    },
+    resolveItem(sourceId, conversationId, itemKey) {
+      db.prepare("UPDATE scan_results SET active=0 WHERE source_id=? AND conversation_id=? AND item_key=? AND error IS NOT NULL AND active=1").run(sourceId, conversationId, itemKey);
+    },
     stage(message) {
       const bytes = Buffer.byteLength(JSON.stringify(message));
       if (bytes > MAX_RECORD_BYTES) throw new Error(`scan record exceeds 64 MiB limit (${bytes} bytes)`);
@@ -102,10 +127,39 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
       });
       transaction();
     },
-    saveResult(r){db.prepare("INSERT INTO scan_results(source_id,conversation_id,memory_id,error) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM scan_results WHERE source_id=? AND conversation_id=? AND memory_id IS ? AND error IS ?)").run(r.sourceId,r.conversationId,r.memoryId??null,r.error??null,r.sourceId,r.conversationId,r.memoryId??null,r.error??null);}, resultCount(s){const row=db.prepare(`SELECT COUNT(*) AS count FROM scan_results${s?" WHERE source_id=?":""}`).get(...(s?[s]:[])) as {count:number}; return Number(row.count);},
-    results(sourceId,cursor,limit=100){const safeLimit=Math.min(500,Math.max(1,Math.floor(limit))); const numericCursor=Number(cursor); const safeCursor=Number.isFinite(numericCursor)&&numericCursor>=0?Math.floor(numericCursor):0; const rows=db.prepare("SELECT id,source_id AS sourceId,conversation_id AS conversationId,memory_id AS memoryId,error FROM scan_results WHERE source_id LIKE ? AND id>? ORDER BY id LIMIT ?").iterate(sourceId??"%",safeCursor,safeLimit) as Iterable<Record<string,unknown>>; return (function*(){for(const row of rows){const result={sourceId:String(row.sourceId),conversationId:String(row.conversationId),...(row.memoryId?{memoryId:String(row.memoryId)}:{}),...(row.error?{error:String(row.error)}:{})} as ScanStoredResult; Object.defineProperty(result,"cursor",{value:String(row.id),enumerable:false}); yield result;}})();},
+    saveResult(r) {
+      const itemKey = r.itemKey ?? "legacy";
+      const error = r.error === undefined ? null : r.error || "Agent source import failed";
+      db.transaction(() => {
+        if (error === null) store.resolveItem(r.sourceId, r.conversationId, itemKey);
+        else db.prepare("UPDATE scan_results SET active=0 WHERE source_id=? AND conversation_id=? AND item_key=? AND error IS NOT NULL").run(r.sourceId,r.conversationId,itemKey);
+        db.prepare(`INSERT INTO scan_results(source_id,conversation_id,memory_id,error,item_key,attempt_id)
+          SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM scan_results WHERE active=1 AND source_id=? AND conversation_id=? AND memory_id IS ? AND error IS ? AND item_key=?)`)
+          .run(r.sourceId,r.conversationId,r.memoryId??null,error,itemKey,attemptId,r.sourceId,r.conversationId,r.memoryId??null,error,itemKey);
+      })();
+    },
+    resultCount(sourceId) {
+      return (db.prepare(`SELECT COUNT(*) AS count FROM scan_results WHERE active=1${sourceId ? " AND source_id=?" : ""}`).get(...(sourceId?[sourceId]:[])) as {count:number}).count;
+    },
+    results(sourceId,cursor,limit=100) {
+      const safeLimit=Math.min(500,Math.max(1,Math.floor(limit)));
+      const safeCursor=Number.isFinite(Number(cursor))&&Number(cursor)>=0?Math.floor(Number(cursor)):0;
+      const rows=db.prepare(`SELECT id,source_id AS sourceId,conversation_id AS conversationId,memory_id AS memoryId,error FROM scan_results
+        WHERE active=1 AND (? IS NULL OR source_id=?) AND id>? ORDER BY id LIMIT ?`).all(sourceId??null,sourceId??null,safeCursor,safeLimit) as Array<Record<string,unknown>>;
+      return rows.map((row) => {
+        const result={sourceId:String(row.sourceId),conversationId:String(row.conversationId),...(row.memoryId?{memoryId:String(row.memoryId)}:{}),...(row.error?{error:String(row.error)}:{})} as ScanStoredResult;
+        Object.defineProperty(result,"cursor",{value:String(row.id),enumerable:false});
+        return result;
+      });
+    },
+    unresolvedSourceIds() {
+      return (db.prepare("SELECT DISTINCT source_id FROM scan_results WHERE active=1 AND error IS NOT NULL").all() as Array<{source_id:string}>).map((row) => row.source_id);
+    },
+    errorDetails(sourceId) {
+      return db.prepare("SELECT conversation_id AS conversationId,error AS reason FROM scan_results WHERE active=1 AND error IS NOT NULL AND source_id=? ORDER BY id LIMIT 500").all(sourceId) as Array<{conversationId:string;reason:string}>;
+    },
     resultSummary(sourceId) {
-      const row = db.prepare("SELECT COUNT(DISTINCT memory_id) AS memories, COALESCE(SUM(error IS NOT NULL),0) AS errors FROM scan_results WHERE source_id=?").get(sourceId) as { memories: number; errors: number };
+      const row = db.prepare("SELECT COUNT(DISTINCT memory_id) AS memories, COALESCE(SUM(error IS NOT NULL),0) AS errors FROM scan_results WHERE active=1 AND source_id=?").get(sourceId) as { memories: number; errors: number };
       const conversations = (db.prepare("SELECT COUNT(*) AS count FROM conversation_meta WHERE source_id=?").get(sourceId) as { count: number }).count;
       return { ...row, conversations };
     },
@@ -122,8 +176,8 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
       }
     },
     importMemoryCount(sourceId) { return (db.prepare("SELECT COUNT(*) AS count FROM scan_import_memories WHERE source_id=?").get(sourceId) as { count: number }).count; },
-    saveMeta(meta){db.prepare("UPDATE scan_meta SET job_id=@jobId,source_id=@sourceId,mode=@mode,phase=@phase,created_at=@createdAt,updated_at=@updatedAt,error=@error WHERE id=1").run({...meta,error:meta.error??null});},
-    getMeta(){return (db.prepare("SELECT job_id AS jobId,source_id AS sourceId,mode,phase,created_at AS createdAt,updated_at AS updatedAt,error FROM scan_meta WHERE id=1").get() as MemoryScanJobMeta|undefined)??null;},
+    saveMeta(meta){db.prepare("UPDATE scan_meta SET job_id=@jobId,source_id=@sourceId,mode=@mode,phase=@phase,created_at=@createdAt,updated_at=@updatedAt,error=@error,completion=@completion WHERE id=1").run({...meta,error:meta.error??null,completion:meta.completion??null});},
+    getMeta(){return (db.prepare("SELECT job_id AS jobId,source_id AS sourceId,mode,phase,created_at AS createdAt,updated_at AS updatedAt,error,attempt_id AS attemptId,attempt_started_at AS attemptStartedAt,completion FROM scan_meta WHERE id=1").get() as MemoryScanJobMeta|undefined)??null;},
     close(){db.close();},
     remove(){db.close(); rmSync(path,{force:true}); rmSync(`${path}-wal`,{force:true}); rmSync(`${path}-shm`,{force:true});}
   };

@@ -1,3 +1,4 @@
+import { agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
 /** App reducer module. */
 import { ASR_DEFAULT_BASE_URL, QWEN_ASR_MODEL_ID, type AgentSourceView, type AgentSourceScanUnavailable, type AppBootstrapResponse, type ScanPreferences } from "@memmy/local-api-contracts";
 import type { AppRoutePath, PreferredMode } from "../app/routes.js";
@@ -32,6 +33,7 @@ export interface AgentSourcesState {
   error: string | null;
   scanProgress: AgentSourceScanProgress | null;
   cancellingScanJobId: string | null;
+  latestScanAttemptStartedAt?: string;
   lastFinishedScanJobId: string | null;
   finishedScanJobIds: string[];
   recentScanCompletions: AgentSourceScanCompletion[];
@@ -288,15 +290,15 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         agentSources: { ...state.agentSources, isScanning: true, activeScanSourceId: action.sourceId, error: null, scanProgress: null, cancellingScanJobId: null }
       };
     case "agentSources/scanProgress":
-      if (
-        state.agentSources.finishedScanJobIds.includes(action.progress.jobId) ||
-        state.agentSources.cancellingScanJobId === action.progress.jobId
-      ) {
+      if (action.progress.attemptStartedAt && state.agentSources.latestScanAttemptStartedAt &&
+        action.progress.attemptStartedAt < state.agentSources.latestScanAttemptStartedAt) return state;
+      if (state.agentSources.finishedScanJobIds.includes(agentSourceScanExecutionKey(action.progress)) ||
+        state.agentSources.cancellingScanJobId === action.progress.jobId) {
         return state;
       }
       if (
-        state.agentSources.scanProgress?.phase === "stopped" &&
-        state.agentSources.scanProgress.jobId === action.progress.jobId &&
+        !action.progress.attemptId && state.agentSources.scanProgress?.phase === "stopped" &&
+        agentSourceScanExecutionKey(state.agentSources.scanProgress) === agentSourceScanExecutionKey(action.progress) &&
         action.progress.phase !== "stopped"
       ) {
         return state;
@@ -309,6 +311,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           isScanning: action.progress.phase !== "stopped",
           activeScanSourceId: action.progress.sourceId,
           error: null,
+          latestScanAttemptStartedAt: action.progress.attemptStartedAt ?? state.agentSources.latestScanAttemptStartedAt,
           scanProgress: action.progress
         }
       };
@@ -331,6 +334,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         }
       };
     case "agentSources/scanCompleted": {
+      if (action.scan?.attemptStartedAt && state.agentSources.latestScanAttemptStartedAt &&
+        action.scan.attemptStartedAt < state.agentSources.latestScanAttemptStartedAt) return state;
+      if (action.scan && state.agentSources.scanProgress &&
+        agentSourceScanExecutionKey(action.scan) !== agentSourceScanExecutionKey(state.agentSources.scanProgress) &&
+        (!action.scan.attemptStartedAt || !state.agentSources.scanProgress.attemptStartedAt ||
+          action.scan.attemptStartedAt <= state.agentSources.scanProgress.attemptStartedAt)) return state;
+      if (action.scan && state.agentSources.finishedScanJobIds.includes(agentSourceScanExecutionKey(action.scan))) return state;
       const finishedJobId = action.scan?.jobId ?? state.agentSources.cancellingScanJobId;
       return {
         ...state,
@@ -341,14 +351,15 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           error: null,
           scanProgress: null,
           cancellingScanJobId: null,
+          latestScanAttemptStartedAt: action.scan?.attemptStartedAt ?? state.agentSources.latestScanAttemptStartedAt,
           lastFinishedScanJobId: finishedJobId ?? state.agentSources.lastFinishedScanJobId,
-          finishedScanJobIds: finishedJobId
-            ? [...state.agentSources.finishedScanJobIds.filter((jobId) => jobId !== finishedJobId), finishedJobId].slice(-20)
+          finishedScanJobIds: action.scan
+            ? [...state.agentSources.finishedScanJobIds.filter((jobId) => jobId !== agentSourceScanExecutionKey(action.scan!)), agentSourceScanExecutionKey(action.scan)].slice(-20)
             : state.agentSources.finishedScanJobIds,
           recentScanCompletions: action.scan
             ? [
                 ...state.agentSources.recentScanCompletions.filter((item) => item.sourceId !== action.scan?.sourceId),
-                { jobId: action.scan.jobId, sourceId: action.scan.sourceId }
+                { ...action.scan }
               ]
             : state.agentSources.recentScanCompletions
         }
@@ -359,7 +370,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         agentSources: {
           ...state.agentSources,
-          recentScanCompletions: state.agentSources.recentScanCompletions.filter((item) => item.jobId !== action.jobId)
+          recentScanCompletions: state.agentSources.recentScanCompletions.filter((item) => agentSourceScanExecutionKey(item) !== agentSourceScanExecutionKey(action))
         }
       };
     case "scanPreferences/updated":

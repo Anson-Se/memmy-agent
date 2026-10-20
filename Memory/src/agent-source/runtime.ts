@@ -1,6 +1,6 @@
 import { readLegacyScanState } from "./legacy-state.js";
 import { openSourceCheckpoints, type SourceCheckpoints } from "./source-checkpoints.js";
-import { waitForImportProcessing } from "./scan-processing.js";
+import { setImmediate as yieldEventLoop } from "node:timers/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -97,6 +97,7 @@ export interface AgentSourceView {
 export interface AgentSourceScanState {
   running: boolean;
   jobId: string | null;
+  attemptId?: string;
   sourceId: string | null;
   mode: "initial_subset" | "incremental" | "full" | null;
   progress: ScanProgress | null;
@@ -108,11 +109,11 @@ export interface AgentSourceScanState {
 
 export interface AgentSourceExecutor {
   list(): Promise<{ executorAvailable: true; sources: AgentSourceView[] }>;
-  startScan(input: unknown): Promise<{ accepted: true; jobId: string }>;
+  startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }>;
   scanStatus(): AgentSourceScanState;
   pauseScan(): Promise<{ ok: true }>;
   cancelScan(): Promise<{ ok: true }>;
-  scanResults?(jobId: string, cursor?: string, limit?: number): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null }>;
+  scanResults?(jobId: string, cursor?: string, limit?: number): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null; attemptId?: string }>;
   mutateConnection(sourceId: string, kind: "plugin" | "skill", method: "POST" | "DELETE"): Promise<unknown>;
   startAutomation(): void;
   dispose(): void | Promise<void>;
@@ -174,7 +175,6 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   let canceling = false;
   const activeScans = new Set<Promise<void>>();
   const canceledScanJobs = new Set<string>();
-  const activeWorkers = new Set<Promise<unknown>>();
   let activeAutomation: Promise<void> | undefined;
 
   const readState = () => statePromise ??= loadState(statePath).then(async (state) => {
@@ -227,12 +227,12 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     return { executorAvailable: true, sources };
   }
 
-  async function startScan(input: unknown): Promise<{ accepted: true; jobId: string }> {
+  async function startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }> {
     if (canceling) throw new MemoryServiceError("conflict", "Canceling the previous scan");
     if (disposed) throw new MemoryServiceError("conflict", "Agent source executor is shutting down");
     const request = normalizeScanInput(input);
     if (request.sourceId !== "all" && !registry.get(request.sourceId)) throw new MemoryServiceError("invalid_argument", "Unknown Agent source");
-    if (!scanAbortController && scan.progress?.phase === "stopped" && scan.sourceId !== request.sourceId) {
+    if (!scanAbortController && scan.progress?.phase === "stopped" && !scan.completedAt && scan.sourceId !== request.sourceId) {
       throw new MemoryServiceError("conflict", "Resume or cancel the recovered scan first");
     }
     if (scan.running) throw new MemoryServiceError("conflict", "An Agent source scan is already running");
@@ -257,20 +257,24 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       resumePausedScan?.();
       resumePausedScan = undefined;
       logger.info("scan.resumed", { jobId, sourceId: request.sourceId });
-      return { accepted: true, jobId };
+      return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined };
     }
     if (scanPaused) {
       throw new MemoryServiceError("conflict", "Stop the paused Agent source scan before starting another scan");
     }
     const jobId = findReusableScanJob(scanStoreDirectory, request.sourceId, request.mode, canceledScanJobs)
       ?? `agent-scan-${randomUUID()}`;
+    const recovering = scan.jobId === jobId && scan.progress?.phase === "stopped" && !scan.completedAt;
+    const attemptId = recovering ? scan.attemptId ?? `${jobId}:legacy` : randomUUID();
+    const startedAt = recovering ? scan.startedAt : new Date().toISOString();
     scan = {
       running: true,
       jobId,
+      attemptId,
       sourceId: request.sourceId,
       mode: request.mode ?? null,
       progress: null,
-      startedAt: new Date().toISOString(),
+      startedAt,
       completedAt: null,
       error: null
     };
@@ -280,15 +284,15 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     scanAbortController = controller;
     const activeScan = runScan(request, controller.signal, jobId).then(() => {
       if (scan.jobId !== jobId || controller.signal.aborted) return;
-      scan = { ...scan, running: false, completedAt: new Date().toISOString() };
+      scan = { ...scan, running: false, completedAt: scan.completedAt ?? new Date().toISOString() };
       logger.info("scan.completed", { jobId, sourceId: request.sourceId });
     }).catch((error) => {
       if (scan.jobId !== jobId || controller.signal.aborted) return;
       scan = {
         ...scan,
         running: false,
-        completedAt: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error)
+        completedAt: scan.completedAt ?? new Date().toISOString(),
+        error: scan.error ?? (error instanceof Error ? error.message || "Agent source import failed" : String(error))
       };
       logger.error("scan.failed", { jobId, sourceId: request.sourceId, ...memoryErrorFields(error) });
     }).finally(() => {
@@ -303,7 +307,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     });
     activeScans.add(activeScan);
     logger.info("scan.started", { jobId, sourceId: request.sourceId, mode: request.mode });
-    return { accepted: true, jobId };
+    return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined };
   }
 
   async function runScan(
@@ -322,14 +326,24 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     let checkpoints: SourceCheckpoints | undefined;
     const preparedContentHashes = new Map<string, string>();
     const checkpoint = createScanCheckpoint(signal, () => waitWhilePaused(signal));
+    const persistCompletion = (error: string | null) => {
+      if (!store) return;
+      const completedAt = new Date().toISOString();
+      const completion = { ...scan, running: false, completedAt, error };
+      store.saveMeta({ jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental",
+        phase: error ? "failed" : "done", createdAt: store.getMeta()?.createdAt ?? completedAt,
+        updatedAt: completedAt, ...(error ? { error } : {}), completion: JSON.stringify(completion) });
+      scan = { ...scan, completedAt, error };
+    };
     try {
       checkpoints = openSourceCheckpoints(`${statePath}.checkpoints.sqlite`);
       store = await openMemoryAgentSourceScanStore(join(scanStoreDirectory, `${jobId}.sqlite`), {
         jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental", phase: "stage",
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
       });
-      if (request.waitForProcessing) store.setWaitForProcessing();
-      request.waitForProcessing = request.waitForProcessing || store.waitForProcessing();
+      store.beginAttempt(scan.attemptId!, scan.startedAt ?? undefined);
+      // Legacy waitForProcessing requests/options no longer change scan completion.
+      // Processing belongs to durable background jobs, independently of this scan.
       const available: SourceAdapter[] = [];
       for (const adapter of adapters) {
         await waitWhilePaused(signal);
@@ -376,13 +390,15 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         store.saveMeta({ jobId, sourceId: store.getMeta()?.sourceId ?? request.sourceId, mode, phase: "prepare", createdAt: store.getMeta()?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
         const sourceState = store.getSourceState(sourceId);
         store.saveSourceState({ ...(sourceState ?? { sourceId, mode, messageCount: store.count(sourceId), resultCount: store.resultCount(sourceId), errorCount: stage.scanErrorCount, updatedAt: new Date().toISOString() }), phase: "prepare", updatedAt: new Date().toISOString() });
-        preparedContentHashes.set(sourceId, await prepareStandaloneSource(store, checkpoints, sourceId, mode, stage.stored.latestSeenAt, stage.stored.contentHash, checkpoint));
+        preparedContentHashes.set(sourceId, await prepareStandaloneSource(store, checkpoints, sourceId, mode, stage.stored.latestSeenAt, checkpoint, (progress) => {
+          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; scan = { ...scan, progress }; }
+        }));
       }
       if (globalInitial) store.selectInitialTurns(stages.map((stage) => stage.sourceId), INITIAL_SCAN_MESSAGE_LIMIT, 200);
       for (const stage of stages) {
         await waitWhilePaused(signal);
         signal.throwIfAborted();
-        const { adapter, stored, mode, sourceId, staged } = stage;
+        const { stored, mode, sourceId } = stage;
         if (mode === "initial_subset" && !globalInitial) store.selectInitialTurns([sourceId], INITIAL_SCAN_MESSAGE_LIMIT, 0);
         store.saveMeta({ jobId, sourceId: store.getMeta()?.sourceId ?? request.sourceId, mode, phase: "ingest", createdAt: store.getMeta()?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
         const preparedState = store.getSourceState(sourceId);
@@ -403,23 +419,17 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           () => waitWhilePaused(signal)
         );
         await checkpoint();
-        const processingErrors = request.waitForProcessing ? await waitForImportProcessing(options.service, store, sourceId, signal, () => waitWhilePaused(signal), (progress) => {
-          if (!scanPaused) scan = { ...scan, progress };
-        }, (worker) => {
-          activeWorkers.add(worker);
-          void worker.finally(() => activeWorkers.delete(worker));
-        }) : [];
-        const sourceErrorCount = stage.scanErrorCount + result.errorCount + skillResult.errorCount + processingErrors.length;
+        const sourceErrorCount = store.resultSummary(sourceId).errors;
+        const sourceErrors = store.errorDetails(sourceId);
         failureCount += sourceErrorCount;
-        for (const detail of [...stage.errors, ...result.errors, ...skillResult.errors, ...processingErrors]) {
+        for (const detail of sourceErrors.map((item) => `${item.conversationId}: ${item.reason}`)) {
           if (failures.length >= 1000) break;
           failures.push(detail);
         }
         const now = new Date().toISOString();
         signal.throwIfAborted();
         if (sourceErrorCount === 0 && !result.hasUncommittedSkips) {
-          // A checkpoint must not hide raw imports whose processing still
-          // needs a retry after a failure, cancellation or service restart.
+          // Raw records and required jobs are durable now; model outcomes cannot invalidate this checkpoint.
           checkpoints.saveCheckpoints(store.checkpoints(sourceId));
         }
         const nextSourceState: PersistedSourceState = {
@@ -446,11 +456,11 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const summary = store.resultSummary(sourceId);
         scan = { ...scan, results: [...(scan.results ?? []), {
           sourceId, discoveredConversations: summary.conversations,
-          emittedMessages: result.messageCount, skipped: 0,
+          emittedMessages: store.count(sourceId), skipped: result.skipped,
           memoryIds: details.flatMap((row) => row.memoryId ? [row.memoryId] : []),
           memoryIdCount: summary.memories, errorCount: Math.max(sourceErrorCount, summary.errors),
           detailsTruncated: store.resultCount(sourceId) > 500,
-          errors: [...details.flatMap((row) => row.error ? [{ conversationId: row.conversationId, reason: row.error }] : []), ...processingErrors.map((reason) => ({ conversationId: "processing", reason }))]
+          errors: sourceErrors
         }] };
         store.saveSourceState({
           sourceId,
@@ -461,26 +471,33 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           errorCount: sourceErrorCount,
           updatedAt: now
         });
-        store.saveMeta({ jobId, sourceId: store.getMeta()?.sourceId ?? request.sourceId, mode, phase: "summarize", createdAt: store.getMeta()?.createdAt ?? now, updatedAt: now });
-        scan = { ...scan, progress: { sourceId, phase: "done", current: staged, total: staged, message: `Imported ${result.written} memories and ${skillResult.written} skills` } };
+        scan = { ...scan, progress: { sourceId, phase: "done", current: store.count(sourceId), total: store.count(sourceId), message: `Imported ${result.written} memories and ${skillResult.written} skills` } };
+      }
+      // A source disappearing between attempts must not erase its unresolved failures.
+      for (const sourceId of store.unresolvedSourceIds()) {
+        if (scan.results?.some((result) => result.sourceId === sourceId)) continue;
+        const summary = store.resultSummary(sourceId);
+        const errors = store.errorDetails(sourceId);
+        failureCount += summary.errors;
+        failures.push(...errors.slice(0, 3).map((item) => `${sourceId}: ${item.reason}`));
+        scan.results?.push({ sourceId, discoveredConversations: summary.conversations, emittedMessages: store.count(sourceId),
+          skipped: 0, memoryIdCount: summary.memories, errorCount: summary.errors, errors });
       }
       await checkpoint();
-      store.saveMeta({ jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental", phase: "done", createdAt: store.getMeta()?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
       if (failureCount > 0) {
-        const meta = store.getMeta();
-        if (meta) store.saveMeta({ ...meta, phase: "failed", updatedAt: new Date().toISOString(), error: failures.slice(0, 3).join("; ") });
+        throw new Error(`Agent source scan completed with ${failureCount} import failure${failureCount === 1 ? "" : "s"}: ${failures.slice(0, 3).join("; ")}`);
       }
-
+      persistCompletion(null);
     } catch (error) {
-      if (store) {
-        const meta = store.getMeta();
-        if (meta) store.saveMeta({ ...meta, phase: "failed", updatedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) });
+      if (signal.aborted) {
+        const meta = store?.getMeta();
+        if (meta) store!.saveMeta({ ...meta, phase: "stopped", updatedAt: new Date().toISOString() });
+      } else {
+        persistCompletion(error instanceof Error ? error.message || "Agent source import failed" : String(error));
       }
       throw error;
     } finally {
-      if (store) {
-        store.close();
-      }
+      store?.close();
       checkpoints?.close();
       if (canceledScanJobs.has(jobId)) {
         // Windows cannot unlink SQLite while its handle is open. Explicit
@@ -492,9 +509,6 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           canceledScanJobs.delete(jobId);
         }
       }
-    }
-    if (failureCount > 0) {
-      throw new Error(`Agent source scan completed with ${failureCount} import failure${failureCount === 1 ? "" : "s"}: ${failures.slice(0, 3).join("; ")}`);
     }
   }
 
@@ -547,25 +561,39 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     }
   }
 
-  async function scanResults(jobId: string, cursor = "0", limit = 100): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null }> {
+  async function scanResults(jobId: string, cursor = "0", limit = 100): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null; attemptId?: string }> {
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(jobId)) throw new MemoryServiceError("invalid_argument", "Invalid scan job id");
     const path = join(scanStoreDirectory, `${jobId}.sqlite`);
     if (!existsSync(path)) return { items: [], nextCursor: null };
     const store = await openMemoryAgentSourceScanStore(path, { jobId, sourceId: "all", mode: "incremental", phase: "ingest", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     try {
+      const attemptId = store.getMeta()?.attemptId;
+      const separator = cursor.lastIndexOf("/");
+      if (separator >= 0) {
+        if (cursor.slice(0, separator) !== attemptId) throw new MemoryServiceError("conflict", "Scan attempt changed; reload results from the first page");
+        cursor = cursor.slice(separator + 1);
+      }
       const safeLimit = Math.min(500, Math.max(1, limit));
       const safeCursor = Number.isFinite(Number(cursor)) && Number(cursor) >= 0 ? String(Math.floor(Number(cursor))) : "0";
       const rows = [...store.results(undefined, safeCursor, safeLimit)];
       const items = rows.map(({ cursor: _cursor, ...item }) => item);
-      const nextCursor = rows.length < safeLimit ? null : rows.at(-1)?.cursor ?? null;
-      return { items, nextCursor };
+      const nextCursor = rows.length < safeLimit ? null : `${attemptId}/${rows.at(-1)!.cursor}`;
+      return { items, nextCursor, attemptId };
     } finally {
       store.close();
 
     }
   }
 
+  let unitsSinceYield = 0;
+  let lastYieldAt = performance.now();
   async function waitWhilePaused(signal: AbortSignal): Promise<void> {
+    if (++unitsSinceYield >= 100 || performance.now() - lastYieldAt >= 16) {
+      await yieldEventLoop();
+      unitsSinceYield = 0;
+      lastYieldAt = performance.now();
+    }
+    signal.throwIfAborted();
     while (scanPaused) {
       await new Promise<void>((resolve, reject) => {
         const onAbort = () => {
@@ -681,7 +709,6 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       resumePausedScan = undefined;
       await activeAutomation;
       await Promise.all(activeScans);
-      await Promise.all(activeWorkers);
     }
   };
 }
@@ -805,19 +832,20 @@ async function stageStandaloneSource(
       const normalizedMessage = message.sourceId === sourceId ? message : { ...message, sourceId };
       const bytes = Buffer.byteLength(JSON.stringify(normalizedMessage));
       if (bytes > 64 * 1024 * 1024) {
-        recordScanItemSkip(store, sourceId, message.conversationId, "record exceeds 64 MiB");
+        recordScanItemSkip(store, sourceId, message.conversationId, "record exceeds 64 MiB", `read:${message.messageId}`);
         continue;
       }
-      if (batch.length > 0 && (batch.length >= 500 || batchBytes + bytes > 8 * 1024 * 1024)) {
+      if (batch.length > 0 && (batch.length >= 100 || batchBytes + bytes > 8 * 1024 * 1024)) {
         staged += store.stageBatch(batch);
         const last = batch[batch.length - 1]!;
         store.saveScanCursor(sourceId, { conversationId: last.conversationId, createdAt: last.createdAt, messageId: last.messageId, ordinal: last.ordinal ?? 0 });
         batch.length = 0;
         batchBytes = 0;
       }
+      store.resolveItem(sourceId, message.conversationId, `read:${message.messageId}`);
       batch.push({ ...normalizedMessage, ordinal: emittedOrdinal++ });
       batchBytes += bytes;
-      if (batch.length >= 500 || batchBytes >= 8 * 1024 * 1024) {
+      if (batch.length >= 100 || batchBytes >= 8 * 1024 * 1024) {
         staged += store.stageBatch(batch);
         const last = batch[batch.length - 1]!;
         store.saveScanCursor(sourceId, { conversationId: last.conversationId, createdAt: last.createdAt, messageId: last.messageId, ordinal: last.ordinal ?? 0 });
@@ -830,12 +858,14 @@ async function stageStandaloneSource(
       const last = batch[batch.length - 1]!;
       store.saveScanCursor(sourceId, { conversationId: last.conversationId, createdAt: last.createdAt, messageId: last.messageId, ordinal: last.ordinal ?? 0 });
     }
+    store.resolveItem(sourceId, "scan", "reader");
+    if (!store.getConversationMeta(sourceId, "scan")) store.resolveItem(sourceId, "scan", "legacy");
   } catch (error) {
     if (signal.aborted) throw error;
     scanErrorCount += 1;
     const reason = error instanceof Error ? error.message : "Agent source scan failed";
     if (errors.length < 1000) errors.push(`${sourceId}: ${reason}`);
-    store.saveResult({ sourceId, conversationId: "scan", error: reason });
+    store.saveResult({ sourceId, conversationId: "scan", itemKey: "reader", error: reason });
   }
   store.saveSourceState({
     sourceId,
@@ -864,9 +894,11 @@ async function ingestStagedMessages(
     "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed"
   >,
   scanMode?: MemoryDesktopAddScanMode
-): Promise<{ written: number; messageCount: number; errors: string[]; errorCount: number; latestSeenAt: string | null; retryFrom: string | null; hasUncommittedSkips: boolean }> {
+): Promise<{ written: number; skipped: number; messageCount: number; errors: string[]; errorCount: number; latestSeenAt: string | null; retryFrom: string | null; hasUncommittedSkips: boolean }> {
   let written = 0;
   let messageCount = 0;
+  let skipped = 0;
+  let itemKey = "legacy";
   let processed = 0;
   // Staging is finished, so this total stays fixed throughout ingestion.
   const totalMessages = store.count(sourceId);
@@ -877,6 +909,7 @@ async function ingestStagedMessages(
   let hasUncommittedSkips = false;
   let activeConversationId: string | null = null;
   let activeConversationFailed = false;
+  let wholeConversationAttempted = true;
   const noteUncommittedSkip = (reason: string, latestActivityAt: string | null) => {
     if (!sourceTurnSkipBlocksWatermark(reason)) return;
     activeConversationFailed = true;
@@ -892,6 +925,7 @@ async function ingestStagedMessages(
   };
   const commitConversation = () => {
     if (!activeConversationId || activeConversationFailed) return;
+    if (wholeConversationAttempted) store.resolveItem(sourceId, activeConversationId, "legacy");
     const meta = store.getConversationMeta(sourceId, activeConversationId);
     if (!meta) return;
     const checkpoint = {
@@ -928,21 +962,26 @@ async function ingestStagedMessages(
   for await (const turn of orderedTurns(pages)) {
     await checkpoint();
     signal.throwIfAborted();
+    // Staged message identity survives enrichment of previously missing native turn metadata.
+    itemKey = `turn:${turn.messages[0]!.messageId}`;
     const turnLatest = turn.messages[turn.messages.length - 1]?.createdAt ?? null;
     if (turnLatest && (latestSeenAt === null || Date.parse(turnLatest) > Date.parse(latestSeenAt))) latestSeenAt = turnLatest;
     if (turn.conversationId !== activeConversationId) {
       commitConversation();
       activeConversationId = turn.conversationId;
       activeConversationFailed = false;
+      wholeConversationAttempted = true;
     }
     const conversationMeta = store.getConversationMeta(sourceId, turn.conversationId);
     if (conversationMeta?.selected === false) {
+      wholeConversationAttempted = false;
       processed += turn.messages.length;
       onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
       continue;
     }
     const selectedTurn = store.getTurnMeta(sourceId, turn.conversationId, stableTurnIdentity(turn));
     if (selectedTurn && !selectedTurn.selected) {
+      wholeConversationAttempted = false;
       processed += turn.messages.length;
       onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
       continue;
@@ -960,7 +999,7 @@ async function ingestStagedMessages(
         const sourceTurn = sourceTurnFromMessages(turn.messages);
         if (!sourceTurn) {
           const reason = sourceTurnFailureReason(turn.messages);
-          recordScanItemSkip(store, sourceId, turn.conversationId, reason);
+          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
           noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
@@ -981,7 +1020,7 @@ async function ingestStagedMessages(
           ...(scanMode === "initial_subset" || scanMode === "full" ? { captureLegacyHistory: true } : {})
         });
         if (result.status === "rejected" && result.reason === "legacy_before_activation" && (scanMode === "initial_subset" || scanMode === "full")) {
-          recordScanItemSkip(store, sourceId, turn.conversationId, result.reason);
+          recordScanItemSkip(store, sourceId, turn.conversationId, result.reason, itemKey);
           noteUncommittedSkip(result.reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
@@ -989,13 +1028,14 @@ async function ingestStagedMessages(
         }
         if (result.status === "pending" || result.status === "conflict") {
           const reason = result.reason ?? result.status;
-          recordScanItemSkip(store, sourceId, turn.conversationId, reason);
+          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
           noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
           continue;
         }
         const ids = result.result?.l1MemoryIds ?? [];
+        if (result.status !== "stored") skipped += turn.messages.length;
         if (result.status === "stored") {
           written += ids.length;
           memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
@@ -1006,8 +1046,8 @@ async function ingestStagedMessages(
           });
           reportedAdd = true;
         }
-        if (ids.length === 0) store.saveResult({ sourceId, conversationId: turn.conversationId });
-        for (const memoryId of ids) store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId });
+        if (ids.length === 0) store.saveResult({ sourceId, itemKey, conversationId: turn.conversationId });
+        for (const memoryId of ids) store.saveResult({ sourceId, itemKey, conversationId: turn.conversationId, memoryId });
         checkpoints.markMessages(turn.messages);
         messageCount += turn.messages.length;
         if (result.status === "stored") scheduleWorker?.();
@@ -1017,7 +1057,7 @@ async function ingestStagedMessages(
         hasUncommittedSkips = true;
         errorCount += 1;
         if (errors.length < 1000) errors.push(`${turn.conversationId}: ${reason}`);
-        recordScanItemSkip(store, sourceId, turn.conversationId, reason);
+        recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
         noteCaptureFailure();
         if (addAnalyticsBase && !reportedAdd) {
           memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
@@ -1059,10 +1099,11 @@ async function ingestStagedMessages(
           storedCount: 1
         });
       }
-      store.saveResult({ sourceId, conversationId: turn.conversationId, memoryId: added.id });
+      store.saveResult({ sourceId, itemKey, conversationId: turn.conversationId, memoryId: added.id });
       store.saveImportMemory(sourceId, added.id);
       memoryIds.push(added.id);
       if (!added.duplicate) written += 1;
+      else skipped += turn.messages.length;
       checkpoints.markMessages(turn.messages);
     } catch (error) {
       succeeded = false;
@@ -1070,9 +1111,8 @@ async function ingestStagedMessages(
       const reason = error instanceof Error ? error.message : String(error);
       errorCount += 1;
       if (errors.length < 1000) errors.push(`${turn.conversationId}: ${reason}`);
-      store.saveResult({ sourceId, conversationId: turn.conversationId, error: reason });
       hasUncommittedSkips = true;
-      recordScanItemSkip(store, sourceId, turn.conversationId, reason);
+      recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
       memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
       memoryAddAnalytics?.trackAddFailed({
         ...addAnalyticsBase,
@@ -1089,7 +1129,7 @@ async function ingestStagedMessages(
   }
   flush(true);
   commitConversation();
-  return { written, messageCount, errors, errorCount, latestSeenAt, retryFrom, hasUncommittedSkips };
+  return { written, skipped, messageCount, errors, errorCount, latestSeenAt, retryFrom, hasUncommittedSkips };
 }
 
 async function prepareStandaloneSource(
@@ -1098,10 +1138,13 @@ async function prepareStandaloneSource(
   sourceId: string,
   mode: "initial_subset" | "incremental" | "full",
   latestSeenAt: string | null,
-  previousContentHash: string | undefined,
-  checkpoint: () => Promise<void>
+  checkpoint: () => Promise<void>,
+  onProgress: (progress: ScanProgress) => void
 ): Promise<string> {
   let cursor: Parameters<ScanStore["messages"]>[1];
+  let prepared = 0;
+  const total = store.count(sourceId);
+  onProgress({ sourceId, phase: "prepare", current: 0, total });
   let currentConversation: string | null = null;
   let currentTurn: ConversationMessage[] = [];
   let hash = createHash("sha256");
@@ -1152,6 +1195,7 @@ async function prepareStandaloneSource(
     if (page.length === 0) break;
     for (const message of page) {
       await checkpoint();
+      if (++prepared % 100 === 0) onProgress({ sourceId, phase: "prepare", current: prepared, total });
       if (message.conversationId !== currentConversation) {
         flushTurn();
         flushConversation();
@@ -1225,10 +1269,12 @@ function recordScanItemSkip(
   store: MemoryAgentSourceScanStore,
   sourceId: string,
   conversationId: string,
-  reason: string
+  reason: string,
+  itemKey = "legacy"
 ): void {
   logger.warn("scan.item_skipped", { sourceId, conversationId, reason });
-  store.saveResult({ sourceId, conversationId, error: reason });
+  if (reason === "turn_cancelled") { store.resolveItem(sourceId, conversationId, itemKey); return; }
+  store.saveResult({ sourceId, conversationId, itemKey, error: reason });
 }
 
 function readScanPage(store: MemoryAgentSourceScanStore, sourceId: string, cursor?: { conversationId: string; createdAt: string; messageId: string; ordinal: number }): ConversationMessage[] {
@@ -1272,23 +1318,25 @@ async function ingestAgentSkills(
   };
   for await (const filePath of findSkillFiles(skillsRoot, checkpoint)) {
     await checkpoint();
-    const content = await readFile(filePath, "utf8");
-    await checkpoint();
-    const contentHash = createHash("sha256").update(content).digest("hex");
     const sourceSkillId = relative(skillsRoot, dirname(filePath)).replaceAll("\\", "/");
-    const requestId = `agent-source-skill:${sourceId}:${sourceSkillId}:${contentHash}`;
-    const fileStat = await stat(filePath);
-    const turnId = `skill:${sourceSkillId}:${contentHash}`;
     const addAnalyticsBase = {
       adapterId: `agent-source:${sourceId}`,
       conversationId: `skill:${sourceSkillId}`,
-      turnId,
+      turnId: `skill:${sourceSkillId}`,
       layer: "Skill" as const,
       ...(scanMode ? { scanMode } : {})
     };
     const addStartedAt = Date.now();
     await checkpoint();
     try {
+      const content = await readFile(filePath, "utf8");
+      const contentHash = createHash("sha256").update(content).digest("hex");
+      const requestId = `agent-source-skill:${sourceId}:${sourceSkillId}:${contentHash}`;
+      const fileStat = await stat(filePath);
+      const turnId = `skill:${sourceSkillId}:${contentHash}`;
+      addAnalyticsBase.turnId = turnId;
+      await waitIfPaused();
+      signal?.throwIfAborted();
       const added = service.addMemory({
         requestId,
         adapterId: `agent-source:${sourceId}`,
@@ -1323,6 +1371,7 @@ async function ingestAgentSkills(
         flush();
       }
     } catch (error) {
+      if (signal?.aborted) throw error;
       const reason = error instanceof Error ? error.message : String(error);
       errorCount += 1;
       if (errors.length < 1000) errors.push(`skill:${sourceSkillId}: ${reason}`);
@@ -1577,7 +1626,6 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-/** Desktop completion includes targeted generic-import processing, not unrelated background jobs. */
 /** Surface an interrupted Memory job as paused so every UI can resume or cancel it. */
 function restoredScanState(directory: string): AgentSourceScanState {
   if (!existsSync(directory)) return emptyScanState();
@@ -1587,13 +1635,16 @@ function restoredScanState(directory: string): AgentSourceScanState {
     let db: InstanceType<typeof Database> | undefined;
     try {
       db = new Database(join(directory, name), { readonly: true, fileMustExist: true });
-      const row = db.prepare("SELECT job_id, source_id, mode, phase, created_at, updated_at FROM scan_meta WHERE id=1").get() as { job_id: string; source_id: string; mode: AgentSourceScanState["mode"]; phase: string; created_at: string; updated_at: string } | undefined;
-      if (!row || row.phase === "done" || !/^[a-zA-Z0-9_-]{1,128}$/.test(row.job_id)) continue;
+      const row = db.prepare("SELECT * FROM scan_meta WHERE id=1").get() as { attempt_id?: string; attempt_started_at?: string; completion?: string; error?: string; job_id: string; source_id: string; mode: AgentSourceScanState["mode"]; phase: string; created_at: string; updated_at: string } | undefined;
+      if (!row || !/^[a-zA-Z0-9_-]{1,128}$/.test(row.job_id)) continue;
       if (Date.parse(row.updated_at) < latestAt) continue;
       latestAt = Date.parse(row.updated_at);
-      latest = { ...emptyScanState(), jobId: row.job_id, sourceId: row.source_id, mode: row.mode,
-        startedAt: row.created_at,
-        progress: { sourceId: row.source_id, phase: "stopped", current: 0, total: 0, message: "Interrupted scan is ready to resume" }
+      if (row.completion) { latest = JSON.parse(row.completion) as AgentSourceScanState; continue; }
+      if (row.phase === "done") { latest = emptyScanState(); continue; }
+      latest = { ...emptyScanState(), attemptId: row.attempt_id ?? `${row.job_id}:legacy`,
+        ...(row.phase === "failed" ? { completedAt: row.updated_at, error: row.error ?? "Agent source import failed" } : {}), jobId: row.job_id, sourceId: row.source_id, mode: row.mode,
+        startedAt: row.attempt_started_at ?? row.created_at,
+        progress: row.phase === "failed" ? null : { sourceId: row.source_id, phase: "stopped", current: 0, total: 0, message: "Interrupted scan is ready to resume" }
       };
     } catch (error) {
       logger.warn("scan.restore_failed", { file: name, ...memoryErrorFields(error) });
