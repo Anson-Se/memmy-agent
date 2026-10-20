@@ -614,12 +614,14 @@ export function WorkspaceArtifactPanel(props: WorkspaceArtifactPanelProps): Reac
                     onPointerUp={(event) => {
                       event.preventDefault();
                       event.stopPropagation();
-                      extra ? extra.onClose() : closePreviewTab(path);
+                      if (extra) extra.onClose();
+                      else closePreviewTab(path);
                     }}
                     onClick={(event) => {
                       event.preventDefault();
                       event.stopPropagation();
-                      extra ? extra.onClose() : closePreviewTab(path);
+                      if (extra) extra.onClose();
+                      else closePreviewTab(path);
                     }}
                   >
                     <X size={11} />

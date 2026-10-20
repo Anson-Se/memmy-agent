@@ -1278,7 +1278,7 @@ describe("WebSocket HTTP route helpers", () => {
       body: JSON.stringify({ path: outside, sessionKey }),
     });
     expect(stagedOutside.status).toBe(200);
-    const stagedOutsideBody = await stagedOutside.json();
+    const stagedOutsideBody = await stagedOutside.json() as Record<string, unknown>;
     expect(stagedOutsideBody).toMatchObject({ ok: true, name: "outside.md", kind: "file", media_url: expect.stringMatching(/^\/api\/media\//) });
     expect(stagedOutsideBody.relative_path).toBeUndefined();
 

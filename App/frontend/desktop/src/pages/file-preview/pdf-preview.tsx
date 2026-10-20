@@ -129,7 +129,6 @@ export function PdfPreview(props: PdfPreviewProps): ReactNode {
     });
     return () => window.cancelAnimationFrame(frame);
     // intentionally only when document identity changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [document]);
 
   useEffect(() => {

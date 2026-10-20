@@ -22,7 +22,6 @@ import { probeNativePermissions, guideNativePermissions } from "../../../tools/c
 import { stopOwnedNativeAgent } from "../../../tools/computer-use/native-agent-lifecycle.js";
 import { ToolRegistry } from "./registry.js";
 import { storeToolImageArtifact } from "../../../utils/artifacts.js";
-import { legacyComputerUseToolName, memmyComputerUseToolName } from "../../../config/computer-use-server.js";
 import { isManagedOcuConfig, managedOcuEnvironment, openComputerUseEnvironment, resolveOpenComputerUseCommand } from "../../../tools/computer-use/open-computer-use-binary.js";
 
 import { computerUsePermissionError } from "../../../tools/computer-use/mac-permission-settings.js";
