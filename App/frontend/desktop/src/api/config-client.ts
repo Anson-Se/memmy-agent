@@ -648,12 +648,14 @@ function withoutPendingPresetAssignments(input: ModelConfigInput, pendingIds: Re
 function resolvePendingPresetIds(pending: PendingPreset[], view: ModelConfigView): Map<string, string> {
   const mapping = new Map<string, string>();
   for (const item of pending) {
+    // Never infer credential equality from a mask. Only the backend can resolve aliases.
+    item.endpointId = view.endpointAliases?.[item.provider]?.[item.endpointId] ?? item.endpointId;
     const matches = view.providers.flatMap((provider) => provider.models).filter((model) => (
       model.provider === item.provider
       && model.endpointId === item.endpointId
       && model.model === item.model
       && model.source === item.source
-      && sameStringSet(model.capabilities, item.capabilities)
+      && item.capabilities.every((capability) => model.capabilities.includes(capability))
     ));
     if (matches.length !== 1) {
       throw new Error(`Unable to resolve server preset for ${item.provider}/${item.endpointId}/${item.model}`);
@@ -712,15 +714,11 @@ function assertResolvedPresetsStillExist(
       || preset.endpointId !== item.endpointId
       || preset.model !== item.model
       || preset.source !== item.source
-      || !sameStringSet(preset.capabilities, item.capabilities)
+      || !item.capabilities.every((capability) => preset.capabilities.includes(capability))
     ) {
       throw new Error(`Created model preset changed before assignment: ${item.provider}/${item.endpointId}/${item.model}`);
     }
   }
-}
-
-function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value) => right.includes(value));
 }
 
 function isModelConfigChanged(error: unknown): boolean {

@@ -1,3 +1,4 @@
+import { requestTiming } from "../../utils/request-timing.js";
 import { initializeDesktopScreenCapture } from '../../tools/computer-use/desktop-screen-capture.js';
 import { closeNativeSurfacesForTurn, registerComputerUseTurnInterrupt } from '../../tools/computer-use/surface-preview.js';
 import fs from "node:fs";
@@ -121,6 +122,7 @@ import {
   type TokenCompactionStatus,
 } from "./memory.js";
 import { AgentHook, AgentHookContext, CompositeAgentHook } from "./hook.js";
+import { loadExternalAgentHooks } from "./external-hook-loader.js";
 import { SubagentManager } from "./subagent.js";
 import { AutoCompact } from "./autocompact.js";
 import { configuredModelPresets, defaultSelectionSignature, makePresetSnapshotLoader, normalizePresetName } from "./model-presets.js";
@@ -801,6 +803,9 @@ export class AgentLoop {
   unifiedSession: boolean;
   backgroundTasks: Array<Promise<any>> = [];
   extraHooks: AgentHook[] = [];
+  private externalHooks: AgentHook[] = [];
+  private externalHooksLoadPromise: Promise<void> | null = null;
+  private externalHooksShutdownPromise: Promise<void> | null = null;
   startTime: number;
   lastUsageBySession: Map<string, Record<string, number>>;
   goalRuntime: GoalRuntime;
@@ -1225,7 +1230,7 @@ export class AgentLoop {
   private reportStartupStage(stage: string, startedAt: number): void {
     if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return;
     try {
-      console.info(`[agent-startup] ${JSON.stringify({ stage, elapsedMs: Date.now() - startedAt })}`);
+      console.info("[agent-startup] " + JSON.stringify({ stage, elapsedMs: Date.now() - startedAt }));
     } catch { /* Diagnostics cannot interrupt startup. */ }
   }
 
@@ -1239,6 +1244,8 @@ export class AgentLoop {
       if (!this.messageLoopReady) this.reportStartupStage(stage, startedAt);
     };
     const initialization = (async () => {
+      await this.ensureExternalHooksLoaded();
+      reportStage("external-hooks-ready");
       await initializeDesktopScreenCapture();
       reportStage("screen-capture-ready");
       await this.connectMcp();
@@ -1263,11 +1270,36 @@ export class AgentLoop {
   async closeRuntimeTools(): Promise<void> {
     this.messageLoopReady = false;
     this.runtimeToolsClosed = true;
-    // A failed attempt may still have opened some resources; clean those up too.
-    await this.runtimeToolsInitialization?.catch(() => undefined);
-    await this.browserSessionManager.close();
-    await this.closeMcp();
-    await this.memmyMemoryIntegration.dispose?.();
+    try {
+      // A failed attempt may still have opened some resources; clean those up too.
+      await this.runtimeToolsInitialization?.catch(() => undefined);
+      await this.browserSessionManager.close();
+      await this.closeMcp();
+      await this.memmyMemoryIntegration.dispose?.();
+    } finally {
+      await this.shutdownExternalHooks();
+    }
+  }
+
+  private ensureExternalHooksLoaded(): Promise<void> {
+    this.externalHooksLoadPromise ??= loadExternalAgentHooks(this.config.agentHooks)
+      .then((hooks) => {
+        this.externalHooks = hooks;
+        this.extraHooks.push(...hooks);
+      })
+      .catch((error) => {
+        console.error("Unable to initialize external agent hooks:", error);
+      });
+    return this.externalHooksLoadPromise;
+  }
+
+  private shutdownExternalHooks(): Promise<void> {
+    this.externalHooksShutdownPromise ??= new CompositeAgentHook(this.externalHooks)
+      .shutdown()
+      .catch((error) => {
+        console.error("Unable to shut down external agent hooks:", error);
+      });
+    return this.externalHooksShutdownPromise;
   }
 
   async closeBrowserSession(
@@ -1432,11 +1464,15 @@ export class AgentLoop {
     });
   }
 
-  registerHookTools(toolCtx: ToolContext, phase: string, registry: ToolRegistryInstance = this.tools): void {
+  registerHookTools(
+    toolCtx: ToolContext,
+    phase: string,
+    registry: ToolRegistryInstance = this.tools,
+  ): void {
     this.lifecycleHook().onRegisterTools({
       registry,
       toolContext: toolCtx,
-      workspace: this.workspace,
+      workspace: toolCtx.workspace ?? this.workspace,
       metadata: { phase },
     });
   }
@@ -1447,6 +1483,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
@@ -1458,6 +1497,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session?.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
@@ -4097,6 +4139,7 @@ export class AgentLoop {
         ctx.userPersistedEarly = Boolean(persisted.entry || ctx.msg.content.trim() || ctx.msg.media.length);
       } else {
         ctx.userPersistedEarly = this.persistUserMessageEarly(ctx.msg, ctx.session!);
+        requestTiming("agent.user_persisted");
       }
     }
     if (ctx.userPersistedEarly && !internalGoal) {
@@ -4119,6 +4162,7 @@ export class AgentLoop {
     if (revalidated.cwd !== sessionWorkspace || revalidated.projectId !== ctx.sessionProjectId) {
       throw new SessionWorkspaceError("workspace_conflict");
     }
+    requestTiming("agent.prompt_hooks_start");
     await this.lifecycleHook().beforeBuildSystemPrompt(new AgentHookContext({
       session: ctx.session,
       sessionKey: ctx.sessionKey,
@@ -4126,6 +4170,7 @@ export class AgentLoop {
       spec: { hostProjectId: ctx.sessionProjectId, workspace: sessionWorkspace, turnId: ctx.turnId, abortSignal: ctx.abortSignal },
       metadata: { lifecycle: "system_prompt" },
     }));
+    requestTiming("agent.prompt_hooks_end");
     const compactionOptions: {
       replayMaxMessages: number | null;
       notifyOnLockWait?: boolean;
@@ -4151,11 +4196,14 @@ export class AgentLoop {
       };
       compactionOptions.onCompactionEvent = ctx.onTokenCompactionEvent;
     }
+    requestTiming("agent.compaction_start");
     await (ctx.consolidator ?? this.consolidator).maybeConsolidateByTokens(
       ctx.session!,
       compactionOptions,
     );
+    requestTiming("agent.compaction_end");
     await initializeDesktopScreenCapture();
+    requestTiming("agent.screen_capture_ready");
     ctx.tools = this.createToolRegistry("turn", sessionWorkspace, {
       includeConnectedMcp: true,
       messageSendCallback: ctx.messageSendCallback,
@@ -4263,6 +4311,7 @@ export class AgentLoop {
   }
 
   async stateRun(ctx: TurnContext): Promise<string> {
+    requestTiming("agent.prepared");
     if (ctx.slot?.state === "running") ctx.slot.acceptingSteer = true;
     const settleSlot = (): void => {
       if (!ctx.slot || ctx.slot.state === "closed") return;
@@ -5751,7 +5800,9 @@ export class AgentLoop {
     const pendingMarker = new AsyncQueue<InboundMessage>();
     this.pendingQueues.set(key, pendingMarker);
     try {
+      requestTiming("agent.tools_start");
       await this.initializeRuntimeTools();
+      requestTiming("agent.tools_ready");
       const msg = new InboundMessage({
         channel,
         chatId,

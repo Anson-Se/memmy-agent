@@ -936,14 +936,14 @@ describe("SettingsPageView", () => {
     expect(source).toContain("setWorkspace(createModelWorkspace(saved));");
   });
 
-  it("模型工作区新建时提示输入 API Key，编辑时显示已配置密钥的脱敏值", () => {
-    const workspaceSource = readFileSync(fileURLToPath(new URL("../model-workspace-section.tsx", import.meta.url)), "utf8");
+  it("模型工作区连接编辑展示已保存脱敏 key，且保存不回传脱敏值", () => {
+    const fieldsSource = readFileSync(fileURLToPath(new URL("../api-key-form-fields.tsx", import.meta.url)), "utf8");
 
-    expect(workspaceSource).toContain('label={t("apiKey.key")}');
-    expect(workspaceSource).toContain('placeholder={t("settings.modelWorkspace.apiKeyPlaceholder")}');
-    expect(workspaceSource).toContain("maskedValue={editor.connectionId && !editorProviderChanged");
-    expect(workspaceSource).toContain("apiKey: editor.apiKey || undefined");
-    expect(workspaceSource).toContain("apiKeyMasked: providerChanged ? undefined : existing?.apiKeyMasked");
+    // Credential display/test/save behavior is covered with the real catalog
+    // writer in byok-credential-consistency.interaction.test.tsx.
+    expect(fieldsSource).toContain("const placeholder = !props.value.trim() && props.maskedValue ? props.maskedValue : props.placeholder;");
+    expect(fieldsSource).toContain("placeholder={placeholder}");
+    expect(fieldsSource).not.toContain("const showSavedSecret = !props.value.trim() && Boolean(props.maskedValue)");
   });
   it("设置页已移除旧内联模型保存链路，模型工作区只走 catalog API", () => {
     const source = readFileSync(settingsPageSourcePath, "utf8");
