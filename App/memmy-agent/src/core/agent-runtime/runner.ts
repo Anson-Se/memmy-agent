@@ -5,9 +5,9 @@ import path from "node:path";
 import { LLMProvider, LLMResponse, ToolCallRequest } from "../../providers/base.js";
 import {
   coversInputModalities,
-  getModelInputModalities,
   hasDeclaredInputModalities,
   requiredInputModalities,
+  resolveModelInputModalities,
 } from "../../providers/model-input-capabilities.js";
 import type { ActualModelContext } from "@memmy/local-api-contracts";
 import { CONTEXT_SAFETY_BUFFER_TOKENS } from "../../token-budget.js";
@@ -677,15 +677,18 @@ export class AgentRunner {
     const messagesForModel = this.prepareImageMessages(this.applyToolResultBudget(spec, messages), imageTextState);
     const model = spec.actualModelContext?.model ?? spec.model;
     const required = requiredInputModalities(messagesForModel);
-    const supported = getModelInputModalities(model);
+    const declared = spec.actualModelContext?.inputModalities;
+    const supported = resolveModelInputModalities(model, declared);
     const missing = required.filter((modality) => !supported.includes(modality));
     const canUseAccountFallback = missing.length === 1
       && missing[0] === "image"
       && this.canRunAccountImageTextFallback(spec, null);
     // A BYOK model ID we have never reviewed may well be multimodal, and BYOK has no
     // image2text fallback to fall back on, so let the user's own endpoint answer rather
-    // than refusing the request here.
+    // than refusing the request here. Custom models always declare modalities, so a
+    // declaration is authoritative and must not defer.
     const deferToProvider = spec.actualModelContext?.source === "byok"
+      && !declared
       && !hasDeclaredInputModalities(model);
 
     let initialResponse: LLMResponse | null = null;

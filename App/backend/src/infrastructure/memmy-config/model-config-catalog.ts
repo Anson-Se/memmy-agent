@@ -27,9 +27,9 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 type ConfigRecord = Record<string, unknown>;
 
 const CAPABILITY_PROTOCOLS: Readonly<Record<ModelCapability, ReadonlySet<ModelEndpointProtocol>>> = {
-  agent: new Set(["openai-chat-completions", "openai-responses", "anthropic-messages", "gemini-generate-content", "memmy-account"]),
-  memory_summary: new Set(["openai-chat-completions", "anthropic-messages", "gemini-generate-content", "memmy-account"]),
-  memory_evolution: new Set(["openai-chat-completions", "anthropic-messages", "gemini-generate-content", "memmy-account"]),
+  agent: new Set(["openai-chat-completions", "openai-responses", "anthropic-messages", "gemini-generate-content", "memmy-account", "bedrock-converse"]),
+  memory_summary: new Set(["openai-chat-completions", "openai-responses", "anthropic-messages", "gemini-generate-content", "memmy-account", "bedrock-converse"]),
+  memory_evolution: new Set(["openai-chat-completions", "openai-responses", "anthropic-messages", "gemini-generate-content", "memmy-account", "bedrock-converse"]),
   embedding: new Set(["openai-embeddings", "memmy-account"]),
   asr: new Set(["dashscope-input-audio-chat", "memmy-account"]),
   image_generation: new Set(["openai-images", "dashscope-multimodal-generation", "memmy-account"])
@@ -64,7 +64,23 @@ export class InvalidModelConfigError extends Error {
 export async function readModelConfigCatalog(configPath: string): Promise<ModelConfigView> {
   const target = resolve(configPath);
   const { content, config } = await readConfig(target);
-  return buildModelConfigView(config, revisionFor(config), await updatedAt(target, content));
+  if (!relocateCustomPresets(config)) {
+    return buildModelConfigView(config, revisionFor(config), await updatedAt(target, content));
+  }
+  try {
+    const result = await mutateRuntimeConfig(target, (current) => {
+      relocateCustomPresets(current);
+      return current;
+    });
+    return buildModelConfigView(result.value, revisionFor(result.value), new Date().toISOString());
+  } catch (error) {
+    if (isErrorCode(error, "migration_lock_timeout")) {
+      throw Object.assign(new Error("Model configuration is busy; try again"), {
+        code: "config_write_busy" as const
+      });
+    }
+    throw error;
+  }
 }
 
 export async function writeModelConfigCatalog(
@@ -151,7 +167,7 @@ function mergeModelConfig(
       validatePresetEndpoint(providerInput.provider, modelInput, endpoint);
       const presetId = resolvePresetId(modelInput.presetId, existingByokPresets, usedPresetIds);
       const previousPreset = record(existingByokPresets[presetId]);
-      nextPresets[presetId] = {
+      const nextPreset: ConfigRecord = {
         ...previousPreset,
         provider: providerInput.provider,
         endpoint: modelInput.endpointId,
@@ -159,11 +175,19 @@ function mergeModelConfig(
         source: "byok",
         capabilities: [...new Set(modelInput.capabilities)]
       };
-      delete record(nextPresets[presetId]).label;
-      delete record(nextPresets[presetId]).ownerAccountId;
+      delete record(nextPreset).label;
+      delete record(nextPreset).ownerAccountId;
+      if (modelInput.thinking) nextPreset.thinking = modelInput.thinking;
+      else delete nextPreset.thinking;
+      if (modelInput.custom) nextPreset.custom = true;
+      else delete nextPreset.custom;
+      if (modelInput.inputModalities) nextPreset.inputModalities = [...modelInput.inputModalities];
+      else delete nextPreset.inputModalities;
+      nextPresets[presetId] = nextPreset;
     }
   }
 
+  relocateCustomPresets({ providers: nextProviders, modelPresets: nextPresets });
   validateUniqueModels(nextPresets);
   const modelAssignments = cloneAssignments(input.modelAssignments);
   validateAssignments(modelAssignments, nextPresets, existingAssignments);
@@ -330,7 +354,7 @@ function memoryConnection(config: ConfigRecord, presetId: string): ConfigRecord 
   const extraHeaders = { ...record(provider.extraHeaders), ...record(endpoint.extraHeaders) };
   const extraBody = { ...record(provider.extraBody), ...record(endpoint.extraBody) };
   return {
-    provider: memoryProvider(providerId),
+    provider: memoryProvider(providerId, stringValue(endpoint.protocol)),
     sourceProvider: providerId,
     endpoint: apiBase,
     model,
@@ -340,10 +364,116 @@ function memoryConnection(config: ConfigRecord, presetId: string): ConfigRecord 
   };
 }
 
-function memoryProvider(providerId: string): string {
-  if (providerId === "anthropic") return "anthropic";
-  if (providerId === "gemini") return "gemini";
+function memoryProvider(providerId: string, protocol: string | undefined): string {
+  if (protocol === "bedrock-converse") return "bedrock";
+  if (protocol === "openai-responses") return "openai_responses";
+  if (protocol === "anthropic-messages" || providerId === "anthropic") return "anthropic";
+  if (protocol === "gemini-generate-content" || providerId === "gemini") return "gemini";
   return "openai_compatible";
+}
+
+const CUSTOM_PROVIDER_ID = "custom";
+const PROVIDER_CONNECTION_KEYS = new Set([
+  "apiKey", "extraHeaders", "extraBody", "region", "profile", "endpoints", "apiBase", "apiType"
+]);
+
+function relocateCustomPresets(config: ConfigRecord): boolean {
+  const providers = record(config.providers);
+  const presets = record(config.modelPresets);
+  const customProvider = record(providers[CUSTOM_PROVIDER_ID]);
+  const customEndpoints = record(customProvider.endpoints);
+  let changed = false;
+
+  for (const presetValue of Object.values(presets)) {
+    const preset = record(presetValue);
+    if (preset.custom !== true) continue;
+    const providerId = stringValue(preset.provider);
+    const endpointId = stringValue(preset.endpoint);
+    if (!providerId || !endpointId || providerId === CUSTOM_PROVIDER_ID) continue;
+    const sourceProvider = record(providers[providerId]);
+    const sourceEndpoint = record(record(sourceProvider.endpoints)[endpointId]);
+    if (!stringValue(sourceEndpoint.apiBase)) continue;
+    const targetId = placeCustomEndpoint(customEndpoints, endpointId, movedEndpoint(sourceProvider, sourceEndpoint));
+    preset.provider = CUSTOM_PROVIDER_ID;
+    preset.endpoint = targetId;
+    changed = true;
+  }
+  if (!changed) return false;
+
+  customProvider.endpoints = customEndpoints;
+  providers[CUSTOM_PROVIDER_ID] = customProvider;
+  for (const [providerId, providerValue] of Object.entries(providers)) {
+    if (providerId === CUSTOM_PROVIDER_ID) continue;
+    const provider = record(providerValue);
+    const endpoints = record(provider.endpoints);
+    for (const endpointId of Object.keys(endpoints)) {
+      const referenced = Object.values(presets).some((presetValue) => {
+        const preset = record(presetValue);
+        return preset.provider === providerId && preset.endpoint === endpointId;
+      });
+      if (!referenced) delete endpoints[endpointId];
+    }
+    const stillReferenced = Object.values(presets).some((presetValue) => record(presetValue).provider === providerId);
+    const onlyConnectionFields = Object.keys(provider).every((key) => PROVIDER_CONNECTION_KEYS.has(key));
+    if (!stillReferenced && !Object.keys(endpoints).length && onlyConnectionFields) {
+      delete providers[providerId];
+    }
+  }
+  config.providers = providers;
+  config.modelPresets = presets;
+  return true;
+}
+
+function movedEndpoint(provider: ConfigRecord, endpoint: ConfigRecord): ConfigRecord {
+  const next: ConfigRecord = { ...endpoint };
+  const apiKey = stringValue(endpoint.apiKey) ?? stringValue(provider.apiKey);
+  if (apiKey) next.apiKey = apiKey;
+  const extraHeaders = { ...record(provider.extraHeaders), ...record(endpoint.extraHeaders) };
+  if (Object.keys(extraHeaders).length) next.extraHeaders = extraHeaders;
+  const extraBody = { ...record(provider.extraBody), ...record(endpoint.extraBody) };
+  if (Object.keys(extraBody).length) next.extraBody = extraBody;
+  const region = stringValue(endpoint.region) ?? stringValue(provider.region);
+  if (region) next.region = region;
+  const profile = stringValue(endpoint.profile) ?? stringValue(provider.profile);
+  if (profile) next.profile = profile;
+  return next;
+}
+
+function placeCustomEndpoint(endpoints: ConfigRecord, preferredId: string, endpoint: ConfigRecord): string {
+  const existing = record(endpoints[preferredId]);
+  if (!Object.keys(existing).length) {
+    endpoints[preferredId] = endpoint;
+    return preferredId;
+  }
+  if (sameStoredEndpoint(existing, endpoint)) return preferredId;
+  let suffix = 2;
+  let id = `${preferredId}-custom`;
+  while (Object.keys(record(endpoints[id])).length && !sameStoredEndpoint(record(endpoints[id]), endpoint)) {
+    id = `${preferredId}-custom-${suffix}`;
+    suffix += 1;
+  }
+  endpoints[id] = endpoint;
+  return id;
+}
+
+function sameStoredEndpoint(left: ConfigRecord, right: ConfigRecord): boolean {
+  return stableJson({
+    protocol: left.protocol ?? null,
+    apiBase: normalizeApiBase(stringValue(left.apiBase) ?? ""),
+    apiKey: stringValue(left.apiKey) ?? null,
+    region: stringValue(left.region) ?? null,
+    profile: stringValue(left.profile) ?? null,
+    extraHeaders: left.extraHeaders ?? null,
+    extraBody: left.extraBody ?? null
+  }) === stableJson({
+    protocol: right.protocol ?? null,
+    apiBase: normalizeApiBase(stringValue(right.apiBase) ?? ""),
+    apiKey: stringValue(right.apiKey) ?? null,
+    region: stringValue(right.region) ?? null,
+    profile: stringValue(right.profile) ?? null,
+    extraHeaders: right.extraHeaders ?? null,
+    extraBody: right.extraBody ?? null
+  });
 }
 
 function mergeMemoryConnection(previous: ConfigRecord, connection: ConfigRecord): ConfigRecord {
@@ -471,6 +601,8 @@ function mergeEndpoint(previous: ConfigRecord, input: CatalogEndpointInput): Con
   setOptionalSecret(next, "apiKey", input.apiKey, previous.apiKey);
   setOptionalRecord(next, "extraHeaders", input.extraHeaders, previous.extraHeaders);
   setOptionalRecord(next, "extraBody", input.extraBody, previous.extraBody);
+  if (input.region) next.region = input.region;
+  else delete next.region;
   return next;
 }
 
@@ -709,7 +841,8 @@ function providerView(
       protocol,
       hasApiKey: Boolean(endpointApiKey),
       apiKeyMasked: maskSecret(endpointApiKey),
-      apiKey: ""
+      apiKey: "",
+      ...(stringValue(endpoint.region) ? { region: stringValue(endpoint.region)! } : {})
     }];
   });
   return {
@@ -750,7 +883,10 @@ function presetView(
     source,
     ...(stringValue(preset.ownerAccountId) ? { ownerAccountId: stringValue(preset.ownerAccountId)! } : {}),
     capabilities: arrayValue(preset.capabilities).filter(isModelCapability),
-    available: Boolean((hasCredential || API_KEY_OPTIONAL_PROVIDERS.has(providerId)) && ownerMatches)
+    available: Boolean((hasCredential || API_KEY_OPTIONAL_PROVIDERS.has(providerId)) && ownerMatches),
+    ...(preset.thinking && typeof preset.thinking === "object" ? { thinking: preset.thinking as TextModelItemView["thinking"] } : {}),
+    ...(preset.custom === true ? { custom: true } : {}),
+    ...(Array.isArray(preset.inputModalities) ? { inputModalities: preset.inputModalities as TextModelItemView["inputModalities"] } : {})
   };
 }
 

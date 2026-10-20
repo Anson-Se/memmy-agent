@@ -402,6 +402,14 @@ export function hasDeclaredInputModalities(model: string | null | undefined): bo
     && Object.prototype.hasOwnProperty.call(MODEL_INPUT_CAPABILITIES, model);
 }
 
+/** 声明优先于静态表：有声明用声明，无声明查表。 */
+export function resolveModelInputModalities(
+  model: string | null | undefined,
+  declared: readonly ModelInputModality[] | null | undefined,
+): readonly ModelInputModality[] {
+  return declared ?? getModelInputModalities(model);
+}
+
 export function requiredInputModalities(
   messages: readonly Record<string, any>[],
 ): readonly ModelInputModality[] {
