@@ -13999,7 +13999,7 @@ body.memmy-platform-windows :is(
   margin-top: 20px;
 }
 
-.ch__settings-card {
+.ch__settings-card, .ch__browser-enhancement-card {
   margin-bottom: 56px;
   overflow: hidden;
   border: 1px solid var(--ch-border);
@@ -14030,8 +14030,29 @@ body.memmy-platform-windows :is(
   line-height: 1.5;
 }
 
-.ch__settings-card > section[aria-label] {
+.ch__browser-enhancement-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 20px 22px;
   border: 0;
+  background: transparent;
+  color: var(--ch-prose);
+  text-align: left;
+  cursor: pointer;
+}
+.ch__browser-enhancement-heading > span { min-width: 0; }
+.ch__browser-enhancement-heading .ch__setting-label,
+.ch__browser-enhancement-heading .ch__setting-description { display: block; }
+.ch__browser-enhancement-heading > svg { flex: none; }
+.ch__browser-enhancement-expanded { transform: rotate(180deg); }
+
+.ch__settings-card > section[aria-label] {
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
   border-radius: 0;
   padding: 0;
 }

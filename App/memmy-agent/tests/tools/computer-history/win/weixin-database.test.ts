@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  baseDirectoriesFromConfigText,
+  configuredSearchRoots,
   dataRootsFromConfigText,
+  discoverWeixinDatabaseRoot,
   findWeixinAccounts,
   normalizeWindowsPath,
   selectWeixinAccount,
@@ -81,6 +84,35 @@ describe("Weixin database location", () => {
     expect(dataRootsFromConfigText(String.raw`save=D:\Chat\xwechat_files`)).toEqual([
       String.raw`D:\Chat\xwechat_files`,
     ]);
+  });
+
+  it("extracts the parent folder Weixin 4 records instead of an xwechat_files path", () => {
+    // The real config stores the base directory on its own line and a bare label elsewhere.
+    expect(baseDirectoriesFromConfigText(documents)).toEqual([documents]);
+    expect(baseDirectoriesFromConfigText("MyDocument:")).toEqual([]);
+    expect(configuredSearchRoots(["MyDocument:", documents])).toEqual([documents]);
+    expect(configuredSearchRoots([String.raw`D:\Chat\xwechat_files`])).toEqual([String.raw`D:\Chat\xwechat_files`]);
+  });
+
+  it("discovers the default Documents store from the real config layout", () => {
+    const root = discoverWeixinDatabaseRoot(reader({
+      [documents]: { directories: ["xwechat_files"] },
+      [files]: { directories: ["all_users", "Backup", "wxid_example_aaaa"] },
+      [message]: { files: ["key_info.db", "message_0.db", "message_fts.db"] },
+    }), { documentsDirectory: documents, configTexts: ["MyDocument:", documents] });
+    expect(root).toBe(String.raw`C:\Users\TestUser\Documents\xwechat_files\wxid_example_aaaa\db_storage`);
+  });
+
+  it("discovers a moved store on another drive while Documents stays empty", () => {
+    const moved = String.raw`D:\WeixinData`;
+    const movedFiles = String.raw`D:\WeixinData\xwechat_files`;
+    const movedMessage = String.raw`D:\WeixinData\xwechat_files\wxid_example_bbbb\db_storage\message`;
+    const root = discoverWeixinDatabaseRoot(reader({
+      [moved]: { directories: ["xwechat_files"] },
+      [movedFiles]: { directories: ["wxid_example_bbbb"] },
+      [movedMessage]: { files: ["message_0.db"] },
+    }), { documentsDirectory: documents, configTexts: [moved] });
+    expect(root).toBe(String.raw`D:\WeixinData\xwechat_files\wxid_example_bbbb\db_storage`);
   });
 
   it("refuses to guess when no account or more than one account has message databases", () => {

@@ -55,6 +55,7 @@ export class ChannelManager {
   sessionManager: any = null;
   webuiRuntimeModelName: (() => string | null) | null = null;
   webuiRuntimeToolNames: (() => string[]) | null = null;
+  webuiRuntimeReady: (() => boolean) | null = null;
   webuiModelSelectionResolver: ((input: {
     requestedPreset?: string | null;
     sessionPreset?: string | null;
@@ -77,6 +78,7 @@ export class ChannelManager {
       sessionManager?: any;
       webuiRuntimeModelName?: (() => string | null) | null;
       webuiRuntimeToolNames?: (() => string[]) | null;
+      webuiRuntimeReady?: (() => boolean) | null;
       webuiModelSelectionResolver?: ((input: {
         requestedPreset?: string | null;
         sessionPreset?: string | null;
@@ -103,6 +105,7 @@ export class ChannelManager {
     this.sessionManager = options.sessionManager ?? null;
     this.webuiRuntimeModelName = options.webuiRuntimeModelName ?? null;
     this.webuiRuntimeToolNames = options.webuiRuntimeToolNames ?? null;
+    this.webuiRuntimeReady = options.webuiRuntimeReady ?? null;
     this.webuiModelSelectionResolver = options.webuiModelSelectionResolver ?? null;
     this.workspacePath = options.workspacePath
       ? path.resolve(options.workspacePath)
@@ -180,6 +183,7 @@ export class ChannelManager {
     if (workspacePath) options.workspacePath = workspacePath;
     if (this.webuiRuntimeModelName) options.runtimeModelName = this.webuiRuntimeModelName;
     if (this.webuiRuntimeToolNames) options.runtimeToolNames = this.webuiRuntimeToolNames;
+    if (this.webuiRuntimeReady) options.runtimeReady = this.webuiRuntimeReady;
     if (this.webuiModelSelectionResolver) {
       options.modelSelectionResolver = this.webuiModelSelectionResolver;
     }

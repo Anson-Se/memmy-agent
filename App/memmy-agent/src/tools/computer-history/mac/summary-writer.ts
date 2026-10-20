@@ -3,6 +3,8 @@ import type { MemmyOutputLanguage } from "../../../memmy-memory/discovery.js";
 import { normalizeOutputLanguage } from "@memmy/local-api-contracts";
 import { redactSensitive } from "./summarize-history.js";
 import { estimatePromptTokens } from "../../../utils/helpers.js";
+import { captureGapRecord, RECORDER_HEALTH_CODES, type CaptureGapRecord, type RecorderHealthSignal } from "./recorder-health.js";
+import { previousControlsAtPoint as projectPreviousControls } from "../win/native-event-adapter.js";
 
 // Codex writes each history entry as a short title plus two or three sentences
 // addressed to the user. Memmy's mechanical summarizer produces the same
@@ -64,6 +66,11 @@ const SYSTEM_PROMPT = [
   "",
   "`entered text` records input characters and `focused field value` records the current visible value. Neither alone proves a message was sent; confirm a submit action and resulting screen or message record.",
   "WeChat `on screen` and `interacted with` lines may be chat-list previews or UI labels. Only `wechat_message` events are canonical conversation messages.",
+  "Browser operation evidence explicitly identifies the actor as human, agent, or unknown. Preserve that attribution; an unknown actor is not proof the user performed the action. Before/after states establish observed changes, not a successful business submission.",
+  "Browser phase=attempt records an attempted input with no confirmed outcome. phase=observed supplies actual subsequent UI evidence. phase=context establishes a visible page URL/title, not successful navigation, submission, or causation by an earlier attempt. Correlate an attempt/observed pair only by its interactionId and preserve unresolved outcomes.",
+  "Native input records and the human_event label do not authenticate the actor. Do not assign a native action to the user without supporting attribution. A scroll does not prove reading; a missing target or action cannot establish responsibility, intent, or success. Addressing the user does not justify inventing their participation.",
+  "Capture evidence describes only the supplied records. Missing screen text or records is not proof nothing happened. Heartbeats, observer readiness and successful event writes do not establish readable content or complete application coverage. ax_snapshot_failed records a failure at its reported time; only ax_snapshot_ready confirms an authorized full snapshot was persisted or matched a persisted baseline. Neither establishes an earlier gap's start, complete coverage, or recovery in every application. Partial snapshots and diffs without baselines remain incomplete evidence; do not invent a cause for missing content.",
+  "capture_gap records an input at its timestamp whose context could not be safely established. It supports the occurrence of input, not its target application, user identity or result. previousControlsAtPoint contains controls seen before the input at that point; these are candidates for reasoning, not confirmed clicked targets. Keep any inference from them explicitly uncertain and do not upgrade it into human attribution or business completion.",
   "BEFORE RETURNING",
   "Check every title, description, and body claim against a supplied source. Remove any guessed action, source, cause, personal trait, or completion state. A shorter accurate account is better than a detailed unsupported one.",
 ].join("\n");
@@ -181,16 +188,24 @@ export async function writeSegmentNarrative(
     { role: "user", content: prompt },
   ];
   const fitsInputBudget = () => estimatePromptTokens(messages()) <= MAX_NARRATIVE_INPUT_TOKENS;
+  // Current evidence takes priority over optional earlier context, including
+  // when a longer system contract leaves less room than its character cap.
+  while (!fitsInputBudget() && prior.length && priorChars > 128) {
+    priorChars = Math.max(128, priorChars - 200);
+    const charsPerSummary = Math.floor(priorChars / priorCandidates.length);
+    prior = priorCandidates.map((summary) => sampleText(summary, charsPerSummary)).filter(Boolean);
+    prompt = buildPrompt();
+  }
+  while (!fitsInputBudget() && prior.length) {
+    prior.shift();
+    prompt = buildPrompt();
+  }
   // Character limits alone do not bound multilingual tokens. Keep both ends
   // and middle evidence using the existing sampler, without changing retention.
   let evidenceBudget = evidence.length;
   while (!fitsInputBudget() && evidenceBudget > 600) {
     evidenceBudget = Math.max(600, evidenceBudget - 600);
     evidence = sampleEvidenceLines(evidenceLines, evidenceBudget, "\n", true);
-    prompt = buildPrompt();
-  }
-  while (!fitsInputBudget() && prior.length) {
-    prior.shift();
     prompt = buildPrompt();
   }
   while (!fitsInputBudget() && evidenceBudget > 64) {
@@ -252,12 +267,167 @@ export async function writeSegmentNarrative(
 // let the summary say what actually happened.
 
 interface HistoryEvent {
+  recordType?: string;
+  sequence?: number;
   timestamp?: string;
   eventType?: string;
   application?: { name?: string; bundleId?: string };
   details?: Record<string, unknown>;
   /** The focused window's accessibility tree: a full snapshot, or a diff from the last. */
-  ax?: { mode?: string; text?: string; windowKey?: string };
+  ax?: { mode?: string; text?: string; windowKey?: string; truncated?: boolean; readFailures?: number };
+}
+
+const captureHealthCodes = new Set<string>(RECORDER_HEALTH_CODES);
+const MAX_CAPTURE_EVIDENCE_CHARS = 2_000;
+
+/** Accept only content-free health fields; extra provider text is never retained. */
+function captureHealthSignal(event: Record<string, unknown>): RecorderHealthSignal | null {
+  if (typeof event.code !== "string" || !captureHealthCodes.has(event.code)
+    || typeof event.timestamp !== "string" || !/^\d{4}-\d{2}-\d{2}T/u.test(event.timestamp)
+    || !Number.isFinite(Date.parse(event.timestamp))
+    || (event.count !== undefined && (!Number.isSafeInteger(event.count) || Number(event.count) <= 0))) return null;
+  return { code: event.code as RecorderHealthSignal["code"], timestamp: new Date(event.timestamp).toISOString(),
+    ...(event.count !== undefined ? { count: Number(event.count) } : {}) };
+}
+
+function captureEvidence(events: HistoryEvent[], signals: RecorderHealthSignal[], gaps: CaptureGapRecord[], retain: boolean): string {
+  const snapshots = events.filter((event) => event.ax && typeof event.ax.text === "string");
+  const full = snapshots.filter((event) => event.ax!.mode === "fullTree").length;
+  const diffs = snapshots.filter((event) => event.ax!.mode === "diffFromPrevious").length;
+  const baselines = new Set<string>();
+  let unbasedDiffs = 0;
+  for (const event of events) {
+    if (event.eventType === "recording_started" || event.eventType === "recording_stopped") baselines.clear();
+    if (typeof event.ax?.text !== "string") continue;
+    const key = typeof event.ax.windowKey === "string" && event.ax.windowKey
+      ? `${event.application?.bundleId ?? event.application?.name ?? ""}\0${event.ax.windowKey}` : "";
+    if (event.ax.mode === "fullTree" && key) baselines.add(key);
+    if (event.ax.mode === "diffFromPrevious" && (!key || !baselines.has(key))) unbasedDiffs++;
+  }
+  const textBearing = snapshots.filter((event) => event.ax!.text!.split("\n")
+    .some((line) => screenLineText(line.replace(/^[+-] /u, ""))));
+  const partial = snapshots.filter((event) => event.ax!.truncated === true || Number(event.ax!.readFailures) > 0);
+  const unknownQuality = snapshots.filter((event) => typeof event.ax!.truncated !== "boolean"
+    || !Number.isSafeInteger(event.ax!.readFailures) || Number(event.ax!.readFailures) < 0);
+  const summaries = new Map<string, { count: number; first: string; last: string }>();
+  for (const signal of signals) {
+    const previous = summaries.get(signal.code);
+    summaries.set(signal.code, { count: Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + (signal.count ?? 1)),
+      first: previous && previous.first < signal.timestamp ? previous.first : signal.timestamp,
+      last: previous && previous.last > signal.timestamp ? previous.last : signal.timestamp });
+  }
+  const gapGroups = new Map<string, { count: number; first: string; last: string }>();
+  for (const gap of gaps) {
+    const key = `${gap.actionKind}${gap.button ? ` button=${gap.button}` : ""} reason=${gap.reason}`;
+    const previous = gapGroups.get(key);
+    gapGroups.set(key, { count: Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + (gap.count ?? 1)),
+      first: previous && previous.first < gap.timestamp ? previous.first : gap.timestamp,
+      last: previous && previous.last > gap.timestamp ? previous.last : gap.timestamp });
+  }
+  const introduction = [
+    "Capture evidence (supplied records only; not complete activity coverage):",
+    `AX records: ${snapshots.length}; text-bearing: ${textBearing.length}; empty/unreadable: ${snapshots.length - textBearing.length}; partial: ${partial.length}; quality unreported: ${unknownQuality.length}.`,
+    `Full trees: ${full}; diffs: ${diffs}; diffs without a supplied continuous baseline: ${unbasedDiffs}.`,
+    `AX signals: last failure ${summaries.get("ax_snapshot_failed")?.last ?? "not recorded"}; last persisted-ready ${summaries.get("ax_snapshot_ready")?.last ?? "not recorded"}. Signal times do not establish earlier gap boundaries.`,
+    ...(gaps.length ? [`Input context gaps: ${gaps.length} record(s); input observed, target/actor/outcome unconfirmed.`] : []),
+    ...(!snapshots.length ? ["No window accessibility text records were supplied; other sources may still contain content."] : []),
+  ].join("\n");
+  const signalLines = retain ? signals.map((signal) => `capture_health ${JSON.stringify(signal)}`)
+    : [...summaries].map(([code, entry]) => `capture_health ${code}: count=${entry.count}; first=${entry.first}; last=${entry.last}`);
+  const gapLines = retain ? gaps.map((gap) => `capture_gap ${JSON.stringify(gap)}`)
+    : [...gapGroups].map(([key, entry]) => `capture_gap ${key}: count=${entry.count}; first=${entry.first}; last=${entry.last}`);
+  if (retain) return [introduction, ...signalLines, ...gapLines].join("\n");
+  // Always retain the quality counts and latest failure/recovery times. A flood
+  // of distinct gap reasons must not sample those facts out of the prefix.
+  const shares = shareBudget([joinedLength(signalLines, "\n"), joinedLength(gapLines, "\n")],
+    Math.max(0, MAX_CAPTURE_EVIDENCE_CHARS - introduction.length - 2));
+  return [introduction, sampleEvidenceLines(signalLines, shares[0], "\n"),
+    sampleEvidenceLines(gapLines, shares[1], "\n")].filter(Boolean).join("\n");
+}
+
+function previousControlsAtPoint(event: HistoryEvent): Record<string, unknown> | null {
+  return projectPreviousControls(event.details?.previousControlsAtPoint, event.timestamp);
+}
+
+function retainedControl(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || depth > 2) return null;
+  const source = value as Record<string, unknown>;
+  if (source.role === "AXSecureTextField" || source.subrole === "AXSecureTextField"
+    || source.isPassword === true || source.IsPassword === true) return null;
+  const result: Record<string, unknown> = {};
+  const sensitive = source.sensitive === true || /^(?:password|hidden)$/iu.test(String(source.inputType ?? ""));
+  for (const key of ["role", "subrole", "name", "title", "description", "identifier", "value"]) {
+    if (key === "value" && sensitive) continue;
+    if (typeof source[key] === "string") result[key] = redactSensitive(source[key]);
+  }
+  for (const key of ["checked", "selected", "expanded", "sensitive"]) {
+    if (typeof source[key] === "boolean") result[key] = source[key];
+  }
+  const focused = retainedControl(source.focused, depth + 1);
+  if (focused) result.focused = focused;
+  for (const key of ["descendants", "ancestors"]) {
+    if (Array.isArray(source[key])) {
+      const nodes = source[key].map((node) => retainedControl(node, depth + 1)).filter(Boolean);
+      if (nodes.length) result[key] = nodes;
+    }
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function retainedBrowserState(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const field of ["url", "title", "text"]) {
+    if (typeof source[field] === "string") result[field] = redactSensitive(source[field]);
+  }
+  // BrowserHistoryState stores exposed text as ordered lines. Preserve that
+  // observation instead of dropping it or flattening it into another action.
+  if (Array.isArray(source.text)) result.text = source.text
+    .filter((line): line is string => typeof line === "string").map(redactSensitive);
+  const target = retainedControl(source.target);
+  if (target) result.target = target;
+  return Object.keys(result).length ? result : null;
+}
+
+const retainedActionTypes = new Set(["recording_started", "recording_stopped", "application_changed", "mouse_click", "mouse_drag",
+  "selection_changed", "scroll", "text_input", "key_press", "page_context", "browser_action"]);
+
+/** Durable action order must survive arc aggregation and raw-file expiration. */
+function retainedAction(event: HistoryEvent): Record<string, unknown> | null {
+  if (!retainedActionTypes.has(event.eventType ?? "")) return null;
+  const source = event.details ?? {};
+  const details: Record<string, unknown> = {};
+  for (const key of ["button", "direction", "textSource", "textPurpose", "url", "title", "action", "interactionId"]) {
+    if (typeof source[key] === "string") details[key] = redactSensitive(source[key]);
+  }
+  for (const key of ["clickCount", "actionCount", "characterCount", "deltaX", "deltaY"]) {
+    if (typeof source[key] === "number" && Number.isFinite(source[key])) details[key] = source[key];
+  }
+  if (typeof source.redacted === "boolean") details.redacted = source.redacted;
+  if (source.redacted === false && typeof source.text === "string") details.text = redactSensitive(source.text);
+  if (Array.isArray(source.keys)) details.keys = source.keys.filter((key): key is string => typeof key === "string").map(redactSensitive);
+  if (["human", "agent", "unknown"].includes(String(source.actor))) details.actor = source.actor;
+  if (["attempt", "observed", "context"].includes(String(source.phase))) details.phase = source.phase;
+  for (const key of ["accessibility", "target", "origin", "destination"]) {
+    const control = retainedControl(source[key]);
+    if (control) details[key] = control;
+  }
+  const previous = previousControlsAtPoint(event);
+  if (previous) details.previousControlsAtPoint = previous;
+  for (const key of ["before", "after"]) {
+    const state = retainedBrowserState(source[key]);
+    if (state) details[key] = state;
+  }
+  return {
+    timestamp: event.timestamp ?? null, eventType: event.eventType,
+    ...(Number.isSafeInteger(event.sequence) && Number(event.sequence) > 0 ? { sequence: event.sequence } : {}),
+    ...(event.application ? { application: {
+      ...(typeof event.application.name === "string" ? { name: redactSensitive(event.application.name) } : {}),
+      ...(typeof event.application.bundleId === "string" ? { bundleId: redactSensitive(event.application.bundleId) } : {}),
+    } } : {}),
+    details,
+  };
 }
 
 const MAX_SCREEN_LINE_CHARS = 200;
@@ -433,13 +603,28 @@ export function compactEventEvidence(
   // complete extracted evidence while the model path keeps its existing budget.
   const retain = options.purpose === "retention";
   const retainedTypes = new Set(["recording_started", "recording_stopped", "application_changed", "accessibility_snapshot",
-    "mouse_click", "mouse_drag", "selection_changed", "scroll", "text_input", "key_press", "page_context", "wechat_message"]);
+    "mouse_click", "mouse_drag", "selection_changed", "scroll", "text_input", "key_press", "page_context", "wechat_message", "browser_action"]);
   const events: HistoryEvent[] = [];
+  const healthSignals: RecorderHealthSignal[] = [];
+  const captureGaps: CaptureGapRecord[] = [];
   for (const line of lines) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line);
       if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error("invalid event");
+      if (event.recordType === "capture_health") {
+        const signal = captureHealthSignal(event);
+        if (!signal) throw new Error("invalid capture health");
+        healthSignals.push(signal);
+        continue;
+      }
+      if (event.recordType === "capture_gap") {
+        const gap = captureGapRecord(event);
+        if (!gap) throw new Error("invalid capture gap");
+        captureGaps.push(gap);
+        continue;
+      }
+      if (event.recordType === "human_history_metadata") continue;
       if (retain && event.recordType !== "human_history_metadata") {
         if (event.recordType !== "human_event" || !retainedTypes.has(event.eventType)) throw new Error("unsupported record");
         if (event.eventType !== "recording_started" && event.eventType !== "recording_stopped"
@@ -451,7 +636,8 @@ export function compactEventEvidence(
       // A truncated final line is expected while a segment is still open.
     }
   }
-  if (!events.length) return "";
+  if (!events.length && !healthSignals.length && !captureGaps.length) return "";
+  const coverage = captureEvidence(events, healthSignals, captureGaps, retain);
 
   interface Arc {
     app: string;
@@ -475,6 +661,10 @@ export function compactEventEvidence(
   const visibleByWindow = new Map<string, Set<string>>();
   const shownMessageIds = new Set<string>();
   for (const event of events) {
+    if (event.eventType === "recording_started" || event.eventType === "recording_stopped") {
+      visibleByWindow.clear();
+      if (!event.ax && !event.application?.name && !event.application?.bundleId) continue;
+    }
     const app = redactSensitive(event.application?.name || event.application?.bundleId || "unknown");
     let arc = arcs.at(-1);
     if (!arc || arc.app !== app) {
@@ -485,6 +675,12 @@ export function compactEventEvidence(
     // All authorized window text can be useful evidence. WeChat UI text is
     // labeled as screen content; its database events remain canonical messages.
     if (typeof event.ax?.text === "string") {
+      if (retain && (event.ax.truncated !== undefined || event.ax.readFailures !== undefined)) {
+        arc.retainedDetails.push(`    AX quality at ${event.timestamp ?? "unknown time"}: ${JSON.stringify({
+          truncated: typeof event.ax.truncated === "boolean" ? event.ax.truncated : null,
+          readFailures: Number.isSafeInteger(event.ax.readFailures) && Number(event.ax.readFailures) >= 0 ? event.ax.readFailures : null,
+        })}`);
+      }
       // What came into view: all of a full snapshot, the added lines of a diff.
       const lines = event.ax.text.split("\n");
       const key = `${event.application?.bundleId || app}\0${typeof event.ax.windowKey === "string" ? event.ax.windowKey : ""}`;
@@ -510,6 +706,25 @@ export function compactEventEvidence(
     }
     const details = event.details;
     switch (event.eventType) {
+      case "browser_action": {
+        const actor = details?.actor === "human" || details?.actor === "agent" ? details.actor : "unknown";
+        const target = retainedControl(details?.target) ?? {};
+        const label = [target.role, target.name].filter(value => typeof value === "string").join(" ");
+        const before = details?.before, after = details?.after;
+        const phase = details?.phase === "attempt" || details?.phase === "context" ? details.phase : "observed";
+        const line = `    browser ${phase === "context" ? "page context" : "operation"} (${actor} actor, ${phase} phase): ${redactSensitive(String(details?.action ?? "unknown"))}`
+          + (label ? `; target: ${redactSensitive(label)}` : "")
+          + (typeof details?.url === "string" ? `; page: ${redactSensitive(details.url)}` : "")
+          + (typeof details?.interactionId === "string" ? `; interactionId: ${redactSensitive(details.interactionId)}` : "")
+          + (phase === "attempt" ? "; attempted input only; outcome unconfirmed" : phase === "context" ? "; page observed; navigation causation unconfirmed" : "");
+        arc.retainedDetails.push(line);
+        for (const [phase, state] of [["before", before], ["after", after]] as const) {
+          // These are observations, never inferred business completion or replay instructions.
+          const stateEvidence = retainedBrowserState(state);
+          if (stateEvidence) arc.retainedDetails.push(`    ${phase} browser state: ${JSON.stringify(stateEvidence)}`);
+        }
+        break;
+      }
       case "wechat_message": {
         const id = details?.messageId;
         const body = details?.text;
@@ -561,6 +776,8 @@ export function compactEventEvidence(
         arc.clicks += 1;
         const label = elementLabel(details, retain);
         if (label && !arc.labels.includes(label)) arc.labels.push(label);
+        const previous = previousControlsAtPoint(event);
+        if (previous) arc.retainedDetails.push(`    previousControlsAtPoint ${JSON.stringify(previous)}; input at ${event.timestamp}; target/actor/outcome unconfirmed`);
         break;
       }
       case "text_input": {
@@ -640,7 +857,7 @@ export function compactEventEvidence(
   }
 
   if (retain) {
-    return arcs.map((arc) => {
+    return [coverage, ...arcs.map((arc) => {
       const parts = [
         ...(arc.clicks ? [`${arc.clicks} click(s)`] : []),
         ...(arc.typedChars ? [`typed ${arc.typedChars} character(s)`] : []),
@@ -657,13 +874,17 @@ export function compactEventEvidence(
         ...arc.retainedDetails,
         ...arc.screen.map((text) => `    on screen: ${text}`),
       ].join("\n");
-    }).join("\n");
+    }), "Ordered action evidence (source order; actor and outcome require supporting evidence):",
+    ...events.flatMap((event) => {
+      const action = retainedAction(event);
+      return action ? [`recorded_action ${JSON.stringify(action)}`] : [];
+    })].join("\n");
   }
 
   const active = arcs
     // Reading is activity too: a window looked at without a click still counts.
     .filter((arc) => arc.clicks || arc.typedChars || arc.textEvidence.length || arc.keys.length || arc.urls.length
-      || arc.labels.length || arc.screen.length || arc.chatMessages.length || arc.wechat.length);
+      || arc.labels.length || arc.screen.length || arc.chatMessages.length || arc.wechat.length || arc.retainedDetails.length);
   const indexes = sampleIndexes(active.length, MAX_ARCS);
   const blocks = indexes.map((index) => {
     const arc = active[index];
@@ -679,6 +900,7 @@ export function compactEventEvidence(
       ...arc.urls.map((url) => `    page: ${url}`),
       ...arc.chatMessages,
       ...wechatTranscript(arc.wechat),
+      ...arc.retainedDetails,
     ];
     return { head, detail, screen: arc.screen };
   });
@@ -693,11 +915,11 @@ export function compactEventEvidence(
   const separatorChars = separators.reduce((total, value) => total + value.length, 0);
   const budgets = shareBudget(demands.map((values, index) => (
     values.reduce((total, value) => total + value, 0) + separatorCounts[index]
-  )), MAX_EVIDENCE_CHARS - separatorChars);
+  )), MAX_EVIDENCE_CHARS - coverage.length - 1 - separatorChars);
   // Budget the complete output, including headings, URLs and separators. A
   // busy arc uses what short arcs leave over; screen evidence receives a share
   // alongside interactions, so long URLs cannot displace the final state.
-  return blocks.map((block, index) => {
+  const activity = blocks.map((block, index) => {
     const shares = shareBudget(demands[index], budgets[index] - separatorCounts[index]);
     const rendered = [
       sampleText(block.head, shares[0]),
@@ -708,6 +930,7 @@ export function compactEventEvidence(
     ].filter(Boolean).join("\n");
     return `${index ? separators[index - 1] : ""}${rendered}`;
   }).join("");
+  return [coverage, activity].filter(Boolean).join("\n");
 }
 
 const FRONTMATTER = /^---\n([\s\S]*?)\n---/u;

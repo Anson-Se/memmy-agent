@@ -83,6 +83,8 @@ export interface CreateLocalBackendOptions {
   memmyAgentAdminClient?: MemmyAgentAdminClient;
   /** Directory containing immutable `*.release.json` files and their MPP archives. */
   bundledPluginDirectory?: string;
+  /** Skip only the startup MCP reload when the caller will start the Agent after bridge config is written. */
+  skipAgentMcpReload?: boolean;
 }
 
 export interface LocalBackend {
@@ -275,7 +277,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       toolTimeout: 7 * 24 * 60 * 60
     });
     const memmyAgentAdminClient = options.memmyAgentAdminClient;
-    if (memmyAgentAdminClient) {
+    if (memmyAgentAdminClient && !options.skipAgentMcpReload) {
       // The bridge config must be written first, but MCP connections must not delay the first window.
       void Promise.resolve()
         .then(() => memmyAgentAdminClient.reloadMcpConfig())

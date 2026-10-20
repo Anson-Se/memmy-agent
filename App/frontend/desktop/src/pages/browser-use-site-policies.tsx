@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { BROWSER_USE_DEFAULT_DECISION, browserUsePatternMatches, parseBrowserUsePattern,
-  type BrowserUseCapability, type BrowserUseDecision, type BrowserUseSiteRule } from '@memmy/local-api-contracts';
+  type BrowserAllowAllState, type BrowserUseCapability, type BrowserUseDecision, type BrowserUseSiteRule } from '@memmy/local-api-contracts';
 import { useTranslation } from '../i18n/use-translation.js';
 import './browser-use-site-policies.css';
 
@@ -34,8 +34,12 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
   const [loadErrors, setLoadErrors] = useState<string[]>([]);
   const [error, setError] = useState<'error' | 'invalid' | null>(null);
   const [notice, setNotice] = useState(false);
+  const [allowAll, setAllowAll] = useState<BrowserAllowAllState | null>(null);
+  const [allowAllLoading, setAllowAllLoading] = useState(Boolean(window.memmy?.getBrowserAllowAll));
+  const [allowAllError, setAllowAllError] = useState(false);
   const lifecycle = useRef(0);
   const writing = useRef(false);
+  const allowAllEpoch = useRef(0);
 
   useEffect(() => {
     const current = ++lifecycle.current;
@@ -55,6 +59,28 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
     return () => { lifecycle.current++; };
   }, []);
 
+  useEffect(() => {
+    let live = true;
+    const apply = (state: BrowserAllowAllState) => {
+      if (!live) return;
+      allowAllEpoch.current++;
+      setAllowAll(state); setAllowAllLoading(false); setAllowAllError(false);
+    };
+    const unsubscribe = window.memmy?.onBrowserAllowAllChanged?.(apply);
+    const load = () => {
+      if (!window.memmy?.getBrowserAllowAll || writing.current) return;
+      const epoch = ++allowAllEpoch.current;
+      void window.memmy.getBrowserAllowAll().then(state => {
+        if (live && epoch === allowAllEpoch.current) apply(state);
+      }).catch(() => {
+        if (live && epoch === allowAllEpoch.current) { setAllowAllError(true); setAllowAllLoading(false); }
+      });
+    };
+    load();
+    window.addEventListener('focus', load);
+    return () => { live = false; allowAllEpoch.current++; unsubscribe?.(); window.removeEventListener('focus', load); };
+  }, []);
+
   async function write(work: () => Promise<void>, failure: 'error' | 'invalid' = 'error'): Promise<boolean> {
     if (loading || writing.current) return false;
     const current = lifecycle.current;
@@ -70,6 +96,7 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
   }
 
   async function save(rule: BrowserUseSiteRule): Promise<boolean> {
+    if (allowAll?.effective) return false;
     if (!rulesLoaded || !window.memmy?.upsertBrowserUseSitePolicy) { setError('error'); return false; }
     const current = lifecycle.current;
     return write(async () => {
@@ -79,6 +106,7 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
   }
 
   async function changeRemembered(origin: string, decision: BrowserUseDecision): Promise<void> {
+    if (allowAll?.effective) return;
     if (!accessLoaded || !window.memmy?.setBrowserAccessRule) { setError('error'); return; }
     const current = lifecycle.current;
     await write(async () => {
@@ -88,6 +116,7 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
   }
 
   async function remove(rule: BrowserUseSiteRule): Promise<void> {
+    if (allowAll?.effective) return;
     if (!rulesLoaded || !accessLoaded || !window.memmy?.removeBrowserUseSitePolicy) { setError('error'); return; }
     const covered = remembered.filter(entry => browserUsePatternMatches(rule.pattern, entry.origin));
     if (covered.length && !window.memmy?.setBrowserAccessRule) { setError('error'); return; }
@@ -100,6 +129,18 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
       }
       const next = await window.memmy!.removeBrowserUseSitePolicy!(rule.pattern);
       if (current === lifecycle.current) { setRules(next); setNotice(true); }
+    });
+  }
+
+  async function changeAllowAll(enabled: boolean): Promise<void> {
+    if (!allowAll || allowAll.inherited || !window.memmy?.setBrowserAllowAll) return;
+    const current = lifecycle.current;
+    const epoch = ++allowAllEpoch.current;
+    await write(async () => {
+      const state = await window.memmy!.setBrowserAllowAll!(enabled);
+      if (current === lifecycle.current && epoch === allowAllEpoch.current) {
+        setAllowAll(state); setAllowAllError(false);
+      }
     });
   }
 
@@ -117,13 +158,24 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
       <option value="allow">{t('browser.policy.allow')}</option>
       <option value="block">{t('browser.policy.block')}</option></>;
   }
-  const disabled = loading || pending;
+  const disabled = loading || pending || allowAllLoading || Boolean(allowAll?.effective);
   return <div className={`memmy-browser-use-policies${embedded ? ' memmy-browser-use-policies--embedded' : ''}`}>
     {!embedded && <h2>{t('browser.policy.title')}</h2>}
+    <section className="memmy-browser-use-policies-all">
+      <label className="memmy-browser-use-policies-permission">
+        <span><strong>{t('browser.policy.allowAll')}</strong><p>{t('browser.policy.allowAllDescription')}</p></span>
+        <input type="checkbox" role="switch" aria-label={t('browser.policy.allowAll')} checked={allowAll?.effective ?? false}
+          disabled={!allowAll || loading || pending || allowAll.inherited || !window.memmy?.setBrowserAllowAll}
+          onChange={event => void changeAllowAll(event.target.checked)} />
+      </label>
+      {allowAll?.inherited && <p className="memmy-browser-use-policies-inherited">{t('browser.policy.allowAllInherited')}</p>}
+      {allowAll?.effective && <p role="status">{t('browser.policy.allowAllOverrides')}</p>}
+    </section>
     <p>{t('browser.policy.defaults')}</p>
     {loading && <p role="status">{t('common.loading')}</p>}
     {loadErrors.includes('rules') && <p className="memmy-browser-use-policies-error" role="alert">{t('browser.policy.error')}</p>}
     {loadErrors.includes('access') && <p className="memmy-browser-use-policies-error" role="alert">{t('browser.error.accessRules')}</p>}
+    {allowAllError && <p className="memmy-browser-use-policies-error" role="alert">{t('browser.policy.error')}</p>}
     {error && <p className="memmy-browser-use-policies-error" role="alert">{t(`browser.policy.${error}`)}</p>}
     {notice && <p role="status">{t('browser.policy.resetNotice')}</p>}
 
@@ -135,7 +187,7 @@ export function BrowserUseSitePolicies({ embedded = false }: { embedded?: boolea
           <button type="button" disabled={disabled || !window.memmy?.setBrowserAccessRule}
             onClick={() => void changeRemembered(entry.origin, 'ask')}>{t('browser.policy.revoke')}</button>
         </div>
-        {rules.some(rule => browserUsePatternMatches(rule.pattern, entry.origin)) && <p>{t('browser.policy.overridden')}</p>}
+        {!allowAll?.effective && rules.some(rule => browserUsePatternMatches(rule.pattern, entry.origin)) && <p>{t('browser.policy.overridden')}</p>}
         <label className="memmy-browser-use-policies-permission">
           <span>{t('browser.policy.access')}</span>
           <select aria-label={`${entry.origin} ${t('browser.policy.remembered')} ${t('browser.policy.access')}`}

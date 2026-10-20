@@ -47,6 +47,78 @@ afterEach(async () => {
 });
 
 describe("external browser bridge", () => {
+  it('closes a pending startup without leaving a late loopback listener', async () => {
+    const bridge = new ExternalBrowserBridge(); bridges.push(bridge);
+    const started = expect(bridge.start(0)).rejects.toThrow(/closed/);
+    await Promise.all([bridge.close(), bridge.close()]);
+    await started;
+    expect((bridge as any).server.listening).toBe(false);
+    expect(bridge.connectionDiagnostics().port).toBe(0);
+    await expect(bridge.waitForConnection('chrome', 60_000)).resolves.toBe(false);
+    await expect(bridge.start(0)).rejects.toThrow(/closed/);
+  });
+
+  it.each(['chrome', 'edge'] as const)("waits for the requested %s handshake without requiring a web page", async browser => {
+    const bridge = new ExternalBrowserBridge(); bridges.push(bridge);
+    const { port } = await bridge.start(0);
+    const waiting = bridge.waitForConnection(browser, 1_000);
+    const other = await connected(`ws://127.0.0.1:${port}/extension`, origin);
+    const otherReady = nextMessage(other);
+    other.send(JSON.stringify({ type: 'hello', browser: browser === 'chrome' ? 'edge' : 'chrome' }));
+    await otherReady;
+    expect((bridge as any).connectionWaiters.size).toBe(1);
+    const requested = await connected(`ws://127.0.0.1:${port}/extension`, origin);
+    const ready = nextMessage(requested);
+    requested.send(JSON.stringify({ type: 'hello', browser, extensionVersion: '1.0.12' }));
+    await expect(ready).resolves.toMatchObject({ type: 'ready', heartbeat: true });
+    await expect(waiting).resolves.toBe(true);
+    expect((bridge as any).connectionWaiters.size).toBe(0);
+    expect(bridge.listClaims()).toEqual([]);
+    await expect(bridge.waitForConnection(browser, 60_000)).resolves.toBe(true);
+    const pong = nextMessage(requested);
+    requested.send(JSON.stringify({ type: 'ping' }));
+    await expect(pong).resolves.toEqual({ type: 'pong' });
+    expect(bridge.connectionDiagnostics()).toMatchObject({ port, events: [
+      expect.objectContaining({ stage: 'listening' }),
+      expect.objectContaining({ stage: 'connected' }),
+      expect.objectContaining({ stage: 'connected', browser, extensionVersion: '1.0.12' }),
+    ] });
+  });
+
+  it("bounds and cancels connection waits and releases them when the bridge closes", async () => {
+    const bridge = new ExternalBrowserBridge(); bridges.push(bridge);
+    await bridge.start(0);
+    await expect(bridge.waitForConnection('chrome', 5)).resolves.toBe(false);
+    const abort = new AbortController();
+    const waiting = bridge.waitForConnection('chrome', 60_000, abort.signal);
+    abort.abort();
+    await expect(waiting).rejects.toThrow(/canceled/);
+    await expect(bridge.waitForConnection('chrome', 60_000, abort.signal)).rejects.toThrow(/canceled/);
+    expect((bridge as any).connectionWaiters.size).toBe(0);
+    const closing = bridge.waitForConnection('edge', 60_000);
+    await bridge.close();
+    await expect(closing).resolves.toBe(false);
+    expect((bridge as any).connectionWaiters.size).toBe(0);
+  });
+
+  it("serializes simultaneous startup and records only bounded connection metadata", async () => {
+    const bridge = new ExternalBrowserBridge(); bridges.push(bridge);
+    const [first, second] = await Promise.all([bridge.start(0), bridge.start(0)]);
+    expect(first.port).toBe(second.port);
+    const socket = await connected(`ws://127.0.0.1:${first.port}/extension`, origin);
+    const ready = nextMessage(socket);
+    socket.send(JSON.stringify({ type: 'hello', browser: 'chrome', extensionVersion: 'secret.invalid.version',
+      title: 'private-title', url: 'https://private.test/', token: 'private-token' }));
+    await ready;
+    socket.close(1000);
+    await vi.waitFor(() => expect(bridge.listConnected()).toEqual([]));
+    const diagnostic = JSON.stringify(bridge.connectionDiagnostics());
+    for (const secret of ['secret.invalid.version', 'private-title', 'private.test', 'private-token']) {
+      expect(diagnostic).not.toContain(secret);
+    }
+    expect(bridge.connectionDiagnostics().events.at(-1)).toMatchObject({ stage: 'disconnected', browser: 'chrome', closeCode: 1000 });
+  });
+
   it("tracks fresh history focus separately from persistent Computer Use claims", async () => {
     const bridge = new ExternalBrowserBridge(); bridges.push(bridge);
     const { port } = await bridge.start(0);

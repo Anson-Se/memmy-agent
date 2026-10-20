@@ -1,6 +1,6 @@
 /** Global.d module. */
 import type { DesktopAppInfo, DesktopImageActionRequest, DesktopImageSaveResult, DesktopMemoryServiceRestartResult, DesktopProjectDirectorySelection, DesktopSystemFileIconResult, DesktopSystemFolderIconKind, DesktopUpdateCheckResult, DesktopUpdateDownloadProgress, DesktopUpdateInstallResult } from "@memmy/desktop-interface";
-import type { AgentGatewayStartupIssue, ComputerUseSurfaceAction, ComputerUseSurfaceMessage } from "@memmy/local-api-contracts";
+import type { AgentGatewayStartupIssue, BrowserAllowAllState, ComputerUseSurfaceAction, ComputerUseSurfaceMessage, ExternalBrowserInstallation } from "@memmy/local-api-contracts";
 
 declare global {
   type MemmyMicrophoneAccessStatus = "not-determined" | "granted" | "denied" | "restricted" | "unsupported";
@@ -68,9 +68,13 @@ declare global {
         directory: string | null;
       }>;
       listInstalledBrowserExtensions?(): Promise<Array<'chrome' | 'edge'>>;
+      getBrowserExtensionInstallation?(): Promise<Record<'chrome' | 'edge', ExternalBrowserInstallation>>;
       listRunningExternalBrowsers?(): Promise<Array<'chrome' | 'edge'> | null>;
       getNativeAppAllowAll?(): Promise<boolean>;
       setNativeAppAllowAll?(enabled: boolean): Promise<boolean>;
+      getBrowserAllowAll?(): Promise<BrowserAllowAllState>;
+      setBrowserAllowAll?(enabled: boolean): Promise<BrowserAllowAllState>;
+      onBrowserAllowAllChanged?(listener: (state: BrowserAllowAllState) => void): () => void;
       getBrowserDownloadSettings?(): Promise<{ directory: string | null; approvedDirectories: string[]; askBeforeDownload: boolean }>;
       chooseBrowserDownloadDirectory?(): Promise<{ directory: string | null; approvedDirectories: string[]; askBeforeDownload: boolean }>;
       resetBrowserDownloadDirectory?(): Promise<{ directory: string | null; approvedDirectories: string[]; askBeforeDownload: boolean }>;

@@ -12,7 +12,7 @@ export async function showBrowserAuthForm(parent: BrowserWindow, request: Browse
   if (parent.isDestroyed() || !isCurrent()) return null;
   const window = new BrowserWindow({ parent, modal: true, show: false, width: 480,
     height: Math.min(690, 300 + request.fields.length * 76), minWidth: 420, minHeight: 260,
-    title: 'Memmy browser sign-in', backgroundColor: '#fff',
+    title: 'Memmy secure browser form', backgroundColor: '#fff',
     webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false,
       webSecurity: true, partition: `browser-auth-${Date.now()}-${Math.random()}` } });
   window.setMenuBarVisibility(false);
@@ -29,7 +29,7 @@ export async function showBrowserAuthForm(parent: BrowserWindow, request: Browse
     label.field{display:block;margin:14px 0}label.field span{display:block;margin-bottom:5px}
     input,select{box-sizing:border-box;width:100%;padding:9px;font:inherit;border:1px solid #aaa;border-radius:6px}
     .buttons{display:flex;gap:12px;justify-content:flex-end;margin-top:24px}button{padding:9px 16px;font:inherit}</style></head>
-    <body><h2>Sign in to this website</h2><p>Memmy will enter these values only in the current browser tab.
+    <body><h2>Secure form for this website</h2><p>Memmy will enter these values only in the current browser tab.
     The assistant will receive only a status.</p><p class="site">${escapeHtml(request.origin)}</p>
     <form id="auth">${request.options ? `<label class="field"><span>Continue with</span><select name="selected_option">${optionHtml}</select></label>` : ''}
     ${fieldHtml}<div class="buttons"><button type="button" id="cancel">Cancel</button>

@@ -2,6 +2,13 @@ export {
   RuntimeConfigSchema as DesktopRuntimeConfigSchema,
   type RuntimeConfig as DesktopRuntimeConfig
 } from "@memmy/local-api-contracts";
+export type { BrowserAllowAllState } from "@memmy/local-api-contracts";
+
+export interface DesktopBrowserAllowAllApi {
+  getBrowserAllowAll(): Promise<import("@memmy/local-api-contracts").BrowserAllowAllState>;
+  setBrowserAllowAll(enabled: boolean): Promise<import("@memmy/local-api-contracts").BrowserAllowAllState>;
+  onBrowserAllowAllChanged(listener: (state: import("@memmy/local-api-contracts").BrowserAllowAllState) => void): () => void;
+}
 
 export type MicrophoneAccessStatus = "not-determined" | "granted" | "denied" | "restricted" | "unsupported";
 

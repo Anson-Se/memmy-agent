@@ -1,11 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { DownloadItem, Session } from 'electron';
+import type { DownloadItem, Session, WebContents } from 'electron';
 import { BrowserDownloadCatalog, type BrowserDownloadEntry } from './browser-download-catalog.js';
 import { BrowserDownloadSettings } from './browser-download-settings.js';
 
 export type BrowserDownloadAction = 'pause' | 'resume' | 'cancel';
+type TaskDestination = { filePath: string; destinationId: string; expiresAt: number;
+  isCurrent: () => boolean; state: 'pending' | 'started' | 'cancelled'; cancelledAt?: number;
+  outcome: Promise<string | null>; settle: (error: string | null) => void };
+// A cancelled action keeps its tab's slot this long, so its late download
+// cannot land in the next action's destination; afterwards the tab is normal.
+const LATE_DOWNLOAD_WINDOW_MS = 30_000;
+
 type LiveDownload = { id: string; name: string; url: string; startedAt: number; item: DownloadItem;
   status: 'started' | 'in_progress' | 'paused'; cancelRequested: boolean;
   updated: (event: Electron.Event, state: 'progressing' | 'interrupted') => void;
@@ -38,6 +45,7 @@ export class BrowserWebviewDownloads {
   private readonly settings: BrowserDownloadSettings;
   private readonly live = new Map<string, LiveDownload>();
   private updateTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly destinations = new Map<number, TaskDestination>();
 
   constructor(private readonly browserSession: Session, agentDataDirectory: string,
     private readonly onChange: (entries: BrowserDownloadEntry[]) => void = () => undefined) {
@@ -46,11 +54,86 @@ export class BrowserWebviewDownloads {
     browserSession.on('will-download', this.onDownload);
   }
 
-  private readonly onDownload = (_event: Electron.Event, item: DownloadItem): void => {
+  private releaseLapsedDestination(tabId: number): void {
+    const current = this.destinations.get(tabId);
+    if (current?.state === 'cancelled' && Date.now() - (current.cancelledAt ?? 0) > LATE_DOWNLOAD_WINDOW_MS) {
+      this.destinations.delete(tabId);
+    }
+  }
+
+  setDestination(tabId: number, filePath: string | null, destinationId: string, isCurrent: () => boolean): void {
+    this.releaseLapsedDestination(tabId);
+    const current = this.destinations.get(tabId);
+    if (filePath === null) {
+      if (current?.destinationId !== destinationId) return;
+      if (current.state === 'started') this.destinations.delete(tabId);
+      else if (current.state === 'pending') {
+        current.state = 'cancelled'; current.cancelledAt = Date.now();
+        current.settle('Browser download was cancelled before it started');
+      }
+      return;
+    }
+    if (current && current.state !== 'started')
+      throw new Error('A previous download has not started or was cancelled. Use a fresh browser tab for another download.');
+    if (!Number.isSafeInteger(tabId) || tabId <= 0 || !path.isAbsolute(filePath) || filePath.includes('\0')
+      || filePath.length > 4096 || !fs.statSync(path.dirname(filePath)).isDirectory()
+      || fs.existsSync(filePath)) throw new Error('Browser download destination must name a new file in an existing folder');
+    let settle!: TaskDestination['settle'];
+    const outcome = new Promise<string | null>(resolve => { settle = resolve; });
+    this.destinations.set(tabId, { filePath, destinationId, expiresAt: Date.now() + 120_000, isCurrent,
+      state: 'pending', outcome, settle });
+  }
+
+  async waitDestination(tabId: number, destinationId: string, isCurrent: () => boolean,
+    timeoutMs = 30_000): Promise<{ started: true }> {
+    if (!Number.isSafeInteger(tabId) || tabId <= 0 || !/^[a-f\d-]{36}$/i.test(destinationId))
+      throw new Error('Invalid browser download destination request');
+    const destination = this.destinations.get(tabId);
+    if (!destination || destination.destinationId !== destinationId)
+      throw new Error('Browser download destination is no longer configured for this action');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const cancel = (message: string) => {
+      if (destination.state !== 'pending') return;
+      destination.state = 'cancelled'; destination.cancelledAt = Date.now(); destination.settle(message);
+    };
+    if (!isCurrent() || !destination.isCurrent()) cancel('Browser download action was cancelled or its page changed');
+    if (destination.state === 'pending') {
+      timer = setTimeout(() => cancel('Browser download did not start within 30 seconds; the requested destination was not used'), timeoutMs);
+      poll = setInterval(() => {
+        if (!isCurrent() || !destination.isCurrent()) cancel('Browser download action was cancelled or its page changed');
+      }, 50);
+    }
+    try {
+      const error = await destination.outcome;
+      if (error) throw new Error(error);
+      if (!isCurrent()) throw new Error('Browser download action was cancelled');
+      return { started: true };
+    } finally { if (timer) clearTimeout(timer); if (poll) clearInterval(poll); }
+  }
+
+  private readonly onDownload = (_event: Electron.Event, item: DownloadItem, contents?: WebContents): void => {
     const id = randomUUID();
     const name = safeFilename(item.getFilename());
     const preference = this.settings.read();
-    if (preference.askBeforeDownload) {
+    if (contents) this.releaseLapsedDestination(contents.id);
+    const destination = contents ? this.destinations.get(contents.id) : undefined;
+    if (destination && destination.state !== 'started') {
+      if (destination.state === 'cancelled' || destination.expiresAt < Date.now() || !destination.isCurrent()
+        || fs.existsSync(destination.filePath)) {
+        destination.state = 'cancelled';
+        destination.settle('Browser download destination was cancelled, expired or changed');
+        if (contents) this.destinations.delete(contents.id);
+        item.cancel(); return;
+      }
+      try { item.setSavePath(destination.filePath); }
+      catch {
+        destination.state = 'cancelled'; destination.settle('Browser download could not use the requested destination');
+        if (contents) this.destinations.delete(contents.id);
+        item.cancel(); return;
+      }
+      destination.state = 'started'; destination.settle(null);
+    } else if (preference.askBeforeDownload) {
       fs.mkdirSync(this.catalog.directory, { recursive: true, mode: 0o700 });
       item.setSaveDialogOptions({ defaultPath: path.join(preference.directory ?? this.catalog.directory, name) });
     } else if (preference.directory) {
@@ -156,6 +239,8 @@ export class BrowserWebviewDownloads {
   }
 
   dispose(): void {
+    for (const destination of this.destinations.values()) destination.settle('Browser download service was closed');
+    this.destinations.clear();
     this.browserSession.removeListener('will-download', this.onDownload);
     if (this.updateTimer) clearTimeout(this.updateTimer);
     this.updateTimer = null;

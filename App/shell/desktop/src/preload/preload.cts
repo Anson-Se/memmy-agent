@@ -13,6 +13,7 @@ type DesktopSystemFolderIconKind = import("@memmy/desktop-interface").DesktopSys
 type DesktopMemoryServiceRestartResult = import("@memmy/desktop-interface").DesktopMemoryServiceRestartResult;
 type DesktopProjectDirectorySelection = import("@memmy/desktop-interface").DesktopProjectDirectorySelection;
 type AgentGatewayStartupIssue = import("@memmy/local-api-contracts").AgentGatewayStartupIssue;
+type ExternalBrowserInstallation = import("@memmy/local-api-contracts").ExternalBrowserInstallation;
 type DesktopWorkspaceDirectoryResult = import("@memmy/desktop-interface").DesktopWorkspaceDirectoryResult;
 type MicrophoneAccessStatus = import("@memmy/desktop-interface").MicrophoneAccessStatus;
 type ComputerUseSurfaceMessage = import("@memmy/local-api-contracts").ComputerUseSurfaceMessage;
@@ -21,6 +22,7 @@ type BrowserDataCategory = import("../main/browser-browsing-data.js").BrowserDat
 type BrowserDownloadSettingsValue = import("../main/browser-download-settings.js").BrowserDownloadSettingsValue;
 type BrowserAccessRecord = import("../main/browser-access-store.js").BrowserAccessRecord;
 type BrowserUseSiteRule = import("@memmy/local-api-contracts").BrowserUseSiteRule;
+type BrowserAllowAllState = import("@memmy/local-api-contracts").BrowserAllowAllState;
 type BrowserSidebarAction = Pick<import("@memmy/local-api-contracts").ComputerUseSurfaceAction, "action" | "x" | "y" | "deltaY" | "key" | "url">;
 type MainWindowActionRequest = { id: string; action: "close" | "minimize" };
 type ExternalBrowserInstallPreparation = import("../main/external-browser-extension-install.js").ExternalBrowserInstallPreparation;
@@ -57,9 +59,13 @@ interface MemmyPreloadApi {
   dragBrowserExtension(): boolean;
   prepareBrowserExtension(browser: 'chrome' | 'edge', revealFolder?: boolean): Promise<ExternalBrowserInstallPreparation>;
   listInstalledBrowserExtensions(): Promise<Array<'chrome' | 'edge'>>;
+  getBrowserExtensionInstallation(): Promise<Record<'chrome' | 'edge', ExternalBrowserInstallation>>;
   listRunningExternalBrowsers(): Promise<Array<'chrome' | 'edge'> | null>;
   getNativeAppAllowAll(): Promise<boolean>;
   setNativeAppAllowAll(enabled: boolean): Promise<boolean>;
+  getBrowserAllowAll(): Promise<BrowserAllowAllState>;
+  setBrowserAllowAll(enabled: boolean): Promise<BrowserAllowAllState>;
+  onBrowserAllowAllChanged(listener: (state: BrowserAllowAllState) => void): () => void;
   getBrowserDownloadSettings(): Promise<BrowserDownloadSettingsValue>;
   chooseBrowserDownloadDirectory(): Promise<BrowserDownloadSettingsValue>;
   resetBrowserDownloadDirectory(): Promise<BrowserDownloadSettingsValue>;
@@ -249,6 +255,9 @@ const memmyPreloadApi: MemmyPreloadApi = {
   async listInstalledBrowserExtensions(): Promise<Array<'chrome' | 'edge'>> {
     return ipcRenderer.invoke('memmy:browser-extension:installed');
   },
+  async getBrowserExtensionInstallation(): Promise<Record<'chrome' | 'edge', ExternalBrowserInstallation>> {
+    return ipcRenderer.invoke('memmy:browser-extension:installation');
+  },
   async listRunningExternalBrowsers(): Promise<Array<'chrome' | 'edge'> | null> {
     return ipcRenderer.invoke('memmy:browser-extension:running');
   },
@@ -257,6 +266,17 @@ const memmyPreloadApi: MemmyPreloadApi = {
   },
   async setNativeAppAllowAll(enabled: boolean): Promise<boolean> {
     return ipcRenderer.invoke('memmy:computer-use:allow-all-apps:set', enabled);
+  },
+  async getBrowserAllowAll(): Promise<BrowserAllowAllState> {
+    return ipcRenderer.invoke('memmy:browser-allow-all:get');
+  },
+  async setBrowserAllowAll(enabled: boolean): Promise<BrowserAllowAllState> {
+    return ipcRenderer.invoke('memmy:browser-allow-all:set', enabled);
+  },
+  onBrowserAllowAllChanged(callback: (state: BrowserAllowAllState) => void): () => void {
+    const listener = (_event: IpcRendererEvent, state: BrowserAllowAllState) => callback(state);
+    ipcRenderer.on('memmy:browser-allow-all:changed', listener);
+    return () => { ipcRenderer.removeListener('memmy:browser-allow-all:changed', listener); };
   },
   async getBrowserDownloadSettings(): Promise<BrowserDownloadSettingsValue> {
     return ipcRenderer.invoke('memmy:browser-downloads:settings');

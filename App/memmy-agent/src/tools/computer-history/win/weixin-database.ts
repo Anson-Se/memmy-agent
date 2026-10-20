@@ -67,6 +67,32 @@ export function dataRootsFromConfigText(text: string): string[] {
   return [...found];
 }
 
+/**
+ * Base directories recorded by Weixin, which store `xwechat_files` as a child.
+ * Weixin 4 writes the parent folder (for example `C:\Users\Name\Documents`) into
+ * its config, not a path that already ends in `xwechat_files`. Characters that are
+ * illegal in Windows paths bound each match; the filesystem later confirms it.
+ */
+export function baseDirectoriesFromConfigText(text: string): string[] {
+  const source = text.replace(/\\\\/g, "\\");
+  const found = new Set<string>();
+  for (const match of source.matchAll(/[A-Za-z]:\\[^"\r\n<>|?*]*/gu)) {
+    const root = normalizeWindowsPath(match[0]);
+    if (root) found.add(root);
+  }
+  return [...found];
+}
+
+/** Every storage root hinted by Weixin config files, verified later on disk. */
+export function configuredSearchRoots(configTexts: readonly string[]): string[] {
+  const roots = new Set<string>();
+  for (const text of configTexts) {
+    for (const root of dataRootsFromConfigText(text)) roots.add(root);
+    for (const root of baseDirectoriesFromConfigText(text)) roots.add(root);
+  }
+  return [...roots];
+}
+
 export function defaultWeixinSearchRoot(documentsDirectory: string): string {
   return win.join(normalizeWindowsPath(documentsDirectory), "xwechat_files");
 }
@@ -117,4 +143,23 @@ export function selectWeixinAccount(accounts: WeixinAccountRoot[]): WeixinAccoun
   if (accounts.length === 0) throw new WeixinDatabaseLookupError("wechat_login_required");
   if (accounts.length > 1) throw new WeixinDatabaseLookupError("current_account_ambiguous");
   return accounts[0];
+}
+
+/**
+ * Resolve the account `db_storage` the reader should open. Weixin config hints
+ * where chat data lives; the default Documents folder is always searched too, so
+ * a standard install still works. The filesystem decides which hints are real.
+ */
+export function discoverWeixinDatabaseRoot(
+  reader: WindowsDirectoryReader,
+  input: { documentsDirectory: string; configTexts?: readonly string[] },
+): string {
+  const configuredPaths = [
+    ...configuredSearchRoots(input.configTexts ?? []),
+    normalizeWindowsPath(input.documentsDirectory),
+  ].filter(Boolean);
+  return selectWeixinAccount(findWeixinAccounts(reader, {
+    documentsDirectory: input.documentsDirectory,
+    configuredPaths,
+  })).databaseRoot;
 }

@@ -43,8 +43,8 @@ describe("personal WeChat History setup boundary", () => {
     });
     try {
       expect(service.snapshot().wechat).toBeUndefined();
-      expect(() => service.setWeChatChatAccess(true)).toThrow(/Apple silicon macOS only/);
-      expect(() => service.connectWeChat()).toThrow(/Apple silicon macOS only/);
+      expect(() => service.setWeChatChatAccess(true)).toThrow(/Apple silicon macOS and Windows 11 only/);
+      expect(() => service.connectWeChat()).toThrow(/Apple silicon macOS and Windows 11 only/);
       expect(service.snapshot().wechat).toBeUndefined();
     } finally {
       arch.mockRestore();

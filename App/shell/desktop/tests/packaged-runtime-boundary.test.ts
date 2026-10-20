@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
@@ -710,7 +711,11 @@ describe("desktop packaged runtime boundaries", () => {
     expect(finishPageMacroSource).toContain('StrCmp $MemmyIsRelayedUpgrade "1"');
     expect(finishPageMacroSource).toContain("Abort");
     expect(finishPageMacroSource).toContain("Function MemmyStartAppAfterInstall");
-    expect(finishPageMacroSource).toContain('${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$1"');
+    expect(finishPageMacroSource).toContain('${If} ${UAC_IsAdmin}');
+    expect(finishPageMacroSource).toContain('${StdUtils.ExecShellAsUser} $MemmyLaunchResult "$launchLink" "open" "$1"');
+    expect(finishPageMacroSource).toContain('ExecShell "open" "$launchLink" "$1"');
+    expect(finishPageMacroSource).toContain('Call MemmyLogLaunchResult');
+    expect(finishPageMacroSource).toContain('MessageBox MB_OK|MB_ICONEXCLAMATION "$3"');
     expect(finishPageMacroSource).toContain("!define MUI_PAGE_CUSTOMFUNCTION_PRE MemmySkipRelayedFinishPage");
     expect(finishPageMacroSource).toContain("!define MUI_FINISHPAGE_RUN_FUNCTION MemmyStartAppAfterInstall");
     expect(finishPageMacroSource).toContain("!insertmacro MUI_PAGE_FINISH");
@@ -1428,7 +1433,7 @@ describe("desktop packaged runtime boundaries", () => {
     expect(preloadSource).toContain('ipcRenderer.invoke("memmy:notify-update-available", payload)');
   });
 
-  it("declares macOS microphone usage and exposes microphone permission bridge", () => {
+  it("declares macOS camera and microphone usage while preserving the existing permission bridge and app identity", () => {
     const mainSource = readFileSync(mainSourcePath, "utf8");
     const preloadSource = readFileSync(preloadSourcePath, "utf8");
     const electronBuilderSource = readFileSync(electronBuilderPath, "utf8");
@@ -1437,18 +1442,52 @@ describe("desktop packaged runtime boundaries", () => {
     const packageMacDmgSource = readFileSync(packageMacDmgPath, "utf8");
 
     expect(electronBuilderSource).toContain("NSMicrophoneUsageDescription");
+    for (const configPath of [electronBuilderPath, unsignedElectronBuilderPath]) {
+      const config = parseYaml(readFileSync(configPath, "utf8"));
+      expect(config.appId).toBe('cn.memtensor.memmy');
+      expect(config.mac.extendInfo.NSMicrophoneUsageDescription).toContain('website tasks you request');
+      expect(config.mac.extendInfo.NSCameraUsageDescription).toContain('website tasks you request');
+      expect(config.mac.entitlements).toBe('build/entitlements.mac.plist');
+      expect(config.mac.entitlementsInherit).toBe('build/entitlements.mac.inherit.plist');
+    }
     expect(electronBuilderSource).toContain("entitlements: build/entitlements.mac.plist");
     expect(electronBuilderSource).toContain("entitlementsInherit: build/entitlements.mac.inherit.plist");
     expect(macEntitlementsSource).toContain("com.apple.security.device.audio-input");
     expect(macEntitlementsInheritSource).toContain("com.apple.security.device.audio-input");
+    expect(macEntitlementsSource).toMatch(/<key>com\.apple\.security\.device\.camera<\/key>\s*<true\/>/);
+    expect(macEntitlementsInheritSource).toMatch(/<key>com\.apple\.security\.device\.camera<\/key>\s*<true\/>/);
     expect(mainSource).toContain('ipcMain.handle("memmy:get-microphone-access-status"');
     expect(mainSource).toContain('ipcMain.handle("memmy:request-microphone-access"');
     expect(preloadSource).toContain("getMicrophoneAccessStatus(): Promise<MicrophoneAccessStatus>;");
     expect(preloadSource).toContain("requestMicrophoneAccess(): Promise<MicrophoneAccessStatus>;");
     expect(packageMacDmgSource).toContain("resolve_microphone_usage_description()");
-    expect(packageMacDmgSource).toContain('printf \'%s\' "Memmy 仅在你开始语音输入时使用麦克风"');
-    expect(packageMacDmgSource).toContain('printf \'%s\' "Memmy uses the microphone only when you start voice input."');
+    expect(packageMacDmgSource).toContain("resolve_camera_usage_description()");
     expect(packageMacDmgSource).toContain("--config.mac.extendInfo.NSMicrophoneUsageDescription=");
+    expect(packageMacDmgSource).toContain("--config.mac.extendInfo.NSCameraUsageDescription=");
+  });
+
+  it.skipIf(process.platform === 'win32').each([
+    { edition: 'cn', channel: 'email', language: 'cn' },
+    { edition: 'intl', channel: 'phone', language: 'intl' },
+    { edition: '', channel: 'email', language: 'intl' },
+    { edition: '', channel: 'phone', language: 'cn' },
+  ])('resolves localized camera/microphone packaging descriptions for edition=$edition channel=$channel', ({ edition, channel, language }) => {
+    const source = readFileSync(packageMacDmgPath, 'utf8');
+    const functions = ['resolve_media_usage_description', 'resolve_microphone_usage_description', 'resolve_camera_usage_description']
+      .map(name => {
+        const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'));
+        expect(match).not.toBeNull();
+        return match![0];
+      }).join('\n');
+    const resolve = (media: string) => execFileSync('bash', ['-c', `${functions}\nresolve_${media}_usage_description`], {
+      encoding: 'utf8', env: { ...process.env, MEMMY_APP_EDITION: edition, MEMMY_ACCOUNT_CHANNEL: channel },
+    });
+    expect(resolve('microphone')).toBe(language === 'cn'
+      ? 'Memmy 会在语音输入和你要求的网页任务中使用麦克风。'
+      : 'Memmy uses the microphone for voice input and for website tasks you request.');
+    expect(resolve('camera')).toBe(language === 'cn'
+      ? 'Memmy 会在你要求的网页任务中使用摄像头。'
+      : 'Memmy uses the camera for website tasks you request.');
   });
 
   it("seals macOS data assets with their containing bundle without skipping native code signing", () => {
@@ -1934,6 +1973,9 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1"');
     expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1"');
     expect(source).toContain('"Windows 11 Computer History observer"');
+    expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/app-icon.ps1"');
+    expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/app-icon.ps1"');
+    expect(source).toContain('"Windows Computer History application icons"');
     expect(source).toContain('require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe"');
     expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe"');
     expect(source).toContain('build-memmy-computer-history.sh');

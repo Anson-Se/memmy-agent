@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -38,10 +39,19 @@ LITERAL = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 RAW_KEY_LITERAL = re.compile(rb"x'([0-9a-fA-F]{96,192})'")
 MAX_USER_ADDRESS = 0x0000800000000000
 MAX_BLOB = 1024
+# The reader requires every numbered chat shard. Partial capture must not report
+# success and then fail the first poll as "keys outdated".
+MESSAGE_DATABASE = re.compile(r"(?:^|/)message_\d+\.db$", re.IGNORECASE)
 
 
 def emit(event, **fields):
     print(json.dumps({"event": event, **fields}, separators=(",", ":")), flush=True)
+
+
+def usable_capture(pages, found):
+    """Every numbered message shard is required by the shared batch reader."""
+    required = {name for name in pages if MESSAGE_DATABASE.search(name)}
+    return bool(required) and required.issubset(found)
 
 
 def authenticated_page(raw_key, page):
@@ -95,13 +105,25 @@ def config_key_candidates(blob):
 
 def encrypted_pages(root):
     pages = {}
-    for db in sorted(root.rglob("*.db")):
-        if not db.is_file() or db.is_symlink():
+    required = message_databases(root)
+    if not required:
+        raise RuntimeError("wechat_login_required")
+    # Contacts/sessions improve names, but unrelated indexes/media must never
+    # prevent a connection to the required message shards.
+    optional = [root / "contact/contact.db", root / "session/session.db"]
+    for db in required + optional:
+        try:
+            if db.is_symlink() or not db.is_file():
+                raise RuntimeError("database_unreadable")
+            page = read_shared(db, limit=PAGE_SIZE)
+        except (OSError, RuntimeError):
+            if db in required:
+                raise
             continue
-        with db.open("rb") as source:
-            page = source.read(PAGE_SIZE)
         if len(page) == PAGE_SIZE and not page.startswith(b"SQLite format 3\x00"):
             pages[db.relative_to(root).as_posix()] = page
+        elif db in required:
+            raise RuntimeError("invalid_database_page")
     return pages
 
 
@@ -422,13 +444,20 @@ def python_aes_cbc_decrypt(key, iv, data):
     return bytes(output)
 
 
-def read_shared(path, allow_empty=False):
+def read_shared(path, allow_empty=False, limit=None):
     if sys.platform != "win32":
-        return path.read_bytes()
+        with path.open("rb") as source:
+            return source.read(-1 if limit is None else limit)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                   ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
     kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.GetFileSizeEx.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
     kernel32.GetFileSizeEx.restype = ctypes.c_int
+    kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                 ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
     kernel32.ReadFile.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
     handle = kernel32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
     invalid = ctypes.c_void_p(-1).value
@@ -444,9 +473,12 @@ def read_shared(path, allow_empty=False):
             if allow_empty:
                 return b""
             raise RuntimeError("database_unreadable")
-        buffer = ctypes.create_string_buffer(size.value)
+        requested = min(size.value, limit) if limit is not None else size.value
+        if requested > 0xFFFFFFFF:
+            raise RuntimeError("database_unreadable")
+        buffer = ctypes.create_string_buffer(requested)
         read = ctypes.c_uint32()
-        if kernel32.ReadFile(handle, buffer, size.value, ctypes.byref(read), None) == 0:
+        if kernel32.ReadFile(handle, buffer, requested, ctypes.byref(read), None) == 0 or read.value != requested:
             raise RuntimeError("database_unreadable")
         return buffer.raw[:read.value]
     finally:
@@ -845,7 +877,7 @@ class WindowsProcessMemory(ProcessMemory):
         buffer = ctypes.create_string_buffer(size)
         read = ctypes.c_size_t(0)
         ok = self.kernel32.ReadProcessMemory(
-            self.handle, ctypes.c_uint64(address), buffer, size, ctypes.byref(read))
+            self.handle, ctypes.c_void_p(address), buffer, size, ctypes.byref(read))
         if not ok:
             return b""
         return buffer.raw[:read.value]
@@ -867,7 +899,7 @@ class WindowsProcessMemory(ProcessMemory):
         address = 0
         info = MemoryBasicInformation()
         while address < 0x7FFFFFFFFFFF:
-            if kernel32.VirtualQueryEx(self.handle, ctypes.c_uint64(address), ctypes.byref(info), ctypes.sizeof(info)) == 0:
+            if kernel32.VirtualQueryEx(self.handle, ctypes.c_void_p(address), ctypes.byref(info), ctypes.sizeof(info)) == 0:
                 break
             if info.State == mem_commit and info.Protect in readable and 0 < info.RegionSize <= 256 * 1024 * 1024:
                 found.append((info.BaseAddress, info.RegionSize))
@@ -898,7 +930,18 @@ def capture_from_running_weixin(pages):
     if sys.platform != "win32":
         raise RuntimeError("windows_required")
     import ctypes
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # ctypes defaults to 32-bit ints; addresses and process handles are 64-bit
+    # in the bundled interpreter, including x64 emulation on Windows ARM.
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel32.ReadProcessMemory.restype = ctypes.c_int
+    kernel32.VirtualQueryEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
     pids = weixin_pids()
     if not pids:
         raise RuntimeError("weixin_not_running")
@@ -925,20 +968,153 @@ def capture_from_running_weixin(pages):
     return found, stats
 
 
-def discover_database_root():
-    home = Path.home() / "Documents" / "xwechat_files"
-    if not home.is_dir():
-        raise RuntimeError("wechat_login_required")
-    accounts = []
-    for child in home.iterdir():
-        if not child.is_dir() or child.is_symlink() or not re.fullmatch(r"wxid_[0-9A-Za-z_]+", child.name):
+def message_databases(root):
+    return sorted(file for file in (root / "message").glob("message_*.db")
+                  if re.fullmatch(r"message_[0-9]+\.db", file.name))
+
+
+def windows_documents_directory():
+    """Follow the user's actual Documents folder, including OneDrive/redirects."""
+    fallback = Path.home() / "Documents"
+    if sys.platform != "win32":
+        return fallback
+    output = ctypes.c_void_p()
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                               ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole32.CoTaskMemFree.restype = None
+        folder = ctypes.create_string_buffer(uuid.UUID("fdd39ad0-238f-46af-adb4-6c85480369c7").bytes_le, 16)
+        if shell32.SHGetKnownFolderPath(folder, 0, None, ctypes.byref(output)) == 0 and output.value:
+            return Path(ctypes.wstring_at(output.value))
+    except (OSError, AttributeError):
+        pass
+    finally:
+        if output.value:
+            ole32.CoTaskMemFree(output)
+    return fallback
+
+
+def config_storage_paths(text):
+    paths = []
+    for match in re.finditer(r'(?:[A-Za-z]:[\\/]|\\\\[^\\\r\n]+\\)[^"\r\n\0<>|?*]*', text):
+        value = match.group(0).strip().rstrip("'")
+        # JSON-style escaped backslashes may occur in older config files.
+        prefix = "\\\\" if value.startswith("\\\\") else ""
+        value = prefix + value[len(prefix):].replace("\\\\", "\\")
+        paths.append(Path(ntpath.normpath(value)))
+    return paths
+
+
+def configured_storage_roots(appdata):
+    directory = appdata / "Tencent/xwechat/config"
+    roots = []
+    try:
+        files = sorted(directory.iterdir())
+    except OSError:
+        return roots
+    for file in files:
+        if file.suffix.lower() != ".ini" or file.is_symlink() or not file.is_file():
             continue
-        message = child / "db_storage" / "message"
-        if message.is_dir() and any(message.glob("message_[0-9]*.db")):
-            accounts.append(child / "db_storage")
-    if len(accounts) == 1:
-        return accounts[0]
-    raise RuntimeError("wechat_login_required" if not accounts else "current_account_ambiguous")
+        try:
+            with file.open("rb") as source:
+                raw = source.read(64 * 1024)
+            encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+            roots.extend(config_storage_paths(raw.decode(encoding)))
+        except (OSError, UnicodeError):
+            continue
+    return roots
+
+
+def discover_database_roots():
+    home = Path.home()
+    appdata = Path(os.environ.get("APPDATA", str(home / "AppData/Roaming")))
+    roots = configured_storage_roots(appdata) + [windows_documents_directory(),
+             home / "Documents", appdata / "Tencent/xwechat_files"]
+    accounts = {}
+    for root in roots:
+        for container in (root, root / "xwechat_files"):
+            try:
+                if container.is_symlink():
+                    continue
+                children = list(container.iterdir())
+            except OSError:
+                continue
+            # Config may name the account itself. Structure, not a wxid_ prefix,
+            # identifies a store: older accounts can use custom account names.
+            for child in [container] + children:
+                database = child / "db_storage"
+                if child.is_symlink() or database.is_symlink() or not database.is_dir():
+                    continue
+                if message_databases(database):
+                    resolved = database.resolve(strict=True)
+                    accounts[os.path.normcase(str(resolved))] = resolved
+    if not accounts:
+        raise RuntimeError("wechat_login_required")
+    return list(accounts.values())
+
+
+def discover_database_root():
+    roots = discover_database_roots()
+    if len(roots) != 1:
+        raise RuntimeError("current_account_ambiguous")
+    return roots[0]
+
+
+def account_pages_for_capture(roots, explicit=False):
+    """A broken historical store must not hide a readable current account.
+
+    Only discovery candidates may be skipped. The selected account still needs
+    every message key and a successful production-reader baseline afterwards.
+    """
+    accounts = []
+    first_error = None
+    for root in roots:
+        try:
+            accounts.append((root, encrypted_pages(root)))
+        except (OSError, RuntimeError) as error:
+            if explicit:
+                raise
+            if first_error is None:
+                first_error = error
+    if not accounts:
+        if first_error is not None:
+            raise first_error
+        raise RuntimeError("wechat_login_required")
+    return accounts
+
+
+def select_captured_account(accounts, found):
+    """Choose by cryptographic proof from running Weixin, never directory age."""
+    matching = []
+    for index, (root, pages) in enumerate(accounts):
+        prefix = str(index) + "/"
+        verified = {name[len(prefix):]: key for name, key in found.items() if name.startswith(prefix)}
+        if any(MESSAGE_DATABASE.search(name) for name in verified):
+            matching.append((root, pages, verified))
+    if len(matching) > 1:
+        raise RuntimeError("current_account_ambiguous")
+    if not matching or not usable_capture(matching[0][1], matching[0][2]):
+        raise RuntimeError("weixin_keys_not_found")
+    return matching[0][0], matching[0][2]
+
+
+def verify_message_databases(root, entries):
+    """Use the production reader before publishing keys/account as connected.
+
+    The computed cursor is deliberately discarded. The first Windows poll must
+    still start at consent time, or retain the already acknowledged cursor.
+    """
+    path = Path(__file__).resolve().parents[1] / "mac/wechat/read_messages.py"
+    spec = importlib.util.spec_from_file_location("wechat_message_reader", path)
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    result = reader.scan(root, {"keys": entries}, reader.SqlCipher("builtin"), {}, 200, True)
+    if result.get("databaseCount") != len(message_databases(root)) or result.get("messages"):
+        raise RuntimeError("database_baseline_failed")
 
 
 def write_connection_files(output, root, consent_file, identifier, started_at=None):
@@ -1010,10 +1186,10 @@ def main():
     parser.add_argument("--peek", action="store_true")
     parser.add_argument("--days", type=int, default=10)
     args = parser.parse_args()
-    root = args.root.resolve(strict=True) if args.root else discover_database_root()
-    if root.name != "db_storage":
-        raise RuntimeError("invalid_database_root")
     if args.peek:
+        root = args.root.resolve(strict=True) if args.root else discover_database_root()
+        if root.name != "db_storage":
+            raise RuntimeError("invalid_database_root")
         memmy_home = Path(os.environ.get("MEMMY_HOME", "")).expanduser() if os.environ.get("MEMMY_HOME") else Path.home() / ".memmy"
         key_file = args.keys or (memmy_home / "computer-history" / "wechat" / "keys.json")
         consent_file = args.consent_file or (key_file.parent / "consent.json")
@@ -1035,22 +1211,38 @@ def main():
         identifier = state.get("consentId")
     if not consent_enabled(consent_file, identifier):
         raise RuntimeError("wechat_consent_required")
-    pages = encrypted_pages(root)
-    if not pages:
-        raise RuntimeError("no_encrypted_databases")
+    roots = [args.root.resolve(strict=True)] if args.root else discover_database_roots()
+    if any(root.name != "db_storage" for root in roots):
+        raise RuntimeError("invalid_database_root")
+    accounts = account_pages_for_capture(roots, explicit=args.root is not None)
+    pages = {str(index) + "/" + name: page
+             for index, (_root, account_pages) in enumerate(accounts)
+             for name, page in account_pages.items()}
     emit("scan_started", database_count=len(pages))
     found, stats = capture_from_running_weixin(pages)
     if not consent_enabled(consent_file, identifier):
         raise RuntimeError("wechat_consent_revoked")
-    if found:
-        entries = {name: {"enc_key": key} for name, key in sorted(found.items())}
-        save_private(args.output, entries)
-        write_connection_files(args.output, root, consent_file, identifier, started_at)
     emit("capture_finished", verified_databases=len(found), expected_databases=len(pages), **stats)
-    if not found:
-        emit("capture_error", category="weixin_keys_not_found", detail="no candidate authenticated a database page")
-        return 3
+    root, verified = select_captured_account(accounts, found)
+    entries = {name: {"enc_key": key} for name, key in sorted(verified.items())}
+    emit("verifying_databases")
+    verify_message_databases(root, entries)
+    if not consent_enabled(consent_file, identifier):
+        raise RuntimeError("wechat_consent_revoked")
+    save_private(args.output, entries)
+    write_connection_files(args.output, root, consent_file, identifier, started_at)
+    emit("connected", verified_message_databases=len(message_databases(root)))
     return 0
+
+
+def capture_error_category(error):
+    category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+    if category in {"invalid_database_page", "database_unreadable", "readonly_query_failed",
+                    "readonly_database_snapshot_busy", "database_baseline_failed"} or isinstance(error, OSError):
+        return "wechat_reader_unavailable"
+    if category in {"database_key_rejected", "database_key_missing", "invalid_database_key"}:
+        return "wechat_keys_outdated"
+    return category
 
 
 if __name__ == "__main__":
@@ -1058,6 +1250,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as error:
         detail = str(error).splitlines()[0][:180]
-        category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        category = capture_error_category(error)
         emit("capture_error", category=category, detail=detail)
         raise SystemExit(2)

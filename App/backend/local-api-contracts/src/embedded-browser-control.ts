@@ -16,14 +16,44 @@ export function isEmbeddedBrowserCancel(value: unknown): value is EmbeddedBrowse
 }
 
 export const EMBEDDED_BROWSER_COMMANDS = [
-  'probe', 'listTabs', 'queryHistory', 'openTab', 'closeTab', 'allowOrigin', 'snapshot', 'find', 'navigate', 'back', 'forward', 'reload',
+  'probe', 'listTabs', 'externalBrowserState', 'recoverExternalBrowser', 'queryHistory', 'openTab', 'closeTab', 'allowOrigin', 'snapshot', 'find', 'navigate', 'back', 'forward', 'reload',
   'click', 'type', 'selectOption', 'pressKey', 'scroll', 'waitFor', 'screenshot',
   'consoleMessages', 'networkRequests', 'viewport', 'historyState', 'resize', 'open',
   'fillCredential', 'fillContact',
-  'authRequest',
+  'authRequest', 'setSitePermission', 'endSitePermissions', 'setDownloadDestination', 'waitDownloadDestination',
   'upload',
   'cdpCall', 'cdpEvents', 'cdpWrite',
+  'playwrightStart', 'playwrightCdp', 'playwrightEnd',
 ] as const;
+
+export type ExternalBrowserInstallation = { installed: boolean | null; enabled: boolean | null };
+/** Browser/extension metadata only; no page contents, paths, or process arguments cross child IPC. */
+export type ExternalBrowserState = {
+  installation: Record<'chrome' | 'edge', ExternalBrowserInstallation>;
+  runningBrowsers: Array<'chrome' | 'edge'> | null;
+};
+export type ExternalBrowserRecovery = 'woken' | 'unavailable' | 'failed';
+
+/** Executor CDP events share the result channel, so they stay ordered with replies. */
+export const EMBEDDED_BROWSER_EVENT = 'memmy:embedded-browser:event';
+export type EmbeddedBrowserEvent = {
+  type: typeof EMBEDDED_BROWSER_EVENT;
+  tabId: number;
+  leaseId: string;
+  method: string;
+  params: Record<string, unknown>;
+  sessionId?: string;
+};
+export function isEmbeddedBrowserEvent(value: unknown): value is EmbeddedBrowserEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Partial<EmbeddedBrowserEvent>;
+  return input.type === EMBEDDED_BROWSER_EVENT
+    && Number.isSafeInteger(input.tabId) && input.tabId! > 0
+    && typeof input.leaseId === 'string' && /^[a-f0-9]{32}$/.test(input.leaseId)
+    && typeof input.method === 'string' && /^[A-Za-z]+\.[A-Za-z]+$/.test(input.method)
+    && Boolean(input.params && typeof input.params === 'object' && !Array.isArray(input.params))
+    && (input.sessionId === undefined || (typeof input.sessionId === 'string' && input.sessionId.length <= 200));
+}
 
 export type EmbeddedBrowserTabMention = {
   browserId: string;
@@ -82,8 +112,14 @@ export function isEmbeddedBrowserRequest(value: unknown): value is EmbeddedBrows
     && typeof input.requestId === 'string' && /^[a-zA-Z0-9:-]{1,100}$/.test(input.requestId)
     && EMBEDDED_BROWSER_COMMANDS.includes(input.command as EmbeddedBrowserCommand)
     && (input.tabId === undefined || (Number.isSafeInteger(input.tabId) && input.tabId! > 0))
-    && (input.command !== 'closeTab' || input.tabId !== undefined)
-    && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args));
+    && ((input.command !== 'closeTab' && input.command !== 'endSitePermissions') || input.tabId !== undefined)
+    && (!input.command?.startsWith('playwright') || input.tabId !== undefined)
+    && Boolean(input.args && typeof input.args === 'object' && !Array.isArray(input.args))
+    && (input.command !== 'externalBrowserState'
+      || (input.tabId === undefined && Object.keys(input.args!).length === 0))
+    && (input.command !== 'recoverExternalBrowser'
+      || (input.tabId === undefined && Object.keys(input.args!).length === 1
+        && (input.args!.browser === 'chrome' || input.args!.browser === 'edge')));
 }
 
 export function isEmbeddedBrowserResult(value: unknown): value is EmbeddedBrowserResult {

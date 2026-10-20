@@ -9,8 +9,31 @@ import YAML from "yaml";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const extension = path.join(root, "extensions", "memmy-browser");
 
+function observerCommandResult(method: string, params: Record<string, unknown>, target: Record<string, unknown>) {
+  if (method === 'Page.getFrameTree') return { frameTree: { frame: {
+    id: target.sessionId ? 'child-frame' : 'main-frame',
+  } } };
+  if (method === 'Page.createIsolatedWorld') return { executionContextId: target.sessionId ? 22 : 11 };
+  if (method === 'Runtime.evaluate' && params.contextId !== undefined
+    && String(params.expression).includes('__memmyInputObserverReady')) return { result: { value: true } };
+  return {};
+}
+
+// These unit fixtures call run() directly, after a successful debugger attachment.
+// Attachment and observer readiness failures are exercised through the real lifecycle elsewhere.
+function markObserverReady(context: vm.Context) {
+  vm.runInContext(`{
+    const claim = claims.get(7);
+    claim.attached = true;
+    claim.inputObserverToken ||= 'fixture-observer-token';
+    claim.inputObservers = new Map(['', ...(claim.cdpSessions?.keys() || [])]
+      .map(sessionId => [sessionId, {...newInputObserver(), ready: true}]));
+  }`, context);
+}
+
 function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean; attach?: (tabId: number) => Promise<void>;
-  command?: (method: string) => Promise<unknown>; targets?: Array<{ tabId: number; attached: boolean }> } = {}) {
+  command?: (method: string, params: Record<string, unknown>, target: Record<string, unknown>) => Promise<unknown>;
+  targets?: Array<{ tabId: number; attached: boolean }> } = {}) {
   const tabs = new Map<number, Record<string, unknown>>([
     [7, { id: 7, title: "百度", url: "https://www.baidu.com/", active: true, windowId: 1 }],
   ]);
@@ -22,7 +45,7 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
   const saved: Record<string, unknown> = {};
   let detached: (source: { tabId: number }, reason: string) => void = () => undefined;
   let message: (value: any, sender: any, respond: (result: any) => void) => unknown = () => undefined;
-  let debuggerEvent: (source: { tabId: number }, method: string, data: Record<string, unknown>) => void = () => undefined;
+  let debuggerEvent: (source: { tabId: number; sessionId?: string }, method: string, data: Record<string, unknown>) => void = () => undefined;
   let tabCreated: (tab: Record<string, unknown>) => void = () => undefined;
   const chrome: any = {
     runtime: { id: "extension-id", onMessage: { addListener(listener: typeof message) { message = listener; } } },
@@ -42,7 +65,10 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
     action: { setBadgeText: async () => undefined },
     debugger: { attach: async ({ tabId }: { tabId: number }) => { attaches.push(tabId); await options.attach?.(tabId); },
       detach: async ({ tabId }: { tabId: number }) => { detaches.push(tabId); },
-      sendCommand: async (_target: unknown, method: string) => options.command ? options.command(method) : ({}),
+      sendCommand: async (target: Record<string, unknown>, method: string, params: Record<string, unknown>) => {
+        const result = await options.command?.(method, params, target);
+        return result && Object.keys(result).length ? result : observerCommandResult(method, params, target);
+      },
       onDetach: { addListener(listener: typeof detached) { detached = listener; } },
       onEvent: { addListener(listener: typeof debuggerEvent) { debuggerEvent = listener; } },
       ...(options.targets ? { getTargets: async () => options.targets } : {}) },
@@ -73,7 +99,8 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
   let commandCount = 0;
   return { context, tabs, sent, attaches, detaches, updates, created, saved,
     detach: (tabId: number, reason: string) => detached({ tabId }, reason),
-    debuggerEvent: (tabId: number, method: string, data: Record<string, unknown>) => debuggerEvent({ tabId }, method, data),
+    debuggerEvent: (tabId: number, method: string, data: Record<string, unknown>, sessionId?: string) =>
+      debuggerEvent({ tabId, ...(sessionId ? { sessionId } : {}) }, method, data),
     createTab: (tab: Record<string, unknown>) => tabCreated(tab),
     message: (value: any) => new Promise<any>(resolve => message(value, { id: "extension-id" }, resolve)),
     command: async (name: string, args: Record<string, unknown> = {}) => {
@@ -86,13 +113,19 @@ function discoveryHarness(options: { browser?: "chrome" | "edge"; boot?: boolean
 }
 
 function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown>>; storage?: Record<string, unknown>;
-  connectDelay?: number; onSave?: () => void;
+  connectDelay?: number; onSave?: () => void; alarmFailures?: number; reloadFailures?: number;
+  historyImportFailure?: boolean; browser?: "chrome" | "edge";
+  historyInitializeFailure?: boolean; storageReadFailure?: boolean; heartbeatSupported?: boolean;
   sendCommand?: (target: unknown, method: string) => Promise<unknown> } = {}) {
   let memmyRunning = false;
   let connectDelay = options.connectDelay ?? 0;
   let readyDelay = 0;
   let installedVersion = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8")).version;
   let onAlarm: (alarm: { name: string }) => void = () => undefined;
+  let onStartup = () => undefined, onInstalled = () => undefined;
+  const focusListeners: Array<() => void> = [];
+  let alarmFailures = options.alarmFailures ?? 0, reloadFailures = options.reloadFailures ?? 0;
+  let respondToPing = true;
   const alarms = options.alarms ?? new Map<string, Record<string, unknown>>();
   const saved = options.storage ?? {};
   const sent: Array<Record<string, unknown>> = [];
@@ -114,27 +147,38 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
       const message = JSON.parse(value); sent.push(message);
       if (message.type === "hello") {
         const acknowledge = () => {
-          if (this.readyState === 1) this.listeners.get("message")?.({ data: JSON.stringify({ type: "ready" }) });
+          if (this.readyState === 1) this.listeners.get("message")?.({ data: JSON.stringify({ type: "ready", heartbeat: options.heartbeatSupported !== false }) });
         };
         if (readyDelay) setTimeout(acknowledge, readyDelay);
         else queueMicrotask(acknowledge);
+      } else if (message.type === "ping" && respondToPing) {
+        queueMicrotask(() => this.listeners.get("message")?.({ data: JSON.stringify({ type: "pong" }) }));
       }
     }
-    close() { this.readyState = 3; this.listeners.get("close")?.(); }
+    close(code = 1000) { this.readyState = 3; this.listeners.get("close")?.({ code }); }
   }
   const events = { addListener() {} };
-  const reload = vi.fn();
-  const createAlarm = vi.fn(async (name: string, value: Record<string, unknown>) => { alarms.set(name, value); });
+  const reload = vi.fn(() => { if (reloadFailures-- > 0) throw new Error("Simulated reload failure"); });
+  const createAlarm = vi.fn(async (name: string, value: Record<string, unknown>) => {
+    if (alarmFailures-- > 0) throw new Error("Simulated alarm API failure");
+    alarms.set(name, value);
+  });
+  const save = vi.fn(async (value: Record<string, unknown>) => {
+    Object.assign(saved, value); options.onSave?.();
+  });
   const chrome = {
-    runtime: { id: "extension-id", onMessage: events, reload, getURL: (file: string) => `chrome-extension://id/${file}` },
-    storage: { local: { get: async () => saved, set: async (value: Record<string, unknown>) => {
-      Object.assign(saved, value); options.onSave?.();
-    } } },
+    runtime: { id: "extension-id", onMessage: events, reload, getURL: (file: string) => `chrome-extension://id/${file}`,
+      onStartup: { addListener(listener: typeof onStartup) { onStartup = listener; } },
+      onInstalled: { addListener(listener: typeof onInstalled) { onInstalled = listener; } } },
+    storage: { local: { get: async () => {
+      if (options.storageReadFailure) throw new Error("Simulated storage read failure");
+      return saved;
+    }, set: save } },
     alarms: { get: async (name: string) => alarms.get(name), create: createAlarm,
       onAlarm: { addListener(listener: typeof onAlarm) { onAlarm = listener; } } },
     tabs: { query: async () => [], onRemoved: events, onUpdated: events, onActivated: events,
       get: async () => ({ id: 7, active: false, windowId: 1, url: "https://example.test/page" }) },
-    windows: { onRemoved: events, get: async () => ({ focused: false }) },
+    windows: { onRemoved: events, onFocusChanged: { addListener(listener: () => void) { focusListeners.push(listener); } }, get: async () => ({ focused: false }) },
     debugger: { onDetach: events, onEvent: events, attach: async () => undefined, detach: async () => undefined,
       sendCommand: options.sendCommand ?? (async () => ({})) },
   };
@@ -143,11 +187,21 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
     expect(init.cache).toBe("no-store");
     return { json: async () => ({ version: installedVersion }) };
   };
-  const context = vm.createContext({ chrome, fetch, WebSocket: BridgeSocket, navigator: { userAgent: "Chrome/154" },
-    URL, setTimeout, clearTimeout, setInterval, clearInterval });
+  const context = vm.createContext({ chrome, fetch, WebSocket: BridgeSocket,
+    navigator: { userAgent: options.browser === "edge" ? "Edg/154" : "Chrome/154" },
+    URL, Date, setTimeout, clearTimeout, setInterval, clearInterval,
+    importScripts: (file: string) => {
+      if (options.historyImportFailure) throw new Error("Simulated History script failure");
+      vm.runInContext(fs.readFileSync(path.join(extension, file), "utf8"), context);
+      if (options.historyInitializeFailure) vm.runInContext("installMemmyBrowserHistoryBackground = () => { throw new Error('Simulated History init failure'); }", context);
+    } });
   vm.runInContext(fs.readFileSync(path.join(extension, "background.js"), "utf8"), context);
-  return { context, alarms, saved, reload, createAlarm, sockets, sent,
+  return { context, alarms, saved, save, reload, createAlarm, sockets, sent,
     fireAlarm: (name = "memmy-reconnect") => onAlarm({ name }),
+    fireStartup: () => onStartup(), fireInstalled: () => onInstalled(),
+    fireFocus: () => focusListeners.forEach(listener => listener()),
+    setAlarmFailures: (count: number) => { alarmFailures = count; },
+    setHeartbeat: (enabled: boolean) => { respondToPing = enabled; },
     setBridge: (running: boolean, connectionDelay = 0, handshakeDelay = 0) => {
       memmyRunning = running; connectDelay = connectionDelay; readyDelay = handshakeDelay;
     },
@@ -156,6 +210,147 @@ function reconnectHarness(options: { alarms?: Map<string, Record<string, unknown
 }
 
 describe("external browser connection recovery", () => {
+  it.each(["chrome", "edge"] as const)("wakes %s on profile startup and repairs a missing alarm", async browser => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ browser });
+      await vi.advanceTimersByTimeAsync(60_000);
+      test.alarms.clear();
+      test.setBridge(true);
+      test.fireStartup();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.get("memmy-reconnect")).toEqual({ periodInMinutes: 0.5 });
+      expect(test.sent).toContainEqual(expect.objectContaining({ type: "hello", browser }));
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("repairs an abnormal alarm on installation without resetting a healthy alarm", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ alarms: new Map([["memmy-reconnect", { periodInMinutes: 5 }]]) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.get("memmy-reconnect")).toEqual({ periodInMinutes: 0.5 });
+      test.createAlarm.mockClear();
+      test.fireInstalled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.createAlarm).not.toHaveBeenCalled();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("retries failed alarm setup within a bound and retries again on a later lifecycle event", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ alarmFailures: 100 });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(test.createAlarm.mock.calls.length).toBeGreaterThan(1);
+      expect(test.createAlarm.mock.calls.length).toBeLessThanOrEqual(4);
+      test.setAlarmFailures(0); test.setBridge(true); test.fireFocus();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+      test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each(["historyImportFailure", "historyInitializeFailure"] as const)("keeps execution recovery available after %s", async failure => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ [failure]: true });
+      test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+      expect(vm.runInContext("browserHistory", test.context)).toBeNull();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("accepts a bounded slow ready handshake and recovers a half-open socket", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness(); test.setBridge(true, 0, 1_200);
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.sockets).toHaveLength(1);
+      test.setHeartbeat(false); const original = test.sockets[0];
+      await vi.advanceTimersByTimeAsync(85_000);
+      expect(original.readyState).toBe(3);
+      test.setHeartbeat(true); await vi.advanceTimersByTimeAsync(6_000);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(JSON.stringify(test.saved.memmyConnectionDiagnostics)).toContain('"failure":"heartbeat_timeout"');
+      expect(JSON.stringify(test.saved.memmyConnectionDiagnostics)).toContain('"closeCode":4000');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("probes a healthy connection after sleep before deciding to reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness(); test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      const original = test.sockets[0];
+      vi.setSystemTime(Date.now() + 120_000); test.fireAlarm();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(test.sockets).toHaveLength(1);
+      expect(original.readyState).toBe(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("keeps older gateways that do not advertise heartbeat support connected", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ heartbeatSupported: false }); test.setBridge(true); test.setHeartbeat(false);
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(test.sockets).toHaveLength(1);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("persists bounded metadata diagnostics in batches and discards stored content fields", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ storage: { memmyConnectionDiagnostics: { version: 1, events: [
+        { stage: "failed", at: 1, extensionVersion: "1.0.11", url: "https://private.test", title: "secret", error: "personal path", failure: "socket_error" },
+        { stage: "secret page text", at: 2, extensionVersion: "1.0.11" },
+      ] } } });
+      test.setBridge(true); await vi.advanceTimersByTimeAsync(0);
+      for (let index = 0; index < 40; index++) test.fireStartup();
+      await vi.advanceTimersByTimeAsync(10_000);
+      const diagnostics = test.saved.memmyConnectionDiagnostics as { version: number; events: Array<Record<string, unknown>> };
+      expect(diagnostics.version).toBe(1);
+      expect(diagnostics.events.length).toBeLessThanOrEqual(24);
+      for (const event of diagnostics.events) {
+        expect(Object.keys(event).every(key => ["stage", "at", "extensionVersion", "port", "failure", "closeCode"].includes(key))).toBe(true);
+      }
+      expect(JSON.stringify(diagnostics)).not.toMatch(/private|secret|personal/);
+      const writes = test.save.mock.calls.length;
+      for (let index = 0; index < 40; index++) test.fireStartup();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(test.save.mock.calls.length).toBe(writes);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(test.save.mock.calls.length).toBe(writes + 1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("does not make connection recovery depend on diagnostic storage availability", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ storageReadFailure: true }); test.setBridge(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(vm.runInContext("sessionLive", test.context)).toBe(true);
+      expect(test.alarms.has("memmy-reconnect")).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("leaves an automatic reload retryable after runtime.reload throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = reconnectHarness({ reloadFailures: 1 }); await vi.advanceTimersByTimeAsync(0);
+      test.setInstalledVersion("99.0.0"); test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(test.reload).toHaveBeenCalledOnce();
+      expect(test.saved.reloadedForVersion).not.toBe("99.0.0");
+      test.fireAlarm(); await vi.advanceTimersByTimeAsync(0);
+      expect(test.reload).toHaveBeenCalledTimes(2);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
   it("bounds failed quick retries and accepts a browser-delayed connection when Memmy returns", async () => {
     vi.useFakeTimers();
     try {
@@ -224,8 +419,8 @@ describe("external browser connection recovery", () => {
     vi.useFakeTimers();
     try {
       const test = reconnectHarness({ connectDelay: 3_000 });
-      test.setBridge(true, 3_000, 1_000);
-      await vi.advanceTimersByTimeAsync(3_800);
+      test.setBridge(true, 3_000, 6_000);
+      await vi.advanceTimersByTimeAsync(8_000);
       expect(test.sockets).toHaveLength(2);
       expect(vm.runInContext("sessionLive", test.context)).toBe(false);
       const abandoned = test.sockets[0];
@@ -300,6 +495,7 @@ describe("external browser connection recovery", () => {
       test.setBridge(true);
       await vi.advanceTimersByTimeAsync(0);
       vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set(), protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0})", test.context);
+      markObserverReady(test.context);
       (test.context as Record<string, unknown>).testCommand = command;
       const operation = vm.runInContext("handleCommand({ tabId: 7, id: 'timed-out-command', command: testCommand, args: {approvedOrigin: 'https://example.test', method: 'Runtime.evaluate', params: {expression: 'document.title'}, timeoutMs: 10} })", test.context) as Promise<unknown>;
       await started;
@@ -354,7 +550,7 @@ describe("external browser page discovery", () => {
     try {
       const test = discoveryHarness({ browser, boot: true });
       await vi.advanceTimersByTimeAsync(0);
-      expect(test.sent).toContainEqual({ type: "hello", browser, capabilities: ["openTab"] });
+      expect(test.sent).toContainEqual({ type: "hello", browser, extensionVersion: "1.0.12", capabilities: ["openTab", "playwright", "browserHistory"] });
       expect(test.attaches).toEqual([]);
       expect(test.sent).toContainEqual(expect.objectContaining({ type: "claim", browser, tabId: 7 }));
       expect((await test.message({ action: "status" })).controllableTabCount).toBe(1);
@@ -381,9 +577,9 @@ describe("external browser page discovery", () => {
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
       expect(test.attaches).toEqual([7]);
-      await vi.advanceTimersByTimeAsync(14_000);
+      await vi.advanceTimersByTimeAsync(44_000);
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
-      await vi.advanceTimersByTimeAsync(14_000);
+      await vi.advanceTimersByTimeAsync(44_000);
       expect(test.detaches).toEqual([]);
       await vi.advanceTimersByTimeAsync(1_000);
       expect(test.detaches).toEqual([7]);
@@ -391,6 +587,50 @@ describe("external browser page discovery", () => {
       expect(await test.command("snapshot")).toMatchObject({ ok: true });
       expect(test.attaches).toEqual([7, 7]);
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it("installs the input observer in the current page and child frames", async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown>; target: Record<string, unknown> }> = [];
+    let unsupportedRunImmediately = true;
+    const test = discoveryHarness({ command: async (method, params, target) => {
+      calls.push({ method, params, target });
+      if (method === 'Page.addScriptToEvaluateOnNewDocument' && target.sessionId === undefined
+        && params.runImmediately === true && unsupportedRunImmediately) {
+        unsupportedRunImmediately = false;
+        throw Error('Unknown parameter runImmediately');
+      }
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: {
+        id: target.sessionId ? 'child-frame' : 'main-frame',
+      } } };
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: target.sessionId ? 22 : 11 };
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [] };
+      return observerCommandResult(method, params, target);
+    } });
+    await vm.runInContext('discoverOpenTabs()', test.context);
+    expect(await test.command('snapshot')).toMatchObject({ ok: true });
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Runtime.addBinding',
+      params: expect.objectContaining({ executionContextName: 'memmy-user-input' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Page.addScriptToEvaluateOnNewDocument',
+      params: expect.objectContaining({ worldName: 'memmy-user-input' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Page.createIsolatedWorld',
+      params: expect.objectContaining({ frameId: 'main-frame' }) }));
+    expect(calls).toContainEqual(expect.objectContaining({ method: 'Runtime.evaluate',
+      params: expect.objectContaining({ contextId: 11,
+        expression: expect.stringContaining('pointerdown') }) }));
+    test.debuggerEvent(7, 'Target.attachedToTarget', {
+      sessionId: 'child-session', targetInfo: { type: 'iframe', targetId: 'child-target',
+        url: 'https://www.baidu.com/frame' },
+    });
+    await vi.waitFor(() => expect(calls).toContainEqual(expect.objectContaining({
+      method: 'Runtime.evaluate', target: { tabId: 7, sessionId: 'child-session' },
+      params: expect.objectContaining({ contextId: 22 }),
+    })));
+    const token = vm.runInContext('claims.get(7).inputObserverToken', test.context);
+    test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
+    test.debuggerEvent(7, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: JSON.stringify([token, 'keydown', Date.now()]),
+    }, 'child-session');
+    expect(vm.runInContext('claims.get(7).lastUserInputAt', test.context)).toBe(0);
   });
 
   it("reports an attachment failure on that command and attaches again for the next one", async () => {
@@ -465,8 +705,8 @@ describe("external browser page discovery", () => {
   it("tells an in-flight command that the user stopped the page", async () => {
     vi.useFakeTimers();
     try {
-      const test = discoveryHarness({ command: async method => {
-        if (method !== "Accessibility.getFullAXTree") return {};
+      const test = discoveryHarness({ command: async (method, params, target) => {
+        if (method !== "Accessibility.getFullAXTree") return observerCommandResult(method, params, target);
         test.detach(7, "canceled_by_user");
         throw Error("Detached while handling command.");
       } });
@@ -656,7 +896,8 @@ describe("Chrome and Edge extension packaging", () => {
         from: "extensions/memmy-browser", to: "browser-extension", filter: ["**/*"],
       });
     }
-    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "auth.html", "auth.js"]) {
+    for (const file of ["manifest.json", "background.js", "popup.html", "popup.js", "auth.html", "auth.js",
+      "browser-history-background.js", "history-content.js", "history-sensor.js"]) {
       expect(fs.existsSync(path.join(extension, file))).toBe(true);
     }
   });
@@ -664,36 +905,138 @@ describe("Chrome and Edge extension packaging", () => {
   it("uses a deterministic browser ID and limits extension privileges", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(extension, "manifest.json"), "utf8"));
     expect(manifest.manifest_version).toBe(3);
+    expect(manifest.version).toBe("1.0.12");
     const id = [...createHash("sha256").update(Buffer.from(manifest.key, "base64"))
       .digest().subarray(0, 16)].flatMap(value => [value >> 4, value & 15])
       .map(value => String.fromCharCode(97 + value)).join("");
     expect(id).toBe("mhodbgbbgalbhehapffidmdegokpoaom");
     expect(fs.readFileSync(path.join(extension, "background.js"), "utf8"))
       .toContain(`const EXTENSION_VERSION = "${manifest.version}";`);
-    expect(manifest.host_permissions).toEqual(["http://127.0.0.1/*"]);
+    expect(manifest.host_permissions).toEqual(["http://127.0.0.1/*", "http://*/*", "https://*/*"]);
     expect(manifest.permissions).toContain("alarms");
+    expect(manifest.permissions).toContain("scripting");
     expect(manifest.permissions).not.toContain("history");
     expect(manifest.permissions).not.toContain("cookies");
   });
 
-  it("pauses writes while the user is focused on the claimed tab", async () => {
-    const sendCommand = async () => ({ nodes: [] });
+  it("allows a focused idle tab, but pauses writes after physical page input", async () => {
+    let onEvent: ((source: { tabId: number }, method: string, data: unknown) => void) | undefined;
+    let delayedAgentInput: string | undefined;
+    const sendCommand = async (_target: unknown, method: string, params: Record<string, unknown>) => {
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') {
+        const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+        delayedAgentInput = JSON.stringify([token, 'pointerdown', Number(params.timestamp) * 1000]);
+        // Deliver this notification after the command reply, as slow VMs can.
+
+      }
+      return { nodes: [] };
+    };
     const chrome = {
       runtime: { onMessage: { addListener() {} } },
-      debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} }, sendCommand },
+      debugger: { onDetach: { addListener() {} }, onEvent: { addListener(callback: typeof onEvent) { onEvent = callback; } }, sendCommand },
       tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
         get: async () => ({ id: 7, active: true, windowId: 1, url: "https://example.test/" }) },
       windows: { get: async () => ({ focused: true }) },
     };
-    const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: "Chrome" }, URL });
+    const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: "Chrome" }, URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, "background.js"), "utf8"), context);
-    vm.runInContext("claims.set(7, { allowedOrigins: new Set(['https://example.test']) })", context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test')); claims.get(7).attached = true", context);
+    markObserverReady(context);
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .resolves.toMatchObject({ x: 10, y: 10 });
+    // A delayed CDP-generated trusted DOM event is excluded from physical takeover.
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: delayedAgentInput,
+    });
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+    const physical = JSON.stringify([token, 'keydown', Date.now()]);
+    onEvent?.({ tabId: 8 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
+    expect(vm.runInContext("claims.get(7).lastUserInputAt", context)).toBe(0);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
     await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
       .rejects.toThrow("USER_ACTIVE_ON_TARGET_TAB");
     await expect(vm.runInContext("run(7, 'cdpWrite', {approvedOrigin: 'https://example.test', method: 'Runtime.evaluate', params: {expression: 'document.title = \"changed\"'}}, 'write-1')", context))
       .rejects.toThrow("USER_ACTIVE_ON_TARGET_TAB");
     await expect(vm.runInContext("run(7, 'snapshot', {})", context))
       .resolves.toMatchObject({ nodes: [] });
+    vm.runInContext("claims.get(7).lastUserInputAt = Date.now() - USER_ACTIVE_WINDOW_MS - 1", context);
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .resolves.toMatchObject({ x: 10, y: 10 });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+      name: '__memmyUserInput', payload: JSON.stringify([token, 'pointerdown', Date.now()]),
+    });
+    await expect(vm.runInContext("run(7, 'click', {x: 10, y: 10})", context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    const lastPhysicalInput = vm.runInContext('claims.get(7).lastUserInputAt', context);
+    vm.runInContext('markDebuggerDetached(claims.get(7)); claims.get(7).attached = true', context);
+    markObserverReady(context);
+    onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', { name: '__memmyUserInput', payload: physical });
+    expect(vm.runInContext('claims.get(7).lastUserInputAt', context)).toBe(lastPhysicalInput);
+    await expect(vm.runInContext('assertUserIsNotUsingTab(7)', context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+  });
+
+  it("stops slow typing when the user starts typing between characters", async () => {
+    let onEvent: ((source: { tabId: number }, method: string, data: unknown) => void) | undefined;
+    const inserted: string[] = [];
+    const chrome = {
+      runtime: { onMessage: { addListener() {} } },
+      debugger: { onDetach: { addListener() {} },
+        onEvent: { addListener(callback: typeof onEvent) { onEvent = callback; } },
+        sendCommand: async (_target: unknown, method: string, params: Record<string, unknown>) => {
+          if (method === 'DOM.resolveNode') return { object: { objectId: 'input-1' } };
+          if (method === 'Input.insertText') {
+            inserted.push(String(params.text));
+            if (inserted.length === 1) {
+              const token = vm.runInContext('claims.get(7).inputObserverToken', context);
+              onEvent?.({ tabId: 7 }, 'Runtime.bindingCalled', {
+                name: '__memmyUserInput', payload: JSON.stringify([token, 'keydown', Date.now()]),
+              });
+            }
+          }
+          return {};
+        } },
+      tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
+        get: async () => ({ id: 7, active: false, windowId: 1, url: 'https://example.test/' }) },
+      windows: { get: async () => ({ focused: false }) },
+    };
+    const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: 'Chrome' }, URL, setTimeout, clearTimeout });
+    vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test')); claims.get(7).attached = true", context);
+    markObserverReady(context);
+    await expect(vm.runInContext("run(7, 'type', {x: 10, y: 10, target: 'ax-1', text: 'AB', slowly: true})", context))
+      .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    expect(inserted).toEqual(['A']);
+  });
+
+  it("observes trusted page input without collecting text or treating modifiers as takeover", () => {
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const reported: string[] = [];
+    const wallNow = Date.now();
+    const timeOrigin = wallNow - 10_000; // The page predates a VM clock correction.
+    const context = vm.createContext({
+      addEventListener: (type: string, listener: (event: Record<string, unknown>) => void) => listeners.set(type, listener),
+      __memmyUserInput: (payload: string) => reported.push(payload),
+      Date: { now: () => wallNow }, performance: { timeOrigin, now: () => 105 },
+    });
+    const extensionContext = vm.createContext({ chrome: {
+      runtime: { onMessage: { addListener() {} } },
+      debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} } },
+      tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} } },
+    }, WebSocket: class {}, navigator: { userAgent: 'Chrome' }, URL });
+    vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), extensionContext);
+    vm.runInContext(vm.runInContext('inputObserverSource("claim-1")', extensionContext), context);
+    listeners.get('keydown')?.({ type: 'keydown', key: 'Shift', isTrusted: true, timeStamp: 101 });
+    listeners.get('keydown')?.({ type: 'keydown', key: 'A', isTrusted: false, timeStamp: 102 });
+    listeners.get('pointerdown')?.({ type: 'pointerdown', isTrusted: true, timeStamp: 103 });
+    listeners.get('wheel')?.({ type: 'wheel', isTrusted: true, timeStamp: 104 });
+    expect(reported.map(JSON.parse)).toEqual([
+      ['claim-1', 'pointerdown', wallNow - 2],
+      ['claim-1', 'wheel', wallNow - 1],
+    ]);
   });
 
   it("captures viewport and element screenshots at CSS or device resolution", async () => {
@@ -745,7 +1088,8 @@ describe("Chrome and Edge extension packaging", () => {
     const context = vm.createContext({ chrome, WebSocket: class {}, navigator: { userAgent: 'Chrome' },
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
-    vm.runInContext("claims.set(7, { allowedOrigins: new Set(['https://example.test']) })", context);
+    vm.runInContext("claims.set(7, newClaim(7, 'https://example.test'))", context);
+    markObserverReady(context);
     const args = { target: 'ax-3', paths: ['/tmp/approved.txt'], approvedOrigin: 'https://example.test' };
     (context as Record<string, unknown>).args = args;
     await expect(vm.runInContext('run(7, "upload", args, "operation-1")', context)).resolves.toEqual({ uploaded: 1 });
@@ -795,6 +1139,7 @@ describe("Chrome and Edge extension packaging", () => {
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
     vm.runInContext("claims.set(7, { origin: 'https://example.test', allowedOrigins: new Set(['https://example.test', 'https://other.test']), cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpSessions: new Map(), cdpWaiters: new Set() })", context);
+    markObserverReady(context);
     const call = { approvedOrigin: 'https://example.test', method: 'Runtime.evaluate',
       params: { expression: 'document.title' } };
     (context as Record<string, unknown>).args = call;
@@ -837,6 +1182,7 @@ describe("Chrome and Edge extension packaging", () => {
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), console: [], requests: [], cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set()})", context);
+    markObserverReady(context);
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
       method: 'Runtime.evaluate', params: { expression: 'document.title = "changed"' } };
     await expect(vm.runInContext("run(7, 'cdpWrite', args, 'write-2')", context)).resolves.toEqual({});
@@ -868,12 +1214,13 @@ describe("Chrome and Edge extension packaging", () => {
     const chrome = {
       runtime: { onMessage: { addListener() {} } },
       debugger: { onDetach: { addListener() {} }, onEvent: { addListener(listener: typeof onEvent) { onEvent = listener; } },
-        sendCommand: async (target: { tabId: number; sessionId?: string }, method: string) => {
+        sendCommand: async (target: { tabId: number; sessionId?: string }, method: string, params: Record<string, unknown>) => {
           sent.push({ target, method });
-          if (method === 'Target.getTargetInfo') return { targetInfo: {
-            type: 'iframe', targetId: 'child-1', url: childUrl,
-          } };
-          return {};
+          if (method === 'Target.getTargetInfo') {
+            expect(target).toEqual({ tabId: 7, sessionId: 'session-1' }); expect(params).toEqual({});
+            return { targetInfo: { type: 'iframe', targetId: 'child-1', url: childUrl } };
+          }
+          return observerCommandResult(method, params, target);
         } },
       tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
         get: async () => ({ id: 7, active: false, windowId: 1, url: 'https://example.test/page' }) },
@@ -883,28 +1230,48 @@ describe("Chrome and Edge extension packaging", () => {
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), console: [], requests: [], cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set()})", context);
+    markObserverReady(context);
     onEvent({ tabId: 7 }, 'Target.attachedToTarget', { sessionId: 'session-1',
       targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://example.test/frame' } });
+    // This fixture exercises child identity after input-observer attachment.
+    await vi.waitFor(() => expect(vm.runInContext(
+      "claims.get(7).inputObservers.get('session-1').ready", context)).toBe(true));
+    let approvedTarget = await vm.runInContext("run(7, 'cdpTarget', {approvedOrigin: 'https://example.test', target: {targetId: 'child-1'}}, 'probe-1')", context);
+    expect(approvedTarget).toMatchObject({ sessionId: 'session-1', targetId: 'child-1',
+      url: childUrl, origin: 'https://example.test', revision: 0 });
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
       method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 1, y: 2 },
-      target: { targetId: 'child-1' } };
+      target: { targetId: 'child-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpWrite', args, 'child-1')", context)).resolves.toEqual({});
     expect(sent.find(item => item.method === 'Input.dispatchMouseEvent')?.target)
       .toEqual({ tabId: 7, sessionId: 'session-1' });
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      afterSequence: 0, target: { sessionId: 'session-1' }, timeoutMs: 100 };
+      afterSequence: 0, target: { sessionId: 'session-1' }, timeoutMs: 100, approvedTarget };
     const pending = vm.runInContext("run(7, 'cdpEvents', args, 'events-1')", context) as Promise<unknown>;
     onEvent({ tabId: 7, sessionId: 'session-1' }, 'Runtime.consoleAPICalled', { type: 'log' });
     await expect(pending).resolves.toMatchObject({ events: [{ source: {
       tabId: 7, sessionId: 'session-1', targetId: 'child-1',
     } }] });
+    childUrl = 'https://silent-navigation.test/frame';
+    (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
+    await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-silent-race')", context))
+      .rejects.toThrow(/changed after approval/);
+    expect(sent.some(item => item.method === 'Page.getLayoutMetrics')).toBe(false);
+    childUrl = 'https://example.test/frame';
     onEvent({ tabId: 7 }, 'Target.targetInfoChanged', {
       targetInfo: { type: 'iframe', targetId: 'child-1', url: 'https://other.test/frame' },
     });
     childUrl = 'https://other.test/frame';
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' } };
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-2')", context))
+      .rejects.toThrow(/changed after approval/);
+    expect(sent.some(item => item.method === 'Page.getLayoutMetrics')).toBe(false);
+    approvedTarget = await vm.runInContext("run(7, 'cdpTarget', {approvedOrigin: 'https://example.test', target: {sessionId: 'session-1'}}, 'probe-2')", context);
+    (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
+      method: 'Page.getLayoutMetrics', params: {}, target: { sessionId: 'session-1' }, approvedTarget };
+    await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-2-approved')", context))
       .resolves.toEqual({});
     expect(sent.find(item => item.method === 'Page.getLayoutMetrics')?.target)
       .toEqual({ tabId: 7, sessionId: 'session-1' });
@@ -912,10 +1279,9 @@ describe("Chrome and Edge extension packaging", () => {
     await expect(vm.runInContext("run(7, 'cdpCall', args, 'child-3')", context))
       .rejects.toThrow(/not attached/);
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
-      afterSequence: 0, target: { targetId: 'child-1' } };
+      afterSequence: 0, target: { targetId: 'child-1' }, approvedTarget };
     await expect(vm.runInContext("run(7, 'cdpEvents', args, 'events-2')", context))
-      .resolves.toMatchObject({ events: [{ method: 'Runtime.consoleAPICalled',
-        source: { targetId: 'child-1' } }] });
+      .rejects.toThrow(/not attached/);
   });
 
   it('blocks raw CDP writes during protected autofill and vice versa', async () => {
@@ -932,6 +1298,7 @@ describe("Chrome and Edge extension packaging", () => {
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set(), protectedActivity: 1, cdpWriteDepth: 0})", context);
+    markObserverReady(context);
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
       method: 'Runtime.evaluate', params: { expression: 'document.title = "changed"' } };
     await expect(vm.runInContext("run(7, 'cdpWrite', args, 'write-1')", context))
@@ -963,6 +1330,7 @@ describe("Chrome and Edge extension packaging", () => {
       URL, setTimeout, clearTimeout });
     vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
     vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpOrigin: 'https://example.test', cdpEvents: [], cdpSequence: 1, cdpEpoch: 0, cdpSessions: new Map(), cdpWaiters: new Set(), protectedActivity: 0, cdpWriteDepth: 0})", context);
+    markObserverReady(context);
     (context as Record<string, unknown>).args = { approvedOrigin: 'https://example.test',
       method: 'Runtime.evaluate', params: { expression: 'document.title = "changed"' }, timeoutMs: 10 };
     const operation = vm.runInContext("run(7, 'cdpWrite', args, 'timeout-1')", context) as Promise<unknown>;
@@ -1009,6 +1377,7 @@ describe("Chrome and Edge extension packaging", () => {
     };
     const first = create();
     await vm.runInContext('discoverTab(7)', first);
+    markObserverReady(first);
     const waiting = vm.runInContext("run(7, 'cdpEvents', {approvedOrigin: 'https://example.test', afterSequence: 0, timeoutMs: 500}, 'events-waiting')", first) as Promise<unknown>;
     const waitingAssertion = expect(waiting).rejects.toThrow(/credential protection|autofill/);
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -1036,6 +1405,7 @@ describe("Chrome and Edge extension packaging", () => {
     expect(sent).not.toContain('Runtime.evaluate');
     const restarted = create();
     await vm.runInContext('discoverTab(7)', restarted);
+    markObserverReady(restarted);
     (restarted as Record<string, unknown>).args = (first as Record<string, unknown>).args;
     await expect(vm.runInContext("run(7, 'cdpCall', args, 'read-2')", restarted))
       .rejects.toThrow(/credential protection/);
@@ -1087,6 +1457,7 @@ it('keeps external browser auth values inside the extension and never returns th
     URL, setTimeout, clearTimeout, setInterval, clearInterval });
   vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
   vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpEvents: [], cdpWaiters: new Set(), cdpSessions: new Map(), console: [], requests: [], protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, documentEpoch: 0}); runningCommands.add('auth-1')", context);
+  markObserverReady(context);
   (context as Record<string, unknown>).authInput = { origin: 'https://example.test',
     fields: [{ id: 'password', label: 'Password', type: 'password', required: true,
       selector: 'input[type=password]' }] };
@@ -1110,8 +1481,10 @@ it('validates a connected cross-origin child before external auth, including aft
         if (method === 'Runtime.evaluate' && args.expression.includes('const found=doc?.querySelectorAll'))
           return { result: { objectId: 'frame-node' } };
         if (method === 'DOM.describeNode') return { node: { nodeName: 'IFRAME', frameId: 'frame-1' } };
-        if (method === 'Target.getTargetInfo') return { targetInfo: {
-          targetId: 'frame-1', url: 'https://identity.test/login' } };
+        if (method === 'Target.getTargetInfo') {
+          expect(target).toEqual({ tabId: 7, sessionId: 'child-1' }); expect(args).toEqual({});
+          return { targetInfo: { type: 'iframe', targetId: 'frame-1', url: 'https://identity.test/login' } };
+        }
         if (method === 'Runtime.evaluate' && args.expression.includes('timeOrigin:doc.defaultView.performance.timeOrigin'))
           return { result: { value: { url: 'https://identity.test/login', timeOrigin: 123 } } };
         if (method === 'Runtime.evaluate') return { result: { value:
@@ -1126,6 +1499,7 @@ it('validates a connected cross-origin child before external auth, including aft
     navigator: { userAgent: 'Chrome' }, URL, setTimeout, clearTimeout });
   vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
   vm.runInContext("claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpEvents: [], cdpWaiters: new Set(), cdpSessions: new Map([['child-1', {targetId: 'frame-1', url: 'https://identity.test/login', revision: 0}]]), console: [], requests: [], protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, documentEpoch: 0}); runningCommands.add('auth-1')", context);
+  markObserverReady(context);
   (context as Record<string, unknown>).authInput = { origin: 'https://example.test', frame: 'iframe#signin',
     fields: [{ id: 'password', label: 'Password', type: 'password', required: true,
       selector: 'input[type=password]' }] };
@@ -1144,4 +1518,362 @@ it('validates a connected cross-origin child before external auth, including aft
   expect(await vm.runInContext("run(7, 'authRequest', authInput, 'auth-3')", context))
     .toEqual({ status: 'page_changed' });
   expect(sent.some(item => item.expression?.includes('cancelled-secret'))).toBe(false);
+});
+
+it.each([true, false])('fills external required auth inputs (already known = %s) and preserves an unspecified optional value', async known => {
+  class Input {
+    isConnected = true; disabled = false; type = 'text';
+    constructor(private currentValue: string) {}
+    get value() { return this.currentValue; }
+    set value(value: string) { this.currentValue = value; }
+    getClientRects() { return [{}]; }
+    dispatchEvent() {}
+  }
+  const code = new Input('old code'), optional = new Input('keep this optional value');
+  const document = { URL: 'https://example.test/login', defaultView: {
+    HTMLInputElement: Input, Event: class { constructor(_name: string, _options: unknown) {} },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+  }, querySelectorAll: (selector: string) => selector === '#code' ? [code] : selector === '#optional' ? [optional] : [] };
+  const collect = vi.fn(async (metadata: { fields: Array<{ id: string }> }) => {
+    expect(metadata.fields.map(field => field.id)).toEqual(['code']);
+    return { values: { code: 'collected-code' } };
+  });
+  const chrome = {
+    runtime: { onMessage: { addListener() {} } },
+    storage: { session: { get: async () => ({}), set: async () => undefined } },
+    debugger: { onDetach: { addListener() {} }, onEvent: { addListener() {} },
+      sendCommand: async (_target: unknown, method: string, args: any) => method === 'Runtime.evaluate'
+        ? { result: { value: vm.runInNewContext(args.expression, { document }) } } : {} },
+    tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
+      get: async () => ({ id: 7, active: false, windowId: 1, url: document.URL }) },
+    windows: { get: async () => ({ focused: false }) },
+  };
+  const context = vm.createContext({ chrome, collect, WebSocket: class { static OPEN = 1; },
+    navigator: { userAgent: 'Chrome' }, URL, setTimeout, clearTimeout, setInterval, clearInterval });
+  vm.runInContext(fs.readFileSync(path.join(extension, 'background.js'), 'utf8'), context);
+  vm.runInContext("connect = async () => undefined; collectAuth = collect; claims.set(7, {origin: 'https://example.test', allowedOrigins: new Set(['https://example.test']), cdpEvents: [], cdpWaiters: new Set(), cdpSessions: new Map(), console: [], requests: [], protectedActivity: 0, cdpReadDepth: 0, cdpWriteDepth: 0, documentEpoch: 0}); runningCommands.add('auth-optional')", context);
+  markObserverReady(context);
+  (context as Record<string, unknown>).authInput = { origin: 'https://example.test', fields: [
+    { id: 'code', label: 'Code', type: 'text', required: true, selector: '#code' },
+    { id: 'optional', label: 'Optional value', type: 'text', required: false, selector: '#optional' },
+  ], provided_values: known ? { code: 'provided-code-246810' } : {} };
+  const result = await vm.runInContext("run(7, 'authRequest', authInput, 'auth-optional')", context);
+  expect(result).toEqual({ status: 'submitted' });
+  expect(collect).toHaveBeenCalledTimes(known ? 0 : 1);
+  expect(code.value).toBe(known ? 'provided-code-246810' : 'collected-code');
+  expect(optional.value).toBe('keep this optional value');
+  expect(JSON.stringify(result)).not.toContain(code.value);
+});
+
+
+it('rechecks the playwrightStart boundary after a delayed tab read and cancel', async () => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  const origin = 'https://example.test';
+  vm.runInContext(`assertUserIsNotUsingTab = async () => undefined;
+    claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map() });`, test.context);
+  let resolveTab!: (value: unknown) => void, reads = 0;
+  const tab = { id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 };
+  (test.context as any).chrome.tabs.get = async () => ++reads === 1 ? await new Promise(resolve => { resolveTab = resolve; }) : tab;
+  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32), input: true, fresh: false };
+  const pending = vm.runInContext("playwrightControl(7, 'playwrightStart', controlArgs, 'cancel-race')", test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/cancelled/);
+  await vi.waitFor(() => expect(reads).toBe(1));
+  vm.runInContext("cancelledCommands.add('cancel-race')", test.context);
+  resolveTab(tab);
+  await checked;
+  expect(methods).toEqual([]);
+});
+
+it.each(['cancel', 'navigate', 'site', 'expire', 'user-active'])('refuses executor CDP for a %s lease at dispatch without reading browser state', async change => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  const origin = 'https://example.test';
+  const tabReads = vi.fn(async () => ({ id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 }));
+  (test.context as any).chrome.tabs.get = tabReads;
+  vm.runInContext(`claims.set(7, { origin: '${origin}', documentEpoch: 0, cdpSessions: new Map(),
+      playwrightLease: {id: '${'a'.repeat(32)}', origin: '${origin}', input: true, expiresAt: Date.now()+45000, documentEpoch: 0} });`, test.context);
+  vm.runInContext(change === 'navigate' ? 'claims.get(7).documentEpoch++'
+    : change === 'site' ? "claims.get(7).origin = 'https://other.test'"
+      : change === 'expire' ? 'claims.get(7).playwrightLease.expiresAt = 0'
+        : change === 'user-active' ? 'claims.get(7).userActiveOnTab = true' : "cancelledCommands.add('cancel-race')", test.context);
+  (test.context as any).controlArgs = { approvedOrigin: origin, leaseId: 'a'.repeat(32),
+    method: 'Input.insertText', params: { text: 'never-sent' } };
+  await expect(vm.runInContext("playwrightControl(7, 'playwrightCdp', controlArgs, 'cancel-race')", test.context))
+    .rejects.toThrow(/cancelled|document changed|lease expired|USER_ACTIVE_ON_TARGET_TAB/);
+  expect(methods).toEqual([]);
+  expect(tabReads).not.toHaveBeenCalled();
+});
+
+it('delivers an executor reply before the events Chrome emits after it', async () => {
+  // Real browser API reads complete in a later task. A reply delayed by one
+  // would let the next CDP event overtake it, which Playwright cannot recover.
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const tab = { id: 7, incognito: false, url: origin + '/', active: false, windowId: 1 };
+  (test.context as any).chrome.tabs.get = () => new Promise(resolve => setTimeout(() => resolve(tab), 0));
+  (test.context as any).chrome.windows.get = () => new Promise(resolve => setTimeout(() => resolve({ focused: false }), 0));
+  let reply!: (value: unknown) => void;
+  (test.context as any).chrome.debugger.sendCommand = () => new Promise(resolve => { reply = resolve; });
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}')); claims.get(7).attached = true;
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false, documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  try {
+    (test.context as any).pendingCommand = { type: 'command', id: 'ordered-reply', tabId: 7, command: 'playwrightCdp',
+      args: { leaseId, approvedOrigin: origin, method: 'Page.getFrameTree', params: {} } };
+    const handled = vm.runInContext('handleCommand(pendingCommand)', test.context) as Promise<unknown>;
+    await vi.waitFor(() => expect(reply).toBeTypeOf('function'));
+    reply({ frameTree: { frame: { id: 'main', url: origin + '/' } } });
+    setTimeout(() => test.debuggerEvent(7, 'Runtime.executionContextCreated',
+      { context: { id: 1, origin, auxData: { frameId: 'main', isDefault: true } } }), 0);
+    await handled;
+    await vi.waitFor(() => expect(test.sent.some(message => message.type === 'playwright_event')).toBe(true));
+    const order = test.sent.filter(message => message.type === 'playwright_event' || message.id === 'ordered-reply')
+      .map(message => message.type);
+    expect(order).toEqual(['response', 'playwright_event']);
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+
+it.each(['cancel', 'replacement'])('does not install a late Start lease after user-activity wait and %s', async change => {
+  const methods: string[] = [];
+  const test = discoveryHarness({ command: async method => { methods.push(method); return {}; } });
+  let resume!: () => void, entered = false;
+  (test.context as any).userActivityWait = async () => { entered = true; await new Promise<void>(done => { resume = done; }); };
+  (test.context as any).chrome.tabs.get = async () => ({ id: 7, incognito: false, url: 'https://example.test/', active: false });
+  vm.runInContext(`assertUserIsNotUsingTab = userActivityWait;
+    claims.set(7, {origin: 'https://example.test', documentEpoch: 0, cdpSessions: new Map()});`, test.context);
+  const pending = vm.runInContext(`playwrightControl(7, 'playwrightStart', {
+    leaseId: '${'a'.repeat(32)}', approvedOrigin: 'https://example.test', input: true, fresh: false }, 'late-start')`, test.context) as Promise<unknown>;
+  const checked = expect(pending).rejects.toThrow(/cancelled|already busy/);
+  await vi.waitFor(() => expect(entered).toBe(true));
+  vm.runInContext(change === 'cancel' ? "cancelledCommands.add('late-start')"
+    : `claims.get(7).playwrightLease = {id:'${'b'.repeat(32)}', expiresAt: Date.now()+45000}`, test.context);
+  resume(); await checked;
+  expect(methods).toEqual([]);
+  expect(vm.runInContext('claims.get(7).playwrightLease?.id', test.context)).toBe(change === 'cancel' ? undefined : 'b'.repeat(32));
+});
+
+it.each(['target-id', 'target-type', 'url', 'revision', 'detached'])('rejects changed external child metadata (%s) on its own registered session', async change => {
+  const test = discoveryHarness();
+  try {
+    await vm.runInContext('discoverTab(7)', test.context);
+    const info = { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' };
+    test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'bound-child', targetInfo: info });
+    const sendCommand = vi.fn(async (target: { tabId: number; sessionId?: string }, method: string, params: any) => {
+      expect(target).toEqual({ tabId: 7, sessionId: 'bound-child' }); expect(method).toBe('Target.getTargetInfo'); expect(params).toEqual({});
+      if (change === 'revision') test.debuggerEvent(7, 'Target.targetInfoChanged', { targetInfo: info });
+      if (change === 'detached') test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'bound-child' });
+      return { targetInfo: { ...info, ...(change === 'target-id' ? { targetId: 'foreign-target' }
+        : change === 'target-type' ? { type: 'page' } : change === 'url' ? { url: 'chrome://settings/' } : {}) } };
+    });
+    (test.context as any).chrome.debugger.sendCommand = sendCommand;
+    await expect(vm.runInContext("resolveCdpTarget(7, claims.get(7), {sessionId:'bound-child'})", test.context)).rejects.toThrow();
+    expect(sendCommand).toHaveBeenCalledTimes(1);
+    sendCommand.mockClear();
+    await expect(vm.runInContext("resolveCdpTarget(7, claims.get(7), {sessionId:'unregistered-child'})", test.context)).rejects.toThrow(/not attached/);
+    expect(sendCommand).not.toHaveBeenCalled();
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it.each([['detach', 'before'], ['navigate', 'during'], ['detach', 'during']])('rejects a child command after the child %s %s dispatch', async (change, when) => {
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const methods: string[] = [];
+  let finish!: (value: unknown) => void;
+  (test.context as any).chrome.debugger.sendCommand = (target: any, method: string) => {
+    methods.push(method);
+    expect(target).toEqual({ tabId: 7, sessionId: 'child-session' });
+    return new Promise(resolve => { finish = resolve; });
+  };
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false,
+      documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+    targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } });
+  const change_ = () => change === 'navigate' ? test.debuggerEvent(7, 'Page.frameNavigated', {
+    frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/form' },
+  }, 'child-session') : test.debuggerEvent(7, 'Target.detachedFromTarget', { sessionId: 'child-session' });
+  try {
+    if (when === 'before') change_();
+    const pending = vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+      leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
+      method:'Runtime.evaluate', params:{expression:'1'} }, 'child-boundary')`, test.context) as Promise<unknown>;
+    const checked = expect(pending).rejects.toThrow(/frame changed/);
+    if (when === 'during') { expect(methods).toEqual(['Runtime.evaluate']); change_(); finish({ result: { value: 1 } }); }
+    await checked;
+    expect(methods).toEqual(when === 'before' ? [] : ['Runtime.evaluate']);
+  } finally { finish?.({}); await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it('sends a child command to a registered child that navigated before dispatch', async () => {
+  const test = discoveryHarness();
+  const origin = 'https://example.test', leaseId = 'a'.repeat(32);
+  const methods: string[] = [];
+  (test.context as any).chrome.debugger.sendCommand = async (_target: any, method: string) => { methods.push(method); return { result: { value: 1 } }; };
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    claims.get(7).playwrightLease = {id:'${leaseId}', origin:'${origin}', input:false,
+      documentEpoch:0, expiresAt:Date.now()+45000};`, test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+    targetInfo: { type: 'iframe', targetId: 'child-target', url: 'https://frame.test/form' } });
+  test.debuggerEvent(7, 'Page.frameNavigated', { frame: { id: 'child-target', parentId: 'main', url: 'https://frame.test/next' } }, 'child-session');
+  try {
+    await expect(vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+      leaseId:'${leaseId}', approvedOrigin:'${origin}', sessionId:'child-session',
+      method:'Runtime.evaluate', params:{expression:'1'} }, 'child-current')`, test.context)).resolves.toEqual({ result: { value: 1 } });
+    expect(methods).toEqual(['Runtime.evaluate']);
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it('keeps an idle focused executor running and stops its lease synchronously on real input', async () => {
+  const calls: string[] = [];
+  const test = discoveryHarness({ command: async method => { calls.push(method); return {}; } });
+  const origin = 'https://example.test';
+  const leaseId = 'a'.repeat(32);
+  (test.context as any).chrome.tabs.get = async () => ({ id: 7, incognito: false, url: origin + '/', active: true, windowId: 1 });
+  (test.context as any).chrome.windows.get = async () => ({ focused: true });
+  vm.runInContext(`claims.set(7, newClaim(7, '${origin}'));
+    Object.assign(claims.get(7), {attached:true, inputObserverToken:'lease-input',
+      playwrightLease: {id:'${leaseId}', origin:'${origin}', input:true, documentEpoch:0, expiresAt:Date.now()+45000}});`, test.context);
+  markObserverReady(test.context);
+  const write = () => vm.runInContext(`playwrightControl(7, 'playwrightCdp', {
+    leaseId:'${leaseId}', approvedOrigin:'${origin}', method:'Input.insertText', params:{text:'A'} }, 'input-check')`, test.context);
+  try {
+    vm.runInContext('refreshUserActivity()', test.context);
+    await expect(write()).resolves.toEqual({});
+    test.debuggerEvent(7, 'Runtime.bindingCalled', { name: '__memmyUserInput',
+      payload: JSON.stringify(['lease-input', 'keydown', Date.now()]) });
+    // No asynchronous focus query can allow another character through here.
+    expect(vm.runInContext('claims.get(7).userActiveOnTab', test.context)).toBe(true);
+    await expect(write()).rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    vm.runInContext('claims.get(7).lastUserInputAt = Date.now() - USER_ACTIVE_WINDOW_MS - 1; refreshUserActivity()', test.context);
+    await expect(write()).rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+    expect(calls).toEqual(['Input.insertText']);
+    expect(test.sent.filter(message => message.type === 'playwright_event')).toHaveLength(0);
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+it.each([
+  { label: 'main document reload', method: 'Page.frameNavigated', params: { frame: { id: 'main', url: 'https://example.test/form' } }, main: true },
+  { label: 'same-process iframe reload', method: 'Page.frameNavigated', params: { frame: { id: 'child', parentId: 'main', url: 'https://example.test/frame' } } },
+  { label: 'OOPIF reload', method: 'Page.frameNavigated', params: { frame: { id: 'child', parentId: 'main', url: 'https://example.test/frame' } }, sessionId: 'child-session' },
+  { label: 'iframe attachment', method: 'Page.frameAttached', params: { frameId: 'child', parentFrameId: 'main' } },
+  { label: 'iframe removal', method: 'Page.frameDetached', params: { frameId: 'child', reason: 'remove' } },
+])('reports idle $label in the next frame generation without streaming old events', async event => {
+  const origin = 'https://example.test';
+  const test = discoveryHarness({ command: async method => method === 'Target.getTargetInfo'
+    ? { targetInfo: { targetId: 'main', type: 'page', url: origin + '/form' } }
+    : method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'main', url: origin + '/form' } } } : {} });
+  test.tabs.get(7)!.url = origin + '/form';
+  try {
+    await vm.runInContext('discoverTab(7)', test.context);
+    test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'child-session',
+      targetInfo: { targetId: 'child', type: 'iframe', url: origin + '/frame' } });
+    const firstId = 'a'.repeat(32), secondId = 'b'.repeat(32);
+    const first = await test.command('playwrightStart', { leaseId: firstId, approvedOrigin: origin, input: false, fresh: false });
+    expect(first).toMatchObject({ ok: true, result: { frameEpoch: 0 } });
+    await test.command('playwrightEnd', { leaseId: firstId });
+    const streamed = test.sent.filter(message => message.type === 'playwright_event').length;
+    test.debuggerEvent(7, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+    expect(test.sent.filter(message => message.type === 'playwright_event')).toHaveLength(streamed);
+    const second = await test.command('playwrightStart', { leaseId: secondId, approvedOrigin: origin, input: false, fresh: false });
+    expect(second).toMatchObject({ ok: true, result: { frameEpoch: 1,
+      documentEpoch: 'main' in event && event.main ? 1 : 0, cdpEpoch: 0 } });
+    expect(second?.result.frameTree).toEqual(first?.result.frameTree);
+    expect(second?.result.childTargets).toEqual(first?.result.childTargets);
+    if (!('main' in event)) {
+      test.debuggerEvent(7, event.method, event.params, 'sessionId' in event ? event.sessionId : undefined);
+      expect(await test.command('playwrightCdp', { leaseId: secondId, approvedOrigin: origin,
+        method: 'Page.getLayoutMetrics', params: {} })).toMatchObject({ ok: true });
+    }
+  } finally { await vm.runInContext('unclaim(7, false)', test.context); }
+});
+
+
+it.each([0, 20])('does not reuse an Agent event exemption for a physical click %sms later', async delta => {
+  let timestamp = 0;
+  const test = discoveryHarness({ command: async (method, params) => {
+    if (method === 'Input.dispatchMouseEvent') timestamp = Number(params.timestamp) * 1000;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'one-shot'});`, test.context);
+  markObserverReady(test.context);
+  await vm.runInContext("command(7,'Input.dispatchMouseEvent',{type:'mousePressed',x:1,y:1})", test.context);
+  const input = (at: number) => test.debuggerEvent(7, 'Runtime.bindingCalled', {
+    name: '__memmyUserInput', payload: JSON.stringify(['one-shot', 'pointerdown', at]),
+  });
+  input(timestamp);
+  expect(vm.runInContext('claims.get(7).lastUserInputAt', test.context)).toBe(0);
+  input(timestamp + delta);
+  await expect(vm.runInContext('assertUserIsNotUsingTab(7)', test.context))
+    .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+});
+
+it('does not treat a nearby physical click as Agent input before its delayed notification', async () => {
+  let timestamp = 0;
+  const test = discoveryHarness({ command: async (method, params) => {
+    if (method === 'Input.dispatchMouseEvent') timestamp = Number(params.timestamp) * 1000;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'delayed'});`, test.context);
+  markObserverReady(test.context);
+  await vm.runInContext("command(7,'Input.dispatchMouseEvent',{type:'mousePressed',x:1,y:1})", test.context);
+  test.debuggerEvent(7, 'Runtime.bindingCalled', { name: '__memmyUserInput',
+    payload: JSON.stringify(['delayed', 'pointerdown', timestamp + 20]) });
+  await expect(vm.runInContext('assertUserIsNotUsingTab(7)', test.context))
+    .rejects.toThrow('USER_ACTIVE_ON_TARGET_TAB');
+});
+
+it('blocks writes while a cross-origin iframe observer is still installing', async () => {
+  let finishInstall: () => void = () => undefined;
+  const installed = new Promise<void>(resolve => { finishInstall = resolve; });
+  const commands: string[] = [];
+  const test = discoveryHarness({ command: async (method, _params, target) => {
+    commands.push(method);
+    if (target.sessionId === 'oop-child' && method === 'Page.addScriptToEvaluateOnNewDocument') await installed;
+    return {};
+  } });
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'child-install'});`, test.context);
+  markObserverReady(test.context);
+  test.debuggerEvent(7, 'Target.attachedToTarget', { sessionId: 'oop-child',
+    targetInfo: { type: 'iframe', targetId: 'cross-origin', url: 'https://other.test/frame' } });
+  const pendingClick = vm.runInContext("run(7,'click',{x:1,y:1})", test.context);
+  await vi.waitFor(() => expect(commands).toContain('Page.addScriptToEvaluateOnNewDocument'));
+  expect(commands).not.toContain('Input.dispatchMouseEvent');
+  finishInstall();
+  await expect(pendingClick).resolves.toEqual({ x: 1, y: 1 });
+});
+
+it.each(['pending', 'failed'])('blocks executor input while any iframe observer is %s', async state => {
+  const commands: string[] = [];
+  const test = discoveryHarness({ command: async method => { commands.push(method); return {}; } });
+  const leaseId = 'c'.repeat(32);
+  vm.runInContext(`claims.set(7,newClaim(7,'https://example.test'));
+    Object.assign(claims.get(7), {attached:true,inputObserverToken:'child-guard',
+      playwrightLease:{id:'${leaseId}',origin:'https://example.test',input:true,documentEpoch:0,expiresAt:Date.now()+45000}});
+    claims.get(7).inputObservers.set('',{...newInputObserver(),ready:true});
+    claims.get(7).cdpSessions.set('child',{targetId:'frame',url:'https://other.test/frame',revision:0});
+    claims.get(7).inputObservers.set('child',newInputObserver());`, test.context);
+  await expect(vm.runInContext(`playwrightControl(7,'playwrightCdp',{
+    leaseId:'${leaseId}',approvedOrigin:'https://example.test',method:'Input.insertText',params:{text:'A'}},'iframe-write')`, test.context))
+    .rejects.toThrow('INPUT_OBSERVER_UNAVAILABLE');
+  expect(commands).not.toContain('Input.insertText');
+});
+
+it.each(['Runtime.removeBinding', 'Runtime.disable', 'Page.removeScriptToEvaluateOnNewDocument',
+  'Input.synthesizeTapGesture', 'Input.synthesizeScrollGesture'])('rejects raw CDP that cannot preserve input observation: %s', method => {
+  const test = discoveryHarness();
+  (test.context as any).observerMethod = method;
+  expect(() => vm.runInContext("normalizeCdpWrite(observerMethod,{name:'__memmyUserInput'})", test.context))
+    .toThrow('CDP write method is unavailable');
+});
+
+it('prevents raw CDP from replacing runtime input observer bindings', () => {
+  const test = discoveryHarness();
+  expect(() => vm.runInContext("normalizeCdpWrite('Runtime.addBinding',{name:'__memmyUserInput'})", test.context))
+    .toThrow('CDP write method is unavailable');
+  expect(() => vm.runInContext("normalizeCdpWrite('Runtime.addBinding',{name:'otherBinding'})", test.context))
+    .toThrow('CDP write method is unavailable');
 });

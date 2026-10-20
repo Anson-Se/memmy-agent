@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import type { BrowserUseSiteRule } from '@memmy/local-api-contracts';
+import type { BrowserAllowAllState, BrowserUseSiteRule } from '@memmy/local-api-contracts';
 import { I18nProvider } from '../../i18n/i18n-provider.js';
 import { BrowserUseSitePolicies } from '../browser-use-site-policies.js';
 
@@ -12,13 +12,22 @@ let container: HTMLDivElement;
 let root: Root;
 let rules: BrowserUseSiteRule[];
 let access: Access[];
+let allowAll: BrowserAllowAllState;
+let permissionChanged: ((state: BrowserAllowAllState) => void) | undefined;
 let bridge: Record<string, ReturnType<typeof vi.fn>>;
 const siteRule = (pattern: string, fullCdp: BrowserUseSiteRule['fullCdp'] = 'block'): BrowserUseSiteRule => ({
   pattern, access: 'ask', downloads: 'ask', uploads: 'ask', fullCdp,
 });
 beforeEach(() => {
-  rules = []; access = [];
+  rules = []; access = []; allowAll = { enabled: false, inherited: false, effective: false }; permissionChanged = undefined;
   bridge = {
+    getBrowserAllowAll: vi.fn(async () => allowAll),
+    setBrowserAllowAll: vi.fn(async (enabled: boolean) => {
+      allowAll = { enabled, inherited: false, effective: enabled }; return allowAll;
+    }),
+    onBrowserAllowAllChanged: vi.fn((listener: (state: BrowserAllowAllState) => void) => {
+      permissionChanged = listener; return vi.fn();
+    }),
     getBrowserUseSitePolicies: vi.fn(async () => rules),
     getBrowserAccessRules: vi.fn(async () => access),
     upsertBrowserUseSitePolicy: vi.fn(async (rule: BrowserUseSiteRule) => {
@@ -59,7 +68,7 @@ it('adds an ordinary website address with safe defaults and keeps advanced contr
   await render();
   await addWebsite('example.com/account?view=profile');
   expect(bridge.upsertBrowserUseSitePolicy).toHaveBeenCalledWith(siteRule('https://example.com', 'ask'));
-  expect(container.querySelector('input')!.value).toBe('');
+  expect((container.querySelector('input[aria-label="Website address"]') as HTMLInputElement).value).toBe('');
   expect(container.textContent).toContain('Visit webpages');
   expect(container.textContent).toContain('Download files');
   expect(container.textContent).toContain('Upload files');
@@ -151,4 +160,69 @@ it('serializes permission writes and leaves saved values intact on failure', asy
   await choose('https://example.com Upload files', 'allow');
   expect((container.querySelector('[aria-label="https://example.com Upload files"]') as HTMLSelectElement).value).toBe('ask');
   expect(container.querySelector('[role="alert"]')).not.toBeNull();
+});
+
+function allWebsitesSwitch(): HTMLInputElement {
+  return container.querySelector('input[role="switch"][aria-label="Always allow all websites"]') as HTMLInputElement;
+}
+
+it('allows websites independently and restores saved site decisions when switched off', async () => {
+  rules = [{ ...siteRule('https://example.com'), access: 'block' }];
+  access = [{ origin: 'https://remembered.test', decision: 'deny' }];
+  await render();
+  await act(async () => allWebsitesSwitch().click());
+  expect(bridge.setBrowserAllowAll).toHaveBeenLastCalledWith(true);
+  expect(allWebsitesSwitch().checked).toBe(true);
+  expect(allWebsitesSwitch().disabled).toBe(false);
+  expect(container.textContent).toContain('Allow all temporarily overrides');
+  const savedDecision = container.querySelector('select[aria-label="https://example.com Visit webpages"]') as HTMLSelectElement;
+  expect(savedDecision.value).toBe('block');
+  expect([...container.querySelectorAll('select')].every(select => select.disabled)).toBe(true);
+  await choose('https://example.com Visit webpages', 'allow');
+  expect(bridge.upsertBrowserUseSitePolicy).not.toHaveBeenCalled();
+  expect(bridge.setBrowserAccessRule).not.toHaveBeenCalled();
+  await act(async () => allWebsitesSwitch().click());
+  expect(bridge.setBrowserAllowAll).toHaveBeenLastCalledWith(false);
+  expect(savedDecision.value).toBe('block');
+  expect(savedDecision.disabled).toBe(false);
+  expect(rules[0]?.access).toBe('block');
+  expect(access[0]?.decision).toBe('deny');
+});
+
+it.each([false, true])('preserves independent website consent = %s when inherited computer consent changes', async enabled => {
+  allowAll = { enabled, inherited: true, effective: true };
+  rules = [siteRule('https://example.com')];
+  await render();
+  expect(allWebsitesSwitch().checked).toBe(true);
+  expect(allWebsitesSwitch().disabled).toBe(true);
+  expect(container.querySelector('.memmy-browser-use-policies-inherited')?.textContent).toContain('Enabled through computer control.');
+  expect((container.querySelector('select') as HTMLSelectElement).disabled).toBe(true);
+  await act(async () => permissionChanged!({ enabled, inherited: false, effective: enabled }));
+  expect(allWebsitesSwitch().checked).toBe(enabled);
+  expect(allWebsitesSwitch().disabled).toBe(false);
+  expect((container.querySelector('select') as HTMLSelectElement).disabled).toBe(enabled);
+  expect(bridge.setBrowserAllowAll).not.toHaveBeenCalled();
+});
+
+it('keeps a permission event newer than a delayed initial read and refreshes on focus', async () => {
+  let finishInitialRead!: (state: BrowserAllowAllState) => void;
+  bridge.getBrowserAllowAll.mockReturnValueOnce(new Promise<BrowserAllowAllState>(resolve => { finishInitialRead = resolve; }));
+  await render();
+  expect(allWebsitesSwitch().disabled).toBe(true);
+  await act(async () => permissionChanged!({ enabled: true, inherited: false, effective: true }));
+  await act(async () => finishInitialRead({ enabled: false, inherited: false, effective: false }));
+  expect(allWebsitesSwitch().checked).toBe(true);
+  allowAll = { enabled: false, inherited: false, effective: false };
+  await act(async () => window.dispatchEvent(new Event('focus')));
+  expect(allWebsitesSwitch().checked).toBe(false);
+  expect(bridge.getBrowserAllowAll).toHaveBeenCalledTimes(2);
+});
+
+it('keeps the saved global permission when a change cannot be persisted', async () => {
+  bridge.setBrowserAllowAll.mockRejectedValueOnce(new Error('save unavailable'));
+  await render();
+  await act(async () => allWebsitesSwitch().click());
+  expect(allWebsitesSwitch().checked).toBe(false);
+  expect(allWebsitesSwitch().disabled).toBe(false);
+  expect(container.querySelector('[role="alert"]')?.textContent).toBe('Could not load or save website permissions. Try again later.');
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction } from "../../../../src/tools/computer-history/win/native-event-adapter.js";
+import { applyWindowsBrowserPrivacy, normalizeWindowsKeyboardAction, previousControlsAtPoint } from "../../../../src/tools/computer-history/win/native-event-adapter.js";
 import { evaluateObservation, type ObservationSettings } from "../../../../src/tools/computer-history/mac/observation-settings.js";
 import { buildBrowserAuthoritySnapshot } from "../../../../src/tools/computer-history/browser-privacy.js";
 import { filterHistoryAuthorityObservations } from "../../../../src/tools/computer-history/mac/computer-history-api.js";
@@ -9,38 +9,58 @@ const policy: ObservationSettings = { memory: { syncEnabled: true }, observation
     { scope: "url", urlDomain: "company.test", behavior: "do_not_observe" },
   ],
 } };
-function browser(url = "https://company.test/finance") {
+function browser(url = "https://company.test/finance", mode = "normal", complete = true) {
   return { kind: "sampling.changed", app: { name: "chrome", bundleIdentifier: "win32.chrome", pid: 41 },
-    window: { browser: true, windowId: "17", url: "https://allowed.test/", browserContext: {
-      url, mode: "normal", complete: true, windowId: "17", processId: 41,
-    } }, ax: { mode: "fullTree", text: "ControlType.Text||COMPANY_CONTENT|||" } };
+    window: { browser: true, windowId: "17", url: "https://stale.test/", browserContext: {
+      url, documentUrl: url, mode, complete, windowId: "17", processId: 41,
+    } }, ax: { mode: "fullTree", text: "ControlType.Text||COMPANY_CONTENT|||" } } as any;
 }
-describe("Windows recording boundary", () => {
-  it("uses this native window URL and rejects its explicit website exclusion", () => {
+describe("Windows native recording boundary", () => {
+  it("keeps earlier control context separate, bounded, and free of values or sensitive fields", () => {
+    const before = { observedAt: "2026-10-15T12:00:00Z", interpretation: "previously_observed_not_confirmed_target",
+      controls: [{ role: "AXButton", title: "Finish", value: "PRIVATE_VALUE", x: 12 },
+        { role: "AXSecureTextField", name: "PRIVATE_PASSWORD" }] };
+    expect(previousControlsAtPoint(before, "2026-10-15T12:00:01Z")).toEqual({
+      observedAt: "2026-10-15T12:00:00.000Z", interpretation: "previously_observed_not_confirmed_target",
+      controls: [{ role: "AXButton", title: "Finish" }],
+    });
+    expect(previousControlsAtPoint(before, "2026-10-15T11:59:59Z")).toBeNull();
+    expect(previousControlsAtPoint(before, "2026-10-15T12:00:06Z")).toBeNull();
+    expect(previousControlsAtPoint({ ...before, interpretation: "confirmed" }, "2026-10-15T12:00:01Z")).toBeNull();
+    expect(previousControlsAtPoint({ ...before, controls: Array(4).fill(before.controls[0]) }, "2026-10-15T12:00:01Z")).toBeNull();
+  });
+  it("uses this native window URL and honors an explicit website exclusion", () => {
     const event = browser();
     applyWindowsBrowserPrivacy(event, null);
     expect(event.window.url).toBe("https://company.test/finance");
     expect(evaluateObservation(policy, { bundleId: "win32.chrome", browser: true, url: event.window.url }).observe).toBe(false);
   });
-  it.each(["missing", "incomplete", "wrong-window", "wrong-process"])("cannot rescue %s native evidence with an old allowed URL", (kind) => {
-    const event: any = browser();
+  it.each(["private", "unknown", "normal"])("keeps an allowed %s browser window even with incomplete chrome evidence", (mode) => {
+    const event = browser("https://allowed.test/page", mode, false);
+    applyWindowsBrowserPrivacy(event, null);
+    expect(event.window.url).toBe("https://allowed.test/page");
+    expect(event.window).not.toHaveProperty("privateBrowsing");
+    expect(event.window).not.toHaveProperty("privateBrowsingUnknown");
+    expect(evaluateObservation(policy, { bundleId: "win32.chrome", browser: true, url: event.window.url }).observe).toBe(true);
+  });
+  it.each(["missing", "wrong-window", "wrong-process", "uncommitted"])("cannot rescue %s native address with a stale sidecar URL", (kind) => {
+    const event = browser("https://company.test/finance");
     if (kind === "missing") delete event.window.browserContext;
-    if (kind === "incomplete") event.window.browserContext.complete = false;
     if (kind === "wrong-window") event.window.browserContext.windowId = "18";
     if (kind === "wrong-process") event.window.browserContext.processId = 42;
-    applyWindowsBrowserPrivacy(event, { updatedAt: Date.now(), browsers: { chrome: { connected: true, activeUrl: "https://allowed.test/" } } });
-    expect(event.window.privateBrowsingUnknown).toBe(true);
+    if (kind === "uncommitted") event.window.browserContext.documentUrl = "https://other.test/";
+    applyWindowsBrowserPrivacy(event, { version: 2, updatedAt: Date.now(), browsers: { chrome: { connected: true, activeUrl: "https://allowed.test/" } } });
     expect(event.window.url).toBeUndefined();
-    expect(evaluateObservation(policy, { bundleId: "win32.chrome", privateBrowsingUnknown: event.window.privateBrowsingUnknown }).observe).toBe(false);
+    expect(evaluateObservation(policy, { bundleId: "win32.chrome", browser: true, url: null }).observe).toBe(false);
   });
-  it("recognizes a browser process even when the helper omitted its browser flag", () => {
-    const event: any = browser();
+  it("recognizes a browser process even when the helper omitted its browser flag and address", () => {
+    const event = browser();
     delete event.window.browser; delete event.window.browserContext;
     applyWindowsBrowserPrivacy(event, null);
-    expect(event.window.privateBrowsingUnknown).toBe(true);
+    expect(event.window.browser).toBe(true);
     expect(event.window.url).toBeUndefined();
   });
-  it("never writes an excluded URL or title to the authority sidecar", () => {
+  it("retains the authority sidecar and never stores excluded URL or title there", () => {
     const now = Date.now();
     const observations = filterHistoryAuthorityObservations(policy, [{
       connectionId: "profile-1", browser: "chrome", focused: true, tabId: 5, windowId: 8,
@@ -49,9 +69,38 @@ describe("Windows recording boundary", () => {
     const snapshot = buildBrowserAuthoritySnapshot(["chrome"], observations, now);
     expect(JSON.stringify(snapshot)).not.toMatch(/company\.test|PRIVATE_COMPANY_TITLE/);
     expect(snapshot.browsers.chrome?.focusedTab?.mode).toBe("unknown");
-    const event: any = browser("https://allowed.test/");
+    const event = browser("https://allowed.test/");
     applyWindowsBrowserPrivacy(event, snapshot, now);
-    expect(event.window.privateBrowsingUnknown).toBe(true);
+    expect(event.window.url).toBe("https://allowed.test/");
+  });
+  it("keeps a native private window even when extension focus reports private mode", () => {
+    const now = Date.now();
+    const snapshot = buildBrowserAuthoritySnapshot(["chrome"], [{
+      connectionId: "profile-1", browser: "chrome", focused: true, tabId: 5, windowId: 8,
+      title: "Private", url: "https://allowed.test/private", mode: "private", observedAt: now, receivedAt: now,
+    }], now);
+    const event = browser("https://allowed.test/private", "private");
+    applyWindowsBrowserPrivacy(event, snapshot, now);
+    expect(event.window.url).toBe("https://allowed.test/private");
+    expect(snapshot.browsers.chrome?.focusedTab?.url).toBe("");
+  });
+  it("withholds a contradictory extension URL without discarding the native window", () => {
+    const now = Date.now();
+    const snapshot = buildBrowserAuthoritySnapshot(["chrome"], [{
+      connectionId: "profile-1", browser: "chrome", focused: true, tabId: 5, windowId: 8,
+      title: "Other page", url: "https://other.test/page", mode: "normal", observedAt: now, receivedAt: now,
+    }], now);
+    const event = browser("https://allowed.test/page");
+    applyWindowsBrowserPrivacy(event, snapshot, now);
+    expect(event.window.browser).toBe(true);
+    expect(event.window.url).toBeUndefined();
+    expect(event.window).not.toHaveProperty("privateBrowsingUnknown");
+  });
+  it("removes credentials, query and fragment from a native page address", () => {
+    const event = browser("https://user:secret@example.com/path?token=secret#fragment", "unknown");
+    applyWindowsBrowserPrivacy(event, null);
+    expect(event.window.url).toBe("https://example.com/path");
+    expect(JSON.stringify(event.window.url)).not.toMatch(/secret|token/);
   });
 });
 describe("Windows action metadata", () => {

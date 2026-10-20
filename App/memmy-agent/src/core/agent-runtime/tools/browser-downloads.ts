@@ -89,13 +89,16 @@ export class BrowserDownloadStore {
   }
 
   async save(download: Pick<Download, 'suggestedFilename' | 'url' | 'saveAs'>,
-    pageUrl: string): Promise<BrowserDownloadEntry> {
+    pageUrl: string, destination?: string): Promise<BrowserDownloadEntry> {
     const generation = this.historyGeneration;
     const id = randomUUID();
     const name = safeFileName(download.suggestedFilename());
     if (!await this.approveDownload(pageUrl, name)) throw new Error('Browser download was not approved');
-    const askBeforeDownload = this.askBeforeDownload();
-    const selected = askBeforeDownload ? await this.requestSavePath(name, download.url()) : null;
+    if (destination !== undefined && (!path.isAbsolute(destination) || destination.includes('\0')
+      || destination.length > 4096 || !fs.statSync(path.dirname(destination)).isDirectory()
+      || fs.existsSync(destination))) throw new Error('Browser download destination must name a new file in an existing folder');
+    const askBeforeDownload = destination === undefined && this.askBeforeDownload();
+    const selected = destination ?? (askBeforeDownload ? await this.requestSavePath(name, download.url()) : null);
     if (askBeforeDownload && !selected) throw new Error('Browser download canceled');
     if (selected && (!path.isAbsolute(selected) || selected.length > 4096
       || !path.basename(selected) || path.basename(selected).length > 255))

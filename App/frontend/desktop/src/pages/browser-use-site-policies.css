@@ -2,6 +2,12 @@
 .memmy-browser-use-policies h2 { margin: 0 0 12px; font-size: 16px; }
 .memmy-browser-use-policies h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
 .memmy-browser-use-policies p { margin: 0; color: var(--color-text-secondary, #73777f); }
+.memmy-browser-use-policies-all { padding: 12px 0 16px; margin-bottom: 16px; border-bottom: 1px solid var(--color-border-stone, #ddd); }
+.memmy-browser-use-policies-all .memmy-browser-use-policies-permission { align-items: flex-start; }
+.memmy-browser-use-policies-all strong { font-weight: 600; }
+.memmy-browser-use-policies-all p { margin-top: 6px; }
+.memmy-browser-use-policies-all p.memmy-browser-use-policies-inherited { color: #c62828; }
+.memmy-browser-use-policies-all input { flex: none; width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--color-brand, #3f8178); }
 .memmy-browser-use-policies-group { margin-top: 20px; }
 .memmy-browser-use-policies-add { display: flex; gap: 8px; margin: 12px 0; }
 .memmy-browser-use-policies-add input { flex: 1; min-width: 0; height: 34px; padding: 0 10px; border: 1px solid var(--color-border-stone, #ddd); border-radius: 8px; background: transparent; color: inherit; font: inherit; }

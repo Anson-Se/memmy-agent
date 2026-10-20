@@ -218,6 +218,7 @@ type WebSocketChannelOptions = {
   standaloneTaskRoot?: string | null;
   runtimeModelName?: RuntimeModelNameResolver;
   runtimeToolNames?: RuntimeToolNamesResolver;
+  runtimeReady?: (() => boolean) | null;
   modelSelectionResolver?: ((input: ModelSelectionInput) => ResolvedModelSelection | null) | null;
   cancelActiveTasks?: (sessionKey: string) => Promise<number>;
   stopCurrentTurn?: (sessionKey: string, expectedTurnId: string | null) => Promise<number>;
@@ -757,6 +758,7 @@ export class WebSocketChannel extends BaseChannel {
   staticDistPath: string | null = null;
   runtimeModelName: RuntimeModelNameResolver = null;
   runtimeToolNames: RuntimeToolNamesResolver = null;
+  private readonly runtimeReady: (() => boolean) | null;
   private computerHistoryModelSignature: string | null = null;
   private computerHistoryModelTimer: ReturnType<typeof setInterval> | null = null;
   modelSelectionResolver: WebSocketChannelOptions["modelSelectionResolver"] = null;
@@ -810,6 +812,7 @@ export class WebSocketChannel extends BaseChannel {
     this.staticDistPath = staticDistPath ? path.resolve(String(staticDistPath)) : null;
     this.runtimeModelName = options.runtimeModelName ?? config?.runtimeModelName ?? null;
     this.runtimeToolNames = options.runtimeToolNames ?? config?.runtimeToolNames ?? null;
+    this.runtimeReady = options.runtimeReady ?? null;
     this.modelSelectionResolver = options.modelSelectionResolver
       ?? config?.modelSelectionResolver
       ?? null;
@@ -1468,6 +1471,13 @@ export class WebSocketChannel extends BaseChannel {
     return true;
   }
 
+  private isRuntimeReady(): boolean {
+    // Standalone channels without an AgentLoop keep their existing bootstrap behavior.
+    if (!this.runtimeReady) return true;
+    try { return this.runtimeReady() === true; }
+    catch { return false; }
+  }
+
   handleBootstrap(connection: any, request: any): HttpLikeResponse {
     const secret = this.config.tokenIssueSecret.trim() || this.config.token.trim();
     if (secret) {
@@ -1475,6 +1485,7 @@ export class WebSocketChannel extends BaseChannel {
     } else if (!isLocalhost(connection)) {
       return httpError(403, "bootstrap is localhost-only");
     }
+    if (!this.isRuntimeReady()) return httpError(503, "agent_runtime_initializing");
     this.purgeExpiredIssuedTokens();
     this.purgeExpiredApiTokens();
     if (this.issuedTokens.size >= MAX_ISSUED_TOKENS || this.apiTokens.size >= MAX_ISSUED_TOKENS) {
@@ -2028,6 +2039,7 @@ export class WebSocketChannel extends BaseChannel {
         [`${tab.connectionId}:${tab.tabId}`, tab.status]));
       const response = httpJsonResponse({
         connected: externalBrowserBridge.listConnected(),
+        connectionDiagnostics: externalBrowserBridge.connectionDiagnostics(),
         controllableTabCount: claims.filter(tab => {
           const status = statusesByTab.get(`${tab.connectionId}:${tab.tabId}`);
           return status === undefined || status === "ready";
@@ -3145,6 +3157,8 @@ export class WebSocketChannel extends BaseChannel {
   }
 
   authorizeWebsocketHandshake(connection: any, query: Query): HttpLikeResponse | null {
+    // Do not consume one-use tokens while the message loop is still starting or stopping.
+    if (!this.isRuntimeReady()) return connectionRespond(connection, 503, "agent_runtime_initializing");
     const supplied = queryFirst(query, "token");
     const staticToken = this.config.token.trim();
     if (staticToken) {

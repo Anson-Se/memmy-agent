@@ -679,6 +679,7 @@ describe("CLI command helpers", () => {
     const toolInitialization = new Promise<void>((resolve) => { finishToolInitialization = resolve; });
     const fakeLoop: any = {
       workspace,
+      isReady: false,
       model: "agent_chat",
       unifiedSession: false,
       fileMemoryEnabled: true,
@@ -691,9 +692,11 @@ describe("CLI command helpers", () => {
       }),
       run: vi.fn(async () => {
         await fakeLoop.initializeRuntimeTools();
+        fakeLoop.isReady = loopRunning;
         while (loopRunning) {
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
+        fakeLoop.isReady = false;
       }),
       dispatchMessage: vi.fn(async () => undefined),
       processMessage: vi.fn(async () => null),
@@ -714,6 +717,7 @@ describe("CLI command helpers", () => {
       },
       stop: vi.fn(() => {
         loopRunning = false;
+        fakeLoop.isReady = false;
       }),
       closeMcp: vi.fn(async () => undefined),
       sessions: null,
@@ -773,7 +777,9 @@ describe("CLI command helpers", () => {
     await vi.waitFor(() => expect((websocketChannel as WebSocketChannel).server).not.toBeNull());
     const websocketPort = (websocketChannel as WebSocketChannel).server.address().port;
     const bootstrap = await fetch(`http://127.0.0.1:${websocketPort}/webui/bootstrap`);
-    expect(bootstrap.status).toBe(200);
+    expect(bootstrap.status).toBe(503);
+    expect((websocketChannel as WebSocketChannel).issuedTokens.size).toBe(0);
+    expect((websocketChannel as WebSocketChannel).apiTokens.size).toBe(0);
     expect(fakeLoop.initializeRuntimeTools).toHaveBeenCalledTimes(1);
     const snapshot = (websocketChannel as WebSocketChannel).webuiSessionSnapshot();
     expect(snapshot.sessions).toEqual(
@@ -835,9 +841,14 @@ describe("CLI command helpers", () => {
 
     const migratedBytes = fs.readFileSync(legacySessionPath);
     const appliedBeforeRestart = JSON.parse(fs.readFileSync(migrationStatePath, "utf8")).applied;
+    loopRunning = true;
     const secondRuntime = await gateway({ config: configPath });
     expect(fs.readFileSync(legacySessionPath)).toEqual(migratedBytes);
     expect(JSON.parse(fs.readFileSync(migrationStatePath, "utf8")).applied).toEqual(appliedBeforeRestart);
+    const secondChannel = secondRuntime.manager.getChannel("websocket") as WebSocketChannel;
+    await vi.waitFor(() => expect(secondChannel.server).not.toBeNull());
+    const secondPort = secondChannel.server.address().port;
+    expect((await fetch(`http://127.0.0.1:${secondPort}/webui/bootstrap`)).status).toBe(200);
     await secondRuntime.stop();
     expect(fakeLoop.stop).toHaveBeenCalledTimes(2);
   });

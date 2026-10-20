@@ -76,8 +76,7 @@ describe("History observation display compatibility", () => {
     ordinary.properties.internal_info = { memory_layer: "L1", memory_kind: "trace" };
     repos.memories.insert(ordinary);
     expect(panelSourceDistribution(repos.memories.listStats())).toEqual([
-      { source: "computer_history", count: 1, percentage: 50 },
-      { source: "memmy", count: 1, percentage: 50 },
+      { source: "memmy", count: 2, percentage: 100 },
     ]);
     expect(panelSourceForMemory(history)).toBe("computer_history");
     expect(panelSourceForMemory(ordinary)).toBe("memmy");

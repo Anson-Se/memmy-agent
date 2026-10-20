@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComputerHistoryDemoService, clientSnapshot } from "../../../../src/tools/computer-history/mac/computer-history-api.js";
+import { ApplicationIconReader } from "../../../../src/tools/computer-history/mac/application-icon.js";
+import { WindowsApplicationIconReader } from "../../../../src/tools/computer-history/win/application-icon.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -14,6 +16,22 @@ afterEach(() => {
 });
 
 describe("ComputerHistoryDemoService", () => {
+  it("uses the Windows icon reader for Windows History application IDs", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(os, "release").mockReturnValue("10.0.26100");
+    const windowsIcon = vi.spyOn(WindowsApplicationIconReader.prototype, "iconFor")
+      .mockResolvedValue("data:image/png;base64,AAA");
+    const macIcon = vi.spyOn(ApplicationIconReader.prototype, "iconFor")
+      .mockResolvedValue(null);
+    const { service } = createService();
+
+    await expect(service.applicationIcon("win32.explorer"))
+      .resolves.toBe("data:image/png;base64,AAA");
+    expect(windowsIcon).toHaveBeenCalledWith("win32.explorer");
+    expect(macIcon).not.toHaveBeenCalled();
+    await service.shutdown();
+  });
+
   it("keeps saved History readable on macOS 13 while rejecting recording before permissions or native launch", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     vi.spyOn(os, "release").mockReturnValue("22.6.0");

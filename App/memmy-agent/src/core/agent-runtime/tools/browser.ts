@@ -1,9 +1,12 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
+import { publicBrowserAuthResult } from "../../../utils/browser-auth-privacy.js";
 import os from "node:os";
 import path from "node:path";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { BROWSER_EXTENSION_SETTINGS_LINK, BROWSER_PROFILE_CLEAR_RESULT, isBrowserProfileClearRequest,
-  isComputerUseSurfaceAction, type ComputerUseSurfaceAction } from '@memmy/local-api-contracts';
+  isComputerUseSurfaceAction, parseBrowserTaskSitePermission,
+  type ComputerUseSurfaceAction, type ExternalBrowserState, type ExternalBrowserRecovery } from '@memmy/local-api-contracts';
 import type { BrowserToolsConfig } from "../../../config/schema.js";
 import { Tool, type ToolExecutionContext } from "./base.js";
 import {
@@ -41,6 +44,9 @@ import { ExternalBrowserSessionRouter } from './external-browser-session-router.
 import { EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED } from './external-browser-tools.js';
 import { formatExternalBrowserTabReference, parseExternalBrowserTabReference } from './external-browser-tab-reference.js';
 import type { ExternalBrowserClaim } from './external-browser-bridge.js';
+
+type ManagedDownloadDestination = { filePath: string; state: 'pending' | 'started' | 'cancelled';
+  outcome: Promise<string | null>; settle: (error: string | null) => void };
 
 type TargetBrowser = 'memmy' | 'chrome' | 'edge';
 const targetBrowserParameter = { type: 'string', enum: ['memmy', 'chrome', 'edge'],
@@ -204,13 +210,17 @@ function narrowBrowserToolDefinition(tool: any): BrowserToolDefinition {
     delete definition.inputSchema.properties.tabDisposition;
   }
   if (definition.name === 'browser_snapshot' || definition.name === 'browser_find') {
-    definition.description += ' Memmy in-app tabs return page text and ax-N element references only; screenshots, image previews and snapshot boxes are unavailable. Use the returned reference for element actions; the client obtains current DOM layout when clicking.';
+    definition.description += ' Connected Memmy, Chrome and Edge pages return current semantic controls, visible text, state and element references in page order; indentation shows the dialog, form, table row, list or frame an element belongs to, and browser_find names that location. Use the exact returned reference for the next element action. Memmy in-app tabs have no screenshots, image previews or snapshot boxes.';
   }
   if (definition.name === 'browser_press_key') {
     definition.description += ' In a Chrome/Edge tab, keys reach only the page; browser shortcuts such as switching tabs or Back do nothing. Use browser_select_tab to show another tab.';
   }
+  if (['browser_click', 'browser_type', 'browser_select_option', 'browser_press_key'].includes(definition.name)) {
+    definition.inputSchema.properties.acceptDialog = { type: 'boolean',
+      description: 'Memmy, Chrome and Edge pages: accept an alert/confirm/prompt this action opens. Dialogs are otherwise dismissed and reported as dialogs in the result. Set it only after seeing that report and only when the task requires accepting.' };
+  }
   if (['browser_click', 'browser_type', 'browser_select_option'].includes(definition.name)) {
-    definition.description += ' For Memmy in-app tabs, prefer the exact ax-N or [ax-N] reference from the latest snapshot. Unique CSS selectors, text=substring and CSS selectors ending in :has-text("substring") are also supported. Multiple matches require a more precise target or an explicit >> nth=N suffix. A stale, hidden or covered target requires a fresh snapshot; do not infer the selected-tab state from a locator error.';
+    definition.description += ' For connected Memmy, Chrome and Edge pages, prefer the exact element reference from the latest snapshot. Unique CSS selectors, text=substring and CSS selectors ending in :has-text("substring") are supported. Multiple matches require a more precise target or an explicit >> nth=N suffix. Actions wait for the target to be usable and return a fresh observation for verifying the result. A stale, hidden or covered target requires a fresh snapshot; do not infer the selected-tab state from a locator error.';
   }
   if (definition.name === "browser_navigate") {
     const localPathDescription =
@@ -224,6 +234,10 @@ function narrowBrowserToolDefinition(tool: any): BrowserToolDefinition {
     }
     definition.inputSchema.properties.newTab = { type: 'boolean',
       description: 'Open the http(s) URL in a new tab and keep the current page open, for example to compare several sites. It opens in targetBrowser, or in the browser this chat is using. A Chrome/Edge tab opens in the background beside that chat\'s last tab there, and the result returns its tabMention. The new tab becomes the current tab; return to another one with its tabMention.' };
+  }
+  if (['browser_click', 'browser_navigate', 'browser_press_key'].includes(definition.name)) {
+    definition.inputSchema.properties.downloadPath = { type: 'string',
+      description: 'Exact absolute destination already requested by the user for a download triggered by this action. In Memmy and managed Chromium it bypasses the save-location picker for this tab/action only; name a new file in an existing folder. Do not combine with newTab. In Chrome/Edge complete its normal Save As automatically through Computer Use using this path; this parameter does not change that browser globally. Verify the completed file before claiming success.' };
   }
   if (definition.name === 'browser_file_upload') {
     definition.description += ' For a Memmy in-app or connected Chrome/Edge tab, provide target as an exact file input reference or unique CSS selector.';
@@ -256,6 +270,7 @@ export class BrowserSessionManager {
   private readonly profileStore: BrowserProfileStore | null;
   private readonly downloadStore: BrowserDownloadStore | null;
   private readonly sitePermissionStore: BrowserSitePermissionStore | null;
+  private managedTaskPermissionStore: BrowserSitePermissionStore | null = null;
   private readonly accessApproval: BrowserAccessApproval | null;
   private readonly capabilityApproval: BrowserCapabilityApproval;
   private readonly externalRouter: ExternalBrowserSessionRouter | null;
@@ -268,12 +283,36 @@ export class BrowserSessionManager {
   private browser: Browser | null = null;
   private browserPromise: Promise<Browser> | null = null;
   private sessions = new Map<string, BrowserSession>();
+  private readonly downloadDestinations = new WeakMap<Page, ManagedDownloadDestination>();
   private creations = new Map<string, Promise<BrowserSession>>();
   private idleTimer: NodeJS.Timeout | null = null;
   private closing = false;
   private clearingData = false;
   private clearDataPromise: Promise<void> | null = null;
   private readonly embeddedTurns = new Map<string, symbol>();
+  private readonly browserDiscoveryControllers = new Map<string, Set<AbortController>>();
+
+  private invalidateEmbeddedTurn(key: string): void {
+    this.embeddedTurns.delete(key);
+    for (const controller of this.browserDiscoveryControllers.get(key) ?? []) controller.abort();
+    this.browserDiscoveryControllers.delete(key);
+  }
+
+  private beginBrowserDiscovery(scope: BrowserScope, signal?: AbortSignal | null) {
+    const key = browserScopeKey(scope);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const controllers = this.browserDiscoveryControllers.get(key) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.browserDiscoveryControllers.set(key, controllers);
+    return { signal: controller.signal, cleanup: () => {
+      signal?.removeEventListener('abort', abort);
+      controllers.delete(controller);
+      if (!controllers.size && this.browserDiscoveryControllers.get(key) === controllers) this.browserDiscoveryControllers.delete(key);
+    } };
+  }
 
   private captureEmbeddedTurn(scope: BrowserScope, signal?: AbortSignal | null): () => void {
     const key = browserScopeKey(scope);
@@ -301,25 +340,76 @@ export class BrowserSessionManager {
   supportsTabListing(): boolean {
     return this.config.enabled && this.desktopManaged && Boolean(this.embeddedBridge || this.externalRouter);
   }
-  async listBrowserTabs(scope: BrowserScope, targetBrowser?: TargetBrowser): Promise<string> {
+  async listBrowserTabs(scope: BrowserScope, targetBrowser?: TargetBrowser, signal?: AbortSignal | null,
+    allowRecovery = true): Promise<string> {
     this.validateTargetBrowser(targetBrowser);
     if (!this.supportsTabListing()) throw new Error('Desktop browser tabs are unavailable');
-    const assertTurn = this.captureEmbeddedTurn(scope);
-    const embedded = targetBrowser === 'chrome' || targetBrowser === 'edge' || !this.embeddedBridge
-      ? null : await this.embeddedBridge.listTabs();
-    assertTurn();
-    const external = targetBrowser === 'memmy' || !this.externalRouter
-      ? null : await this.externalRouter.listTabs(scope, targetBrowser);
-    assertTurn();
-    const tabs = [...(embedded?.tabs ?? []).map(tab => ({ ...tab, browser: 'memmy' })), ...(external?.tabs ?? [])];
-    const connectedBrowsers = external?.connectedBrowsers ?? [];
-    const wanted: Array<'chrome' | 'edge'> = targetBrowser === 'chrome' || targetBrowser === 'edge' ? [targetBrowser]
-      : targetBrowser === undefined && connectedBrowsers.length === 0 ? ['chrome', 'edge'] : [];
-    const notConnected = external ? wanted.filter(browser => !connectedBrowsers.includes(browser)) : [];
-    return JSON.stringify({ browserId: embedded?.browserId ?? null, selectedTabId: embedded?.selectedTabId ?? null,
-      tabs, count: tabs.length, connectedBrowsers, tabStatuses: external?.tabStatuses ?? [],
-      ...(notConnected.length ? { extensionSetup: { notConnected, settingsLink: BROWSER_EXTENSION_SETTINGS_LINK,
-        note: 'The Memmy extension is not connected in these browsers: it is not installed, or the browser is not running. It is optional. Offer settingsLink to the user once as a Markdown link, then continue without waiting: prefer the Memmy in-app browser, or use Computer Use on the user\'s browser.' } } : {}) });
+    const discovery = this.beginBrowserDiscovery(scope, signal);
+    const assertTurn = this.captureEmbeddedTurn(scope, discovery.signal);
+    try {
+      assertTurn();
+      const explicitExternal = targetBrowser === 'chrome' || targetBrowser === 'edge' ? targetBrowser : null;
+      const embedded = explicitExternal || !this.embeddedBridge ? null : await this.embeddedBridge.listTabs();
+      assertTurn();
+      let external = targetBrowser === 'memmy' || !this.externalRouter
+        ? null : await this.externalRouter.listTabs(scope, explicitExternal ?? undefined);
+      assertTurn();
+      let state: ExternalBrowserState | null = null;
+      let recovery: ExternalBrowserRecovery | 'not_attempted' = 'not_attempted';
+      let waitTimeoutMs = 0;
+      const canRecover = allowRecovery && !['system', 'cron'].includes(scope.channel);
+      if (explicitExternal && external && (!external.connectedBrowsers.includes(explicitExternal)
+        || external.pageDiscoveryStatus === 'unresponsive')) {
+        try { state = await this.embeddedBridge?.getExternalBrowserState(discovery.signal) ?? null; }
+        catch { /* Preserve unavailable metadata as unknown. */ }
+        assertTurn();
+        const installed = state?.installation[explicitExternal].installed ?? null;
+        const enabled = state?.installation[explicitExternal].enabled ?? null;
+        const running = state?.runningBrowsers === null || !state ? null : state.runningBrowsers.includes(explicitExternal);
+        if (canRecover && installed !== false && enabled !== false && running !== false) {
+          // Profile metadata can be denied even while the browser is running.
+          // The user's explicit interactive request authorizes a bounded wake;
+          // only a live extension handshake establishes successful recovery.
+          if (running === true && this.embeddedBridge) {
+            assertTurn();
+            try { recovery = await this.embeddedBridge.recoverExternalBrowser(explicitExternal, discovery.signal); }
+            catch { recovery = 'failed'; }
+            assertTurn();
+          }
+          waitTimeoutMs = running === true ? 45_000 : 2_000;
+          await this.externalRouter!.waitForConnection(explicitExternal, waitTimeoutMs, discovery.signal);
+          assertTurn();
+          external = await this.externalRouter!.listTabs(scope, explicitExternal);
+          assertTurn();
+        }
+      }
+      const tabs = [...(embedded?.tabs ?? []).map(tab => ({ ...tab, browser: 'memmy' })), ...(external?.tabs ?? [])];
+      const connectedBrowsers = external?.connectedBrowsers ?? [];
+      const wanted: Array<'chrome' | 'edge'> = explicitExternal ? [explicitExternal]
+        : targetBrowser === undefined && connectedBrowsers.length === 0 ? ['chrome', 'edge'] : [];
+      const statuses = explicitExternal ? [explicitExternal] : connectedBrowsers.length ? connectedBrowsers : wanted;
+      const connectionStatus = statuses.map(browser => {
+        const connected = connectedBrowsers.includes(browser);
+        const installed = connected ? true : state?.installation[browser].installed ?? null;
+        const enabled = connected ? true : state?.installation[browser].enabled ?? null;
+        const running = connected ? true : !state || state.runningBrowsers === null ? null : state.runningBrowsers.includes(browser);
+        const reason = external?.pageDiscoveryStatus === 'unresponsive' ? 'page_discovery_unresponsive'
+          : connected ? undefined : installed === false ? 'not_installed'
+          : enabled === false ? 'extension_disabled' : running === false ? 'browser_not_running'
+          : !canRecover ? 'recovery_not_allowed' : waitTimeoutMs === 45_000 ? 'connection_timeout' : 'state_unknown';
+        return { browser, installed, enabled, running, connected,
+          recovery: connected && waitTimeoutMs === 0 && external?.pageDiscoveryStatus !== 'unresponsive' ? 'not_needed' : recovery, waitTimeoutMs,
+          ...(reason ? { reason } : {}) };
+      });
+      const notConnected = external ? wanted.filter(browser => !connectedBrowsers.includes(browser)) : [];
+      return JSON.stringify({ browserId: embedded?.browserId ?? null, selectedTabId: embedded?.selectedTabId ?? null,
+        tabs, count: tabs.length, connectedBrowsers, connectionStatus, tabStatuses: external?.tabStatuses ?? [],
+        ...(external ? { pageDiscoveryStatus: external.pageDiscoveryStatus ?? 'ready' } : {}),
+        ...(notConnected.length ? { extensionSetup: { notConnected,
+          installRequired: connectionStatus.filter(status => status.installed === false).map(status => status.browser),
+          settingsLink: BROWSER_EXTENSION_SETTINGS_LINK,
+          note: 'Connection, installation, enabled state, and browser process state are separate facts. Suggest installation only for installRequired; null means unknown. If enabled is false, the existing extension needs enabling. An installed but disconnected extension may be starting or reconnecting. Preserve the requested browser, account, and page when continuing with another available interface.' } } : {}) });
+    } finally { discovery.cleanup(); }
   }
   supportsExternalTabSelection(): boolean {
     return this.config.enabled && this.desktopManaged && this.externalRouter !== null;
@@ -446,7 +536,7 @@ export class BrowserSessionManager {
     if (externalTarget && this.externalRouter) {
       const result = await this.externalRouter.requestAuth(scope, externalTarget, args, signal);
       assertEmbeddedTurn();
-      return result;
+      return publicBrowserAuthResult(JSON.parse(result));
     }
     if (this.embeddedBridge && this.embeddedRouter) {
       let claim;
@@ -468,14 +558,84 @@ export class BrowserSessionManager {
         if (!result || typeof result !== 'object' || typeof (result as { status?: unknown }).status !== 'string') {
           throw new Error('Invalid browser auth response');
         }
-        return JSON.stringify(result);
+        return publicBrowserAuthResult(result);
       }
     }
     if (tabMention !== undefined || !this.externalRouter || input.targetBrowser === 'memmy') return JSON.stringify({ status: 'unavailable' });
     const claim = this.externalRouter.select(scope,
       this.sessions.has(browserScopeKey(scope)) || this.creations.has(browserScopeKey(scope)));
     if (!claim) return JSON.stringify({ status: 'unavailable' });
-    return this.externalRouter.requestAuth(scope, claim, args, signal);
+    return publicBrowserAuthResult(JSON.parse(await this.externalRouter.requestAuth(scope, claim, args, signal)));
+  }
+
+  supportsSitePermissions(): boolean {
+    return this.supportsCdpTabs() || (this.config.enabled && ['ready', 'preparing'].includes(this.capability));
+  }
+
+  async setBrowserSitePermission(scope: BrowserScope, input: Record<string, unknown>,
+    signal?: AbortSignal | null): Promise<string> {
+    const request = parseBrowserTaskSitePermission(input);
+    if (!request || Object.keys(input).some(key => !['origin', 'permission', 'allow', 'targetBrowser', 'tabMention'].includes(key))) {
+      throw new Error('Invalid browser site permission');
+    }
+    const assertTurn = this.captureEmbeddedTurn(scope, signal);
+    const tabMention = input.tabMention;
+    if (tabMention !== undefined && typeof tabMention !== 'string') throw new Error('Invalid browser tab mention');
+    if ((input.targetBrowser === 'chrome' || input.targetBrowser === 'edge') && tabMention === undefined
+      && (!this.externalRouter?.hasBinding(scope) || this.externalRouter.currentBrowser(scope) !== input.targetBrowser)) {
+      throw new Error('Browser site permission requires a tab already bound to this task');
+    }
+    const external = await this.resolveExternalTarget(scope, input, assertTurn);
+    assertTurn();
+    if (external && this.externalRouter) {
+      const result = await this.externalRouter.setSitePermission(scope, external, request, signal);
+      assertTurn();
+      return result;
+    }
+    if (this.embeddedBridge && this.embeddedRouter) {
+      let claim: ExternalBrowserClaim | null;
+      if (typeof tabMention === 'string') {
+        claim = await this.embeddedBridge.resolveMention(tabMention);
+        assertTurn();
+        this.embeddedRouter.selectClaim(scope, claim);
+      } else {
+        await this.embeddedBridge.refresh();
+        assertTurn();
+        claim = this.embeddedRouter.select(scope, true);
+      }
+      if (claim) {
+        const result = await this.embeddedRouter.setSitePermission(scope, claim, request, signal);
+        assertTurn();
+        return result;
+      }
+    }
+    if (tabMention !== undefined) throw new Error('Mentioned browser tab is unavailable');
+    const session = this.sessions.get(browserScopeKey(scope));
+    if (!session || session.closed) throw new Error('Browser site permission requires a page already bound to this task');
+    return session.mutex.runExclusive(async () => {
+      const pages = session.context.pages().filter(page => !page.isClosed());
+      if (pages.length !== 1) throw new Error('Browser site permission requires one unambiguous task page');
+      const page = pages[0]!;
+      const current = () => {
+        assertTurn();
+        const currentPages = session.context.pages().filter(candidate => !candidate.isClosed());
+        if (session.closed || this.sessions.get(session.key) !== session || page.isClosed()
+          || new URL(page.url()).origin !== request.origin
+          || currentPages.length !== 1 || currentPages[0] !== page) {
+          throw new Error('Browser site permission origin or task changed');
+        }
+      };
+      current();
+      if (request.allow && this.accessApproval && !await this.accessApproval.authorize(page.url(), session.allowedOrigins)) {
+        throw new Error('Browser site permission page access was not approved');
+      }
+      current();
+      const permissions = this.sitePermissionStore
+        ?? (this.managedTaskPermissionStore ??= new BrowserSitePermissionStore());
+      await permissions.setForContext(session.context, request, current);
+      return JSON.stringify({ status: request.allow ? 'granted' : 'revoked', origin: request.origin,
+        permission: request.permission, allowed: request.allow, lasts: 'task' });
+    });
   }
   private readonly surfaceActionListener = (raw: unknown) => {
     if (isBrowserProfileClearRequest(raw)) {
@@ -943,7 +1103,17 @@ export class BrowserSessionManager {
           if (!this.browser) return;
           void setAgentBrowserPageVisible(this.browser, page, session.visible).catch(() => undefined);
           page.on('download', download => {
-            void this.downloadStore?.save(download, page.url()).catch(() => undefined);
+            const destination = this.downloadDestinations.get(page);
+            if (destination?.state === 'cancelled') {
+              this.downloadDestinations.delete(page);
+              void download.cancel().catch(() => undefined);
+              return;
+            }
+            const filePath = destination?.state === 'pending' ? destination.filePath : undefined;
+            if (destination?.state === 'pending') { destination.state = 'started'; destination.settle(null); }
+            const saved = filePath === undefined ? this.downloadStore?.save(download, page.url())
+              : this.downloadStore?.save(download, page.url(), filePath);
+            void saved?.catch(() => undefined);
           });
           page.on('framenavigated', frame => {
             if (frame === page.mainFrame()) void this.emitBrowserFrame(session);
@@ -1025,6 +1195,69 @@ export class BrowserSessionManager {
     if (listing.selectedTabId !== tabId) throw new Error('Selected in-app browser tab changed');
   }
 
+  private async withEmbeddedDownloadDestination<T>(scope: BrowserScope, claim: ExternalBrowserClaim,
+    filePath: string | undefined, action: () => Promise<T>, signal?: AbortSignal | null): Promise<T> {
+    if (!filePath) return action();
+    const destinationId = randomUUID();
+    await this.embeddedRouter!.setDownloadDestination(scope, claim, filePath, destinationId, signal);
+    try {
+      const result = await action();
+      await this.embeddedRouter!.waitDownloadDestination(scope, claim, destinationId, signal);
+      return result;
+    } finally {
+      await this.embeddedRouter!.setDownloadDestination(scope, claim, null, destinationId).catch(() => undefined);
+    }
+  }
+
+  private beginManagedDownload(page: Page, filePath: string): ManagedDownloadDestination {
+    if (!this.downloadStore) throw new Error('Managed browser downloads are unavailable');
+    const previous = this.downloadDestinations.get(page);
+    if (previous && previous.state !== 'started')
+      throw new Error('A previous download has not started or was cancelled. Use a fresh browser tab for another download.');
+    let settle!: ManagedDownloadDestination['settle'];
+    const outcome = new Promise<string | null>(resolve => { settle = resolve; });
+    const destination: ManagedDownloadDestination = { filePath, state: 'pending', outcome, settle };
+    this.downloadDestinations.set(page, destination);
+    return destination;
+  }
+
+  private async waitManagedDownload(page: Page, destination: ManagedDownloadDestination,
+    signal?: AbortSignal | null, timeoutMs = 30_000): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const cancel = (message: string) => {
+      if (destination.state !== 'pending') return;
+      destination.state = 'cancelled'; destination.settle(message);
+    };
+    const onAbort = () => cancel('Browser download action was cancelled');
+    if (signal?.aborted || page.isClosed()) cancel('Browser download action was cancelled or its page closed');
+    if (destination.state === 'pending') {
+      signal?.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(() => cancel('Browser download did not start within 30 seconds; the requested destination was not used'), timeoutMs);
+      poll = setInterval(() => { if (page.isClosed()) cancel('Browser download page closed before it started'); }, 50);
+    }
+    try {
+      const error = await destination.outcome;
+      if (error) throw new Error(error);
+      if (signal?.aborted) throw new Error('Browser download action was cancelled');
+    } finally {
+      if (timer) clearTimeout(timer); if (poll) clearInterval(poll);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  private releaseManagedDownload(page: Page, destination: ManagedDownloadDestination): void {
+    if (this.downloadDestinations.get(page) !== destination) return;
+    if (destination.state === 'started') this.downloadDestinations.delete(page);
+    else {
+      destination.state = 'cancelled'; destination.settle('Browser download action ended before its download started');
+    }
+  }
+
+  private withExternalDownloadInstruction(result: Array<Record<string, any>>, filePath?: string): Array<Record<string, any>> {
+    return filePath ? [...result, { type: 'text', text: `Requested download destination: ${filePath}. This action keeps the browser's normal download behavior. Complete any Save As dialog automatically with Computer Use using this exact path, or move only a reliably identified completed file. Do not ask the user to repeat the known destination. Verify the completed file before reporting success.` }] : result;
+  }
+
   async callTool(
     scope: BrowserScope,
     name: BrowserToolName,
@@ -1033,6 +1266,11 @@ export class BrowserSessionManager {
     localPreviewContext: BrowserLocalPreviewContext | null = null,
   ): Promise<string | Array<Record<string, any>>> {
     const assertEmbeddedTurn = this.captureEmbeddedTurn(scope, abortSignal);
+    const downloadPath = params.downloadPath;
+    if (downloadPath !== undefined && (!['browser_click', 'browser_navigate', 'browser_press_key'].includes(name)
+      || typeof downloadPath !== 'string' || downloadPath.length > 4096 || !path.isAbsolute(downloadPath)
+      || downloadPath.includes('\0') || !fs.statSync(path.dirname(downloadPath)).isDirectory()
+      || fs.existsSync(downloadPath))) throw new Error('downloadPath must name a new file in an existing absolute folder');
     const tabMention = params.tabMention;
     const disposition = params.tabDisposition;
     if (tabMention !== undefined && typeof tabMention !== 'string') throw new Error('Invalid browser tab mention');
@@ -1042,6 +1280,7 @@ export class BrowserSessionManager {
     if (params.newTab !== undefined && typeof params.newTab !== 'boolean') throw new Error('Invalid newTab');
     const openNewTab = name === 'browser_navigate' && params.newTab === true;
     if (openNewTab) {
+      if (downloadPath !== undefined) throw new Error('downloadPath requires an existing browser tab; open the tab before triggering its download');
       this.validateTargetBrowser(params.targetBrowser);
       if (tabMention !== undefined) throw new Error('newTab opens another tab; omit tabMention');
       const browser = params.targetBrowser
@@ -1060,6 +1299,7 @@ export class BrowserSessionManager {
     delete browserParams.tabDisposition;
     delete browserParams.targetBrowser;
     delete browserParams.newTab;
+    delete browserParams.downloadPath;
     const externalTarget = openNewTab ? null : await this.resolveExternalTarget(scope, params, assertEmbeddedTurn);
     assertEmbeddedTurn();
     if (externalTarget && this.externalRouter) {
@@ -1073,7 +1313,7 @@ export class BrowserSessionManager {
       }
       const result = await this.externalRouter.call(scope, externalTarget, name, browserParams, abortSignal);
       assertEmbeddedTurn();
-      return Array.isArray(result) ? convertMcpToolContent({ content: result }, 'structured') : result;
+      return Array.isArray(result) ? convertMcpToolContent({ content: this.withExternalDownloadInstruction(result, downloadPath) }, 'structured') : result;
     }
     if (tabMention !== undefined) {
       if (!this.config.enabled) throw new Error('Browser tools are disabled');
@@ -1085,7 +1325,8 @@ export class BrowserSessionManager {
         localPreviewContext?.workspace);
       assertEmbeddedTurn();
       const selected = this.embeddedRouter.selectClaim(scope, claim);
-      const result = await this.embeddedRouter.call(scope, selected, name, browserParams, abortSignal);
+      const result = await this.withEmbeddedDownloadDestination(scope, selected, downloadPath,
+        () => this.embeddedRouter!.call(scope, selected, name, browserParams, abortSignal), abortSignal);
       assertEmbeddedTurn();
       if (disposition) this.embeddedRouter.markTab(scope, disposition, selected);
       return result;
@@ -1103,7 +1344,8 @@ export class BrowserSessionManager {
           if (name === 'browser_file_upload') await this.verifyEmbeddedUpload(embedded.tabId, browserParams,
             localPreviewContext?.workspace);
           assertEmbeddedTurn();
-          const result = await this.embeddedRouter.call(scope, embedded, name, browserParams, abortSignal);
+          const result = await this.withEmbeddedDownloadDestination(scope, embedded, downloadPath,
+            () => this.embeddedRouter!.call(scope, embedded, name, browserParams, abortSignal), abortSignal);
           assertEmbeddedTurn();
           if (disposition) this.embeddedRouter.markTab(scope, disposition, embedded);
           return result;
@@ -1123,13 +1365,16 @@ export class BrowserSessionManager {
         if (disposition) throw new Error('tabDisposition requires an in-app browser tab');
         const result = await this.externalRouter.call(scope, external, name, browserParams, abortSignal);
         assertEmbeddedTurn();
-        return Array.isArray(result) ? convertMcpToolContent({ content: result }, 'structured') : result;
+        return Array.isArray(result) ? convertMcpToolContent({ content: this.withExternalDownloadInstruction(result, downloadPath) }, 'structured') : result;
       }
     }
+    // Only in-app and extension tabs take acceptDialog.
+    delete browserParams.acceptDialog;
     if (this.config.enabled && this.embeddedBridge && this.embeddedRouter
       && name === 'browser_navigate' && !abortSignal?.aborted
       && (openNewTab || (!this.embeddedRouter.hasBinding(scope)
         && !this.sessions.has(browserScopeKey(scope)) && !this.creations.has(browserScopeKey(scope))))) {
+      if (downloadPath !== undefined) throw new Error('downloadPath requires an existing in-app tab; open a regular page first');
       const targetUrl = String(params.url ?? '');
       let targetOrigin: string | null = null;
       try {
@@ -1152,10 +1397,13 @@ export class BrowserSessionManager {
         if (!opened) throw new Error('Memmy browser tab did not open');
         const selected = this.embeddedRouter.selectClaim(scope, opened,
           { allowedOrigins: approved, agentCreated: true });
-        const result = await this.embeddedRouter.call(scope, selected, name, browserParams);
+        // openTab already navigates the webview through its initial src. A
+        // second navigate can abort that load or reset a page that has begun
+        // rendering. Keep the live-site approval check without loading again.
+        await this.embeddedRouter.authorizeCurrent(scope, selected);
         assertEmbeddedTurn();
         if (disposition) this.embeddedRouter.markTab(scope, disposition, selected);
-        return result;
+        return [{ type: 'text', text: JSON.stringify({ url: selected.url }) }];
       }
     }
     if (openNewTab) throw new Error('newTab requires the Memmy in-app browser and an http(s) URL');
@@ -1170,6 +1418,7 @@ export class BrowserSessionManager {
       return await session.mutex.runExclusive(async () => {
         let candidatePreview: BrowserPreviewLease | null = null;
         let uploadTempDir: string | null = null;
+        let pendingDownload: { page: Page; destination: ManagedDownloadDestination } | null = null;
         try {
           if (session.closed) throw new Error("browser session closed");
           if (this.sitePermissionStore && typeof session.context.clearPermissions === 'function') {
@@ -1181,6 +1430,12 @@ export class BrowserSessionManager {
             throw error;
           }
           session.lastUsedAt = Date.now();
+          if (downloadPath !== undefined) {
+            const pages = session.context.pages().filter(page => !page.isClosed());
+            if (pages.length !== 1) throw new Error('Browser download destination requires one unambiguous page');
+            const page = pages[0]!;
+            pendingDownload = { page, destination: this.beginManagedDownload(page, downloadPath) };
+          }
           let approvedUploadPage: Page | null = null;
           let approvedUploadUrl: string | null = null;
           let approvedFiles: Array<{ path: string; realPath: string; dev: number; ino: number;
@@ -1258,7 +1513,7 @@ export class BrowserSessionManager {
               readonlyRoots: localPreviewContext.readonlyRoots,
               restrictLocalFiles: this.restrictLocalFiles,
             });
-            callParams = { ...params, url: candidatePreview.url };
+            callParams = { ...browserParams, url: candidatePreview.url };
             session.allowedOrigins.add(new URL(candidatePreview.url).origin);
           }
           const directScreenshot = this.desktopManaged
@@ -1293,9 +1548,10 @@ export class BrowserSessionManager {
           const result = this.desktopManaged && process.env.MEMMY_DESKTOP_MANAGED_GATEWAY === '1'
             && process.platform === 'darwin'
             && this.definitions.get(name)?.annotations?.readOnlyHint !== true
-            ? await withMacFocusGuard('com.google.chrome.for.testing', name, invoke,
-              undefined, { blockWhenTargetForeground: true })
+            ? await withMacFocusGuard('com.google.chrome.for.testing', name, invoke)
             : await invoke();
+          if (pendingDownload && result.isError !== true)
+            await this.waitManagedDownload(pendingDownload.page, pendingDownload.destination, abortSignal);
           session.lastUsedAt = Date.now();
           if (navigateTarget && result.isError !== true) {
             const previousPreview = session.preview;
@@ -1322,6 +1578,7 @@ export class BrowserSessionManager {
           }
           throw error;
         } finally {
+          if (pendingDownload) this.releaseManagedDownload(pendingDownload.page, pendingDownload.destination);
           if (uploadTempDir) fs.rmSync(uploadTempDir, { recursive: true, force: true });
         }
       });
@@ -1353,7 +1610,7 @@ export class BrowserSessionManager {
   }
 
   async closeSession(scope: BrowserScope): Promise<void> {
-    this.embeddedTurns.delete(browserScopeKey(scope));
+    this.invalidateEmbeddedTurn(browserScopeKey(scope));
     this.embeddedRouter?.closeSession(scope);
     this.externalRouter?.closeSession(scope);
     const key = browserScopeKey(scope);
@@ -1364,7 +1621,7 @@ export class BrowserSessionManager {
   async closeChat(channel: string, chatId: string): Promise<void> {
     for (const key of this.embeddedTurns.keys()) {
       const [, boundChannel, boundChatId] = JSON.parse(key);
-      if (boundChannel === channel && boundChatId === chatId) this.embeddedTurns.delete(key);
+      if (boundChannel === channel && boundChatId === chatId) this.invalidateEmbeddedTurn(key);
     }
     this.embeddedRouter?.closeChat(channel, chatId);
     this.externalRouter?.closeChat(channel, chatId);
@@ -1394,7 +1651,7 @@ export class BrowserSessionManager {
 
   private async clearBrowsingDataOnce(): Promise<void> {
     this.clearingData = true;
-    this.embeddedTurns.clear();
+    for (const key of this.embeddedTurns.keys()) this.invalidateEmbeddedTurn(key);
     try {
       await Promise.allSettled([...this.creations.values()]);
       const sessions = [...this.sessions.values()];
@@ -1417,7 +1674,7 @@ export class BrowserSessionManager {
       channel: 'projected-session', chatId: scope.sessionKey };
     const turnScopes = browserScopeKey(scope) === browserScopeKey(projectedScope)
       ? [scope] : [scope, projectedScope];
-    for (const item of turnScopes) this.embeddedTurns.delete(browserScopeKey(item));
+    for (const item of turnScopes) this.invalidateEmbeddedTurn(browserScopeKey(item));
     await Promise.allSettled(turnScopes.map(item => this.embeddedRouter?.finishTurn(item)));
     await Promise.allSettled(turnScopes.map(async item => this.externalRouter?.finishTurn(item)));
     const session = this.sessions.get(browserScopeKey(scope))
@@ -1458,7 +1715,7 @@ export class BrowserSessionManager {
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
-    this.embeddedTurns.clear();
+    for (const key of this.embeddedTurns.keys()) this.invalidateEmbeddedTurn(key);
     this.externalRouter?.closeAll();
     this.embeddedRouter?.closeAll();
     this.embeddedBridge?.close();
@@ -1622,14 +1879,14 @@ export class BrowserListTabsTool extends Tool {
 
   get name(): string { return 'browser_list_tabs'; }
   get description(): string {
-    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. Chrome/Edge discovery refreshes the installed extension and reports connected browsers, controllable tabs, and page connection failures separately; extensionSetup appears when the requested browser has no connected extension. Resolve the user-requested title or URL to its matching tabMention internally; never ask the user to copy it. A connected extension with no controllable tab is not a usable page. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
+    return 'Discover open Memmy, Chrome, and Edge web tabs. Set targetBrowser when the user names a browser. For an explicitly requested running Chrome/Edge, interactive discovery may bring that browser forward without navigation and waits up to 45 seconds for a live extension handshake, including when installation metadata cannot be read. Confirmed absent or disabled extensions and stopped browsers return immediately. Untargeted, Memmy, and non-interactive discovery never wake an external browser. When the running-process state is unknown, discovery allows only a short passive grace period. connectionStatus separates installed/enabled/running/connected facts; null means unknown. Only extensionSetup.installRequired confirms missing installation. Connected extensions with no controllable tabs remain connected; pageDiscoveryStatus unresponsive is a page-list reply failure, not proof of disconnection. Resolve the requested page to its tabMention internally; never ask the user to copy it. If several tabs match, ask which page. available is false only while another chat is still working in that tab. In-app about:blank has a null reference. Listing does not navigate or bind a chat to a tab.';
   }
   get parameters(): Record<string, any> { return { type: 'object', properties: { targetBrowser: targetBrowserParameter }, additionalProperties: false }; }
-  override get readOnly(): boolean { return true; }
+  override get readOnly(): boolean { return false; }
 
   setContext(context: RequestContext): void { this.requestContext.set(context); }
 
-  async execute(params: Record<string, any> = {}): Promise<string> {
+  async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string> {
     const request = this.requestContext.get();
     if (!request?.sessionKey?.trim() || !request.channel?.trim()
         || !request.chatId?.trim() || !request.workspace?.trim()) {
@@ -1637,7 +1894,8 @@ export class BrowserListTabsTool extends Tool {
     }
     return this.manager.listBrowserTabs(request.browserScope ?? {
       sessionKey: request.sessionKey, channel: request.channel, chatId: request.chatId,
-    }, params.targetBrowser);
+    }, params.targetBrowser, context?.abortSignal,
+      request.metadata.computerUseInteractive !== false && !['system', 'cron'].includes(request.channel));
   }
 }
 
@@ -1680,7 +1938,7 @@ export class BrowserSelectTabTool extends Tool {
   }
 }
 
-/** History is read only from the desktop's in-app webview store after a visible host approval. */
+/** History is read from the desktop's in-app store under its effective website approval. */
 export class BrowserHistoryTool extends Tool {
   static scopes = new Set(['core']);
   private readonly requestContext = new RequestContextStore();
@@ -1690,7 +1948,7 @@ export class BrowserHistoryTool extends Tool {
   static create(ctx: any): BrowserHistoryTool { return new BrowserHistoryTool(ctx.browserSessionManager); }
   get name(): string { return 'browser_history'; }
   get description(): string {
-    return 'Search only the Memmy in-app browser history when the current task needs it. Specify a keyword and an ISO 8601 time range of at most 30 days. Each call asks the user in a desktop approval dialog; use at most once per assistant turn. This does not read Chrome, Edge, or Computer History.';
+    return 'Search the Memmy in-app browser history using a keyword and an ISO 8601 time range of at most 30 days. Computer Use allow-all or website allow-all covers this request; otherwise the desktop asks for this history query. This reads the in-app browser store.';
   }
   get parameters(): Record<string, any> {
     return { type: 'object', properties: {
@@ -1731,7 +1989,7 @@ abstract class BrowserCdpReadTool extends Tool {
     if (!request?.sessionKey?.trim() || !request.channel?.trim() || !request.chatId?.trim()
       || !request.workspace?.trim() || request.metadata.computerUseInteractive === false
       || ['system', 'cron'].includes(request.channel)) {
-      throw new Error('Browser CDP operations require a current interactive desktop chat');
+      throw new Error('Browser operations require a current interactive desktop chat');
     }
     return request.browserScope ?? { sessionKey: request.sessionKey, channel: request.channel, chatId: request.chatId };
   }
@@ -1804,14 +2062,14 @@ export class BrowserAuthRequestTool extends BrowserCdpReadTool {
   static enabled(ctx: any): boolean { return ctx.browserSessionManager?.supportsCdpTabs() === true; }
   get name(): string { return 'browser_auth_request'; }
   get description(): string {
-    return 'Ask the user through a secure form for sign-in fields on the selected Memmy or connected Chrome/Edge tab. Pass only inspected, visible field metadata and exact CSS selectors. Passwords and codes never appear in tool results or chat. The browser client validates the form, fills it and optionally submits it; a submitted status does not prove sign-in. This tool collects sign-in credentials and is not for signup. Use ordinary page controls for non-secret visual verification (CAPTCHA). After submission, explicitly navigate to the retained site origin before inspecting the page.';
+    return 'Fill a visible secure web form on the selected Memmy or connected Chrome/Edge tab. Pass inspected field metadata, exact CSS selectors and any needed submit control. Use provided_values for values already supplied for this task or obtained through an authorized channel; the secure form collects missing values or a still unresolved option. Supplied values are redacted from tool history/progress and never returned. The client validates visible controls, fills them and optionally submits; submitted reports dispatch, so verify the task result afterward. After secret entry, explicitly navigate to the retained site origin before inspecting the new document.';
   }
   override get readOnly(): boolean { return false; }
   get parameters(): Record<string, any> { return { type: 'object', properties: {
     origin: { type: 'string', description: 'Canonical current HTTP(S) origin only, with no path or query.' },
-    frame: { type: 'string', description: 'Optional exact CSS selector for one iframe containing every requested sign-in control, including cross-origin frames.' },
+    frame: { type: 'string', description: 'Optional exact CSS selector for one iframe containing every requested secure form control, including cross-origin frames.' },
     frames: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string' },
-      description: 'Optional chain of exact iframe CSS selectors from the top document to the sign-in form; do not combine with frame.' },
+      description: 'Optional chain of exact iframe CSS selectors from the top document to the secure form; do not combine with frame.' },
     fields: { type: 'array', maxItems: 8, items: { type: 'object', properties: {
       id: { type: 'string' }, label: { type: 'string' }, type: { type: 'string', enum: ['text', 'email', 'password', 'tel', 'number'] },
       autocomplete: { type: 'string' }, required: { type: 'boolean' }, selector: { type: 'string', description: 'Exact CSS selector for one visible enabled input in the document selected by frame or frames, or the top document when omitted.' },
@@ -1822,11 +2080,33 @@ export class BrowserAuthRequestTool extends BrowserCdpReadTool {
     }, required: ['id', 'label'], additionalProperties: false } },
     submit: { type: 'object', properties: { selector: { type: 'string' }, action: { type: 'string', enum: ['click', 'press_enter'] } },
       required: ['selector', 'action'], additionalProperties: false },
+    provided_values: { type: 'object', maxProperties: 8, additionalProperties: { type: 'string', maxLength: 4096 },
+      description: 'Values already supplied for this task or obtained through an authorized channel, keyed by an inspected field id. Never invent values, copy redaction placeholders, or collect secrets from unrelated sources. Do not echo them in messages.' },
+    selected_option: { type: 'string', description: 'Known form option id from options. The secure form resolves an option still missing from the task context.' },
     targetBrowser: targetBrowserParameter,
     tabMention: { type: 'string', description: 'Exact Memmy browser tab reference supplied by the user or returned by browser_list_tabs for the user-requested tab. Resolve a unique title or URL match internally; do not ask the user to copy the reference.' },
   }, required: ['origin', 'fields'], additionalProperties: false }; }
   async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string> {
     return this.manager.requestBrowserAuth(this.scope(), params, context?.abortSignal);
+  }
+}
+
+export class BrowserSitePermissionTool extends BrowserCdpReadTool {
+  static enabled(ctx: any): boolean { return ctx.browserSessionManager?.supportsSitePermissions?.() === true; }
+  get name(): string { return 'browser_site_permission'; }
+  get description(): string {
+    return 'Grant or revoke camera or microphone permission for the HTTP(S) origin in the current task browser tab. In Memmy and managed Chromium the choice applies only to this task tab or context and origin (lasts: "task"), ends with the task, and leaves the user\'s saved site settings unchanged. Chrome/Edge returns the browser UI step for the Agent to complete with Computer Use. A granted result describes site configuration: perform the page action and verify its result.';
+  }
+  override get readOnly(): boolean { return false; }
+  get parameters(): Record<string, any> { return { type: 'object', properties: {
+    origin: { type: 'string', description: 'Exact current HTTP(S) origin from this task tab, without a path or query.' },
+    permission: { type: 'string', enum: ['camera', 'microphone'] },
+    allow: { type: 'boolean', description: 'Grant this site permission when true; revoke this site grant when false.' },
+    targetBrowser: targetBrowserParameter,
+    tabMention: { type: 'string', description: 'Exact reference for the task tab returned by browser_list_tabs.' },
+  }, required: ['origin', 'permission', 'allow'], additionalProperties: false }; }
+  async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string> {
+    return this.manager.setBrowserSitePermission(this.scope(), params, context?.abortSignal);
   }
 }
 
@@ -1851,4 +2131,5 @@ export const BROWSER_TOOL_CLASSES = [
   BrowserCdpEventsTool,
   BrowserCdpWriteTool,
   BrowserAuthRequestTool,
+  BrowserSitePermissionTool,
 ];

@@ -94,3 +94,31 @@ it('approves every explicit CDP destination before touching the selected webview
     () => true, () => true)).toEqual({ success: true });
   expect(driver.handle).toHaveBeenCalledOnce();
 });
+
+it('checks the attached iframe site before approval and restores its block when global allowance is revoked', async () => {
+  const targeted = { ...request, args: { ...request.args, target: { sessionId: 'child-session' } } };
+  const child = { sessionId: 'child-session', targetId: 'child-target',
+    url: 'https://private.test/frame', origin: 'https://private.test', revision: 3 };
+  const driver = { uploadOrigin: vi.fn(() => 'https://example.test'),
+    cdpTarget: vi.fn(async () => child), handle: vi.fn(async () => ({ metrics: true })) };
+  let globalAllowed = false;
+  const policy = (url: string) => globalAllowed || new URL(url).origin !== child.origin;
+  const approve = vi.fn(async (_origin: string) => true);
+  await expect(runApprovedEmbeddedCdpRead(targeted, driver as any, approve, () => true, policy))
+    .rejects.toThrow(/child target is blocked/);
+  expect(approve).not.toHaveBeenCalled();
+  expect(driver.handle).not.toHaveBeenCalled();
+  globalAllowed = true;
+  await expect(runApprovedEmbeddedCdpRead(targeted, driver as any, approve, () => true, policy))
+    .resolves.toEqual({ metrics: true });
+  expect(approve.mock.calls.map(call => call[0])).toEqual(['https://example.test', child.origin]);
+  const grant = (driver.handle.mock.calls as unknown[][])[0][2] as { target: unknown; isAllowed: () => boolean };
+  expect(grant.target).toEqual(child);
+  expect(grant.isAllowed()).toBe(true);
+  globalAllowed = false;
+  expect(grant.isAllowed()).toBe(false);
+  driver.handle.mockClear();
+  await expect(runApprovedEmbeddedCdpRead(targeted, driver as any, approve, () => true, policy))
+    .rejects.toThrow(/child target is blocked/);
+  expect(driver.handle).not.toHaveBeenCalled();
+});

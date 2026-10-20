@@ -1,9 +1,22 @@
 # Memmy Chrome / Edge extension
 
 This unpacked MV3 extension lets Memmy operate ordinary web pages in Chrome or Edge
-after it is installed. It uses the Chromium Debugger API for accessibility snapshots,
-targeted input, navigation, and screenshots. It does not read browsing history or cookies.
+after it is installed. Ordinary page actions use Playwright's public APIs through
+a tab-scoped Chromium Debugger transport. Navigation and separately authorized
+file/credential operations retain the Memmy bridge. It does not read the browser's
+browsing-history database or cookies.
 Browser internal pages, extension pages, and `file:` pages cannot be controlled.
+
+When unified Computer History recording is enabled, isolated content scripts
+observe bounded semantic page actions and states. This recording channel does not
+attach the debugger and also works without an Agent task. The extension requests
+HTTP(S) page access; Chrome/Edge may ask to confirm the expanded permissions on
+update. No separate demonstration mode is required. History pause, stop, application
+and site exclusions, private-page exclusion, and sensitive-value redaction apply.
+The authenticated host authorizes a short-lived recording configuration before
+the scripts read page content and rechecks the live policy before appending to the
+same History event stream. Page event provenance remains unknown unless trusted
+evidence attributes it to an actor.
 
 ## Install in a Memmy-managed browser profile
 
@@ -27,9 +40,10 @@ separate browser closes when Memmy exits normally.
 
 The extension attaches the Chromium debugger to a page only while Memmy runs a
 command there and releases it 15 seconds after the last command. Chrome and Edge
-show their "started debugging this browser" bar only during that window. Closing
-the bar stops Memmy on the attached pages; a later Memmy request (after 10
-seconds) or **重新连接** in the extension popup offers them again.
+show their system "started debugging this browser" bar when attached; its wording
+and disappearance are controlled by the browser. Memmy cannot replace that text
+with a custom operation status. Closing the bar stops Memmy on the attached pages;
+**重新连接** in the extension popup is the explicit recovery path.
 
 The Chrome and Edge build uses the same extension ID, derived from the public
 manifest key. The private key used to generate that public key is not shipped.

@@ -4,6 +4,7 @@ Only the current user's two fixed WeChat containers are accepted. Source data is
 never written, decoded, or emitted. There is deliberately no bulk-copy fallback.
 """
 import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -31,6 +32,54 @@ _LIBRARY_ALIASES = (
 _LIBRARY_FILE_ALIASES = ("Preferences/com.apple.security.plist", "Preferences/com.apple.security_common.plist")
 _GROUP_SCRIPT_ALIAS = Path("Library/Application Scripts/5A4RE8SF68.com.tencent.xinWeChat")
 _HOME_ALIASES = ("Music", "Pictures", "Desktop", "Movies", "Downloads", ".CFUserTextEncoding")
+# containermanagerd's own record of a container, kept at the container root. It
+# is not WeChat data, and macOS can refuse to open it (EPERM) even for its owner.
+_CONTAINER_MANAGER_METADATA = (".com.apple.containermanagerd.", ".com.apple.mobile_container_manager.")
+# macOS holds a process's first access to another app's container until sandboxd
+# approves it. When that approval request is lost, the kernel fails the waiting
+# call with EINTR after about ten seconds; calling again requests approval again.
+_INTERRUPTED_ATTEMPTS = 3
+
+
+class StorageError(RuntimeError):
+    """A connection category, plus the source path and the check or call that failed."""
+
+    def __init__(self, category, path, **detail):
+        super().__init__(category)
+        error_number = detail.pop("errno", None)
+        if error_number is not None:
+            detail["errno"] = errno.errorcode.get(error_number, str(error_number))
+        self.detail = {"path": str(path), **detail}
+
+
+def _retrying(operation, path, function, *arguments):
+    for attempt in range(_INTERRUPTED_ATTEMPTS):
+        try:
+            return function(*arguments)
+        except InterruptedError:
+            if attempt + 1 == _INTERRUPTED_ATTEMPTS:
+                raise StorageError("wechat_data_access_interrupted", path, operation=operation,
+                                   errno=errno.EINTR) from None
+
+
+def _source_lstat(path):
+    return _retrying("lstat", path, os.lstat, path)
+
+
+def _source_names(directory):
+    return _retrying("listdir", directory, os.listdir, directory)
+
+
+def _source_exists(path):
+    try:
+        _source_lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _container_manager_metadata(path, root):
+    return path.parent == root and path.name.startswith(_CONTAINER_MANAGER_METADATA)
 
 
 def _real_home():
@@ -79,10 +128,10 @@ def _source_directory(path, root):
     for item in (path, *path.parents):
         if item == root:
             break
-        info = item.lstat()
+        info = _source_lstat(item)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            raise RuntimeError("wechat_private_storage_unsafe_path")
-    return path.lstat()
+            raise StorageError("wechat_private_storage_unsafe_path", item, reason="directory")
+    return _source_lstat(path)
 
 
 def _read_private_json(path):
@@ -122,27 +171,47 @@ def _write_private_json(path, value):
         os.fsync(stream.fileno())
 
 
-def _clone_file(source, destination):
-    source_descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+def _clone_file(source, destination, root=None):
+    operation = "open"
+    try:
+        source_descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise StorageError("wechat_private_storage_clone_failed", source, operation=operation,
+                           errno=error.errno) from None
     destination_descriptor = None
     try:
+        operation = "fstat"
         info = os.fstat(source_descriptor)
-        expected = source.lstat()
+        operation = "lstat"
+        expected = _source_lstat(source)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)):
-            raise RuntimeError("wechat_private_storage_unsafe_path")
+            raise StorageError("wechat_private_storage_unsafe_path", source, reason="identity")
         # F_GETPATH is public Darwin fcntl(2). It binds the open descriptor to
         # the fixed source spelling rather than following a raced ancestor link.
-        actual_path = fcntl.fcntl(source_descriptor, 50, b"\0" * 1024).split(b"\0", 1)[0]
-        if os.fsdecode(actual_path) != str(source):
-            raise RuntimeError("wechat_private_storage_unsafe_path")
+        # A hard-linked file may report another of its names instead; a name
+        # inside the same fixed root still proves the descriptor never left it.
+        operation = "getpath"
+        actual = Path(os.fsdecode(fcntl.fcntl(source_descriptor, 50, b"\0" * 1024).split(b"\0", 1)[0]))
+        if actual != source:
+            try:
+                actual.relative_to(source.parent if root is None else root)
+            except ValueError:
+                raise StorageError("wechat_private_storage_unsafe_path", source, reason="path") from None
+        operation = "open_destination"
         destination_descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        operation = "clone"
         function = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).fclonefileat
         function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
         function.restype = ctypes.c_int
-        # CLONE_NOOWNERCOPY | CLONE_NOFOLLOW_ANY; never clone source ACLs.
-        if function(source_descriptor, destination_descriptor, os.fsencode(destination.name), 0x0002 | 0x0008) != 0:
-            raise RuntimeError("wechat_private_storage_clone_failed")
+        for attempt in range(_INTERRUPTED_ATTEMPTS):
+            # CLONE_NOOWNERCOPY | CLONE_NOFOLLOW_ANY; never clone source ACLs.
+            if function(source_descriptor, destination_descriptor, os.fsencode(destination.name), 0x0002 | 0x0008) == 0:
+                break
+            error_number = ctypes.get_errno()
+            if error_number != errno.EINTR or attempt + 1 == _INTERRUPTED_ATTEMPTS:
+                raise OSError(error_number, os.strerror(error_number))
+        operation = "verify"
         after = os.fstat(source_descriptor)
         if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (info.st_size, info.st_mtime_ns, info.st_ctime_ns):
             raise RuntimeError("wechat_private_storage_source_changed")
@@ -151,12 +220,15 @@ def _clone_file(source, destination):
             copied = os.fstat(cloned)
             if (not stat.S_ISREG(copied.st_mode) or copied.st_uid != os.getuid() or copied.st_nlink != 1
                     or (copied.st_dev, copied.st_ino) == (info.st_dev, info.st_ino)):
-                raise RuntimeError("wechat_private_storage_unsafe_path")
+                raise StorageError("wechat_private_storage_unsafe_path", source, reason="copy")
             os.fchmod(cloned, 0o600)
         finally:
             os.close(cloned)
-    except (OSError, AttributeError):
-        raise RuntimeError("wechat_private_storage_clone_failed") from None
+    except (OSError, AttributeError) as error:
+        error_number = getattr(error, "errno", None)
+        category = ("wechat_data_access_interrupted" if error_number == errno.EINTR
+                    else "wechat_private_storage_clone_failed")
+        raise StorageError(category, source, operation=operation, errno=error_number) from None
     finally:
         if destination_descriptor is not None:
             os.close(destination_descriptor)
@@ -180,48 +252,50 @@ def _standard_alias(relative, target, home, root=None):
 
 
 def _source_item(path, root, home):
-    info = path.lstat()
+    info = _source_lstat(path)
     if info.st_uid != os.getuid():
-        raise RuntimeError("wechat_private_storage_unsafe_path")
+        raise StorageError("wechat_private_storage_unsafe_path", path, reason="owner")
     if stat.S_ISLNK(info.st_mode):
-        target = os.readlink(path)
+        target = _retrying("readlink", path, os.readlink, path)
         relative = path.relative_to(root)
         if root in (home / _CONTAINER, home / _GROUP) and _standard_alias(relative, target, home, root):
             return info, target, True
         if Path(target).is_absolute():
-            raise RuntimeError("wechat_private_storage_unsafe_path")
+            raise StorageError("wechat_private_storage_unsafe_path", path, reason="symlink")
         try:
             path.resolve(strict=False).relative_to(root)
         except (ValueError, RuntimeError):
-            raise RuntimeError("wechat_private_storage_unsafe_path") from None
+            raise StorageError("wechat_private_storage_unsafe_path", path, reason="symlink") from None
         return info, target, False
     if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-        raise RuntimeError("wechat_private_storage_unsafe_path")
+        raise StorageError("wechat_private_storage_unsafe_path", path, reason="file_type")
     return info, None, False
 
 
 def _preflight_tree(source, root, home, guard):
     guard()
     _source_directory(source, root)
-    with os.scandir(source) as entries:
-        for entry in entries:
-            guard()
-            path = source / entry.name
-            try:
-                info, _, _ = _source_item(path, root, home)
-                if stat.S_ISDIR(info.st_mode):
-                    _preflight_tree(path, root, home, guard)
-            except FileNotFoundError:
-                # WeChat may remove a live cache entry after enumeration. The
-                # fixed roots are checked again below; final cloning is strict.
-                continue
+    for name in _source_names(source):
+        guard()
+        path = source / name
+        if _container_manager_metadata(path, root):
+            continue
+        try:
+            info, _, _ = _source_item(path, root, home)
+            if stat.S_ISDIR(info.st_mode):
+                _preflight_tree(path, root, home, guard)
+        except FileNotFoundError:
+            # WeChat may remove a live cache entry after enumeration. The
+            # fixed roots are checked again below; final cloning is strict.
+            continue
     guard()
 
 
 def _preflight_clone(state, roots, guard):
     device = _directory(state, private=True).st_dev
-    if any(_directory(root).st_dev != device for root in roots):
-        raise RuntimeError("wechat_private_storage_clone_failed")
+    for root in roots:
+        if _directory(root).st_dev != device:
+            raise StorageError("wechat_private_storage_clone_failed", root, reason="volume")
     # Prove copy-on-write support using our own inert bytes on the same volume.
     # Never clone changing chat data or create a file in the source containers.
     with tempfile.TemporaryDirectory(prefix="clone-preflight-", dir=state) as temporary:
@@ -248,7 +322,7 @@ def preflight_private_storage(state, consent_id):
     _preflight_tree(container, container, home, guard)
     roots = [container]
     group = home / _GROUP
-    if group.exists() or group.is_symlink():
+    if _source_exists(group):
         _preflight_tree(group, group, home, guard)
         roots.append(group)
     _preflight_clone(state, roots, guard)
@@ -258,39 +332,40 @@ def _clone_tree(source, destination, root, home, guard):
     guard()
     original = _source_directory(source, root)
     destination.mkdir(mode=0o700)
-    with os.scandir(source) as entries:
-        for entry in entries:
-            guard()
-            path = source / entry.name
-            copy = destination / entry.name
-            info, target, standard_alias = _source_item(path, root, home)
-            if stat.S_ISLNK(info.st_mode):
-                relative = path.relative_to(root)
-                if standard_alias:
-                    if relative == Path("Data/.CFUserTextEncoding") or relative in {
-                            Path("Data/Library") / name for name in _LIBRARY_FILE_ALIASES}:
-                        descriptor = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                        os.close(descriptor)
-                    else:
-                        copy.mkdir(mode=0o700)
-                    continue
-                copy.symlink_to(target)
-            elif stat.S_ISDIR(info.st_mode):
-                _clone_tree(path, copy, root, home, guard)
-            elif stat.S_ISREG(info.st_mode):
-                _clone_file(path, copy)
-                copied_descriptor = os.open(copy, os.O_RDONLY | os.O_NOFOLLOW)
-                try:
-                    copied = os.fstat(copied_descriptor)
-                    if (not stat.S_ISREG(copied.st_mode) or copied.st_uid != os.getuid() or copied.st_nlink != 1
-                            or (copied.st_dev, copied.st_ino) == (info.st_dev, info.st_ino)):
-                        raise RuntimeError("wechat_private_storage_unsafe_path")
-                    os.fchmod(copied_descriptor, 0o600)
-                finally:
-                    os.close(copied_descriptor)
-            else:
-                raise RuntimeError("wechat_private_storage_unsafe_path")
-    after = source.lstat()
+    for name in _source_names(source):
+        guard()
+        path = source / name
+        if _container_manager_metadata(path, root):
+            continue
+        copy = destination / name
+        info, target, standard_alias = _source_item(path, root, home)
+        if stat.S_ISLNK(info.st_mode):
+            relative = path.relative_to(root)
+            if standard_alias:
+                if relative == Path("Data/.CFUserTextEncoding") or relative in {
+                        Path("Data/Library") / name for name in _LIBRARY_FILE_ALIASES}:
+                    descriptor = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    os.close(descriptor)
+                else:
+                    copy.mkdir(mode=0o700)
+                continue
+            copy.symlink_to(target)
+        elif stat.S_ISDIR(info.st_mode):
+            _clone_tree(path, copy, root, home, guard)
+        elif stat.S_ISREG(info.st_mode):
+            _clone_file(path, copy, root)
+            copied_descriptor = os.open(copy, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                copied = os.fstat(copied_descriptor)
+                if (not stat.S_ISREG(copied.st_mode) or copied.st_uid != os.getuid() or copied.st_nlink != 1
+                        or (copied.st_dev, copied.st_ino) == (info.st_dev, info.st_ino)):
+                    raise StorageError("wechat_private_storage_unsafe_path", path, reason="copy")
+                os.fchmod(copied_descriptor, 0o600)
+            finally:
+                os.close(copied_descriptor)
+        else:
+            raise StorageError("wechat_private_storage_unsafe_path", path, reason="file_type")
+    after = _source_lstat(source)
     if (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns) != (
             original.st_dev, original.st_ino, original.st_mtime_ns, original.st_ctime_ns):
         raise RuntimeError("wechat_private_storage_source_changed")
@@ -311,7 +386,7 @@ def create_private_storage(state, original_container=None, optional_group=None, 
     if optional_group is not None and _absolute(optional_group) != group:
         raise RuntimeError("wechat_private_storage_source_refused")
     _directory(container)
-    has_group = group.exists() or group.is_symlink()
+    has_group = _source_exists(group)
     if has_group:
         _directory(group)
     try:

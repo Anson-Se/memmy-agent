@@ -12,8 +12,6 @@ export function MemoryAgentSourceTag(props: { sourceAgent: string; label: string
   const isUnknown = normalizeAgentSourceId(props.sourceAgent) === "unknown";
   const displayName = isUnknown
     ? t("common.unknown")
-    : normalizeAgentSourceId(props.sourceAgent) === "computer_history"
-      ? t("memory.memories.historySource")
     : agentSourceDisplayName(props.sourceAgent);
   const logoUrl = agentSourceLogoUrl(props.sourceAgent);
   const accessibleLabel = `${props.label}: ${displayName}`;

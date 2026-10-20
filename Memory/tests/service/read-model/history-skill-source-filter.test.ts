@@ -46,7 +46,9 @@ describe("History Skill panel source", () => {
       .toEqual(Object.fromEntries(fixtures.map((fixture) => [fixture.id, fixture.displayedSource])));
 
     for (const source of ["computer_history", "memmy", "cursor"]) {
-      const expected = fixtures.filter((fixture) => fixture.displayedSource === source).map((fixture) => fixture.id).sort();
+      const expected = fixtures.filter((fixture) => source === "memmy"
+        ? fixture.displayedSource === "memmy" || fixture.displayedSource === "computer_history"
+        : fixture.displayedSource === source).map((fixture) => fixture.id).sort();
       const filtered = service.panelItems({ layer: "Skill", sourceAgent: source === "memmy" ? "memmy-agent" : source });
       expect(filtered.total).toBe(expected.length);
       expect(filtered.items.map((item) => item.id).sort()).toEqual(expected);
@@ -56,6 +58,6 @@ describe("History Skill panel source", () => {
 
     const distribution = service.panelOverviewSummary().sourceDistribution;
     expect(Object.fromEntries(distribution.map((entry) => [entry.source, entry.count])))
-      .toEqual({ computer_history: 4, memmy: 8, cursor: 1 });
+      .toEqual({ memmy: 12, cursor: 1 });
   });
 });

@@ -3,14 +3,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { normalizeBrowserCdpReadCall, normalizeBrowserCdpWriteCall, normalizeBrowserCdpEventQuery,
-  normalizeBrowserCdpCommandOptions,
-  type ComputerUseSurfaceAction } from "@memmy/local-api-contracts";
+  normalizeBrowserCdpCommandOptions, parseBrowserCdpTargetApproval, parseBrowserTaskSitePermission,
+  type BrowserTaskSitePermissionRequest,
+  type BrowserCdpTarget, type ComputerUseSurfaceAction } from "@memmy/local-api-contracts";
 import { emitComputerUseSurface } from "../../../tools/computer-use/surface-preview.js";
-import { type ExternalBrowserClaim, type ExternalBrowserTabStatus } from "./external-browser-bridge.js";
+import { type ExternalBrowserClaim, type ExternalBrowserTabStatus, type ExternalBrowserPlaywrightEvent } from "./external-browser-bridge.js";
 import { formatExternalBrowserTabReference, parseExternalBrowserTabReference } from './external-browser-tab-reference.js';
 import { callExternalBrowserTool, emitExternalBrowserFrame, externalBrowserTargetId,
   EMBEDDED_BROWSER_SCREENSHOT_UNSUPPORTED } from "./external-browser-tools.js";
 import { BrowserUseSitePolicyReader } from './browser-use-site-policy-store.js';
+import { closeExternalBrowserPlaywrightScope, closeAllExternalBrowserPlaywright } from './external-browser-playwright.js';
+import type { BrowserCommandBridge } from './external-browser-tools.js';
+import { publicBrowserAuthResult } from '../../../utils/browser-auth-privacy.js';
 
 export type ClaimedBrowserBridge = {
   refresh?(): Promise<ExternalBrowserClaim | null>;
@@ -18,11 +22,14 @@ export type ClaimedBrowserBridge = {
   listConnected?(): Array<'chrome' | 'edge'>;
   listTabStatuses?(): ExternalBrowserTabStatus[];
   refreshTabs?(browser?: 'chrome' | 'edge'): Promise<void>;
+  waitForConnection?(browser: 'chrome' | 'edge', timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
   openBrowserTab?(browser: 'chrome' | 'edge', url: string,
     source?: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): Promise<ExternalBrowserClaim>;
   getClaim(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>): ExternalBrowserClaim | null;
   command(claim: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
     command: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
+  subscribePlaywright?(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
+    listener: (event: ExternalBrowserPlaywrightEvent) => void): () => void;
 };
 
 type Binding = {
@@ -36,8 +43,10 @@ type Binding = {
   agentCreated: boolean;
   retainedUnseen: boolean;
   disposition: 'deliverable' | 'handoff' | null;
+  sitePermissions: boolean;
   usedInTurn: boolean;
   turnRevision: number;
+  activityRevision: number;
   inFlight: number;
   lastUsed: number;
 };
@@ -125,18 +134,27 @@ export class ExternalBrowserSessionRouter {
   }
 
   async listTabs(scope: BrowserScope, browser?: 'chrome' | 'edge') {
-    await this.bridge.refreshTabs?.(browser);
+    let pageDiscoveryStatus: 'ready' | 'unresponsive' = 'ready';
+    try { await this.bridge.refreshTabs?.(browser); }
+    catch (error) {
+      // Keep a slow/half-open bridge distinct from an absent extension. Do not
+      // disconnect a shared client and cancel another chat's work to rescan it.
+      if (!(error instanceof Error) || !['Browser extension page refresh timed out', 'External browser disconnected']
+        .includes(error.message)) throw error;
+      pageDiscoveryStatus = 'unresponsive';
+    }
     const key = scopeKey(scope);
     const chat = this.chats.get(key);
     const claims = this.controllableClaims().filter(claim => claim.browser !== 'memmy'
       && (!browser || claim.browser === browser));
     return {
+      pageDiscoveryStatus,
       connectedBrowsers: (this.bridge.listConnected?.() ?? [])
         .filter(name => !browser || name === browser),
       tabStatuses: (this.bridge.listTabStatuses?.() ?? [])
         .filter(tab => !browser || tab.browser === browser)
         .map(({ connectionId: _connectionId, ...tab }) => tab),
-      tabs: claims.map(claim => {
+      tabs: (pageDiscoveryStatus === 'ready' ? claims : []).map(claim => {
         const owner = this.otherOwner(key, claim);
         return { browser: claim.browser, tabId: claim.tabId,
           title: claim.title, url: claim.url, active: claim.active === true,
@@ -145,6 +163,11 @@ export class ExternalBrowserSessionRouter {
           tabMention: formatExternalBrowserTabReference({ ...claim, browser: claim.browser as 'chrome' | 'edge' }) };
       }),
     };
+  }
+
+  waitForConnection(browser: 'chrome' | 'edge', timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    return this.bridge.waitForConnection?.(browser, timeoutMs, signal)
+      ?? Promise.resolve((this.bridge.listConnected?.() ?? []).includes(browser));
   }
 
   async selectBrowser(scope: BrowserScope, browser: 'chrome' | 'edge', mention?: string,
@@ -226,7 +249,7 @@ export class ExternalBrowserSessionRouter {
 
   private assertBinding(scope: BrowserScope, binding: Binding, turnRevision: number): void {
     if (this.bindingFor(scope, binding.identity) !== binding
-      || (this.targetKind === 'embedded' && binding.turnRevision !== turnRevision)) {
+      || binding.turnRevision !== turnRevision) {
       throw new Error(this.changedMessage());
     }
   }
@@ -237,6 +260,7 @@ export class ExternalBrowserSessionRouter {
     const binding = this.bindingFor(scope, identity);
     if (!binding) throw new Error(this.changedMessage());
     const turnRevision = binding.turnRevision;
+    binding.activityRevision += 1;
     binding.inFlight += 1;
     try {
       const result = await operation(binding, turnRevision);
@@ -246,7 +270,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   private scopedBridge(scope: BrowserScope, binding: Binding,
-    turnRevision = binding.turnRevision): Pick<ClaimedBrowserBridge, 'getClaim' | 'command'> {
+    turnRevision = binding.turnRevision): BrowserCommandBridge {
     return {
       getClaim: identity => this.bridge.getClaim(identity),
       command: async (...args: Parameters<ClaimedBrowserBridge['command']>) => {
@@ -255,6 +279,18 @@ export class ExternalBrowserSessionRouter {
         this.assertBinding(scope, binding, turnRevision);
         return result;
       },
+      isFrameAllowed: url => this.sitePolicy.decision(url, 'access') !== 'block',
+      ...(this.bridge.subscribePlaywright ? {
+        subscribePlaywright: (identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
+          listener: (event: ExternalBrowserPlaywrightEvent) => void) => {
+          this.assertBinding(scope, binding, turnRevision);
+          if (claimKey(identity) !== claimKey(binding.identity)) throw new Error(this.changedMessage());
+          return this.bridge.subscribePlaywright!(identity, event => {
+            try { this.assertBinding(scope, binding, turnRevision); listener(event); }
+            catch { /* Events from a released task must not enter another executor. */ }
+          });
+        },
+      } : {}),
     };
   }
 
@@ -285,11 +321,10 @@ export class ExternalBrowserSessionRouter {
     const binding: Binding = { scope: { ...scope },
       identity: { connectionId: claim.connectionId, tabId: claim.tabId },
       browser: claim.browser, targetId: externalBrowserTargetId(claim), title: claim.title,
-      allowedOrigins: options.allowedOrigins
-        ?? (claim.browser === 'memmy' ? new Set() : new Set([new URL(claim.url).origin])),
+      allowedOrigins: options.allowedOrigins ?? new Set(),
       outputDir: fs.mkdtempSync(path.join(os.tmpdir(), "memmy-external-browser-session-")),
-      agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null,
-      usedInTurn: true, turnRevision: 0, inFlight: 0, lastUsed: 0 };
+      agentCreated: options.agentCreated === true, retainedUnseen: false, disposition: null, sitePermissions: false,
+      usedInTurn: true, turnRevision: 0, activityRevision: 0, inFlight: 0, lastUsed: 0 };
     chat.tabs.set(claimKey(claim), binding);
     this.touch(key, binding);
     return claim;
@@ -332,7 +367,7 @@ export class ExternalBrowserSessionRouter {
       this.assertBinding(scope, binding, turnRevision);
       const scopedBridge = this.scopedBridge(scope, binding, turnRevision);
       const content = await callExternalBrowserTool(scopedBridge, claim, scope, name, params,
-        url => this.authorizePage(claim, binding, url), abortSignal);
+        url => this.authorizePage(binding, url), abortSignal);
       this.assertBinding(scope, binding, turnRevision);
       if (name === "browser_take_screenshot") {
         const filename = typeof params.filename === "string" && params.filename.trim()
@@ -364,7 +399,58 @@ export class ExternalBrowserSessionRouter {
       if (!result || typeof result !== 'object' || typeof (result as { status?: unknown }).status !== 'string') {
         throw new Error('Invalid browser auth response');
       }
+      return publicBrowserAuthResult(result);
+    });
+  }
+
+  async setDownloadDestination(scope: BrowserScope, claim: ExternalBrowserClaim,
+    filePath: string | null, destinationId: string, signal?: AbortSignal | null): Promise<unknown> {
+    if (claim.browser !== 'memmy') throw new Error('Download destination is available for in-app browser tabs');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      // Revoke this request's private destination without asking for page access
+      // again. The bridge still binds cleanup to the original task and tab.
+      if (filePath !== null) await this.authorizeCurrent(scope, claim);
+      return this.scopedBridge(scope, binding, revision)
+        .command(claim, 'setDownloadDestination', { filePath, destinationId }, signal ?? undefined);
+    });
+  }
+
+  async setSitePermission(scope: BrowserScope, claim: ExternalBrowserClaim,
+    input: BrowserTaskSitePermissionRequest, signal?: AbortSignal | null): Promise<string> {
+    const request = parseBrowserTaskSitePermission(input);
+    if (!request) throw new Error('Invalid browser site permission');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      const current = () => {
+        this.assertBinding(scope, binding, revision);
+        if (signal?.aborted) throw new Error('Browser site permission operation cancelled');
+        const latest = this.bridge.getClaim(binding.identity);
+        if (!latest || latest.browser !== binding.browser || new URL(latest.url).origin !== request.origin) {
+          throw new Error('Browser site permission origin changed');
+        }
+        return latest;
+      };
+      current();
+      if (request.allow) await this.authorizeCurrent(scope, claim);
+      const latest = current();
+      if (claim.browser !== 'memmy') {
+        return JSON.stringify({ status: 'requires_browser_ui', browser: claim.browser, ...request,
+          tabMention: formatExternalBrowserTabReference({ ...latest, browser: claim.browser }),
+          agentAction: 'Select this task tab, then use Computer Use on this browser to complete its normal permission prompt or change this exact site permission in the browser site controls. Continue the task and verify the page result.' });
+      }
+      binding.sitePermissions = true;
+      const result = await this.scopedBridge(scope, binding, revision)
+        .command(claim, 'setSitePermission', request, signal ?? undefined);
+      current();
       return JSON.stringify(result);
+    });
+  }
+
+  async waitDownloadDestination(scope: BrowserScope, claim: ExternalBrowserClaim,
+    destinationId: string, signal?: AbortSignal | null): Promise<unknown> {
+    if (claim.browser !== 'memmy') throw new Error('Download destination is available for in-app browser tabs');
+    return this.withBinding(scope, claim, async (binding, revision) => {
+      return this.scopedBridge(scope, binding, revision)
+        .command(claim, 'waitDownloadDestination', { destinationId }, signal ?? undefined);
     });
   }
 
@@ -381,12 +467,8 @@ export class ExternalBrowserSessionRouter {
     });
   }
 
-  private async authorizePage(claim: ExternalBrowserClaim, binding: Binding, url: string): Promise<boolean> {
+  private async authorizePage(binding: Binding, url: string): Promise<boolean> {
     if (this.sitePolicy.decision(url, 'access') === 'block') return false;
-    if (claim.browser !== 'memmy') {
-      binding.allowedOrigins.add(new URL(url).origin);
-      return true;
-    }
     return this.authorizeNavigation(url, binding.allowedOrigins);
   }
 
@@ -398,25 +480,23 @@ export class ExternalBrowserSessionRouter {
         throw new Error('Browser site is blocked by policy');
       }
       binding.usedInTurn = true;
-      if (claim.browser !== 'memmy') {
-        try { binding.allowedOrigins.add(new URL(liveClaim.url).origin); }
-        catch { throw new Error('Browser site is blocked by policy'); }
-      } else {
-        const currentOrigin = new URL(liveClaim.url).origin;
-        const previouslyAllowed = binding.allowedOrigins.has(currentOrigin);
-        // The approval gate revalidates saved rules and revocations, including
-        // cached temporary grants. The origin Set alone is not an approval.
-        if (!await this.authorizeNavigation(liveClaim.url, binding.allowedOrigins)) {
-          throw new Error(`Access to ${currentOrigin} was not approved`);
-        }
-        this.assertBinding(scope, binding, turnRevision);
-        const approvedClaim = this.bridge.getClaim(binding.identity);
-        if (!approvedClaim) throw new Error(this.disconnectedMessage());
-        if (new URL(approvedClaim.url).origin !== currentOrigin) throw new Error(this.changedMessage());
-        if (!previouslyAllowed || !binding.allowedOrigins.has(currentOrigin)) {
-          await this.scopedBridge(scope, binding, turnRevision).command(claim, 'allowOrigin', { origin: currentOrigin });
-        }
+      const currentOrigin = new URL(liveClaim.url).origin;
+      const previouslyAllowed = binding.allowedOrigins.has(currentOrigin);
+      // The approval gate revalidates saved rules and revocations, including
+      // cached temporary grants. The origin Set alone is not an approval.
+      if (!await this.authorizeNavigation(liveClaim.url, binding.allowedOrigins)) {
+        throw new Error(`Access to ${currentOrigin} was not approved`);
       }
+      this.assertBinding(scope, binding, turnRevision);
+      const approvedClaim = this.bridge.getClaim(binding.identity);
+      if (!approvedClaim) throw new Error(this.disconnectedMessage());
+      if (new URL(approvedClaim.url).origin !== currentOrigin) throw new Error(this.changedMessage());
+      if (!previouslyAllowed || !binding.allowedOrigins.has(currentOrigin)) {
+        await this.scopedBridge(scope, binding, turnRevision).command(claim, 'allowOrigin', { origin: currentOrigin });
+      }
+      // This tracks the approved page for navigation/file binding only. The
+      // approval gate revalidates it on every call, including global revocation.
+      binding.allowedOrigins.add(currentOrigin);
     });
   }
 
@@ -428,6 +508,13 @@ export class ExternalBrowserSessionRouter {
     if (!binding || claim.browser === 'memmy') {
       throw new Error('External browser session changed');
     }
+    const turnRevision = binding.turnRevision;
+    const assertCurrent = () => {
+      if (abortSignal?.aborted || this.bindingFor(scope, binding.identity) !== binding) {
+        throw new Error('Browser upload cancelled');
+      }
+      this.assertBinding(scope, binding, turnRevision);
+    };
     if (this.sitePolicy.decision(claim.url, 'access') === 'block') {
       throw new Error('Browser site is blocked by policy');
     }
@@ -440,11 +527,11 @@ export class ExternalBrowserSessionRouter {
     if (typeof target !== 'string' || !target || target.length > 500) {
       throw new Error('External browser upload requires a file input target');
     }
-    if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+    assertCurrent();
+    await this.authorizeCurrent(scope, claim);
+    assertCurrent();
     const initial = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
-    if (initial?.origin && initial.url && new URL(initial.url).origin === initial.origin) {
-      binding.allowedOrigins.add(initial.origin);
-    }
+    assertCurrent();
     if (!initial?.url || !initial.origin || new URL(initial.url).origin !== initial.origin
       || !binding.allowedOrigins.has(initial.origin)) throw new Error('External browser upload site changed');
     const stamps = files.map(file => {
@@ -453,8 +540,9 @@ export class ExternalBrowserSessionRouter {
         size: info.size, mtimeMs: info.mtimeMs };
     });
     if (!await authorize(initial.url, files, abortSignal ?? undefined)) throw new Error('Browser upload was not approved');
-    if (abortSignal?.aborted || this.bindingFor(scope, claim) !== binding) throw new Error('Browser upload cancelled');
+    assertCurrent();
     const current = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
+    assertCurrent();
     if (current?.url !== initial.url || current?.origin !== initial.origin
       || this.bridge.getClaim(binding.identity)?.connectionId !== claim.connectionId) {
       throw new Error('External browser upload site changed after approval');
@@ -464,7 +552,8 @@ export class ExternalBrowserSessionRouter {
     try {
       const staged: string[] = [];
       for (const [index, stamp] of stamps.entries()) {
-        if (abortSignal?.aborted || fs.realpathSync(stamp.path) !== stamp.realPath) {
+        assertCurrent();
+        if (fs.realpathSync(stamp.path) !== stamp.realPath) {
           throw new Error('Browser upload file changed after approval');
         }
         const directory = path.join(temporary, String(index));
@@ -481,9 +570,10 @@ export class ExternalBrowserSessionRouter {
           try {
             const buffer = Buffer.allocUnsafe(1024 * 1024);
             while (true) {
-              if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+              assertCurrent();
               const { bytesRead } = await source.read(buffer, 0, buffer.length, null);
               if (!bytesRead) break;
+              assertCurrent();
               let written = 0;
               while (written < bytesRead) written += (await output.write(buffer, written, bytesRead - written)).bytesWritten;
             }
@@ -495,16 +585,20 @@ export class ExternalBrowserSessionRouter {
         } finally { await source.close().catch(() => undefined); }
         staged.push(destination);
       }
-      if (abortSignal?.aborted) throw new Error('Browser upload cancelled');
+      assertCurrent();
       const final = await this.bridge.command(claim, 'tabState', {}, abortSignal ?? undefined) as { url?: string; origin?: string };
+      assertCurrent();
       if (final?.url !== initial.url || final?.origin !== initial.origin) {
         throw new Error('External browser upload site changed after approval');
       }
       if (this.sitePolicy.decision(initial.url, 'uploads') === 'block') {
         throw new Error('Browser upload was blocked by site policy');
       }
-      return await this.call(scope, claim, 'browser_file_upload',
+      assertCurrent();
+      const result = await this.call(scope, claim, 'browser_file_upload',
         { target, paths: staged, approvedOrigin: initial.origin }, abortSignal);
+      assertCurrent();
+      return result;
     } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
   }
 
@@ -536,7 +630,8 @@ export class ExternalBrowserSessionRouter {
       }
       const initialUrl = currentClaim.url;
       const initialOrigin = new URL(initialUrl).origin;
-      if (claim.browser === 'memmy') await this.authorizeCurrent(scope, currentClaim);
+      await this.authorizeCurrent(scope, currentClaim);
+      let approvedTarget: ReturnType<typeof parseBrowserCdpTargetApproval> = null;
       if (claim.browser !== 'memmy') {
         binding.allowedOrigins.add(initialOrigin);
         const state = await bridge.command(claim, 'tabState', {}, signal ?? undefined) as { url?: string; origin?: string };
@@ -545,6 +640,23 @@ export class ExternalBrowserSessionRouter {
         if (!await approve(initialUrl, actionName, signal ?? undefined)) throw new Error('Browser CDP operation was not approved');
         const after = await bridge.command(claim, 'tabState', {}, signal ?? undefined) as { url?: string; origin?: string };
         if (after.url !== initialUrl || after.origin !== initialOrigin) throw new Error('Browser tab changed after CDP approval');
+        const target = (args as { target?: BrowserCdpTarget }).target;
+        if (target) {
+          approvedTarget = parseBrowserCdpTargetApproval(await bridge.command(claim, 'cdpTarget',
+            { target, approvedOrigin: initialOrigin }, signal ?? undefined));
+          if (!approvedTarget
+            || ('sessionId' in target && target.sessionId !== approvedTarget.sessionId)
+            || ('targetId' in target && target.targetId !== approvedTarget.targetId)) {
+            throw new Error('Browser CDP child target approval is unavailable');
+          }
+          if (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+            || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'
+            || !await this.authorizePage(binding, approvedTarget.url)
+            || (approvedTarget.origin !== initialOrigin
+              && !await approve(approvedTarget.url, actionName, signal ?? undefined))) {
+            throw new Error('Browser CDP child target site was not approved');
+          }
+        }
       }
       for (const target of [...new Set(targetUrls)]) {
         let destination: URL;
@@ -554,7 +666,7 @@ export class ExternalBrowserSessionRouter {
           throw new Error('Invalid CDP destination URL');
         }
         if (destination.origin === initialOrigin) continue;
-        if (!await this.authorizePage(claim, binding, destination.href)) {
+        if (!await this.authorizePage(binding, destination.href)) {
           throw new Error('CDP destination site was not approved');
         }
         binding.allowedOrigins.add(destination.origin);
@@ -566,14 +678,19 @@ export class ExternalBrowserSessionRouter {
         }
       }
       if (signal?.aborted || this.bindingFor(scope, binding.identity) !== binding
+        || (approvedTarget && (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+          || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'))
         || this.sitePolicy.decision(initialUrl, 'fullCdp') === 'block'
         || targetUrls.some(url => this.sitePolicy.decision(url, 'access') === 'block'
           || this.sitePolicy.decision(url, 'fullCdp') === 'block')) {
         throw new Error('Browser CDP operation is blocked');
       }
       const result = await bridge.command(claim, operation,
-        claim.browser === 'memmy' ? args : { ...args, approvedOrigin: initialOrigin }, signal ?? undefined);
+        claim.browser === 'memmy' ? args : { ...args, approvedOrigin: initialOrigin,
+          ...(approvedTarget ? { approvedTarget } : {}) }, signal ?? undefined);
       if (signal?.aborted || this.bindingFor(scope, binding.identity) !== binding
+        || (approvedTarget && (this.sitePolicy.decision(approvedTarget.url, 'access') === 'block'
+          || this.sitePolicy.decision(approvedTarget.url, 'fullCdp') === 'block'))
         || this.sitePolicy.decision(initialUrl, 'fullCdp') === 'block'
         || targetUrls.some(url => this.sitePolicy.decision(url, 'access') === 'block'
           || this.sitePolicy.decision(url, 'fullCdp') === 'block')) {
@@ -604,14 +721,16 @@ export class ExternalBrowserSessionRouter {
         this.assertBinding(scope, binding, turnRevision);
         const claim = this.bridge.getClaim(binding.identity);
         if (!claim || externalBrowserTargetId(claim) !== action.targetId) return true;
+        if ((action.action === 'fill-credential' || action.action === 'fill-contact')
+          && (!action.autofill || new URL(claim.url).origin !== action.autofill.origin)) return true;
         if (this.sitePolicy.decision(claim.url, 'access') === 'block') return true;
-        if (claim.browser === 'memmy') await this.authorizeCurrent(scope, claim);
+        await this.authorizeCurrent(scope, claim);
         const bridge = this.scopedBridge(scope, binding, turnRevision);
         if (action.action === "navigate") {
           const url = new URL(action.url!);
           if (!["http:", "https:"].includes(url.protocol)) return true;
           if (url.origin !== new URL(claim.url).origin) {
-            if (!await this.authorizePage(claim, binding, url.href)) return true;
+            if (!await this.authorizePage(binding, url.href)) return true;
             await bridge.command(claim, "allowOrigin", { origin: url.origin });
           }
           await bridge.command(claim, "navigate", { url: url.href });
@@ -650,18 +769,33 @@ export class ExternalBrowserSessionRouter {
   async finishTurn(scope: BrowserScope): Promise<void> {
     const key = scopeKey(scope);
     const chat = this.chats.get(key);
-    if (!chat) return;
+    // Revoke each pending tool before cleanup yields. A permission prompt can
+    // complete after the turn ends, before Playwright has even created a scope.
+    const ending = [...(chat?.tabs.values() ?? [])].map(binding => {
+      const usedInTurn = binding.usedInTurn;
+      binding.usedInTurn = false;
+      binding.turnRevision += 1;
+      return { binding, usedInTurn, turnRevision: binding.turnRevision,
+        activityRevision: binding.activityRevision, lastUsed: binding.lastUsed };
+    });
+    // Sent before cleanup yields, so the end reaches the desktop ahead of a next turn's grant.
+    const endedPermissions = ending.filter(({ binding }) => binding.sitePermissions)
+      .map(({ binding }) => this.endSitePermissions(binding));
     this.closeSurfacesForTurn(scope);
+    await closeExternalBrowserPlaywrightScope(scope);
+    if (!chat) return;
     let freshTabInventory = false;
     if (this.targetKind === 'embedded' && this.bridge.refresh) {
       try { await this.bridge.refresh(); freshTabInventory = true; }
       catch { /* Without fresh visibility evidence, keep the normal close policy. */ }
     }
     const closing: Binding[] = [];
-    for (const binding of chat.tabs.values()) {
-      const usedInTurn = binding.usedInTurn;
-      binding.usedInTurn = false;
-      if (this.targetKind === 'embedded') binding.turnRevision += 1;
+    for (const { binding, usedInTurn, turnRevision, activityRevision, lastUsed } of ending) {
+      // The next turn may start while the old relay is cleaning up. Its use of
+      // this same tab, or a replacement binding, belongs to the new owner.
+      if (this.bindingFor(scope, binding.identity) !== binding
+        || binding.turnRevision !== turnRevision || binding.activityRevision !== activityRevision
+        || binding.lastUsed !== lastUsed || binding.usedInTurn) continue;
       if (!binding.agentCreated || !usedInTurn) continue;
       if (binding.disposition) binding.disposition = null;
       else if (this.targetKind === 'embedded' && freshTabInventory && !binding.retainedUnseen
@@ -671,18 +805,26 @@ export class ExternalBrowserSessionRouter {
         binding.retainedUnseen = true;
       } else closing.push(binding);
     }
-    await Promise.allSettled(closing.map(async binding => {
+    await Promise.allSettled([...endedPermissions, ...closing.map(async binding => {
       try {
         const claim = this.bridge.getClaim(binding.identity);
         if (claim) await this.bridge.command(claim, 'closeTab');
       } finally { this.release(key, binding); }
-    }));
+    })]);
+  }
+
+  /** In-app device choices last only for the task that made them on this tab. */
+  private async endSitePermissions(binding: Binding): Promise<void> {
+    binding.sitePermissions = false;
+    try { await this.bridge.command(binding.identity, 'endSitePermissions'); }
+    catch { /* A closed tab or stopped desktop has already ended its choices. */ }
   }
 
   private release(key: string, binding: Binding): void {
     const chat = this.chats.get(key);
     const tabKey = claimKey(binding.identity);
     if (!chat || chat.tabs.get(tabKey) !== binding) return;
+    if (binding.sitePermissions) void this.endSitePermissions(binding);
     chat.tabs.delete(tabKey);
     if (chat.current === tabKey) chat.current = null;
     if (chat.tabs.size === 0) this.chats.delete(key);
@@ -693,6 +835,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   closeSession(scope: BrowserScope): void {
+    void closeExternalBrowserPlaywrightScope(scope);
     const key = scopeKey(scope);
     for (const binding of [...(this.chats.get(key)?.tabs.values() ?? [])]) this.release(key, binding);
   }
@@ -705,6 +848,7 @@ export class ExternalBrowserSessionRouter {
   }
 
   closeAll(): void {
+    void closeAllExternalBrowserPlaywright();
     for (const key of [...this.chats.keys()]) {
       for (const binding of [...(this.chats.get(key)?.tabs.values() ?? [])]) this.release(key, binding);
     }

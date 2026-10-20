@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { ExternalBrowserSessionRouter } from "../../../../src/core/agent-runtime/tools/external-browser-session-router.js";
 import { BrowserUseSitePolicyReader } from '../../../../src/core/agent-runtime/tools/browser-use-site-policy-store.js';
+import { BrowserAccessApproval } from '../../../../src/core/agent-runtime/tools/browser-access-approval.js';
+import { BrowserCapabilityApproval } from '../../../../src/core/agent-runtime/tools/browser-capability-approval.js';
 import type { ExternalBrowserBridge, ExternalBrowserClaim } from "../../../../src/core/agent-runtime/tools/external-browser-bridge.js";
 import * as surfaces from '../../../../src/tools/computer-use/surface-preview.js';
 
@@ -33,6 +35,121 @@ function bindingOf(router: ExternalBrowserSessionRouter, scope: typeof scopeA, t
 }
 
 describe("external browser session router", () => {
+  it('reports an unresponsive refresh without losing connection facts or offering stale pages', async () => {
+    const bridge = fakeBridge();
+    Object.assign(bridge, { refreshTabs: vi.fn(async () => { throw new Error('Browser extension page refresh timed out'); }),
+      listConnected: () => ['edge'] });
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
+    try {
+      const listing = await router.listTabs(scopeA, 'edge');
+      expect(listing).toMatchObject({ pageDiscoveryStatus: 'unresponsive', connectedBrowsers: ['edge'], tabs: [] });
+      expect(bridge.listClaims()).toEqual([claim]);
+      expect(router.hasBinding(scopeA)).toBe(false);
+      Object.assign(bridge, { refreshTabs: vi.fn(async () => { throw new Error('unexpected bridge error'); }) });
+      await expect(router.listTabs(scopeA, 'edge')).rejects.toThrow('unexpected bridge error');
+    } finally { router.closeAll(); }
+  });
+
+  it('waits for the requested browser without binding or claiming a page', async () => {
+    const bridge = fakeBridge([]);
+    const waitForConnection = vi.fn(async () => true);
+    Object.assign(bridge, { waitForConnection });
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
+    const signal = new AbortController().signal;
+    try {
+      await expect(router.waitForConnection('chrome', 45_000, signal)).resolves.toBe(true);
+      expect(waitForConnection).toHaveBeenCalledExactlyOnceWith('chrome', 45_000, signal);
+      expect(router.hasBinding(scopeA)).toBe(false);
+      expect(router.hasBinding(scopeB)).toBe(false);
+    } finally { router.closeAll(); }
+  });
+
+  it.each(['website', 'computer'] as const)('applies %s allow-all and revocation to raw CDP attached cross-site iframe targets', async source => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-child-cdp-policy-'));
+    const reader = new BrowserUseSitePolicyReader(path.join(directory, 'site-policy.json'), {
+      nativeAllowAllFilePath: path.join(directory, 'allow-all-apps.json'),
+    });
+    fs.writeFileSync(reader.filePath, JSON.stringify({ version: 1, rules: [
+      { pattern: 'https://example.test', access: 'allow', downloads: 'ask', uploads: 'ask', fullCdp: 'allow' },
+      { pattern: 'https://frame.test', access: 'block', downloads: 'block', uploads: 'block', fullCdp: 'block' },
+    ] }));
+    const approvedTarget = { sessionId: 'child-session', targetId: 'child-target',
+      url: 'https://frame.test/private', origin: 'https://frame.test', revision: 1 };
+    const bridge = fakeBridge();
+    const command = vi.fn(async (_bound: unknown, operation: string) => {
+      if (operation === 'tabState') return { url: claim.url, origin: 'https://example.test' };
+      if (operation === 'cdpTarget') return approvedTarget;
+      return {};
+    });
+    bridge.command = command;
+    const access = new BrowserAccessApproval(path.join(directory, 'access.json'), reader);
+    const prompt = vi.spyOn(access as any, 'requestDecision').mockResolvedValue('deny');
+    const capability = new BrowserCapabilityApproval(reader);
+    const router = new ExternalBrowserSessionRouter(bridge, (url, grants) => access.authorize(url, grants), 'external', reader);
+    router.selectClaim(scopeA, claim);
+    const run = () => router.cdp(scopeA, claim, 'cdpCall', { method: 'Page.getLayoutMetrics',
+      target: { sessionId: 'child-session' } }, (url, method) => capability.authorize('debug', url, [method]));
+    try {
+      await expect(run()).rejects.toThrow(/child target site was not approved/);
+      expect(command.mock.calls.some(call => call[1] === 'cdpCall')).toBe(false);
+      const globalPath = source === 'website' ? reader.allowAllFilePath : reader.nativeAllowAllFilePath!;
+      fs.writeFileSync(globalPath, JSON.stringify({ version: 1, enabled: true }));
+      await expect(run()).resolves.toBe('{}');
+      expect(bridge.command).toHaveBeenCalledWith(claim, 'cdpCall', expect.objectContaining({ approvedTarget }), undefined);
+      expect(prompt).not.toHaveBeenCalled();
+      command.mockClear();
+      fs.writeFileSync(globalPath, JSON.stringify({ version: 1, enabled: false }));
+      await expect(run()).rejects.toThrow(/child target site was not approved/);
+      expect(command.mock.calls.some(call => call[1] === 'cdpCall')).toBe(false);
+    } finally { router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('clears only the bound in-app download destination after page access is revoked without asking again', async () => {
+    const current = { ...claim, browser: 'memmy' as const };
+    const bridge = fakeBridge([current]);
+    const authorize = vi.fn(async () => true);
+    const router = new ExternalBrowserSessionRouter(bridge, authorize, 'embedded');
+    try {
+      router.selectClaim(scopeA, current);
+      await router.setDownloadDestination(scopeA, current, '/private/output.txt', 'request-a');
+      expect(authorize).toHaveBeenCalledOnce();
+      authorize.mockResolvedValue(false);
+      await router.setDownloadDestination(scopeA, current, null, 'request-a');
+      expect(authorize).toHaveBeenCalledOnce();
+      expect(bridge.command).toHaveBeenCalledWith(current, 'setDownloadDestination',
+        { filePath: null, destinationId: 'request-a' }, undefined);
+      router.closeSession(scopeA);
+      await expect(router.setDownloadDestination(scopeA, current, null, 'request-a')).rejects.toThrow(/changed/);
+    } finally { router.closeAll(); }
+  });
+
+  it.each(['memmy', 'chrome', 'edge'] as const)('uses the shared website gate for %s and revalidates global revocation', async browser => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-shared-access-'));
+    const current = { ...claim, browser };
+    const bridge = fakeBridge([current]);
+    const reader = new BrowserUseSitePolicyReader(path.join(directory, 'site-policy.json'));
+    const access = new BrowserAccessApproval(path.join(directory, 'access.json'), reader);
+    const prompt = vi.spyOn(access as any, 'requestDecision').mockResolvedValue('deny');
+    const router = new ExternalBrowserSessionRouter(bridge,
+      (url, allowed) => access.authorize(url, allowed), browser === 'memmy' ? 'embedded' : 'external', reader);
+    try {
+      router.selectClaim(scopeA, current);
+      expect(bindingOf(router, scopeA, current).allowedOrigins.size).toBe(0);
+      await expect(router.call(scopeA, current, 'browser_snapshot', {})).rejects.toThrow(/not approved/);
+      expect(prompt).toHaveBeenCalledOnce();
+      expect(bridge.command).not.toHaveBeenCalled();
+      fs.writeFileSync(reader.allowAllFilePath, JSON.stringify({ version: 1, enabled: true }));
+      await expect(router.call(scopeA, current, 'browser_snapshot', {})).resolves.toBeDefined();
+      expect(prompt).toHaveBeenCalledOnce();
+      (bridge.command as ReturnType<typeof vi.fn>).mockClear();
+      fs.writeFileSync(reader.allowAllFilePath, JSON.stringify({ version: 1, enabled: false }));
+      await expect(router.call(scopeA, current, 'browser_click', { target: 'ax-1' })).rejects.toThrow(/not approved/);
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(bridge.command).not.toHaveBeenCalled();
+      expect(bindingOf(router, scopeA, current).allowedOrigins.size).toBe(0);
+    } finally { router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('rejects in-app screenshot tools and CDP before site approval or any browser command', async () => {
     const current = { ...claim, browser: 'memmy' as const };
     const bridge = fakeBridge([current]);
@@ -455,6 +572,92 @@ describe("external browser session router", () => {
     } finally { grant(true); router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('does not execute an external click after its turn ends during page approval', async () => {
+    const bridge = fakeBridge();
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    let approvals = 0;
+    const authorize = vi.fn(async (url: string, allowed: Set<string>) => {
+      const approved = ++approvals === 1 ? (entered(), await waiting) : true;
+      if (approved) allowed.add(new URL(url).origin);
+      return approved;
+    });
+    const router = new ExternalBrowserSessionRouter(bridge, authorize, 'external');
+    try {
+      router.selectClaim(scopeA, claim);
+      const pending = expect(router.call(scopeA, claim, 'browser_click', { target: '#submit' }))
+        .rejects.toThrow(/Chrome\/Edge.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      expect(router.hasBinding(scopeA)).toBe(true);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'click')).toBe(false);
+      await router.call(scopeA, claim, 'browser_click', { target: '#submit' });
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'click')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); }
+  });
+
+  it('revokes an in-app click while page approval is still pending', async () => {
+    const current = { ...claim, browser: 'memmy' as const };
+    const bridge = fakeBridge([current]);
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    let approvals = 0;
+    const router = new ExternalBrowserSessionRouter(bridge, async (url, allowed) => {
+      const approved = ++approvals === 1 ? (entered(), await waiting) : true;
+      if (approved) allowed.add(new URL(url).origin);
+      return approved;
+    }, 'embedded');
+    try {
+      router.selectClaim(scopeA, current);
+      const pending = expect(router.call(scopeA, current, 'browser_click', { target: 'ax-1' }))
+        .rejects.toThrow(/Memmy in-app.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'click')).toBe(false);
+      await router.call(scopeA, current, 'browser_click', { target: 'ax-1' });
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'click')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); }
+  });
+
+  it('does not upload after its turn ends while file approval is pending', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upload-stopped-turn-'));
+    const source = path.join(workspace, 'evidence.txt');
+    fs.writeFileSync(source, 'fixture evidence');
+    const bridge = fakeBridge();
+    const originalCommand = bridge.command;
+    bridge.command = vi.fn((bound, operation, args, signal) => operation === 'tabState'
+      ? Promise.resolve({ url: claim.url, origin: new URL(claim.url).origin })
+      : originalCommand(bound, operation, args, signal));
+    let grant!: (allowed: boolean) => void;
+    const waiting = new Promise<boolean>(resolve => { grant = resolve; });
+    let entered!: () => void;
+    const approvalStarted = new Promise<void>(resolve => { entered = resolve; });
+    const approve = vi.fn(async () => { entered(); return waiting; });
+    const router = new ExternalBrowserSessionRouter(bridge, async (url, allowed) => {
+      allowed.add(new URL(url).origin); return true;
+    }, 'external');
+    try {
+      router.selectClaim(scopeA, claim);
+      const pending = expect(router.upload(scopeA, claim, { target: '#attachment', paths: [source] }, approve))
+        .rejects.toThrow(/Chrome\/Edge.*changed/);
+      await approvalStarted;
+      await router.finishTurn(scopeA);
+      grant(true);
+      await pending;
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'upload')).toBe(false);
+      await router.upload(scopeA, claim, { target: '#attachment', paths: [source] }, async () => true);
+      expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.filter(call => call[1] === 'upload')).toHaveLength(1);
+    } finally { grant(true); router.closeAll(); fs.rmSync(workspace, { recursive: true, force: true }); }
+  });
+
   it('discards a late screenshot after recovery without recreating old files or surfaces', async () => {
     const original = { ...claim };
     const replacement = { ...original, tabId: 18 };
@@ -600,7 +803,7 @@ describe("external browser session router", () => {
     } finally { finish({}); router.closeAll(); fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('keeps high-risk CDP approval for another site without asking for page access again', async () => {
+  it('checks page access and high-risk CDP approval for both current and destination sites', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'external-cdp-destination-'));
     const policyPath = path.join(directory, 'site-policy.json');
     fs.writeFileSync(policyPath, JSON.stringify({ version: 1, rules: [
@@ -627,7 +830,7 @@ describe("external browser session router", () => {
         .rejects.toThrow(/destination debug access/);
       expect((bridge.command as ReturnType<typeof vi.fn>).mock.calls.some(call => call[1] === 'cdpWrite'))
         .toBe(false);
-      expect(authorize).not.toHaveBeenCalled();
+      expect(authorize.mock.calls.map(call => call[0])).toEqual([claim.url, 'https://destination.test/']);
       approve.mockResolvedValue(true);
       await expect(router.cdp(scopeA, claim, 'cdpWrite', input, approve)).resolves.toBe('{}');
       expect(bridge.command).toHaveBeenCalledWith(claim, 'allowOrigin',
@@ -648,6 +851,8 @@ describe("external browser session router", () => {
     const bridge = fakeBridge();
     bridge.command = vi.fn(async (_bound, operation: string, args: Record<string, unknown>) => {
       if (operation === 'tabState') return { url: currentUrl, origin: new URL(currentUrl).origin };
+      if (operation === 'cdpTarget') return { sessionId: 'child-1', targetId: 'frame-1',
+        url: claim.url, origin: 'https://example.test', revision: 0 };
       if (operation === 'cdpCall') {
         expect(args).toMatchObject({ method: 'Runtime.evaluate', approvedOrigin: 'https://example.test',
           params: { expression: 'document.title', throwOnSideEffect: true } });
@@ -738,7 +943,7 @@ describe("external browser session router", () => {
       return original(bound, operation, args);
     });
     bridge.command = command;
-    const router = new ExternalBrowserSessionRouter(bridge, async () => false);
+    const router = new ExternalBrowserSessionRouter(bridge, async () => true);
     router.selectClaim(scopeA, claim);
     const approve = vi.fn(async () => true);
     try {

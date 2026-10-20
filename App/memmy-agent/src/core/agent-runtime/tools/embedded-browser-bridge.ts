@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserResult,
+import { EMBEDDED_BROWSER_REQUEST, EMBEDDED_BROWSER_CANCEL, isEmbeddedBrowserEvent, isEmbeddedBrowserResult,
   formatEmbeddedBrowserTabMention, parseEmbeddedBrowserTabMention,
-  type EmbeddedBrowserCommand } from '@memmy/local-api-contracts';
-import type { ExternalBrowserClaim } from './external-browser-bridge.js';
+  type EmbeddedBrowserCommand, type ExternalBrowserState, type ExternalBrowserRecovery } from '@memmy/local-api-contracts';
+import type { BrowserCommandOutcome, BrowserCommandSettle, ExternalBrowserClaim,
+  ExternalBrowserPlaywrightEvent } from './external-browser-bridge.js';
 
 type Pending = { resolve: (value: unknown) => void; reject: (reason: Error) => void;
   cleanup: () => void };
@@ -15,7 +16,14 @@ export class EmbeddedBrowserBridge {
   private selectedTabId: number | null = null;
   private visibleTabs: Array<{ tabId: number; title: string; url: string; tabMention: string | null }> = [];
   private readonly claims = new Map<number, ExternalBrowserClaim>();
+  private readonly executorListeners = new Map<number, Set<(event: ExternalBrowserPlaywrightEvent) => void>>();
   private readonly receive = (value: unknown) => {
+    if (isEmbeddedBrowserEvent(value)) {
+      const event: ExternalBrowserPlaywrightEvent = { leaseId: value.leaseId, method: value.method, params: value.params,
+        ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId }) };
+      for (const listener of this.executorListeners.get(value.tabId) ?? []) listener(event);
+      return;
+    }
     if (!isEmbeddedBrowserResult(value)) return;
     const pending = this.pending.get(value.requestId);
     if (!pending) return;
@@ -30,11 +38,16 @@ export class EmbeddedBrowserBridge {
   }
 
   private request(command: EmbeddedBrowserCommand, args: Record<string, unknown> = {}, tabId?: number,
-    signal?: AbortSignal): Promise<unknown> {
+    signal?: AbortSignal, settle?: BrowserCommandSettle): Promise<unknown> {
     if (!process.send) return Promise.reject(new Error('Embedded browser is available only in the desktop app'));
     if (signal?.aborted) return Promise.reject(new Error('Browser operation was canceled'));
     const requestId = randomUUID();
-    return new Promise((resolve, reject) => {
+    return new Promise((resolvePromise, rejectPromise) => {
+      const report = (outcome: BrowserCommandOutcome) => {
+        try { settle?.(outcome); } catch { /* A caller's reply handling cannot break the bridge. */ }
+      };
+      const resolve = (value: unknown) => { report({ ok: true, result: value }); resolvePromise(value); };
+      const reject = (error: Error) => { report({ ok: false, error }); rejectPromise(error); };
       const onAbort = () => {
         if (!this.pending.delete(requestId)) return;
         cleanup();
@@ -46,10 +59,17 @@ export class EmbeddedBrowserBridge {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         cleanup();
+        try { process.send?.({ type: EMBEDDED_BROWSER_CANCEL, requestId }, () => undefined); }
+        catch { /* A timed-out request remains cancelled locally. */ }
         reject(new Error('Embedded browser command timed out'));
-      }, command === 'queryHistory' ? 5 * 60_000
+      }, command === 'externalBrowserState' ? 5_000
+        : command === 'recoverExternalBrowser' ? 15_000
+        : command === 'waitDownloadDestination' ? 35_000
+        : command === 'queryHistory' ? 5 * 60_000
         : command === 'authRequest' ? 5 * 60_000 + 15_000
         : command === 'upload' ? 5 * 60_000 + 15_000
+        : command === 'playwrightStart' && Array.isArray(args.uploadPaths) && args.uploadPaths.length > 0
+          ? 5 * 60_000 + 15_000
         : command === 'cdpCall' || command === 'cdpEvents' || command === 'cdpWrite'
           ? 5 * 60_000 + 45_000 : 30_000);
       timer.unref?.();
@@ -122,6 +142,22 @@ export class EmbeddedBrowserBridge {
       tabs: this.visibleTabs,
     };
   }
+  async getExternalBrowserState(signal?: AbortSignal): Promise<ExternalBrowserState> {
+    const result = await this.request('externalBrowserState', {}, undefined, signal) as Partial<ExternalBrowserState> | null;
+    const installation = (browser: 'chrome' | 'edge') => {
+      const state = result?.installation?.[browser];
+      return { installed: typeof state?.installed === 'boolean' ? state.installed : null,
+        enabled: typeof state?.enabled === 'boolean' ? state.enabled : null };
+    };
+    const running = result?.runningBrowsers;
+    return { installation: { chrome: installation('chrome'), edge: installation('edge') },
+      runningBrowsers: Array.isArray(running) && running.every(browser => browser === 'chrome' || browser === 'edge')
+        ? [...new Set(running)] : null };
+  }
+  async recoverExternalBrowser(browser: 'chrome' | 'edge', signal?: AbortSignal): Promise<ExternalBrowserRecovery> {
+    const result = await this.request('recoverExternalBrowser', { browser }, undefined, signal);
+    return result === 'woken' || result === 'failed' ? result : 'unavailable';
+  }
   async queryHistory(input: { from: string; to: string; keyword: string; limit: number }): Promise<unknown> {
     return this.request('queryHistory', input);
   }
@@ -146,11 +182,25 @@ export class EmbeddedBrowserBridge {
     return identity.connectionId === `memmy-webview:${this.browserId}` ? this.claims.get(identity.tabId) ?? null : null;
   }
   command(claim: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
-    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
+    command: string, args: Record<string, unknown> = {}, signal?: AbortSignal,
+    settle?: BrowserCommandSettle): Promise<unknown> {
     if (!this.getClaim(claim)) return Promise.reject(new Error('Embedded browser tab is no longer open'));
-    return this.request(command as EmbeddedBrowserCommand, args, claim.tabId, signal);
+    return this.request(command as EmbeddedBrowserCommand, args, claim.tabId, signal, settle);
   }
+
+  subscribePlaywright(identity: Pick<ExternalBrowserClaim, 'connectionId' | 'tabId'>,
+    listener: (event: ExternalBrowserPlaywrightEvent) => void): () => void {
+    if (!this.getClaim(identity)) throw new Error('Embedded browser tab is no longer open');
+    const listeners = this.executorListeners.get(identity.tabId) ?? new Set();
+    listeners.add(listener); this.executorListeners.set(identity.tabId, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size) this.executorListeners.delete(identity.tabId);
+    };
+  }
+
   close(): void {
+    this.executorListeners.clear();
     process.removeListener('message', this.receive);
     for (const pending of this.pending.values()) {
       pending.cleanup();

@@ -173,7 +173,7 @@ describe("WeChat connection preparation and Memmy permission guide", () => {
 
   it.each([
     ["/private/unexpected", "微信连接准备失败，请重试。"],
-    ["lldb_incompatible", "微信连接所需的系统组件与当前 macOS 不兼容"],
+    ["python_unavailable", "微信读取组件不完整，请重新安装 Memmy"],
   ])("shows a readable error and allows retry when preparation rejects with %s", async (error, message) => {
     await render({ onPrepareReader: vi.fn().mockRejectedValueOnce(new Error(error)).mockResolvedValue(ready) });
     expect(document.body.textContent).toContain(message);
@@ -199,7 +199,7 @@ describe("WeChat connection preparation and Memmy permission guide", () => {
   it.each([
     ["wechat_data_access_probe_failed", "微信连接准备失败，请重试。"],
     ["wechat_permission_helper_unavailable", "微信连接准备失败，请重试。"],
-    ["lldb_incompatible", "微信连接所需的系统组件与当前 macOS 不兼容"],
+    ["python_unavailable", "微信读取组件不完整，请重新安装 Memmy"],
     ["wechat_private_storage_source_changed", "微信数据正在更新，连接未完成。请稍后重试。"],
     ["unknown_error:/private/path", "微信连接准备失败，请重试。"],
   ])(

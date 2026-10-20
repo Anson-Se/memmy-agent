@@ -39,11 +39,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ApplicationIconReader } from "./application-icon.js";
+import { WindowsApplicationIconReader } from "../win/application-icon.js";
 import { isPersonalWeChatHistorySupported } from "../platform.js";
 import { isWindows11, listWindowsApplications } from "../win/win11.js";
 import { HistoryMemoryAdapter, type HistoryEvidence, type HistorySkillGroup } from "../memory-adapter.js";
 import { historyEvidenceSummary } from "../memory-evidence-summary.js";
-import { renderSummary } from "./summarize-history.js";
+import { isCaptureInterruptionRecord, renderSummary } from "./summarize-history.js";
 import { writeWorkflowCandidate } from "../../computer-use/extract-workflow-candidate.js";
 import { WeChatHistoryConsentStore, defaultWeChatConsentFile } from "./wechat-consent.js";
 import { WeChatMessageBatchReader, WeChatReaderError } from "./wechat-message-batch.js";
@@ -52,6 +53,9 @@ import { physicalRuntimeAsset } from "./native-helper.js";
 import { resolveMacWeChatPython } from "./wechat-python.js";
 import { resolveWindowsWeChatPython } from "../win/python-runtime.js";
 import { buildBrowserAuthoritySnapshot, writeBrowserAuthority, type BrowserFocusObservation } from "../browser-privacy.js";
+import { appendBrowserHistoryEvent, prepareBrowserHistoryEvent,
+  type BrowserHistoryCaptureIntent, type BrowserHistoryTrustedContext } from "../browser-semantic-history.js";
+import { connectBrowserHistoryBridge } from "../browser-history-bridge.js";
 
 /** The authority sidecar is a recording too: excluded page identity never goes to disk. */
 export function filterHistoryAuthorityObservations(settings: ObservationSettings,
@@ -60,7 +64,6 @@ export function filterHistoryAuthorityObservations(settings: ObservationSettings
     const allowed = evaluateObservation(settings, {
       bundleId: entry.browser === "edge" ? "win32.msedge" : "win32.chrome",
       browser: true, url: entry.url,
-      privateBrowsing: entry.mode === "private", privateBrowsingUnknown: entry.mode !== "normal",
     }).observe;
     return allowed ? { ...entry, title: "" }
       : { ...entry, mode: "unknown", title: "", url: "" };
@@ -73,6 +76,15 @@ export interface WeChatReaderPreparation {
   ready: boolean;
   appPath: string | null;
   error: string | null;
+}
+
+/** Where a Mac connection step failed (path, check or call, errno), as the helper reported it. */
+function weChatFailureDetail(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.length || entries.length > 8
+    || entries.some(([key, field]) => !/^[a-z_]{1,32}$/u.test(key) || typeof field !== "string" || field.length > 4096)) return;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 export interface ComputerHistoryReplayPlan {
@@ -205,7 +217,8 @@ const CAPTURE_ISSUE_RECOVERY_MS = 30_000;
 const RECORDER_HEALTH_PREFIX = "[recorder-health] ";
 const CAPTURE_ISSUE_CODES = new Set([
   "observer_unavailable", "observer_notifications_unavailable", "ax_snapshot_budget_exceeded",
-  "enrichment_backlog", "privacy_unknown", "helper_parse_error", "event_processing_error", "input_monitoring_unavailable",
+  "ax_snapshot_failed",
+  "enrichment_backlog", "helper_parse_error", "event_processing_error", "input_monitoring_unavailable",
 ]);
 
 interface RetainedSegmentEvidence {
@@ -357,6 +370,21 @@ function isMachineSummary(sourceType: ComputerHistorySourceType): boolean {
  * excluded — is never empty. Summarizing it anyway wrote "no activity" into
  * the timeline every ten minutes for as long as nobody was there.
  */
+function rawHasEvidence(text: string): boolean {
+  return text.split("\n").some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const record = JSON.parse(line);
+      if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+      return isCaptureInterruptionRecord(record) || (record.recordType === "human_event"
+        && typeof record.eventType === "string" && record.eventType.length > 0
+        && !["recording_started", "recording_stopped"].includes(record.eventType));
+    } catch { return false; }
+  });
+}
+
+// A failed recorder may have no activity to describe. Its failure evidence
+// must still be searchable and checkpointed before raw retention expires.
 function segmentHasActivity(eventsFile: string): boolean {
   let text: string;
   try {
@@ -364,7 +392,7 @@ function segmentHasActivity(eventsFile: string): boolean {
   } catch {
     return false;
   }
-  return /"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(text);
+  return rawHasEvidence(text);
 }
 
 function lastRecordedEvent(raw: string): Record<string, unknown> | null {
@@ -425,6 +453,8 @@ export class ComputerHistoryDemoService {
   private browserAuthoritySuspended = true;
   private browserAuthorityCleared = false;
   private publishBrowserAuthority: (() => void) | null = null;
+  private readonly browserEventIds = new Set<string>();
+  private browserHistoryBridge: ReturnType<typeof connectBrowserHistoryBridge> | null = null;
   private readonly liveSummaryIntervalMs: number;
   private segment: SegmentState | null = null;
   private observationState: ObservationState = "stopped";
@@ -447,6 +477,7 @@ export class ComputerHistoryDemoService {
   // segment rotations rather than treating new event output as liveness.
   private captureHeartbeatSupported = false;
   private captureObserverReadyAt = 0;
+  private captureSnapshotReadyAt = 0;
   private captureInputReadyAt = 0;
   private captureHealthGeneration = 0;
   private readonly captureHealthDrainingChildren = new Set<ChildProcessWithoutNullStreams>();
@@ -455,6 +486,7 @@ export class ComputerHistoryDemoService {
   private readonly memoryAdapter: HistoryMemoryAdapter;
   private readonly skillGroupCache = new Map<string, { revision: string; group: HistorySkillGroup | null }>();
   private readonly applicationIcons: ApplicationIconReader;
+  private readonly windowsApplicationIcons: WindowsApplicationIconReader;
   private llmRuntime: LLMRuntimeResolver | null = null;
   private readonly summaryLanguage: () => MemmyOutputLanguage | undefined;
   /** Coalesce only an active pass, so failures remain eligible for retry. */
@@ -530,6 +562,7 @@ export class ComputerHistoryDemoService {
     this.observationSettings = new ObservationSettingsStore(input.observationSettingsFile);
     this.weChatConsent = new WeChatHistoryConsentStore(input.weChatConsentFile ?? defaultWeChatConsentFile());
     this.applicationIcons = new ApplicationIconReader();
+    this.windowsApplicationIcons = new WindowsApplicationIconReader();
     this.permissionReader = input.permissionReader ?? readHistoryPermissions;
     this.summaryLanguage = input.summaryLanguage ?? discoverMemmyOutputLanguage;
     this.liveSummaryIntervalMs = boundedInterval(
@@ -551,6 +584,11 @@ export class ComputerHistoryDemoService {
       this.browserAuthorityEnabled = true;
       this.startBrowserAuthorityPublisher();
     }
+    // DOM semantics use the same History consent on both platforms and need no Agent claim.
+    void import("../../../core/agent-runtime/tools/external-browser-bridge.js").then(({ externalBrowserBridge }) => {
+      if (this.shuttingDown) return;
+      this.browserHistoryBridge = connectBrowserHistoryBridge(this, externalBrowserBridge);
+    }).catch(() => { /* A missing browser connection must not interrupt native History recording. */ });
   }
 
   /** Clear page identity immediately, including while an async stop is draining. */
@@ -563,6 +601,36 @@ export class ComputerHistoryDemoService {
       // A failed replacement must not leave a previously authorized URL alive.
       try { fs.rmSync(this.browserAuthorityPath, { force: true }); this.browserAuthorityCleared = true; } catch { /* Unreadable authority cannot authorize native-unknown capture. */ }
     }
+  }
+
+  /** Passive browser observation follows the ordinary History switch, independent of Agent chats. */
+  getBrowserCaptureIntent(): BrowserHistoryCaptureIntent {
+    const disabled = { enabled: false, generation: null, settings: null, captureText: false } as const;
+    if (this.shuttingDown || this.browserAuthoritySuspended || this.recorderTransition
+      || this.observationState !== "running" || !this.segment) return disabled;
+    try {
+      // Capture cannot use the settings store's UI-friendly fallback on a missing/corrupt file.
+      const settings = parseObservationSettings(JSON.parse(fs.readFileSync(this.observationSettings.filePath, "utf8")));
+      const policy = crypto.createHash("sha256").update(JSON.stringify(settings)).digest("hex").slice(0, 20);
+      return { enabled: true, generation: `${this.segment.id}:${this.captureHealthGeneration}:${policy}`,
+        settings, captureText: true };
+    } catch { return disabled; }
+  }
+
+  /** The bridge supplies browser-owned context; DOM messages supply observations only. */
+  ingestBrowserSemanticEvent(payload: unknown, context: BrowserHistoryTrustedContext): boolean {
+    const intent = this.getBrowserCaptureIntent();
+    const segment = this.segment;
+    const prepared = prepareBrowserHistoryEvent(payload, context, intent);
+    if (!prepared || !segment || this.browserEventIds.has(prepared.deduplicationKey)) return false;
+    // Validation and commit are synchronous, so Stop/Pause/policy transitions cannot interleave.
+    appendBrowserHistoryEvent(segment.eventsFile, prepared);
+    this.browserEventIds.add(prepared.deduplicationKey);
+    if (this.browserEventIds.size > 4096) this.browserEventIds.delete(this.browserEventIds.values().next().value!);
+    // Like native events, the live narration notices the grown event file on
+    // its next check; invalidating here would discard a narration in progress.
+    if (!this.captureLastEventAt || prepared.event.timestamp > this.captureLastEventAt) this.captureLastEventAt = prepared.event.timestamp;
+    return true;
   }
 
   // This sidecar obeys the same recording intent and strict policy as raw
@@ -701,8 +769,8 @@ export class ComputerHistoryDemoService {
     const helper = physicalRuntimeAsset(moduleFile("wechat/connect.py"));
     const python = resolveMacWeChatPython();
     if (!python) {
-      this.saveWeChatFailure("lldb_unavailable", "reader_permission_check");
-      return Promise.resolve({ ready: false, appPath: null, error: "lldb_unavailable" });
+      this.saveWeChatFailure("python_unavailable", "reader_permission_check");
+      return Promise.resolve({ ready: false, appPath: null, error: "python_unavailable" });
     }
     this.weChatPreparation = new Promise<WeChatReaderPreparation>((resolve) => {
       const child = spawn(python, ["-B", helper, "--state", this.weChatStateDirectory, "--prepare-only"],
@@ -753,9 +821,10 @@ export class ComputerHistoryDemoService {
     return this.weChatPreparation;
   }
 
-  /** Retain categories and phases only; never log key manifests or reader stdout. */
-  private saveWeChatFailure(category: string, phase: string | null): void {
+  /** Keep the latest failure and where it happened; never key manifests or reader stdout. */
+  private saveWeChatFailure(category: string, phase: string | null, detail?: unknown): void {
     if (!/^[a-zA-Z_][a-zA-Z_:0-9-]{0,127}$/u.test(category)) return;
+    const failureDetail = weChatFailureDetail(detail);
     const file = path.join(this.weChatStateDirectory, "last-connection-error.json");
     const temporary = `${file}.${crypto.randomUUID()}.tmp`;
     try {
@@ -765,7 +834,8 @@ export class ComputerHistoryDemoService {
       if (!info.isDirectory() || info.isSymbolicLink()) return;
       // Windows privacy comes from the NTFS ACL set up with consent; POSIX owner and mode bits do not apply.
       if (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077))) return;
-      fs.writeFileSync(temporary, JSON.stringify({ category, phase, failedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+      fs.writeFileSync(temporary, JSON.stringify({ category, phase, failedAt: new Date().toISOString(),
+        ...(failureDetail ? { detail: failureDetail } : {}) }), { mode: 0o600, flag: "wx" });
       fs.renameSync(temporary, file);
     } catch { /* Diagnostics must not change connection or consent behavior. */ }
     finally { fs.rmSync(temporary, { force: true }); }
@@ -838,7 +908,7 @@ export class ComputerHistoryDemoService {
     }
     if (this.weChatError) return { enabled: true, connection: "error", phase: null, error: this.weChatError };
     if (windows ? !resolveWindowsWeChatPython() : !resolveMacWeChatPython()) {
-      return { enabled: true, connection: "unavailable", phase: null, error: windows ? "python_unavailable" : "lldb_unavailable" };
+      return { enabled: true, connection: "unavailable", phase: null, error: "python_unavailable" };
     }
     return { enabled: true, connection: this.weChatReader(consent.consentId) ? "connected" : "needs_setup",
       phase: null, error: null };
@@ -890,7 +960,7 @@ export class ComputerHistoryDemoService {
     const windowsPython = windows ? resolveWindowsWeChatPython() : null;
     const command = windows ? windowsPython?.executable : resolveMacWeChatPython();
     if (!command) {
-      this.weChatError = windows ? "python_unavailable" : "lldb_unavailable";
+      this.weChatError = "python_unavailable";
       this.weChatPhase = null;
       this.saveWeChatFailure(this.weChatError, "preparing");
       return this.snapshot();
@@ -898,6 +968,8 @@ export class ComputerHistoryDemoService {
     this.weChatError = null;
     this.weChatReadFailures = 0;
     this.weChatPhase = "preparing";
+    // The Windows helper uses Known Folders/config and verifies account keys;
+    // do not silently replace an ambiguous custom store with default Documents.
     const args = windows
       ? [...windowsPython!.args, helper, "--output", path.join(this.weChatStateDirectory, "keys.json"),
         "--consent-file", this.weChatConsent.filePath]
@@ -911,7 +983,7 @@ export class ComputerHistoryDemoService {
     let pending = "";
     const readStatus = (line: string) => {
       try {
-        const status = JSON.parse(line) as { event?: unknown; category?: unknown };
+        const status = JSON.parse(line) as { event?: unknown; category?: unknown; detail?: unknown };
         const failedPhase = this.weChatPhase;
         if (typeof status.event === "string" && /^[a-z_]+$/u.test(status.event)
           && status.event !== "connection_error" && status.event !== "capture_error") {
@@ -924,7 +996,7 @@ export class ComputerHistoryDemoService {
           if (status.category !== this.weChatError
             && (status.category !== "key_capture_failed" || !this.weChatError)) {
             this.weChatError = status.category;
-            this.saveWeChatFailure(status.category, failedPhase);
+            this.saveWeChatFailure(status.category, failedPhase, status.detail);
           }
         }
       } catch { /* Status output contains no chat content; ignore malformed lines. */ }
@@ -1017,7 +1089,7 @@ export class ComputerHistoryDemoService {
 
   private assertPersonalWeChatHistorySupported(): void {
     if (!isPersonalWeChatHistorySupported()) {
-      throw new ComputerHistoryApiError(400, "Personal WeChat History is available on Apple silicon macOS only");
+      throw new ComputerHistoryApiError(400, "Personal WeChat History is available on Apple silicon macOS and Windows 11 only");
     }
   }
 
@@ -1064,7 +1136,9 @@ export class ComputerHistoryDemoService {
 
   /** An application's icon for the timeline, as a data URL. */
   applicationIcon(bundleId: string): Promise<string | null> {
-    return this.applicationIcons.iconFor(bundleId);
+    return isWindows11()
+      ? this.windowsApplicationIcons.iconFor(bundleId)
+      : this.applicationIcons.iconFor(bundleId);
   }
 
   listApplications(): Promise<Array<{ bundleId: string; name: string }>> {
@@ -1606,6 +1680,7 @@ export class ComputerHistoryDemoService {
     this.captureHeartbeatSupported = false;
     this.captureIssues.clear();
     this.captureObserverReadyAt = 0;
+    this.captureSnapshotReadyAt = 0;
     this.captureInputReadyAt = 0;
   }
 
@@ -1630,6 +1705,13 @@ export class ComputerHistoryDemoService {
       if (!this.captureLastHeartbeatAt || at >= Date.parse(this.captureLastHeartbeatAt)) this.captureLastHeartbeatAt = normalized;
     } else if (code === "event_recorded") {
       if (!this.captureLastEventAt || at >= Date.parse(this.captureLastEventAt)) this.captureLastEventAt = normalized;
+    } else if (code === "ax_snapshot_ready") {
+      // Only the consumer emits this after a complete authorized tree reaches
+      // disk (or matches its persisted baseline). Input and heartbeat signals
+      // say nothing about whether window contents can be read.
+      this.captureSnapshotReadyAt = Math.max(this.captureSnapshotReadyAt, at);
+      const previous = this.captureIssues.get("ax_snapshot_failed");
+      if (previous && at >= previous.lastAt) previous.active = false;
     } else if (code === "input_monitoring_ready") {
       this.captureInputReadyAt = Math.max(this.captureInputReadyAt, at);
       const previous = this.captureIssues.get("input_monitoring_unavailable");
@@ -1646,6 +1728,7 @@ export class ComputerHistoryDemoService {
       if (count !== undefined && (!Number.isSafeInteger(count) || (count as number) < 1)) return;
       const previous = this.captureIssues.get(code);
       const readyAt = code === "input_monitoring_unavailable" ? this.captureInputReadyAt
+        : code === "ax_snapshot_failed" ? this.captureSnapshotReadyAt
         : code === "observer_unavailable" || code === "observer_notifications_unavailable" ? this.captureObserverReadyAt : 0;
       this.captureIssues.set(code, {
         count: Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + (typeof count === "number" ? count : 1)),
@@ -1662,7 +1745,7 @@ export class ComputerHistoryDemoService {
     const issues: Array<{ code: string; count: number }> = [];
     let activeIssue = false;
     for (const [code, issue] of this.captureIssues) {
-      if (issue.active && code !== "observer_unavailable" && code !== "observer_notifications_unavailable" && code !== "input_monitoring_unavailable"
+      if (issue.active && code !== "observer_unavailable" && code !== "observer_notifications_unavailable" && code !== "input_monitoring_unavailable" && code !== "ax_snapshot_failed"
         && now - issue.lastAt >= CAPTURE_ISSUE_RECOVERY_MS
         && this.captureLastEventAt && Date.parse(this.captureLastEventAt) > issue.lastAt
         && ((windows && !this.captureHeartbeatSupported)
@@ -1688,7 +1771,7 @@ export class ComputerHistoryDemoService {
     return { status, lastEventAt: this.captureLastEventAt, lastHeartbeatAt: this.captureLastHeartbeatAt,
       issues: status === "inactive" ? [] : issues,
       limitations: [windows ? "foreground_events_and_accessibility_only" : "foreground_accessibility_only",
-        "private_and_unverifiable_browsers_excluded", "screenshots_and_audio_not_recorded"] };
+        "screenshots_and_audio_not_recorded"] };
   }
 
   private cancelRecorderReconnect(): void {
@@ -2405,6 +2488,8 @@ export class ComputerHistoryDemoService {
   async shutdown(): Promise<void> {
     ++this.permissionStartVersion;
     this.shuttingDown = true;
+    this.browserHistoryBridge?.close();
+    this.browserHistoryBridge = null;
     this.browserAuthoritySuspended = true;
     this.clearBrowserAuthority();
     if (this.browserAuthorityTimer) clearInterval(this.browserAuthorityTimer);
@@ -2446,7 +2531,7 @@ export class ComputerHistoryDemoService {
     try {
       stat = fs.statSync(segment.eventsFile);
       const raw = fs.readFileSync(segment.eventsFile, "utf8");
-      if (!/"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(raw)) return;
+      if (!rawHasEvidence(raw)) return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.setNarrationError("Computer History could not read the active event stream");
       return;
@@ -2650,7 +2735,7 @@ export class ComputerHistoryDemoService {
         return { history: { ...this.currentRawCache.history, filePath }, raw: this.currentRawCache.raw };
       }
       const raw = fs.readFileSync(segment.eventsFile, "utf8");
-      if (!/"eventType"\s*:\s*"(?!recording_started"|recording_stopped")/u.test(raw)) return null;
+      if (!rawHasEvidence(raw)) return null;
       const pending = renderSummary({ file: segment.eventsFile, ...parsedRawRecords(raw), title: `Computer History ${segment.id}` })
         .replace(/^source_type:\s*human_computer_history\s*$/mu, "source_type: captured")
         .replace(/^status:.*$/mu, "status: incomplete")
@@ -3236,18 +3321,22 @@ function queryTerms(value: string): string[] {
   return [...terms].slice(0, 32);
 }
 
-function buildRecordedExperienceWorkflow(input: {
+export function buildRecordedExperienceWorkflow(input: {
   history: ComputerHistoryEntry;
   request: string;
   steps: string[];
 }): string {
+  const isBrowserStep = (step: string) => /^Recorded browser operation \(/u.test(step);
+  const browserSteps = input.steps.filter(isBrowserStep).length;
   const gateSections = input.steps.map((step, index) => [
     `### Gate ${index + 1} of ${input.steps.length}`,
     "",
     `Recorded semantic action: ${step}`,
     "",
-    "- Read the target application's current window state immediately before acting.",
-    "- Locate the target from current Accessibility text, role, value, or visible UI; never use a recorded coordinate.",
+    isBrowserStep(step) ? "- Execution surface: browser. Resolve the intended Chrome/Edge tab with browser_list_tabs, then read browser_snapshot immediately before acting."
+      : "- Execution surface: desktop. Read the target application's current window state immediately before acting.",
+    isBrowserStep(step) ? "- Locate the current page control using its role/name and current state; use browser actions and verify the returned or refreshed browser state. Never replay a recorded reference or coordinate."
+      : "- Locate the target from current Accessibility text, role, value, or visible UI; never use a recorded coordinate.",
     "- Perform this gate at most once, then read state again and record concrete evidence that its intended effect occurred.",
     `- Gate ${index + 2} is locked until this evidence exists. If the target or evidence is unavailable, stop and report this gate as blocked.`,
   ].join("\n")).join("\n\n");
@@ -3269,15 +3358,21 @@ function buildRecordedExperienceWorkflow(input: {
     "",
     `> ${input.request}`,
     "",
-    "This Workflow was distilled from an explicit human demonstration. It is a semantic state machine, not a macro: raw coordinates and exact scroll distances are deliberately excluded.",
+    browserSteps ? "This Workflow was distilled from observed operation evidence. Browser steps preserve their human/unknown actor attribution; an unknown actor is not a confirmed human demonstration. Follow semantic targets and state transitions rather than recorded coordinates."
+      : "This Workflow was distilled from an explicit human demonstration. It is a semantic state machine, not a macro: raw coordinates and exact scroll distances are deliberately excluded.",
     "",
     "## Execution contract",
     "",
     "1. Start by stating the current request, the source History title, and the safety boundary inferred from the request.",
-    "2. Use only the Memmy Computer Use MCP tools `mcp_memmy_computer_use_list_apps`, `mcp_memmy_computer_use_get_app_state`, `mcp_memmy_computer_use_click`, `mcp_memmy_computer_use_type_text`, `mcp_memmy_computer_use_press_key`, and `mcp_memmy_computer_use_scroll`. If these tools are unavailable, stop and report the workflow as blocked; never substitute another desktop executor.",
+    browserSteps ? "2. Browser gates use Memmy browser tools: browser_list_tabs, browser_snapshot, browser_click, browser_type, browser_select_option, browser_press_key, and browser_wait_for. Preserve the selected tab and verify every state transition."
+      + (browserSteps < input.steps.length ? " Desktop gates use only Memmy Computer Use MCP list_apps/get_app_state/click/type_text/press_key/scroll. Choose the executor from each gate's surface." : "")
+      + " If a required tool or target is unavailable, stop at that gate and report it as blocked."
+      : "2. Use only the Memmy Computer Use MCP tools `mcp_memmy_computer_use_list_apps`, `mcp_memmy_computer_use_get_app_state`, `mcp_memmy_computer_use_click`, `mcp_memmy_computer_use_type_text`, `mcp_memmy_computer_use_press_key`, and `mcp_memmy_computer_use_scroll`. If these tools are unavailable, stop and report the workflow as blocked; never substitute another desktop executor.",
     "3. Execute the gates below strictly in order. Maintain a visible checklist such as `G1 verified / G2 pending`; never search for a later action while an earlier gate is unresolved.",
-    "4. Start with `list_apps` and `get_app_state`. Memmy Computer Use action tools return refreshed post-action state; use that result as verification evidence instead of immediately calling `get_app_state` again. Read state again only after an out-of-band UI change or when the action result lacks the evidence needed for the next gate.",
-    "5. Element indexes are state-scoped. Use only an `element_index` from the latest returned state, and never reuse an index after a click, key action, scroll, navigation, modal change, or page reload.",
+    browserSteps ? "4. For browser gates, begin with browser_list_tabs/browser_snapshot and verify the actual state after each action. For desktop gates, use list_apps/get_app_state and the refreshed state returned by the action."
+      : "4. Start with `list_apps` and `get_app_state`. Memmy Computer Use action tools return refreshed post-action state; use that result as verification evidence instead of immediately calling `get_app_state` again. Read state again only after an out-of-band UI change or when the action result lacks the evidence needed for the next gate.",
+    browserSteps ? "5. Browser element references and desktop element indexes belong to the current observation. Re-observe after navigation, modal changes or stale targets, and locate each gate from live semantics."
+      : "5. Element indexes are state-scoped. Use only an `element_index` from the latest returned state, and never reuse an index after a click, key action, scroll, navigation, modal change, or page reload.",
     "6. Recorded scrolls are navigation hints, not workflow gates. If a target is absent, scroll at most one viewport and inspect the state returned by that scroll; stop as soon as the target or its section anchor appears.",
     "7. If the live UI differs from the demonstration, adapt semantic localization but preserve the demonstrated intent and order. Do not guess missing values or choose approximate alternatives.",
     "",

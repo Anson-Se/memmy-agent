@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExcelControlStatus, MemmyAgentClient } from "../../api/memmy-agent-client.js";
+import type { BrowserAllowAllState } from '@memmy/local-api-contracts';
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { ComputerUseSettings } from "../computer-use-settings.js";
 
@@ -20,6 +21,12 @@ function applicationExcelStatus(overrides: Partial<ExcelControlStatus> = {}): Ex
 describe("computer use settings", () => {
   let container: HTMLDivElement;
   let root: Root;
+
+  function excelRowText(): string {
+    const row = container.querySelector('input[aria-label="Microsoft Excel"]')?.parentElement;
+    if (!row) throw new Error("Excel setting row is missing");
+    return row.textContent ?? "";
+  }
 
   beforeEach(() => {
     container = document.createElement("div");
@@ -123,18 +130,81 @@ describe("computer use settings", () => {
       expect(setNativeAppAllowAll).toHaveBeenCalledWith(true);
       expect(setComputerUseEnabled).not.toHaveBeenCalledWith(false);
       expect(toggle.checked).toBe(true);
-      expect(container.textContent).toContain("安装");
+      expect(container.textContent).toContain("暂时无法读取 Memmy 扩展状态");
     } finally {
       Reflect.deleteProperty(window, "memmy");
+    }
+  });
+
+  it.each(['darwin', 'win32'])('does not interpret a missing installation bridge as absent extensions on %s', async platform => {
+    const listInstalledBrowserExtensions = vi.fn().mockResolvedValue([]);
+    const prepareBrowserExtension = vi.fn().mockResolvedValue({ status: "browser-opened", directory: "/app/browser-extension" });
+    Object.defineProperty(window, "memmy", { configurable: true, value: {
+      listInstalledBrowserExtensions, prepareBrowserExtension,
+    } });
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    try {
+      await act(async () => root.render(<I18nProvider language="zh-CN">
+        <ComputerUseSettings client={client} platform={platform} />
+      </I18nProvider>));
+      const browsers = container.querySelector("#computer-use-browser-extension")!;
+      expect(browsers.textContent).toContain("暂时无法读取 Memmy 扩展状态");
+      expect(browsers.textContent).not.toContain("未安装");
+      expect(Array.from(browsers.querySelectorAll("button")).map(button => button.textContent)).toEqual(["管理", "管理"]);
+      expect(listInstalledBrowserExtensions).not.toHaveBeenCalled();
+      expect(prepareBrowserExtension).not.toHaveBeenCalled();
+      await act(async () => { browsers.querySelector("button")!.click(); });
+      expect(prepareBrowserExtension).toHaveBeenCalledExactlyOnceWith("chrome", true);
+      expect(container.querySelector("#memmy-chrome-extension-guide")).not.toBeNull();
+    } finally {
+      Reflect.deleteProperty(window, "memmy");
+    }
+  });
+
+  it.each(['darwin', 'win32'])('syncs the computer switch from inherited browser state without a stale read on %s', async platform => {
+    let changed!: (state: BrowserAllowAllState) => void;
+    let finishRead!: (state: BrowserAllowAllState) => void;
+    const unsubscribe = vi.fn();
+    const getBrowserAllowAll = vi.fn().mockReturnValueOnce(new Promise<BrowserAllowAllState>(resolve => { finishRead = resolve; }))
+      .mockResolvedValue({ enabled: true, inherited: false, effective: true });
+    Object.defineProperty(window, 'memmy', { configurable: true, value: {
+      getBrowserAllowAll, setNativeAppAllowAll: vi.fn(),
+      onBrowserAllowAllChanged: vi.fn((listener: (state: BrowserAllowAllState) => void) => { changed = listener; return unsubscribe; }),
+    } });
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    try {
+      await act(async () => root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform={platform} /></I18nProvider>));
+      const toggle = container.querySelector('input[role="switch"][aria-label="始终允许任意应用"]') as HTMLInputElement;
+      expect(toggle.disabled).toBe(true);
+      await act(async () => changed({ enabled: false, inherited: true, effective: true }));
+      await act(async () => finishRead({ enabled: false, inherited: false, effective: false }));
+      expect(toggle.checked).toBe(true);
+      expect(toggle.disabled).toBe(false);
+      await act(async () => window.dispatchEvent(new Event('focus')));
+      // Independent website permission does not enable all application control.
+      expect(toggle.checked).toBe(false);
+      expect(getBrowserAllowAll).toHaveBeenCalledTimes(2);
+      await act(async () => root.render(<></>));
+      expect(unsubscribe).toHaveBeenCalledOnce();
+    } finally {
+      Reflect.deleteProperty(window, 'memmy');
     }
   });
 
   it.each(["darwin", "win32"])("offers only manual browser installation on %s", async platform => {
     sessionStorage.setItem("memmy.browser-extension-install.v1", "retired-install");
     const prepareBrowserExtension = vi.fn().mockResolvedValue({ status: "browser-opened", directory: "/app/browser-extension" });
-    const listInstalledBrowserExtensions = vi.fn().mockResolvedValue(["chrome"]);
+    const getBrowserExtensionInstallation = vi.fn().mockResolvedValue({
+      chrome: { installed: true, enabled: true }, edge: { installed: false, enabled: false },
+    });
     Object.defineProperty(window, "memmy", { configurable: true, value: {
-      prepareBrowserExtension, listInstalledBrowserExtensions,
+      prepareBrowserExtension, getBrowserExtensionInstallation,
     } });
     const client = {
       getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
@@ -149,7 +219,11 @@ describe("computer use settings", () => {
       const browserRow = (name: string) => Array.from(container.querySelectorAll("strong"))
         .find(node => node.textContent === name)?.parentElement?.parentElement?.textContent;
       expect(browserRow("Google Chrome")).toContain("已安装，等待浏览器连接");
+      expect(browserRow("Google Chrome")).toContain("重新安装");
+      expect(browserRow("Google Chrome")).not.toContain("检查连接");
       expect(browserRow("Microsoft Edge")).toContain("未安装");
+      expect(browserRow("Microsoft Edge")).not.toContain("检查连接");
+      expect(container.textContent).not.toContain("修复连接");
       expect(container.textContent).not.toContain("Memmy帮你安装");
       expect(container.textContent).not.toContain("手动安装");
       expect(container.textContent).not.toContain("暂时无法操作浏览器窗口");
@@ -227,11 +301,11 @@ describe("computer use settings", () => {
     expect(container.textContent).toContain("旧版 Excel 加载项：仅连接已打开 Memmy 窗格的工作簿");
     expect(container.textContent).not.toContain("授权一次即可使用");
     expect(container.textContent).toContain("请重启 Excel，并在需要操作的空白或目标工作簿中打开 Memmy 加载项。");
-    expect(container.textContent).not.toContain("已连接");
+    expect(excelRowText()).not.toContain("已连接");
     expect(container.querySelector('a[download="Memmy-Excel.xml"]')).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(getExcelAddinStatus).toHaveBeenCalledTimes(2);
-    expect(container.textContent).toContain("已连接");
+    expect(excelRowText()).toContain("已连接");
     expect(container.textContent).not.toContain("请重启 Excel");
     } finally {
       vi.useRealTimers();
@@ -272,7 +346,7 @@ describe("computer use settings", () => {
       await act(async () => { window.dispatchEvent(new Event("focus")); await vi.advanceTimersByTimeAsync(5000); });
       expect(getExcelAddinStatus).toHaveBeenCalledTimes(2);
       expect(setExcelAddinEnabled).toHaveBeenCalledTimes(1);
-      expect(container.textContent).toContain("已连接");
+      expect(excelRowText()).toContain("已连接");
       expect(container.textContent).not.toContain("打开 Excel 文件后即可使用");
       await act(async () => { toggle.click(); });
       expect(setExcelAddinEnabled).toHaveBeenNthCalledWith(2, false);
@@ -282,6 +356,64 @@ describe("computer use settings", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("shows a pending Windows Excel status before allowing the switch to be used", async () => {
+    let finishCheck!: (value: ExcelControlStatus) => void;
+    const pendingCheck = new Promise<ExcelControlStatus>(resolve => { finishCheck = resolve; });
+    const setExcelAddinEnabled = vi.fn();
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExcelAddinStatus: vi.fn().mockReturnValue(pendingCheck), setExcelAddinEnabled,
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    const render = (activeClient?: MemmyAgentClient) => <I18nProvider language="zh-CN">
+      <ComputerUseSettings client={activeClient} platform="win32" /></I18nProvider>;
+    await act(async () => { root.render(render()); });
+    const section = container.querySelector("#computer-use-excel");
+    const toggle = section?.querySelector('input[role="switch"]') as HTMLInputElement;
+    expect(section?.textContent).toContain("正在确认 Excel 连接");
+    expect(toggle.disabled).toBe(true);
+    await act(async () => { root.render(render(client)); });
+    expect(section?.textContent).toContain("正在确认 Excel 连接");
+    expect(toggle.disabled).toBe(true);
+    await act(async () => { toggle.click(); });
+    expect(setExcelAddinEnabled).not.toHaveBeenCalled();
+    await act(async () => {
+      finishCheck(applicationExcelStatus({ enabled: true, configured: true, connected: true }));
+      await pendingCheck;
+    });
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(false);
+    expect(section?.textContent).toContain("已连接");
+    expect(section?.textContent).not.toContain("正在确认 Excel 连接");
+  });
+
+  it("confirms a Windows Excel grant before showing connected", async () => {
+    const connected = applicationExcelStatus({ enabled: true, configured: true, connected: true,
+      connectionCount: 1, workbooks: [{ id: "book1", name: "Book1" }], activeWorkbookId: "book1" });
+    const unavailable = applicationExcelStatus({ enabled: true, configured: true,
+      error: "The running Excel application is not available for control. HRESULT -2147221021" });
+    let finishCheck!: (value: ExcelControlStatus) => void;
+    const pendingCheck = new Promise<ExcelControlStatus>(resolve => { finishCheck = resolve; });
+    const getExcelAddinStatus = vi.fn().mockResolvedValueOnce(applicationExcelStatus()).mockReturnValueOnce(pendingCheck);
+    const client = {
+      getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+      getExcelAddinStatus, setExcelAddinEnabled: vi.fn().mockResolvedValue(connected),
+      getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+    } as unknown as MemmyAgentClient;
+    await act(async () => {
+      root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform="win32" /></I18nProvider>);
+    });
+    const toggle = container.querySelector('input[role="switch"][aria-label="Microsoft Excel"]') as HTMLInputElement;
+    await act(async () => { toggle.click(); await Promise.resolve(); });
+    expect(container.textContent).toContain("正在连接");
+    expect(excelRowText()).not.toContain("已连接");
+    await act(async () => { finishCheck(unavailable); await pendingCheck; });
+    expect(getExcelAddinStatus).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("正在确认 Excel 连接");
+    expect(excelRowText()).not.toContain("已连接");
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
   });
 
   it("requires an explicit retry after native Excel permission is denied and never asks for Full Disk Access", async () => {
@@ -317,7 +449,7 @@ describe("computer use settings", () => {
       await act(async () => { retry.click(); });
       expect(setExcelAddinEnabled).toHaveBeenCalledTimes(1);
       expect(setExcelAddinEnabled).toHaveBeenCalledWith(true);
-      expect(container.textContent).toContain("已连接");
+      expect(excelRowText()).toContain("已连接");
       expect(container.textContent).not.toContain("macOS 已拒绝 Memmy 控制 Excel");
       expect(container.textContent).not.toContain("打开自动化设置");
     } finally {
@@ -443,8 +575,6 @@ describe("computer use settings", () => {
       error: "Excel is busy because a cell is being edited or a dialog is open. Ask the user to press Enter or close the dialog in Excel, then try again." },
     { name: "several Windows Excel instances", platform: "win32", language: "zh-CN", shown: "检测到同时运行着多个 Excel 程序",
       error: "Multiple Excel application instances are running. Keep one Excel instance open to select a workbook safely." },
-    { name: "an Excel dialog blocking the connection", platform: "win32", language: "zh-CN", shown: "Excel 正在运行，但暂时无法连接",
-      error: "The running Excel application is not available for control. Finish any Excel dialog and try again." },
     { name: "a locked Mac", platform: "darwin", language: "zh-CN", shown: "需要在电脑解锁的状态下才能操作 Excel",
       error: "macOS is locked; Excel operation was not executed" },
     { name: "an unresponsive Excel", platform: "darwin", language: "zh-CN", shown: "Excel 长时间没有响应",
@@ -465,6 +595,42 @@ describe("computer use settings", () => {
     expect(container.textContent).toContain(language === "en-US" ? "Retry connection" : "重试连接");
   });
 
+  it("waits through a Windows Excel startup attachment failure and clears it when polling recovers", async () => {
+    vi.useFakeTimers();
+    try {
+      const connected = applicationExcelStatus({ enabled: true, configured: true, connected: true });
+      const unavailable = applicationExcelStatus({ enabled: true, configured: true,
+        error: "The running Excel application is not available for control. COM HRESULT: 0x800401E3" });
+      const getExcelAddinStatus = vi.fn().mockResolvedValueOnce(connected)
+        .mockResolvedValueOnce(unavailable).mockResolvedValueOnce(unavailable)
+        .mockResolvedValueOnce(unavailable).mockResolvedValueOnce(connected);
+      const client = {
+        getComputerUseSetting: vi.fn().mockResolvedValue({ enabled: true, available: true, binaryAvailable: true }),
+        getExcelAddinStatus,
+        getExternalBrowserStatus: vi.fn().mockResolvedValue({ connected: [], claims: [] }),
+      } as unknown as MemmyAgentClient;
+      await act(async () => {
+        root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform="win32" /></I18nProvider>);
+      });
+      expect(excelRowText()).toContain("已连接");
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(container.textContent).toContain("正在确认 Excel 连接");
+      expect(excelRowText()).not.toContain("已连接");
+      expect(container.textContent).not.toContain("重试连接");
+      expect(container.textContent).not.toContain("0x800401E3");
+      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(container.textContent).toContain("请确认 Excel 已完成启动、没有待处理的窗口");
+      expect(container.textContent).toContain("重试连接");
+      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(excelRowText()).toContain("已连接");
+      expect(container.textContent).not.toContain("重试连接");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not flash a raw Excel status error and clears it when the next check recovers", async () => {
     vi.useFakeTimers();
     try {
@@ -481,14 +647,14 @@ describe("computer use settings", () => {
       await act(async () => {
         root.render(<I18nProvider language="zh-CN"><ComputerUseSettings client={client} platform="win32" /></I18nProvider>);
       });
-      expect(container.textContent).toContain("已连接");
+      expect(excelRowText()).toContain("已连接");
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
       expect(container.textContent).toContain("正在确认 Excel 连接");
-      expect(container.textContent).not.toContain("已连接");
+      expect(excelRowText()).not.toContain("已连接");
       expect(container.textContent).not.toContain("Object reference");
       expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-      expect(container.textContent).toContain("已连接");
+      expect(excelRowText()).toContain("已连接");
       expect(container.textContent).not.toContain("正在确认 Excel 连接");
     } finally {
       vi.useRealTimers();
@@ -536,9 +702,9 @@ describe("computer use settings", () => {
       const toggle = container.querySelector('input[role="switch"][aria-label="Microsoft Excel"]') as HTMLInputElement;
       await act(async () => { toggle.click(); });
       expect(container.textContent).toContain("暂时没连上 Excel");
-      expect(container.textContent).not.toContain("已连接");
+      expect(excelRowText()).not.toContain("已连接");
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-      expect(container.textContent).toContain("已连接");
+      expect(excelRowText()).toContain("已连接");
       expect(container.textContent).not.toContain("暂时没连上 Excel");
       expect(setExcelAddinEnabled).toHaveBeenCalledTimes(1);
     } finally {

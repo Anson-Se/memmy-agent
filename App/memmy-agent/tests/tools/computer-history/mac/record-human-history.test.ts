@@ -128,17 +128,22 @@ test("retains ordinary text in observed applications when no text allowlist is s
   });
 });
 
-test("withholds typed characters when the target is a password field or unknown", () => {
+test("withholds typed characters only when the target is a password field", () => {
   for (const target of [
     { role: "AXSecureTextField" },
     { role: "AXTextField", subrole: "AXSecureTextField" },
     { role: "AXSecureTextField", focused: { role: "AXTextField" } },
     { role: "ControlType.Edit", isPassword: true },
-    { role: "AXUnknown" },
-    undefined,
   ]) {
     const event = textInput("hunter2", notes, { keyboard: { text: "hunter2", target } });
     assert.equal(normalizeKeyBurst([event], { captureText: true, allowApps: [] }).details.text, "[REDACTED]");
+  }
+  // Apps such as WeChat do not report their focused input; that is not a password field.
+  for (const target of [{ role: "AXUnknown" }, undefined]) {
+    const event = textInput("你好", notes, { keyboard: { text: "你好", target } });
+    assert.deepEqual(normalizeKeyBurst([event], { captureText: true, allowApps: [] }).details, {
+      text: "你好", characterCount: 2, redacted: false,
+    });
   }
   assert.equal(isSecureInput(textInput("x", notes, {
     keyboard: { text: "x", target: { role: "AXTextField", subrole: "AXSecureTextField" } },
@@ -244,14 +249,15 @@ const policy = (
   observation: { defaultApplicationBehavior: defaultApp, defaultURLBehavior: defaultUrl, rules },
 });
 
-test("never records a window its browser reports as private", () => {
-  // The helper sets privateBrowsing for Chrome and Arc; the exclusion used to
-  // exist only in a policy function the capture path never called.
+test("records browser windows by the user's application and website rules alone", () => {
   const everything = policy("observe", "observe", [
     { scope: "app", bundleID: "com.google.Chrome", behavior: "observe" },
   ]);
-  assert.equal(shouldObserve(everything, { bundleId: "com.google.Chrome", url: "https://example.com/", privateBrowsing: true }), false);
-  assert.equal(shouldObserve(everything, { bundleId: "com.google.Chrome", url: "https://example.com/", privateBrowsing: false }), true);
+  assert.equal(shouldObserve(everything, { bundleId: "com.google.Chrome", url: "https://example.com/" }), true);
+  const withoutChrome = policy("observe", "observe", [
+    { scope: "app", bundleID: "com.google.Chrome", behavior: "do_not_observe" },
+  ]);
+  assert.equal(shouldObserve(withoutChrome, { bundleId: "com.google.Chrome", url: "https://example.com/" }), false);
 });
 
 test("never records the login window or the screen saver, whatever the rules say", () => {

@@ -117,3 +117,41 @@ it('sends a cancel request when an in-app upload turn is aborted', async () => {
     else delete (process as { send?: unknown }).send;
   }
 });
+
+it('requests external browser facts without reading or claiming any page', async () => {
+  const bridge = new EmbeddedBrowserBridge();
+  const signal = new AbortController().signal;
+  (bridge as any).request = vi.fn(async () => ({ installation: {
+    chrome: { installed: true, enabled: false }, edge: { installed: null, enabled: null },
+  }, runningBrowsers: ['chrome', 'chrome'] }));
+  try {
+    expect(await bridge.getExternalBrowserState(signal)).toEqual({ installation: {
+      chrome: { installed: true, enabled: false }, edge: { installed: null, enabled: null },
+    }, runningBrowsers: ['chrome'] });
+    expect((bridge as any).request).toHaveBeenCalledExactlyOnceWith('externalBrowserState', {}, undefined, signal);
+    expect(bridge.listClaims()).toEqual([]);
+  } finally { bridge.close(); }
+});
+
+it.each([null, {}, { installation: { chrome: { installed: 'yes', enabled: 1 } }, runningBrowsers: ['other'] }])
+  ('preserves malformed external browser facts as unknown: %j', async response => {
+    const bridge = new EmbeddedBrowserBridge();
+    (bridge as any).request = vi.fn(async () => response);
+    try {
+      expect(await bridge.getExternalBrowserState()).toEqual({ installation: {
+        chrome: { installed: null, enabled: null }, edge: { installed: null, enabled: null },
+      }, runningBrowsers: null });
+    } finally { bridge.close(); }
+  });
+
+it('sends only the target browser identity and cancellation signal for recovery', async () => {
+  const bridge = new EmbeddedBrowserBridge();
+  const signal = new AbortController().signal;
+  (bridge as any).request = vi.fn(async () => 'woken');
+  try {
+    expect(await bridge.recoverExternalBrowser('edge', signal)).toBe('woken');
+    expect((bridge as any).request).toHaveBeenCalledExactlyOnceWith('recoverExternalBrowser', { browser: 'edge' }, undefined, signal);
+    (bridge as any).request.mockResolvedValue({ private: 'untrusted' });
+    expect(await bridge.recoverExternalBrowser('chrome')).toBe('unavailable');
+  } finally { bridge.close(); }
+});

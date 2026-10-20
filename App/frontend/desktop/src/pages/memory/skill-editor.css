@@ -24,6 +24,11 @@
   padding: 6px 12px;
   background: var(--color-background-paper);
   color: var(--color-text-ink);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  cursor: pointer;
 }
 
 .memory-skill-editor__button:disabled {
