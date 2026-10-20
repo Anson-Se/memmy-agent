@@ -198,6 +198,7 @@ async function lifecycleHarness(factory, options = {}) {
   vi.stubGlobal("fetch", vi.fn(async (url, init) => {
     const path = new URL(url).pathname, body = init?.body ? JSON.parse(init.body) : {};
     requests.push({ path, body });
+    if (options.failL3 && path.endsWith("/context")) return Response.json({ error: "L3 temporarily unavailable" }, { status: 503 });
     return Response.json(options.l3 && path === "/api/v1/health" ? { features: { l3WorldModelProtocolVersions: [2] } }
       : path === "/api/v1/sessions/open" ? { sessionId: "memmy-session" }
       : path.endsWith("/context") ? { renderedContext: options.l3?.() || "" }
@@ -343,5 +344,19 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s L3 and effective A
       expect(JSON.stringify(refreshed)).not.toContain("INITIAL_L3");
       expect(reads()).toHaveLength(2); expect(boundaries()).toHaveLength(1);
     } finally { await h.cleanup(); }
+  });
+});
+
+
+describe.each([["Backend", backend], ["Memory", memory]])("%s V1 L3 degradation", (_, factory) => {
+  it("keeps recall and capture active when L3 initialization fails", async () => {
+    const h = await lifecycleHarness(factory, { l3: () => "unused", failL3: true });
+    const hooks = await h.plugin.server({ directory: "fixture" });
+    try {
+      await hooks["chat.message"]({ sessionID: "session-1", messageID: "user-1" }, { message: { id: "user-1", agent: "build" }, parts: [{ type: "text", text: "Inspect README" }] });
+      expect(h.requests.filter(r => r.path === "/api/v1/turns/start")).toHaveLength(1);
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-1" } } });
+      await vi.waitFor(() => expect(h.captures()).toHaveLength(1));
+    } finally { await hooks.dispose(); await h.cleanup(); }
   });
 });

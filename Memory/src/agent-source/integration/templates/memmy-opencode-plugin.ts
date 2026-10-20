@@ -240,11 +240,15 @@ const createMemmyHooks = async ({ client, directory, worktree, resolveAgent, mod
       sessionAgents.set(input.sessionID, input.agent);
       const runtimeSession = await ensureSession(memmy, input.sessionID, input.agent);
       if (!modelContextL3) {
-        const context = await l3Context(input.sessionID, input.agent);
-        const state = l3States.get(input.sessionID);
-        if (state.pendingInjection) {
-          selectedContext = [selectedContext, context].filter(Boolean).join("\n\n");
-          state.pendingInjection = false;
+        try {
+          const context = await l3Context(input.sessionID, input.agent);
+          const state = l3States.get(input.sessionID);
+          if (state.pendingInjection) {
+            selectedContext = [selectedContext, context].filter(Boolean).join("\n\n");
+            state.pendingInjection = false;
+          }
+        } catch (error) {
+          log("warn", "Memmy L3 initialization deferred", { error: formatError(error), sessionID: input.sessionID });
         }
       }
       const sessionId = runtimeSession.sessionId;
