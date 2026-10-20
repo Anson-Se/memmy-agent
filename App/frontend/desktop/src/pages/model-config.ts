@@ -21,7 +21,7 @@ import {
 } from "./model-config-validation.js";
 
 /** Type definition for protocol. */
-export type Protocol = "openai" | "anthropic" | "gemini" | "deepseek" | "zhipu" | "qwen" | "moonshot" | "minimax" | "baidu" | "doubao" | "stepfun" | "xiaomi";
+export type Protocol = "openai" | "openai_responses" | "anthropic" | "gemini" | "deepseek" | "zhipu" | "qwen" | "moonshot" | "minimax" | "baidu" | "doubao" | "stepfun" | "xiaomi" | "custom";
 
 /** Contract for model config. */
 export interface ModelConfig {
@@ -35,6 +35,7 @@ export interface ModelConfig {
   configured: boolean;
   showKey: boolean;
   validation: ModelConfigValidationState;
+  customProtocol?: CustomProtocol;
 }
 
 /** Contract for protocol option. */
@@ -112,7 +113,8 @@ export interface TestModelConnectionMessages {
 }
 
 export const PROTOCOL_OPTIONS: ProtocolOption[] = [
-  { value: "openai", labelKey: "apiKey.provider.openai" },
+  { value: "openai", labelKey: "apiKey.provider.openaiCompletions" },
+  { value: "openai_responses", labelKey: "apiKey.provider.openaiResponses" },
   { value: "anthropic", labelKey: "apiKey.provider.anthropic" },
   { value: "gemini", labelKey: "apiKey.provider.gemini" },
   { value: "deepseek", labelKey: "apiKey.provider.deepseek" },
@@ -123,13 +125,15 @@ export const PROTOCOL_OPTIONS: ProtocolOption[] = [
   { value: "baidu", labelKey: "apiKey.provider.baidu" },
   { value: "doubao", labelKey: "apiKey.provider.doubao" },
   { value: "stepfun", labelKey: "apiKey.provider.stepfun" },
-  { value: "xiaomi", labelKey: "apiKey.provider.xiaomi" }
+  { value: "xiaomi", labelKey: "apiKey.provider.xiaomi" },
+  { value: "custom", labelKey: "apiKey.provider.custom" }
 ];
 
 const MEMMY_ACCOUNT_PROVIDER = "memmy_account";
 
 export const DEFAULT_ENDPOINTS: Record<Protocol, string> = {
   openai: "https://api.openai.com/v1",
+  openai_responses: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   gemini: "https://generativelanguage.googleapis.com",
   deepseek: "https://api.deepseek.com/v1",
@@ -140,11 +144,13 @@ export const DEFAULT_ENDPOINTS: Record<Protocol, string> = {
   baidu: "https://qianfan.baidubce.com/v2",
   doubao: "https://ark.cn-beijing.volces.com/api/v3",
   stepfun: "https://api.stepfun.com/v1",
-  xiaomi: "https://api.xiaomimimo.com/v1"
+  xiaomi: "https://api.xiaomimimo.com/v1",
+  custom: ""
 };
 
 export const DEFAULT_MODEL_IDS: Record<Protocol, string> = {
   openai: "gpt-4o",
+  openai_responses: "gpt-4o",
   anthropic: "claude-sonnet-4",
   gemini: "gemini-2.5-pro",
   deepseek: "deepseek-chat",
@@ -155,7 +161,8 @@ export const DEFAULT_MODEL_IDS: Record<Protocol, string> = {
   baidu: "ernie-x1.1",
   doubao: "doubao-pro-256k",
   stepfun: "step-3.5-flash",
-  xiaomi: "mimo-v2.5-pro"
+  xiaomi: "mimo-v2.5-pro",
+  custom: ""
 };
 
 export const ASR_MODEL_ID = QWEN_ASR_MODEL_ID;
@@ -634,6 +641,14 @@ export function toProtocol(provider: string): Protocol {
     return "moonshot";
   }
 
+  if (provider === "openai_responses") {
+    return "openai_responses";
+  }
+
+  if (provider === "custom") {
+    return "custom";
+  }
+
   return PROTOCOL_OPTIONS.some((option) => option.value === provider) ? (provider as Protocol) : "openai";
 }
 
@@ -693,5 +708,26 @@ export function textProviderDisplayName(
 
 /** Handles from protocol. */
 export function fromProtocol(protocol: Protocol): string {
-  return protocol === "moonshot" ? "kimi" : protocol;
+  if (protocol === "moonshot") return "kimi";
+  if (protocol === "openai_responses") return "openai_responses";
+  if (protocol === "custom") return "custom";
+  return protocol;
 }
+
+export type CustomProtocol =
+  | "openai-chat-completions"
+  | "openai-responses"
+  | "anthropic-messages"
+  | "bedrock-converse";
+
+export interface CustomProtocolOption {
+  value: CustomProtocol;
+  labelKey: MessageKey;
+}
+
+export const CUSTOM_PROTOCOL_OPTIONS: CustomProtocolOption[] = [
+  { value: "openai-chat-completions", labelKey: "apiKey.customProtocol.openaiCompletions" },
+  { value: "openai-responses", labelKey: "apiKey.customProtocol.openaiResponses" },
+  { value: "anthropic-messages", labelKey: "apiKey.customProtocol.anthropicMessages" },
+  { value: "bedrock-converse", labelKey: "apiKey.customProtocol.awsBedrock" }
+];

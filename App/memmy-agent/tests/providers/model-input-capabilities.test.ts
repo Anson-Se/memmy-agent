@@ -7,6 +7,7 @@ import {
   MODEL_INPUT_CAPABILITIES,
   MODEL_INPUT_CAPABILITIES_REVIEWED_AT,
   requiredInputModalities,
+  resolveModelInputModalities,
   type ModelInputModality,
 } from "../../src/providers/model-input-capabilities.js";
 
@@ -84,5 +85,12 @@ describe("model input capabilities", () => {
     expect(imageRequired).toEqual(["text", "image"]);
     expect(coversInputModalities(["text", "image"], imageRequired)).toBe(true);
     expect(coversInputModalities(["text"], imageRequired)).toBe(false);
+  });
+
+  it("prefers an explicit modality declaration over the static catalog", () => {
+    expect(resolveModelInputModalities("deepseek-v4-pro", ["text", "image"])).toEqual(["text", "image"]);
+    expect(resolveModelInputModalities("gpt-5.6", ["text"])).toEqual(["text"]);
+    expect(resolveModelInputModalities("Qwen3-27B", undefined)).toEqual(["text"]);
+    expect(resolveModelInputModalities("gpt-5.6", null)).toEqual(["text", "image"]);
   });
 });

@@ -365,6 +365,49 @@ describe("config-client canonical model catalog", () => {
     });
     expect(result.ok).toBe(true);
   });
+
+  it("keeps custom as the test provider and probes by the selected protocol", async () => {
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ ok: true, message: "ok", checkedAt: "2026-08-11T00:00:00.000Z" });
+    }));
+    const client = createHttpConfigClient(config);
+
+    await client.testModelConfig({
+      provider: "custom",
+      endpointId: "chat",
+      protocol: "openai-chat-completions",
+      endpoint: "https://api.example.test/v1",
+      model: "gpt-6-sol",
+      apiKey: "sk-live",
+      apiKeyMasked: "",
+      configured: true
+    });
+    await client.testModelConfig({
+      provider: "custom",
+      endpointId: "messages",
+      protocol: "anthropic-messages",
+      endpoint: "https://api.anthropic.com",
+      model: "claude-sonnet",
+      apiKey: "sk-live",
+      apiKeyMasked: "",
+      configured: true
+    });
+
+    expect(bodies[0]).toMatchObject({
+      provider: "custom",
+      protocol: "openai-chat-completions",
+      apiBase: "https://api.example.test/v1",
+      modelId: "gpt-6-sol"
+    });
+    expect(bodies[1]).toMatchObject({
+      provider: "custom",
+      protocol: "anthropic-messages",
+      apiBase: "https://api.anthropic.com",
+      modelId: "claude-sonnet"
+    });
+  });
 });
 
 function catalog(configRevision: string): ModelConfigView {

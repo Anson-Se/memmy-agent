@@ -16,6 +16,10 @@ import {
   convertTools,
   parseResponseOutput,
 } from "./openai-responses/index.js";
+import {
+  chatCompletionsModelForcesNoneReasoning,
+  customModelUsesMaxCompletionTokens,
+} from "./custom-provider.js";
 import { memmyAccountNoneThinkingStyle } from "./memmy-account.js";
 import { getModelInputModalities } from "./model-input-capabilities.js";
 import { OPENROUTER_ATTRIBUTION_HEADERS } from "./openrouter-attribution.js";
@@ -136,7 +140,8 @@ export class OpenAICompatProvider extends LLMProvider {
     }
 
     this.defaultModel = this.model ?? "gpt-4o";
-    if (this.apiType !== "auto" && specName(this.spec) !== "openai") {
+    const name = specName(this.spec);
+    if (this.apiType !== "auto" && name !== "openai" && name !== "custom") {
       this.apiType = "auto";
     }
     if (this.apiKey && this.spec?.envKey) this.setupEnv(this.apiKey, this.apiBase);
@@ -608,7 +613,9 @@ export class OpenAICompatProvider extends LLMProvider {
 
     if (OpenAICompatProvider.supportsTemperature(modelName, reasoningEffort))
       kwargs.temperature = temperature;
-    if (this.spec?.supportsMaxCompletionTokens) kwargs.max_completion_tokens = maxTokens;
+    const useMaxCompletionTokens = Boolean(this.spec?.supportsMaxCompletionTokens)
+      || (specName(this.spec) === "custom" && customModelUsesMaxCompletionTokens(modelName));
+    if (useMaxCompletionTokens) kwargs.max_completion_tokens = maxTokens;
     else kwargs.max_tokens = maxTokens;
 
     for (const [pattern, overrides] of this.spec?.modelOverrides ?? []) {
@@ -618,7 +625,16 @@ export class OpenAICompatProvider extends LLMProvider {
       }
     }
 
-    if (wireEffort && semanticEffort !== "none") kwargs.reasoning_effort = wireEffort;
+    const chatCompletionsGptWithTools = this.apiType === "chatCompletions"
+      && Boolean(tools?.length)
+      && chatCompletionsModelForcesNoneReasoning(modelName);
+    const providerName = specName(this.spec);
+    const thinkingOff = !wireEffort || semanticEffort === "none";
+    const forceNoneReasoningEffort = chatCompletionsGptWithTools && (
+      providerName === "openai" || (providerName === "custom" && thinkingOff)
+    );
+    if (forceNoneReasoningEffort) kwargs.reasoning_effort = "none";
+    else if (wireEffort && semanticEffort !== "none") kwargs.reasoning_effort = wireEffort;
     if (reasoningEffort !== null) {
       const thinkingEnabled = semanticEffort !== "none" && semanticEffort !== "minimal";
       const styles = thinkingStylesFor(this.spec, modelName);
