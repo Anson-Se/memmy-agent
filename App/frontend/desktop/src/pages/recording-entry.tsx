@@ -2,10 +2,10 @@
  * The recording entry in the conversation top bar, and the page it opens.
  *
  * The PoC asks for a button next to the conversation title that opens the
- * recording page in the side panel and closes it on a second click. The page is
- * the one the design calls 访谈录音: it opens on 录音列表, and from there the
- * user either records an interview or uploads one they already have. A finished
- * recording becomes a row in that list, and a row can be sent into the
+ * recording page in the side panel and closes it on a second click. It opens on
+ * the recording list, and from there the user either starts a new recording or
+ * uploads one they already have. A finished recording becomes a row in that
+ * list, and a row can be sent into the
  * conversation either as a summary task or as material for the current one.
  *
  * The composer opens a compact recorder; the top-bar icon opens the list.
@@ -100,7 +100,7 @@ export interface RecordingEntrySession {
    * Transcribes a row again after its first attempt failed.
    *
    * The audio is kept on exactly this assumption, so a transient ASR failure
-   * does not cost the user an interview.
+   * does not cost the user a recording.
    */
   retry?(entry: RecordingArchiveEntry): void;
   /** Row ids whose transcription is being tried again, so the row can show it. */

@@ -75,7 +75,7 @@ it("archives a guidance recording before its card disappears, reopens it from th
     // lists the interview itself and can be submitted.
     expect(respond).toHaveBeenCalledTimes(1);
     expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(1);
-    expect(container.querySelector(".diagnostic-upload-card")?.textContent).toContain("访谈转写-");
+    expect(container.querySelector(".diagnostic-upload-card")?.textContent).toContain("录音转写-");
     expect(container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.disabled).toBe(false);
     await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
     expect(respond).toHaveBeenCalledTimes(2);
