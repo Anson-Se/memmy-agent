@@ -94,7 +94,7 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s OpenCode upgrade",
       command: { async transform(fn) { fn({ add(c) { command = c; } }); return registration(); } },
       session: {
         async get() { return { agent: "build" }; },
-        async hook(name, fn) { expect(name).toBe("prompt"); promptHook = fn; return registration(); },
+        async hook(name, fn) { expect(["prompt", "context"]).toContain(name); if (name === "prompt") promptHook = fn; return registration(); },
         async prompt(input) { const event = { sessionID: input.sessionID, messageID: "resume", prompt: { text: input.text } }; await promptHook(event); return event; }
       },
       event: { async *subscribe(options) {
@@ -188,7 +188,7 @@ function writeV2Fixture(dataHome) {
 
 // This harness exercises installed artifacts with exact V2 event names. The
 // separate real-host script guards the contract against changes in OpenCode.
-async function lifecycleHarness(factory) {
+async function lifecycleHarness(factory, options = {}) {
   const { root, target } = fixture(factory);
   await target.installPlugin("opencode");
   const plugin = await load(root);
@@ -198,15 +198,19 @@ async function lifecycleHarness(factory) {
   vi.stubGlobal("fetch", vi.fn(async (url, init) => {
     const path = new URL(url).pathname, body = init?.body ? JSON.parse(init.body) : {};
     requests.push({ path, body });
-    return Response.json(path === "/api/v1/sessions/open" ? { sessionId: "memmy-session" }
+    return Response.json(options.l3 && path === "/api/v1/health" ? { features: { l3WorldModelProtocolVersions: [2] } }
+      : path === "/api/v1/sessions/open" ? { sessionId: "memmy-session" }
+      : path.endsWith("/context") ? { renderedContext: options.l3?.() || "" }
+      : path.endsWith("/l3-world-model-trace-head") ? { throughL1MemoryId: "trace" }
       : path === "/api/v1/turns/start" ? { turnId: body.turnId } : { status: "stored" });
   }));
-  const buffer = []; let wake; let prompt; let aborted = false;
+  const buffer = []; let wake; let prompt; let context; let aborted = false;
   const ctx = {
     location: { directory: root },
     tool: { async transform() { return { dispose() {} }; } },
     command: { async transform() { return { dispose() {} }; } },
-    session: { async get() { return { agent: "build" }; }, async hook(_, fn) { prompt = fn; return { dispose() {} }; } },
+    agent: { async list() { return [{ id: options.defaultAgent || "build", mode: "primary" }]; } },
+    session: { async get() { return { agent: options.defaultAgent ? undefined : "build" }; }, async hook(name, fn) { if (name === "prompt") prompt = fn; else if (name === "context") context = fn; return { dispose() {} }; } },
     event: { async *subscribe({ signal }) {
       signal.addEventListener("abort", () => { aborted = true; wake?.(); }, { once: true });
       while (!aborted) { if (!buffer.length) await new Promise(r => wake = r); while (buffer.length) yield buffer.shift(); }
@@ -214,7 +218,8 @@ async function lifecycleHarness(factory) {
   };
   const cleanup = await plugin.setup(ctx);
   return {
-    dbPath, cleanup, plugin,
+    dbPath, cleanup, plugin, requests,
+    context: async (system = []) => { const event = { sessionID: "session-1", agent: options.defaultAgent || "build", system }; await context(event); return event.system; },
     captures: () => requests.filter(r => r.path === "/api/v1/source-turns/complete").map(r => r.body),
     prompt: id => prompt({ sessionID: "session-1", messageID: id, prompt: { text: "Native request " + id } }),
     emit: (type, extra = {}) => { buffer.push({ type, data: { sessionID: "session-1", ...extra } }); wake?.(); }
@@ -306,5 +311,37 @@ describe.each([["Backend", backend], ["Memory", memory]])("%s turn lifecycle", (
       await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-1" } } });
     } finally { await hooks.dispose(); await h.cleanup(); }
     expect(h.captures()).toHaveLength(1);
+  });
+});
+
+describe.each([["Backend", backend], ["Memory", memory]])("%s L3 and effective Agent", (_, factory) => {
+  it("initializes on actual use, coalesces concurrent reads and refreshes only a durable successful compaction", async () => {
+    let l3 = "INITIAL_L3";
+    const h = await lifecycleHarness(factory, { l3: () => l3, defaultAgent: "plan" });
+    const reads = () => h.requests.filter(r => r.path.endsWith("/context"));
+    const boundaries = () => h.requests.filter(r => r.path.endsWith("/l3-world-model-boundary"));
+    try {
+      // No session.created: same path for cold start and restored existing sessions.
+      await h.prompt("user-1");
+      const contexts = await Promise.all([h.context(), h.context()]);
+      expect(contexts.every(parts => JSON.stringify(parts).includes("INITIAL_L3"))).toBe(true);
+      expect(reads()).toHaveLength(1);
+      expect(h.requests.find(r => r.path === "/api/v1/sessions/open").body.namespace.profileId).toBe("plan");
+      expect(h.requests.find(r => r.path === "/api/v1/turns/start").body.namespace.profileId).toBe("plan");
+      expect(await h.context(contexts[0])).toHaveLength(1); // duplicate hook does not append twice
+      l3 = "UPDATED_L3";
+      const db = new DatabaseSync(h.dbPath);
+      db.prepare("INSERT INTO session_message VALUES ('compact', 'session-1', 'compaction', ?, 20, 20)").run(JSON.stringify({ status: "failed" }));
+      h.emit("session.compaction.failed");
+      expect(JSON.stringify(await h.context())).toContain("INITIAL_L3");
+      expect(reads()).toHaveLength(1); expect(boundaries()).toHaveLength(0);
+      db.prepare("UPDATE session_message SET data = ? WHERE id = 'compact'").run(JSON.stringify({ status: "completed" })); db.close();
+      h.emit("session.compaction.ended");
+      h.emit("session.compaction.ended");
+      const refreshed = await h.context();
+      expect(JSON.stringify(refreshed)).toContain("UPDATED_L3");
+      expect(JSON.stringify(refreshed)).not.toContain("INITIAL_L3");
+      expect(reads()).toHaveLength(2); expect(boundaries()).toHaveLength(1);
+    } finally { await h.cleanup(); }
   });
 });

@@ -290,7 +290,7 @@ export async function completeSourceTurn(input: {
   })));
 }
 
-type NodeSqliteDatabase = import("node:sqlite").DatabaseSync;
+type NodeSqliteDatabase = Pick<import("node:sqlite").DatabaseSync, "prepare" | "close">;
 
 let nodeSqlite: Promise<typeof import("node:sqlite")> | undefined;
 
@@ -315,8 +315,47 @@ function silenceSqliteExperimentalWarning(): void {
 }
 
 async function openReadOnlySqlite(path: string): Promise<NodeSqliteDatabase> {
+  // Official V1 embeds Bun, which does not implement node:sqlite. Choose the
+  // host driver before opening; never retry an open error with a writable DB.
+  if ("Bun" in globalThis) {
+    const moduleName = "bun:sqlite";
+    const { Database } = await import(moduleName);
+    return new Database(path, { readonly: true, create: false, strict: true });
+  }
   const { DatabaseSync } = await loadNodeSqlite();
   return new DatabaseSync(path, { readOnly: true });
+}
+
+/** Resolve only host-provided identities. V1 exposes the selected agent on
+ * output.message; V2 agent.list puts its configured effective default first. */
+export function resolveOpencodeAgent(selected: unknown, messageAgent?: unknown, agents?: unknown): string {
+  const explicit = text(selected) || text(messageAgent);
+  if (explicit) return explicit;
+  const list = Array.isArray(agents) ? agents : objectValue(agents).data;
+  if (Array.isArray(list)) {
+    const candidate = list.map(objectValue).find(agent => agent.mode !== "subagent" && !agent.hidden);
+    const id = text(candidate?.id) || text(candidate?.name);
+    if (id) return id;
+  }
+  throw new Error("OpenCode effective agent unavailable");
+}
+
+/** Durable success identity also covers a compaction event delivered before its
+ * projection, missed during restart, or repeated by the host. Failed rows are ignored. */
+export async function readOpencodeCompactionBoundary(conversationId: string): Promise<string> {
+  const db = await openReadOnlySqlite(resolveOpencodeDatabasePath());
+  try {
+    const v2 = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_v2'").get();
+    const rows = db.prepare(v2
+      ? "SELECT id, data FROM session_message WHERE session_id = ? AND type = 'compaction' ORDER BY seq DESC"
+      : "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC").all(conversationId);
+    for (const value of rows) {
+      const row = objectValue(value);
+      const data = objectValue(JSON.parse(String(row.data)));
+      if (v2 ? data.status === "completed" : data.summary === true && objectValue(data.time).completed && !data.error) return text(row.id);
+    }
+    return "";
+  } finally { db.close(); }
 }
 
 /**

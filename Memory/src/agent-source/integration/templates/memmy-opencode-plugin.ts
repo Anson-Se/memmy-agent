@@ -14,6 +14,8 @@ import {
   notifyRuntimeBoundary,
   openRuntimeSession,
   readOpencodeHookSourceTurn,
+  readOpencodeCompactionBoundary,
+  resolveOpencodeAgent,
   startRuntimeTurn
 } from "./memmy-workspace-bridge.mjs";
 
@@ -26,7 +28,7 @@ const DISPLAY_LIMIT = 5;
 const RESUME_STATE_TTL_MS = 10 * 60 * 1000;
 const RESUME_CONTEXT_MAX_CHARS = 24000;
 const TOOL_OUTPUT_MAX_CHARS = 12000;
-const PLUGIN_REVISION = "opencode-v2-2";
+const PLUGIN_REVISION = "opencode-v2-3";
 
 // A single default export prevents V1 from registering the same plugin twice.
 // The schema helper is bundled in our bridge; neither host needs the other SDK.
@@ -38,7 +40,11 @@ export default {
     return hooks;
   },
   async setup(ctx) {
-    const hooks = await createMemmyHooks({ directory: ctx.location.directory });
+    const resolveAgent = async (sessionID) => {
+      const session = await ctx.session.get({ sessionID });
+      return resolveOpencodeAgent(session.agent, undefined, session.agent ? undefined : await ctx.agent.list());
+    };
+    const hooks = await createMemmyHooks({ directory: ctx.location.directory, resolveAgent, modelContextL3: true });
     const controller = new AbortController();
     const registrations = [];
     let events;
@@ -70,13 +76,24 @@ export default {
           const session = await ctx.session.get({ sessionID: event.sessionID });
           if (session.parentID) return;
           await hooks["chat.message"](
-            { sessionID: event.sessionID, messageID: event.messageID, agent: session.agent },
+            { sessionID: event.sessionID, messageID: event.messageID, agent: await resolveAgent(event.sessionID) },
             { message: { id: event.messageID }, parts }
           );
           event.prompt.text = extractUserText(parts);
         } catch (error) {
           console.warn("Memmy prompt recall skipped: " + formatError(error));
         }
+      }));
+      registrations.push(await ctx.session.hook("context", async (event) => {
+        if (controller.signal.aborted) return;
+        try {
+          const session = await ctx.session.get({ sessionID: event.sessionID });
+          if (session.parentID) return;
+          const context = await hooks.l3Context(event.sessionID, event.agent);
+          // Context hooks receive a fresh model request, not a persisted user
+          // message. Inject one current L3 block even after automatic compaction.
+          if (context && !event.system.some(part => part.text === context)) event.system.push({ type: "text", text: context });
+        } catch (error) { console.warn("Memmy L3 context skipped: " + formatError(error)); }
       }));
       registrations.push(await ctx.command.transform((editor) => editor.add({
         name: "memmy-resume",
@@ -97,9 +114,9 @@ export default {
             const terminal = ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"].includes(event.type);
             // Shutdown preserves V2's execution claim: it is not a completed turn.
             if (event.type === "session.execution.interrupted" && properties.reason === "shutdown") continue;
-            if (!terminal && !["session.created", "session.compacted", "session.deleted"].includes(event.type)) continue;
+            if (!terminal && !["session.compaction.ended", "session.deleted"].includes(event.type)) continue;
             try {
-              await hooks.event({ event: { type: terminal ? "session.idle" : event.type, properties } });
+              await hooks.event({ event: { type: terminal ? "session.idle" : event.type === "session.compaction.ended" ? "session.compacted" : event.type, properties } });
             } catch (error) {
               console.warn("Memmy event failed: " + formatError(error));
             }
@@ -117,9 +134,10 @@ export default {
   }
 };
 
-const createMemmyHooks = async ({ client, directory, worktree }) => {
+const createMemmyHooks = async ({ client, directory, worktree, resolveAgent, modelContextL3 = false }) => {
   const sessionCache = new Map();
-  const l3InjectOnce = new Map();
+  const l3States = new Map();
+  const sessionAgents = new Map();
   const pendingTurns = new Map();
   const pendingResumeSelections = new Map();
   const latestRequests = new Map();
@@ -150,21 +168,22 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     for (const [key, session] of sessionCache) {
       if (!key.startsWith(sessionID + ":")) continue;
       sessionCache.delete(key);
-      await closeRuntimeSession(session).catch(() => undefined);
+      await Promise.resolve(session).then(closeRuntimeSession).catch(() => undefined);
     }
-    l3InjectOnce.delete(sessionID);
+    l3States.delete(sessionID);
+    sessionAgents.delete(sessionID);
     pendingResumeSelections.delete(sessionID);
     latestRequests.delete(sessionID);
   }
 
   async function ensureSession(memmy, externalSessionId, agent) {
-    const profileId = normalizeText(agent) || "main";
+    const profileId = resolveOpencodeAgent(agent);
     const cacheKey = externalSessionId + ":" + profileId;
     const cached = sessionCache.get(cacheKey);
     if (cached) {
       return cached;
     }
-    const opened = await openRuntimeSession({
+    const opening = openRuntimeSession({
       configUrl: CONFIG_URL,
       source: SOURCE,
       adapterId: "memmy-opencode-plugin",
@@ -172,10 +191,39 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       sessionKey: "opencode-memory-" + externalSessionId,
       workspaceRoot: worktree || directory || null,
       transition: "allow_legacy_rollover"
+    }).then((opened) => {
+      if (!opened) throw new Error("Memmy session unavailable");
+      return opened;
+    }).catch((error) => { sessionCache.delete(cacheKey); throw error; });
+    sessionCache.set(cacheKey, opening);
+    return opening;
+  }
+
+  async function l3Context(sessionID, agent) {
+    const profile = resolveOpencodeAgent(agent || sessionAgents.get(sessionID));
+    sessionAgents.set(sessionID, profile);
+    let state = l3States.get(sessionID);
+    if (!state) { state = { initialized: false, context: "", boundary: "", job: Promise.resolve() }; l3States.set(sessionID, state); }
+    // Serialize initialization and compaction refresh per native session.
+    const job = state.job.catch(() => undefined).then(async () => {
+      const runtime = await ensureSession(null, sessionID, profile);
+      const boundary = await readOpencodeCompactionBoundary(sessionID).catch(() => null);
+      const changed = boundary && boundary !== state.boundary;
+      if (!state.initialized || changed) {
+        if (changed && state.initialized && state.notifiedBoundary !== boundary) {
+          await notifyRuntimeBoundary(runtime, "token_compaction");
+          state.notifiedBoundary = boundary;
+        }
+        const loaded = await loadRuntimeL3(runtime);
+        state.context = loaded.additionalContext || "";
+        state.initialized = true;
+        state.pendingInjection = true;
+        if (boundary !== null) state.boundary = boundary;
+      }
+      return state.context;
     });
-    if (!opened) throw new Error("Memmy session unavailable");
-    sessionCache.set(cacheKey, opened);
-    return opened;
+    state.job = job;
+    return job;
   }
 
   async function beginTurn(input, output, query, selectedContext = "") {
@@ -188,7 +236,17 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
     let recalledContext = "";
     try {
       const memmy = await createMemmyClient();
+      input = { ...input, agent: resolveOpencodeAgent(input.agent, output && output.message && output.message.agent) };
+      sessionAgents.set(input.sessionID, input.agent);
       const runtimeSession = await ensureSession(memmy, input.sessionID, input.agent);
+      if (!modelContextL3) {
+        const context = await l3Context(input.sessionID, input.agent);
+        const state = l3States.get(input.sessionID);
+        if (state.pendingInjection) {
+          selectedContext = [selectedContext, context].filter(Boolean).join("\n\n");
+          state.pendingInjection = false;
+        }
+      }
       const sessionId = runtimeSession.sessionId;
       const requestedTurnId = normalizeText(input.messageID) || normalizeText(output && output.message && output.message.id);
       const turn = await startRuntimeTurn(
@@ -213,7 +271,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
         sourceMemoryIds: Array.isArray(turn && turn.sourceMemoryIds) ? turn.sourceMemoryIds : undefined,
         query: cleanQuery,
         userMessageId: normalizeText(output && output.message && output.message.id) || requestedTurnId,
-        profileId: normalizeText(input.agent) || "main",
+        profileId: input.agent,
         answerParts: new Map(),
         toolCalls: [],
         toolResults: [],
@@ -297,12 +355,16 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
       log("warn", "Memmy turn capture deferred", { reason: parsed.reason || "identity_unresolved", sessionID: conversationId, turnId });
       return false;
     }
+    // Preserve the Memory scope check. If execution selected another agent,
+    // resolve its scoped session instead of reusing the old agent's session ID.
+    const captureSession = parsed.turn.profileId === pending.profileId
+      ? pending.sessionId : (await ensureSession(null, conversationId, parsed.turn.profileId)).sessionId;
     const result = await completeSourceTurn({
       configUrl: CONFIG_URL,
       turn: parsed.turn,
-      sessionId: normalizeText(pending.sessionId) || undefined,
+      sessionId: normalizeText(captureSession) || undefined,
       sourceMemoryIds: pending.sourceMemoryIds,
-      profileId: normalizeText(parsed.turn.profileId) || normalizeText(pending.profileId) || "main",
+      profileId: parsed.turn.profileId,
       adapterId: "memmy-opencode-plugin"
     });
     const status = normalizeText(result && result.status);
@@ -365,6 +427,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
   }
 
   return {
+    l3Context,
     tool: {
       memmy_memory_search: tool({
         description: "Search Memmy local memory for relevant facts, preferences, decisions, procedures, and prior tasks.",
@@ -419,7 +482,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
             throw new Error("Missing required parameter: content");
           }
           const memmy = await createMemmyClient();
-          const sessionId = (await ensureSession(memmy, context.sessionID, context.agent)).sessionId;
+          const sessionId = (await ensureSession(memmy, context.sessionID, context.agent || sessionAgents.get(context.sessionID) || (resolveAgent && await resolveAgent(context.sessionID)))).sessionId;
           const result = await memmy.post("/api/v1/memory/add", {
             content,
             title: normalizeText(args.title) || undefined,
@@ -447,9 +510,7 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
         await handleResumeSearch(input.sessionID, normalizeText(commandArguments), output.parts);
         return;
       }
-      const l3Context = l3InjectOnce.get(input.sessionID) || "";
-      l3InjectOnce.delete(input.sessionID);
-      await beginTurn(input, output, rawPrompt, l3Context);
+      await beginTurn(input, output, rawPrompt);
     },
 
     "tool.execute.before": async (input, output) => {
@@ -497,22 +558,10 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
 
     event: async ({ event }) => {
       const properties = event && event.properties && typeof event.properties === "object" ? event.properties : {};
-      if (event && event.type === "session.created") {
-        const info = properties.info && typeof properties.info === "object" ? properties.info : properties;
-        const sessionID = normalizeText(info.id || info.sessionID);
-        if (sessionID) {
-          const runtimeSession = await ensureSession(null, sessionID, "main");
-          const loaded = await loadRuntimeL3(runtimeSession);
-          if (loaded.additionalContext) l3InjectOnce.set(sessionID, loaded.additionalContext);
-        }
-        return;
-      }
       if (event && event.type === "session.compacted") {
         const sessionID = normalizeText(properties.sessionID || properties.id);
-        const runtimeSession = await ensureSession(null, sessionID, "main");
-        await notifyRuntimeBoundary(runtimeSession, "token_compaction");
-        const loaded = await loadRuntimeL3(runtimeSession);
-        if (loaded.additionalContext) l3InjectOnce.set(sessionID, loaded.additionalContext);
+        const agent = sessionAgents.get(sessionID) || (resolveAgent && await resolveAgent(sessionID));
+        if (agent) await l3Context(sessionID, agent);
         return;
       }
       if (event && event.type === "session.deleted") {
@@ -556,10 +605,12 @@ const createMemmyHooks = async ({ client, directory, worktree }) => {
         queueTurnCompletion(sessionID);
       }
       await Promise.allSettled([...captureJobs]);
-      await Promise.allSettled([...sessionCache.values()].map((session) => closeRuntimeSession(session)));
+      await Promise.allSettled([...l3States.values()].map(state => state.job));
+      await Promise.allSettled([...sessionCache.values()].map((session) => Promise.resolve(session).then(closeRuntimeSession)));
       pendingTurns.clear();
       sessionCache.clear();
-      l3InjectOnce.clear();
+      l3States.clear();
+      sessionAgents.clear();
       pendingResumeSelections.clear();
       latestRequests.clear();
       console.error("Memmy plugin disposed: revision=" + PLUGIN_REVISION);

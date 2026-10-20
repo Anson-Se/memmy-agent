@@ -7,7 +7,7 @@ Official migration reference: https://dev.opencode.ai/v2/docs/build/plugins/migr
 
 Implementation
 - One default export: V1 calls server(), V2 calls setup(). The V2 adapter registers
-  JSON Schema tools, the prompt hook, the memmy-resume command and event subscription.
+  JSON Schema tools, the prompt/context hooks, the memmy-resume command and event subscription.
 - The bridge bundles real Zod schemas. No runtime import of either host's SDK is
   necessary. V1 receives Zod arguments; V2 receives JSON Schema and structured output.
 - Plugin capture and offline scanning use the same V1/V2 database adapter. V2 uses
@@ -76,7 +76,7 @@ Lifecycle implementation and review regression
   scanning remains the recovery path if the process exits before persistence.
   Shutdown cancels retry delays and performs one last read, rather than spending
   the host's short cleanup budget waiting through the full projection backoff.
-- Both plugin and bridge revisions advance to v2-2 so installed v2-1 artifacts are
+- Both plugin and bridge revisions advance to v2-3 so older artifacts are
   updated. Save work and fully restart OpenCode, including any separate server.
 
 Packaged acceptance
@@ -88,7 +88,7 @@ Packaged acceptance
 3. Save work, fully quit and reopen OpenCode. If it uses a separate server, restart
    the server that loads the plugin too. Do not treat a new chat/window refresh as
    sufficient until verified on that exact version.
-4. Look for "Memmy plugin loaded: revision=opencode-v2-2, entry=v1/v2" in stderr or
+4. Look for "Memmy plugin loaded: revision=opencode-v2-3, entry=v1/v2" in stderr or
    host logs. Lifecycle diagnostics use stderr because V2 can consume stdout.
 5. Exercise search/get/add, pre-turn recall, completed conversation capture and
    /memmy-resume search plus selection. Verify one completed turn is stored once,
@@ -102,3 +102,68 @@ Packaged acceptance
    results do not constitute Windows Desktop acceptance.
 
 No data migration or user-database writes are needed for the read-only V2 adapter.
+
+Review follow-up: L3, effective Agent, migrated history (2026-10-20)
+- Initialization occurs on actual use, not session.created. V2 context hooks add
+  the current L3 block to each fresh model request, including the first request
+  after restart and after compaction; it is not persisted in the native user text.
+  Initialization/read jobs are serialized per session. Repeated hooks do not append
+  the same block twice to one request. V1 injects on the first prompt and refresh.
+- V2 session.compaction.ended maps to V1's internal successful-compaction path.
+  Both paths verify a durable successful compaction ID in the native read-only DB.
+  Duplicate events cannot notify/reload twice; failed rows do not advance the ID.
+  Checking at model/prompt use also catches event/projection races and missed events.
+- Resolve V2 session.agent or the first effective default from the host agent.list
+  (which orders the configured selected default first). V1 uses the resolved agent
+  on output.message when input.agent is absent. Do not guess main/build. Session
+  opening, recall and capture use this scope; Memory's scope validation is unchanged.
+  If execution ultimately selected another agent, capture resolves that agent's
+  scoped Memory session instead of passing the prior agent's session ID.
+- Official V1 embeds Bun: the read-only bridge selects bun:sqlite there and
+  node:sqlite in Node. Both installers bundle the same behavior without SDK imports.
+- Official V1 migration retains original message/part tables. Those rows provide
+  positive migration provenance and preserve the original completion timestamp,
+  parent links, tools and sequence. Native V2 messages still require durable idle;
+  a completed intermediate tool step never establishes final execution completion.
+  Idle clears the active parent/assistant list so later synthetic replies or
+  standalone compaction cannot rewrite a previously completed source turn.
+
+Required real-storage regression (in addition to loader and lifecycle checks)
+  OPENCODE_V2_BINARY=/absolute/v2/bin/opencode OPENCODE_V1_BINARY=/absolute/v1/bin/opencode node --import tsx scripts/test-opencode-review.mjs
+Run with each supported V1 binary (1.18.29 and 1.19.2). The V2 binary is 2.0.26.
+The script installs through Backend and Memory separately, starts real Memory HTTP
+and SQLite storage, and records actual OpenCode model requests and native events.
+Only model replies and embeddings are fixtures; Memory acceptance, scope checks,
+capture policy and deduplication remain real. Test prompts contain concrete coding
+feedback so a recalled prior fixture answer is not rejected as memory-only chatter.
+L3 markers are seeded into the actual project-scoped Memory records. Background
+summary/evolution model jobs are outside this test (no Memory LLM is configured).
+
+Acceptance assertions:
+- Unspecified Agent uses real CLI run --server without --agent, twice in one live
+  session. Custom default plan is also tested through the CLI; explicit build and
+  mid-session switch to plan are exercised through the official session API.
+- Eight eligible V2 turns per installation path are accepted before exit. Source
+  scopes are checked by actual Memory, and history rescan returns existing.
+- Cold first use, newly created sessions and restart/resume include current L3 in
+  the actual model request. Successful compaction notifies once and refreshes the
+  next request; failed compaction neither notifies nor refreshes.
+- A synthetic continuation and standalone compaction leave completed turns intact.
+- Six actual V1 turns (default plan then explicit build) are stored and deduplicated,
+  then migrated by the official V2 executable. All six remain eligible, preserve
+  the entire normalized source turn and rescan as existing after migration.
+- Service tests separately exercise hook-first and scan-first with real Memory
+  storage, native intermediate-tool exclusion, and immutable terminal boundaries.
+- Controlled plugin tests cover concurrent initialization, repeated context hooks,
+  duplicate successful events and failed compaction across both installed templates.
+
+The previous HEAD adapter was also checked against these real native databases:
+all six migrated turns returned turn_incomplete; a synthetic reply was appended
+into the prior user turn. The repaired adapter resolves all six and freezes that
+turn's original answer. This is not a claim based only on hand-made DB fixtures.
+
+Validation limit: these are macOS official CLI/server tests with local model
+replies, not a Windows Desktop or new DMG acceptance. The upstream v1.2.4 missing
+settings.modelWorkspace.replaceKey / replaceKeyPlaceholder translations still
+block the full typecheck/build. Per user instruction they are left untouched;
+no new package is claimed for this revision.

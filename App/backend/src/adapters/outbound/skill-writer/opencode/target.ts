@@ -21,7 +21,7 @@ const PLUGIN_CONFIG_FILE_NAME = "memmy-memory-config.json";
 const WORKSPACE_BRIDGE_FILE_NAME = "memmy-workspace-bridge.mjs";
 // Bump when the OpenCode bridge contract changes. Backend/Memory bundles have
 // different bytes, so their valid installations must share a logical revision.
-const OPENCODE_BRIDGE_REVISION = "v2-2";
+const OPENCODE_BRIDGE_REVISION = "v2-3";
 const COMMAND_DIRECTORY_NAME = "commands";
 const RESUME_COMMAND_FILE_NAME = "memmy-resume.md";
 const START_MARKER = "<!-- memmy:start v=1 -->";

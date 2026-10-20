@@ -23,6 +23,13 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
     ? "SELECT id, type, data, time_created FROM session_message WHERE session_id = ? ORDER BY seq ASC, id ASC"
     : "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC");
   const parts = v2 ? null : db.prepare("SELECT id, data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC");
+  // Official V1 -> V2 migration retains the original tables. They are positive
+  // provenance for migrated messages, whose completion/parent/tool identity must
+  // remain identical to captures made before upgrading. Native V2 rows still
+  // require their own durable idle boundary.
+  const legacyMessages = v2 && hasTable("message") && hasTable("part")
+    ? db.prepare("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC") : null;
+  const legacyParts = legacyMessages ? db.prepare("SELECT id, data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC") : null;
   const currentParts = new Map<string, Array<{ id: string; data: unknown }>>();
   return {
     sessions: () => sessions.all(...(conversationId ? [conversationId] : [])).map(value => {
@@ -43,10 +50,30 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
       let agent = "";
       let turnAssistants: Row[] = [];
       const result: Array<{ id: string; data: Row }> = [];
+      const legacy = legacyMessages?.all(sessionId).map(record) || [];
+      const migratedIds = new Set(rows.map(row => String(row.id)));
+      const legacyIds = new Set<string>();
+      if (legacy.some(row => migratedIds.has(String(row.id)))) {
+        for (const row of legacy) {
+          const id = String(row.id);
+          legacyIds.add(id);
+          const data = parse(row.data);
+          const owner = data.role === "assistant" ? String(data.parentID || "") : id;
+          // V2 may have removed/reverted a migrated user. Keep its ordinal slot
+          // for existing source identities, but never resurrect deleted history.
+          const visible = migratedIds.has(owner);
+          result.push({ id, data: visible ? data : {} });
+          if (!visible) continue;
+          currentParts.set(id, legacyParts!.all(id).map(value => {
+            const part = record(value); return { id: String(part.id), data: parse(part.data) };
+          }));
+        }
+      }
       for (const row of rows) {
         const data = parse(row.data);
         const type = data.type || row.type;
         const id = String(row.id);
+        if (legacyIds.has(id)) continue;
         if (type === "agent-switched") { agent = String(data.agent || ""); continue; }
         if (type === "user") {
           parentID = id;
@@ -81,6 +108,10 @@ export function createOpencodeDatabaseSource(db: Database, conversationId?: stri
             if (data.outcome === "interrupted") assistant.error = { name: "MessageAbortedError" };
             assistant.time = { ...record(assistant.time), completed: record(data.time).created || row.time_created };
           }
+          // Freeze the completed turn. Synthetic continuations and independent
+          // compactions are not new user turns and cannot reopen this parent.
+          parentID = "";
+          turnAssistants = [];
         }
       }
       return result;
