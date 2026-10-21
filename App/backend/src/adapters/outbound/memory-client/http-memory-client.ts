@@ -1,6 +1,7 @@
 /** Http memory client module. */
 import {
   MemoryAgentSourceScanStateSchema,
+  MemoryScanControlResponseSchema,
   MemoryAgentSourceListSchema,
   AgentSourceScanJobResponseSchema,
   ScanResultPageSchema,
@@ -147,8 +148,8 @@ export function createHttpMemoryClient(
       start: (input) => request("POST", "agentSourceScan", AgentSourceScanJobResponseSchema, { body: input, maxRetries: 0 }),
       status: () => request("GET", "agentSourceStatus", MemoryAgentSourceScanStateSchema),
       results: (jobId, cursor = "0", limit = 100) => request("GET", "agentSourceResults", ScanResultPageSchema, { params: { jobId }, query: { cursor, limit } }),
-      pause: () => request("POST", "agentSourcePause", OkResponseSchema, { body: {}, maxRetries: 0 }),
-      cancel: () => request("POST", "agentSourceCancel", OkResponseSchema, { body: {}, maxRetries: 0 })
+      pause: (input) => request("POST", "agentSourcePause", MemoryScanControlResponseSchema, { body: input ?? {}, maxRetries: 0 }),
+      cancel: (input) => request("POST", "agentSourceCancel", MemoryScanControlResponseSchema, { body: input ?? {}, maxRetries: 0 })
     },
     async health() {
       return request("GET", "health", MemoryHealthSnapshotSchema);

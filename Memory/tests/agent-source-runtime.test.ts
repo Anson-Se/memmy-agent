@@ -362,15 +362,10 @@ describe("standalone Agent source executor", () => {
     await waitForProgress(executor);
     await executor.pauseScan();
     await executor.cancelScan();
-    expect(executor.scanStatus()).toEqual({
-      running: false,
-      jobId: null,
-      sourceId: null,
-      mode: null,
-      progress: null,
-      startedAt: null,
-      completedAt: null,
-      error: null
+    expect(executor.scanStatus()).toMatchObject({
+      running: false, status: "cancelled", jobId: expect.any(String), attemptId: expect.any(String),
+      version: { generation: expect.any(Number), sequence: expect.any(Number) }, progress: null,
+      completedAt: null, error: null
     });
   });
 

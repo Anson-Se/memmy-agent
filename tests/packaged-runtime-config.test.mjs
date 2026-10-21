@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createPackageWithOptions, listPackage } from "@electron/asar";
 import { afterEach, describe, expect, it } from "vitest";
+import { transpileModule, ModuleKind, ScriptTarget } from "typescript";
 import {
   normalizePublicCloudService,
   writeDesktopEditionManifest,
@@ -29,6 +30,32 @@ afterEach(() => {
 });
 
 describe("packaged desktop runtime configuration", () => {
+  it.each(["mac/build-dmg.sh", "win/build-nsis.sh"])("stages executable scan ordering for standalone agent contracts: %s", (script) => {
+    const root = fixtureRoot();
+    const memory = join(root, "Memory");
+    const core = join(memory, "AgentSourceCore");
+    mkdirSync(join(core, "dist/src"), { recursive: true });
+    const repo = dirname(dirname(fileURLToPath(import.meta.url)));
+    writeFileSync(join(core, "package.json"), readFileSync(join(repo, "Memory/AgentSourceCore/package.json")));
+    // Packaging guards run before workspace builds on a clean checkout.
+    // Compile the actual shared implementation inside the isolated fixture.
+    const source = readFileSync(join(repo, "Memory/AgentSourceCore/src/scan-state.ts"), "utf8");
+    writeFileSync(join(core, "dist/src/scan-state.js"), transpileModule(source, {
+      compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 },
+    }).outputText);
+    const runtime = join(root, "runtime");
+    const build = readFileSync(join(repo, "scripts/internal", script), "utf8");
+    const stage = build.slice(build.lastIndexOf('RUNTIME_AGENT_SOURCE_CORE_DIR='), build.indexOf('RUNTIME_LOCAL_API_CONTRACTS_DIR='));
+    expect(stage).toContain('cp -R');
+    const staged = spawnSync("bash", ["-eu", "-c", stage], { env: { ...process.env, MEMORY_DIR: memory, RUNTIME_DIR: runtime }, encoding: "utf8" });
+    expect(staged.status, staged.stderr).toBe(0);
+    const agent = join(runtime, "memmy-agent");
+    writeFileSync(join(agent, "check.mjs"), `import { acceptsScanUpdate } from '@memmy/agent-source-core/scan-state';
+      if (acceptsScanUpdate({version:{generation:2,sequence:3}}, {version:{generation:2,sequence:2}})) throw Error('stale accepted');`);
+    const imported = spawnSync(process.execPath, [join(agent, "check.mjs")], { encoding: "utf8" });
+    expect(imported.status, imported.stderr).toBe(0);
+  });
+
   it("writes exactly the public allowlist and never serializes env decoys", async () => {
     const root = fixtureRoot();
     const envFile = join(root, ".env");

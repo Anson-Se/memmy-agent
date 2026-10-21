@@ -109,6 +109,8 @@ describe("CR-002 durable enqueue defines scan completion", () => {
     f.db.db.exec("DROP TRIGGER reject_summary");
     const retried = await scan.startScan({ sourceId: "fixture", mode: "full", waitForProcessing: true });
     expect(retried.jobId).toBe(first.jobId);
+    expect(retried.attemptId).not.toBe(first.attemptId);
+    expect(retried.version!.sequence).toBeGreaterThan(first.version!.sequence);
     expect((await finish(scan)).error).toBeNull();
     expect(f.db.db.prepare("SELECT id FROM memories ORDER BY id").all()).toEqual(raw);
     expect(f.db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE job_type='import_summary'").get()).toEqual({ n: 1 });
@@ -129,6 +131,8 @@ describe("CR-002 durable enqueue defines scan completion", () => {
     expect(restored.scanStatus()).toMatchObject({
       completedAt: completed.completedAt, attemptId: completed.attemptId, error: null, running: false
     });
+    expect(restored.scanStatus().version!.generation).toBeGreaterThan(completed.version!.generation);
+    expect(restored.scanStatus()).toEqual(restored.scanStatus());
     await restored.startScan({ sourceId: "fixture", mode: "incremental", waitForProcessing: true });
     expect((await finish(restored)).error).toBeNull();
     expect(f.db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs").get()).toEqual({ n: 1 });

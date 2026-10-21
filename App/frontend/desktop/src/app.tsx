@@ -1,4 +1,4 @@
-import { agentSourceScanExecutionKey, type AgentSourceScanStatusResponse, type ScanResult } from "@memmy/local-api-contracts";
+import { type AgentSourceScanStatusResponse, type ScanResult } from "@memmy/local-api-contracts";
 import { useComputerHistoryModelSync } from "./app/computer-history-model-sync.js";
 import { isComputerHistorySupported } from "./app/computer-history-platform.js";
 /** App module. */
@@ -7,7 +7,7 @@ import { rememberPublishedMemoryBudget } from "./components/memory-token-budget-
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { setAnalyticsUserId, setAnalyticsUserMode } from "./analytics/analytics-context.js";
 import { trackCloudAnalyticsEvent } from "./analytics/cloud-analytics.js";
-import { trackAgentSourceScanOutcome } from "./analytics/memory-ui-analytics.js";
+import { useScanCompletions } from "./app/use-scan-completions.js";
 import { useAnalytics } from "./analytics/use-analytics.js";
 import { buildInvitationToastEvent } from "./app/invitation-analytics.js";
 import {
@@ -45,15 +45,9 @@ import { MemmyAgentRequestError, type MemmyAgentClient } from "./api/memmy-agent
 import { getRuntimeConfig } from "./api/runtime-config.js";
 import { readHistoryPermissionSetup } from "./pages/memory/computer-history-permission-state.js";
 import { shouldReturnToWeChatSettings } from "./pages/memory/computer-history-wechat-permission-state.js";
-import { clearMemoryPanelCache } from "./pages/memory/memory-panel-cache.js";
 import { readLocalNickname } from "./app/nickname.js";
-import {
-  formatAgentSourceScanRequestError,
-  formatScanCompletedError
-} from "./pages/agent-source-scan-error.js";
 import { useTranslation } from "./i18n/use-translation.js";
 import {
-  AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS,
   agentActions,
   appActions,
   createAgentOperationError,
@@ -75,6 +69,8 @@ export function App() {
 /** Runs runtime app. */
 function RuntimeApp() {
   const { state, dispatch } = useAppState();
+  const scanStateRef = useRef(state.agentSources);
+  scanStateRef.current = state.agentSources;
   const { clients, setClients } = useApiClients();
   useComputerHistoryTrayIndicator(clients?.memmyAgent ?? null);
   useComputerHistoryModelSync({
@@ -105,6 +101,8 @@ function RuntimeApp() {
   ), [clients?.memmyAgent, dispatch]);
 
   const retry = useCallback(() => setBootKey((value) => value + 1), []);
+
+  useScanCompletions(clients?.agentSources ?? null, state.agentSources, dispatch, t);
 
   useEffect(() => {
     setAnalyticsUserMode(state.bootstrap?.app.userMode ?? "unset");
@@ -172,66 +170,30 @@ function RuntimeApp() {
   useEffect(() => {
     let events: EventSource | undefined;
     let isActive = true;
-    const scanCompletionTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
-
-    function scheduleScanCompletionExpiry(scan: { jobId: string; attemptId?: string }) {
-      const jobId = agentSourceScanExecutionKey(scan);
-      const existingTimeout = scanCompletionTimeouts.get(jobId);
-      if (existingTimeout) clearTimeout(existingTimeout);
-      scanCompletionTimeouts.set(jobId, setTimeout(() => {
-        scanCompletionTimeouts.delete(jobId);
-        dispatch(appActions.agentSourceScanCompletionExpired(scan.jobId, scan.attemptId));
-      }, AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS));
-    }
-
-    const handledCompletions = new Set<string>();
-    let latestAttemptStartedAt = "";
-    function acceptAttempt(scan: { attemptStartedAt?: string }) {
-      if (scan.attemptStartedAt && scan.attemptStartedAt < latestAttemptStartedAt) return false;
-      latestAttemptStartedAt = scan.attemptStartedAt ?? latestAttemptStartedAt;
-      return true;
-    }
     function handleScanCompletion(
       completion: NonNullable<AgentSourceScanStatusResponse["completion"]>,
-      client: ReturnType<typeof createAppClients>["agentSources"],
+      _client: ReturnType<typeof createAppClients>["agentSources"],
       scanResults?: ScanResult[]
     ) {
-      if (!isActive || !acceptAttempt(completion)) return;
-      const key = agentSourceScanExecutionKey(completion);
-      if (handledCompletions.has(key)) return;
-      handledCompletions.add(key);
-      trackAgentSourceScanOutcome(completion);
-      clearMemoryPanelCache();
-      dispatch(appActions.agentSourceScanCompleted(completion));
-      scheduleScanCompletionExpiry(completion);
-      if (!completion.succeeded) dispatch(appActions.agentSourcesFailed(translationRef.current("memory.scanFailed")));
-      void client.listSources().then((nextSources) => {
-        if (!isActive || !acceptAttempt(completion)) return;
-        dispatch(appActions.agentSourcesLoaded(nextSources));
-        const error = scanResults ? formatScanCompletedError(scanResults, nextSources, translationRef.current) : null;
-        if (!completion.succeeded) dispatch(appActions.agentSourcesFailed(error ?? translationRef.current("memory.scanFailed")));
-      }).catch((error) => {
-        if (isActive && acceptAttempt(completion)) dispatch(appActions.agentSourcesFailed(
-          formatAgentSourceScanRequestError(error, undefined, translationRef.current)
-        ));
-      });
+      if (isActive) dispatch(appActions.agentSourceScanCompleted({ ...completion, results: scanResults }));
     }
 
     async function reconcileAgentSourceScanStatus(agentSourceClient: ReturnType<typeof createAppClients>["agentSources"]) {
+      const requestGeneration = scanStateRef.current.scanRequestGeneration ?? 0;
       try {
         const status = await agentSourceClient.getScanStatus();
         if (!isActive) return;
         dispatch(appActions.agentSourceScanAvailability(status.unavailable ?? null));
         if (status.unavailable) return;
         if (status.progress) {
-          if (acceptAttempt(status.progress)) dispatch(appActions.agentSourceScanProgressReceived(status.progress));
+          dispatch(appActions.agentSourceScanProgressReceived(status.progress));
           return;
         }
         if (status.completion) {
           handleScanCompletion(status.completion, agentSourceClient);
           return;
         }
-        dispatch(appActions.agentSourceScanCompleted());
+        dispatch(appActions.agentSourceScanStatusReceived(status, requestGeneration));
       } catch {
         // The next scanning heartbeat or reconnect will reconcile again.
       }
@@ -305,9 +267,11 @@ function RuntimeApp() {
         dispatch(appActions.agentSourcesLoaded(sources));
         dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
         if (scanStatus.progress) {
-          if (acceptAttempt(scanStatus.progress)) dispatch(appActions.agentSourceScanProgressReceived(scanStatus.progress));
+          dispatch(appActions.agentSourceScanProgressReceived(scanStatus.progress));
         } else if (scanStatus.completion) {
           handleScanCompletion(scanStatus.completion, clients.agentSources);
+        } else {
+          dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
         }
         if (accountSession.authenticated) {
           dispatch(appActions.accountUpdated({
@@ -334,14 +298,14 @@ function RuntimeApp() {
         });
         events.addEventListener("app.heartbeat", () => {
           dispatch(appActions.eventStatusChanged("heartbeat"));
-          if (isScanningRef.current || scanUnavailableRef.current) {
+          if (isScanningRef.current || scanUnavailableRef.current || scanStateRef.current.scanProgress || scanStateRef.current.scanControl) {
             void reconcileAgentSourceScanStatus(clients.agentSources);
           }
         });
         events.addEventListener("agent_source.scan_progress", (event) => {
           const parsed = parseSseEvent(event);
           if (parsed?.type === "agent_source.scan_progress") {
-            if (acceptAttempt(parsed.payload)) dispatch(appActions.agentSourceScanProgressReceived(parsed.payload));
+            dispatch(appActions.agentSourceScanProgressReceived(parsed.payload));
           }
         });
         events.addEventListener("agent_source.scan_completed", (event) => {
@@ -368,9 +332,6 @@ function RuntimeApp() {
     return () => {
       isActive = false;
       events?.close();
-      for (const timeout of scanCompletionTimeouts.values()) {
-        clearTimeout(timeout);
-      }
     };
   }, [bootKey, dispatch, setClients]);
 

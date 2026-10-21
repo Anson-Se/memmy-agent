@@ -12,6 +12,7 @@
  * background. Successful writes stay silent; failures are surfaced and the
  * server remains responsible for hot-reloading the canonical config.
  */
+import { acceptsScanUpdate, scanExecutionKey, type ScanVersion, type ScanLifecycle, type ScanControlInput } from "@memmy/agent-source-core/scan-state";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../api/client";
 import { classifyModelTestFailure } from "../model-test-error";
@@ -74,6 +75,8 @@ interface MemoryServiceHealth {
 }
 
 interface AgentSourceScanState {
+  version?: ScanVersion;
+  status?: ScanLifecycle;
   running: boolean;
   jobId: string | null;
   attemptId?: string;
@@ -1033,7 +1036,7 @@ function HubTab({
 
 // ─── Cross-Agent access tab ──────────────────────────────────────────
 
-function AgentAccessTab({
+export function AgentAccessTab({
   agentAccess,
   onPatch,
 }: {
@@ -1059,10 +1062,12 @@ function AgentAccessTab({
   const [serviceFeedback, setServiceFeedback] = useState<InfrastructureFeedback | null>(null);
   const [automationBusy, setAutomationBusy] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
-  const activeScanJob = useRef<string | null>(null);
-  const latestScanStartedAt = useRef("");
-  const scanIdentity = (scan: { jobId: string | null; attemptId?: string }) => scan.attemptId
-    ? JSON.stringify([scan.jobId, scan.attemptId]) : scan.jobId;
+  const latestScan = useRef<AgentSourceScanState | null>(null);
+  const operationGeneration = useRef(0);
+  const pendingControl = useRef<string | null>(null);
+  const completedExecutions = useRef(new Set<string>());
+  const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(completionTimer.current), []);
   const scannableSources = visibleAgentSources(sources);
   const scanPaused = scanStatus?.progress?.phase === "stopped";
   const scanSessionActive = scanStatus?.running === true || scanPaused;
@@ -1090,6 +1095,32 @@ function AgentAccessTab({
     }
   };
 
+  const receiveScan = (next: AgentSourceScanState, requestGeneration?: number) => {
+    const stamp = (value: AgentSourceScanState | null) => value ? { ...value, attemptStartedAt: value.startedAt ?? undefined } : null;
+    if (!acceptsScanUpdate(stamp(latestScan.current), stamp(next)!)) return;
+    if (!next.version && requestGeneration !== undefined && requestGeneration !== operationGeneration.current) return;
+    latestScan.current = next;
+    if (!next.completedAt && (next.running || next.progress?.phase === "stopped")) {
+      setScanStatus(next);
+      setBusySource(next.running ? next.sourceId ?? next.progress?.sourceId ?? "all" : null);
+      return;
+    }
+    pendingControl.current = null;
+    setScanControlBusy(null);
+    setScanStatus(null);
+    setBusySource(null);
+    if (next.status === "cancelled" || !next.completedAt || !next.jobId) return;
+    const key = scanExecutionKey(next);
+    if (completedExecutions.current.has(key)) return;
+    completedExecutions.current.add(key);
+    if (completedExecutions.current.size > 100) completedExecutions.current.delete(completedExecutions.current.values().next().value!);
+    if (next.error) setMessage(next.error);
+    else setScanCompletion(t("settings.agents.scanCompletedNotice", { agent: sourceDisplayName(next.sourceId ?? "all", sourcesRef.current) }));
+    clearTimeout(completionTimer.current);
+    completionTimer.current = setTimeout(() => setScanCompletion(null), 5_000);
+    void loadSources();
+  };
+
   useEffect(() => {
     void loadSources();
     void api
@@ -1104,34 +1135,11 @@ function AgentAccessTab({
       });
     let active = true;
     const refreshScan = async () => {
+      const generation = operationGeneration.current;
       try {
         const next = await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status");
-        if (!active || (next.startedAt && next.startedAt < latestScanStartedAt.current)) return;
-        latestScanStartedAt.current = next.startedAt ?? latestScanStartedAt.current;
-        const paused = next.progress?.phase === "stopped";
-        if (next.running || paused) {
-          activeScanJob.current = scanIdentity(next);
-          setScanStatus(next);
-          setBusySource(next.running ? next.sourceId ?? next.progress?.sourceId ?? "all" : null);
-          return;
-        }
-        if (activeScanJob.current && scanIdentity(next) === activeScanJob.current) {
-          const completedSourceId = next.sourceId ?? next.progress?.sourceId ?? "all";
-          activeScanJob.current = null;
-          setScanStatus(null);
-          setBusySource(null);
-          if (next.error) {
-            setMessage(next.error);
-          } else {
-            setScanCompletion(t("settings.agents.scanCompletedNotice", {
-              agent: sourceDisplayName(completedSourceId, sourcesRef.current),
-            }));
-          }
-          await loadSources();
-        }
-      } catch {
-        // Other infrastructure status remains usable while scan polling is unavailable.
-      }
+        if (active) receiveScan(next, generation);
+      } catch { /* next poll reconciles transport failures */ }
     };
     void refreshScan();
     const timer = window.setInterval(() => void refreshScan(), 500);
@@ -1188,79 +1196,53 @@ function AgentAccessTab({
   };
 
   const scan = async (sourceId: string, mode?: "full") => {
+    const generation = ++operationGeneration.current;
     setBusySource(sourceId);
     setMessage(null);
     setScanCompletion(null);
+    const previous = latestScan.current;
+    const expected: ScanControlInput = previous?.progress?.phase === "stopped" && previous.jobId
+      ? { expectedExecution: { jobId: previous.jobId, attemptId: previous.attemptId } }
+      : { expectedVersion: previous?.version };
     try {
-      const result = await api.post<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }>(
-        "/api/v1/agent-sources/scan",
-        { sourceId, ...(mode ? { mode } : {}) },
-      );
-      activeScanJob.current = scanIdentity(result);
-      latestScanStartedAt.current = result.attemptStartedAt ?? new Date().toISOString();
-      setScanStatus({
-        running: true,
-        jobId: result.jobId,
-        attemptId: result.attemptId,
-        sourceId,
-        mode: mode ?? null,
-        progress: {
-          sourceId,
-          phase: "scan",
-          current: 0,
-          total: 0,
-        },
-        startedAt: latestScanStartedAt.current,
-        completedAt: null,
-        error: null,
-      });
+      await api.post("/api/v1/agent-sources/scan", { sourceId, ...(mode ? { mode } : {}), ...expected });
+      receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-      setBusySource(null);
+      try { receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation); } catch { /* next poll */ }
+      if (operationGeneration.current === generation && !latestScan.current?.running) setBusySource(null);
     }
   };
 
-  const pauseScan = async () => {
-    if (!scanStatus?.running) return;
-    setScanControlBusy("pause");
+  const controlScan = async (kind: "pause" | "cancel") => {
+    const previous = latestScan.current;
+    if (!previous?.jobId || pendingControl.current) return;
+    const token = `${++operationGeneration.current}:${kind}`;
+    pendingControl.current = token;
+    setScanControlBusy(kind);
     setMessage(null);
     try {
-      await api.post("/api/v1/agent-sources/scan/stop", {});
-      const next = await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status");
-      setScanStatus(next);
-      setBusySource(null);
+      const result = await api.post<{ snapshot?: AgentSourceScanState }>(`/api/v1/agent-sources/scan/${kind === "pause" ? "stop" : "cancel"}`, {
+        expectedExecution: { jobId: previous.jobId, attemptId: previous.attemptId }
+      });
+      receiveScan(result.snapshot ?? await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
+      try { receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status")); } catch { /* next poll */ }
     } finally {
-      setScanControlBusy(null);
+      if (pendingControl.current === token) { pendingControl.current = null; setScanControlBusy(null); }
     }
   };
-
+  const pauseScan = async () => { if (scanStatus?.running) await controlScan("pause"); };
+  const cancelScan = async () => { if (scanSessionActive) await controlScan("cancel"); };
   const resumeScan = async () => {
     const sourceId = scanStatus?.sourceId ?? scanStatus?.progress?.sourceId;
-    if (!scanPaused || !sourceId) return;
+    if (!scanPaused || !sourceId || pendingControl.current) return;
+    const token = `${++operationGeneration.current}:resume`;
+    pendingControl.current = token;
     setScanControlBusy("resume");
-    try {
-      await scan(sourceId, scanStatus?.mode === "full" ? "full" : undefined);
-    } finally {
-      setScanControlBusy(null);
-    }
-  };
-
-  const cancelScan = async () => {
-    if (!scanSessionActive) return;
-    setScanControlBusy("cancel");
-    setMessage(null);
-    try {
-      await api.post("/api/v1/agent-sources/scan/cancel", {});
-      activeScanJob.current = null;
-      setScanStatus(null);
-      setBusySource(null);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setScanControlBusy(null);
-    }
+    try { await scan(sourceId, scanStatus?.mode === "full" ? "full" : undefined); }
+    finally { if (pendingControl.current === token) { pendingControl.current = null; setScanControlBusy(null); } }
   };
 
   const openFullScanConfirm = () => {

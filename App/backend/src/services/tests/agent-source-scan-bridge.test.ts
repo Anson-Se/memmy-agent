@@ -88,3 +88,41 @@ it("reports complete error counts and emits each retry once for SSE and polling"
     expect(completed.mock.calls[1]![0]).toMatchObject({ jobId: "same-job", attemptId: "second", succeeded: true });
   } finally { await bridge.dispose(); }
 });
+
+it.each(["pause", "cancel"] as const)("uses the %s snapshot while a pre-control poll is outstanding", async (kind) => {
+  let release!: (state: MemoryAgentSourceScanState) => void;
+  const old: MemoryAgentSourceScanState = { ...empty(), running: true, jobId: "job", attemptId: "a", sourceId: "all", status: "running", version: { generation: 1, sequence: 1 }, progress: { sourceId: "all", phase: "scan", current: 1, total: 2 } };
+  const next: MemoryAgentSourceScanState = { ...old, running: false, status: kind === "pause" ? "paused" : "cancelled", version: { generation: 1, sequence: 2 }, progress: kind === "pause" ? { ...old.progress!, phase: "stopped" } : null };
+  const control = vi.fn(async () => ({ ok: true as const, outcome: "applied" as const, snapshot: next }));
+  const client = { status: () => new Promise<MemoryAgentSourceScanState>(resolve => { release = resolve; }), [kind]: control } as unknown as AgentSourceScanClient;
+  const bus = createProgressBus(); const published = vi.fn(); bus.on("agent_source.scan_progress", published);
+  const bridge = createAgentSourceScanBridge(client, bus, 60_000);
+  const poll = bridge.status();
+  try {
+    const expectedExecution = { jobId: "job", attemptId: "a" };
+    const response = await bridge[kind]({ expectedExecution });
+    expect(control).toHaveBeenCalledWith({ expectedExecution });
+    expect(response.snapshot.status).toBe(next.status);
+    release(old);
+    expect((await poll).version).toEqual(next.version);
+    expect(published.mock.calls.every(([value]) => value.version.sequence === 2)).toBe(true);
+  } finally { release(old); await bridge.dispose(); }
+});
+
+it("does not bypass execution/version preconditions when a matching source is running", async () => {
+  const start = vi.fn(async () => { throw new Error("conflict"); });
+  const bridge = createAgentSourceScanBridge({ status: async () => ({ ...empty(), running: true, sourceId: "all", jobId: "new" }), start } as unknown as AgentSourceScanClient, createProgressBus(), 60_000);
+  try {
+    await expect(bridge.start({ sourceId: "all", expectedExecution: { jobId: "old", attemptId: "a" } })).rejects.toThrow("conflict");
+    expect(start).toHaveBeenCalledOnce();
+  } finally { await bridge.dispose(); }
+});
+
+it("prioritizes completion over residual paused progress at the same version", async () => {
+  const state: MemoryAgentSourceScanState = { ...empty(), jobId: "job", attemptId: "a", sourceId: "all", status: "completed", version: { generation: 1, sequence: 5 }, completedAt: "2026-10-21T00:00:00Z", progress: { sourceId: "all", phase: "stopped", current: 1, total: 1 } };
+  const bus = createProgressBus(), progress = vi.fn(), completed = vi.fn(); bus.on("agent_source.scan_progress", progress); bus.on("agent_source.scan_completed", completed);
+  const bridge = createAgentSourceScanBridge({ status: async () => state } as AgentSourceScanClient, bus, 60_000);
+  try {
+    expect((await bridge.status()).progress).toBeNull(); expect(progress).not.toHaveBeenCalled(); expect(completed).toHaveBeenCalledOnce();
+  } finally { await bridge.dispose(); }
+});

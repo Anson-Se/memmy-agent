@@ -888,6 +888,12 @@ package_step_start "Build native Windows History recorder from source"
 bash "$ROOT_DIR/scripts/internal/win/build-memmy-computer-history.sh" \
   "$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe" amd64
 package_step_start "Stage Windows memmy-agent workspace runtime packages"
+# local-api-contracts shares scan ordering with Memory through this browser-safe package.
+RUNTIME_AGENT_SOURCE_CORE_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/agent-source-core"
+rm -rf "$RUNTIME_AGENT_SOURCE_CORE_DIR"
+mkdir -p "$RUNTIME_AGENT_SOURCE_CORE_DIR"
+cp "$MEMORY_DIR/AgentSourceCore/package.json" "$RUNTIME_AGENT_SOURCE_CORE_DIR/package.json"
+cp -R "$MEMORY_DIR/AgentSourceCore/dist" "$RUNTIME_AGENT_SOURCE_CORE_DIR/dist"
 RUNTIME_LOCAL_API_CONTRACTS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts"
 rm -rf "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
 mkdir -p "$RUNTIME_LOCAL_API_CONTRACTS_DIR"

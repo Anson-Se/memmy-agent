@@ -1077,6 +1077,12 @@ else
 fi
 bash "$ROOT_DIR/scripts/internal/mac/build-memmy-computer-use.sh" "$OCU_APP" "$TARGET_CPU" "$OCU_SIGNING_IDENTITY" cn.memtensor.memmy
 package_step_start "Stage memmy-agent workspace runtime packages"
+# local-api-contracts shares scan ordering with Memory through this browser-safe package.
+RUNTIME_AGENT_SOURCE_CORE_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/agent-source-core"
+rm -rf "$RUNTIME_AGENT_SOURCE_CORE_DIR"
+mkdir -p "$RUNTIME_AGENT_SOURCE_CORE_DIR"
+cp "$MEMORY_DIR/AgentSourceCore/package.json" "$RUNTIME_AGENT_SOURCE_CORE_DIR/package.json"
+cp -R "$MEMORY_DIR/AgentSourceCore/dist" "$RUNTIME_AGENT_SOURCE_CORE_DIR/dist"
 RUNTIME_LOCAL_API_CONTRACTS_DIR="$RUNTIME_DIR/memmy-agent/node_modules/@memmy/local-api-contracts"
 rm -rf "$RUNTIME_LOCAL_API_CONTRACTS_DIR"
 mkdir -p "$RUNTIME_LOCAL_API_CONTRACTS_DIR"

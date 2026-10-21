@@ -31,11 +31,13 @@ import type {
 } from "./agent-chat-slice.js";
 import type { ToolsAction } from "./tools-slice.js";
 
+import type { ScanStamp as importScanStamp, AgentSourceScanStatusResponse } from "@memmy/local-api-contracts";
+
 /** Type definition for event connection status. */
 export type EventConnectionStatus = "pending" | "connecting" | "connected" | "heartbeat" | "reconnecting";
 
 /** Contract for agent source scan progress. */
-export interface AgentSourceScanProgress {
+export interface AgentSourceScanProgress extends importScanStamp {
   jobId: string;
   attemptId?: string;
   attemptStartedAt?: string;
@@ -46,7 +48,8 @@ export interface AgentSourceScanProgress {
   message?: string;
 }
 
-export interface AgentSourceScanCompletion {
+export interface AgentSourceScanCompletion extends importScanStamp {
+  results?: import("@memmy/local-api-contracts").ScanResult[];
   succeeded?: boolean;
   jobId: string;
   attemptId?: string;
@@ -103,6 +106,8 @@ export type AppAction =
   | { type: "agentSources/error"; message: string }
   | { type: "agentSources/scanAvailability"; unavailable: AgentSourceScanUnavailable | null }
   | { type: "agentSources/scanStarted"; sourceId: string }
+  | { type: "agentSources/scanStatus"; status: AgentSourceScanStatusResponse; requestGeneration?: number; cancelledExecution?: { token: string; jobId: string; attemptId?: string } }
+  | { type: "agentSources/scanControl"; control: "start" | "pause" | "resume" | "cancel" | null; token: string }
   | { type: "agentSources/scanProgress"; progress: AgentSourceScanProgress }
   | { type: "agentSources/scanCancelRequested"; jobId: string }
   | { type: "agentSources/scanCancelFailed"; message: string }
@@ -219,6 +224,8 @@ export const appActions = {
   },
 
   /** Handles agent source scan completed. */
+  agentSourceScanStatusReceived(status: AgentSourceScanStatusResponse, requestGeneration?: number, cancelledExecution?: { token: string; jobId: string; attemptId?: string }): AppAction { return { type: "agentSources/scanStatus", status, requestGeneration, cancelledExecution }; },
+  agentSourceScanControl(control: "start" | "pause" | "resume" | "cancel" | null, token: string): AppAction { return { type: "agentSources/scanControl", control, token }; },
   agentSourceScanCompleted(scan?: AgentSourceScanFinished): AppAction {
     return { type: "agentSources/scanCompleted", scan };
   },

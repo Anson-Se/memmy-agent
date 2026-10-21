@@ -1,3 +1,5 @@
+import { nextScanGeneration } from "./scan-version.js";
+import { matchesScanExecution, compareScanVersions, type ScanVersion, type ScanLifecycle, type ScanControlInput } from "@memmy/agent-source-core/scan-state";
 import { readLegacyScanState } from "./legacy-state.js";
 import { openSourceCheckpoints, publishSourceCheckpoints, type SourceCheckpoints } from "./source-checkpoints.js";
 import { setImmediate as yieldEventLoop } from "node:timers/promises";
@@ -95,6 +97,8 @@ export interface AgentSourceView {
 }
 
 export interface AgentSourceScanState {
+  version?: ScanVersion;
+  status?: ScanLifecycle;
   running: boolean;
   jobId: string | null;
   attemptId?: string;
@@ -107,12 +111,14 @@ export interface AgentSourceScanState {
   results?: Array<{ sourceId: string; discoveredConversations: number; emittedMessages: number; skipped: number; memoryIds?: string[]; memoryIdCount?: number; errorCount?: number; detailsTruncated?: boolean; errors: Array<{ conversationId: string; reason: string }> }>;
 }
 
+export interface ScanControlResult { ok: true; outcome: "applied" | "already_terminal" | "conflict"; snapshot: AgentSourceScanState }
+
 export interface AgentSourceExecutor {
   list(): Promise<{ executorAvailable: true; sources: AgentSourceView[] }>;
-  startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }>;
+  startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string; version?: ScanVersion }>;
   scanStatus(): AgentSourceScanState;
-  pauseScan(): Promise<{ ok: true }>;
-  cancelScan(): Promise<{ ok: true }>;
+  pauseScan(input?: ScanControlInput): Promise<ScanControlResult>;
+  cancelScan(input?: ScanControlInput): Promise<ScanControlResult>;
   scanResults?(jobId: string, cursor?: string, limit?: number): Promise<{ items: Array<{ sourceId: string; conversationId: string; memoryId?: string; error?: string }>; nextCursor: string | null; attemptId?: string }>;
   mutateConnection(sourceId: string, kind: "plugin" | "skill", method: "POST" | "DELETE"): Promise<unknown>;
   startAutomation(): void;
@@ -164,7 +170,16 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   const statePath = options.statePath ?? join(dirname(configPath), "memory-service", "agent-sources.json");
   const scanStoreDirectory = options.scanStoreDirectory ?? join(dirname(statePath), "agent-source-scans");
   let statePromise: Promise<PersistedState> | undefined;
-  let scan: AgentSourceScanState = restoredScanState(scanStoreDirectory);
+  const generation = nextScanGeneration(scanStoreDirectory);
+  let sequence = 0;
+  let scan: AgentSourceScanState = { ...restoredScanState(scanStoreDirectory), version: { generation, sequence } };
+  scan.status = scan.running ? "running" : scan.completedAt ? (scan.error ? "failed" : "completed") : scan.progress?.phase === "stopped" ? "paused" : "idle";
+  function setScan(next: AgentSourceScanState): void {
+    scan = { ...next, version: { generation, sequence: ++sequence },
+      status: next.running ? "running" : next.completedAt ? (next.error ? "failed" : "completed") : next.progress?.phase === "stopped" ? "paused" : next.status === "cancelled" ? "cancelled" : "idle" };
+  }
+  const snapshot = () => structuredClone(scan);
+  const controlResult = (outcome: ScanControlResult["outcome"]): ScanControlResult => ({ ok: true, outcome, snapshot: snapshot() });
   let scanTimer: ReturnType<typeof setTimeout> | undefined;
   let scanAbortController: AbortController | undefined;
   let activeScanRequest: ReturnType<typeof normalizeScanInput> | undefined;
@@ -227,9 +242,13 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     return { executorAvailable: true, sources };
   }
 
-  async function startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string }> {
+  async function startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string; version?: ScanVersion }> {
     if (canceling) throw new MemoryServiceError("conflict", "Canceling the previous scan");
     if (disposed) throw new MemoryServiceError("conflict", "Agent source executor is shutting down");
+    const expected = (input ?? {}) as ScanControlInput;
+    if (!matchesScanExecution(scan, expected.expectedExecution) || (expected.expectedVersion && (!scan.version || compareScanVersions(scan.version, expected.expectedVersion) !== 0))) {
+      throw new MemoryServiceError("conflict", "Scan state changed; refresh before starting or resuming");
+    }
     const request = normalizeScanInput(input);
     if (request.sourceId !== "all" && !registry.get(request.sourceId)) throw new MemoryServiceError("invalid_argument", "Unknown Agent source");
     if (!scanAbortController && scan.progress?.phase === "stopped" && !scan.completedAt && scan.sourceId !== request.sourceId) {
@@ -242,7 +261,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       }
       const jobId = scan.jobId;
       scanPaused = false;
-      scan = {
+      setScan({
         ...scan,
         running: true,
         progress: progressBeforePause ?? {
@@ -253,11 +272,11 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           message: "Scanning Agent history"
         },
         error: null
-      };
+      });
       resumePausedScan?.();
       resumePausedScan = undefined;
       logger.info("scan.resumed", { jobId, sourceId: request.sourceId });
-      return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined };
+      return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined, version: scan.version };
     }
     if (scanPaused) {
       throw new MemoryServiceError("conflict", "Stop the paused Agent source scan before starting another scan");
@@ -267,7 +286,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     const recovering = scan.jobId === jobId && scan.progress?.phase === "stopped" && !scan.completedAt;
     const attemptId = recovering ? scan.attemptId ?? `${jobId}:legacy` : randomUUID();
     const startedAt = recovering ? scan.startedAt : new Date().toISOString();
-    scan = {
+    setScan({
       running: true,
       jobId,
       attemptId,
@@ -277,23 +296,23 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       startedAt,
       completedAt: null,
       error: null
-    };
+    });
     activeScanRequest = request;
     progressBeforePause = null;
     const controller = new AbortController();
     scanAbortController = controller;
     const activeScan = runScan(request, controller.signal, jobId).then(() => {
       if (scan.jobId !== jobId || controller.signal.aborted) return;
-      scan = { ...scan, running: false, completedAt: scan.completedAt ?? new Date().toISOString() };
+      setScan({ ...scan, running: false, completedAt: scan.completedAt ?? new Date().toISOString() });
       logger.info("scan.completed", { jobId, sourceId: request.sourceId });
     }).catch((error) => {
       if (scan.jobId !== jobId || controller.signal.aborted) return;
-      scan = {
+      setScan({
         ...scan,
         running: false,
         completedAt: scan.completedAt ?? new Date().toISOString(),
         error: scan.error ?? (error instanceof Error ? error.message || "Agent source import failed" : String(error))
-      };
+      });
       logger.error("scan.failed", { jobId, sourceId: request.sourceId, ...memoryErrorFields(error) });
     }).finally(() => {
       activeScans.delete(activeScan);
@@ -307,7 +326,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     });
     activeScans.add(activeScan);
     logger.info("scan.started", { jobId, sourceId: request.sourceId, mode: request.mode });
-    return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined };
+    return { accepted: true, jobId, attemptId: scan.attemptId, attemptStartedAt: scan.startedAt ?? undefined, version: scan.version };
   }
 
   async function runScan(
@@ -316,7 +335,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     jobId: string
   ): Promise<void> {
     const failures: string[] = [];
-    scan = { ...scan, results: [] };
+    setScan({ ...scan, results: [] });
     let failureCount = 0;
     const adapters = request.sourceId === "all"
       ? registry.list()
@@ -333,7 +352,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       store.saveMeta({ jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental",
         phase: error ? "failed" : "done", createdAt: store.getMeta()?.createdAt ?? completedAt,
         updatedAt: completedAt, ...(error ? { error } : {}), completion: JSON.stringify(completion) });
-      scan = { ...scan, completedAt, error };
+      setScan({ ...scan, running: false, completedAt, error });
     };
     try {
       checkpoints = openSourceCheckpoints(`${statePath}.checkpoints.sqlite`);
@@ -380,7 +399,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const mode = stored.recoveryPending ? "full" : request.mode ?? preservedModes.get(adapter.descriptor.sourceId) ?? (stored.lastScannedAt ? "incremental" : "initial_subset");
         store.saveMeta({ jobId, sourceId: store.getMeta()?.sourceId ?? request.sourceId, mode, phase: "stage", createdAt: store.getMeta()?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
         stages.push(await stageStandaloneSource(adapter, stored, mode, store, signal, checkpoint, (progress) => {
-          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; scan = { ...scan, progress }; }
+          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; setScan({ ...scan, progress }); }
         }));
       }
       for (const stage of stages) {
@@ -391,7 +410,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const sourceState = store.getSourceState(sourceId);
         store.saveSourceState({ ...(sourceState ?? { sourceId, mode, messageCount: store.count(sourceId), resultCount: store.resultCount(sourceId), errorCount: stage.scanErrorCount, updatedAt: new Date().toISOString() }), phase: "prepare", updatedAt: new Date().toISOString() });
         preparedContentHashes.set(sourceId, await prepareStandaloneSource(store, checkpoints, sourceId, mode, stage.stored.latestSeenAt, checkpoint, (progress) => {
-          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; scan = { ...scan, progress }; }
+          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; setScan({ ...scan, progress }); }
         }));
       }
       if (globalInitial) store.selectInitialTurns(stages.map((stage) => stage.sourceId), INITIAL_SCAN_MESSAGE_LIMIT, 200);
@@ -404,7 +423,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const preparedState = store.getSourceState(sourceId);
         store.saveSourceState({ ...(preparedState ?? { sourceId, mode, messageCount: store.count(sourceId), resultCount: store.resultCount(sourceId), errorCount: stage.scanErrorCount, updatedAt: new Date().toISOString() }), phase: "ingest", updatedAt: new Date().toISOString() });
         const result = await ingestStagedMessages(options.service, store, checkpoints, sourceId, signal, checkpoint, (progress) => {
-          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; scan = { ...scan, progress }; }
+          if (scan.jobId === jobId && !signal.aborted && !scanPaused) { progressBeforePause = progress; setScan({ ...scan, progress }); }
         }, options.scheduleWorker, options.memoryAddAnalytics, persistentScanMode(mode));
         const skillResult = await ingestAgentSkills(
           options.service,
@@ -456,14 +475,14 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         state.sources[sourceId] = nextSourceState;
         const details = [...store.results(sourceId, "0", 500)];
         const summary = store.resultSummary(sourceId);
-        scan = { ...scan, results: [...(scan.results ?? []), {
+        setScan({ ...scan, results: [...(scan.results ?? []), {
           sourceId, discoveredConversations: summary.conversations,
           emittedMessages: store.count(sourceId), skipped: result.skipped,
           memoryIds: details.flatMap((row) => row.memoryId ? [row.memoryId] : []),
           memoryIdCount: summary.memories, errorCount: Math.max(sourceErrorCount, summary.errors),
           detailsTruncated: store.resultCount(sourceId) > 500,
           errors: sourceErrors
-        }] };
+        }] });
         store.saveSourceState({
           sourceId,
           mode,
@@ -473,7 +492,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           errorCount: sourceErrorCount,
           updatedAt: now
         });
-        scan = { ...scan, progress: { sourceId, phase: "done", current: store.count(sourceId), total: store.count(sourceId), message: `Imported ${result.written} memories and ${skillResult.written} skills` } };
+        setScan({ ...scan, progress: { sourceId, phase: "done", current: store.count(sourceId), total: store.count(sourceId), message: `Imported ${result.written} memories and ${skillResult.written} skills` } });
       }
       // A source disappearing between attempts must not erase its unresolved failures.
       for (const sourceId of store.unresolvedSourceIds()) {
@@ -482,8 +501,8 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const errors = store.errorDetails(sourceId);
         failureCount += summary.errors;
         failures.push(...errors.slice(0, 3).map((item) => `${sourceId}: ${item.reason}`));
-        scan.results?.push({ sourceId, discoveredConversations: summary.conversations, emittedMessages: store.count(sourceId),
-          skipped: 0, memoryIdCount: summary.memories, errorCount: summary.errors, errors });
+        setScan({ ...scan, results: [...(scan.results ?? []), { sourceId, discoveredConversations: summary.conversations, emittedMessages: store.count(sourceId),
+          skipped: 0, memoryIdCount: summary.memories, errorCount: summary.errors, errors }] });
       }
       await checkpoint();
       if (failureCount > 0) {
@@ -514,14 +533,17 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     }
   }
 
-  async function pauseScan(): Promise<{ ok: true }> {
-    if (scanPaused) return { ok: true };
+  async function pauseScan(input: ScanControlInput = {}): Promise<ScanControlResult> {
+    if (!matchesScanExecution(scan, input.expectedExecution)) return controlResult("conflict");
+    if (canceling) return controlResult("conflict");
+    if (scan.completedAt) return controlResult("already_terminal");
+    if (scanPaused || scan.progress?.phase === "stopped") return controlResult("applied");
     if (!scan.running || !scanAbortController || !activeScanRequest) {
-      throw new MemoryServiceError("conflict", "No Agent source scan is running");
+      return controlResult("already_terminal");
     }
     progressBeforePause = scan.progress;
     scanPaused = true;
-    scan = {
+    setScan({
       ...scan,
       running: false,
       progress: {
@@ -531,14 +553,17 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         total: scan.progress?.total ?? 0,
         message: "Agent source scan paused"
       }
-    };
+    });
     logger.info("scan.paused", { jobId: scan.jobId, sourceId: activeScanRequest.sourceId });
-    return { ok: true };
+    return controlResult("applied");
   }
 
-  async function cancelScan(): Promise<{ ok: true }> {
+  async function cancelScan(input: ScanControlInput = {}): Promise<ScanControlResult> {
+    if (!matchesScanExecution(scan, input.expectedExecution)) return controlResult("conflict");
+    if (scan.completedAt) return controlResult("already_terminal");
     const controller = scanAbortController;
-    if (!controller && !scanPaused && scan.progress?.phase !== "stopped") return { ok: true };
+    if (!controller && !scanPaused && scan.progress?.phase !== "stopped") return controlResult("already_terminal");
+    if (canceling) return controlResult("conflict");
     const jobId = scan.jobId;
     const sourceId = activeScanRequest?.sourceId;
     canceling = true;
@@ -553,11 +578,11 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         const path = join(scanStoreDirectory, `${jobId}.sqlite`);
         await Promise.all([rm(path, { force: true }), rm(`${path}-wal`, { force: true }), rm(`${path}-shm`, { force: true })]);
       }
-      scan = emptyScanState();
+      setScan({ ...emptyScanState(), jobId: scan.jobId, attemptId: scan.attemptId, startedAt: scan.startedAt, sourceId: scan.sourceId, status: "cancelled" });
       activeScanRequest = undefined;
       progressBeforePause = null;
       logger.info("scan.canceled", { jobId, sourceId });
-      return { ok: true };
+      return controlResult("applied");
     } finally {
       canceling = false;
     }
@@ -686,7 +711,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   return {
     list,
     startScan,
-    scanStatus: () => scan,
+    scanStatus: snapshot,
     pauseScan,
     cancelScan,
     scanResults,

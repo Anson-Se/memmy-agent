@@ -168,7 +168,7 @@ describe("unified scan behavior", () => {
     expect(scan.scanStatus()).toMatchObject({ jobId: "interrupted", progress: { phase: "stopped" } });
     await expect(scan.startScan({ sourceId: "all" })).rejects.toThrow(/recovered/);
     await scan.cancelScan();
-    expect(scan.scanStatus().jobId).toBeNull();
+    expect(scan.scanStatus()).toMatchObject({ status: "cancelled", jobId: expect.any(String), attemptId: expect.any(String), progress: null });
     await scan.startScan({ sourceId: "all" }); expect((await done(scan)).error).toBeNull();
   });
 
@@ -242,7 +242,7 @@ describe("scan repair regressions", () => {
     const resumed = await scan.startScan({ sourceId: "all", mode: "full" });
     expect(resumed.attemptId).toBe(first.attemptId);
     await scan.cancelScan();
-    expect(scan.scanStatus().jobId).toBeNull();
+    expect(scan.scanStatus()).toMatchObject({ status: "cancelled", jobId: expect.any(String), attemptId: expect.any(String), progress: null });
   });
 
   it("counts all staged messages, with duplicate skips measured in messages", async () => {
@@ -325,7 +325,7 @@ it("services pause during preparation before any ingestion and preserves the exe
     expect(memory.addMemory).not.toHaveBeenCalled();
     expect(scan.scanStatus()).toMatchObject({ running: false, attemptId: started.attemptId, progress: { phase: "stopped" } });
     await scan.cancelScan();
-    expect(scan.scanStatus().jobId).toBeNull();
+    expect(scan.scanStatus()).toMatchObject({ status: "cancelled", jobId: expect.any(String), attemptId: expect.any(String), progress: null });
   } finally { clearInterval(timer); }
 });
 

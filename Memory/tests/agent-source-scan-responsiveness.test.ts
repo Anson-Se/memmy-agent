@@ -81,7 +81,7 @@ describe("standalone scan HTTP responsiveness", () => {
         body: "{}",
       });
       expect(cancel.status).toBe(200);
-      expect(executor.scanStatus()).toMatchObject({ running: false, jobId: null });
+      expect(executor.scanStatus()).toMatchObject({ running: false, status: "cancelled", jobId: expect.any(String), attemptId: expect.any(String) });
     };
     try {
       const { jobId } = await executor.startScan({ sourceId: "codex", mode: "full" });
@@ -179,7 +179,13 @@ describe("standalone scan HTTP responsiveness", () => {
       expect(completeSourceTurn).not.toHaveBeenCalled();
       expect(existsSync(join(root, "scans", `${initial.jobId}.sqlite`))).toBe(true);
       resumed = create();
-      expect((await resumed.startScan({ sourceId: "codex", mode: "initial_subset" })).jobId).toBe(initial.jobId);
+      const recovery = resumed.scanStatus();
+      expect(recovery.version!.generation).toBeGreaterThan(initial.version!.generation);
+      expect(recovery.attemptId).toBe(initial.attemptId);
+      expect(recovery.status).toBe("paused");
+      const continued = await resumed.startScan({ sourceId: "codex", mode: "initial_subset", expectedExecution: { jobId: initial.jobId, attemptId: initial.attemptId } });
+      expect(continued.jobId).toBe(initial.jobId);
+      expect(continued.attemptId).toBe(initial.attemptId);
       await vi.waitFor(() => expect(resumed!.scanStatus().running).toBe(false), { timeout: 10_000 });
       expect(resumed.scanStatus().error).toBeNull();
       expect(completeSourceTurn).toHaveBeenCalledTimes(1_000);

@@ -13,7 +13,9 @@ import {
   ManagedAgentSourceImportInputSchema,
   ManagedAgentSourceImportResultSchema,
   ManagedAgentSourceUpdateInputSchema,
-  OkResponseSchema
+  OkResponseSchema,
+  ScanControlInputSchema,
+  AgentSourceScanControlResponseSchema
 } from "@memmy/local-api-contracts";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PermissionManager } from "../../../../permission/index.js";
@@ -81,12 +83,12 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     return reply.send(AgentSourceScanJobResponseSchema.parse(await scans.start(input)));
   }));
 
-  app.post("/api/agent-sources/scan/stop", { preHandler: options.authenticateRuntimeToken }, withErrorEnvelope(async (_request, reply) => {
-    return reply.send(OkResponseSchema.parse(await scans.pause()));
+  app.post("/api/agent-sources/scan/stop", { preHandler: options.authenticateRuntimeToken }, withErrorEnvelope(async (request, reply) => {
+    return reply.send(AgentSourceScanControlResponseSchema.parse(await scans.pause(ScanControlInputSchema.parse(request.body ?? {}))));
   }));
 
-  app.post("/api/agent-sources/scan/cancel", { preHandler: options.authenticateRuntimeToken }, withErrorEnvelope(async (_request, reply) => {
-    return reply.send(OkResponseSchema.parse(await scans.cancel()));
+  app.post("/api/agent-sources/scan/cancel", { preHandler: options.authenticateRuntimeToken }, withErrorEnvelope(async (request, reply) => {
+    return reply.send(AgentSourceScanControlResponseSchema.parse(await scans.cancel(ScanControlInputSchema.parse(request.body ?? {}))));
   }));
 
   app.post("/api/agent-sources/manual", { preHandler: options.authenticateRuntimeToken }, async (request, reply) => {

@@ -35,6 +35,8 @@ export interface StartAgentSourceScanInput {
   formatError?: (error: unknown) => string;
   scheduleFallback: (callback: () => void, delayMs: number) => unknown;
   fallbackDelayMs?: number;
+  expectedExecution?: import("@memmy/local-api-contracts").ScanControlInput["expectedExecution"];
+  expectedVersion?: import("@memmy/local-api-contracts").ScanVersion;
   analyticsContext?: {
     pagePath: string;
     subPage: MemoryUiSubPage;
@@ -49,13 +51,17 @@ export async function startAgentSourceScan(input: StartAgentSourceScanInput): Pr
     subPage: "sources" as const
   };
 
+  const token = crypto.randomUUID();
+  input.dispatch(appActions.agentSourceScanControl(input.expectedExecution ? "resume" : "start", token));
   input.dispatch(appActions.agentSourceScanStarted(sourceId));
 
   try {
     await input.ensureScanPermission?.();
     const job = await input.clients.agentSources.startScan({
       sourceId,
-      ...(input.mode ? { mode: input.mode } : {})
+      ...(input.mode ? { mode: input.mode } : {}),
+      ...(input.expectedExecution ? { expectedExecution: input.expectedExecution } : {}),
+      ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {})
     });
     recordScanStarted(job.jobId, {
       attemptId: job.attemptId,
@@ -70,7 +76,9 @@ export async function startAgentSourceScan(input: StartAgentSourceScanInput): Pr
       sourceId,
       scanMode: input.mode
     }));
-    input.dispatch(appActions.agentSourceScanProgressReceived(await resolveStartedScanProgress(input.clients, job, sourceId, input.queuedMessage)));
+    const started = await resolveStartedScanProgress(input.clients, job, sourceId, input.queuedMessage);
+    if ("active" in started) input.dispatch(appActions.agentSourceScanStatusReceived(started));
+    else input.dispatch(appActions.agentSourceScanProgressReceived(started));
 
     input.scheduleFallback(() => {
       void reloadSources(input.clients, input.dispatch, input.formatError);
@@ -84,6 +92,11 @@ export async function startAgentSourceScan(input: StartAgentSourceScanInput): Pr
       durationMs: 0
     }));
     input.dispatch(appActions.agentSourcesFailed(formatScanError(error, input.formatError)));
+    try {
+      if (input.clients.agentSources.getScanStatus) input.dispatch(appActions.agentSourceScanStatusReceived(await input.clients.agentSources.getScanStatus()));
+    } catch { /* later status reconciliation */ }
+  } finally {
+    input.dispatch(appActions.agentSourceScanControl(null, token));
   }
 }
 
@@ -108,7 +121,7 @@ async function resolveStartedScanProgress(
 
   try {
     const status = await clients.agentSources.getScanStatus();
-    return status.progress ?? queuedProgress;
+    return status.version || status.completion ? status : status.progress ?? queuedProgress;
   } catch {
     return queuedProgress;
   }

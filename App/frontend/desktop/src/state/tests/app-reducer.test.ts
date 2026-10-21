@@ -194,7 +194,8 @@ describe("app reducer", () => {
 
   it("stores real scan progress from SSE events until the completed event arrives", () => {
     const loadingState = appReducer(createInitialAppState(), appActions.agentSourceScanStarted("cursor"));
-    expect(loadingState.agentSources.activeScanSourceId).toBe("cursor");
+    expect(loadingState.agentSources.activeScanSourceId).toBeNull();
+    expect(loadingState.agentSources.isScanning).toBe(false);
     const progressState = appReducer(
       loadingState,
       appActions.agentSourceScanProgressReceived({

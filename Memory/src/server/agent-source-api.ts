@@ -1,3 +1,4 @@
+import type { ScanControlInput } from "@memmy/agent-source-core/scan-state";
 import type { IncomingMessage } from "node:http";
 import type { AgentSourceExecutor } from "../agent-source/runtime.js";
 import { MemoryServiceError } from "../utils/error.js";
@@ -24,10 +25,13 @@ export function isAgentSourceScanPath(path: string): boolean {
 export async function routeAgentSourceScan(executor: AgentSourceExecutor, method: string, url: URL, body: unknown) {
   const path = url.pathname;
   if (method === "GET" && path === "/api/v1/agent-sources") return { body: await executor.list() };
-  if (method === "POST" && path === "/api/v1/agent-sources/scan") return { status: 202, body: await executor.startScan(body) };
+  if (method === "POST" && path === "/api/v1/agent-sources/scan") {
+    scanControlInput(body);
+    return { status: 202, body: await executor.startScan(body) };
+  }
   if (method === "GET" && path === "/api/v1/agent-sources/scan/status") return { body: executor.scanStatus() };
-  if (method === "POST" && path === "/api/v1/agent-sources/scan/stop") return { body: await executor.pauseScan() };
-  if (method === "POST" && path === "/api/v1/agent-sources/scan/cancel") return { body: await executor.cancelScan() };
+  if (method === "POST" && path === "/api/v1/agent-sources/scan/stop") return { body: await executor.pauseScan(scanControlInput(body)) };
+  if (method === "POST" && path === "/api/v1/agent-sources/scan/cancel") return { body: await executor.cancelScan(scanControlInput(body)) };
   const results = path.match(/^\/api\/v1\/agent-sources\/scan\/jobs\/([^/]+)\/results$/);
   if (method === "GET" && results?.[1]) {
     const jobId = decodeURIComponent(results[1]);
@@ -37,4 +41,13 @@ export async function routeAgentSourceScan(executor: AgentSourceExecutor, method
     return { body: await executor.scanResults?.(jobId, url.searchParams.get("cursor") ?? "0", limit) ?? { items: [], nextCursor: null } };
   }
   return undefined;
+}
+
+function scanControlInput(body: unknown): ScanControlInput {
+  if (body === undefined || body === null) return {};
+  if (typeof body !== "object" || Array.isArray(body)) throw new MemoryServiceError("invalid_argument", "Invalid scan control");
+  const input = body as ScanControlInput;
+  if (input.expectedExecution !== undefined && (!input.expectedExecution || typeof input.expectedExecution !== "object" || Array.isArray(input.expectedExecution) || typeof input.expectedExecution.jobId !== "string" || !input.expectedExecution.jobId || (input.expectedExecution.attemptId !== undefined && typeof input.expectedExecution.attemptId !== "string"))) throw new MemoryServiceError("invalid_argument", "Invalid scan execution");
+  if (input.expectedVersion !== undefined && (!input.expectedVersion || typeof input.expectedVersion !== "object" || !Number.isSafeInteger(input.expectedVersion.generation) || input.expectedVersion.generation < 0 || !Number.isSafeInteger(input.expectedVersion.sequence) || input.expectedVersion.sequence < 0)) throw new MemoryServiceError("invalid_argument", "Invalid scan version");
+  return input;
 }

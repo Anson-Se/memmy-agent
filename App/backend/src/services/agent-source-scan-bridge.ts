@@ -1,4 +1,4 @@
-import { agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
+import { acceptsScanUpdate, type ScanControlInput, agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
 import type { AgentSourceScanInput, AgentSourceScanStatusResponse, MemoryAgentSourceScanState } from "@memmy/local-api-contracts";
 import type { AgentSourceScanClient } from "../adapters/outbound/memory-client/types.js";
 import { MemoryLayerError, memoryScanUnavailable } from "../adapters/outbound/memory-client/errors.js";
@@ -9,6 +9,7 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let polling: Promise<MemoryAgentSourceScanState> | undefined;
+  let latest: MemoryAgentSourceScanState | undefined;
   let lastProgress = "";
   let lastCompletion = "";
   const requireClient = () => {
@@ -16,7 +17,7 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
     return client;
   };
   function identity(state: MemoryAgentSourceScanState) {
-    return { jobId: state.jobId!, ...(state.attemptId ? { attemptId: state.attemptId } : {}),
+    return { version: state.version, status: state.status, jobId: state.jobId!, ...(state.attemptId ? { attemptId: state.attemptId } : {}),
       ...(state.startedAt ? { attemptStartedAt: state.startedAt } : {}) };
   }
   function desktopProgress(progress: NonNullable<MemoryAgentSourceScanState["progress"]>) {
@@ -29,7 +30,7 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
   }
   function publish(state: MemoryAgentSourceScanState) {
     if (stopped || !state.jobId || !state.sourceId) return;
-    if (state.progress && (state.running || state.progress.phase === "stopped")) {
+    if (state.progress && !state.completedAt && (state.running || state.progress.phase === "stopped")) {
       const progress = { ...desktopProgress(state.progress), ...identity(state) };
       const key = JSON.stringify(progress);
       if (key !== lastProgress) {
@@ -53,9 +54,37 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
       });
     }
   }
-  async function snapshot() {
-    if (!polling) polling = requireClient().status().then((state) => { publish(state); return state; }).finally(() => { polling = undefined; });
+  function receive(state: MemoryAgentSourceScanState) {
+    if (latest?.version && !acceptsScanUpdate(latest, state)) return latest;
+    latest = state;
+    publish(state);
+    return state;
+  }
+  async function snapshot(fresh = false) {
+    if (!polling || fresh) {
+      const pending = requireClient().status().then(receive).finally(() => { if (polling === pending) polling = undefined; });
+      polling = pending;
+    }
     return polling;
+  }
+  function desktopState(state: MemoryAgentSourceScanState): AgentSourceScanStatusResponse {
+    return {
+      version: state.version, status: state.status,
+      ...(state.jobId ? { execution: { ...identity(state) } } : {}),
+      active: state.running,
+      progress: state.jobId && !state.completedAt && (state.running || state.progress?.phase === "stopped") ? {
+        ...identity(state),
+        ...desktopProgress(state.progress ?? { sourceId: state.sourceId ?? "all", phase: "scan" as const, current: 0, total: 0 })
+      } : null,
+      ...(state.jobId && state.sourceId && state.completedAt ? { completion: {
+        ...identity(state), sourceId: state.sourceId, succeeded: succeeded(state), completedAt: state.completedAt
+      } } : {})
+    };
+  }
+  async function control(kind: "pause" | "cancel", input?: ScanControlInput) {
+    const result = await requireClient()[kind](input);
+    const state = result.snapshot ? receive(result.snapshot) : await snapshot(true);
+    return { ...result, snapshot: desktopState(state) };
   }
   function schedule() {
     if (stopped || !client) return;
@@ -69,9 +98,9 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
   return {
     async start(input: AgentSourceScanInput) {
       const current = await snapshot();
-      if (current.running && current.sourceId === input.sourceId && current.mode === (input.mode ?? null) && current.jobId) return identity(current);
+      if (!input.expectedExecution && !input.expectedVersion && current.running && current.sourceId === input.sourceId && current.mode === (input.mode ?? null) && current.jobId) return identity(current);
       const job = await requireClient().start(input);
-      await snapshot();
+      await snapshot(true);
       return job;
     },
     async status(): Promise<AgentSourceScanStatusResponse> {
@@ -84,20 +113,11 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
         // This is an explicit unavailable state, never a successful completion.
         return { active: false, progress: null, unavailable };
       }
-      return {
-        active: state.running,
-        progress: state.jobId && (state.running || state.progress?.phase === "stopped") ? {
-          ...identity(state),
-          ...desktopProgress(state.progress ?? { sourceId: state.sourceId ?? "all", phase: "scan" as const, current: 0, total: 0 })
-        } : null,
-        ...(state.jobId && state.sourceId && state.completedAt ? { completion: {
-          ...identity(state), sourceId: state.sourceId, succeeded: succeeded(state), completedAt: state.completedAt
-        } } : {})
-      };
+      return desktopState(state);
     },
     results: (jobId: string, cursor: string, limit: number) => requireClient().results(jobId, cursor, limit),
-    async pause() { const result = await requireClient().pause(); await snapshot(); return result; },
-    async cancel() { const result = await requireClient().cancel(); lastProgress = ""; return result; },
+    pause: (input?: ScanControlInput) => control("pause", input),
+    cancel: (input?: ScanControlInput) => control("cancel", input),
     async dispose() {
       stopped = true;
       if (timer) clearTimeout(timer);

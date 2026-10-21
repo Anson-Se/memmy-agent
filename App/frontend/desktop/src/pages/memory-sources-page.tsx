@@ -124,7 +124,8 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const scanTargetSourceId = scanProgress?.sourceId ?? state.agentSources.activeScanSourceId;
   const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
-  const scanCancelling = Boolean(state.agentSources.cancellingScanJobId);
+  const scanCancelling = Boolean(state.agentSources.cancellingScanJobId || state.agentSources.scanControl?.control === "cancel");
+  const scanControlBusy = Boolean(state.agentSources.scanControl);
   const showScanProgress = isScanning || scanStopped || scanCancelling;
   const hasDeterminateScanProgress = Boolean(scanProgress && scanProgress.phase !== "scan" && scanProgress.phase !== "stopped" && scanProgress.total > 0);
   const memoryUnavailable = memoryServiceStatus === "unavailable";
@@ -434,7 +435,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
    * Triggers an automatic scan.
    */
   function scanSources(sourceId = "all", mode?: AgentSourceScanMode) {
-    if (!clients || isScanning || scanCancelling || recentlyCompletedSourceIds.has(sourceId)) {
+    if (!clients || isScanning || scanCancelling || scanControlBusy || recentlyCompletedSourceIds.has(sourceId)) {
       return;
     }
 
@@ -448,6 +449,8 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
       ensureScanPermission,
       sourceId,
       mode,
+      expectedExecution: scanProgress ? { jobId: scanProgress.jobId, attemptId: scanProgress.attemptId } : undefined,
+      expectedVersion: scanProgress ? undefined : state.agentSources.scanStamp?.version,
       queuedMessage: t("memory.scanQueued"),
       formatError: (error) => formatAgentSourceScanRequestError(error, scanSource, t),
       scheduleFallback(callback, delayMs) {
@@ -494,41 +497,36 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
     scanSources(fullScanTargetSourceId, "full");
   }
 
-  function stopScan() {
-    if (!clients || !isScanning || scanCancelling) {
+  async function stopScan() {
+    if (!clients || !isScanning || scanCancelling || scanControlBusy) {
       return;
     }
 
-    const jobId = scanProgress?.jobId ?? "stopped";
-    dispatch(appActions.agentSourceScanProgressReceived({
-      jobId,
-      sourceId: scanProgress?.sourceId ?? "all",
-      phase: "stopped",
-      current: scanProgress?.current ?? 0,
-      total: scanProgress?.total ?? 0,
-      message: t("memory.scanStopped")
-    }));
-    void clients.agentSources
-      .stopScan()
-      .catch((error) => dispatch(appActions.agentSourcesFailed(error instanceof Error ? error.message : String(error))));
+    await controlScan("pause");
+  }
+
+  async function controlScan(kind: "pause" | "cancel") {
+    if (!clients || !scanProgress) return;
+    const token = crypto.randomUUID();
+    const expectedExecution = scanProgress ? { jobId: scanProgress.jobId, attemptId: scanProgress.attemptId } : undefined;
+    dispatch(appActions.agentSourceScanControl(kind, token));
+    try {
+      const result = await (kind === "pause" ? clients.agentSources.stopScan({ expectedExecution }) : clients.agentSources.cancelScan({ expectedExecution }));
+      const status = result?.snapshot ?? await clients.agentSources.getScanStatus();
+      dispatch(appActions.agentSourceScanStatusReceived(status, undefined,
+        kind === "cancel" && expectedExecution ? { ...expectedExecution, token } : undefined));
+      if (kind === "cancel") reloadSources();
+    } catch (error) {
+      dispatch(appActions.agentSourcesFailed(error instanceof Error ? error.message : String(error)));
+      try { dispatch(appActions.agentSourceScanStatusReceived(await clients.agentSources.getScanStatus())); } catch { /* next heartbeat reconciles */ }
+    } finally {
+      dispatch(appActions.agentSourceScanControl(null, token));
+    }
   }
 
   function cancelScan() {
-    if (!clients || !showScanProgress || scanCancelling) {
-      return;
-    }
-
-    const jobId = scanProgress?.jobId;
-    if (jobId) {
-      dispatch(appActions.agentSourceScanCancelRequested(jobId));
-    }
-    void clients.agentSources
-      .cancelScan()
-      .then(() => {
-        dispatch(appActions.agentSourceScanCompleted());
-        reloadSources();
-      })
-      .catch((error) => dispatch(appActions.agentSourceScanCancelFailed(error instanceof Error ? error.message : String(error))));
+    if (!clients || !showScanProgress || scanCancelling || scanControlBusy) return;
+    void controlScan("cancel");
   }
 
   /**
@@ -867,7 +865,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
             <button
               type="button"
               onClick={isScanning ? stopScan : continueScan}
-              disabled={scanCancelling}
+              disabled={scanCancelling || scanControlBusy}
               className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-btn border border-action-sky/30 text-action-sky bg-action-sky/8 hover:bg-action-sky/12 hover:border-action-sky/40 active:scale-[0.98] text-xs font-normal cursor-pointer transition-all disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-action-sky/8 disabled:hover:border-action-sky/30 disabled:active:scale-100"
               title={t(isScanning ? "memory.scanPause" : "memory.scanContinue")}
               aria-label={t(isScanning ? "memory.scanPause" : "memory.scanContinue")}
@@ -878,7 +876,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
             <button
               type="button"
               onClick={cancelScan}
-              disabled={scanCancelling}
+              disabled={scanCancelling || scanControlBusy}
               className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-btn border border-status-error/30 text-status-error bg-status-error-soft/50 hover:bg-status-error-soft hover:border-status-error/40 active:scale-[0.98] text-xs font-normal cursor-pointer transition-all disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-status-error-soft/50 disabled:hover:border-status-error/30 disabled:active:scale-100"
               title={t(scanCancelling ? "memory.scanCancelling" : "memory.scanStop")}
               aria-label={t(scanCancelling ? "memory.scanCancelling" : "memory.scanStop")}
@@ -910,7 +908,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
           <button
             type="button"
             onClick={scanStopped ? continueScan : () => scanSources()}
-            disabled={isScanning || scanCancelling || recentlyCompletedSourceIds.has("all")}
+            disabled={isScanning || scanCancelling || scanControlBusy || recentlyCompletedSourceIds.has("all")}
             className={`inline-flex h-8 items-center gap-2 rounded-btn px-3.5 text-xs font-normal text-white shadow-sm transition-all active:scale-[0.98] disabled:cursor-not-allowed ${
               recentlyCompletedSourceIds.has("all")
                 ? "bg-status-success"
@@ -939,7 +937,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
           );
           const connectionAction = resolveAgentSourceConnectionAction(source);
           const connectionActionDisabled = isAgentSourceConnectionActionDisabled(source, connectionAction);
-          const sourceScanDisabled = isScanning || scanCancelling || sourceScanButtonState === "completed" || !source.available;
+          const sourceScanDisabled = isScanning || scanCancelling || scanControlBusy || sourceScanButtonState === "completed" || !source.available;
           const managedSyncReady = !source.builtin && source.syncReady === true;
           const managedSyncButtonState = resolveManagedAgentSourceSyncButtonState(
             source.sourceId,
@@ -995,7 +993,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
                       onClick={() => managedSyncReady
                         ? syncManagedSource(source)
                         : launchManagedAgentTask(source, "connect")}
-                      disabled={isScanning || scanCancelling || Boolean(managedSyncingSourceId) || managedSyncButtonState === "completed"}
+                      disabled={isScanning || scanCancelling || scanControlBusy || Boolean(managedSyncingSourceId) || managedSyncButtonState === "completed"}
                       busy={managedSyncButtonState === "running"}
                       completed={managedSyncButtonState === "completed"}
                     />
@@ -1031,7 +1029,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
             <button
               type="button"
               onClick={openFullScanConfirm}
-              disabled={isScanning || scanCancelling}
+              disabled={isScanning || scanCancelling || scanControlBusy}
               className="flex items-start gap-3 rounded-card border-content-panel bg-background-paper/70 p-3 text-left transition-all hover:bg-background-paper disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer outline-none focus:outline-none focus-visible:ring-2 focus-visible:ring-status-error/20"
             >
               <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-btn bg-background-paper/80 text-status-error">
