@@ -48,6 +48,7 @@ import { renderTemplate } from "../../utils/prompt-templates.js";
 import type { TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
 import { resolveToolResultMaxChars, type ToolResultMaxCharsByName } from "./tool-result-budget.js";
 import { convertMcpToolContent } from "./tools/mcp.js";
+import { OUTPUT_FEEDBACK_KEY, takeOutputPaths, withOutputPaths, type OutputDelivery } from "./tools/output-location.js";
 
 const DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
 const PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]";
@@ -157,6 +158,7 @@ export class AgentRunSpec {
   maxIterationsMessage: string | null;
   maxIterationsFinalPrompt: string | null;
   workspace?: string | null;
+  outputLocation?: OutputDelivery;
   sessionKey?: string | null;
   hostProjectId?: string | null;
   contextWindowTokens?: number | null;
@@ -196,6 +198,7 @@ export class AgentRunSpec {
     maxIterationsMessage?: string | null;
     maxIterationsFinalPrompt?: string | null;
     workspace?: string | null;
+    outputLocation?: OutputDelivery;
     sessionKey?: string | null;
     hostProjectId?: string | null;
     contextWindowTokens?: number | null;
@@ -233,6 +236,7 @@ export class AgentRunSpec {
     this.maxIterationsMessage = init.maxIterationsMessage ?? null;
     this.maxIterationsFinalPrompt = init.maxIterationsFinalPrompt ?? null;
     this.workspace = init.workspace ?? null;
+    this.outputLocation = init.outputLocation;
     this.sessionKey = init.sessionKey ?? null;
     this.hostProjectId = init.hostProjectId ?? null;
     this.contextWindowTokens = init.contextWindowTokens ?? null;
@@ -425,6 +429,7 @@ export class AgentRunner {
         delete providerMessage.turn_source;
         delete providerMessage.webui_queue_steer_origin;
         delete providerMessage.webui_queue_steer_recovery;
+        delete providerMessage[OUTPUT_FEEDBACK_KEY];
         return providerMessage;
       }),
       tools,
@@ -436,6 +441,21 @@ export class AgentRunner {
     if (spec.maxTokens != null) args.maxTokens = spec.maxTokens;
     if (spec.reasoningEffort != null) args.reasoningEffort = spec.reasoningEffort;
     return args;
+  }
+
+  private toolDefinitions(spec: AgentRunSpec): Record<string, any>[] {
+    const definitions = spec.tools?.getDefinitions?.() ?? [];
+    return spec.outputLocation ? withOutputPaths(definitions) : definitions;
+  }
+
+  private withOutputInstruction(spec: AgentRunSpec, messages: Record<string, any>[]): Record<string, any>[] {
+    if (!spec.outputLocation) return messages;
+    const instruction = spec.outputLocation.instruction();
+    const index = messages.findIndex((message) => message.role === "system" && typeof message.content === "string");
+    if (index < 0) return [{ role: "system", content: instruction }, ...messages];
+    return messages.map((message, position) => position === index
+      ? { ...message, content: `${message.content}\n\n${instruction}` }
+      : message);
   }
 
   private static imageIdentity(block: Record<string, any>): string {
@@ -811,7 +831,7 @@ export class AgentRunner {
     const shouldEmitLive = (): boolean => boundary?.shouldEmitLive() ?? spec.abortSignal?.aborted !== true;
     const timeoutS = normalizeTimeout(spec.llmTimeoutS);
     const tools = options.toolsOverride === undefined
-      ? spec.tools?.getDefinitions?.() ?? []
+      ? this.toolDefinitions(spec)
       : options.toolsOverride;
     const inputBudget = this.inputTokenBudget(spec);
     if (inputBudget != null) {
@@ -1074,13 +1094,32 @@ export class AgentRunner {
       return { call, result: repeatedLookup + hint, event, error: spec.failOnToolError ? new Error(repeatedLookup) : null };
     }
 
+    if (call.name === "message" && spec.outputLocation) {
+      // A message is a delivery channel: it may not reach the user before the files do.
+      const problem = await spec.outputLocation.verify();
+      if (problem) {
+        const result = `Error: message not sent. ${problem} Do not tell the user the files are ready; finish them first.`;
+        const event = { name: call.name, status: "error", detail: eventDetail("", result, 120) };
+        return { call, result: result + hint, event, error: spec.failOnToolError ? new Error(result) : null };
+      }
+    }
+    const { args: toolArgs, outputPaths } = takeOutputPaths(call.name, call.arguments);
+    const declaresOutputs = Boolean(spec.outputLocation && Array.isArray(outputPaths) && outputPaths.length);
+    if (spec.outputLocation && outputPaths !== undefined) {
+      const declarationError = await spec.outputLocation.declare(outputPaths);
+      if (declarationError) {
+        const event = { name: call.name, status: "error", detail: eventDetail("", declarationError, 120) };
+        return { call, result: declarationError + hint, event, error: spec.failOnToolError ? new Error(declarationError) : null };
+      }
+    }
+
     const prepare = spec.tools?.prepareCall;
     let tool: any = null;
-    let params: any = call.arguments;
+    let params: any = toolArgs;
     let prepError: string | null = null;
     if (typeof prepare === "function") {
       try {
-        const prepared = prepare.call(spec.tools, call.name, call.arguments);
+        const prepared = prepare.call(spec.tools, call.name, toolArgs);
         if (Array.isArray(prepared) && prepared.length === 3) [tool, params, prepError] = prepared;
       } catch (error) {
         prepError = String((error as Error).message ?? error);
@@ -1126,6 +1165,8 @@ export class AgentRunner {
       const fileMutationOutcomes = new Map<string, FileMutationOutcome>();
       await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
       const toolContext: ToolExecutionContext = {
+        outputLocation: spec.outputLocation,
+        ...(declaresOutputs ? { trackOutputProducer: (isRunning: () => boolean) => spec.outputLocation!.track(isRunning) } : {}),
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
         callId: call.id ?? null,
@@ -1425,7 +1466,7 @@ export class AgentRunner {
     spec: AgentRunSpec,
     messages: Record<string, any>[],
     options: PrepareMessagesOptions = {
-      toolsForRequest: spec.tools?.getDefinitions?.() ?? [],
+      toolsForRequest: this.toolDefinitions(spec),
       reservedPromptTokens: 0,
     },
   ): Record<string, any>[] {
@@ -1590,6 +1631,7 @@ export class AgentRunner {
     let error: string | null = null;
     let emptyContentRetries = 0;
     let lengthRecoveries = 0;
+    let deliveryRetries = 0;
     let injectionCycles = 0;
     let hadInjections = false;
     const imageTextState: TurnImageTextState = {
@@ -1610,7 +1652,7 @@ export class AgentRunner {
         error = finalContent;
         break;
       }
-      const toolsForRequest = spec.tools?.getDefinitions?.() ?? [];
+      const toolsForRequest = this.toolDefinitions(spec);
       if (iteration > 0) {
         modelContextProjection = await this.updateProjectionBeforeFollowup(
           spec,
@@ -1630,7 +1672,7 @@ export class AgentRunner {
           break;
         }
       }
-      let messagesForModel = this.modelContextMessages(messages, modelContextProjection);
+      let messagesForModel = this.withOutputInstruction(spec, this.modelContextMessages(messages, modelContextProjection));
       messagesForModel = this.prepareMessagesForModel(spec, messagesForModel, {
         toolsForRequest,
         reservedPromptTokens: 0,
@@ -1645,6 +1687,8 @@ export class AgentRunner {
         hook,
         context,
         imageTextState,
+        // A reply claiming delivery must not reach the user before it is verified.
+        { forceNonStreaming: Boolean(spec.outputLocation?.hasFiles) },
       );
       const iterationUsage = this.usageDict(response.usage);
       this.accumulateUsage(usage, iterationUsage);
@@ -1884,6 +1928,17 @@ export class AgentRunner {
         break;
       }
 
+      const deliveryProblem = spec.outputLocation && deliveryRetries < 2 && iteration + 1 < spec.maxIterations
+        ? await spec.outputLocation.verify()
+        : null;
+      if (deliveryProblem) {
+        // Let the model fix it; neither the unverified reply nor this feedback is persisted.
+        deliveryRetries += 1;
+        messages.push({ ...(assistant ?? buildAssistantMessage(clean)), [OUTPUT_FEEDBACK_KEY]: true });
+        messages.push({ role: "user", content: deliveryProblem, [OUTPUT_FEEDBACK_KEY]: true });
+        await hook.afterIteration(context);
+        continue;
+      }
       messages.push(assistant ?? buildAssistantMessage(clean));
       await this.emitCheckpoint(spec, {
         phase: "finalResponse",
@@ -1933,7 +1988,7 @@ export class AgentRunner {
           stopReason = "cancelled";
           error = finalContent;
         } else {
-          const finalizationMessages = this.modelContextMessages(messages, modelContextProjection);
+          const finalizationMessages = this.withOutputInstruction(spec, this.modelContextMessages(messages, modelContextProjection));
           const preparedMessages = this.prepareMessagesForModel(spec, finalizationMessages, {
             toolsForRequest: null,
             reservedPromptTokens,
@@ -2010,6 +2065,21 @@ export class AgentRunner {
         const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after maxIterations" });
         injectionCycles = cycles;
         if (drained) hadInjections = true;
+      }
+    }
+
+    // Every ending that would tell the user the work is done is checked once more here.
+    if (spec.outputLocation && finalContent != null && ["completed", "maxIterations", "emptyFinalResponse"].includes(stopReason)) {
+      const deliveryProblem = await spec.outputLocation.verify();
+      if (deliveryProblem) {
+        finalContent = deliveryProblem;
+        finalContentStreamed = false;
+        stopReason = "toolError";
+        error = "Output delivery not confirmed";
+        AgentRunner.appendFinalMessage(messages, finalContent);
+      } else if (stopReason !== "maxIterations") {
+        // An unfinished run keeps its list; an empty reply after a message-tool delivery does not.
+        spec.outputLocation.complete();
       }
     }
 

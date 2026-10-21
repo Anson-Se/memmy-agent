@@ -1,3 +1,5 @@
+import type { OutputDelivery } from "./output-location.js";
+
 export type JsonSchema = Record<string, any>;
 
 export type FileMutationOutcome = {
@@ -12,6 +14,9 @@ export type ToolExecutionContext = {
   /** Stop this run without asking the model to select another executor. */
   stopTurn?: (message: string) => void;
   reportFileMutation?: (outcome: FileMutationOutcome) => void;
+  outputLocation?: OutputDelivery;
+  /** Set only when this call declared output_paths: report work that outlives the call. */
+  trackOutputProducer?: (isRunning: () => boolean) => void;
 };
 
 const JSON_TYPE_MAP: Record<string, (value: any) => boolean> = {
