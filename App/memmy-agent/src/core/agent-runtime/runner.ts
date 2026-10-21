@@ -175,6 +175,7 @@ export class AgentRunSpec {
   onMaxFinalizationStarting?: (() => void) | null;
   currentTurnMessageStartIndex?: number | null;
   beforeFollowupModelRequest?: ((ctx: FollowupModelRequestContext) => Promise<FollowupModelContextUpdate>) | null;
+  finalResponseContinuation?: ((ctx: { finalContent: string; messages: Record<string, any>[] }) => string | null) | null;
 
   constructor(init: {
     messages?: Record<string, any>[];
@@ -214,6 +215,7 @@ export class AgentRunSpec {
     onMaxFinalizationStarting?: (() => void) | null;
     currentTurnMessageStartIndex?: number | null;
     beforeFollowupModelRequest?: ((ctx: FollowupModelRequestContext) => Promise<FollowupModelContextUpdate>) | null;
+    finalResponseContinuation?: ((ctx: { finalContent: string; messages: Record<string, any>[] }) => string | null) | null;
   } = {}) {
     this.messages = this.initialMessages = init.messages ?? init.initialMessages ?? [];
     this.provider = init.provider;
@@ -251,6 +253,7 @@ export class AgentRunSpec {
     this.onMaxFinalizationStarting = init.onMaxFinalizationStarting ?? null;
     this.currentTurnMessageStartIndex = init.currentTurnMessageStartIndex ?? null;
     this.beforeFollowupModelRequest = init.beforeFollowupModelRequest ?? null;
+    this.finalResponseContinuation = init.finalResponseContinuation ?? null;
   }
 }
 
@@ -1839,8 +1842,10 @@ export class AgentRunner {
         injectionCycles = cycles;
         if (shouldContinue) hadInjections = true;
       }
+      const planContinuation = !shouldContinue && response.finishReason !== "error" && !isBlankText(clean)
+        ? spec.finalResponseContinuation?.({ finalContent: clean!, messages }) : null;
       if (hook.wantsStreaming()) {
-        await hook.onStreamEnd(context, { resuming: shouldContinue });
+        await hook.onStreamEnd(context, { resuming: shouldContinue || Boolean(planContinuation) });
       }
       if (shouldContinue) {
         await hook.afterIteration(context);
@@ -1885,6 +1890,11 @@ export class AgentRunner {
       }
 
       messages.push(assistant ?? buildAssistantMessage(clean));
+      if (planContinuation) {
+        messages.push({ role: "system", content: planContinuation });
+        await hook.afterIteration(context);
+        continue;
+      }
       await this.emitCheckpoint(spec, {
         phase: "finalResponse",
         iteration,
