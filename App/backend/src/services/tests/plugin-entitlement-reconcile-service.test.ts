@@ -1,12 +1,12 @@
 /** Entitlement-gated plugin reconciliation tests. */
 import type { InstalledPlugin, PluginManifest } from "@memmy/local-api-contracts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { PluginService } from "../plugin-service.js";
 import { entitledPluginIds, reconcileEntitledPlugins } from "../plugin-entitlement-reconcile-service.js";
 
 describe("entitled plugin reconciliation", () => {
   it("installs, approves, and enables a newly granted plugin", async () => {
-    const plugins = fakePluginService();
+    const plugins = fakePluginService([], new Set(), ["vertical-demo"]);
     const failures = await reconcileEntitledPlugins({
       plugins: plugins.service,
       entitlements: ["plugin:vertical-demo", "unrelated:grant"]
@@ -21,7 +21,7 @@ describe("entitled plugin reconciliation", () => {
   });
 
   it("updates an already installed plugin instead of reinstalling it", async () => {
-    const plugins = fakePluginService([installed("vertical-demo", "active")]);
+    const plugins = fakePluginService([installed("vertical-demo", "active")], new Set(), ["vertical-demo"]);
     await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
 
     // Already active, so no redundant enable is issued.
@@ -50,7 +50,7 @@ describe("entitled plugin reconciliation", () => {
   });
 
   it("reports a failing plugin without aborting the remaining ones", async () => {
-    const plugins = fakePluginService([], new Set(["broken"]));
+    const plugins = fakePluginService([], new Set(["broken"]), ["broken", "healthy"]);
     const failures = await reconcileEntitledPlugins({
       plugins: plugins.service,
       entitlements: ["plugin:broken", "plugin:healthy"]
@@ -58,6 +58,26 @@ describe("entitled plugin reconciliation", () => {
 
     expect(failures).toEqual([{ pluginId: "broken", message: "registry unavailable" }]);
     expect(plugins.calls).toContain("enable:healthy");
+  });
+
+  it("pins install and update to the catalog version when the default changes", async () => {
+    for (const initial of [[], [installed("vertical-demo", "active")]]) {
+      const plugins = fakePluginService(initial, new Set(), ["vertical-demo"]);
+      const action = initial.length ? "update" : "install";
+      const spy = vi.spyOn(plugins.service, action);
+      await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
+      expect(spy).toHaveBeenCalledWith("vertical-demo", "2.0.0");
+    }
+  });
+
+  it("does not resolve an unpinned grant when the catalog is empty or unavailable", async () => {
+    const plugins = fakePluginService();
+    await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
+    expect(plugins.calls).toEqual([]);
+    vi.spyOn(plugins.service, "catalog").mockRejectedValue(new Error("offline"));
+    const failures = await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
+    expect(failures).toHaveLength(1);
+    expect(plugins.calls).toEqual([]);
   });
 
   it("ignores grants that are not plugin grants", () => {
@@ -99,7 +119,7 @@ function installed(id: string, state: InstalledPlugin["state"]): InstalledPlugin
   };
 }
 
-function fakePluginService(initial: InstalledPlugin[] = [], failing: ReadonlySet<string> = new Set()) {
+function fakePluginService(initial: InstalledPlugin[] = [], failing: ReadonlySet<string> = new Set(), catalogIds: string[] = []) {
   const calls: string[] = [];
   const state = new Map(initial.map((plugin) => [plugin.id, plugin]));
   const record = (action: string, id: string) => {
@@ -109,6 +129,10 @@ function fakePluginService(initial: InstalledPlugin[] = [], failing: ReadonlySet
 
   const service = {
     list: () => [...state.values()],
+    catalog: async () => catalogIds.map((id) => ({
+      manifest: { ...manifest(id), version: "2.0.0", rules: { installation: "automatic" } },
+      eligibility: { visible: true, canInstall: true, canUse: true, reason: null }
+    })),
     install: async (id: string) => {
       record("install", id);
       const plugin = installed(id, "installed");

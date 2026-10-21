@@ -1280,7 +1280,7 @@ describe("WebSocket HTTP route helpers", () => {
     expect(stagedOutside.status).toBe(200);
     const stagedOutsideBody = await stagedOutside.json() as Record<string, unknown>;
     expect(stagedOutsideBody).toMatchObject({ ok: true, name: "outside.md", kind: "file", media_url: expect.stringMatching(/^\/api\/media\//) });
-    expect(stagedOutsideBody.relative_path).toBeUndefined();
+    expect(stagedOutsideBody).not.toHaveProperty("relative_path");
 
     const resolvedDirectory = await fetch(`http://127.0.0.1:${port}/api/webui/artifacts/resolve`, {
       method: "POST",

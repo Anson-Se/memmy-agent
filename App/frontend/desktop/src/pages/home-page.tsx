@@ -83,6 +83,7 @@ import { AgentTaskPlanBar } from "./agent-task-plan-bar.js";
 import { agentOutputSignature, useStalledOutputShimmer } from "./agent-stall-shimmer.js";
 import { AgentThreadMessages, ChatImageLightbox } from "./agent-thread-messages.js";
 import {
+  pendingAgentQuestion, composerQuestionAnswer,
   type AgentQuestionCardPayload,
   type AgentQuestionResponse,
 } from "./agent-question-card.js";
@@ -227,6 +228,7 @@ const TRANSLATABLE_AGENT_ERROR_KEYS = new Set<MessageKey>([
   "home.composer.emptyMessage",
   "home.goal.controlUnknown",
   "home.modelSelector.unavailable",
+  "home.modelSelector.pluginRequiresLogin",
   "home.project.desktopRequired",
   "home.queue.removeFailed",
   "home.queue.editBlocked",
@@ -1781,6 +1783,7 @@ export function HomePage() {
   );
   // The same condition the sidebar spinner uses, so the thread and the
   // spinner never disagree about whether Memmy is working.
+  const pendingQuestion = isCurrentAgentRunning ? pendingAgentQuestion(state.agent.messages, currentActiveTurnId) : null;
   const isAgentWorking = isCurrentAgentRunning || isCurrentGoalActive;
   useStalledOutputShimmer(
     conversationContentRef,
@@ -2541,6 +2544,9 @@ export function HomePage() {
   const hasComposerIntent = Boolean(input.trim() || pendingAttachments.length > 0);
   const stopInFlight = state.agent.currentChatId ? Boolean(state.agent.stopInFlightByChatId[state.agent.currentChatId]) : false;
   const pluginCommandInvocation = parsePluginCommandInvocation(input, pluginCommandTargets);
+  // A login-required official plugin in the composer still requires sign-in,
+  // but does not force the model. The official model stays a recommendation on the plugin page.
+  const loginRequiredPluginActive = Boolean(pluginCommandInvocation?.plugin.manifest.rules?.requiresLogin);
   const agentRoutedPluginPrompt = buildAgentRoutedPluginPrompt(input, pluginCommandTargets);
   const isDirectPluginCommand = Boolean(pluginCommandInvocation && !agentRoutedPluginPrompt);
   const composerSendDisabled = isDirectPluginCommand
@@ -2754,6 +2760,33 @@ export function HomePage() {
    */
   async function sendMessage() {
     if (runExactLocalSlashCommand(input)) {
+      return;
+    }
+    if (loginRequiredPluginActive && !state.account.userId) {
+      dispatch(agentActions.operationFailed("chat", createAgentOperationError({
+        source: "send",
+        message: "home.modelSelector.pluginRequiresLogin",
+        ...(state.agent.currentChatId ? { chatId: state.agent.currentChatId } : { scopeKey: chatScopeKey })
+      })));
+      return;
+    }
+    if (pendingQuestion && input.trim() && !input.trimStart().startsWith("/")) {
+      const response = pendingAttachments.length ? null : composerQuestionAnswer(pendingQuestion, input);
+      if (!response) {
+        dispatch(agentActions.operationFailed("chat", createAgentOperationError({ source: "send", message: "home.question.useCard", chatId: state.agent.currentChatId ?? undefined })));
+        return;
+      }
+      if (messageSendLocksRef.current.has(chatScopeKey)) return;
+      const submitted = input;
+      messageSendLocksRef.current.add(chatScopeKey);
+      stageComposerForSend(chatScopeKey);
+      try {
+        const answered = await submitAgentQuestionResponse(pendingQuestion, response);
+        if (!answered) {
+          restoreComposerAfterFailedSend(chatScopeKey, submitted, [], null);
+          dispatch(agentActions.operationFailed("chat", createAgentOperationError({ source: "send", message: "home.question.submitFailed", chatId: state.agent.currentChatId ?? undefined })));
+        } else settleComposerAfterSend(chatScopeKey, []);
+      } finally { messageSendLocksRef.current.delete(chatScopeKey); }
       return;
     }
     const clientRequestId = crypto.randomUUID();
@@ -4345,7 +4378,7 @@ export function HomePage() {
                   textareaRef={inputRef}
                   value={composerInput}
                   highlightedCommands={slashCommandsWithLocal.map((command) => command.command)}
-                  placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}
+                  placeholder={pendingQuestion ? t("home.question.waitingInput") : selectedComposerCommand ? t("home.goal.input") : t("home.input")}
                   rows={3}
                   onChange={(event) => {
                     updateComposerInput(
@@ -4702,7 +4735,7 @@ export function HomePage() {
                     <textarea
                       ref={inputRef}
                       value={composerInput}
-                      placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}
+                      placeholder={pendingQuestion ? t("home.question.waitingInput") : selectedComposerCommand ? t("home.goal.input") : t("home.input")}
                       rows={1}
                       onChange={(event) => {
                         updateComposerInput(

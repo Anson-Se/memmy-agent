@@ -742,6 +742,7 @@ export type MemmyAgentSendMessageInput = {
 
 export type MemmyAgentQuestionResponseInput = {
   requestId: string;
+  cancelled?: boolean;
   answers: Array<{
     questionId: string;
     selectedOptionIds: string[];
@@ -2046,6 +2047,7 @@ class MemmyAgentWebSocketSession implements MemmyAgentWebSocketConnection {
           type: "agent_question_response",
           chat_id: chatId,
           request_id: response.requestId,
+          ...(response.cancelled === true ? { cancelled: true } : {}),
           answers: response.answers.map((answer) => ({
             question_id: answer.questionId,
             selected_option_ids: answer.selectedOptionIds,

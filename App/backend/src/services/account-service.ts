@@ -334,6 +334,9 @@ async function clearLocalAccountState(
     options.accountSessionRepository.clear();
   }
   await reloadMemoryConfigIfNeeded(projection, options);
+  await options.onAccountGrantsRefreshed?.().catch((error: unknown) => {
+    console.warn(`Account grant reconciliation failed: ${String(error)}`);
+  });
 }
 
 /** Handles refresh cloud guide state. */

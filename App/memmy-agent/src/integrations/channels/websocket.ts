@@ -283,8 +283,10 @@ const MCP_PRESET_ACTIONS_BY_PATH: Record<string, string> = {
 function normalizeAgentQuestionResponse(
   requestId: unknown,
   value: unknown,
+  cancelled?: unknown,
 ): AgentQuestionResponse | null {
   if (typeof requestId !== "string" || !UUID_RE.test(requestId)) return null;
+  if (cancelled === true) return Array.isArray(value) && value.length === 0 ? { requestId, answers: [], cancelled: true } : null;
   if (!Array.isArray(value) || value.length < 1 || value.length > 4) return null;
   const answers: AgentQuestionAnswer[] = [];
   for (const raw of value) {
@@ -4035,7 +4037,7 @@ export class WebSocketChannel extends BaseChannel {
       const chatId = typeof envelope.chat_id === "string" && isValidGuiChatId(envelope.chat_id)
         ? envelope.chat_id
         : "";
-      const response = normalizeAgentQuestionResponse(envelope.request_id, envelope.answers);
+      const response = normalizeAgentQuestionResponse(envelope.request_id, envelope.answers, envelope.cancelled);
       if (
         !chatId
         || !response
@@ -4057,6 +4059,7 @@ export class WebSocketChannel extends BaseChannel {
           chat_id: chatId,
           request_id: response.requestId,
           answers: response.answers,
+          ...(response.cancelled === true ? { cancelled: true } : {}),
         });
       }
       await this.safeSendTo(connection, {

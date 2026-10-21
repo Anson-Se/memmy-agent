@@ -1278,7 +1278,7 @@ export function replayTranscriptToUiMessages(lines: Dict[], options: ReplayTrans
         if (stringValue(card?.requestId) !== requestId) continue;
         messages[index] = {
           ...candidate,
-          questionResponse: { requestId, answers: rec.answers },
+          questionResponse: { requestId, answers: rec.answers, ...(rec.cancelled === true ? { cancelled: true } : {}) },
         };
         break;
       }

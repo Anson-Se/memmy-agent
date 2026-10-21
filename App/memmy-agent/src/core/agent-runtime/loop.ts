@@ -102,6 +102,7 @@ import {
   type WebuiQueueSteerTransferRecord,
 } from "./goal-runtime.js";
 import { TaskPlanRuntime } from "./task-plan-runtime.js";
+import { createTaskPlanContinuation } from "./task-plan-continuation.js";
 import { resolveToolResultMaxChars, SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME } from "./tool-result-budget.js";
 import { AgentProgressHook } from "./progress-hook.js";
 import { createTurnCancellationBoundary, type TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
@@ -3750,11 +3751,18 @@ export class AgentLoop {
     const result = await this.runner.run(
       new AgentRunSpec({
         messages: initialMessages,
+        privateSkillRefs: session?.metadata?.privatePluginSkillRefs,
+        onPrivateSkillRefsChanged: session ? (refs) => {
+          session.metadata.privatePluginSkillRefs = refs;
+          this.sessions.save(session);
+        } : undefined,
         provider: activeProvider,
         tools: activeTools,
         model: activeModel,
         maxIterations: this.maxIterations,
         maxIterationsFinalPrompt: renderTemplate("agent/max-iterations-final-response.md", { strip: true }),
+        finalResponseContinuation: createTaskPlanContinuation(() => activeSessionKey
+          ? this.taskPlanRuntime.get(activeSessionKey) : null),
         maxTokens: activeProvider?.generation?.maxTokens ?? this.config.agents.defaults.maxTokens,
         temperature: activeProvider?.generation?.temperature ?? this.config.agents.defaults.temperature,
         reasoningEffort: activeProvider?.generation?.reasoningEffort ?? this.config.agents.defaults.reasoningEffort,

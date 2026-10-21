@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MessageBus } from "../../../src/core/runtime-messages/queue.js";
 import {
   AskQuestionTool,
@@ -6,6 +9,13 @@ import {
 } from "../../../src/core/agent-runtime/tools/ask-question.js";
 import { RequestContext } from "../../../src/core/agent-runtime/tools/context.js";
 import { WebSocketChannel } from "../../../src/integrations/channels/websocket.js";
+
+let dataRoot: string;
+beforeEach(() => {
+  dataRoot = mkdtempSync(join(tmpdir(), "memmy-question-response-"));
+  vi.stubEnv("MEMMY_AGENT_DATA_DIR", dataRoot);
+});
+afterEach(() => { vi.unstubAllEnvs(); rmSync(dataRoot, { recursive: true, force: true }); });
 
 function createConnection() {
   return {
@@ -50,6 +60,7 @@ describe("WebSocket agent question responses", () => {
     await expect(pending).resolves.toContain('"status":"answered"');
     expect(sent(ws)).toContainEqual({
       event: "agent_question_response",
+      transcript_offset: 0,
       chat_id: "chat-1",
       request_id: requestId,
       answers: [{
@@ -63,6 +74,20 @@ describe("WebSocket agent question responses", () => {
       request_id: requestId,
       ok: true,
     });
+  });
+
+  it("closes a native card through the real channel without confirming any answers", async () => {
+    const cards: any[] = [];
+    const tool = new AskQuestionTool({ sendCallback: async (message) => { cards.push(message); } });
+    tool.setContext(new RequestContext({ channel: "websocket", chatId: "chat-cancel" }));
+    const pending = tool.execute({ questions: [{ id: "scope", prompt: "Scope?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const requestId = cards[0].metadata.agentUi.questionCard.requestId;
+    const channel = new WebSocketChannel({}, new MessageBus()); const ws = createConnection(); channel.attachConnection(ws, "chat-cancel");
+    await channel.dispatchEnvelope(ws, "client", { type: "agent_question_response", chat_id: "chat-cancel", request_id: requestId, cancelled: true, answers: [] });
+    expect(JSON.parse(await pending)).toEqual({ status: "cancelled", requestId, cancelled: true, answers: [] });
+    expect(sent(ws)).toContainEqual({ event: "agent_question_response", transcript_offset: 0, chat_id: "chat-cancel", request_id: requestId, cancelled: true, answers: [] });
+    expect(pendingAgentQuestionCount()).toBe(0);
   });
 
   it("rejects responses from a connection not attached to the chat", async () => {

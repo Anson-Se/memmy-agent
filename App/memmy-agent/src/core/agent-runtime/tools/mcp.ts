@@ -1,3 +1,4 @@
+import { PluginSkillRefSchema, type PluginSkillRef } from "@memmy/local-api-contracts";
 import { createHash } from "node:crypto";
 import net from "node:net";
 import os from "node:os";
@@ -49,6 +50,8 @@ const SANITIZE_RE = /_+/g;
 const MAX_TOOL_NAME_LENGTH = 64;
 const TOOL_NAME_HASH_LENGTH = 12;
 const RELOAD_LOCKS = new WeakMap<object, Promise<void>>();
+// Per MCP connection and conversation, populated only by the internal request projection.
+const PRIVATE_SKILL_READY = new WeakMap<object, Map<string, Map<string, PluginSkillRef>>>();
 
 type Runtime = {
   ClientSession: new (read: any, write: any) => any;
@@ -555,6 +558,28 @@ export class MCPToolWrapper extends Tool {
     this.requestContext.set(context);
   }
 
+  /** Internal channel: never routed through execute(), tool results, UI events or history. */
+  async resolvePluginSkillInstructions(ref: PluginSkillRef, signal?: AbortSignal | null, sessionKey?: string | null): Promise<string> {
+    if (this.serverName !== "plugins" || this.originalName !== "read_plugin_skill") throw new Error("plugin_skill_loader_unavailable");
+    const expected = PluginSkillRefSchema.parse(ref);
+    const result = await this.session.callTool("resolve_plugin_skill_context", { ref: expected }, this.toolTimeout,
+      { "memmy.dev/cloud-skills": "1" }, signal);
+    const envelope = result?._meta?.["memmy.dev/private-skill-context"];
+    const actual = PluginSkillRefSchema.safeParse(envelope?.ref);
+    if (actual.success && envelope.reloadRequired === true && actual.data.pluginId === expected.pluginId && actual.data.skillId === expected.skillId) {
+      throw Object.assign(new Error("plugin_skill_version_changed"), { code: "plugin_skill_version_changed", ref: actual.data });
+    }
+    if (result?.isError || !actual.success || JSON.stringify(actual.data) !== JSON.stringify(expected)
+      || typeof envelope.instructions !== "string" || Buffer.byteLength(envelope.instructions) > 512 * 1024) throw new Error("plugin_skill_load_failed");
+    let sessions = PRIVATE_SKILL_READY.get(this.session);
+    if (!sessions) { sessions = new Map(); PRIVATE_SKILL_READY.set(this.session, sessions); }
+    const key = sessionKey ?? "default";
+    let ready = sessions.get(key);
+    if (!ready) { ready = new Map(); sessions.set(key, ready); }
+    ready.set(`${expected.pluginId}/${expected.skillId}`, expected);
+    return envelope.instructions;
+  }
+
   async execute(params: Record<string, any> = {}, context?: ToolExecutionContext): Promise<string | Array<Record<string, any>>> {
     if (context?.abortSignal?.aborted) return "(MCP tool call was cancelled)";
     if (this.managed) {
@@ -660,6 +685,8 @@ export class MCPToolWrapper extends Tool {
     }
     if (context?.abortSignal?.aborted) return "(MCP tool call was cancelled)";
     const meta = this.sendMemmyContext ? pluginCallMeta(context) : undefined;
+    const ready = PRIVATE_SKILL_READY.get(this.session)?.get(context?.sessionKey ?? "default");
+    if (meta && ready?.size) meta["memmy.dev/private-skills-ready"] = JSON.stringify([...ready.values()]);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const result: any = await timeoutPromise(
@@ -690,6 +717,7 @@ export class MCPToolWrapper extends Tool {
 
 function pluginCallMeta(context?: ToolExecutionContext): Record<string, string> | undefined {
   const entries = [
+    ["memmy.dev/cloud-skills", "1"],
     ["memmy.dev/session-key", context?.sessionKey],
     ["memmy.dev/tool-call-id", context?.callId],
     ["memmy.dev/model-preset", context?.modelPreset],
@@ -1291,6 +1319,9 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
       refreshed,
       connected: Object.keys(state.mcpStacks).sort(),
       configured: Object.keys(state.mcpServers).sort(),
+      tool_counts: Object.fromEntries([...nextNames].sort().map((name) => [
+        name, registry.toolNames.filter((toolName) => toolName.startsWith(toolPrefix(name))).length,
+      ])),
       failed,
       tools_removed: toolsRemoved,
       requires_restart: false,

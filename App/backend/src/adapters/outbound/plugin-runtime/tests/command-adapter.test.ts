@@ -449,19 +449,19 @@ describe("CommandPluginAdapter", () => {
       expect(command).toMatch(/sandbox-exec$/u);
     });
 
-    it("runs unsandboxed on Windows for an entitled plugin", async () => {
+    it.each(["plugin:legal-labor", "plugin:literature-review"])("runs unsandboxed on Windows with %s", async (entitlement) => {
       // Windows has no sandbox implementation, so an entitled first-party
       // plugin is the only way a command plugin runs there at all.
       const command = await spawnedCommandFor({
-        entitlement: "plugin:legal-labor",
-        granted: ["plugin:legal-labor"],
+        entitlement,
+        granted: [entitlement],
         platform: "win32"
       });
 
       expect(command).not.toMatch(/sandbox-exec|bwrap/u);
     });
 
-    it("refuses to activate an unentitled plugin on Windows", async () => {
+    it.each([null, "plugin:literature-review"])("refuses Windows activation without a grant for %s", async (entitlement) => {
       const adapter = createCommandPluginAdapter({
         platform: "win32",
         isEntitlementGranted: () => false
@@ -471,6 +471,8 @@ describe("CommandPluginAdapter", () => {
         ...pluginContext.plugin.manifest.runtime.config,
         sandbox: "none"
       };
+
+      if (entitlement) pluginContext.plugin.manifest.requiredEntitlement = entitlement;
 
       // Falling back to an unsandboxed child process here would hand every
       // third-party plugin the thing the sandbox exists to prevent.

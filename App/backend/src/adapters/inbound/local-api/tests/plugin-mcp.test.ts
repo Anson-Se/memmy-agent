@@ -141,3 +141,32 @@ describe("plugin MCP bridge", () => {
     await expect(call).resolves.toMatchObject({ structuredContent: { review: "done" } });
   });
 });
+
+it("activates metadata only, keeps private text off progress events, and rejects old clients", async () => {
+  const ref = { pluginId: plugin.id, skillId: "review", pluginVersion: plugin.version, revision: "r1", sha256: "a".repeat(64) };
+  const secret = "PRIVATE-SKILL-MCP-SENTINEL";
+  const { service, invoke } = createPlugins();
+  const cloudPlugin = { ...plugin, manifest: { ...plugin.manifest, skills: [{ id: "review", name: "Review", description: "Review", entry: "skills/review/SKILL.md", cloud: { revision: ref.revision, sha256: ref.sha256 } }] } };
+  service.list = () => [cloudPlugin];
+  const events: unknown[] = [];
+  const bus = createProgressBus(); bus.on("plugin.capability_event", event => events.push(event));
+  const server = buildPluginMcpServer(service, bus, undefined, { reference: () => ref, resolve: async () => secret, clear() {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test", version: "1" });
+  await server.connect(serverTransport); await client.connect(clientTransport); connections.push({ client, server });
+  const tools = (await client.listTools()).tools.map(tool => tool.name);
+  expect(tools).toContain("read_plugin_skill"); expect(tools).not.toContain("resolve_plugin_skill_context");
+  const oldClient = await client.callTool({ name: "read_plugin_skill", arguments: { pluginId: plugin.id, skillId: "review" } });
+  expect(oldClient.isError).toBe(true);
+  const activated = await client.callTool({ name: "read_plugin_skill", arguments: { pluginId: plugin.id, skillId: "review" }, _meta: { "memmy.dev/cloud-skills": "1" } });
+  expect(JSON.stringify(activated)).not.toContain(secret);
+  expect(activated.structuredContent).toEqual({ kind: "memmy_plugin_skill_ref_v1", ref });
+  const premature = await client.callTool({ name: capabilityToolName(plugin.id, "run"), arguments: { topic: "test" }, _meta: { "memmy.dev/cloud-skills": "1" } });
+  expect(premature.isError).toBe(true); expect(invoke).not.toHaveBeenCalled();
+  const internal = await client.callTool({ name: "resolve_plugin_skill_context", arguments: { ref }, _meta: { "memmy.dev/cloud-skills": "1" } });
+  expect(internal.content).toEqual([]); expect(JSON.stringify(internal._meta)).toContain(secret);
+  const result = await client.callTool({ name: capabilityToolName(plugin.id, "run"), arguments: { topic: "test" },
+    _meta: { "memmy.dev/cloud-skills": "1", "memmy.dev/private-skills-ready": JSON.stringify([ref]) } });
+  expect(result.isError).not.toBe(true); expect(invoke).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify(events)).not.toContain(secret);
+});

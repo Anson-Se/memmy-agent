@@ -96,7 +96,7 @@ class StaticTool extends Tool {
     return { type: "object", properties: {} };
   }
 
-  async execute(): Promise<string> {
+  async execute(_params: Record<string, any> = {}, _context?: ToolExecutionContext): Promise<string> {
     return "tool result";
   }
 }

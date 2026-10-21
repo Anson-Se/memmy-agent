@@ -1,4 +1,5 @@
-import type { AccountChannel, InstalledPlugin } from "@memmy/local-api-contracts";
+import { createPluginSkillContentService, type PluginSkillContentService } from "./plugin-skill-content-service.js";
+import type { AccountChannel } from "@memmy/local-api-contracts";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { resolveCloudClientConfig, resolvePluginRegistryBaseUrl } from "../config/service-urls.js";
@@ -110,6 +111,7 @@ export interface BackendServices {
   tokenQuota: TokenQuotaService;
   /** Third-party plugins. */
   plugins: PluginService;
+  pluginSkillContent?: PluginSkillContentService;
 }
 
 export interface CreateBackendServicesOptions {
@@ -187,6 +189,11 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
   // ASR only needs audio upload locations; do not let it turn an arbitrary
   // workspace file into a base64 cloud request merely because it has a path.
   const pluginAudioRoots = [uploadedMediaRoot, join(agentWorkspace, "recordings")];
+  const pluginSkillContent = createPluginSkillContentService({
+    baseUrl: resolvePluginRegistryBaseUrl(process.env) ?? resolveCloudClientConfig(process.env).baseUrl,
+    getPlugin: (id) => plugins.list().find(plugin => plugin.id === id) ?? null,
+    authHeaders: pluginRegistryAuthHeaders
+  });
   const pluginModelInference = createPluginModelInferenceService({
     resolveModel: (pluginId, requestedPreset) => resolvePluginModelSelection({
       accountOnly: pluginRepository.get(pluginId)?.manifest.modelPolicy?.requiredSource === "account",
@@ -237,6 +244,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       authOrigin: resolvePluginRegistryBaseUrl(process.env),
       authHeaders: pluginRegistryAuthHeaders
     }),
+    onSkillContentInvalidated: (id) => pluginSkillContent.clear(id),
     skillManager: createPluginSkillManager({ skillsRoot: join(resolveAgentWorkspace(process.env), "skills") }),
     localArtifactService: createPluginLocalArtifactService({
       pluginDataRoot: join(dirname(options.appStateStore.databasePath), "plugin-data"),
@@ -249,8 +257,14 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
         }
       }
     }),
+    isAuthenticated: () => accountSessionRepository.get().authenticated,
     isEntitlementGranted
   });
+  const pluginToolSignature = () => JSON.stringify(plugins.list()
+    .filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)
+    .map((plugin) => [plugin.id, plugin.version, plugin.manifest.capabilities])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  let publishedPluginTools = pluginToolSignature();
   const sourceRegistry =
     options.sourceRegistry ??
     createBuiltinAgentSourceRegistry();
@@ -331,18 +345,22 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       memoryClient: options.memoryClient,
       accountChannel: options.accountChannel,
       onAccountGrantsRefreshed: async () => {
-        const previousCapabilities = activePluginCapabilities(plugins.list());
+        pluginSkillContent.clear();
         const failures = await reconcileEntitledPlugins({
           plugins,
+          userUninstalledIds: new Set(pluginRepository.listUserUninstalledIds()),
           entitlements: accountSessionRepository.getEntitlements()
         });
         for (const failure of failures) {
           console.warn(`Entitled plugin reconciliation failed for ${failure.pluginId}: ${failure.message}`);
         }
-        if (previousCapabilities !== activePluginCapabilities(plugins.list())) {
+        // Reconciliation bypasses management routes; retry publishing changes after a failed reload.
+        const nextPluginTools = pluginToolSignature();
+        if (nextPluginTools !== publishedPluginTools) {
           try {
             const result = await memmyAgentAdminClient.reloadMcpConfig();
-            if (!result.ok) console.warn(`Agent plugin tool reload did not complete: ${result.message}`);
+            if (result.ok) publishedPluginTools = nextPluginTools;
+            else console.warn(`Agent plugin tools refresh did not complete: ${result.message}`);
           } catch (error) {
             console.warn(`Agent plugin tool reload unavailable: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -408,7 +426,8 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       cloudClient: options.cloudClient,
       accountSessionRepository: options.appStateStore.repositories.accountSession
     }),
-    plugins
+    plugins,
+    pluginSkillContent
   };
 }
 
@@ -472,11 +491,6 @@ function agentApiType(protocol: string): "auto" | "chatCompletions" | "responses
   if (protocol === "openai-responses") return "responses";
   if (protocol === "openai-chat-completions" || protocol === "memmy-account") return "chatCompletions";
   return "auto";
-}
-
-function activePluginCapabilities(plugins: InstalledPlugin[]): string {
-  return JSON.stringify(plugins.filter((plugin) => plugin.state === "active")
-    .map((plugin) => [plugin.id, plugin.version]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
 }
 
 function createUnavailableMemmyConfigWriter(): MemmyConfigWriter {

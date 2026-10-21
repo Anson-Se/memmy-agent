@@ -1,3 +1,6 @@
+import { AskQuestionTool, respondToAgentQuestion } from "../../../memmy-agent/src/core/agent-runtime/tools/ask-question.js";
+import { RequestContext } from "../../../memmy-agent/src/core/agent-runtime/tools/context.js";
+import { createPluginSkillContentService } from "../services/plugin-skill-content-service.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer, type Server as HttpServer } from "node:http";
@@ -77,6 +80,8 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     store = createAppStateStore({ databasePath: join(root, "app.sqlite") });
     const runtimeHost = createPluginRuntimeHost(new PluginAdapterRegistry([
       createCommandPluginAdapter({
+        platform: "win32",
+        isEntitlementGranted: (grant) => grant === "plugin:literature-review",
         allowedNetworkHosts: manifest.permissions
           .filter((permission: { type: string }) => permission.type === "network")
           .flatMap((permission: { hosts: string[] }) => permission.hosts),
@@ -124,6 +129,8 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const localArtifactService = createPluginLocalArtifactService({ pluginDataRoot: dataRoot });
     const progressBus = createProgressBus();
     const service = createPluginService({
+      isAuthenticated: () => true,
+      isEntitlementGranted: (grant) => grant === "plugin:literature-review",
       repository: store.repositories.plugins,
       secretStore: store.secretStore,
       registry: createHttpPluginRegistry({ baseUrl: registry.baseUrl }),
@@ -144,7 +151,12 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     expect(readFileSync(join(skillsRoot, "literature-review", "SKILL.md"), "utf8")).toContain("# Literature Review");
     await expect(service.readUi(manifest.id, "renderer")).resolves.toContain("memmy.plugin.render");
 
-    mcpServer = buildPluginMcpServer(service, progressBus);
+    const bundleBytes = readFileSync(join(pluginRoot, "release", descriptor.skillBundles["literature-review"].file));
+    const skillContent = createPluginSkillContentService({ baseUrl: registry.baseUrl,
+      getPlugin: id => service.list().find(plugin => plugin.id === id) ?? null,
+      authHeaders: () => ({ authorization: "Bearer fixture-account" }), fetch: async () => new Response(new Uint8Array(bundleBytes)) });
+    const skillRef = skillContent.reference(manifest.id, "literature-review");
+    mcpServer = buildPluginMcpServer(service, progressBus, undefined, skillContent);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     client = new Client({ name: "literature-review-package-e2e", version: "1.0.0" });
     await mcpServer.connect(serverTransport);
@@ -159,7 +171,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const created = await client.callTool({
       name: createTool!.name,
       arguments: { title: "Host package smoke", topic: "memory-augmented agents" },
-      _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e" }
+      _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e", "memmy.dev/cloud-skills": "1", "memmy.dev/private-skills-ready": JSON.stringify([skillRef]) }
     });
     if (created.isError) throw new Error(`Installed plugin create-task call failed: ${JSON.stringify(created.content)}`);
     expect(created.isError).not.toBe(true);
@@ -170,7 +182,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const status = await client.callTool({
       name: statusTool!.name,
       arguments: { taskId: createOutput.taskId },
-      _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e" }
+      _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e", "memmy.dev/cloud-skills": "1", "memmy.dev/private-skills-ready": JSON.stringify([skillRef]) }
     });
     expect(status.isError).not.toBe(true);
     expect(status.structuredContent).toMatchObject({ taskId: createOutput.taskId, ok: true });
@@ -182,7 +194,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       pluginId: manifest.id,
       capabilityId: "review_request_interaction",
       conversationId: "desktop:literature-review-e2e",
-      input: { taskId: createOutput.taskId, type: "review-spec" }
+      input: { taskId: createOutput.taskId, type: "source-import" }
     })[Symbol.asyncIterator]();
     expect((await cancellable.next()).value).toMatchObject({ type: "interaction" });
     let cancelOutput: Record<string, unknown> | undefined;
@@ -217,7 +229,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       const result = await client!.callTool({
         name: tool.name,
         arguments: args,
-        _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e" }
+        _meta: { "memmy.dev/session-key": "desktop:literature-review-e2e", "memmy.dev/cloud-skills": "1", "memmy.dev/private-skills-ready": JSON.stringify([skillRef]) }
       });
       if (result.isError) throw new Error(`${capabilityId} failed: ${JSON.stringify(result.content)}`);
       trace.push({ phase: "invoked", capabilityId });
@@ -225,7 +237,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     };
 
     const interact = async (
-      type: "review-spec" | "source-import" | "keywords" | "outline" | "paper-selection",
+      type: "source-import" | "keywords" | "outline" | "paper-selection",
       responseFor: (request: Record<string, unknown>) => Record<string, unknown>
     ) => {
       const callId = `interaction-${type}`;
@@ -274,14 +286,33 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
         onlineSearch: true,
         outputLanguage: "en",
         citationStyle: "apa",
+        targetLength: 700,
         renderMode: "neurips-2024",
-        outputFormats: ["pdf", "tex", "docx"]
+        outputFormats: ["pdf", "tex", "docx"],
+        dateRange: { from: 2022, to: 2026 }
     };
-    const specInteraction = await interact("review-spec", (request) => customResponse(request, { spec: confirmedSpec }));
-    await call("review_update_spec", {
-      taskId: createOutput.taskId,
-      spec: (specInteraction.response.values as { spec: unknown }).spec
-    });
+    const scopeQuestions: Array<Record<string, unknown>> = [];
+    const scopeTool = (onQuestion?: () => void) => {
+      const tool = new AskQuestionTool({ sendCallback: async message => {
+        const card = message.metadata.agentUi.questionCard;
+        scopeQuestions.push(card);
+        trace.push({ phase: "native-scope-question", context: card.context });
+        expect(card.context).toMatchObject({ workflow: "literature-review" });
+        expect(card.questions.map((question: { id: string }) => question.id)).toEqual(["reference-range"]);
+        onQuestion?.();
+        expect(respondToAgentQuestion({ chatId: message.chatId, response: {
+          requestId: card.requestId,
+          answers: card.questions.map((question: { id: string }) => ({ questionId: question.id, selectedOptionIds: [], otherText: "2022–2026" }))
+        } })).toEqual({ ok: true });
+      } });
+      tool.setContext(new RequestContext({ channel: "websocket", chatId: "literature-review-e2e", sessionKey: "desktop:literature-review-e2e" }));
+      return tool;
+    };
+    const scopeSuggestion = (createOutput.suggestedNextTools as Array<{ toolName: string; args: Record<string, unknown> }>).find(item => item.toolName === "ask_question");
+    expect(scopeSuggestion).toBeDefined();
+    const scopeAnswer = JSON.parse(await scopeTool().execute(scopeSuggestion!.args));
+    expect(scopeAnswer.status).toBe("answered");
+    await call("review_update_spec", { taskId: createOutput.taskId, spec: confirmedSpec, questionRequestId: scopeAnswer.requestId });
     const importInteraction = await interact("source-import", () => ({
       files: [{ path: sourcePath, name: "host-service-evidence.txt" }]
     }));
@@ -317,7 +348,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       taskId: createOutput.taskId,
       keywords: (keywordInteraction.response.values as { keywords: unknown[] }).keywords
     });
-    const searched = await call("review_search_papers", { taskId: createOutput.taskId, providers: ["arxiv"], limit: 5 });
+    const searched = await call("review_search_papers", { taskId: createOutput.taskId, providers: ["arxiv"], researchDomain: "general", domainRationale: "Agent memory and retrieval are computer science topics", limit: 5 });
     const papers = (searched.data as { candidates: Array<{ id: string; authors: string[]; year?: number }> }).candidates;
     expect(papers).toHaveLength(1);
     expect(papers[0]).toMatchObject({ authors: ["Ada Lovelace"], year: 2024 });
@@ -333,8 +364,9 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const fetched = await call("review_fetch_fulltexts", { taskId: createOutput.taskId });
     expect(fetched.data).toMatchObject({ counts: { downloaded: 1 } });
     const readings = await call("review_build_readings", { taskId: createOutput.taskId });
-    const readingData = readings.data as { evidenceUnits: unknown[]; readings?: unknown[]; chunks?: unknown[] };
-    if (!readingData.evidenceUnits.length) {
+    const readingData = readings.data as { counts: { evidenceUnits: number } };
+    expect(readingData).not.toHaveProperty("evidenceUnits");
+    if (!readingData.counts.evidenceUnits) {
       const debugStatus = await call("review_get_status", { taskId: createOutput.taskId });
       const values = (debugStatus.data as { values?: Record<string, unknown> }).values;
       throw new Error(`Downloaded PDF produced no evidence: ${JSON.stringify({ data: readingData, warnings: readings.warnings, diagnostics: values?.downloadParseDiagnostics, documents: values?.parsedDocuments })}`);
@@ -349,10 +381,11 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       outline: (outlineInteraction.response.values as { outline: unknown[] }).outline
     });
     expect(trace.filter((item) => item.phase === "interaction-submitted").map((item) => item.cardType)).toEqual([
-      "review-spec", "source-import", "keywords", "paper-selection", "outline"
+      "source-import", "keywords", "paper-selection", "outline"
     ]);
     const mapped = await call("review_map_evidence", { taskId: createOutput.taskId });
-    const packs = (mapped.data as { evidencePacks: Array<{ rankingMode: string }> }).evidencePacks;
+    const packs = (mapped.data as { sections: Array<{ rankingMode: string }> }).sections;
+    expect(mapped.data).not.toHaveProperty("evidencePacks");
     expect(packs.length).toBeGreaterThan(0);
     expect(packs.every((pack) => pack.rankingMode === "embedding+lexical")).toBe(true);
     expect(trace.some((item) => item.phase === "host-service" && item.service === "model-inference")).toBe(true);
@@ -360,8 +393,15 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     expect(existsSync(join(dataRoot, manifest.id, "tasks", createOutput.taskId!, "task.json"))).toBe(true);
     trace.push({ phase: "host-boundaries-verified", modelInference: true, embeddingInference: true, taskData: true, networkPolicy: true });
 
-    const generatedSections = await call("review_generate_sections", { taskId: createOutput.taskId, batchSize: 2 });
-    expect(generatedSections.data).toMatchObject({ generation: { mode: "host-model" } });
+    let generatedSections = await call("review_generate_sections", { taskId: createOutput.taskId, batchSize: 2 });
+    let sectionResumes = 0;
+    while ((generatedSections.data as { generation: { pendingOutlineNodeIds: string[] } }).generation.pendingOutlineNodeIds.length) {
+      if (++sectionResumes > 4) throw new Error(`Section generation did not converge: ${JSON.stringify(generatedSections.data)}`);
+      const next = (generatedSections.suggestedNextTools as Array<{ toolName: string; args: Record<string, unknown> }>).find(item => item.toolName === "review_generate_sections");
+      expect(next).toBeDefined();
+      generatedSections = await call(next!.toolName, next!.args);
+    }
+    expect(generatedSections.data, JSON.stringify(generatedSections.data)).toMatchObject({ generation: { mode: "host-model", pendingOutlineNodeIds: [], fallbackOutlineNodeIds: [] } });
     const refined = await call("review_refine", {
       taskId: createOutput.taskId,
       instruction: "Improve transitions without changing evidence or citations.",
@@ -460,6 +500,9 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
         );
       }
     };
+    const skillLoader = tools.find(tool => tool.name === "read_plugin_skill");
+    expect(skillLoader).toBeDefined();
+    agentTools.register(new MCPToolWrapper(mcpSession, "plugins", skillLoader!, 60));
     for (const [capability, tool] of originalToolsByCapability) {
       const wrapper = new MCPToolWrapper(mcpSession, "plugins", tool, 60);
       agentTools.register(wrapper);
@@ -474,6 +517,11 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const pendingChat: Array<Record<string, unknown>> = [];
     const interactionResponses: Array<Promise<void>> = [];
     const agentCardTypes: string[] = [];
+    agentTools.register(scopeTool(() => pendingChat.push({
+      role: "user", content: "把输出语言改为中文，并且只纳入2022年以来的论文。",
+      client_request_id: "chat-during-native-scope-question", webui_queue_steer_origin: true
+    })));
+    agentToolNames.set("ask_question", "ask_question");
     const unsubscribe = progressBus.on("plugin.capability_event", (event) => {
       if (event.capabilityId === "review_create_task" && event.event.type === "result") {
         const output = event.event.output as { taskId?: unknown };
@@ -485,12 +533,6 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       const cardType = String(payload.cardType ?? "");
       if (!cardType) return;
       agentCardTypes.push(cardType);
-      if (cardType === "review-spec") pendingChat.push({
-          role: "user",
-          content: "把输出语言改为中文，并且只纳入2022年以来的论文。",
-          client_request_id: "chat-during-review-spec-card",
-          webui_queue_steer_origin: true
-        });
       const baseArtifact = payload.baseArtifact as Record<string, unknown> | undefined;
       const data = payload.data as Record<string, unknown> | undefined;
       const paperCardIds = cardType === "paper-selection"
@@ -505,8 +547,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
         : {
             action: "submit",
             ...(typeof baseArtifact?.contentHash === "string" ? { baseArtifactHash: baseArtifact.contentHash } : {}),
-            values: cardType === "review-spec" ? { spec: agentSpecBeforeChat }
-              : cardType === "keywords" ? { keywords: data?.keywords ?? [] }
+            values: cardType === "keywords" ? { keywords: data?.keywords ?? [] }
                 : cardType === "outline" ? { outline: data?.outline ?? [] }
                   : cardType === "paper-selection" ? {
                       includedPaperIds: paperCardIds,
@@ -540,17 +581,26 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
           topic: "retrieval quality and grounded agent memory"
         });
         const latestToolOutput = [...messages].reverse().find((message) => message.role === "tool")?.content;
+        if (typeof latestToolOutput === "string" && latestToolOutput.startsWith("Error")) {
+          throw new Error(`Scripted Agent step ${step} received a tool validation failure: ${latestToolOutput.slice(0, 2000)}`);
+        }
         const parsed = typeof latestToolOutput === "string" ? JSON.parse(latestToolOutput) as Record<string, unknown> : {};
         if (!agentTaskId && typeof parsed.taskId === "string") agentTaskId = parsed.taskId;
+        if (parsed.ok === false) throw new Error(`Scripted Agent received a failed plugin operation: ${JSON.stringify(parsed)}`);
         const data = (parsed.data ?? {}) as Record<string, unknown>;
         const response = (data.response ?? {}) as Record<string, unknown>;
         const values = (response.values ?? {}) as Record<string, unknown>;
-        if (step === 1) return tool("review_request_interaction", { taskId: agentTaskId, type: "review-spec" });
+        if (step === 1) {
+          const suggestion = (parsed.suggestedNextTools as Array<{ toolName: string; args: Record<string, unknown> }>).find(item => item.toolName === "ask_question");
+          if (!suggestion) throw new Error("Task creation did not request native research scope confirmation");
+          return tool(suggestion.toolName, suggestion.args);
+        }
         if (step === 2) {
           const sawSteering = messages.some((message) => message.role === "user" && String(message.content).includes("2022"));
           if (!sawSteering) throw new Error("The Agent did not receive Chat steering submitted while the card was open.");
           return tool("review_update_spec", {
             taskId: agentTaskId,
+            questionRequestId: parsed.requestId,
             spec: {
               ...agentSpecBeforeChat,
               outputLanguage: "zh-CN",
@@ -567,7 +617,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
         if (step === 6) return tool("review_generate_keywords", { taskId: agentTaskId });
         if (step === 7) return tool("review_request_interaction", { taskId: agentTaskId, type: "keywords" });
         if (step === 8) return tool("review_update_keywords", { taskId: agentTaskId, keywords: values.keywords });
-        if (step === 9) return tool("review_search_papers", { taskId: agentTaskId, providers: ["arxiv"], limit: 5 });
+        if (step === 9) return tool("review_search_papers", { taskId: agentTaskId, providers: ["arxiv"], researchDomain: "general", domainRationale: "Agent memory and retrieval are computer science topics", limit: 5 });
         if (step === 10) return tool("review_request_interaction", { taskId: agentTaskId, type: "paper-selection" });
         if (step === 11) return tool("review_update_paper_selection", {
           taskId: agentTaskId,
@@ -582,6 +632,12 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
         if (step === 17) return tool("review_update_outline", { taskId: agentTaskId, outline: values.outline });
         if (step === 18) return tool("review_map_evidence", { taskId: agentTaskId });
         if (step === 19) return tool("review_generate_sections", { taskId: agentTaskId, batchSize: 2 });
+        if (step === 20 && (data.generation as { pendingOutlineNodeIds?: string[] } | undefined)?.pendingOutlineNodeIds?.length) {
+          const suggestion = (parsed.suggestedNextTools as Array<{ toolName: string; args: Record<string, unknown> }>).find(item => item.toolName === "review_generate_sections");
+          if (!suggestion || agentModelStep > 40) throw new Error("Missing bounded section-resume suggestion");
+          agentModelStep--;
+          return tool(suggestion.toolName, suggestion.args);
+        }
         if (step === 20) return tool("review_refine", {
           taskId: agentTaskId,
           instruction: "Improve transitions without changing evidence or citations.",
@@ -615,13 +671,10 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     if (liveAgentEnabled && !liveSelection) throw new Error("The current Memmy user model is unavailable for the live Agent E2E.");
     const agentProvider = liveSelection?.snapshot.provider ?? scriptedAgentProvider;
     const agentContext = new ContextBuilder({ workspace: join(root, "workspace"), fileMemoryEnabled: false });
-    const agentSystemPrompt = [
-      agentContext.buildSystemPrompt(["literature-review"]),
-      readFileSync(join(pluginRoot, "skills", "literature-review", "references", "tool-recipes.md"), "utf8")
-    ].join("\n\n");
+    const agentSystemPrompt = agentContext.buildSystemPrompt(["literature-review"]);
     expect(agentSystemPrompt).toContain("### Skill: literature-review");
-    expect(agentSystemPrompt).toContain("five required structured interactions");
-    expect(agentSystemPrompt).toContain("## New Full Review");
+    expect(agentSystemPrompt).toContain("mcp_plugins_read_plugin_skill");
+    expect(agentSystemPrompt).not.toContain("## New Full Review");
     let agentResult;
     try {
       agentResult = await new AgentRunner(agentProvider as never).run(new AgentRunSpec({
@@ -629,10 +682,11 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
           { role: "system", content: agentSystemPrompt },
           { role: "user", content: "$literature-review 请创建一份关于检索质量与智能体长期记忆的综述。请使用 arXiv 检索，首次 review_search_papers 请明确使用 query=\"retrieval quality AND agent memory\"、providers=[\"arxiv\"]、limit=5。请立即通过插件依次发出所有必需卡片让我确认，无需在发卡片前再次用聊天征求许可；收到每张卡片结果后继续完成证据映射、正文、图表、参考文献、审计、摘要和全部交付物。上传的 host-service-evidence.txt 只用于验证文件导入和解析，不是具备书目信息的论文，不要把它加入写作语料、EvidenceUnit 或参考文献；论文选择必须采用卡片返回的 arXiv includedPaperIds。本评测允许保留 partial 或 gap 覆盖诊断，请不要为覆盖缺口重复检索、重复修改大纲、重复映射或重复生成正文，使用当前有全文 EvidenceUnit 的范围继续。正文生成后必须调用 review_refine 完成章节连贯性改写；随后必须分别调用 review_plan_figures 和 review_build_tables，即使没有合格图表也要让工具产出可审计的空结果；最后构建参考文献、审计、生成摘要并渲染。中途不要仅汇报下一步或询问是否继续。" }
         ],
+        privateSkillRefs: [skillRef],
         provider: agentProvider as never,
         tools: agentTools,
         model: liveSelection?.model ?? "fixture-agent-model",
-        maxIterations: liveAgentEnabled ? 60 : 32,
+        maxIterations: liveAgentEnabled ? 60 : 40,
         injectionCallback: ({ limit = 3 } = {}) => pendingChat.splice(0, limit)
       }));
       await Promise.all(interactionResponses);
@@ -653,13 +707,18 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       }, null, 2)}\n`, "utf8");
     }
     expect(agentResult.finalContent.length).toBeGreaterThan(0);
+    const privateDocuments = JSON.parse(bundleBytes.toString("utf8")).files as Record<string, string>;
+    for (const document of Object.values(privateDocuments)) expect(JSON.stringify(agentResult.messages)).not.toContain(document);
+    skillContent.clear();
     expect(agentResult.hadInjections).toBe(true);
+    expect(scopeQuestions).toHaveLength(2);
+    expect(agentResult.toolsUsed).toContain("ask_question");
     const firstSeenCardTypes = agentCardTypes.filter((cardType, index) => agentCardTypes.indexOf(cardType) === index);
     expect(firstSeenCardTypes, JSON.stringify({
       finalContent: agentResult.finalContent,
       cards: agentCardTypes,
       toolsUsed: agentResult.toolsUsed
-    }, null, 2)).toEqual(["review-spec", "source-import", "keywords", "paper-selection", "outline"]);
+    }, null, 2)).toEqual(["source-import", "keywords", "paper-selection", "outline"]);
     for (const capability of [
       "review_create_task", "review_update_spec", "review_import_sources", "review_parse_sources", "review_generate_keywords",
       "review_update_keywords", "review_search_papers", "review_update_paper_selection", "review_resolve_metadata",
@@ -667,9 +726,12 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
       "review_generate_sections", "review_refine", "review_plan_figures", "review_build_tables", "review_build_bibliography",
       "review_audit", "review_generate_abstract", "review_render"
     ]) expect(agentResult.toolsUsed, JSON.stringify({ missing: capability, finalContent: agentResult.finalContent, toolsUsed: agentResult.toolsUsed }, null, 2)).toContain(agentToolNames.get(capability));
-    expect(agentResult.toolsUsed.filter((name) => name === agentToolNames.get("review_request_interaction")).length).toBeGreaterThanOrEqual(5);
+    expect(agentResult.toolsUsed.filter((name) => name === agentToolNames.get("review_request_interaction")).length).toBe(4);
     const agentTask = JSON.parse(readFileSync(join(dataRoot, manifest.id, "tasks", agentTaskId, "task.json"), "utf8"));
     expect(agentTask.spec).toMatchObject({ outputLanguage: "zh-CN", dateRange: { from: 2022 } });
+    expect(agentTask.values.sectionGeneration).toMatchObject({ mode: "host-model", pendingOutlineNodeIds: [], fallbackOutlineNodeIds: [] });
+    expect(agentTask.values.sectionRefinement).toMatchObject({ mode: "host-model", validationPassed: true });
+    expect(agentTask.values.sections.every((section: { markdown: string }) => /[\u4e00-\u9fff]/u.test(section.markdown))).toBe(true);
     expect(agentTask.values.outputs.map((output: { name: string }) => output.name).sort()).toEqual([
       "neurips_2024.sty", "references.bib", "review.docx", "review.md", "review.pdf", "review.tex"
     ]);
@@ -698,9 +760,11 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     });
 
     await service.disable(manifest.id);
-    expect((await client.listTools()).tools).toHaveLength(0);
+    expect((await client.listTools()).tools.map(tool => tool.name)).toEqual(["read_plugin_skill"]);
+    const disabledSkill = await client.callTool({ name: "read_plugin_skill", arguments: { pluginId: manifest.id, skillId: "literature-review" }, _meta: { "memmy.dev/cloud-skills": "1" } });
+    expect(disabledSkill.isError).toBe(true);
     expect(existsSync(join(skillsRoot, "literature-review"))).toBe(false);
-    trace.push({ phase: "disabled", tools: 0, skillRegistered: false });
+    trace.push({ phase: "disabled", tools: 1, pluginCapabilities: 0, skillRegistered: false });
     await writeReport(trace, {
       plugin: {
         id: manifest.id,
@@ -722,6 +786,24 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
 });
 
 function modelFixtureResponse(system: string, request: Record<string, unknown>): Record<string, unknown> {
+  const evidence = (request.evidence ?? []) as Array<{ evidenceId: string; citeKey: string }>;
+  if (request.task === "plan-review-paragraphs") return {
+    paragraphs: Array.from({ length: Number(request.paragraphCount) }, (_, index) => ({
+      point: `Compare retrieval relevance and evidence provenance, argument ${index + 1}`,
+      evidenceIds: evidence.slice(0, 2).map(unit => unit.evidenceId)
+    }))
+  };
+  if (request.task === "write-review-paragraph") return {
+    paragraphId: request.paragraphId,
+    markdown: request.language === "zh-CN"
+      ? String(request.paragraphId).endsWith("-1")
+        ? `所给研究表明，检索相关性有助于提高智能体对持久记忆中证据的可靠复用，减少缺乏支持的回答 [${evidence[0].citeKey}]。`
+        : `明确的证据来源也有助于减少陈旧上下文引起的冲突，但有限的基准范围约束了结论的推广 [${evidence[0].citeKey}]。`
+      : String(request.paragraphId).endsWith("-1")
+        ? `The supplied study associates retrieval relevance with more reliable reuse of persistent memory and fewer unsupported answers [${evidence[0].citeKey}].`
+        : `Explicit provenance also helps reduce stale-context conflicts, while the limited benchmark scope constrains generalization beyond the evaluated tasks [${evidence[0].citeKey}].`
+  };
+  if (request.task === "check-review-paragraph-continuity") return { passed: true, repairs: [] };
   if (system.includes("design evidence-oriented literature-review outlines")) {
     return { outline: [
       { title: "Scope and concepts", guidance: "Define the review scope and core concepts.", children: [] },
@@ -740,9 +822,13 @@ function modelFixtureResponse(system: string, request: Record<string, unknown>):
     return { sections: sections.map((section) => {
       const evidenceIds = section.evidence?.map((item) => item.evidenceId) ?? section.evidenceIds ?? [];
       const citeKeys = section.evidence?.map((item) => item.citeKey) ?? section.citeKeys ?? [];
-      const focus = section.outlineNodeId.includes("2-1")
-        ? "Across the reviewed evaluations, higher retrieval relevance is associated with fewer unsupported answers and clearer evidence provenance"
-        : "The review scope connects retrieval quality, persistent memory, and grounded behavior under a shared evidence-tracing framework";
+      const focus = request.language === "zh-CN"
+        ? section.outlineNodeId.includes("2-1")
+          ? "所给研究将更高的检索相关性与更少的不受支持回答以及更清晰的证据来源联系起来"
+          : "本综述在可追溯的证据框架下综合检索质量、持久记忆和有依据的智能体行为"
+        : section.outlineNodeId.includes("2-1")
+          ? "Across the reviewed evaluations, higher retrieval relevance is associated with fewer unsupported answers and clearer evidence provenance"
+          : "The review scope connects retrieval quality, persistent memory, and grounded behavior under a shared evidence-tracing framework";
       return {
         outlineNodeId: section.outlineNodeId,
         markdown: `${focus} ${citeKeys.map((key) => `[${key}]`).join(" ")}.`,
@@ -841,7 +927,10 @@ async function serveRelease(manifest: Record<string, unknown>, sha256: string, a
     }
     response.writeHead(404).end();
   });
-  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Local plugin registry did not bind a TCP port");
   return { server, baseUrl: `http://127.0.0.1:${address.port}` };

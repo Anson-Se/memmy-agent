@@ -1117,7 +1117,7 @@ describe("PluginCapabilityHost", () => {
         ui: { renderer: { entry: "ui/bundles/review-cards/index.html", height: 680 } }
       }
     });
-    const customCardTypes = ["review-spec", "keywords", "outline", "paper-selection", "fulltext-recovery"];
+    const customCardTypes = ["keywords", "outline", "paper-selection", "fulltext-recovery"];
     const calls: PluginUiCall[] = customCardTypes.map((cardType, index) => ({
       pluginId: literatureReviewPlugin.id,
       capabilityId: "review_request_interaction",
@@ -1157,39 +1157,30 @@ describe("PluginCapabilityHost", () => {
       }]
     });
 
-    await act(async () => root.render(
-      <I18nProvider language="zh-CN">
-        <PluginCapabilityHost
-          calls={calls}
-          plugins={[literatureReviewPlugin]}
-          client={{ getUi, cancel, respond }}
-          uploadFiles={uploadFiles}
-        />
-      </I18nProvider>
-    ));
-    await act(async () => Promise.resolve());
-
-    const iframes = Array.from(container.querySelectorAll("iframe"));
-    expect(iframes).toHaveLength(customCardTypes.length);
-    expect(getUi).toHaveBeenCalledTimes(customCardTypes.length);
-    for (const iframe of iframes) {
+    const client = { getUi, cancel, respond };
+    const renderCall = async (call: PluginUiCall) => {
+      await act(async () => root.render(
+        <I18nProvider language="zh-CN"><PluginCapabilityHost calls={[call]} plugins={[literatureReviewPlugin]} client={client} uploadFiles={uploadFiles} /></I18nProvider>
+      ));
+      await act(async () => Promise.resolve());
+    };
+    // Cards are sequential: the current-call selector intentionally hides superseded editors.
+    for (const [index, cardType] of customCardTypes.entries()) {
+      await renderCall(calls[index]!);
+      const iframe = container.querySelector("iframe")!;
+      expect(iframe).not.toBeNull();
       expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
       expect(iframe.getAttribute("srcdoc")).toContain("CARD_NAMES");
       expect(iframe.getAttribute("srcdoc")).toContain("Content-Security-Policy");
-    }
-
-    for (const [index, iframe] of iframes.entries()) {
       await act(async () => window.dispatchEvent(new MessageEvent("message", {
         source: iframe.contentWindow,
-        data: {
-          type: "memmy.plugin.interaction-response",
-          version: 1,
-          interactionId: `interaction-${index}`,
-          response: { action: "submit", values: { cardType: customCardTypes[index] } }
-        }
+        data: { type: "memmy.plugin.interaction-response", version: 1, interactionId: `interaction-${index}`, response: { action: "submit", values: { cardType } } }
       })));
+      expect(container.querySelector("iframe")).toBeNull();
     }
+    expect(getUi).toHaveBeenCalledTimes(customCardTypes.length);
     expect(respond).toHaveBeenCalledTimes(customCardTypes.length);
+    await renderCall(calls.at(-1)!);
 
     const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
     Object.defineProperty(fileInput, "files", { value: [new File(["pdf"], "local-source.pdf", { type: "application/pdf" })] });

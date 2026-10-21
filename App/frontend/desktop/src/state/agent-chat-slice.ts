@@ -3077,7 +3077,7 @@ function applyAgentQuestionResponse(state: AgentState, event: MemmyAgentWsEvent)
   const messages = [...state.messages];
   messages[index] = {
     ...messages[index]!,
-    questionResponse: { requestId, answers: event.answers },
+    questionResponse: { requestId, answers: event.answers, ...(event.cancelled === true ? { cancelled: true } : {}) },
   };
   return syncCurrentMessages({ ...state, messages });
 }
