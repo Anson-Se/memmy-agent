@@ -185,14 +185,6 @@ function RuntimeApp() {
         if (!isActive) return;
         dispatch(appActions.agentSourceScanAvailability(status.unavailable ?? null));
         if (status.unavailable) return;
-        if (status.progress) {
-          dispatch(appActions.agentSourceScanProgressReceived(status.progress));
-          return;
-        }
-        if (status.completion) {
-          handleScanCompletion(status.completion, agentSourceClient);
-          return;
-        }
         dispatch(appActions.agentSourceScanStatusReceived(status, requestGeneration));
       } catch {
         // The next scanning heartbeat or reconnect will reconcile again.

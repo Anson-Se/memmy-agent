@@ -1176,6 +1176,8 @@ export function AgentAccessTab({
   };
 
   const restartService = async () => {
+    if (serviceBusy) return;
+    const generation = ++operationGeneration.current;
     setServiceBusy(true);
     setServiceFeedback(null);
     try {
@@ -1184,6 +1186,7 @@ export function AgentAccessTab({
       await api.post("/api/v1/system/restart", {});
       const running = await waitForMemoryService(before.uptimeMs, requestedAt);
       if (!running) throw new Error(t("settings.agents.serviceRestartFailed"));
+      receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation);
       setServiceFeedback({ kind: "ok", text: t("settings.agents.serviceRestarted") });
     } catch (error) {
       setServiceFeedback({
@@ -1196,6 +1199,7 @@ export function AgentAccessTab({
   };
 
   const scan = async (sourceId: string, mode?: "full") => {
+    if (serviceBusy) return;
     const generation = ++operationGeneration.current;
     setBusySource(sourceId);
     setMessage(null);
@@ -1216,7 +1220,7 @@ export function AgentAccessTab({
 
   const controlScan = async (kind: "pause" | "cancel") => {
     const previous = latestScan.current;
-    if (!previous?.jobId || pendingControl.current) return;
+    if (serviceBusy || !previous?.jobId || pendingControl.current) return;
     const token = `${++operationGeneration.current}:${kind}`;
     pendingControl.current = token;
     setScanControlBusy(kind);
@@ -1237,7 +1241,7 @@ export function AgentAccessTab({
   const cancelScan = async () => { if (scanSessionActive) await controlScan("cancel"); };
   const resumeScan = async () => {
     const sourceId = scanStatus?.sourceId ?? scanStatus?.progress?.sourceId;
-    if (!scanPaused || !sourceId || pendingControl.current) return;
+    if (serviceBusy || !scanPaused || !sourceId || pendingControl.current) return;
     const token = `${++operationGeneration.current}:resume`;
     pendingControl.current = token;
     setScanControlBusy("resume");
@@ -1389,7 +1393,7 @@ export function AgentAccessTab({
             </div>
             <button
               class="btn btn--ghost btn--sm"
-              disabled={scanControlBusy !== null}
+              disabled={serviceBusy || scanControlBusy !== null}
               onClick={() => void (scanPaused ? resumeScan() : pauseScan())}
             >
               <Icon
@@ -1401,7 +1405,7 @@ export function AgentAccessTab({
             </button>
             <button
               class="btn btn--danger btn--sm"
-              disabled={scanControlBusy !== null}
+              disabled={serviceBusy || scanControlBusy !== null}
               onClick={() => void cancelScan()}
             >
               <Icon name={scanControlBusy === "cancel" ? "loader-2" : "x"} size={13} class={scanControlBusy === "cancel" ? "spin" : ""} />
@@ -1425,7 +1429,7 @@ export function AgentAccessTab({
           </div>
           <button
             class="btn btn--primary btn--sm"
-            disabled={scanSessionActive || busySource !== null}
+            disabled={serviceBusy || scanSessionActive || busySource !== null}
             onClick={() => void scan("all")}
           >
             <Icon name={busySource === "all" ? "loader-2" : "refresh-cw"} size={14} class={busySource === "all" ? "spin" : ""} />
@@ -1462,7 +1466,7 @@ export function AgentAccessTab({
                   <div class="hstack" style="gap:var(--sp-2);flex-shrink:0">
                     <button
                       class={`btn btn--sm ${connected ? "btn--danger" : "btn--primary"}`}
-                      disabled={!source.available || scanSessionActive || busySource !== null}
+                      disabled={serviceBusy || !source.available || scanSessionActive || busySource !== null}
                       onClick={() => void toggleConnection(source)}
                     >
                       <Icon name={busy ? "loader-2" : agentActionIcon(action)} size={13} class={busy ? "spin" : ""} />
@@ -1470,7 +1474,7 @@ export function AgentAccessTab({
                     </button>
                     <button
                       class="btn btn--ghost btn--sm"
-                      disabled={!source.available || scanSessionActive || busySource !== null}
+                      disabled={serviceBusy || !source.available || scanSessionActive || busySource !== null}
                       onClick={() => void scan(source.sourceId)}
                     >
                       <Icon name={busy ? "loader-2" : "refresh-cw"} size={13} class={busy ? "spin" : ""} />
@@ -1503,7 +1507,7 @@ export function AgentAccessTab({
                 </div>
                 <button
                   class="btn btn--danger btn--sm"
-                  disabled={scanSessionActive || busySource !== null}
+                  disabled={serviceBusy || scanSessionActive || busySource !== null}
                   onClick={openFullScanConfirm}
                 >
                   <Icon name="history" size={13} />
@@ -1613,7 +1617,7 @@ export function AgentAccessTab({
               </button>
               <button
                 class="btn btn--danger btn--sm"
-                disabled={!fullScanTargetSourceId || scanSessionActive || busySource !== null}
+                disabled={serviceBusy || !fullScanTargetSourceId || scanSessionActive || busySource !== null}
                 onClick={startFullScan}
               >
                 <Icon name="history" size={13} />

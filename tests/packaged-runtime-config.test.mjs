@@ -51,6 +51,8 @@ describe("packaged desktop runtime configuration", () => {
     expect(staged.status, staged.stderr).toBe(0);
     const agent = join(runtime, "memmy-agent");
     writeFileSync(join(agent, "check.mjs"), `import { acceptsScanUpdate } from '@memmy/agent-source-core/scan-state';
+      import { createRequire } from 'node:module';
+      createRequire(import.meta.url).resolve('@memmy/agent-source-core/package.json');
       if (acceptsScanUpdate({version:{generation:2,sequence:3}}, {version:{generation:2,sequence:2}})) throw Error('stale accepted');`);
     const imported = spawnSync(process.execPath, [join(agent, "check.mjs")], { encoding: "utf8" });
     expect(imported.status, imported.stderr).toBe(0);

@@ -106,7 +106,8 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
     async status(): Promise<AgentSourceScanStatusResponse> {
       let state: MemoryAgentSourceScanState;
       try {
-        state = await snapshot();
+        // Explicit reads may follow a Memory restart; never reuse a pre-restart poll.
+        state = await snapshot(true);
       } catch (error) {
         const unavailable = memoryScanUnavailable(error);
         if (!unavailable) throw error;

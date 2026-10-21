@@ -125,7 +125,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
   const scanCancelling = Boolean(state.agentSources.cancellingScanJobId || state.agentSources.scanControl?.control === "cancel");
-  const scanControlBusy = Boolean(state.agentSources.scanControl);
+  const scanControlBusy = memoryServiceBusy || Boolean(state.agentSources.scanControl);
   const showScanProgress = isScanning || scanStopped || scanCancelling;
   const hasDeterminateScanProgress = Boolean(scanProgress && scanProgress.phase !== "scan" && scanProgress.phase !== "stopped" && scanProgress.total > 0);
   const memoryUnavailable = memoryServiceStatus === "unavailable";
@@ -370,6 +370,12 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
           const scanStatus = await clients.agentSources.getScanStatus();
           if (!isCurrent()) return;
           dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
+          dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
+          if (scanStatus.unavailable) {
+            setMemoryServiceStatus("unavailable");
+            setMemoryServiceError(t("memory.restartServiceStillUnavailable"));
+            return;
+          }
           setMemoryServiceMessage(t("memory.restartServiceDone"));
         } else {
           setMemoryServiceError(health.error
@@ -506,7 +512,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   }
 
   async function controlScan(kind: "pause" | "cancel") {
-    if (!clients || !scanProgress) return;
+    if (!clients || !scanProgress || scanControlBusy) return;
     const token = crypto.randomUUID();
     const expectedExecution = scanProgress ? { jobId: scanProgress.jobId, attemptId: scanProgress.attemptId } : undefined;
     dispatch(appActions.agentSourceScanControl(kind, token));
@@ -1249,7 +1255,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
                 <button
                   type="button"
                   onClick={startFullScan}
-                  disabled={!fullScanTargetSourceId || isScanning || scanCancelling}
+                  disabled={!fullScanTargetSourceId || isScanning || scanCancelling || scanControlBusy}
                   className="px-4 py-2 text-sm text-white bg-status-error rounded-btn hover:bg-status-error/85 transition-all cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                 >
                   <Radar size={14} />

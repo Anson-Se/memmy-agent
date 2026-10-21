@@ -16,7 +16,7 @@ let clients: AppClients;
 let legacyService = false;
 function Harness() {
   const { setClients } = useApiClients(); stateApi = useAppState();
-  useEffect(() => { setClients(clients); stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(1), ...(legacyService ? { version: undefined } : {}) })); }, [setClients]);
+  useEffect(() => { setClients(clients); stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(1), ...(legacyService ? { version: undefined, attemptId: undefined } : {}) })); }, [setClients]);
   return <SourcesSubPage />;
 }
 beforeEach(() => {
@@ -25,7 +25,7 @@ beforeEach(() => {
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
   clients = { runtimeConfig: { baseUrl: "http://127.0.0.1:18100", localToken: "test", memory: { baseUrl: "http://127.0.0.1:18960" } },
     localData: { getPath: async () => ({ ok: true, dataPath: "/test" }) }, memoryRuntime: { health: async () => ({ ok: true, storage: { ready: true } }) },
-    config: { getScanPreferences: async () => ({ autoScanKnownAgents: false, watchFileChanges: false, autoInjectSkill: false }) },
+    config: { updateOnboarding: async () => ({ scanPermission: "scan_only" }), getScanPreferences: async () => ({ autoScanKnownAgents: false, watchFileChanges: false, autoInjectSkill: false }) },
     agentSources: { listSources: vi.fn(async () => []), getScanStatus: vi.fn(async () => status(1)), stopScan: vi.fn(), cancelScan: vi.fn(), startScan: vi.fn() }
   } as unknown as AppClients;
 });
@@ -42,7 +42,7 @@ it("cancels an older service using its post-control idle query and rejects delay
   expect(stateApi.state.agentSources.scanProgress).toBeNull();
   expect(stateApi.state.agentSources.isScanning).toBe(false);
   expect(stateApi.state.agentSources.scanControl).toBeNull();
-  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(1), version: undefined })); });
+  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(1), version: undefined, attemptId: undefined })); });
   expect(stateApi.state.agentSources.scanProgress).toBeNull();
 });
 it("1/2/4: pause, resume and cancel apply snapshots and reject late states", async () => {
@@ -83,4 +83,23 @@ it("control failure leaves running state and releases the button", async () => {
   await mount(); vi.mocked(clients.agentSources.stopScan).mockRejectedValue(new Error("offline"));
   await act(async () => { button("暂停").click(); });
   expect(stateApi.state.agentSources.scanProgress).toEqual(progress(1)); expect(button("暂停").disabled).toBe(false);
+});
+
+it("accepts a successful legacy resume without accepting unsolicited running progress", async () => {
+  legacyService = true;
+  await mount();
+  const paused = { ...progress(2, "stopped"), version: undefined, attemptId: undefined };
+  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived(paused)); });
+  const running = { ...paused, phase: "scan" as const };
+  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived(running)); });
+  expect(stateApi.state.agentSources.scanProgress?.phase).toBe("stopped");
+  vi.mocked(clients.agentSources.startScan).mockRejectedValueOnce(new Error("offline"));
+  vi.mocked(clients.agentSources.getScanStatus).mockResolvedValue({ active: false, progress: paused });
+  await act(async () => { button("继续").click(); });
+  expect(stateApi.state.agentSources.scanProgress?.phase).toBe("stopped");
+  vi.mocked(clients.agentSources.startScan).mockResolvedValue({ jobId: "job" });
+  vi.mocked(clients.agentSources.getScanStatus).mockResolvedValue({ active: true, progress: running });
+  await act(async () => { button("继续").click(); });
+  expect(stateApi.state.agentSources.scanProgress?.phase).toBe("scan");
+  expect(button("暂停").disabled).toBe(false);
 });

@@ -5,10 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppClients } from "../../../api/client-types.js";
 import { AppProviders, useApiClients } from "../../../app/providers.js";
+import { useAppState } from "../../../state/app-state.js";
+import { appActions } from "../../../state/app-actions.js";
 import { SourcesSubPage } from "../sources-sub-page.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+let stateApi: ReturnType<typeof useAppState>;
 const healthy = { ok: true, storage: { ready: true } };
 
 describe("SourcesSubPage memory service recovery", () => {
@@ -59,6 +62,92 @@ describe("SourcesSubPage memory service recovery", () => {
     if (!button) throw new Error("Memory restart action was not rendered");
     return button;
   }
+
+  it.each(["idle", "completed"] as const)("uses the new version on the first scan after restarting from %s", async (lifecycle) => {
+    const clients = createClients(async () => healthy);
+    const version = { generation: 2, sequence: 0 };
+    const completion = { jobId: "finished", attemptId: "attempt", sourceId: "all", succeeded: true, completedAt: "2026-10-21T00:00:00Z" };
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, status: lifecycle, version,
+      ...(lifecycle === "completed" ? { completion: { ...completion, version } } : {}) }));
+    clients.config.updateOnboarding = vi.fn(async () => ({} as never));
+    clients.agentSources.startScan = vi.fn(async (input) => {
+      if (input?.expectedVersion?.generation !== version.generation) throw new Error("Scan state changed");
+      clients.agentSources.getScanStatus = vi.fn(async () => ({ active: true, progress: { jobId: "new-job", attemptId: "new-attempt", sourceId: "all", phase: "scan", current: 0, total: 0, version: { generation: 2, sequence: 1 } } }));
+      return { jobId: "new-job", attemptId: "new-attempt", version: { generation: 2, sequence: 1 } };
+    });
+    await render(clients);
+    await act(async () => {
+      if (lifecycle === "completed") {
+        stateApi.dispatch(appActions.agentSourceScanCompleted({ ...completion, version: { generation: 1, sequence: 5 } }));
+        stateApi.dispatch(appActions.agentSourceScanCompletionExpired("finished", "attempt"));
+      } else {
+        stateApi.dispatch(appActions.agentSourceScanStatusReceived({ active: false, progress: null, status: "idle", version: { generation: 1, sequence: 0 } }));
+      }
+    });
+    await act(async () => { restartButton().click(); });
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(version);
+    expect(container.textContent).toContain("记忆服务已重新启动");
+    const scan = [...container.querySelectorAll("button")].find(button => button.textContent?.trim() === "同步新增");
+    expect(scan).toBeDefined();
+    expect(scan?.disabled).toBe(false);
+    await act(async () => { scan!.click(); });
+    expect(clients.agentSources.startScan).toHaveBeenCalledTimes(1);
+    expect(clients.agentSources.startScan).toHaveBeenCalledWith({ sourceId: "all", expectedVersion: version });
+    expect(stateApi.state.agentSources.scanProgress?.jobId).toBe("new-job");
+    expect(stateApi.state.agentSources.error).toBeNull();
+  });
+
+  it("keeps scan actions blocked until the post-restart snapshot arrives", async () => {
+    const clients = createClients(async () => healthy);
+    const pending = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
+    clients.agentSources.getScanStatus = vi.fn(() => pending.promise);
+    await render(clients);
+    await act(async () => { restartButton().click(); });
+    const scan = [...container.querySelectorAll("button")].find(button => button.textContent?.trim() === "同步新增");
+    expect(scan?.disabled).toBe(true);
+    expect(container.textContent).not.toContain("记忆服务已重新启动");
+    await act(async () => { pending.resolve({ active: false, progress: null, status: "idle", version: { generation: 2, sequence: 0 } }); });
+    expect(scan?.disabled).toBe(false);
+    expect(stateApi.state.agentSources.scanStamp?.version?.generation).toBe(2);
+  });
+
+  it.each(["scan", "stopped"] as const)("reconciles recovered execution before the first control after %s restart", async (phase) => {
+    const clients = createClients(async () => healthy);
+    const progress = { jobId: "recovered", attemptId: "attempt", sourceId: "all", phase, current: 1, total: 10, version: { generation: 2, sequence: 0 } };
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: phase === "scan", progress, version: progress.version }));
+    clients.agentSources.cancelScan = vi.fn(async () => ({ ok: true, snapshot: { active: false, progress: null, status: "cancelled", version: { generation: 2, sequence: 1 }, execution: { jobId: progress.jobId, attemptId: progress.attemptId } } }));
+    await render(clients);
+    await act(async () => { restartButton().click(); });
+    expect(stateApi.state.agentSources.scanProgress).toEqual(progress);
+    const cancel = [...container.querySelectorAll("button")].find(button => button.getAttribute("aria-label")?.includes("停止"));
+    expect(cancel?.disabled).toBe(false);
+    await act(async () => { cancel!.click(); });
+    expect(clients.agentSources.cancelScan).toHaveBeenCalledWith({ expectedExecution: { jobId: "recovered", attemptId: "attempt" } });
+    expect(stateApi.state.agentSources.scanProgress).toBeNull();
+  });
+
+  it("does not announce success when health is ready but scan status is unavailable", async () => {
+    const clients = createClients(async () => healthy);
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, unavailable: { code: "memory_layer_unavailable" as const, message: "offline" } }));
+    await render(clients);
+    await act(async () => { restartButton().click(); });
+    expect(container.textContent).not.toContain("记忆服务已重新启动");
+    expect(stateApi.state.agentSources.scanUnavailable).toBeTruthy();
+    expect(restartButton().disabled).toBe(false);
+  });
+
+  it("does not overwrite a newer execution with a delayed restart snapshot", async () => {
+    const clients = createClients(async () => healthy);
+    const pending = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
+    clients.agentSources.getScanStatus = vi.fn(() => pending.promise);
+    await render(clients);
+    await act(async () => { restartButton().click(); });
+    const progress = { jobId: "other-page", attemptId: "new-attempt", sourceId: "all", phase: "scan" as const, current: 1, total: 10, version: { generation: 2, sequence: 1 } };
+    await act(async () => { stateApi.dispatch(appActions.agentSourceScanProgressReceived(progress)); });
+    await act(async () => { pending.resolve({ active: false, progress: null, status: "idle", version: { generation: 2, sequence: 0 } }); });
+    expect(stateApi.state.agentSources.scanProgress).toEqual(progress);
+    expect(stateApi.state.agentSources.isScanning).toBe(true);
+  });
 
   it("recovers automatically when Memory becomes ready after the first connection failure", async () => {
     const health = vi.fn().mockRejectedValueOnce(new Error("memory layer network error")).mockResolvedValue(healthy);
@@ -239,6 +328,7 @@ describe("SourcesSubPage memory service recovery", () => {
 
 function ClientsHarness(props: { clients: AppClients }) {
   const { setClients } = useApiClients();
+  stateApi = useAppState();
   useEffect(() => { setClients(props.clients); }, [props.clients, setClients]);
   return <SourcesSubPage />;
 }

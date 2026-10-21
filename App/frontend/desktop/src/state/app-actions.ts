@@ -105,6 +105,7 @@ export type AppAction =
   | { type: "agentSources/refreshed"; sources: AgentSourceView[] }
   | { type: "agentSources/error"; message: string }
   | { type: "agentSources/scanAvailability"; unavailable: AgentSourceScanUnavailable | null }
+  | { type: "agentSources/scanResumeAcknowledged"; token: string; jobId: string; attemptId?: string }
   | { type: "agentSources/scanStarted"; sourceId: string }
   | { type: "agentSources/scanStatus"; status: AgentSourceScanStatusResponse; requestGeneration?: number; cancelledExecution?: { token: string; jobId: string; attemptId?: string } }
   | { type: "agentSources/scanControl"; control: "start" | "pause" | "resume" | "cancel" | null; token: string }
@@ -224,6 +225,9 @@ export const appActions = {
   },
 
   /** Handles agent source scan completed. */
+  agentSourceScanResumeAcknowledged(token: string, jobId: string, attemptId?: string): AppAction {
+    return { type: "agentSources/scanResumeAcknowledged", token, jobId, attemptId };
+  },
   agentSourceScanStatusReceived(status: AgentSourceScanStatusResponse, requestGeneration?: number, cancelledExecution?: { token: string; jobId: string; attemptId?: string }): AppAction { return { type: "agentSources/scanStatus", status, requestGeneration, cancelledExecution }; },
   agentSourceScanControl(control: "start" | "pause" | "resume" | "cancel" | null, token: string): AppAction { return { type: "agentSources/scanControl", control, token }; },
   agentSourceScanCompleted(scan?: AgentSourceScanFinished): AppAction {

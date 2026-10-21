@@ -470,7 +470,9 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
             : stored.latestSeenAt
         };
         await writeState(statePath, { ...state, sources: { ...state.sources, [sourceId]: nextSourceState } }, signal);
-        signal.throwIfAborted();
+        // A pause can arrive while the source state is being published. Keep
+        // its stopped progress until resumed, before publishing source-done.
+        await checkpoint();
         if (scan.jobId !== jobId) throw new MemoryServiceError("conflict", "Agent source scan was replaced");
         state.sources[sourceId] = nextSourceState;
         const details = [...store.results(sourceId, "0", 500)];
@@ -534,7 +536,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   async function pauseScan(input: ScanControlInput = {}): Promise<ScanControlResult> {
-    if (!matchesScanExecution(scan, input.expectedExecution)) return controlResult("conflict");
+    if (!matchesScanExecution(scan, input.expectedExecution) || (input.expectedVersion && (!scan.version || compareScanVersions(scan.version, input.expectedVersion) !== 0))) return controlResult("conflict");
     if (canceling) return controlResult("conflict");
     if (scan.completedAt) return controlResult("already_terminal");
     if (scanPaused || scan.progress?.phase === "stopped") return controlResult("applied");
@@ -559,7 +561,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   async function cancelScan(input: ScanControlInput = {}): Promise<ScanControlResult> {
-    if (!matchesScanExecution(scan, input.expectedExecution)) return controlResult("conflict");
+    if (!matchesScanExecution(scan, input.expectedExecution) || (input.expectedVersion && (!scan.version || compareScanVersions(scan.version, input.expectedVersion) !== 0))) return controlResult("conflict");
     if (scan.completedAt) return controlResult("already_terminal");
     const controller = scanAbortController;
     if (!controller && !scanPaused && scan.progress?.phase !== "stopped") return controlResult("already_terminal");

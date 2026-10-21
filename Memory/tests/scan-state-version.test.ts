@@ -36,7 +36,10 @@ it("orders pause/resume/cancel, keeps snapshots immutable and rejects controls f
     const resumed = await executor.startScan({ sourceId: "fixture", expectedExecution });
     expect(resumed.attemptId).toBe(first.attemptId);
     expect(resumed.version!.sequence).toBeGreaterThan(paused.snapshot.version!.sequence);
-    const cancel = executor.cancelScan({ expectedExecution }); release();
+    expect((await executor.pauseScan({ expectedExecution, expectedVersion: paused.snapshot.version })).outcome).toBe("conflict");
+    expect((await executor.cancelScan({ expectedVersion: paused.snapshot.version })).outcome).toBe("conflict");
+    expect(executor.scanStatus().running).toBe(true);
+    const cancel = executor.cancelScan({ expectedExecution, expectedVersion: resumed.version }); release();
     const cancelled = await cancel;
     expect(cancelled.snapshot).toMatchObject({ status: "cancelled", jobId: first.jobId, attemptId: first.attemptId });
     expect(cancelled.snapshot.version!.sequence).toBeGreaterThan(resumed.version!.sequence);

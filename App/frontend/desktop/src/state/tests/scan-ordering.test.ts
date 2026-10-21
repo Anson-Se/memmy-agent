@@ -94,3 +94,53 @@ describe("authoritative scan order", () => {
     expect(state.agentSources.recentScanCompletions).toEqual([]);
   });
 });
+
+it("reconciles a current legacy idle query after external cancellation and rejects late queries/events", () => {
+  const legacy = { ...progress(1), version: undefined, attemptId: undefined };
+  let state = reduce(createInitialAppState(), a.agentSourceScanProgressReceived(legacy));
+  const generation = state.agentSources.scanRequestGeneration ?? 0;
+  state = reduce(state, a.agentSourceScanStatusReceived({ active: false, progress: null }, generation));
+  expect(state.agentSources.isScanning).toBe(false);
+  expect(state.agentSources.scanProgress).toBeNull();
+  expect(reduce(state, a.agentSourceScanStatusReceived({ active: true, progress: legacy }, generation))).toBe(state);
+  expect(reduce(state, a.agentSourceScanProgressReceived(legacy))).toBe(state);
+  const next = reduce(state, a.agentSourceScanProgressReceived({ ...legacy, jobId: "new" }));
+  expect(next.agentSources.isScanning).toBe(true);
+});
+
+it("does not let a current legacy idle poll acknowledge a pending resume", () => {
+  let state = reduce(createInitialAppState(), a.agentSourceScanProgressReceived({ ...progress(1, "stopped"), version: undefined, attemptId: undefined }));
+  state = reduce(state, a.agentSourceScanControl("resume", "pending"));
+  expect(reduce(state, a.agentSourceScanStatusReceived({ active: false, progress: null }, state.agentSources.scanRequestGeneration))).toBe(state);
+});
+
+it("rejects legacy idle queries issued before another page's new execution was observed", () => {
+  let state = createInitialAppState();
+  const generation = state.agentSources.scanRequestGeneration ?? 0;
+  state = reduce(state, a.agentSourceScanProgressReceived({ ...progress(1), version: undefined, attemptId: undefined }));
+  expect(reduce(state, a.agentSourceScanStatusReceived({ active: false, progress: null }, generation))).toBe(state);
+});
+
+it("preserves failure feedback when a restored failed attempt advances generation", () => {
+  let state = reduce(running(), a.agentSourceScanCompleted({ ...completion(2), succeeded: false }));
+  state = reduce(state, a.agentSourcesFailed("Import failed: unreadable history"));
+  const recent = state.agentSources.recentScanCompletions;
+  state = reduce(state, a.agentSourceScanCompleted({ ...completion(0), succeeded: false, version: version(0, 2) }));
+  expect(state.agentSources.error).toBe("Import failed: unreadable history");
+  expect(state.agentSources.scanStamp?.version).toEqual(version(0, 2));
+  expect(state.agentSources.recentScanCompletions).toBe(recent);
+});
+
+for (const refresh of [a.agentSourcesLoading(), a.agentSourcesLoaded([]), a.agentSourcesRefreshed([])]) {
+  it(`retains failed scan feedback across ${refresh.type} and restart, until retry`, () => {
+    let state = reduce(running(), a.agentSourceScanCompleted({ ...completion(2), succeeded: false }));
+    state = reduce(state, a.agentSourcesFailed("Import failed: unreadable history"));
+    state = reduce(state, a.agentSourceScanCompletionExpired("job", "a"));
+    state = reduce(state, refresh);
+    expect(state.agentSources.error).toBe("Import failed: unreadable history");
+    state = reduce(state, a.agentSourceScanCompleted({ ...completion(0), succeeded: false, version: version(0, 2) }));
+    expect(state.agentSources.error).toBe("Import failed: unreadable history");
+    state = reduce(state, a.agentSourceScanStarted());
+    expect(state.agentSources.error).toBeNull();
+  });
+}

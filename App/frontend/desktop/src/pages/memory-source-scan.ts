@@ -63,6 +63,7 @@ export async function startAgentSourceScan(input: StartAgentSourceScanInput): Pr
       ...(input.expectedExecution ? { expectedExecution: input.expectedExecution } : {}),
       ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {})
     });
+    if (input.expectedExecution) input.dispatch(appActions.agentSourceScanResumeAcknowledged(token, job.jobId, job.attemptId));
     recordScanStarted(job.jobId, {
       attemptId: job.attemptId,
       sourceId,

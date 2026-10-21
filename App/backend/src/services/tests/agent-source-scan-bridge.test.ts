@@ -126,3 +126,20 @@ it("prioritizes completion over residual paused progress at the same version", a
     expect((await bridge.status()).progress).toBeNull(); expect(progress).not.toHaveBeenCalled(); expect(completed).toHaveBeenCalledOnce();
   } finally { await bridge.dispose(); }
 });
+
+
+it("starts a fresh status read after restart instead of reusing an outstanding old read", async () => {
+  let release!: (state: MemoryAgentSourceScanState) => void;
+  const old = { ...empty(), status: "idle" as const, version: { generation: 1, sequence: 0 } };
+  const current = { ...old, version: { generation: 2, sequence: 0 } };
+  const status = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; })).mockResolvedValue(current);
+  const bridge = createAgentSourceScanBridge({ status } as unknown as AgentSourceScanClient, createProgressBus(), 60_000);
+  const pending = bridge.status();
+  try {
+    const fresh = bridge.status();
+    expect(status).toHaveBeenCalledTimes(2);
+    expect((await fresh).version).toEqual(current.version);
+    release(old);
+    expect((await pending).version).toEqual(current.version);
+  } finally { release(old); await pending; await bridge.dispose(); }
+});
