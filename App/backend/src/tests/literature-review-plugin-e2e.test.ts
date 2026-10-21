@@ -80,6 +80,8 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     store = createAppStateStore({ databasePath: join(root, "app.sqlite") });
     const runtimeHost = createPluginRuntimeHost(new PluginAdapterRegistry([
       createCommandPluginAdapter({
+        platform: "win32",
+        isEntitlementGranted: (grant) => grant === "plugin:literature-review",
         allowedNetworkHosts: manifest.permissions
           .filter((permission: { type: string }) => permission.type === "network")
           .flatMap((permission: { hosts: string[] }) => permission.hosts),
@@ -128,6 +130,7 @@ describe.skipIf(!integrationAvailable)("installed Literature Review Plugin", () 
     const progressBus = createProgressBus();
     const service = createPluginService({
       isAuthenticated: () => true,
+      isEntitlementGranted: (grant) => grant === "plugin:literature-review",
       repository: store.repositories.plugins,
       secretStore: store.secretStore,
       registry: createHttpPluginRegistry({ baseUrl: registry.baseUrl }),
