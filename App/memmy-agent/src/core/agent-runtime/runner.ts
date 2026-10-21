@@ -1,3 +1,5 @@
+import { collectPrivateSkillRefs, normalizePrivateSkillRefs, projectPrivateSkillInstructions } from "./private-plugin-skills.js";
+import type { PluginSkillRef } from "@memmy/local-api-contracts";
 import crypto from "node:crypto";
 import path from "node:path";
 import { LLMProvider, LLMResponse, ToolCallRequest } from "../../providers/base.js";
@@ -138,6 +140,10 @@ type PendingImageBatch = {
 };
 
 export class AgentRunSpec {
+  privateSkillRefs: PluginSkillRef[];
+  privateSkillRequestStarted = false;
+  privateSkillPromptTokens = 0;
+  onPrivateSkillRefsChanged?: (refs: PluginSkillRef[]) => void;
   messages: Record<string, any>[];
   initialMessages: Record<string, any>[];
   tools?: ToolRegistry | any;
@@ -178,6 +184,8 @@ export class AgentRunSpec {
   finalResponseContinuation?: ((ctx: { finalContent: string; messages: Record<string, any>[] }) => string | null) | null;
 
   constructor(init: {
+    privateSkillRefs?: unknown;
+    onPrivateSkillRefsChanged?: (refs: PluginSkillRef[]) => void;
     messages?: Record<string, any>[];
     initialMessages?: Record<string, any>[];
     provider?: LLMProvider;
@@ -217,6 +225,8 @@ export class AgentRunSpec {
     beforeFollowupModelRequest?: ((ctx: FollowupModelRequestContext) => Promise<FollowupModelContextUpdate>) | null;
     finalResponseContinuation?: ((ctx: { finalContent: string; messages: Record<string, any>[] }) => string | null) | null;
   } = {}) {
+    this.privateSkillRefs = normalizePrivateSkillRefs(init.privateSkillRefs);
+    this.onPrivateSkillRefsChanged = init.onPrivateSkillRefsChanged;
     this.messages = this.initialMessages = init.messages ?? init.initialMessages ?? [];
     this.provider = init.provider;
     this.tools = init.tools;
@@ -815,6 +825,24 @@ export class AgentRunner {
     const tools = options.toolsOverride === undefined
       ? spec.tools?.getDefinitions?.() ?? []
       : options.toolsOverride;
+    try {
+      const previousRefs = JSON.stringify(spec.privateSkillRefs);
+      const publicMessages = messages;
+      messages = await projectPrivateSkillInstructions(publicMessages, spec.privateSkillRefs, spec.tools, spec.abortSignal, spec.sessionKey, !spec.privateSkillRequestStarted);
+      if (spec.privateSkillRefs.length) {
+        const privateMessage = messages[0];
+        spec.privateSkillPromptTokens = estimateMessageTokens(privateMessage);
+        // Reserve private context without ever exposing it to transcript compaction or checkpoints.
+        messages = [privateMessage, ...this.prepareMessagesForModel(spec, publicMessages, {
+          toolsForRequest: tools, reservedPromptTokens: spec.privateSkillPromptTokens
+        })];
+      }
+      spec.privateSkillRequestStarted = true;
+      if (JSON.stringify(spec.privateSkillRefs) !== previousRefs) spec.onPrivateSkillRefsChanged?.(spec.privateSkillRefs);
+    } catch {
+      return new LLMResponse({ content: "Private plugin instructions could not be loaded. Sign in, check connectivity and plugin version, then resume the task. No plugin work was started by this model request.",
+        finishReason: "error", errorKind: "invalid_request", errorCode: "plugin_skill_load_failed", errorShouldRetry: false });
+    }
     const inputBudget = this.inputTokenBudget(spec);
     if (inputBudget != null) {
       const estimateResult = estimatePromptTokensChain(provider, spec.model ?? null, messages, tools);
@@ -1581,6 +1609,8 @@ export class AgentRunner {
     if (!spec.provider) throw new Error("AgentRunSpec.provider is required");
     const hook = spec.hook ?? new AgentHook();
     const messages = [...spec.initialMessages];
+    if (!spec.privateSkillRefs.length) spec.privateSkillRefs = collectPrivateSkillRefs(messages);
+    spec.onPrivateSkillRefsChanged?.(spec.privateSkillRefs);
     const toolCalls: any[] = [];
     const toolEvents: Record<string, any>[] = [];
     const toolsUsed: string[] = [];
@@ -1624,7 +1654,7 @@ export class AgentRunner {
             requestKind: "iteration",
             iteration,
             toolsForRequest,
-            reservedPromptTokens: 0,
+            reservedPromptTokens: spec.privateSkillPromptTokens,
           },
         );
         if (spec.abortSignal?.aborted) {
@@ -1637,7 +1667,7 @@ export class AgentRunner {
       let messagesForModel = this.modelContextMessages(messages, modelContextProjection);
       messagesForModel = this.prepareMessagesForModel(spec, messagesForModel, {
         toolsForRequest,
-        reservedPromptTokens: 0,
+        reservedPromptTokens: spec.privateSkillPromptTokens,
       });
       messagesForModel = this.prepareImageMessages(messagesForModel, imageTextState);
 
@@ -1709,6 +1739,9 @@ export class AgentRunner {
           toolEvents.push(item.event);
           const toolMessage = { role: "tool", tool_call_id: item.call.id, name: item.call.name, content: item.result };
           messages.push(toolMessage);
+          const previousRefs = JSON.stringify(spec.privateSkillRefs);
+          spec.privateSkillRefs = collectPrivateSkillRefs([toolMessage], spec.privateSkillRefs);
+          if (JSON.stringify(spec.privateSkillRefs) !== previousRefs) spec.onPrivateSkillRefsChanged?.(spec.privateSkillRefs);
           completed.push(toolMessage);
         }
         context.toolResults = executed.map((item) => item.result);
@@ -1924,7 +1957,7 @@ export class AgentRunner {
         const reservedPromptTokens = estimateMessageTokens({
           role: "user",
           content: spec.maxIterationsFinalPrompt,
-        });
+        }) + spec.privateSkillPromptTokens;
         if (!spec.abortSignal?.aborted) {
           modelContextProjection = await this.updateProjectionBeforeFollowup(
             spec,

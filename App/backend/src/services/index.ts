@@ -1,3 +1,4 @@
+import { createPluginSkillContentService, type PluginSkillContentService } from "./plugin-skill-content-service.js";
 import type { AccountChannel } from "@memmy/local-api-contracts";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -110,6 +111,7 @@ export interface BackendServices {
   tokenQuota: TokenQuotaService;
   /** Third-party plugins. */
   plugins: PluginService;
+  pluginSkillContent?: PluginSkillContentService;
 }
 
 export interface CreateBackendServicesOptions {
@@ -187,6 +189,11 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
   // ASR only needs audio upload locations; do not let it turn an arbitrary
   // workspace file into a base64 cloud request merely because it has a path.
   const pluginAudioRoots = [uploadedMediaRoot, join(agentWorkspace, "recordings")];
+  const pluginSkillContent = createPluginSkillContentService({
+    baseUrl: resolvePluginRegistryBaseUrl(process.env) ?? resolveCloudClientConfig(process.env).baseUrl,
+    getPlugin: (id) => plugins.list().find(plugin => plugin.id === id) ?? null,
+    authHeaders: pluginRegistryAuthHeaders
+  });
   const pluginModelInference = createPluginModelInferenceService({
     resolveModel: (pluginId, requestedPreset) => resolvePluginModelSelection({
       accountOnly: pluginRepository.get(pluginId)?.manifest.modelPolicy?.requiredSource === "account",
@@ -237,6 +244,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       authOrigin: resolvePluginRegistryBaseUrl(process.env),
       authHeaders: pluginRegistryAuthHeaders
     }),
+    onSkillContentInvalidated: (id) => pluginSkillContent.clear(id),
     skillManager: createPluginSkillManager({ skillsRoot: join(resolveAgentWorkspace(process.env), "skills") }),
     localArtifactService: createPluginLocalArtifactService({
       pluginDataRoot: join(dirname(options.appStateStore.databasePath), "plugin-data"),
@@ -337,6 +345,7 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       memoryClient: options.memoryClient,
       accountChannel: options.accountChannel,
       onAccountGrantsRefreshed: async () => {
+        pluginSkillContent.clear();
         const failures = await reconcileEntitledPlugins({
           plugins,
           userUninstalledIds: new Set(pluginRepository.listUserUninstalledIds()),
@@ -417,7 +426,8 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       cloudClient: options.cloudClient,
       accountSessionRepository: options.appStateStore.repositories.accountSession
     }),
-    plugins
+    plugins,
+    pluginSkillContent
   };
 }
 

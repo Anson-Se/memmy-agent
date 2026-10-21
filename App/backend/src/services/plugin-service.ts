@@ -57,6 +57,7 @@ export interface CreatePluginServiceOptions {
   runtimeHost: PluginRuntimeHost;
   artifactManager: PluginArtifactManager;
   skillManager?: PluginSkillManager;
+  onSkillContentInvalidated?: (pluginId?: string) => void;
   localArtifactService?: PluginLocalArtifactService;
   /** Resolves whether the signed-in account holds a manifest-declared entitlement. */
   isAuthenticated?: () => boolean;
@@ -96,6 +97,7 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     }
   };
   const deactivateContributions = async (pluginId: string) => {
+    options.onSkillContentInvalidated?.(pluginId);
     const results = await Promise.allSettled([
       options.runtimeHost.deactivate(pluginId),
       skillManager.deactivate(pluginId)
@@ -322,6 +324,7 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     },
 
     async uninstall(id) {
+      options.onSkillContentInvalidated?.(id);
       let plugin = required(id);
       if (plugin.state === "active" || plugin.state === "enabling" || plugin.state === "failed") {
         await this.disable(id);
@@ -424,6 +427,7 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     },
 
     async shutdown() {
+      options.onSkillContentInvalidated?.();
       await Promise.allSettled(options.repository.list()
         .filter((plugin) => plugin.state === "active" || plugin.state === "enabling")
         .map((plugin) => deactivateContributions(plugin.id)));

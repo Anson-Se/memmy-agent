@@ -97,7 +97,12 @@ export const PluginSkillContributionSchema = z.object({
   id: PluginIdentifierSchema,
   name: z.string().trim().min(1).max(128),
   description: z.string().trim().min(1).max(500),
-  entry: PluginPackagePathSchema
+  entry: PluginPackagePathSchema,
+  /** Private instructions are resolved in memory by a cloud-skill-aware Host. */
+  cloud: z.object({
+    revision: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).superRefine((skill, context) => {
   if (!skill.entry.endsWith("/SKILL.md") && skill.entry !== "SKILL.md") {
     context.addIssue({ code: "custom", path: ["entry"], message: "Plugin skill entry must point to SKILL.md" });
@@ -448,3 +453,16 @@ export const PluginCatalogEntrySchema = z.object({
 });
 export const PluginCatalogSchema = z.array(PluginCatalogEntrySchema);
 export type PluginCatalogEntry = z.infer<typeof PluginCatalogEntrySchema>;
+
+/** Persistable identity only. Private instruction text must never enter a transcript. */
+export const PluginSkillRefSchema = z.object({
+  pluginId: PluginIdentifierSchema,
+  skillId: PluginIdentifierSchema,
+  pluginVersion: z.string().min(1).max(128),
+  revision: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+export type PluginSkillRef = z.infer<typeof PluginSkillRefSchema>;
+export const PluginSkillActivationSchema = z.object({
+  kind: z.literal("memmy_plugin_skill_ref_v1"), ref: PluginSkillRefSchema
+}).strict();

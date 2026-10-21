@@ -20,7 +20,7 @@ describe("task plan premature handoff recovery", () => {
     const provider: any = { getDefaultModel: () => "test", chatWithRetry: vi.fn(async () => {
       n++;
       if (n === 1) return new LLMResponse({ content: handoff });
-      if (n === 2 || n === 3) return new LLMResponse({ toolCalls: [new ToolCallRequest({ id: `call-${n}`, name: n === 2 ? "audit" : "render", arguments: {} })] });
+      if (n === 2 || n === 3) return new LLMResponse({ content: null, toolCalls: [new ToolCallRequest({ id: `call-${n}`, name: n === 2 ? "audit" : "render", arguments: {} })] });
       return new LLMResponse({ content: "Delivered" });
     }) };
     const tools: any = { getDefinitions: () => [], execute: vi.fn(async (name: string) => {

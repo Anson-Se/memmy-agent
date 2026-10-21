@@ -3730,6 +3730,11 @@ export class AgentLoop {
     const result = await this.runner.run(
       new AgentRunSpec({
         messages: initialMessages,
+        privateSkillRefs: session?.metadata?.privatePluginSkillRefs,
+        onPrivateSkillRefsChanged: session ? (refs) => {
+          session.metadata.privatePluginSkillRefs = refs;
+          this.sessions.save(session);
+        } : undefined,
         provider: activeProvider,
         tools: activeTools,
         model: activeModel,

@@ -40,7 +40,15 @@ export function createPluginSkillManager(options: CreatePluginSkillManagerOption
         // it rather than onto it.
         const staged = join(temp, "skill");
         try {
-          await cp(sourceDirectory, staged, { recursive: true, errorOnExist: true, force: false, verbatimSymlinks: true });
+          if (skill.cloud) {
+            // A cloud Skill contributes only a public loader, never sibling private references.
+            const bootstrap = await readFile(sourceEntry, "utf8");
+            if (Buffer.byteLength(bootstrap) > 4096 || !bootstrap.includes("mcp_plugins_read_plugin_skill")) throw new Error("Invalid cloud Skill bootstrap");
+            await mkdir(staged);
+            await writeFile(join(staged, "SKILL.md"), bootstrap, "utf8");
+          } else {
+            await cp(sourceDirectory, staged, { recursive: true, errorOnExist: true, force: false, verbatimSymlinks: true });
+          }
           const copiedEntry = join(staged, "SKILL.md");
           if (!(await lstat(copiedEntry)).isFile()) throw new Error(`Plugin skill directory does not contain SKILL.md: ${skill.entry}`);
           await writeFile(join(staged, OWNER_FILE), JSON.stringify({ pluginId: plugin.id, skillId: skill.id, version: plugin.version }), "utf8");

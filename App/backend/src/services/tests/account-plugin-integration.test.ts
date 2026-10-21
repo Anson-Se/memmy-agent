@@ -52,6 +52,7 @@ it("refreshes Agent tools when account grants install or disable a plugin, and k
       manifest: {
         apiVersion: "memmy/v1", id: "legal-labor", name: "Legal Test", version: "0.1.0",
         requiredEntitlement: "plugin:legal-labor",
+        rules: { installation: "automatic" },
         runtime: { adapter: "command", config: {} }, permissions: [],
         capabilities: [{ id: "session-start", name: "Start", description: "Start diagnosis",
           inputSchema: { type: "object" }, outputSchema: { type: "object" }, execution: "request" }]

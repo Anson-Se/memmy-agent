@@ -23,6 +23,21 @@ describe("PluginSkillManager", () => {
     await manager.deactivate("com.example.review");
     expect(() => readFileSync(join(skillsRoot, "review", "SKILL.md"), "utf8")).toThrow();
   });
+  it("copies only the public entry for cloud Skills and replaces previous local instructions", async () => {
+    root = mkdtempSync(join(tmpdir(), "memmy-plugin-skill-"));
+    const artifact = join(root, "artifact"); const skillsRoot = join(root, "workspace", "skills");
+    mkdirSync(join(artifact, "skills", "review", "references"), { recursive: true });
+    writeFileSync(join(artifact, "skills", "review", "SKILL.md"), "old private instructions");
+    writeFileSync(join(artifact, "skills", "review", "references", "guide.md"), "private reference");
+    const manager = createPluginSkillManager({ skillsRoot }); const record = plugin(artifact);
+    await manager.activate(record);
+    writeFileSync(join(artifact, "skills", "review", "SKILL.md"), "Public entry: mcp_plugins_read_plugin_skill");
+    record.manifest.skills![0].cloud = { revision: "r1", sha256: "a".repeat(64) };
+    await manager.activate(record);
+    expect(readFileSync(join(skillsRoot, "review", "SKILL.md"), "utf8")).not.toContain("private instructions");
+    expect(() => readFileSync(join(skillsRoot, "review", "references", "guide.md"), "utf8")).toThrow();
+  });
+
 });
 
 function plugin(rootPath: string): PluginRuntimeRecord {
