@@ -54,6 +54,7 @@ async function runSingleToolResult({
     workspace,
     sessionKey: "test:runner",
     maxToolResultChars: 16_000,
+    toolResultCompressionEnabled: true,
     toolResultMaxCharsByName,
   }));
 
@@ -152,6 +153,7 @@ describe("AgentRunner tool result persistence", () => {
       workspace,
       sessionKey: "history:runner",
       maxToolResultChars: 16_000,
+      toolResultCompressionEnabled: true,
       toolResultMaxCharsByName: SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME,
     }));
 
@@ -196,6 +198,7 @@ describe("AgentRunner tool result persistence", () => {
         workspace,
         sessionKey: "test:runner",
         maxToolResultChars: 2048,
+        toolResultCompressionEnabled: true,
       }),
     );
 
@@ -270,6 +273,7 @@ describe("AgentRunner tool result persistence", () => {
         model: "test-model",
         maxIterations: 2,
         maxToolResultChars: 16_000,
+        toolResultCompressionEnabled: true,
         toolResultMaxCharsByName: SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME,
         workspace: workspaceFile,
       }),
