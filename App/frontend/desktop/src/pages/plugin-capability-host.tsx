@@ -74,6 +74,8 @@ export function isLegalFlowInteraction(call: PluginUiCall): boolean {
     ));
 }
 
+import { collectReviewPreparation, isReviewPreparation, reviewResponseKey, ReviewPreparationHistory } from "./review-preparation-history.js";
+
 const TASK_STATUS_KEYS = {
   pending: "plugin.ui.task.pending",
   running: "plugin.ui.task.running",
@@ -172,6 +174,7 @@ export interface PluginRendererInteractionState {
 export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const { t } = useTranslation();
   const [localAnsweredInteractions, setLocalAnsweredInteractions] = useState<Set<string>>(() => new Set());
+  const [reviewResponses, setReviewResponses] = useState<Map<string, unknown>>(() => new Map());
   const [dismissedCalls, setDismissedCalls] = useState<Set<string>>(() => new Set());
   const diagnosisRequested = useRef(new Set<string>());
   const responseFlights = useRef(new Map<string, Promise<void>>());
@@ -263,7 +266,8 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const deliveryReport = region === "flow" && props.legalDelivery?.ready && !legalCallActive
     ? selectLegalDeliveryReport(props.calls) : null;
   const deliveryFiles = deliveryReport ? [deliveryReport, ...props.legalDelivery!.recordings] : [];
-  if (orderedCalls.length === 0 && currentRetries.length === 0 && deliveryFiles.length === 0) return null;
+  const preparation = region === "flow" ? collectReviewPreparation(props.calls, reviewResponses) : [];
+  if (orderedCalls.length === 0 && currentRetries.length === 0 && deliveryFiles.length === 0 && preparation.length === 0) return null;
 
   return (
     <section
@@ -290,6 +294,8 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             }}>{t("plugin.ui.generateDiagnosis")}</button>
         </footer>
       </article>)}
+
+      <ReviewPreparationHistory groups={preparation} />
       {orderedCalls.map((call) => {
         const plugin = plugins.get(call.pluginId);
         const renderer = plugin?.manifest.ui?.renderer;
@@ -312,7 +318,10 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             const existing = responseFlights.current.get(key);
             if (existing) return existing;
             const flight = props.client!.respond(target.pluginId, target.callId, targetId, response).then(() => {
-              if (asRecord(response).action !== "refresh") rememberAnswered(key);
+              if (asRecord(response).action !== "refresh") {
+                if (isReviewPreparation(target)) setReviewResponses((current) => new Map(current).set(reviewResponseKey(target, targetId), response));
+                rememberAnswered(key);
+              }
             });
             responseFlights.current.set(key, flight);
             try { await flight; } finally { responseFlights.current.delete(key); }
@@ -378,6 +387,12 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
           || isLegalFlowInteraction(call)
           || (call.pluginId === "legal-labor" && ((call.capabilityId === "session-start" && guidanceQuestion(call.events))
             || (["session-start", "material-collect"].includes(call.capabilityId) && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input"))))) return <div key={call.callId} hidden={hidden}>{cards}</div>;
+        if (isReviewPreparation(call)) return (
+          <div key={call.callId} data-review-active-card hidden={hidden}>
+            <p className="review-waiting" role="status">{t("plugin.ui.waitingForResponse")}</p>
+            {usesRenderer && renderer ? <SandboxedPluginRenderer call={call} interactionStates={interactionStates.get(call.pluginId + ":" + call.callId) ?? []} height={renderer.height ?? 680} client={props.client!} onRespond={respond} onUploadFiles={plugin?.approvedPermissions.some((permission) => permission.type === "host-service" && permission.services.includes("file-input")) ? props.uploadFiles : undefined} fallback={cards} /> : cards}
+          </div>
+        );
         return (
           <div key={call.callId} hidden={hidden} className="rounded-card border border-border-stone/30 bg-background-paper p-3 shadow-sm">
             <div className="mb-2 flex items-start justify-between gap-2">
@@ -631,7 +646,8 @@ function TaskText(props: { event: Extract<CapabilityEvent, { type: "task-list" }
       <div className="flex flex-wrap gap-x-3 gap-y-1">
         {props.event.tasks.map((task) => {
           return (
-            <span key={task.id} className="text-sm text-text-ink/65">
+            <span key={task.id} className={`inline-flex items-center gap-1 text-sm text-text-ink/65 ${task.status === "completed" ? "review-task-completed" : ""}`}>
+              {task.status === "running" ? <span aria-hidden="true" className="review-task-spinner" /> : null}
               {task.title}（{t(TASK_STATUS_KEYS[task.status])}）
             </span>
           );
@@ -1171,6 +1187,8 @@ export function FileInputCard(props: {
   const payload = asRecord(props.request.payload);
   const recordingMaterials = usePluginRecordingMaterials(props.diagnosticUpload ? props.pluginId : undefined, props.conversationId);
   const stagedFiles = recordingMaterials.files;
+
+  const reviewImport = props.pluginId === "literature-review" && payload.cardType === "source-import";
   const [files, setFiles] = useState<File[]>([]);
   const localPreviewUrls = useRef<string[]>([]);
   useEffect(() => () => { for (const uri of localPreviewUrls.current) URL.revokeObjectURL(uri); }, []);
@@ -1410,6 +1428,30 @@ export function FileInputCard(props: {
         onClick={() => void upload()}>{t("plugin.ui.generateDiagnosis")}</Button>
     </footer>
   </article>;
+
+  if (reviewImport) return (
+    <section className="review-upload">
+      <header><h2>{props.title}</h2><button type="button" aria-label={t("plugin.ui.dismissCard")} disabled={props.disabled} onClick={() => { props.onStatus("submitting"); void props.onRespond(props.request.interactionId, { action: "cancel", files: [] }).then(() => props.onStatus("answered"), () => props.onStatus("error")); }}><X size={16} /></button></header>
+      <div className="review-upload-body">
+        <p>{props.description || t("plugin.review.uploadFormats", { count: maxFiles ?? 200 })}</p>
+        {files.length ? <ul className="review-upload-files">{fileStates.map((item, index) => <li key={`${index}:${item.file.name}`}>
+          <Paperclip size={16} aria-hidden="true"/><span>{item.file.name}<small>{item.status === "ready" ? t("plugin.ui.fileReady") : item.message}</small></span>
+          <button type="button" disabled={props.disabled} aria-label={t("plugin.ui.removeFile", { name: item.file.name })} onClick={() => remove(index)}><X size={14}/></button>
+        </li>)}</ul> : <div className="review-upload-empty">{t("plugin.review.uploadEmpty")}</div>}
+        <div className="review-upload-pickers">
+          <label>{t("plugin.ui.chooseFiles")}<input className="sr-only" type="file" accept={accept || undefined} multiple disabled={props.disabled} onChange={choose}/></label>
+          {payload.allowDirectory === true ? <label>{t("plugin.ui.chooseFolder")}<input className="sr-only" type="file" multiple disabled={props.disabled} onChange={choose} {...{ webkitdirectory: "" } as Record<string, string>}/></label> : null}
+        </div>
+      </div>
+      {validationError || props.status === "error" ? <p className="review-upload-error" role="alert">{validationError || t("plugin.ui.responseFailed")}</p> : null}
+      <footer>
+        {files.length ? <span className="text-xs text-text-ink/45">{t("plugin.ui.filesReadySummary", { ready: readyFiles.length, blocked: files.length - readyFiles.length })}</span> : null}
+        <button type="button" disabled={props.disabled || Boolean(validationError) || (files.length > 0 && (readyFiles.length === 0 || !props.onUploadFiles))} onClick={() => void (files.length ? upload() : skip())}>
+          {files.length ? t("plugin.review.confirmSources") : t("plugin.review.continueWithoutSources")}
+        </button>
+      </footer>
+    </section>
+  );
   return (
     <div className="rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3">
       <div className="flex items-start gap-2">

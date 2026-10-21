@@ -1,3 +1,4 @@
+import { WorkflowQuestionCard } from "./review-preparation-history.js";
 /**
  * Agent chat message rendering.
  *
@@ -70,7 +71,6 @@ import {
   shouldSuppressRetryWaitStatus,
 } from "./agent-model-error.js";
 import {
-  AgentQuestionCard,
   normalizeAgentQuestionResponse,
   readAgentQuestionCard,
   readAgentQuestionResponse,
@@ -652,7 +652,7 @@ const SingleMessage = memo(function SingleMessage(props: SingleMessageProps) {
     return (
       <div className="flex min-w-0 justify-start">
         <div className="min-w-0 w-full">
-          <AgentQuestionCard
+          <WorkflowQuestionCard
             card={questionCard}
             response={props.questionResponse}
             onSubmit={props.onAnswerQuestion

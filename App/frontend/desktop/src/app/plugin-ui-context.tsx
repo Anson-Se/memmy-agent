@@ -264,3 +264,8 @@ export function usePluginTranscriptions() {
 
 /** Keep typed legal answers when a settings route temporarily unmounts the chat. */
 export function usePluginQuestionDrafts() { return useContext(PluginUiContext)?.questionDrafts; }
+
+/** Optional for native question rendering outside the desktop plugin provider. */
+export function useOptionalPluginUiCalls(): PluginUiCall[] {
+  return useContext(PluginUiContext)?.calls ?? [];
+}
