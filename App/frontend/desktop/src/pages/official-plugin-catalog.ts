@@ -1,5 +1,4 @@
 import type { InstalledPlugin } from "@memmy/local-api-contracts";
-import bundledPlugins from "../../../../shell/desktop/resources/bundled-plugins.json";
 import type { MarketplacePlugin } from "./plugin-marketplace-section.js";
 
 /**
@@ -23,7 +22,6 @@ export function officialPluginCatalog(options: {
   installed: InstalledPlugin[];
 }): MarketplacePlugin[] {
   const en = options.language === "en-US";
-  const bundledVersion = (id: string) => bundledPlugins.plugins.find((plugin) => plugin.id === id)?.version;
   const installedOf = (id: string) => options.installed.find((plugin) => plugin.id === id);
   return [
     {
@@ -33,7 +31,7 @@ export function officialPluginCatalog(options: {
         ? "Find papers, organize evidence, and draft a referenced literature review."
         : "检索论文、整理证据，生成带参考文献的综述初稿。",
       ...OFFICIAL_PLUGIN_POLICIES["literature-review"],
-      version: bundledVersion("literature-review"),
+      version: installedOf("literature-review")?.version,
       installable: true,
       installed: installedOf("literature-review")
     },
@@ -44,7 +42,7 @@ export function officialPluginCatalog(options: {
         ? "Create and edit Word, Excel, and PowerPoint files, and work with PDFs."
         : "创建和编辑 Word、Excel、PPT 文档，并处理 PDF 文件。",
       ...OFFICIAL_PLUGIN_POLICIES["office"],
-      version: bundledVersion("office"),
+      version: installedOf("office")?.version,
       installable: true,
       installed: installedOf("office")
     },
@@ -55,7 +53,7 @@ export function officialPluginCatalog(options: {
         ? "Organize employment research materials, verify information, and draft reports for professional review."
         : "整理劳动用工调研材料、核实信息并起草报告，供专业人员审核。",
       ...OFFICIAL_PLUGIN_POLICIES["legal"],
-      version: bundledVersion("legal"),
+      version: installedOf("legal")?.version,
       installable: true,
       installed: installedOf("legal")
     }

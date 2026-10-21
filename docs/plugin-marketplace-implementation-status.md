@@ -35,9 +35,11 @@ Office 和法律均写为 `installable: true`，缺少真实发布状态。未�
 
 本地 `GET /api/v1/plugins` 仅返回已安装插件；HTTP registry 只有按 ID 解析 release，没有目录列举接口。缺少账号过滤后的目录、`canInstall`、`canUse`、阻塞原因等契约。
 
-### 3. 捆绑安装流程尚未被远程分发替代
+### 3. 捆绑安装流程（历史核对，已收尾）
 
-`App/shell/desktop/resources/bundled-plugins.json` 仍声明文献综述 `0.5.25`。启动流程保留捆绑安装/更新，复合 registry 优先解析捆绑 release，再回退远程。此路径未依据“登录后才自动安装”规则执行。
+2026-10-21 已移除桌面端内置插件版本锁和构建时的 release/ZIP 复制入口，Mac、Windows 和开发启动统一使用 `prepare-plugin-migration-state.mjs`。版本由远程插件目录决定，不再随客户端固定。旧的 `MEMMY_BUNDLED_PLUGIN_SOURCE_DIR` 不再参与构建。
+
+包内 `bundled-plugins` 目录仅保留 `bundled-plugins-state.json`，记录历史管理过的插件 ID（无版本、摘要或发布产物），供旧安装迁移使用。后端旧内置包读取和迁移兼容保留；新构建不携带可供内置 registry 解析的 release。市场演示目录的版本也只读取 Host 已安装记录。
 
 远程 release 与下载适配器可复用，但没有在本次核对中验证实际服务器是否按账号资格发放法律包，也未验证 Office、法律正式产物。资源目录的版本声明不能证明已部署发布包可用。
 

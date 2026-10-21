@@ -16,13 +16,15 @@ describe("official plugin presentation policy", () => {
     expect(plugin.defaultInstalled).toBe(true);
     expect(plugin.requiresOfficialModel).toBe(true);
     expect(plugin.installed).toBeUndefined();
+    expect(plugin.version).toBeUndefined();
     expect(plugin.installable).toBe(true);
   });
 
   it("preserves the host state, including incomplete permission approval", () => {
-    const installed = { id: "literature-review", state: "pending_approval" } as InstalledPlugin;
+    const installed = { id: "literature-review", version: "0.5.41", state: "pending_approval" } as InstalledPlugin;
     const plugin = officialPluginCatalog({ language: "en-US", installed: [installed] })[0]!;
     expect(plugin.installed).toBe(installed);
+    expect(plugin.version).toBe("0.5.41");
     expect(plugin.name).toBe("Literature Review");
   });
 
