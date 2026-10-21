@@ -1096,6 +1096,7 @@ export class AgentRunner {
     }
 
     const managed = memmatePermissionRequired();
+    let managedResult: string | undefined;
     if (managed) {
       try {
         const executionName = call.name;
@@ -1104,7 +1105,9 @@ export class AgentRunner {
         if (["read_file", "write_file", "edit_file", "list_dir"].includes(executionName) && typeof params?.path === "string") {
           params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params.path) };
         }
-        params = await authorizeMemmateTool(executionName, params, spec.abortSignal);
+        const authorized = await authorizeMemmateTool(executionName, params, spec.abortSignal);
+        params = authorized.args;
+        managedResult = authorized.result;
       } catch (error) {
         const message = error instanceof Error ? error.message : "MemMate approval failed";
         return { call, result: `Error: ${message}`, event: { name: call.name, status: "error", detail: message },
@@ -1156,7 +1159,7 @@ export class AgentRunner {
           });
         },
       };
-      const run = tool && typeof tool.execute === "function"
+      const run = managedResult !== undefined ? managedResult : tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
         : spec.tools.execute(call.name, params, toolContext);
       raw = await withAbort(Promise.resolve(run), spec.abortSignal);

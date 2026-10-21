@@ -10,6 +10,20 @@ const scope = () => createMemmatePermissionScope(credential, new AbortController
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe("mandatory MemMate permission", () => {
+  it("uses the Host web result without executing any native network tool", async () => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow", result: "approved page" })));
+    const execute = vi.fn();
+    const results = await withMemmatePermission(scope(), () => new AgentRunner().executeTools(new AgentRunSpec({
+      tools: { execute, get: () => ({ readOnly: true }) } as any
+    }), [new ToolCallRequest({ id: "web", name: "web_fetch", arguments: { url: "https://example.com" } })]));
+    expect(execute).not.toHaveBeenCalled(); expect(results[0].result).toContain("approved page");
+  });
+  it("does not fall back to direct networking when the Host omits its web result", async () => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow" })));
+    await expect(withMemmatePermission(scope(), () => authorizeMemmateTool("web_fetch", { url: "https://example.com" }))).rejects.toThrow("result is missing");
+  });
   it("blocks managed tools without an authenticated request context", async () => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
     await expect(authorizeMemmateTool("write_file", {})).rejects.toThrow("context is missing");
