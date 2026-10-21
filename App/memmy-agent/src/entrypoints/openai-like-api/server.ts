@@ -311,6 +311,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
             closed = true;
           }
         };
+        if (permission) permission.onEvent = event => write(`data: ${JSON.stringify({ memmy_event: event })}\n\n`);
         const close = (): void => {
           if (closed) return;
           closed = true;

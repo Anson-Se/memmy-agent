@@ -79,4 +79,25 @@ describe("mandatory MemMate permission", () => {
     }));
     expect(result.status).toBe(200); await expect(detached()).rejects.toThrow("run has ended");
   });
+  it.each(["allow", "deny"])("streams tool outcomes with the approval call id for %s", async decision => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1"); vi.stubEnv("MEMMATE_RUNTIME_TOKEN", "b".repeat(64));
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => { requests.push(JSON.parse(init.body)); return Response.json({ decision }); }));
+    const execute = vi.fn(async () => "written");
+    const app = createApp(async () => {
+      await new AgentRunner().executeTools(new AgentRunSpec({ tools: { execute, get: () => ({ readOnly: false }) } as any }),
+        [new ToolCallRequest({ id: "correlated", name: "write_file", arguments: { path: "a" } })]);
+      return "finished";
+    });
+    const response = await app.fetch(new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json", "x-memmate-runtime-token": "b".repeat(64) },
+      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "test" }], memmate_permission: credential })
+    }));
+    const events = (await response.text()).split("\n\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)).memmy_event).filter(Boolean);
+    expect(requests[0].callId).toBe("correlated");
+    expect(events.map(event => [event.type, event.callId])).toEqual([["tool_call", "correlated"], ["tool_result", "correlated"]]);
+    expect(events[1].ok).toBe(decision === "allow");
+    expect(execute).toHaveBeenCalledTimes(decision === "allow" ? 1 : 0);
+  });
+
 });

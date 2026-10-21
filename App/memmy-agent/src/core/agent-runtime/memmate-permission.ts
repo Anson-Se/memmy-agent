@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 
-type PermissionScope = { url: string; token: string; active: boolean; signal: AbortSignal };
+type PermissionScope = { url: string; token: string; active: boolean; signal: AbortSignal; onEvent?: (event: Record<string, unknown>) => void };
 const scopes = new AsyncLocalStorage<PermissionScope>();
 
 export function memmatePermissionRequired(): boolean {
@@ -36,7 +36,7 @@ export function withMemmatePermission<T>(scope: PermissionScope | undefined, run
 }
 
 /** Outside the authenticated request scope, managed runtimes cannot execute tools. */
-export async function authorizeMemmateTool(name: string, args: unknown, signal?: AbortSignal | null): Promise<{ args: unknown; result?: string }> {
+export async function authorizeMemmateTool(name: string, args: unknown, signal?: AbortSignal | null, callId: string = randomUUID()): Promise<{ args: unknown; result?: string }> {
   const scope = scopes.getStore();
   if (!scope) {
     if (memmatePermissionRequired()) throw new Error("MemMate approval context is missing");
@@ -45,10 +45,11 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
   if (!scope.active || scope.signal.aborted || signal?.aborted) throw new Error("MemMate run has ended");
   // A detached copy prevents a hook or parallel caller from changing approved parameters.
   const approvedArgs = JSON.parse(JSON.stringify(args));
+  emitMemmateToolEvent({ type: "tool_call", callId, name, input: approvedArgs });
   const response = await fetch(scope.url, {
     method: "POST", redirect: "error",
     headers: { "content-type": "application/json", authorization: `Bearer ${scope.token}` },
-    body: JSON.stringify({ callId: randomUUID(), toolName: name, args: approvedArgs }),
+    body: JSON.stringify({ callId, toolName: name, args: approvedArgs }),
     signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(125_000)])
   });
   if (!response.ok) throw new Error("MemMate approval service is unavailable");
@@ -57,4 +58,9 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
   if (!scope.active || scope.signal.aborted || signal?.aborted) throw new Error("MemMate run has ended");
   if (name === "web_fetch" && typeof result.result !== "string") throw new Error("MemMate web execution result is missing");
   return { args: approvedArgs, ...(typeof result.result === "string" ? { result: result.result } : {}) };
+}
+
+export function emitMemmateToolEvent(event: Record<string, unknown>): void {
+  const scope = scopes.getStore();
+  if (scope?.active && !scope.signal.aborted) scope.onEvent?.(event);
 }

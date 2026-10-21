@@ -1,5 +1,5 @@
 import { resolveWorkspacePath as resolveManagedFilePath } from "./tools/path-utils.js";
-import { authorizeMemmateTool, memmatePermissionRequired } from "./memmate-permission.js";
+import { authorizeMemmateTool, emitMemmateToolEvent, memmatePermissionRequired } from "./memmate-permission.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
 import path from "node:path";
@@ -1056,6 +1056,8 @@ export class AgentRunner {
         }
       }
     }
+    for (const item of out) emitMemmateToolEvent({ type: "tool_result", callId: item.call.id, name: item.call.name,
+      output: item.result, ok: item.event.status !== "error" });
     return out;
   }
 
@@ -1105,7 +1107,7 @@ export class AgentRunner {
         if (["read_file", "write_file", "edit_file", "list_dir"].includes(executionName) && typeof params?.path === "string") {
           params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params.path) };
         }
-        const authorized = await authorizeMemmateTool(executionName, params, spec.abortSignal);
+        const authorized = await authorizeMemmateTool(executionName, params, spec.abortSignal, call.id);
         params = authorized.args;
         managedResult = authorized.result;
       } catch (error) {
