@@ -1292,6 +1292,9 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
       refreshed,
       connected: Object.keys(state.mcpStacks).sort(),
       configured: Object.keys(state.mcpServers).sort(),
+      tool_counts: Object.fromEntries([...nextNames].sort().map((name) => [
+        name, registry.toolNames.filter((toolName) => toolName.startsWith(toolPrefix(name))).length,
+      ])),
       failed,
       tools_removed: toolsRemoved,
       requires_restart: false,

@@ -242,6 +242,14 @@ describe("HomePage", () => {
     expect(source).toContain("scopeKey={modelSelectionScopeKey}");
     expect(source).toContain("const modelWorkspaceMode = state.bootstrap?.app.userMode");
     expect(source).toContain("disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}");
+    // Login-required plugins gate on sign-in but no longer force/lock the model selector.
+    expect(source).not.toContain("locked={officialPluginActive}");
+    expect(source).not.toContain("forcedPresetId={officialPluginActive ? officialAgent?.id ?? null : undefined}");
+    expect(source).toContain("const loginRequiredPluginActive");
+    expect(source).toContain("home.modelSelector.pluginRequiresLogin");
+    expect(source).toContain("pluginCommandInvocation?.plugin.manifest.rules?.requiresLogin");
+    expect(source).toContain("mode={modelWorkspaceMode}");
+    expect(selectorSource).toContain("const locked = Boolean(props.locked)");
     expect(source).toContain("state.agent.pendingPresetByScope[modelSelectionScopeKey]");
     expect(source).toContain("state.agent.committedModelSelectionByScope[modelSelectionScopeKey]");
     expect(source).toContain("allowUnassignedSelected: pendingModelPreset == null && Boolean(committedModelSelection)");

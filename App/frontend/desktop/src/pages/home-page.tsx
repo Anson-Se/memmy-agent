@@ -228,6 +228,7 @@ const TRANSLATABLE_AGENT_ERROR_KEYS = new Set<MessageKey>([
   "home.composer.emptyMessage",
   "home.goal.controlUnknown",
   "home.modelSelector.unavailable",
+  "home.modelSelector.pluginRequiresLogin",
   "home.project.desktopRequired",
   "home.queue.removeFailed",
   "home.queue.editBlocked",
@@ -2563,6 +2564,9 @@ export function HomePage() {
   const hasComposerIntent = Boolean(input.trim() || pendingAttachments.length > 0);
   const stopInFlight = state.agent.currentChatId ? Boolean(state.agent.stopInFlightByChatId[state.agent.currentChatId]) : false;
   const pluginCommandInvocation = parsePluginCommandInvocation(input, pluginCommandTargets);
+  // A login-required official plugin in the composer still requires sign-in,
+  // but does not force the model. The official model stays a recommendation on the plugin page.
+  const loginRequiredPluginActive = Boolean(pluginCommandInvocation?.plugin.manifest.rules?.requiresLogin);
   const agentRoutedPluginPrompt = buildAgentRoutedPluginPrompt(input, pluginCommandTargets);
   const isDirectPluginCommand = Boolean(pluginCommandInvocation && !agentRoutedPluginPrompt);
   const composerSendDisabled = isDirectPluginCommand
@@ -2776,6 +2780,14 @@ export function HomePage() {
    */
   async function sendMessage() {
     if (runExactLocalSlashCommand(input)) {
+      return;
+    }
+    if (loginRequiredPluginActive && !state.account.userId) {
+      dispatch(agentActions.operationFailed("chat", createAgentOperationError({
+        source: "send",
+        message: "home.modelSelector.pluginRequiresLogin",
+        ...(state.agent.currentChatId ? { chatId: state.agent.currentChatId } : { scopeKey: chatScopeKey })
+      })));
       return;
     }
     if (pendingQuestion && input.trim() && !input.trimStart().startsWith("/")) {

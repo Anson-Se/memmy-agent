@@ -51,6 +51,13 @@ const bootstrap = AppBootstrapResponseSchema.parse({
 });
 
 describe("app reducer", () => {
+  it("does not redraw the app when connection polling returns unchanged data", () => {
+    const connection = { id: "github-1", toolkit: "github", status: "ACTIVE" };
+    const ready = appReducer(createInitialAppState(), { type: "tools/loadSuccess", connections: [connection] });
+    const unchanged = appReducer(ready, { type: "tools/connectionsUpdated", connections: [{ ...connection }] });
+    expect(unchanged).toBe(ready);
+    expect(appReducer(ready, { type: "tools/connectionsUpdated", connections: [{ ...connection, status: "EXPIRED" }] })).not.toBe(ready);
+  });
   it("stores bootstrap state and marks startup ready", () => {
     const state = appReducer(createInitialAppState(), appActions.bootstrapLoaded(bootstrap, "/welcome"));
 

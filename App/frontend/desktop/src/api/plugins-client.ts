@@ -1,5 +1,7 @@
 import {
   InstalledPluginSchema,
+  PluginCatalogSchema,
+  type PluginCatalogEntry,
   InstalledPluginsSchema,
   InvokePluginCapabilityInputSchema,
   InvokePluginCapabilityResponseSchema,
@@ -18,6 +20,7 @@ import { userTimeZone } from "../lib/user-time-zone.js";
 
 export interface PluginsClient {
   list(): Promise<InstalledPlugin[]>;
+  catalog?(): Promise<PluginCatalogEntry[]>;
   install(pluginId: string, version?: string): Promise<InstalledPlugin>;
   approvePermissions(pluginId: string, permissions: PluginPermission[]): Promise<InstalledPlugin>;
   enable(pluginId: string): Promise<InstalledPlugin>;
@@ -53,6 +56,7 @@ export const pluginEndpointPaths = {
 export function createHttpPluginsClient(config: RuntimeConfig): PluginsClient {
   const uiCache = new Map<string, Promise<string>>();
   return {
+    catalog() { return requestJson({ config, path: "/api/v1/plugins/catalog", schema: PluginCatalogSchema }); },
     list() {
       return requestJson({ config, path: pluginEndpointPaths.list, schema: InstalledPluginsSchema });
     },

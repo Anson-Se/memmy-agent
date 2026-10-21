@@ -1,4 +1,4 @@
-import type { AccountChannel, InstalledPlugin } from "@memmy/local-api-contracts";
+import type { AccountChannel } from "@memmy/local-api-contracts";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { resolveCloudClientConfig, resolvePluginRegistryBaseUrl } from "../config/service-urls.js";
@@ -249,8 +249,14 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
         }
       }
     }),
+    isAuthenticated: () => accountSessionRepository.get().authenticated,
     isEntitlementGranted
   });
+  const pluginToolSignature = () => JSON.stringify(plugins.list()
+    .filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)
+    .map((plugin) => [plugin.id, plugin.version, plugin.manifest.capabilities])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  let publishedPluginTools = pluginToolSignature();
   const sourceRegistry =
     options.sourceRegistry ??
     createBuiltinAgentSourceRegistry();
@@ -331,18 +337,21 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       memoryClient: options.memoryClient,
       accountChannel: options.accountChannel,
       onAccountGrantsRefreshed: async () => {
-        const previousCapabilities = activePluginCapabilities(plugins.list());
         const failures = await reconcileEntitledPlugins({
           plugins,
+          userUninstalledIds: new Set(pluginRepository.listUserUninstalledIds()),
           entitlements: accountSessionRepository.getEntitlements()
         });
         for (const failure of failures) {
           console.warn(`Entitled plugin reconciliation failed for ${failure.pluginId}: ${failure.message}`);
         }
-        if (previousCapabilities !== activePluginCapabilities(plugins.list())) {
+        // Reconciliation bypasses management routes; retry publishing changes after a failed reload.
+        const nextPluginTools = pluginToolSignature();
+        if (nextPluginTools !== publishedPluginTools) {
           try {
             const result = await memmyAgentAdminClient.reloadMcpConfig();
-            if (!result.ok) console.warn(`Agent plugin tool reload did not complete: ${result.message}`);
+            if (result.ok) publishedPluginTools = nextPluginTools;
+            else console.warn(`Agent plugin tools refresh did not complete: ${result.message}`);
           } catch (error) {
             console.warn(`Agent plugin tool reload unavailable: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -472,11 +481,6 @@ function agentApiType(protocol: string): "auto" | "chatCompletions" | "responses
   if (protocol === "openai-responses") return "responses";
   if (protocol === "openai-chat-completions" || protocol === "memmy-account") return "chatCompletions";
   return "auto";
-}
-
-function activePluginCapabilities(plugins: InstalledPlugin[]): string {
-  return JSON.stringify(plugins.filter((plugin) => plugin.state === "active")
-    .map((plugin) => [plugin.id, plugin.version]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
 }
 
 function createUnavailableMemmyConfigWriter(): MemmyConfigWriter {

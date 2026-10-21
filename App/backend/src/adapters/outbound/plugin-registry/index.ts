@@ -14,6 +14,7 @@ export interface PluginRelease {
 }
 
 export interface PluginRegistry {
+  list?(): Promise<PluginManifest[]>;
   resolve(pluginId: string, version?: string): Promise<PluginRelease>;
 }
 
@@ -30,6 +31,10 @@ export function createCompositePluginRegistry(
   fallback?: PluginRegistry
 ): PluginRegistry {
   return {
+    async list() {
+      const entries = [...await primary.list?.() ?? [], ...await fallback?.list?.() ?? []];
+      return [...new Map(entries.map((manifest) => [manifest.id, manifest])).values()];
+    },
     async resolve(pluginId, version) {
       try {
         return await primary.resolve(pluginId, version);
@@ -43,6 +48,7 @@ export function createCompositePluginRegistry(
 
 export function createInMemoryPluginRegistry(releases: PluginRelease[]): PluginRegistry {
   return {
+    async list() { return releases.map((release) => structuredClone(release.manifest)); },
     async resolve(pluginId, version) {
       const matches = releases.filter((release) =>
         release.manifest.id === pluginId && (!version || release.manifest.version === version)
