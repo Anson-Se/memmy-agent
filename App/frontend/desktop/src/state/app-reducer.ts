@@ -342,6 +342,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           action.scan.attemptStartedAt <= state.agentSources.scanProgress.attemptStartedAt)) return state;
       if (action.scan && state.agentSources.finishedScanJobIds.includes(agentSourceScanExecutionKey(action.scan))) return state;
       const finishedJobId = action.scan?.jobId ?? state.agentSources.cancellingScanJobId;
+      const finishedExecution = action.scan ?? (state.agentSources.scanProgress?.jobId === finishedJobId
+        ? state.agentSources.scanProgress : finishedJobId ? { jobId: finishedJobId } : undefined);
       return {
         ...state,
         agentSources: {
@@ -353,8 +355,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           cancellingScanJobId: null,
           latestScanAttemptStartedAt: action.scan?.attemptStartedAt ?? state.agentSources.latestScanAttemptStartedAt,
           lastFinishedScanJobId: finishedJobId ?? state.agentSources.lastFinishedScanJobId,
-          finishedScanJobIds: action.scan
-            ? [...state.agentSources.finishedScanJobIds.filter((jobId) => jobId !== agentSourceScanExecutionKey(action.scan!)), agentSourceScanExecutionKey(action.scan)].slice(-20)
+          finishedScanJobIds: finishedExecution
+            ? [...state.agentSources.finishedScanJobIds.filter((jobId) => jobId !== agentSourceScanExecutionKey(finishedExecution)), agentSourceScanExecutionKey(finishedExecution)].slice(-20)
             : state.agentSources.finishedScanJobIds,
           recentScanCompletions: action.scan
             ? [

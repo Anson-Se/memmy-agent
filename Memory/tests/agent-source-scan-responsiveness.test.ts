@@ -118,8 +118,15 @@ describe("standalone scan HTTP responsiveness", () => {
       resolveAgentSkillRoot: () => {
         if (!firstJob) return null;
         firstJob = false;
-        void executor.cancelScan();
-        replacement = executor.startScan({ sourceId: "codex", mode: "full" });
+        const cancellation = executor.cancelScan();
+        replacement = executor.startScan({ sourceId: "codex", mode: "full" }).then(
+          () => { throw new Error("replacement must wait for cancellation"); },
+          async (error: unknown) => {
+            expect(error).toMatchObject({ code: "conflict" });
+            await cancellation;
+            return executor.startScan({ sourceId: "codex", mode: "full" });
+          }
+        );
         return skillRoot;
       },
     });

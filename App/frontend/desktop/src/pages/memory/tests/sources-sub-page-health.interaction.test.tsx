@@ -251,7 +251,7 @@ function createClients(health: (signal?: AbortSignal) => Promise<unknown>): AppC
       memory: { baseUrl: "http://127.0.0.1:18960" }
     },
     localData: { getPath: async () => ({ ok: true, dataPath: "/test/memory" }) },
-    agentSources: { listSources: async () => [] },
+    agentSources: { listSources: async () => [], getScanStatus: async () => ({ running: false, jobId: null, progress: null, unavailable: null }) },
     config: {
       getScanPreferences: async () => ({ autoScanKnownAgents: true, watchFileChanges: true, autoInjectSkill: false })
     },

@@ -1001,7 +1001,7 @@ async function ingestStagedMessages(
         const sourceTurn = sourceTurnFromMessages(turn.messages);
         if (!sourceTurn) {
           const reason = sourceTurnFailureReason(turn.messages);
-          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
+          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey, turnLatest);
           noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
@@ -1022,7 +1022,7 @@ async function ingestStagedMessages(
           ...(scanMode === "initial_subset" || scanMode === "full" ? { captureLegacyHistory: true } : {})
         });
         if (result.status === "rejected" && result.reason === "legacy_before_activation" && (scanMode === "initial_subset" || scanMode === "full")) {
-          recordScanItemSkip(store, sourceId, turn.conversationId, result.reason, itemKey);
+          recordScanItemSkip(store, sourceId, turn.conversationId, result.reason, itemKey, turnLatest);
           noteUncommittedSkip(result.reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
@@ -1030,7 +1030,7 @@ async function ingestStagedMessages(
         }
         if (result.status === "pending" || result.status === "conflict") {
           const reason = result.reason ?? result.status;
-          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey);
+          recordScanItemSkip(store, sourceId, turn.conversationId, reason, itemKey, turnLatest);
           noteUncommittedSkip(reason, turnLatest);
           processed += turn.messages.length;
           onProgress({ sourceId, phase: "add", current: processed, total: totalMessages, message: "Capturing conversation turns" });
@@ -1272,10 +1272,17 @@ function recordScanItemSkip(
   sourceId: string,
   conversationId: string,
   reason: string,
-  itemKey = "legacy"
+  itemKey = "legacy",
+  latestActivityAt?: string | null
 ): void {
   logger.warn("scan.item_skipped", { sourceId, conversationId, reason });
-  if (reason === "turn_cancelled") { store.resolveItem(sourceId, conversationId, itemKey); return; }
+  // Preserve v1.2.6: unfinished turns are held/revisited by the watermark,
+  // not failed imports. Unavailable capture and actual write failures still fail.
+  if (reason === "turn_cancelled" || (latestActivityAt !== undefined && sourceTurnSkipBlocksWatermark(reason) &&
+    sourceTurnSkipWatermarkEffect(reason, latestActivityAt) !== "rescan")) {
+    store.resolveItem(sourceId, conversationId, itemKey);
+    return;
+  }
   store.saveResult({ sourceId, conversationId, itemKey, error: reason });
 }
 
