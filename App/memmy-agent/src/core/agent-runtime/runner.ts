@@ -1,3 +1,5 @@
+import { resolveWorkspacePath as resolveManagedFilePath } from "./tools/path-utils.js";
+import { authorizeMemmateTool, memmatePermissionRequired } from "./memmate-permission.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
 import path from "node:path";
@@ -1093,6 +1095,23 @@ export class AgentRunner {
       return { call, result: prepError + hint, event, error: spec.failOnToolError ? new Error(prepError) : null };
     }
 
+    const managed = memmatePermissionRequired();
+    if (managed) {
+      try {
+        const executionName = call.name;
+        await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
+        if (call.name !== executionName) throw new Error("Tool name changed before MemMate approval");
+        if (["read_file", "write_file", "edit_file", "list_dir"].includes(executionName) && typeof params?.path === "string") {
+          params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params.path) };
+        }
+        params = await authorizeMemmateTool(executionName, params, spec.abortSignal);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "MemMate approval failed";
+        return { call, result: `Error: ${message}`, event: { name: call.name, status: "error", detail: message },
+          error: spec.failOnToolError ? error : null };
+      }
+    }
+
     const progressCallback = spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
       ? spec.progressCallback
       : null;
@@ -1124,7 +1143,7 @@ export class AgentRunner {
     try {
       let raw: any;
       const fileMutationOutcomes = new Map<string, FileMutationOutcome>();
-      await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
+      if (!managed) await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
       const toolContext: ToolExecutionContext = {
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,

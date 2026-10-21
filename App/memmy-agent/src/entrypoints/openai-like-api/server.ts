@@ -1,3 +1,4 @@
+import { authenticateMemmateRuntime, createMemmatePermissionScope, memmatePermissionRequired, withMemmatePermission } from "../../core/agent-runtime/memmate-permission.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Config } from "../../config/schema.js";
@@ -243,6 +244,11 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
     requestTimeout: 120,
     sessionLocks: new Map<string, Promise<void>>(),
   };
+  const managed = memmatePermissionRequired();
+  if (managed && !authenticateMemmateRuntime(request)) return errorJson(401, "MemMate runtime authentication required");
+  const permissionAbort = new AbortController();
+  const permissionSignal = AbortSignal.any([request.signal, permissionAbort.signal]);
+  let permission: ReturnType<typeof createMemmatePermissionScope> | undefined;
   const contentType = request.headers.get("content-type") ?? "";
   let text = "";
   let mediaPaths: string[] = [];
@@ -252,6 +258,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
 
   try {
     if (contentType.startsWith("multipart/")) {
+      if (managed) return errorJson(400, "Managed requests require a JSON approval context");
       [text, mediaPaths, sessionId, requestedModel] = await parseMultipart(request);
     } else {
       let body: any;
@@ -260,6 +267,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
       } catch {
         return errorJson(400, "Invalid JSON body");
       }
+      if (managed) permission = createMemmatePermissionScope(body.memmate_permission, permissionSignal);
       stream = Boolean(body.stream);
       requestedModel = body.model;
       [text, mediaPaths] = parseJsonContent(body);
@@ -284,6 +292,9 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
     chat_id: API_CHAT_ID,
     chatId: API_CHAT_ID,
   };
+
+  const invoke = (args: Record<string, any>) => withMemmatePermission(permission, () => callAgent(context, args));
+  const endPermission = () => { if (permission) permission.active = false; permissionAbort.abort(); };
 
   if (stream) {
     const chunkId = `chatcmpl-${crypto.randomUUID().slice(0, 12)}`;
@@ -320,7 +331,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
             await withSessionLock(context, sessionKey, async () => {
               const response = await withTimeout(
                 Promise.resolve(
-                  callAgent(context, {
+                  invoke({
                     ...baseArgs,
                     onStream,
                     onStreamEnd,
@@ -336,6 +347,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
           } catch {
             failed = true;
           } finally {
+            endPermission();
             if (!failed) {
               write(sseChunk("", context.modelName, chunkId, "stop"));
               write(SSE_DONE);
@@ -346,6 +358,7 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
       },
       cancel() {
         closed = true;
+        endPermission();
       },
     });
     return new Response(body, {
@@ -360,11 +373,11 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
 
   try {
     const reply = await withSessionLock(context, sessionKey, async () => {
-      const first = await withTimeout(Promise.resolve(callAgent(context, baseArgs)), context.requestTimeout);
+      const first = await withTimeout(Promise.resolve(invoke(baseArgs)), context.requestTimeout);
       let textResponse = responseText(first);
       let usage = responseUsage(first);
       if (!textResponse.trim()) {
-        const retry = await withTimeout(Promise.resolve(callAgent(context, baseArgs)), context.requestTimeout);
+        const retry = await withTimeout(Promise.resolve(invoke(baseArgs)), context.requestTimeout);
         textResponse = responseText(retry);
         usage = mergeUsageRecords(usage, responseUsage(retry));
         if (!textResponse.trim()) textResponse = EMPTY_FINAL_RESPONSE_MESSAGE;
@@ -376,6 +389,8 @@ export async function handleChatCompletions(request: Request, ctx?: ApiContext):
     const message = (err as Error).message ?? "";
     if (message.startsWith("Request timed out")) return errorJson(504, message);
     return errorJson(500, "Internal server error", "server_error");
+  } finally {
+    endPermission();
   }
 }
 
@@ -389,7 +404,7 @@ export async function handleModels(request?: Request, ctx?: Pick<ApiContext, "mo
 }
 
 export async function handleHealth(): Promise<Response> {
-  return Response.json({ status: "ok" });
+  return Response.json({ status: "ok", ...(memmatePermissionRequired() ? { memmatePermissionProtocol: 1, memmatePermissionRequired: true } : {}) });
 }
 
 export function createApp(
