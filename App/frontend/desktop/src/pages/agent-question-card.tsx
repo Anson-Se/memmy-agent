@@ -1,5 +1,6 @@
+import "./agent-question-card.css";
 import { useMemo, useState } from "react";
-import { Check, Loader2, PenLine, ChevronRight } from "lucide-react";
+import { Check, Loader2, PenLine, ChevronRight, X } from "lucide-react";
 import { useTranslation } from "../i18n/use-translation.js";
 
 export type AgentQuestionOption = {
@@ -20,6 +21,7 @@ export type AgentQuestionCardPayload = {
   version: 1;
   requestId: string;
   title?: string;
+  context?: { workflow: string; taskId: string };
   questions: AgentQuestion[];
 };
 
@@ -31,6 +33,7 @@ export type AgentQuestionAnswer = {
 
 export type AgentQuestionResponse = {
   requestId: string;
+  cancelled?: boolean;
   answers: AgentQuestionAnswer[];
 };
 
@@ -74,12 +77,32 @@ export function readAgentQuestionCard(value: unknown): AgentQuestionCardPayload 
     });
   }
   const title = nonemptyString(raw.title);
+  const context = isRecord(raw.context) ? raw.context : {};
+  const workflow = nonemptyString(context.workflow), taskId = nonemptyString(context.taskId);
   return {
     version: 1,
     requestId,
     ...(title ? { title } : {}),
+    ...(workflow && taskId ? { context: { workflow, taskId } } : {}),
     questions,
   };
+}
+
+/** Only an unanswered card belonging to the active turn can receive composer text. */
+export function pendingAgentQuestion(messages: Array<{ agentUi?: unknown; questionResponse?: unknown; turnId?: string }>, activeTurnId: string | null): AgentQuestionCardPayload | null {
+  if (!activeTurnId) return null;
+  for (const message of [...messages].reverse()) {
+    if (message.turnId !== activeTurnId || message.questionResponse) continue;
+    const card = readAgentQuestionCard(message.agentUi);
+    if (card) return card;
+  }
+  return null;
+}
+
+export function composerQuestionAnswer(card: AgentQuestionCardPayload, content: string): AgentQuestionResponse | null {
+  const question = card.questions[0];
+  if (card.questions.length !== 1 || !question?.allowOther || !content.trim() || content.trimStart().startsWith("/")) return null;
+  return { requestId: card.requestId, answers: [{ questionId: question.id, selectedOptionIds: [], otherText: content.trim() }] };
 }
 
 export function serializeAgentQuestionResponse(
@@ -127,7 +150,7 @@ export function normalizeAgentQuestionResponse(value: unknown): AgentQuestionRes
     const otherText = nonemptyString(item.otherText);
     answers.push({ questionId, selectedOptionIds, ...(otherText ? { otherText } : {}) });
   }
-  return { requestId, answers };
+  return { requestId, answers, ...(value.cancelled === true ? { cancelled: true } : {}) };
 }
 
 export function visibleAgentQuestionResponseContent(content: string): string {
@@ -242,13 +265,28 @@ export function AgentQuestionCard(props: {
     }
   };
 
+  if (Boolean(completedResponse)) return (
+    <details className="agent-question-summary" data-workflow={props.card.context?.workflow}>
+      <summary>{props.card.title ?? t("home.question.title")} · {t(completedResponse?.cancelled ? "home.question.cancelled" : "home.question.answered")}</summary>
+      <div className="agent-question-summary__body">{completedResponse?.cancelled ? <p>{t("home.question.cancelled")}</p> : props.card.questions.map((question) => (
+        <div key={question.id}><p>{question.prompt}</p><p>{responseLabel(question, completedResponse!.answers.find((answer) => answer.questionId === question.id))}</p></div>
+      ))}</div>
+    </details>
+  );
+
   return (
-    <section className="overflow-hidden rounded-card border border-border-stone/50 bg-background-paper shadow-sm" aria-label={props.card.title ?? t("home.question.title")}>
+    <section data-workflow={props.card.context?.workflow} className="agent-question-card overflow-hidden rounded-card border border-border-stone/50 bg-background-paper shadow-sm" aria-label={props.card.title ?? t("home.question.title")}>
       <div className="flex items-center justify-between gap-3 border-b border-border-stone/40 px-4 py-2.5">
         <span className="text-sm font-semibold text-text-ink">{props.card.title ?? t("home.question.title")}</span>
         <span className="shrink-0 text-xs text-text-ink/40">
           {t("home.question.count", { count: props.card.questions.length })}
         </span>
+        <button type="button" aria-label={t("plugin.ui.dismissCard")} disabled={submitting || !props.onSubmit} onClick={() => {
+          if (!props.onSubmit || submitting) return;
+          const response: AgentQuestionResponse = { requestId: props.card.requestId, answers: [], cancelled: true };
+          setSubmitting(true); setSubmitFailed(false);
+          Promise.resolve().then(() => props.onSubmit!(response)).then((ok) => { if (ok) setSubmittedResponse(response); else setSubmitFailed(true); }, () => setSubmitFailed(true)).finally(() => setSubmitting(false));
+        }}><X size={16} aria-hidden="true" /></button>
       </div>
       <div className="flex flex-col">
         {props.card.questions.map((question, questionIndex) => {
@@ -307,13 +345,13 @@ export function AgentQuestionCard(props: {
                             selected ? "bg-action-sky text-white" : "bg-canvas-oat text-text-ink/60"
                           }`}
                         >
-                          {selected ? <Check size={12} aria-hidden="true" /> : index + 1}
+                          {index + 1}
                         </span>
                         <span className="min-w-0 flex-1">
                           <span className="block text-sm">{option.label}</span>
                           {option.description ? <span className="mt-0.5 block text-xs text-text-ink/50">{option.description}</span> : null}
                         </span>
-                        <ChevronRight size={15} className="shrink-0 text-text-ink/40" aria-hidden="true" />
+                        {selected ? <Check size={15} className="shrink-0 text-action-sky" aria-hidden="true" /> : <ChevronRight size={15} className="shrink-0 text-text-ink/40" aria-hidden="true" />}
                       </button>
                     );
                   })}
@@ -362,7 +400,7 @@ export function AgentQuestionCard(props: {
             className="inline-flex h-8 items-center justify-center gap-2 rounded-btn bg-action-sky px-4 text-sm font-semibold text-white transition-colors hover:bg-action-sky-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             {submitting ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : null}
-            {submitting ? t("home.question.submitting") : t("home.question.submit")}
+            {submitting ? t("home.question.submitting") : props.card.context?.workflow === "literature-review" ? t("common.confirm") : t("home.question.submit")}
           </button>
         </div>
       ) : (

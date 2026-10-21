@@ -73,6 +73,26 @@ describe("AskQuestionTool", () => {
     expect(pendingAgentQuestionCount()).toBe(0);
   });
 
+  it("carries workflow context through the native two-question chain", async () => {
+    const sent: OutboundMessage[] = [];
+    const tool = new AskQuestionTool({ sendCallback: async (message) => { sent.push(message); } });
+    tool.setContext(new RequestContext({ channel: "websocket", chatId: "scope-chat" }));
+    const pending = tool.execute({ title: "确认研究需求", context: { workflow: "literature-review", taskId: "review-native" }, questions: [
+      { id: "research-domain", prompt: "研究领域", options: [{ id: "ai", label: "AI / 计算机技术" }, { id: "medical", label: "医学 / 生命科学" }] },
+      { id: "reference-range", prompt: "参考文献检索范围", options: [{ id: "recent-3", label: "近 3 年" }, { id: "recent-5", label: "近 5 年" }], allow_other: true }
+    ] });
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const card = sent[0]!.metadata.agentUi.questionCard;
+    expect(card.context).toEqual({ workflow: "literature-review", taskId: "review-native" });
+    expect(card.questions).toHaveLength(2);
+    expect(respondToAgentQuestion({ chatId: "scope-chat", response: { requestId: card.requestId, answers: [
+      { questionId: "research-domain", selectedOptionIds: ["ai"] }, { questionId: "reference-range", selectedOptionIds: [], otherText: "2020–2026" }
+    ] } })).toEqual({ ok: true });
+    const answered = JSON.parse(await pending);
+    expect(answered.requestId).toBe(card.requestId);
+    expect(answered.answers[1].otherText).toBe("2020–2026");
+  });
+
   it("rejects duplicate question and option ids", async () => {
     const tool = new AskQuestionTool({ sendCallback: async () => undefined });
     tool.setContext(new RequestContext({ channel: "websocket", chatId: "chat-1" }));

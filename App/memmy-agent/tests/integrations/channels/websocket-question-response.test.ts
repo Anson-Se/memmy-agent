@@ -65,6 +65,20 @@ describe("WebSocket agent question responses", () => {
     });
   });
 
+  it("closes a native card through the real channel without confirming any answers", async () => {
+    const cards: any[] = [];
+    const tool = new AskQuestionTool({ sendCallback: async (message) => { cards.push(message); } });
+    tool.setContext(new RequestContext({ channel: "websocket", chatId: "chat-cancel" }));
+    const pending = tool.execute({ questions: [{ id: "scope", prompt: "Scope?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const requestId = cards[0].metadata.agentUi.questionCard.requestId;
+    const channel = new WebSocketChannel({}, new MessageBus()); const ws = createConnection(); channel.attachConnection(ws, "chat-cancel");
+    await channel.dispatchEnvelope(ws, "client", { type: "agent_question_response", chat_id: "chat-cancel", request_id: requestId, cancelled: true, answers: [] });
+    expect(JSON.parse(await pending)).toEqual({ status: "cancelled", requestId, cancelled: true, answers: [] });
+    expect(sent(ws)).toContainEqual({ event: "agent_question_response", chat_id: "chat-cancel", request_id: requestId, cancelled: true, answers: [] });
+    expect(pendingAgentQuestionCount()).toBe(0);
+  });
+
   it("rejects responses from a connection not attached to the chat", async () => {
     const channel = new WebSocketChannel({}, new MessageBus());
     const ws = createConnection();
