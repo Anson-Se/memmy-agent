@@ -29,6 +29,7 @@ export type AgentQuestionAnswer = {
 
 export type AgentQuestionResponse = {
   requestId: string;
+  cancelled?: boolean;
   answers: AgentQuestionAnswer[];
 };
 
@@ -54,6 +55,7 @@ function validateResponse(
   pending: PendingQuestion,
   response: AgentQuestionResponse,
 ): string | null {
+  if (response.cancelled === true) return response.answers.length === 0 ? null : "cancelled_answer_not_empty";
   if (response.answers.length !== pending.questions.length) return "answer_count_mismatch";
   const answersByQuestion = new Map(response.answers.map((answer) => [answer.questionId, answer]));
   if (answersByQuestion.size !== response.answers.length) return "duplicate_question_answer";
@@ -86,6 +88,7 @@ export function respondToAgentQuestion(input: {
   pending.cleanup();
   pending.resolve({
     requestId: input.response.requestId,
+    ...(input.response.cancelled === true ? { cancelled: true } : {}),
     answers: input.response.answers.map((answer) => ({
       questionId: answer.questionId,
       selectedOptionIds: [...answer.selectedOptionIds],
@@ -161,6 +164,12 @@ export class AskQuestionTool extends Tool {
           maxLength: 120,
           description: "Optional concise heading for the question card.",
         },
+        context: {
+          type: "object",
+          description: "Optional workflow/task identity for consolidating the answered card into its workflow summary. Does not grant permissions or confirm any task data.",
+          properties: { workflow: { type: "string", minLength: 1, maxLength: 64 }, taskId: { type: "string", minLength: 1, maxLength: 128 } },
+          required: ["workflow", "taskId"], additionalProperties: false,
+        },
         questions: {
           type: "array",
           minItems: 1,
@@ -200,7 +209,7 @@ export class AskQuestionTool extends Tool {
   }
 
   async execute(
-    params: { title?: string; questions?: Question[] } = {},
+    params: { title?: string; questions?: Question[]; context?: { workflow: string; taskId: string } } = {},
     executionContext?: { abortSignal?: AbortSignal | null },
   ): Promise<string> {
     const context = this.requestContext.get();
@@ -221,6 +230,9 @@ export class AskQuestionTool extends Tool {
       }
     }
 
+    const workflow = params.context?.workflow?.trim();
+    const taskId = params.context?.taskId?.trim();
+    const workflowContext = workflow && taskId ? { workflow, taskId } : undefined;
     const requestId = randomUUID();
     const normalizedQuestions = questions.map((question) => ({
       id: question.id.trim(),
@@ -277,6 +289,7 @@ export class AskQuestionTool extends Tool {
             [AGENT_QUESTION_UI_KEY]: {
               version: AGENT_QUESTION_UI_VERSION,
               requestId,
+              ...(workflowContext ? { context: workflowContext } : {}),
               ...(title ? { title } : {}),
               questions: normalizedQuestions,
             },
@@ -293,6 +306,6 @@ export class AskQuestionTool extends Tool {
     }
 
     const response = await responsePromise;
-    return JSON.stringify({ status: "answered", ...response });
+    return JSON.stringify({ status: response.cancelled ? "cancelled" : "answered", ...response });
   }
 }

@@ -410,10 +410,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           agent: agentReducer(state.agent, action as AgentAction)
         };
       }
-      return {
-        ...state,
-        tools: toolsReducer(state.tools, action as ToolsAction)
-      };
+      {
+        const tools = toolsReducer(state.tools, action as ToolsAction);
+        return tools === state.tools ? state : { ...state, tools };
+      }
   }
 }
 

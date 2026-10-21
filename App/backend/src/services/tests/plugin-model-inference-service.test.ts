@@ -322,6 +322,7 @@ describe("plugin model inference Host service", () => {
     };
     await expect(service.invoke(call)).rejects.toMatchObject({
       code: "model_response_truncated",
+      message: expect.stringContaining("this request's 512-token output budget (maxOutputTokens)"),
       retryable: false
     });
     // Retrying cannot help, so the ceiling is reported after a single attempt.

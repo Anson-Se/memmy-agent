@@ -97,7 +97,12 @@ export const PluginSkillContributionSchema = z.object({
   id: PluginIdentifierSchema,
   name: z.string().trim().min(1).max(128),
   description: z.string().trim().min(1).max(500),
-  entry: PluginPackagePathSchema
+  entry: PluginPackagePathSchema,
+  /** Private instructions are resolved in memory by a cloud-skill-aware Host. */
+  cloud: z.object({
+    revision: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).superRefine((skill, context) => {
   if (!skill.entry.endsWith("/SKILL.md") && skill.entry !== "SKILL.md") {
     context.addIssue({ code: "custom", path: ["entry"], message: "Plugin skill entry must point to SKILL.md" });
@@ -151,6 +156,24 @@ export const PluginScenarioContributionSchema = z.object({
 });
 export type PluginScenarioContribution = z.infer<typeof PluginScenarioContributionSchema>;
 
+/** Product policy declared by the plugin; account facts are supplied by the Host. */
+export const PluginRulesSchema = z.object({
+  distribution: z.enum(["public", "account"]).default("public"),
+  installation: z.enum(["manual", "automatic"]).default("manual"),
+  requiresLogin: z.boolean().default(false),
+  unavailableVisibility: z.enum(["visible", "hidden"]).default("visible"),
+  autoUpdate: z.boolean().default(true),
+  recommendsOfficialModel: z.boolean().default(false)
+});
+export type PluginRules = z.infer<typeof PluginRulesSchema>;
+export const PluginEligibilitySchema = z.object({
+  visible: z.boolean(),
+  canInstall: z.boolean(),
+  canUse: z.boolean(),
+  reason: z.enum(["login_required", "entitlement_required"]).nullable()
+});
+export type PluginEligibility = z.infer<typeof PluginEligibilitySchema>;
+
 export const PluginManifestSchema = z.object({
   apiVersion: z.literal("memmy/v1"),
   id: PluginIdentifierSchema,
@@ -164,6 +187,7 @@ export const PluginManifestSchema = z.object({
   commands: z.array(PluginCommandContributionSchema).max(100).optional(),
   scenarios: z.array(PluginScenarioContributionSchema).max(8).optional(),
   ui: PluginUiSchema.optional(),
+  rules: PluginRulesSchema.optional(),
   /** Account grant the Host verifies before installing, enabling, or invoking this plugin. */
   requiredEntitlement: PluginEntitlementSchema.optional(),
   /** Host-enforced restriction on the model presets this plugin may reach through host services. */
@@ -343,6 +367,7 @@ export const InstalledPluginSchema = z.object({
   id: PluginIdentifierSchema,
   version: z.string().min(1),
   manifest: PluginManifestSchema,
+  eligibility: PluginEligibilitySchema.optional(),
   state: PluginStateSchema,
   approvedPermissions: z.array(PluginPermissionSchema),
   config: z.record(z.string(), z.unknown()),
@@ -420,3 +445,24 @@ export const PluginCapabilityEventPayloadSchema = z.object({
   event: CapabilityEventSchema
 });
 export type PluginCapabilityEventPayload = z.infer<typeof PluginCapabilityEventPayloadSchema>;
+
+export const PluginCatalogEntrySchema = z.object({
+  manifest: PluginManifestSchema,
+  eligibility: PluginEligibilitySchema,
+  installed: InstalledPluginSchema.optional()
+});
+export const PluginCatalogSchema = z.array(PluginCatalogEntrySchema);
+export type PluginCatalogEntry = z.infer<typeof PluginCatalogEntrySchema>;
+
+/** Persistable identity only. Private instruction text must never enter a transcript. */
+export const PluginSkillRefSchema = z.object({
+  pluginId: PluginIdentifierSchema,
+  skillId: PluginIdentifierSchema,
+  pluginVersion: z.string().min(1).max(128),
+  revision: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+export type PluginSkillRef = z.infer<typeof PluginSkillRefSchema>;
+export const PluginSkillActivationSchema = z.object({
+  kind: z.literal("memmy_plugin_skill_ref_v1"), ref: PluginSkillRefSchema
+}).strict();

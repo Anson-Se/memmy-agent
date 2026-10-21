@@ -210,6 +210,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
       const failures = await reconcileBundledPlugins({
         plugins: services.plugins,
         releases: bundledCatalog.releases,
+        userUninstalledIds: new Set(appStateStore.repositories.plugins.listUserUninstalledIds()),
         enabledById: Object.fromEntries(
           bundledCatalog.releases.map((release) => [
             release.id,
@@ -225,6 +226,7 @@ export async function createLocalBackend(options: CreateLocalBackendOptions): Pr
     const reconcileEntitlements = async () => {
       const failures = await reconcileEntitledPlugins({
         plugins: services.plugins,
+        userUninstalledIds: new Set(appStateStore.repositories.plugins.listUserUninstalledIds()),
         entitlements: appStateStore.repositories.accountSession.getEntitlements()
       });
       for (const failure of failures) {
@@ -330,9 +332,9 @@ function configuredPluginRegistry(
 ): PluginRegistry | undefined {
   const baseUrl = resolvePluginRegistryBaseUrl(env);
   const remoteRegistry = baseUrl ? createHttpPluginRegistry({ baseUrl, authHeaders }) : undefined;
-  return bundledRegistry
-    ? createCompositePluginRegistry(bundledRegistry, remoteRegistry)
-    : remoteRegistry;
+  // Explicit remote distribution must never fall back to a locally bundled package.
+  if (env.MEMMY_PLUGIN_REGISTRY_URL?.trim()) return remoteRegistry;
+  return bundledRegistry ? createCompositePluginRegistry(bundledRegistry, remoteRegistry) : remoteRegistry;
 }
 
 async function tryLoadBundledPluginCatalog(directory: string | undefined): Promise<BundledPluginCatalog | null> {

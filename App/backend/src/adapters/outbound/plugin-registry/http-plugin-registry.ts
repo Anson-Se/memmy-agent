@@ -7,7 +7,8 @@ const MAX_REGISTRY_RESPONSE_BYTES = 1024 * 1024;
 const PluginReleaseSchema = z.object({
   manifest: PluginManifestSchema,
   artifact: z.object({
-    url: z.string().min(1),
+    // Local registries return an origin-relative authenticated download path.
+    url: z.string().url().or(z.string().regex(/^\/(?!\/)/)),
     sha256: z.string().regex(/^[a-f0-9]{64}$/i)
   }).optional()
 });
@@ -25,6 +26,14 @@ export function createHttpPluginRegistry(options: CreateHttpPluginRegistryOption
   const fetchFn = options.fetchFn ?? fetch.bind(globalThis);
 
   return {
+    async list() {
+      const response = await fetchFn(new URL("/api/v1/plugins", baseUrl), {
+        headers: { accept: "application/json", ...options.authHeaders?.() },
+        redirect: "error", signal: AbortSignal.timeout(15_000)
+      });
+      if (!response.ok) throw new Error(`Plugin catalog request failed with ${response.status}`);
+      return z.array(PluginManifestSchema).parse(JSON.parse(await readLimitedText(response)));
+    },
     async resolve(pluginId, version) {
       const url = new URL(`/api/v1/plugins/${encodeURIComponent(pluginId)}`, baseUrl);
       if (version) url.searchParams.set("version", version);
@@ -51,6 +60,11 @@ export function createHttpPluginRegistry(options: CreateHttpPluginRegistryOption
       }
       if (release.manifest.id !== pluginId || (version && release.manifest.version !== version)) {
         throw Object.assign(new Error("Plugin registry returned a different release"), { code: "plugin_invalid" });
+      }
+      if (release.artifact) {
+        const artifactUrl = new URL(release.artifact.url, baseUrl);
+        assertAllowedProtocol(artifactUrl);
+        release.artifact.url = artifactUrl.toString();
       }
       return release;
     }

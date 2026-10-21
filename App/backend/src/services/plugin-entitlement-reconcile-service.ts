@@ -1,4 +1,6 @@
 /** Reconciles entitlement-gated plugins against the grants held by the signed-in account. */
+import type { PluginCatalogEntry } from "@memmy/local-api-contracts";
+import { pluginRules } from "./plugin-rules.js";
 import type { PluginService } from "./plugin-service.js";
 
 /** Prefix of an account grant that names an installable plugin, e.g. `plugin:literature-review`. */
@@ -13,6 +15,7 @@ export interface ReconcileEntitledPluginsOptions {
   plugins: PluginService;
   /** Grants held by the active account; empty when signed out. */
   entitlements: readonly string[];
+  userUninstalledIds?: ReadonlySet<string>;
 }
 
 /** Derives the plugin ids an account is entitled to install. */
@@ -35,19 +38,33 @@ export function entitledPluginIds(entitlements: readonly string[]): string[] {
  * Failures are collected per plugin instead of thrown: a registry outage or one
  * broken release must not prevent the rest of the app from starting.
  */
-export async function reconcileEntitledPlugins(
+async function reconcileOnce(
   options: ReconcileEntitledPluginsOptions
 ): Promise<PluginEntitlementFailure[]> {
   const failures: PluginEntitlementFailure[] = [];
   const granted = new Set(options.entitlements);
 
-  for (const pluginId of entitledPluginIds(options.entitlements)) {
+  let catalog: PluginCatalogEntry[];
+  try { catalog = await options.plugins.catalog?.() ?? []; }
+  catch (error) {
+    failures.push({ pluginId: "catalog", message: String(error) });
+    catalog = [];
+  }
+  const declared = new Map(catalog.map((entry) => [entry.manifest.id, entry]));
+  const candidates = new Set([
+    ...catalog.filter((entry) => entry.eligibility.canInstall && pluginRules(entry.manifest).installation === "automatic").map((entry) => entry.manifest.id)
+  ]);
+  for (const pluginId of candidates) {
+    if (options.userUninstalledIds?.has(pluginId)) continue;
+    if (declared.has(pluginId) && !declared.get(pluginId)!.eligibility.canInstall) continue;
     try {
       const existing = options.plugins.list().find((plugin) => plugin.id === pluginId);
-      // The registry resolves the version for this app build, so no version is pinned here.
+      // Freeze the catalog selection across resolve/download, even if the server default changes.
+      const entry = declared.get(pluginId)!;
       let plugin = existing
-        ? await options.plugins.update(pluginId)
-        : await options.plugins.install(pluginId);
+        ? entry && (existing.version === entry.manifest.version || !pluginRules(entry.manifest).autoUpdate)
+          ? existing : await options.plugins.update(pluginId, entry.manifest.version)
+        : await options.plugins.install(pluginId, entry.manifest.version);
       plugin = await options.plugins.approvePermissions(pluginId, plugin.manifest.permissions);
       if (plugin.state !== "active") {
         await options.plugins.enable(pluginId);
@@ -62,10 +79,11 @@ export async function reconcileEntitledPlugins(
 
   for (const installed of options.plugins.list()) {
     const required = installed.manifest.requiredEntitlement;
-    if (!required || granted.has(required)) continue;
+    if (installed.eligibility ? installed.eligibility.canUse : (!required || granted.has(required))) continue;
     if (installed.state !== "active" && installed.state !== "enabling") continue;
     try {
-      await options.plugins.disable(installed.id);
+      if (options.plugins.suspend) await options.plugins.suspend(installed.id);
+      else await options.plugins.disable(installed.id);
     } catch (error) {
       failures.push({
         pluginId: installed.id,
@@ -75,4 +93,13 @@ export async function reconcileEntitledPlugins(
   }
 
   return failures;
+}
+
+// Login, panel refresh and startup may overlap; serialize installation decisions per Host.
+const reconciliations = new WeakMap<PluginService, Promise<PluginEntitlementFailure[]>>();
+export function reconcileEntitledPlugins(options: ReconcileEntitledPluginsOptions): Promise<PluginEntitlementFailure[]> {
+  const previous = reconciliations.get(options.plugins) ?? Promise.resolve([]);
+  const next = previous.catch(() => []).then(() => reconcileOnce(options));
+  reconciliations.set(options.plugins, next);
+  return next;
 }

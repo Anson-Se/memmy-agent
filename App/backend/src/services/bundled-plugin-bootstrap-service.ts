@@ -11,6 +11,7 @@ export interface ReconcileBundledPluginsOptions {
   plugins: PluginService;
   releases: readonly BundledPluginRelease[];
   enabledById: Readonly<Record<string, boolean>>;
+  userUninstalledIds?: ReadonlySet<string>;
 }
 
 export interface SuppressBundledPluginsOptions extends ReconcileBundledPluginsOptions {
@@ -44,7 +45,8 @@ export async function suppressBundledPlugins(
 
 /**
  * Installs or upgrades trusted bundled releases, grants their fixed declared
- * permissions, and applies the config.yaml desired state without deleting data.
+ * permissions, and applies the config.yaml desired state without deleting data
+ * or reinstalling plugins the user explicitly removed.
  */
 export async function reconcileBundledPlugins(
   options: ReconcileBundledPluginsOptions
@@ -53,6 +55,7 @@ export async function reconcileBundledPlugins(
   for (const release of options.releases) {
     try {
       const existing = options.plugins.list().find((plugin) => plugin.id === release.id);
+      if (!existing && options.userUninstalledIds?.has(release.id)) continue;
       let plugin = existing
         ? existing.version === release.version
           ? await options.plugins.install(release.id, release.version)

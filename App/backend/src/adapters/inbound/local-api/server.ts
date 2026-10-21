@@ -123,6 +123,7 @@ export function createLocalApiServer(options: CreateLocalApiServerOptions): Fast
     mcpToken: options.composioMcpToken
   });
   registerPluginMcpRoutes(app, {
+    skillContent: options.services.pluginSkillContent,
     plugins: options.services.plugins,
     progressBus: options.services.progressBus,
     mcpToken: options.composioMcpToken

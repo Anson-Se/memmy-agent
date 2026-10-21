@@ -879,6 +879,15 @@ body.memmy-window-fullscreen {
   overflow: visible;
 }
 
+.agent-model-selector--locked {
+  cursor: not-allowed;
+}
+
+.agent-model-selector--locked .agent-model-selector__button:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
 .agent-model-selector__control.select-control--compact {
   width: max-content;
   max-width: 180px;

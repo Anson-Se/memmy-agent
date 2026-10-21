@@ -176,7 +176,8 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
         conversationId: call.conversationId,
         input: call.input,
         deadline: call.deadline,
-        config: session.pluginConfig
+        config: session.pluginConfig,
+        hostServiceBudget: { maxRequests: MAX_HOST_SERVICE_REQUESTS_PER_CALL }
       });
       const args = session.launch.args.map((arg) => applyPlaceholders(arg, call));
       if (session.config.inputMode === "argument-json") args.push(request);

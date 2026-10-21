@@ -183,7 +183,7 @@ async function infer(
     if (isTruncated(parsed.finishReason) && (!parsed.content.trim() || requestedFormat === "json")) {
       throw serviceError(
         "model_response_truncated",
-        `Current user model hit its ${maxTokens}-token output limit before finishing the response`,
+        `Model output was truncated after reaching this request's ${maxTokens}-token output budget (maxOutputTokens), not the user's global model setting`,
         false
       );
     }

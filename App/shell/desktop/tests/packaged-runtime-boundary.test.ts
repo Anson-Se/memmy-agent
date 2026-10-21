@@ -360,7 +360,7 @@ describe("desktop packaged runtime boundaries", () => {
     }
   });
 
-  it("bundles local models and first-party plugins in every desktop package variant", () => {
+  it("bundles local models and legacy plugin migration state in every desktop package variant", () => {
     for (const configPath of [
       electronBuilderPath,
       unsignedElectronBuilderPath,
@@ -375,11 +375,11 @@ describe("desktop packaged runtime boundaries", () => {
         to: "embedding-models",
         filter: ["**/*"]
       });
-      expect(config.extraResources).toContainEqual({
-        from: "dist/bundled-plugins",
-        to: "bundled-plugins",
-        filter: ["**/*"]
-      });
+      const migrationState = config.extraResources?.find(
+        (resource) => resource.from === "dist/bundled-plugins"
+      );
+      expect(migrationState?.to).toBe("bundled-plugins");
+      expect(migrationState?.filter ?? ["**/*"]).toEqual(["**/*"]);
     }
   });
 
