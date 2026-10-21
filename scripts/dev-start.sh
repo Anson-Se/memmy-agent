@@ -640,6 +640,13 @@ run_main() {
   "$MEMMY_RUNTIME_NODE_PATH" --eval \
     'const Database = require("better-sqlite3"); const db = new Database(":memory:"); db.close();'
 
+  # The agent is installed separately from the root workspace and can resolve
+  # its own native addon. Rebuild and check it with the same runtime as serve.
+  cd "$MEMMY_AGENT_DIR"
+  npm rebuild better-sqlite3
+  "$MEMMY_RUNTIME_NODE_PATH" --eval \
+    'const Database = require("better-sqlite3"); const db = new Database(":memory:"); db.close();'
+
   unset MEMMY_MIGRATIONS_READY_CONFIG MEMMY_MIGRATIONS_READY_WORKSPACE MEMMY_MIGRATIONS_READY_SESSION_DAG MEMMY_MIGRATIONS_READY_APP_DATABASE
   log "running startup migrations"
   cd "$MEMMY_AGENT_DIR"
