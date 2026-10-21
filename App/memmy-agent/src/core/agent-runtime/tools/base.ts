@@ -5,28 +5,25 @@ export type FileMutationOutcome = {
   changed: boolean;
 };
 
-export type ToolOutputPersistenceOptions = {
-  suffix?: "json" | "txt";
+export type TextResultOptions = {
+  source: string;
   contentType?: string;
-  complete?: boolean;
-  sourceTool?: string;
-  untrusted?: boolean;
-  force?: boolean;
-  preview?: string;
+  suffix?: "json" | "txt";
+  maxChars: number;
 };
 
 export type ToolExecutionContext = {
+  maxResultChars?: number;
+  availableTools?: string[];
+  /** Keep raw external text separate from its bounded model and UI representations. */
+  formatTextResult?: (text: string, options: TextResultOptions) => string;
   abortSignal?: AbortSignal | null;
   toolName?: string;
   callId?: string | null;
   /** Stop this run without asking the model to select another executor. */
   stopTurn?: (message: string) => void;
   reportFileMutation?: (outcome: FileMutationOutcome) => void;
-  /** Persist complete output before a tool replaces it with a bounded preview. */
-  persistOutput?: (
-    content: string,
-    options?: ToolOutputPersistenceOptions,
-  ) => string | null;
+
 };
 
 const JSON_TYPE_MAP: Record<string, (value: any) => boolean> = {

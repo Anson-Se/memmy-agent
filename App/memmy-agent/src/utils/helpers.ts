@@ -488,6 +488,56 @@ export function buildStatusContent(
   return lines.join("\n");
 }
 
+export type ToolOutputFile = {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  contentType?: string;
+  complete: boolean;
+  untrusted: boolean;
+};
+
+/** Character budgets include the entire returned reference, not just its body. */
+export function boundedHeadTail(text: string, maxChars: number, perEnd = 1500): string {
+  const budget = Math.max(0, Math.floor(maxChars));
+  if (text.length <= budget) return text;
+  const marker = "\n... [middle omitted; raw excerpts, not a complete JSON document] ...\n";
+  const room = Math.max(0, budget - marker.length);
+  if (budget < marker.length) return "[Preview omitted]".slice(0, budget);
+  const head = Math.min(perEnd, Math.ceil(room / 2));
+  const tail = Math.min(perEnd, Math.floor(room / 2));
+  const headEnd = head > 0 && /[\uD800-\uDBFF]/.test(text[head - 1]!) ? head - 1 : head;
+  const tailStart = text.length - tail + (tail > 0 && /[\uDC00-\uDFFF]/.test(text[text.length - tail]!) ? 1 : 0);
+  return text.slice(0, headEnd) + marker + (tail ? text.slice(tailStart) : "");
+}
+
+export function formatExternalToolText(
+  text: string,
+  options: { source: string; contentType?: string; suffix?: "json" | "txt"; maxChars: number },
+  context: {
+    workspace?: string | null; sessionKey?: string | null; callId: string;
+    maxChars: number; onFile: (file: ToolOutputFile) => void;
+  },
+): { content: string; displayText?: string } {
+  const budget = Math.max(1, Math.min(options.maxChars, context.maxChars));
+  const source = `Source: ${options.source}\n${options.contentType ? `Content type: ${options.contentType}\n` : ""}`;
+  const inline = `${EXTERNAL_CONTENT_BANNER}\n${source}\n${text}`;
+  // The UI's raw-text threshold is independent of the model budget.
+  const needsModelReference = inline.length > budget;
+  if (text.length <= 4000 && !needsModelReference) return { content: inline, displayText: text };
+  try {
+    const content = persistToolResult(context.workspace, context.sessionKey, context.callId, text, {
+      force: true, maxChars: budget, suffix: options.suffix, complete: true,
+      contentType: options.contentType, sourceTool: "web_fetch", untrusted: true,
+      headTail: true, sourceDescription: source, onPersist: context.onFile,
+    });
+    if (content) return { content: needsModelReference ? content : inline, ...(text.length <= 4000 ? { displayText: text } : {}) };
+  } catch { /* Return a bounded failure preview, never a fictitious file reference. */ }
+  const header = `${EXTERNAL_CONTENT_BANNER}\nFull content NOT saved.\n`;
+  const preview = header.slice(0, Math.min(header.length, budget)) + boundedHeadTail(text, Math.max(0, Math.min(4000, budget) - header.length));
+  return needsModelReference ? { content: preview } : { content: inline, displayText: preview };
+}
+
 export type PersistToolResultOptions = {
   maxChars?: number;
   force?: boolean;
@@ -497,6 +547,9 @@ export type PersistToolResultOptions = {
   sourceTool?: string;
   untrusted?: boolean;
   preview?: string;
+  headTail?: boolean;
+  sourceDescription?: string;
+  onPersist?: (file: ToolOutputFile) => void;
 };
 
 export type PersistedToolResultMetadata = {
@@ -570,6 +623,24 @@ export function persistToolResult(
       if (createdFile) fs.rmSync(filePath, { force: true });
       throw error;
     }
+  }
+  opts.onPersist?.({ path: filePath, name: path.basename(filePath), sizeBytes: fs.statSync(filePath).size,
+    contentType: opts.contentType, complete: opts.complete === true, untrusted: opts.untrusted === true });
+  if (opts.headTail) {
+    const budget = Math.min(4000, maxChars);
+    let header = `${EXTERNAL_CONTENT_BANNER}\n[tool output persisted]\nFull output saved to: ${filePath}\nOriginal size: ${textPayload.length} chars\nSaved content complete: yes\n${opts.sourceDescription ?? ""}`;
+    const guidance = "\nExcerpts only; do not infer missing fields from this preview. Use read_file with char_offset/char_limit for raw fragments, or an available exec tool to query specific fields/records with an integer-safe parser (e.g. Python json). Keep query results bounded; reduce the range if too large.\n";
+    // Keep a usable workspace-relative reference when long source metadata or an
+    // absolute workspace path would crowd out the original head/tail excerpts.
+    if (header.length + 160 > budget) {
+      const relativePath = path.relative(workspace, filePath).replaceAll(path.sep, "/");
+      header = `${EXTERNAL_CONTENT_BANNER}\n[tool output persisted]\nFull output saved to: ${relativePath}\nComplete: yes; source: ${opts.sourceTool ?? "external"}\n`;
+    }
+    if (header.length >= budget)
+      return `${EXTERNAL_CONTENT_BANNER}\nComplete content saved; reference exceeds result budget. Increase budget or use the UI file link.`.slice(0, budget);
+    const remaining = budget - header.length;
+    const hint = guidance.length < remaining / 2 ? guidance : "\nRaw excerpts, not complete JSON. Read bounded char_offset/char_limit fragments.\n";
+    return header + hint.slice(0, remaining) + boundedHeadTail(textPayload, Math.max(0, remaining - hint.length));
   }
   const previewSource = opts.preview ?? textPayload;
   const preview = previewSource.slice(0, TOOL_RESULT_PREVIEW_CHARS);

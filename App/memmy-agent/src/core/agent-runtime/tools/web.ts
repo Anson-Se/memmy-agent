@@ -4,7 +4,7 @@ import TurndownService from "turndown";
 import { loadConfig, resolveConfigEnvVars } from "../../../config/loader.js";
 import { WebFetchConfig, WebSearchConfig } from "../../../config/schema.js";
 import { validateUrlTarget } from "../../../security/network.js";
-import { buildImageContentBlocks, EXTERNAL_CONTENT_BANNER } from "../../../utils/helpers.js";
+import { buildImageContentBlocks, boundedHeadTail, EXTERNAL_CONTENT_BANNER } from "../../../utils/helpers.js";
 import { Tool, type ToolExecutionContext } from "./base.js";
 
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
@@ -32,66 +32,30 @@ type WebFetchTextResult = {
   contentType?: string;
   extractor: string;
   text: string;
-  persistedText?: string;
   suffix?: "json" | "txt";
-  previewError?: string;
   maxChars: number;
   context?: ToolExecutionContext;
 };
 
-function persistWebFetchText(
-  input: WebFetchTextResult,
-  preview: string,
-  force: boolean,
-): string | null {
-  try {
-    return input.context?.persistOutput?.(
-      input.persistedText ?? input.text,
-      {
-        suffix: input.suffix ?? "txt",
-        contentType: input.contentType,
-        complete: true,
-        sourceTool: "web_fetch",
-        untrusted: true,
-        force,
-        preview,
-      },
-    ) ?? null;
-  } catch {
-    return null;
-  }
-}
-
 function formatWebFetchTextResult(input: WebFetchTextResult): string {
-  const truncated = input.text.length > input.maxChars;
-  const previewText = truncated ? input.text.slice(0, input.maxChars) : input.text;
-  const renderedPreview = `${UNTRUSTED_BANNER}\n\n${previewText}`;
-  const base = {
-    url: input.url,
-    finalUrl: input.finalUrl,
-    status: input.status,
-    ...(input.contentType ? { content_type: input.contentType } : {}),
-    extractor: input.extractor,
-    truncated,
-    length: renderedPreview.length,
-    original_length: input.text.length,
-    untrusted: true,
-    ...(input.previewError ? { parse_error: input.previewError } : {}),
-  };
-  const persistencePreview = JSON.stringify({
-    ...base,
-    full_content_saved: true,
-    saved_content_complete: true,
-    text: `${UNTRUSTED_BANNER}\n\n${input.text.slice(0, 800)}`,
-  });
-  const persisted = persistWebFetchText(input, persistencePreview, truncated);
-  if (persisted) return persisted;
+  if (input.context?.formatTextResult) {
+    return input.context.formatTextResult(input.text, {
+      source: input.finalUrl,
+      contentType: input.contentType,
+      suffix: input.suffix ?? "txt",
+      maxChars: input.maxChars,
+    });
+  }
+  // Standalone callers have no workspace/Runner. Preserve the raw text inside the
+  // legacy envelope, but never claim a full file was saved.
+  const preview = boundedHeadTail(input.text, input.maxChars);
   return JSON.stringify({
-    ...base,
-    full_content_saved: false,
-    saved_content_complete: null,
-    content_complete: !truncated,
-    text: renderedPreview,
+    url: input.url, finalUrl: input.finalUrl, status: input.status,
+    content_type: input.contentType, extractor: input.extractor,
+    truncated: preview !== input.text, untrusted: true,
+    full_content_saved: false, saved_content_complete: null,
+    content_complete: preview === input.text,
+    text: `${UNTRUSTED_BANNER}\n\n${preview}`,
   });
 }
 
@@ -935,46 +899,10 @@ export class WebFetchTool extends Tool {
       }
 
       let text: string;
-      let persistedText: string | undefined;
       let extractor: string;
       if (contentType.includes("application/json")) {
-        // Keep the exact response text so the persisted artifact remains valid JSON
-        // and retains fields that fall beyond the bounded model preview.
-        persistedText = await response.text();
+        text = await response.text();
         extractor = "json";
-        const preparseInput: WebFetchTextResult = {
-          url,
-          finalUrl: response.url || url,
-          status: response.status,
-          contentType,
-          extractor,
-          text: persistedText,
-          persistedText,
-          suffix: "json",
-          maxChars,
-          context,
-        };
-        const preparsePreview = JSON.stringify({
-          url,
-          finalUrl: response.url || url,
-          status: response.status,
-          content_type: contentType,
-          extractor,
-          untrusted: true,
-          full_content_saved: true,
-          saved_content_complete: true,
-          text: `${UNTRUSTED_BANNER}\n\n${persistedText.slice(0, 800)}`,
-        });
-        // Persist oversized raw JSON before parsing or constructing the bounded preview.
-        persistWebFetchText(preparseInput, preparsePreview, false);
-        try {
-          text = JSON.stringify(persistedText ? JSON.parse(persistedText) : {}, null, 2);
-        } catch (error) {
-          return formatWebFetchTextResult({
-            ...preparseInput,
-            previewError: String((error as Error).message ?? error),
-          });
-        }
       } else {
         const rawText = await response.text();
         if (
@@ -996,7 +924,6 @@ export class WebFetchTool extends Tool {
         contentType,
         extractor,
         text,
-        persistedText,
         suffix: extractor === "json" ? "json" : "txt",
         maxChars,
         context,

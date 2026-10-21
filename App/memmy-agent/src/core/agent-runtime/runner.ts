@@ -29,7 +29,8 @@ import {
   extractReasoning,
   IncrementalThinkExtractor,
   maybePersistToolResult,
-  persistToolResult,
+  formatExternalToolText,
+  type ToolOutputFile,
   stripThink,
   truncateText,
 } from "../../utils/helpers.js";
@@ -1124,9 +1125,21 @@ export class AgentRunner {
     let stopTurn: string | undefined;
     try {
       let raw: any;
+      let preparedText: { content: string; displayText?: string } | undefined;
+      let outputFile: ToolOutputFile | undefined;
       const fileMutationOutcomes = new Map<string, FileMutationOutcome>();
       await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
       const toolContext: ToolExecutionContext = {
+        maxResultChars: resolveToolResultMaxChars(call.name, spec.maxToolResultChars, spec.toolResultMaxCharsByName),
+        availableTools: (spec.tools?.getDefinitions?.() ?? []).map((definition: any) => definition.function?.name ?? definition.name).filter(Boolean),
+        formatTextResult: (text, options) => {
+          preparedText = formatExternalToolText(text, options, {
+            workspace: spec.workspace, sessionKey: spec.sessionKey, callId: call.id ?? "tool",
+            maxChars: resolveToolResultMaxChars(call.name, spec.maxToolResultChars, spec.toolResultMaxCharsByName),
+            onFile: (file) => { outputFile = file; },
+          });
+          return preparedText.content;
+        },
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
         callId: call.id ?? null,
@@ -1137,22 +1150,7 @@ export class AgentRunner {
             changed: outcome.changed,
           });
         },
-        ...(spec.workspace ? {
-          persistOutput: (content, options = {}) => persistToolResult(
-            spec.workspace,
-            spec.sessionKey ?? "default",
-            call.id ?? "tool",
-            content,
-            {
-              maxChars: resolveToolResultMaxChars(
-                call.name,
-                spec.maxToolResultChars,
-                spec.toolResultMaxCharsByName,
-              ),
-              ...options,
-            },
-          ),
-        } : {}),
+
       };
       const run = tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
@@ -1191,7 +1189,9 @@ export class AgentRunner {
           )),
         );
       }
-      const result = this.normalizeToolResult(spec, call.id, call.name, raw);
+      const result = preparedText?.content === raw ? raw : this.normalizeToolResult(spec, call.id, call.name, raw);
+      if (preparedText?.displayText !== undefined) event.display_text = preparedText.displayText;
+      if (outputFile) event.output_file = outputFile;
       if (stopTurn) event.status = "error";
       await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
       return { call, result, event, error, ...(stopTurn ? { stopTurn } : {}) };
