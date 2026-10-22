@@ -324,6 +324,57 @@ describe("SourcesSubPage memory service recovery", () => {
     expect(restartButton().disabled).toBe(false);
     expect(oldHealth).toHaveBeenCalledTimes(1);
   });
+
+  it("bounds a never-settling restart and unlocks scans only after a fresh snapshot", async () => {
+    const clients = createClients(async () => healthy);
+    restart.mockReturnValue(new Promise(() => undefined));
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, status: "idle", version: { generation: 2, sequence: 0 } }));
+    await render(clients);
+    const scan = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")!;
+    await act(async () => { restartButton().click(); });
+    expect(scan.disabled).toBe(true);
+
+    await advance(30_000);
+    expect(restartButton().disabled).toBe(false);
+    expect(scan.disabled).toBe(true);
+    expect(container.textContent).not.toContain("记忆服务已重新启动");
+
+    await advance(1_000);
+    expect(clients.agentSources.getScanStatus).toHaveBeenCalled();
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual({ generation: 2, sequence: 0 });
+    expect(scan.disabled).toBe(false);
+  });
+
+  it("aborts a hanging post-restart status read and ignores its late result", async () => {
+    const clients = createClients(async () => healthy);
+    const late = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
+    let statusCalls = 0;
+    let statusSignal: AbortSignal | undefined;
+    const fresh = { active: false, progress: null, status: "idle" as const, version: { generation: 3, sequence: 0 } };
+    clients.agentSources.getScanStatus = vi.fn((options?: { signal?: AbortSignal }) => {
+      statusCalls += 1;
+      if (statusCalls === 1) {
+        statusSignal = options?.signal;
+        return late.promise;
+      }
+      return Promise.resolve(fresh);
+    });
+    await render(clients);
+    const scan = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")!;
+    await act(async () => { restartButton().click(); });
+    expect(scan.disabled).toBe(true);
+
+    await advance(5_000);
+    expect(statusSignal?.aborted).toBe(true);
+    expect(restartButton().disabled).toBe(false);
+    expect(scan.disabled).toBe(true);
+    await advance(1_000);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(fresh.version);
+    expect(scan.disabled).toBe(false);
+
+    await act(async () => { late.resolve({ active: true, progress: null, status: "idle", version: { generation: 2, sequence: 99 } }); });
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(fresh.version);
+  });
 });
 
 function ClientsHarness(props: { clients: AppClients }) {

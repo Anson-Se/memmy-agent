@@ -28,7 +28,7 @@ import { requestJson } from "./http.js";
 export interface AgentSourceClient {
   listSources(): Promise<AgentSourceView[]>;
   startScan(input?: AgentSourceScanInput): Promise<AgentSourceScanJobResponse>;
-  getScanStatus(): Promise<AgentSourceScanStatusResponse>;
+  getScanStatus(options?: { signal?: AbortSignal }): Promise<AgentSourceScanStatusResponse>;
   getScanResults(jobId: string, cursor?: string, limit?: number): Promise<ScanResultPage>;
   stopScan(input?: ScanControlInput): Promise<AgentSourceScanControlResponse | void>;
   cancelScan(input?: ScanControlInput): Promise<AgentSourceScanControlResponse | void>;
@@ -61,11 +61,12 @@ export function createHttpAgentSourceClient(config: RuntimeConfig): AgentSourceC
       });
     },
 
-    async getScanStatus() {
+    async getScanStatus(options) {
       return requestJson({
         config,
         path: "/api/agent-sources/scan/status",
-        schema: AgentSourceScanStatusResponseSchema
+        schema: AgentSourceScanStatusResponseSchema,
+        init: options?.signal ? { signal: options.signal } : undefined
       });
     },
 

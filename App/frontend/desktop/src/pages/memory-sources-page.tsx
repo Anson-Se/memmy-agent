@@ -58,6 +58,44 @@ import {
 type MemoryServiceStatus = "checking" | "ok" | "unavailable";
 const MEMORY_SERVICE_HEALTH_INTERVAL_MS = 5_000;
 const MEMORY_SERVICE_HEALTH_TIMEOUT_MS = 10_000;
+const MEMORY_SCAN_STATUS_TIMEOUT_MS = 5_000;
+const MEMORY_SERVICE_RESTART_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  message: string,
+  parentSignal?: AbortSignal
+): Promise<T> {
+  const controller = new AbortController();
+  if (parentSignal?.aborted) {
+    const reason = parentSignal.reason instanceof Error ? parentSignal.reason : new Error(message);
+    controller.abort(reason);
+    return Promise.reject(reason);
+  }
+  let timeoutId = 0;
+  let rejectTimeout!: (error: Error) => void;
+  const timeout = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+  const abort = (error: Error) => {
+    if (controller.signal.aborted) return;
+    controller.abort(error);
+    rejectTimeout(error);
+  };
+  const parentAbort = () => abort(parentSignal?.reason instanceof Error ? parentSignal.reason : new Error(message));
+  parentSignal?.addEventListener("abort", parentAbort, { once: true });
+  timeoutId = window.setTimeout(() => abort(new Error(message)), timeoutMs);
+  let request: Promise<T>;
+  try {
+    request = operation(controller.signal);
+  } catch (error) {
+    request = Promise.reject(error);
+  }
+  return Promise.race([request, timeout]).finally(() => {
+    window.clearTimeout(timeoutId);
+    parentSignal?.removeEventListener("abort", parentAbort);
+    if (!controller.signal.aborted) controller.abort();
+  });
+}
 
 interface MemoryServiceHealthResult {
   ready: boolean;
@@ -103,6 +141,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const [dataDir, setDataDir] = useState("");
   const [memoryServiceStatus, setMemoryServiceStatus] = useState<MemoryServiceStatus>(() => memoryServiceStatusFromBootstrap(state.bootstrap?.health.memory));
   const [memoryServiceBusy, setMemoryServiceBusy] = useState(false);
+  const [scanStateSyncRequired, setScanStateSyncRequired] = useState(false);
   const [memoryServiceMessage, setMemoryServiceMessage] = useState("");
   const [memoryServiceError, setMemoryServiceError] = useState("");
   const memoryServiceMonitor = useRef<MemoryServiceMonitor | null>(null);
@@ -124,7 +163,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
   const scanCancelling = Boolean(state.agentSources.cancellingScanJobId || state.agentSources.scanControl?.control === "cancel");
-  const scanControlBusy = memoryServiceBusy || Boolean(state.agentSources.scanControl);
+  const scanControlBusy = memoryServiceBusy || scanStateSyncRequired || Boolean(state.agentSources.scanControl);
   const showScanProgress = isScanning || scanStopped || scanCancelling;
   const hasDeterminateScanProgress = Boolean(scanProgress && scanProgress.phase !== "scan" && scanProgress.phase !== "stopped" && scanProgress.total > 0);
   const memoryUnavailable = memoryServiceStatus === "unavailable";
@@ -260,6 +299,45 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   }, [clients, dispatch]);
 
   useEffect(() => {
+    if (!clients || memoryServiceBusy || !scanStateSyncRequired) return;
+    let active = true;
+    let pending = false;
+    const reconcile = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const health = await withTimeout(
+          (signal) => clients.memoryRuntime.health(signal),
+          MEMORY_SERVICE_HEALTH_TIMEOUT_MS,
+          t("memory.healthCheckTimeout")
+        );
+        if (!health.ok || !health.storage.ready) return;
+        const scanStatus = await withTimeout(
+          (signal) => clients.agentSources.getScanStatus({ signal }),
+          MEMORY_SCAN_STATUS_TIMEOUT_MS,
+          t("memory.restartServiceStillUnavailable")
+        );
+        if (!active) return;
+        dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
+        if (scanStatus.unavailable) return;
+        dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
+        setMemoryServiceStatus("ok");
+        setMemoryServiceError("");
+        setScanStateSyncRequired(false);
+      } catch {
+        // Keep scan actions locked until a fresh full snapshot can be read.
+      } finally {
+        pending = false;
+      }
+    };
+    const timer = window.setInterval(() => void reconcile(), 1_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [clients, dispatch, memoryServiceBusy, scanStateSyncRequired, t]);
+
+  useEffect(() => {
     if (!clients) return;
     let active = true;
     const refresh = () => {
@@ -354,42 +432,52 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
     monitor.healthController = null;
     monitor.pendingHealth = null;
     setMemoryServiceBusy(true);
+    setScanStateSyncRequired(true);
     setMemoryServiceStatus("checking");
     setMemoryServiceMessage("");
     setMemoryServiceError("");
-    void (async () => {
-      try {
-        await restart();
-        if (!isCurrent()) return;
-        clearMemoryPanelCache();
-        monitor.restarting = false;
-        const health = await monitor.refresh();
-        if (!isCurrent()) return;
-        if (health.ready) {
-          const scanStatus = await clients.agentSources.getScanStatus();
-          if (!isCurrent()) return;
-          dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
-          dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
-          if (scanStatus.unavailable) {
-            setMemoryServiceStatus("unavailable");
-            setMemoryServiceError(t("memory.restartServiceStillUnavailable"));
-            return;
-          }
-          setMemoryServiceMessage(t("memory.restartServiceDone"));
-        } else {
-          setMemoryServiceError(health.error
-            ? t("memory.restartServiceStillUnavailableWithReason", { reason: health.error })
-            : t("memory.restartServiceStillUnavailable"));
-        }
-      } catch (error) {
+    void withTimeout(async (signal) => {
+      await restart();
+      if (signal.aborted || !isCurrent()) return;
+      clearMemoryPanelCache();
+
+      const health = await withTimeout(
+        (healthSignal) => clients.memoryRuntime.health(healthSignal),
+        MEMORY_SERVICE_HEALTH_TIMEOUT_MS,
+        t("memory.healthCheckTimeout"),
+        signal
+      );
+      if (signal.aborted || !isCurrent()) return;
+      if (!health.ok || !health.storage.ready) {
+        throw new Error(t("memory.restartServiceStillUnavailable"));
+      }
+      setMemoryServiceStatus("ok");
+      setMemoryServiceError("");
+
+      const scanStatus = await withTimeout(
+        (statusSignal) => clients.agentSources.getScanStatus({ signal: statusSignal }),
+        MEMORY_SCAN_STATUS_TIMEOUT_MS,
+        t("memory.restartServiceStillUnavailable"),
+        signal
+      );
+      if (signal.aborted || !isCurrent()) return;
+      dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
+      if (scanStatus.unavailable) {
+        throw new Error(t("memory.restartServiceStillUnavailable"));
+      }
+      dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
+      setScanStateSyncRequired(false);
+      setMemoryServiceMessage(t("memory.restartServiceDone"));
+    }, MEMORY_SERVICE_RESTART_TIMEOUT_MS, t("memory.restartServiceFailed", { reason: t("memory.restartServiceStillUnavailable") }))
+      .catch((error) => {
         if (!isCurrent()) return;
         setMemoryServiceStatus("unavailable");
         setMemoryServiceError(t("memory.restartServiceFailed", { reason: formatErrorMessage(error) }));
-      } finally {
+      })
+      .finally(() => {
         monitor.restarting = false;
         if (isCurrent()) setMemoryServiceBusy(false);
-      }
-    })();
+      });
   }
 
   function reinstallCliTools() {

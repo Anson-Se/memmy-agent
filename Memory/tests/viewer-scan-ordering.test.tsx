@@ -22,7 +22,7 @@ beforeEach(() => {
   });
 });
 afterEach(() => { act(() => render(null, container)); container.remove(); vi.clearAllMocks(); vi.useRealTimers(); });
-const mount = async () => { await act(async () => { render(h(AgentAccessTab, { agentAccess: {}, onPatch: async () => ({}) }), container); }); await act(async () => { await Promise.resolve(); }); };
+const mount = async () => { await act(async () => { render(h(AgentAccessTab, { agentAccess: {}, onPatch: async () => ({}) }), container); }); await act(async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); }); };
 const control = (index: number) => container.querySelectorAll<HTMLButtonElement>(".agent-scan-progress__controls button")[index]!;
 const card = () => container.querySelector(".agent-scan-progress");
 it.each(["pause", "cancel"] as const)("7/8: %s response wins over a pre-control polling response", async (kind) => {
@@ -61,8 +61,9 @@ it.each(["idle", "running", "paused", "completed"] as const)("restart synchroniz
   const before: AgentSourceScanState = { ...running(), running: status === "running", status, completedAt: status === "completed" ? "2026-10-21T00:01:00Z" : null, progress: resumable ? { ...running().progress!, phase: status === "paused" ? "stopped" : "scan" } : null };
   nextStatus = async () => before;
   let healthCalls = 0;
+  let statusCalls = 0;
   vi.mocked(api.get).mockImplementation(async path => {
-    if (path.endsWith("scan/status")) return nextStatus();
+    if (path.endsWith("scan/status")) { statusCalls += 1; return nextStatus(); }
     if (path.endsWith("health")) return { ok: true, uptimeMs: ++healthCalls === 1 ? 10_000 : 10 };
     if (path === "/api/v1/agent-sources") return { executorAvailable: true, sources: [] };
     return { installed: false };
@@ -73,12 +74,14 @@ it.each(["idle", "running", "paused", "completed"] as const)("restart synchroniz
   const fresh = deferred<AgentSourceScanState>(); nextStatus = () => fresh.promise;
   await act(async () => { button("重启服务").click(); for (let i = 0; i < 10; i++) await Promise.resolve(); });
   await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  expect(statusCalls).toBe(2);
   expect(container.textContent).not.toContain("记忆服务已重新启动");
   if (resumable) expect(control(0).disabled).toBe(true);
   else expect(button("同步新增").disabled).toBe(true);
   const after: AgentSourceScanState = { ...before, running: false, ...(resumable ? { status: "paused", progress: { ...running().progress!, phase: "stopped" } } : {}), version: { generation: 2, sequence: 0 } };
-  await act(async () => { fresh.resolve(after); for (let i = 0; i < 10; i++) await Promise.resolve(); });
+  await act(async () => { fresh.resolve(after); for (let i = 0; i < 30; i++) await Promise.resolve(); });
   nextStatus = async () => after;
+  expect((resumable ? control(0) : button("同步新增")).disabled).toBe(false);
   await act(async () => { (resumable ? control(0) : button("同步新增")).click(); });
   expect(api.post).toHaveBeenLastCalledWith("/api/v1/agent-sources/scan", {
     sourceId: resumable ? "codex" : "all",
@@ -103,7 +106,100 @@ it("does not report restart success when the full scan-state read fails", async 
   await act(async () => { await vi.advanceTimersByTimeAsync(250); });
   expect(container.textContent).toContain("scan state unavailable");
   expect(container.textContent).not.toContain("记忆服务已重新启动");
+  expect(control(0).disabled).toBe(true);
+  nextStatus = async () => running();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
   expect(control(0).disabled).toBe(false);
+});
+
+it("times out a hanging restart, keeps scan actions locked, then reconciles a fresh status", async () => {
+  let healthCalls = 0;
+  vi.mocked(api.get).mockImplementation(async (path) => {
+    if (path.endsWith("scan/status")) return nextStatus();
+    if (path.endsWith("health")) {
+      healthCalls += 1;
+      if (healthCalls === 1) return new Promise(() => undefined);
+      return { ok: true, uptimeMs: 10 };
+    }
+    if (path === "/api/v1/agent-sources") return { executorAvailable: true, sources: [] };
+    return { installed: false };
+  });
+  await mount();
+  vi.mocked(api.post).mockResolvedValue({ ok: true });
+  const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent?.trim() === text)!;
+  await act(async () => { button("重启服务").click(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+  expect(button("重启服务").disabled).toBe(false);
+  expect(button("同步新增").disabled).toBe(true);
+  expect(container.textContent).not.toContain("记忆服务已重新启动");
+
+  nextStatus = async () => ({ ...running(), running: false, status: "idle", jobId: null, attemptId: undefined, startedAt: undefined, progress: null, version: { generation: 2, sequence: 0 } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  expect(button("同步新增").disabled).toBe(false);
+  expect(card()).toBeNull();
+});
+
+it("ignores a late status response after its request deadline", async () => {
+  const late = deferred<AgentSourceScanState>();
+  let statusCalls = 0;
+  let healthCalls = 0;
+  nextStatus = async () => running();
+  vi.mocked(api.get).mockImplementation(async (path) => {
+    if (path.endsWith("scan/status")) {
+      statusCalls += 1;
+      if (statusCalls === 2) return late.promise;
+      return { ...running(), version: { generation: 3, sequence: statusCalls } };
+    }
+    if (path.endsWith("health")) return { ok: true, uptimeMs: ++healthCalls === 1 ? 10_000 : 10 };
+    if (path === "/api/v1/agent-sources") return { executorAvailable: true, sources: [] };
+    return { installed: false };
+  });
+  vi.mocked(api.post).mockResolvedValue({ ok: true });
+  await mount();
+  await act(async () => { [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent?.trim() === "重启服务")!.click(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  expect(card()).not.toBeNull();
+  const staleIdle: AgentSourceScanState = { ...running(), running: false, status: "idle", jobId: null, attemptId: undefined, startedAt: null, progress: null, version: { generation: 2, sequence: 99 } };
+  await act(async () => { late.resolve(staleIdle); });
+  expect(card()).not.toBeNull();
+  expect(control(0).textContent).toContain("暂停");
+});
+
+it("bounds the post-restart scan read and ignores a late response after recovery", async () => {
+  const late = deferred<AgentSourceScanState>();
+  let statusCalls = 0;
+  let healthCalls = 0;
+  let allowFreshStatus = false;
+  let statusSignal: AbortSignal | undefined;
+  vi.mocked(api.get).mockImplementation(async (path, options) => {
+    if (path.endsWith("scan/status")) {
+      statusCalls += 1;
+      if (statusCalls === 1) return running();
+      if (statusCalls === 2) { statusSignal = options?.signal; return late.promise; }
+      if (!allowFreshStatus) return new Promise(() => undefined);
+      return { ...running(), running: false, status: "idle", jobId: null, attemptId: undefined, startedAt: undefined, progress: null, version: { generation: 2, sequence: 0 } };
+    }
+    if (path.endsWith("health")) return { ok: true, uptimeMs: ++healthCalls === 1 ? 10_000 : 10 };
+    if (path === "/api/v1/agent-sources") return { executorAvailable: true, sources: [] };
+    return { installed: false };
+  });
+  vi.mocked(api.post).mockResolvedValue({ ok: true });
+  await mount();
+  const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(b => b.textContent?.trim() === text)!;
+  await act(async () => { button("重启服务").click(); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5_250); });
+  expect(statusSignal?.aborted).toBe(true);
+  expect(button("重启服务").disabled).toBe(false);
+  expect(button("同步新增").disabled).toBe(true);
+  expect(container.textContent).not.toContain("记忆服务已重新启动");
+
+  allowFreshStatus = true;
+  await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+  expect(button("同步新增").disabled).toBe(false);
+
+  await act(async () => { late.resolve(running()); });
+  expect(card()).toBeNull();
+  expect(button("同步新增").disabled).toBe(false);
 });
 
 
