@@ -72,17 +72,17 @@ describe("Memory HTTP unified worker entry", () => {
     let manual: Promise<Response> | undefined;
     try {
       expect((await post(base, "/api/v1/worker/import-summaries/enqueue", { memoryIds: targets })).status).toBe(200);
-      await waitFor(() => active === 4);
+      await waitFor(() => active === 1);
       manual = post(base, "/api/v1/worker/run", { limit: 4, priorityCohortOnly: true });
       await waitFor(() => run.mock.calls.length >= 2);
       // Both routes entered the real service, but only the active scheduler
-      // request can claim. The second request must wait, not add four workers.
-      expect(active).toBe(4);
-      expect((db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='leased'").get() as { n: number }).n).toBe(4);
+      // request can claim. The local provider permits one request; the second entry cannot add another.
+      expect(active).toBe(1);
+      expect((db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='leased'").get() as { n: number }).n).toBe(1);
     } finally { release(); }
     expect((await manual!).status).toBe(200);
     await waitFor(() => targets.every(id => service.memoryProcessingStatus([id], { namespace }).items[0]?.state === "ready"));
-    expect(peak).toBe(4);
+    expect(peak).toBe(1);
   });
 
   it("waits for an active automatic drain and its queued manual request when closing", async () => {
@@ -105,7 +105,7 @@ describe("Memory HTTP unified worker entry", () => {
     let closing: Promise<void> | undefined;
     try {
       await post(base, "/api/v1/worker/import-summaries/enqueue", { memoryIds: targets });
-      await waitFor(() => entered === 4);
+      await waitFor(() => entered === 1);
       // Closing sockets may reject the client, but accepted server work must
       // still settle before cleanup completes.
       const pending = db.db.prepare("SELECT target_memory_id FROM evolution_jobs WHERE job_type='import_summary' AND status='queued'").all() as Array<{ target_memory_id: string }>;
@@ -115,11 +115,21 @@ describe("Memory HTTP unified worker entry", () => {
       closing = closeMemoryHttpServer(server).then(() => { closed = true; });
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(closed).toBe(false);
-      expect(entered).toBe(4);
+      expect(entered).toBe(1);
     } finally { release(); }
     await closing;
     await manual;
-    expect(entered).toBe(8);
+    const completedRuns = await Promise.all(run.mock.results.map(result => result.value));
+    expect(completedRuns.reduce((sum, result) => sum + result.leased + result.embeddingRetries.leased, 0)).toBe(8);
+    expect(entered).toBeGreaterThan(1);
+    const completedSummaries = db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE job_type='import_summary' AND status='succeeded'").get() as { n: number };
+    expect(completedSummaries.n).toBe(entered);
+    // Continuous drains can finish generated embedding jobs within the same
+    // budget. Every accepted execution settles; work not admitted stays queued.
+    expect((db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='leased'").get() as { n: number }).n).toBe(0);
+    const waiting = db.db.prepare("SELECT attempts,lease_token FROM evolution_jobs WHERE status='queued'").all();
+    expect(waiting.every(row => (row as { attempts: number; lease_token: string | null }).attempts === 0
+      && (row as { lease_token: string | null }).lease_token === null)).toBe(true);
   });
 
   it("retains manual retry wake-up through the same background scheduler", async () => {

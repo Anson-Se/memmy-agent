@@ -1,0 +1,162 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryDb } from "../../src/storage/db.js";
+import { Repositories, type EvolutionJobRecord } from "../../src/storage/repositories.js";
+import { claimFairWorkerBatch, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
+import { resolveWorkerSchedulingOptions } from "../../src/service/worker/worker-scheduling-options.js";
+
+const at = "2026-10-22T00:00:00.000Z", now = Date.parse(at);
+const resources: Array<{ db: MemoryDb; root: string }> = [];
+function harness() {
+  const root = mkdtempSync(join(tmpdir(), "memmy-admission-claim-"));
+  const db = new MemoryDb({ path: join(root, "memory.sqlite") });
+  resources.push({ db, root });
+  const repos = new Repositories(db.db), runtime = repos.runtime;
+  function job(id: string, jobType: EvolutionJobRecord["jobType"] = "trace_summary", targetMemoryId = id) {
+    return runtime.enqueueJob({ id, jobType, targetMemoryId, userId: "user", status: "queued", payload: {},
+      attempts: 0, maxAttempts: 3, createdAt: at, updatedAt: at });
+  }
+  function retry(id: string) {
+    return runtime.enqueueEmbeddingRetry({ id, targetKind: "trace", targetId: id, vectorField: "vec_summary", sourceText: id, now });
+  }
+  function claim(limit: number, admit: (work: FairClaimedWork) => { release(): void } | undefined,
+    algorithm: "wrr" | "legacy" = "wrr", priorityCohortOnly = false) {
+    return claimFairWorkerBatch(repos, { at, limit, includeRetries: true, owner: "main", retryOwner: "retry",
+      leaseSeconds: 60, retryLeaseMs: 60_000, options: resolveWorkerSchedulingOptions({ algorithm }, {}),
+      admit, priorityCohortOnly });
+  }
+  return { db, repos, runtime, job, retry, claim };
+}
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const { db, root } of resources.splice(0)) {
+    if (db.db.open) db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+describe("atomic resource admission before queue claims", () => {
+  it("does not claim, count an attempt or advance WRR when all permits are busy", () => {
+    const h = harness(); const before = h.job("busy"); h.retry("retry-busy");
+    const admit = vi.fn((_work: FairClaimedWork) => undefined);
+    expect(h.claim(2, admit)).toEqual([]);
+    expect(admit).toHaveBeenCalledTimes(2);
+    expect(h.runtime.getJob("busy")).toEqual(before);
+    expect(h.runtime.getEmbeddingRetry("retry-busy")).toMatchObject({ status: "pending", claimedBy: null });
+    expect(h.runtime.listKv("worker.scheduler.wrr_cursor")).toEqual([]);
+  });
+
+  it("finds a different resource beyond more than five hundred blocked heads in the same lane", () => {
+    const h = harness();
+    for (let i = 0; i < 551; i++) h.job(`blocked-${i}`);
+    const before = h.job("free-embedding", "user_memory_embedding");
+    const release = vi.fn();
+    const admit = vi.fn((work: FairClaimedWork) => work.queue === "main" && work.job.jobType === "user_memory_embedding" ? { release } : undefined);
+    const work = h.claim(1, admit);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["free-embedding"]);
+    expect(work[0]?.admission).toBeDefined();
+    expect(admit).toHaveBeenCalledTimes(552);
+    expect(h.runtime.getJob("blocked-0")).toMatchObject({ status: "queued", attempts: 0 });
+    expect(h.runtime.getJob("free-embedding")?.enqueueSeq).toBe(before.enqueueSeq);
+    expect(release).not.toHaveBeenCalled();
+    work[0]!.admission!.release();
+    work[0]!.admission!.release();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an acquired permit after main CAS loses and leaves the round intact", () => {
+    const h = harness(); h.job("lost-cas");
+    vi.spyOn(h.runtime, "claimQueuedJob").mockReturnValueOnce(undefined);
+    const release = vi.fn();
+    const admit = vi.fn((work: FairClaimedWork) => {
+      expect(work.queue === "main" && work.job).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
+      return { release };
+    });
+    expect(h.claim(1, admit)).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.runtime.getJob("lost-cas")?.status).toBe("queued");
+    expect(h.runtime.listKv("worker.scheduler.wrr_cursor")).toEqual([]);
+  });
+
+  it("keeps FIFO across both backing tables while paging past busy resources", () => {
+    const h = harness();
+    for (let i = 0; i < 401; i++) { h.job(`repair-${i}`, "decision_repair"); h.retry(`blocked-retry-${i}`); }
+    h.retry("ready-retry");
+    const seen: number[] = [];
+    const work = h.claim(1, item => {
+      seen.push((item.queue === "main" ? item.job.enqueueSeq : item.retry.enqueueSeq)!);
+      return item.queue === "embedding_retry" && item.retry.id === "ready-retry" ? { release() {} } : undefined;
+    });
+    expect(work.map(item => item.queue === "embedding_retry" && item.retry.id)).toEqual(["ready-retry"]);
+    expect(seen).toHaveLength(803);
+    expect(seen).toEqual([...seen].sort((a, b) => a - b));
+  });
+
+  it("returns a retry permit after retry CAS loses", () => {
+    const h = harness(); h.retry("lost-cas");
+    vi.spyOn(h.runtime, "claimEmbeddingRetryById").mockReturnValueOnce(undefined);
+    const release = vi.fn();
+    expect(h.claim(1, () => ({ release }))).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.runtime.getEmbeddingRetry("lost-cas")?.status).toBe("pending");
+  });
+
+  it("returns every acquired permit and rolls back every claim on a cursor write failure", () => {
+    const h = harness(); h.job("one"); h.job("two");
+    const releases = [vi.fn(), vi.fn()]; let index = 0;
+    vi.spyOn(h.runtime, "setKv").mockImplementation(() => { throw new Error("cursor disk failure"); });
+    expect(() => h.claim(2, () => ({ release: releases[index++]! }))).toThrow("cursor disk failure");
+    expect(releases.map(release => release.mock.calls.length)).toEqual([1, 1]);
+    for (const id of ["one", "two"]) expect(h.runtime.getJob(id)).toMatchObject({ status: "queued", attempts: 0, leaseCount: 0 });
+  });
+
+  it("rolls back earlier permits and claims if admission itself throws", () => {
+    const h = harness(); h.job("one"); h.job("two");
+    const release = vi.fn(); let calls = 0;
+    expect(() => h.claim(2, () => {
+      if (calls++ > 0) throw new Error("admission failure");
+      return { release };
+    })).toThrow("admission failure");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.runtime.getJob("one")).toMatchObject({ status: "queued", attempts: 0 });
+  });
+
+  it("uses legacy priority order rather than WRR when admission is enabled in rollback mode", () => {
+    const h = harness();
+    for (let i = 0; i < 6; i++) { h.job(`summary-${i}`); h.job(`repair-${i}`, "decision_repair"); }
+    const work = h.claim(5, () => ({ release() {} }), "legacy");
+    expect(work.map(item => item.queue === "main" && item.job.jobType)).toEqual(Array(5).fill("trace_summary"));
+    expect(h.runtime.listKv("worker.scheduler.wrr_cursor")).toEqual([]);
+  });
+
+  it("scans legacy pages past blocked resources and keeps unclaimed retry surplus available", () => {
+    const h = harness();
+    for (let i = 0; i < 551; i++) h.job(`blocked-${i}`);
+    h.job("free-main", "user_memory_embedding"); h.retry("free-retry"); h.retry("surplus");
+    const release = vi.fn();
+    const work = h.claim(2, item => item.queue === "embedding_retry" || item.job.id === "free-main" ? { release } : undefined, "legacy");
+    expect(work.map(item => item.queue === "main" ? item.job.id : item.retry.id)).toEqual(["free-main", "free-retry"]);
+    expect(h.runtime.getEmbeddingRetry("surplus")?.status).toBe("pending");
+    expect(h.runtime.getJob("blocked-550")?.status).toBe("queued");
+  });
+
+  it("does not skip a later legacy page when earlier admitted rows leave the eligible result set", () => {
+    const h = harness();
+    for (let i = 0; i < 199; i++) h.job(`blocked-before-${i}`);
+    h.job("free-one");
+    for (let i = 0; i < 201; i++) h.job(`blocked-after-${i}`);
+    h.job("free-two");
+    const work = h.claim(2, item => item.queue === "main" && item.job.id.startsWith("free-") ? { release() {} } : undefined, "legacy");
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["free-one", "free-two"]);
+  });
+
+  it("sets the legacy cohort from its first admitted main job and then uses spare capacity for retry", () => {
+    const h = harness(); h.job("blocked-summary"); h.job("free-import", "import_summary"); h.job("other-priority", "reflection"); h.retry("retry");
+    const work = h.claim(3, item => item.queue === "main" && item.job.id === "blocked-summary" ? undefined : { release() {} }, "legacy", true);
+    expect(work.map(item => item.queue === "main" ? item.job.id : item.retry.id)).toEqual(["free-import", "retry"]);
+    expect(h.runtime.getJob("other-priority")?.status).toBe("queued");
+    expect(h.runtime.getJob("blocked-summary")?.status).toBe("queued");
+  });
+});

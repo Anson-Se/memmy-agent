@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryModelTaskRouter, type MemoryModelTaskContext } from "../src/model/task-routing.js";
+import { WorkerConcurrencyController, providerDescriptor } from "../src/service/worker/worker-concurrency.js";
 import type { Embedder, LlmClient, LlmCompletionOptions, LlmMessage } from "../src/model/types.js";
 
 function client(name: string): LlmClient {
@@ -65,6 +66,109 @@ function embedder(name: string): Embedder {
 }
 
 describe("MemoryModelTaskRouter", () => {
+  it("allows shutdown from an inherited callback after its foreground task completed", async () => {
+    const router = new MemoryModelTaskRouter(() => context("completed"));
+    let continueCallback!: () => void;
+    const gate = new Promise<void>(resolve => { continueCallback = resolve; });
+    let completeCallback!: () => void, rejectCallback!: (error: unknown) => void;
+    const completed = new Promise<void>((resolve, reject) => { completeCallback = resolve; rejectCallback = reject; });
+    await router.run(async () => {
+      setImmediate(() => {
+        void (async () => { await gate; await router.stop(); })().then(completeCallback, rejectCallback);
+      });
+    });
+    continueCallback();
+    await expect(completed).resolves.toBeUndefined();
+  });
+
+  it("rejects new work from an inherited completed-task callback after shutdown", async () => {
+    const router = new MemoryModelTaskRouter(() => context("completed"));
+    let continueCallback!: () => void;
+    const gate = new Promise<void>(resolve => { continueCallback = resolve; });
+    let completeCallback!: (error: unknown) => void;
+    const completed = new Promise<unknown>(resolve => { completeCallback = resolve; });
+    let invoked = false;
+    await router.run(async () => {
+      setImmediate(() => {
+        void (async () => {
+          await gate;
+          try { router.run(() => { invoked = true; }); completeCallback(undefined); }
+          catch (error) { completeCallback(error); }
+        })();
+      });
+    });
+    await router.stop(); continueCallback();
+    expect(await completed).toBeInstanceOf(Error);
+    expect(invoked).toBe(false);
+  });
+
+  it("waits for complete business tasks after model responses while stopping new foreground tasks", async () => {
+    const router = new MemoryModelTaskRouter(() => context("closing"));
+    let response!: () => void, processed!: () => void;
+    const responseGate = new Promise<void>(resolve => { response = resolve; });
+    const processingGate = new Promise<void>(resolve => { processed = resolve; });
+    let postRequestWrite = false, stopped = false;
+    const business = router.run(async () => { await responseGate; await processingGate; postRequestWrite = true; });
+    const stop = router.stop().then(() => { stopped = true; });
+    response(); await Promise.resolve();
+    expect(stopped).toBe(false); expect(postRequestWrite).toBe(false);
+    expect(() => router.run(() => "new task")).toThrow(/clos|stop/i);
+    processed(); await Promise.all([business, stop]);
+    expect(postRequestWrite).toBe(true); expect(stopped).toBe(true);
+  });
+
+  it("allows an already admitted worker to enter its queued snapshot after router shutdown begins", async () => {
+    const c = new WorkerConcurrencyController({}, {});
+    const router = new MemoryModelTaskRouter(() => context("claimed"), c);
+    const snapshot = router.snapshot();
+    const p = c.tryAcquire({ resourceClass: "summary", providers: providerDescriptor(snapshot.summary.config, c.limits).providers, scopeKeys: [] })!;
+    await router.stop(); const close = c.close();
+    expect(await p.run(() => router.runWith(snapshot, () => router.client("summary").complete([], { operation: "finish" })))).toBe("claimed-summary");
+    p.release(); await close;
+  });
+
+  it("runs the admission snapshot after configuration reload without resolving a new provider", async () => {
+    let current = context("admitted"), resolutions = 0;
+    const controller = new WorkerConcurrencyController({}, {});
+    const router = new MemoryModelTaskRouter(() => { resolutions++; return current; }, controller);
+    const snapshot = router.snapshot();
+    const providers = [snapshot.summary, snapshot.evolution].flatMap(delegate => providerDescriptor(delegate.config, controller.limits).providers);
+    const permit = controller.tryAcquire({ resourceClass: "summary", providers, scopeKeys: [] })!;
+    current = context("reloaded");
+    try {
+      const result = await permit.run(() => router.runWith(snapshot, async () => [
+        await router.client("summary").complete([], { operation: "test" }),
+        await router.client("evolution").complete([], { operation: "test" })
+      ]));
+      expect(result).toEqual(["admitted-summary", "admitted-evolution"]);
+      expect(resolutions).toBe(1); expect(Object.isFrozen(snapshot)).toBe(true);
+    } finally { permit.release(); }
+  });
+
+  it("guards real routed calls to distinct models sharing a local endpoint", async () => {
+    const task = context("shared");
+    const controller = new WorkerConcurrencyController({}, {});
+    let active = 0, maximum = 0;
+    for (const delegate of [task.summary, task.evolution]) {
+      delegate.config.endpoint = "http://localhost:1234/v1";
+      delegate.complete = async () => {
+        maximum = Math.max(maximum, ++active);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        active--; return "ok";
+      };
+    }
+    const router = new MemoryModelTaskRouter(() => task, controller);
+    const providers = [task.summary, task.evolution].flatMap(delegate => providerDescriptor(delegate.config, controller.limits).providers);
+    const permit = controller.tryAcquire({ resourceClass: "summary", providers, scopeKeys: [] })!;
+    try {
+      await permit.run(() => router.runWith(task, () => Promise.all([
+        router.client("summary").complete([], { operation: "one" }),
+        router.client("evolution").complete([], { operation: "two" })
+      ])));
+      expect(maximum).toBe(1);
+    } finally { permit.release(); }
+  });
+
   it("keeps one immutable model snapshot across all LLM calls in a task", async () => {
     let resolutions = 0;
     const router = new MemoryModelTaskRouter(() => context(`task-${++resolutions}`));

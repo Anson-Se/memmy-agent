@@ -114,7 +114,7 @@ function saveProcessing(h: ReturnType<typeof harness>, id: string, attemptCount 
 }
 
 describe("Embedding budget checks between requests", () => {
-  it("preserves legacy document-first batching while holding the next main role after a pause", async () => {
+  it("preserves legacy SQL admission order while holding subsequent main roles after a pause", async () => {
     const h = embeddingRoleHarness("legacy", ["query", "document", "query"]);
     let paused = false;
     h.deps.memoryBudgetPaused = () => paused;
@@ -127,8 +127,8 @@ describe("Embedding budget checks between requests", () => {
       return result;
     };
     expect(await h.runner.runWorkerOnce(3)).toMatchObject({ leased: 3, succeeded: 1, failed: 0 });
-    expect(h.calls).toEqual([{ role: "document", texts: ["embedding-1"] }]);
-    for (const id of ["embedding-0", "embedding-2"]) {
+    expect(h.calls).toEqual([{ role: "query", texts: ["embedding-0"] }]);
+    for (const id of ["embedding-1", "embedding-2"]) {
       expect(h.repos.runtime.getJob(id)).toMatchObject({ status: "queued", attempts: 0, failureCount: 0 });
       expect(h.repos.processing.get(id)).toMatchObject({ state: "embedding_pending", attemptCount: 0 });
     }
@@ -144,7 +144,7 @@ describe("Embedding budget checks between requests", () => {
     h.db.db.prepare("UPDATE embedding_retry_queue SET embed_role = 'query' WHERE id = ?").run(query.id);
     const roles: Array<"document" | "query" | undefined> = [];
     h.deps.embedder.embed = async (texts, role) => { roles.push(role); paused = true; return texts.map(() => [1, 0, 0]); };
-    expect(await h.runner.runEmbeddingRetryOnce(2)).toMatchObject({ leased: 2, succeeded: 1, failed: 0 });
+    expect(await h.runner.runEmbeddingRetryOnce(2)).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
     expect(roles).toEqual(["document"]);
     expect(h.repos.runtime.getEmbeddingRetry(query.id)).toMatchObject({ status: "pending", attempts: 0,
       enqueueSeq: query.enqueueSeq, nextAttemptAt: query.nextAttemptAt, claimedBy: null, leaseToken: null, leaseUntil: null });

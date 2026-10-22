@@ -64,6 +64,7 @@ import {
   legacyTurnRequestId
 } from "@memmy/agent-source-core";
 import { openAppAgentSourceScanStore, type AppAgentSourceScanStore } from "../infrastructure/agent-source-scan-store/index.js";
+import { withAgentSourceScanPermit } from "./agent-source-scan-admission.js";
 
 export type { ScanProgress } from "../adapters/outbound/agent-source/types.js";
 
@@ -652,6 +653,19 @@ async function stagePersistentSource(
   scanOptions: AgentSourceScanOptions,
   now: () => string
 ): Promise<PersistentSourceStage> {
+  return withAgentSourceScanPermit(options.agentSourceRepository, adapter.descriptor.sourceId, scanOptions.signal,
+    () => stagePersistentSourceWithPermit(options, store, adapter, mode, since, scanOptions, now));
+}
+
+async function stagePersistentSourceWithPermit(
+  options: CreateAgentSourceServiceOptions,
+  store: AppAgentSourceScanStore,
+  adapter: SourceAdapter,
+  mode: AgentSourceScanMode,
+  since: string | undefined,
+  scanOptions: AgentSourceScanOptions,
+  now: () => string
+): Promise<PersistentSourceStage> {
   const sourceId = adapter.descriptor.sourceId;
   options.agentSourceRepository.upsertSource({ sourceId, displayName: adapter.descriptor.displayName, dataPath: adapter.descriptor.dataPath, builtin: adapter.descriptor.builtin });
   store.saveMeta({ jobId: store.getMeta()?.jobId ?? scanOptions.scanJobId ?? "", sourceId: store.getMeta()?.sourceId ?? sourceId, mode, phase: "stage", createdAt: store.getMeta()?.createdAt ?? now(), updatedAt: now() });
@@ -1117,6 +1131,16 @@ export interface CollectedSourceScan {
 
 /** Handles collect source messages. */
 async function collectSourceMessages(
+  options: CreateAgentSourceServiceOptions,
+  sourceId: string,
+  scanOptions: AgentSourceScanOptions,
+  now: () => string
+): Promise<CollectedSourceScan> {
+  return withAgentSourceScanPermit(options.agentSourceRepository, sourceId, scanOptions.signal,
+    () => collectSourceMessagesWithPermit(options, sourceId, scanOptions, now));
+}
+
+async function collectSourceMessagesWithPermit(
   options: CreateAgentSourceServiceOptions,
   sourceId: string,
   scanOptions: AgentSourceScanOptions,

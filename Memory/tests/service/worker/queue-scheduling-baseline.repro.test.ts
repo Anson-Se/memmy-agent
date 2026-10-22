@@ -3,7 +3,8 @@
  *
  * Scheduling diagnostics explicitly select the legacy rollback algorithm.
  * Lease/recovery/backoff cases assert the repaired stage 2 behavior.
- * Cross-entry overlap is a repaired stage 4 regression.
+ * Cross-entry overlap is a repaired stage 4 regression. Stage 6 keeps the legacy
+ * selection diagnostic but asserts safe admission and continuous execution.
  * SQLite, schema, repositories and WorkerRunner are real. Business handlers and
  * model requests are controlled local substitutes so queue timing is repeatable.
  */
@@ -24,6 +25,8 @@ const epoch = Date.parse("2026-10-22T00:00:00.000Z");
 function record(scenario: string, values: Record<string, unknown>): void {
   observations.push({ scenario, ...values });
 }
+
+async function flushWorker() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -133,7 +136,7 @@ afterAll(() => {
   }
 });
 
-describe("queue scheduler: pre-change diagnostic baseline", () => {
+describe("legacy selection diagnostics and current execution safety", () => {
   it("leaves runnable reflection and embedding retry untouched across 50 full import rounds", async () => {
     const h = harness();
     h.db.db.transaction(() => {
@@ -165,12 +168,13 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     h.memory("native-target", undefined, false);
     h.job("interactive-probe", "trace_summary", { target: "native-target" });
     const interactive = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
-    expect(interactive.jobs.map((j) => j.jobId)).toEqual(["interactive-probe"]);
+    expect(interactive.jobs[0]?.jobId).toBe("interactive-probe");
+    expect(interactive.leased).toBe(4);
     record("10000_import_backlog", {
       seededImports: 10_000, rounds: 50, completedImports: 200, remainingImports: 9_800,
       retryLeased: 0, reflectionStarted: 0, maintenanceStarted: 0, retryDirectClaimControl: true,
       reflectionDirectClaimControl: true,
-      nativeTaskControl: "runs next round", elapsedMs: Math.round(performance.now() - start)
+      nativeTaskControl: "starts first, then fills remaining execution opportunities", elapsedMs: Math.round(performance.now() - start)
     });
   });
 
@@ -236,14 +240,14 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     record("retry_order_control", { firstClaim: "newer-memory", olderRetry: "pending" });
   });
 
-  it("does not fill lower-tier slots after filtering a one-job priority cohort", async () => {
+  it("fills lower-tier work after the first legacy priority cohort finishes", async () => {
     const h = harness();
     h.job("one-summary", "trace_summary");
     for (let i = 0; i < 3; i++) h.job(`waiting-reflection-${i}`, "reflection");
     const result = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
-    expect(result.leased).toBe(1);
-    expect(h.repos.runtime.getJob("waiting-reflection-0")!.attempts).toBe(0);
-    record("priority_cohort_underfill", { limit: 4, leased: 1, otherRunnable: 3 });
+    expect(result).toMatchObject({ leased: 4, succeeded: 4 });
+    expect(h.repos.runtime.getJob("waiting-reflection-0")!.status).toBe("succeeded");
+    record("priority_cohort_refill", { limit: 4, leased: 4, otherRunnableInitially: 3 });
   });
 
   it("shares one execution boundary across two concurrent worker entry calls", async () => {
@@ -254,6 +258,7 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     const a = h.runner.runWorkerOnce(4);
     const b = h.runner.runWorkerOnce(4);
     try {
+      await flushWorker();
       expect(active).toBe(4); expect(peak).toBe(4);
       expect(h.repos.runtime.getJob("parallel-4")).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
     } finally { gate.resolve(); await Promise.all([a, b]); }
@@ -261,7 +266,7 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     record("multiple_entries_concurrency", { calls: 2, perCallLimit: 4, peakHandlers: peak });
   });
 
-  it("waits for the slowest summary in the first group before starting the fifth", async () => {
+  it("starts the fifth summary while the first slow one is still running", async () => {
     const fast = deferred(); const slow = deferred();
     const started: string[] = [];
     let active = 0;
@@ -273,31 +278,33 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     for (let i = 0; i < 8; i++) h.job(`summary-${i}`, "trace_summary");
     const run = h.runner.runWorkerOnce(8);
     try {
+      await flushWorker();
       expect(started).toHaveLength(4);
+      expect(h.repos.runtime.getJob("summary-4")!.status).toBe("queued");
       fast.resolve();
-      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      await flushWorker();
       expect(active).toBe(1);
-      expect(started).toHaveLength(4);
-      expect(h.repos.runtime.getJob("summary-4")!.status).toBe("leased");
-      record("summary_batch_barrier", { limit: 8, finished: 3, active: 1, unstartedButLeased: 4, fifthStarted: false });
+      expect(started).toHaveLength(8);
+      expect(h.repos.runtime.getJob("summary-4")!.status).toBe("succeeded");
+      record("summary_continuous_refill", { limit: 8, finished: 7, active: 1, unstartedButLeased: 0, fifthStarted: true });
     } finally { fast.resolve(); slow.resolve(); await run; }
     expect(started).toHaveLength(8);
   });
 
-  it("keeps a serial batch leased while its first handler runs beyond 60 seconds", async () => {
+  it("renews only the active serial-scope job while waiting jobs stay unclaimed", async () => {
     vi.useFakeTimers(); vi.setSystemTime(epoch);
     const gate = deferred(); const started: string[] = [];
     const h = harness(async (j) => { started.push(j.id); if (j.id === "serial-0") await gate.promise; });
-    for (let i = 0; i < 4; i++) h.job(`serial-${i}`, "reflection");
+    for (let i = 0; i < 4; i++) h.job(`serial-${i}`, "reflection", { target: "shared-target" });
     const run = h.runner.runWorkerOnce(4);
     try {
+      await flushWorker();
       expect(started).toEqual(["serial-0"]);
-      expect(h.repos.runtime.getJob("serial-3")!.status).toBe("leased");
+      expect(h.repos.runtime.getJob("serial-3")).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
       await vi.advanceTimersByTimeAsync(61_000);
-      const reclaimed = h.repos.runtime.leaseQueuedJobs(4);
-      expect(reclaimed).toEqual([]);
+      expect(h.repos.runtime.claimQueuedJob("serial-0")).toBeUndefined();
       expect(h.repos.runtime.getJob("serial-0")!.failureCount).toBe(0);
-      record("serial_prefetch_expiry", { actualStarted: 1, leased: 4, elapsedClockSeconds: 61, reclaimable: 0 });
+      record("serial_admission_renewal", { actualStarted: 1, leased: 1, waitingQueued: 3, elapsedClockSeconds: 61, reclaimableActive: 0 });
     } finally { gate.resolve(); await run; }
   });
 

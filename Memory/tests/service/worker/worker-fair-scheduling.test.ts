@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
+import { WorkerConcurrencyController } from "../../../src/service/worker/worker-concurrency.js";
 import { WorkerRunner, type WorkerRunnerDeps } from "../../../src/service/worker/worker-runner.js";
 import { QUEUE_LANES, type QueueLane } from "../../../src/service/worker/job-policy-registry.js";
 import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
@@ -16,7 +17,7 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
-type HarnessOptions = { algorithm?: "wrr" | "legacy"; process?: (job: EvolutionJobRecord) => Promise<void> };
+type HarnessOptions = { concurrency?: WorkerConcurrencyController; algorithm?: "wrr" | "legacy"; process?: (job: EvolutionJobRecord) => Promise<void> };
 
 /** Real SQLite and claim transitions; business/model work is a local substitute. */
 function harness(options: HarnessOptions = {}) {
@@ -31,7 +32,7 @@ function harness(options: HarnessOptions = {}) {
     memoryBudgetPaused: () => false, memoryBudgetJobConsumes: () => false,
     memoryBudgetModelSources: () => ({ embedding: { mode: "local" } }),
     memoryBudgetNextWakeAtMs: () => Date.now(), summaryModelConfigured: () => true,
-    schedulingShadow: { enabled: false },
+    schedulingShadow: { enabled: false }, concurrency: options.concurrency,
     ...(options.algorithm ? { scheduling: { algorithm: options.algorithm } } : {}),
     nowIso: () => new Date().toISOString(), encodeChangeCursor: String,
     namespaceIdFromMemory: () => "synthetic",
@@ -264,12 +265,15 @@ describe("production WRR and runnable FIFO", () => {
     expect(h.repos.runtime.getEmbeddingRetry("new-retry")!.status).toBe("pending");
   });
 
-  it("merges explicit repair jobs and embedding retries in the same lane FIFO", async () => {
-    const h = harness(); h.retry("older-retry"); h.job("manual-summary", "trace_summary", { source: "memory.processing.manual_retry" });
+  it("starts explicit repair jobs and embedding retry requests in the same lane FIFO", async () => {
+    const started: string[] = [];
+    const h = harness({ process: async job => { started.push(job.id); } });
+    h.deps.embedder.embed = async texts => { started.push("retry:older-retry"); return texts.map(() => [1, 0, 0]); };
+    h.retry("older-retry"); h.job("manual-summary", "trace_summary", { source: "memory.processing.manual_retry" });
     await h.runner.runWorkerOnce(2);
-    expect(h.executed).toEqual(["retry:older-retry", "manual-summary"]);
+    expect(started).toEqual(["retry:older-retry", "manual-summary"]);
+    expect(h.executed).toEqual(expect.arrayContaining(["retry:older-retry", "manual-summary"]));
   });
-
   it("fills a request across priority cohorts instead of throwing away three runnable slots", async () => {
     const h = harness(); h.job("summary", "trace_summary");
     for (let i = 0; i < 3; i++) h.job(`reflection-${i}`);
@@ -365,46 +369,45 @@ describe("production WRR and runnable FIFO", () => {
     expect(h.runner.nextWorkerRunAt()).toBeUndefined();
   });
 
-  it("renews a prefetched retry while an earlier main task holds execution for more than five minutes", async () => {
+  it("keeps a capacity-blocked retry unclaimed while the active main task renews its lease", async () => {
     vi.useFakeTimers(); vi.setSystemTime(epoch);
     const entered = deferred(), gate = deferred();
-    const h = harness({ process: async () => { entered.resolve(); await gate.promise; } });
-    h.job("slow-summary", "trace_summary"); h.retry("waiting-retry");
+    const h = harness({ concurrency: new WorkerConcurrencyController({ maxActiveJobs: 1 }, {}),
+      process: async () => { entered.resolve(); await gate.promise; } });
+    h.job("slow-summary", "trace_summary"); const original = h.retry("waiting-retry");
     const run = h.runner.runWorkerOnce(2);
     await entered.promise;
-    const initial = h.repos.runtime.getEmbeddingRetry("waiting-retry")!;
+    const initialMain = h.repos.runtime.getJob("slow-summary")!;
     try {
-      expect(initial.status).toBe("in_progress");
-      expect(h.executed).toEqual(["slow-summary"]);
+      expect(h.repos.runtime.getEmbeddingRetry(original.id)).toMatchObject({ status: "pending", leaseToken: null });
       await vi.advanceTimersByTimeAsync(310_000);
-      const stillOwned = h.repos.runtime.getEmbeddingRetry("waiting-retry")!;
-      expect(stillOwned).toMatchObject({ status: "in_progress", leaseToken: initial.leaseToken });
-      expect(stillOwned.leaseUntil).toBeGreaterThan(Date.now());
-      expect(h.repos.runtime.claimDueEmbeddingRetries({
-        now: Date.now(), workerId: "other-worker", leaseUntil: Date.now() + 300_000, limit: 1
-      })).toEqual([]);
+      expect(h.repos.runtime.getEmbeddingRetry(original.id)).toMatchObject({ status: "pending", attempts: 0,
+        enqueueSeq: original.enqueueSeq, claimedBy: null, leaseToken: null, leaseUntil: null });
+      const activeMain = h.repos.runtime.getJob("slow-summary")!;
+      expect(activeMain).toMatchObject({ status: "leased", leaseToken: initialMain.leaseToken });
+      expect(Date.parse(activeMain.leasedUntil!)).toBeGreaterThan(Date.now());
+      expect(h.executed).toEqual(["slow-summary"]);
     } finally { gate.resolve(); }
     expect((await run).embeddingRetries).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
-    expect(h.repos.runtime.getEmbeddingRetry("waiting-retry")!.status).toBe("succeeded");
+    expect(h.repos.runtime.getEmbeddingRetry(original.id)!.status).toBe("succeeded");
     expect(vi.getTimerCount()).toBe(0);
   });
-
-  it("returns an unstarted renewed retry when budget becomes paused without consuming a failure or FIFO position", async () => {
+  it("leaves a waiting retry unclaimed when an active task pauses the budget, preserving its FIFO position", async () => {
     vi.useFakeTimers(); vi.setSystemTime(epoch);
     const entered = deferred(), gate = deferred();
     let paused = false;
-    const h = harness({ process: async () => { entered.resolve(); await gate.promise; paused = true; } });
+    const h = harness({ concurrency: new WorkerConcurrencyController({ maxActiveJobs: 1 }, {}),
+      process: async () => { entered.resolve(); await gate.promise; paused = true; } });
     h.deps.memoryBudgetPaused = () => paused;
     h.deps.memoryBudgetJobConsumes = type => type === "embedding";
-    h.job("slow-summary", "trace_summary");
-    const original = h.retry("budget-held-retry");
+    h.job("slow-summary", "trace_summary"); const original = h.retry("budget-held-retry");
     const run = h.runner.runWorkerOnce(2);
     await entered.promise;
     try {
       await vi.advanceTimersByTimeAsync(310_000);
-      expect(h.repos.runtime.getEmbeddingRetry(original.id)!.leaseUntil).toBeGreaterThan(Date.now());
+      expect(h.repos.runtime.getEmbeddingRetry(original.id)).toMatchObject({ status: "pending", leaseUntil: null });
     } finally { gate.resolve(); }
-    expect((await run).embeddingRetries).toMatchObject({ leased: 1, succeeded: 0, failed: 0 });
+    expect((await run).embeddingRetries).toMatchObject({ leased: 0, succeeded: 0, failed: 0 });
     expect(h.executed).toEqual(["slow-summary"]);
     expect(h.repos.runtime.getEmbeddingRetry(original.id)).toMatchObject({
       status: "pending", attempts: 0, enqueueSeq: original.enqueueSeq,
@@ -415,7 +418,6 @@ describe("production WRR and runnable FIFO", () => {
     expect((await h.runner.runWorkerOnce(1)).embeddingRetries).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
     expect(vi.getTimerCount()).toBe(0);
   });
-
   it("keeps target-limited requests from consuming jobs in another target", async () => {
     const h = harness(); h.job("allowed", "import_summary", { target: "A" }); h.job("outside", "trace_summary", { target: "B" });
     h.retry("B");
@@ -428,19 +430,21 @@ describe("production WRR and runnable FIFO", () => {
 });
 
 describe("legacy scheduling rollback", () => {
-  it("restores strict priority, remaining retry capacity and cohort underfill via the environment flag", async () => {
+  it("retains legacy SQL priority and spare retry admission while continuous refill uses remaining capacity", async () => {
     vi.stubEnv("MEMMY_WORKER_SCHEDULER_ALGORITHM", "legacy");
     const h = harness(); h.job("one-summary", "trace_summary");
     for (let i = 0; i < 4; i++) h.job(`import-${i}`, "import_summary");
     h.job("reflection"); h.retry("retry");
+    expect(h.repos.runtime.previewLegacyJobPage({ at, limit: 10 }).map(row => row.job.id))
+      .toEqual(["one-summary", "import-0", "import-1", "import-2", "import-3", "reflection"]);
     const first = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
-    expect(first).toMatchObject({ leased: 1, succeeded: 1, embeddingRetries: { leased: 1 } });
+    expect(first).toMatchObject({ leased: 3, succeeded: 3, embeddingRetries: { leased: 1 } });
+    expect(first.jobs.map(job => job.jobId)).toEqual(["one-summary", "import-0", "import-1"]);
     expect(h.repos.runtime.getJob("reflection")!.attempts).toBe(0);
     const second = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
-    expect(second).toMatchObject({ leased: 4, embeddingRetries: { leased: 0 } });
-    expect(h.repos.runtime.getJob("reflection")!.attempts).toBe(0);
+    expect(second).toMatchObject({ leased: 3, succeeded: 3, embeddingRetries: { leased: 0 } });
+    expect(second.jobs.map(job => job.jobId)).toEqual(["import-2", "import-3", "reflection"]);
   });
-
   it("keeps the old memory-recency order when legacy is explicitly selected", async () => {
     const h = harness({ algorithm: "legacy" });
     h.memory("older"); h.job("older-job", "import_summary", { target: "older" });
@@ -517,14 +521,16 @@ describe("main Embedding FIFO across role boundaries", () => {
     expect(h.repos.runtime.listJobs("succeeded")).toHaveLength(4);
   });
 
-  it("keeps the old document-first role grouping when explicitly switched to legacy", async () => {
+  it("retains legacy SQL admission order without restoring a cross-role execution barrier", async () => {
     const h = embeddingRoleHarness("legacy", ["query", "document", "document", "query"]);
+    expect(h.repos.runtime.previewLegacyJobPage({ at, limit: 4 }).map(row => row.job.id))
+      .toEqual(["embedding-0", "embedding-1", "embedding-2", "embedding-3"]);
     expect(await h.runner.runWorkerOnce(4)).toMatchObject({ leased: 4, succeeded: 4, failed: 0 });
     expect(h.calls).toEqual([
+      { role: "query", texts: ["embedding-0"] },
       { role: "document", texts: ["embedding-1", "embedding-2"] },
-      { role: "query", texts: ["embedding-0", "embedding-3"] }
+      { role: "query", texts: ["embedding-3"] }
     ]);
-    expect(h.applied).toEqual(["embedding-1", "embedding-2", "embedding-0", "embedding-3"]);
+    expect(h.applied).toEqual(["embedding-0", "embedding-1", "embedding-2", "embedding-3"]);
     expect(h.repos.runtime.listJobs("succeeded")).toHaveLength(4);
-  });
-});
+  });});

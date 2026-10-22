@@ -166,32 +166,44 @@ export class QueueSchedulingStore {
   }): SchedulingCandidate[] {
     const result: SchedulingCandidate[] = [];
     if (input.limit <= 0) return result;
+    for (const lane of QUEUE_LANES) {
+      result.push(...this.candidatePage({ ...input, lane, queue: "main" }));
+      if (input.includeRetries !== false) result.push(...this.candidatePage({ ...input, lane, queue: "embedding_retry" }));
+    }
+    return result;
+  }
+
+  /** Keyset pages let admission skip busy resources without hiding later FIFO rows. */
+  candidatePage(input: QueueEligibilityOptions & {
+    at: string; limit: number; queue: SchedulingCandidate["queue"]; lane: QueueLane;
+    afterEnqueueSeq?: number; includeUnregistered?: boolean;
+  }): SchedulingCandidate[] {
+    if (input.limit <= 0) return [];
     const main = mainQueueEligibility(input.at, input);
     const retry = retryQueueEligibility(Date.parse(input.at), input.targetMemoryIds);
     const limit = Math.max(1, Math.min(200, Math.floor(input.limit)));
-    for (const lane of QUEUE_LANES) {
-      const includeUnknown = input.includeUnregistered === true && lane === "maintenance";
-      const laneFilter = includeUnknown ? "queue_lane IN (?, 'unregistered')" : "queue_lane = ?";
+    const includeUnknown = input.includeUnregistered === true && input.lane === "maintenance";
+    const laneFilter = includeUnknown ? "queue_lane IN (?, 'unregistered')" : "queue_lane = ?";
+    const after = input.afterEnqueueSeq ?? 0;
+    if (input.queue === "main") {
       const rows = this.db.prepare(`SELECT id, job_type, queue_lane, enqueue_seq, base_priority FROM evolution_jobs
-        WHERE ${main.sql} AND ${laneFilter} AND policy_version = ?
-        ORDER BY enqueue_seq LIMIT ?`).all(...main.params, lane, JOB_POLICY_VERSION, limit) as Array<{
+        WHERE ${main.sql} AND ${laneFilter} AND policy_version = ? AND enqueue_seq > ?
+        ORDER BY enqueue_seq LIMIT ?`).all(...main.params, input.lane, JOB_POLICY_VERSION, after, limit) as Array<{
           id: string; job_type: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
         }>;
-      result.push(...rows.map((row) => ({ queue: "main" as const, id: row.id, jobType: row.job_type,
+      return rows.map((row) => ({ queue: "main" as const, id: row.id, jobType: row.job_type,
         lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
         enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
-        ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) })));
-      if (input.includeRetries === false) continue;
-      const retries = this.db.prepare(`SELECT q.id, q.queue_lane, q.enqueue_seq, q.base_priority FROM embedding_retry_queue q
-        WHERE ${retry.sql} AND q.${laneFilter} AND q.policy_version = ?
-        ORDER BY q.enqueue_seq LIMIT ?`).all(...retry.params, lane, JOB_POLICY_VERSION, limit) as Array<{
-          id: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
-        }>;
-      result.push(...retries.map((row) => ({ queue: "embedding_retry" as const, id: row.id, jobType: "embedding_retry",
-        lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
-        enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
-        ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) })));
+        ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) }));
     }
-    return result;
+    const retries = this.db.prepare(`SELECT q.id, q.queue_lane, q.enqueue_seq, q.base_priority FROM embedding_retry_queue q
+      WHERE ${retry.sql} AND q.${laneFilter} AND q.policy_version = ? AND q.enqueue_seq > ?
+      ORDER BY q.enqueue_seq LIMIT ?`).all(...retry.params, input.lane, JOB_POLICY_VERSION, after, limit) as Array<{
+        id: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
+      }>;
+    return retries.map((row) => ({ queue: "embedding_retry" as const, id: row.id, jobType: "embedding_retry",
+      lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
+      enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
+      ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) }));
   }
 }

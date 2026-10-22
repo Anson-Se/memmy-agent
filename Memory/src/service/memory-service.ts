@@ -198,6 +198,9 @@ import {
   type EnqueueJobInput
 } from "./worker/job-handlers.js";
 import { WorkerRunner } from "./worker/worker-runner.js";
+import { WorkerConcurrencyController, providerDescriptor, workerModelBatchKey, type PreparedWorkerExecution } from "./worker/worker-concurrency.js";
+import { jobPolicyRegistry, UnknownJobPolicyError } from "./worker/job-policy-registry.js";
+import type { FairClaimedWork } from "./worker/fair-worker-queue.js";
 
 const serviceLogger = createMemoryLogger("memory-service");
 
@@ -215,6 +218,8 @@ export type { FeedbackResponse } from "./feedback/feedback-experience.js";
 
 
 export interface MemoryServiceOptions {
+  /** One controller is shared by worker admission and actual model requests. */
+  concurrency?: WorkerConcurrencyController;
   db?: MemoryDb;
   backend?: StorageBackend;
   mode?: "local" | "cloud" | "dev";
@@ -298,6 +303,11 @@ export class MemoryService {
   private readonly mode: "local" | "cloud" | "dev";
   private config: MemmyConfig;
   private readonly modelTasks: MemoryModelTaskRouter;
+  private readonly concurrency: WorkerConcurrencyController;
+  private readonly workerExecutionSnapshots = new WeakMap<MemoryModelTaskContext, {
+    batchKey: string;
+    providers: Map<string, PreparedWorkerExecution["providers"]>;
+  }>();
   private llm: LlmClient;
   private skillLlm: LlmClient;
   private embedder: Embedder;
@@ -323,6 +333,7 @@ export class MemoryService {
   private viewerEndpoint?: string;
 
   constructor(private readonly options: MemoryServiceOptions) {
+    this.concurrency = options.concurrency ?? new WorkerConcurrencyController();
     this.viewerEndpoint = options.viewerEndpoint;
     this.repos = options.backend?.repositories() ?? new Repositories(requireMemoryDb(options).db);
     this.l3WorldModelContextReadModel = new L3WorldModelContextReadModel(this.repos);
@@ -344,7 +355,7 @@ export class MemoryService {
     this.fetchAppMemoryBudgetFn = options.fetchAppMemoryBudget
       ?? ((signal) => fetchAppMemoryBudget({ signal }));
     this.startAppBudgetReconcile();
-    this.modelTasks = new MemoryModelTaskRouter(() => this.resolveModelTaskContext());
+    this.modelTasks = new MemoryModelTaskRouter(() => this.resolveModelTaskContext(), this.concurrency);
     this.llm = this.modelTasks.client("summary");
     this.skillLlm = this.modelTasks.client("evolution");
     this.embedder = this.modelTasks.embedder();
@@ -548,6 +559,9 @@ export class MemoryService {
     });
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
+      concurrency: this.concurrency,
+      prepareExecution: this.prepareWorkerExecution.bind(this),
+      prepareExecutionBatch: this.prepareWorkerExecutionBatch.bind(this),
       repos: this.repos,
       get embedder() { return workerRunnerOwner.embedder; },
       get capture() { return workerRunnerOwner.config.algorithm.capture; },
@@ -743,12 +757,17 @@ export class MemoryService {
   }
 
   async stop(): Promise<void> {
+    this.modelTasks.assertCanStop();
     const stopped = this.workerRunner.stop();
     if (this.stopping) return this.stopping;
     this.closing = true;
     this.tokenUsageRecorder.stop();
     this.budgetAbort.abort();
-    this.stopping = stopped;
+    // Close request admission synchronously before the worker releases provider
+    // slots, then keep storage alive through complete foreground business work.
+    const modelsStopped = this.modelTasks.stop();
+    const requestsStopped = this.concurrency.close();
+    this.stopping = Promise.all([stopped, modelsStopped, requestsStopped]).then(() => {});
     return this.stopping;
   }
 
@@ -916,6 +935,46 @@ export class MemoryService {
       evolution,
       embedding
     };
+  }
+
+  private prepareWorkerExecutionBatch(): (work: FairClaimedWork) => PreparedWorkerExecution {
+    // One synchronous fill observes one configuration snapshot. Provider work is
+    // still resolved per candidate; injected runner factories may vary per work.
+    const context = this.modelTasks.snapshot();
+    return work => this.prepareWorkerExecution(work, context);
+  }
+
+  private prepareWorkerExecution(work: FairClaimedWork, snapshot?: MemoryModelTaskContext): PreparedWorkerExecution {
+    let roles: readonly ("summary" | "evolution" | "embedding")[];
+    try {
+      roles = jobPolicyRegistry.resolve({ jobType: work.queue === "main" ? work.job.jobType : "embedding_retry" }).concurrency.providerRoles;
+    } catch (error) {
+      if (!(error instanceof UnknownJobPolicyError)) throw error;
+      // Unregistered jobs are admitted only for controlled dead-letter cleanup.
+      return { providers: [], run: operation => operation() };
+    }
+    const context = snapshot ?? this.modelTasks.snapshot();
+    let cached = this.workerExecutionSnapshots.get(context);
+    if (!cached) {
+      cached = { batchKey: workerModelBatchKey([context.summary.config, context.evolution.config, context.embedding.config]), providers: new Map() };
+      this.workerExecutionSnapshots.set(context, cached);
+    }
+    const roleKey = roles.join("/");
+    let providers = cached.providers.get(roleKey);
+    if (!providers) {
+      providers = roles.flatMap(role => providerDescriptor(context[role].config, this.concurrency.limits).providers);
+      cached.providers.set(roleKey, providers);
+    }
+    return {
+      providers,
+      embedding: roles.includes("embedding"),
+      batchKey: cached.batchKey,
+      run: operation => this.modelTasks.runWith(context, operation)
+    };
+  }
+
+  notifyWorkerWorkAvailable(): void {
+    this.workerRunner.notifyWorkAvailable();
   }
 
   private withModelTaskContext<T>(operation: () => T): T {

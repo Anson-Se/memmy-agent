@@ -65,12 +65,12 @@ const DEFINITIONS: Readonly<Record<PolicyJobType, PolicyDefinition>> = Object.fr
   episode_idle_close: definition("maintenance", "database", 10, [], "episode"),
   episode_title: definition("interactive", "summary", 15, ["summary"], "episode"),
   trace_summary: definition("interactive", "summary", 1, ["summary", "evolution"]),
-  import_summary: definition("import", "summary", 2, ["summary"]),
+  import_summary: definition("import", "summary", 2, ["summary", "evolution"]),
   observation_extract: definition("interactive", "summary", 1, ["summary"]),
   embedding: definition("evolution", "embedding", 3, ["embedding"], "target", true),
   user_memory_embedding: definition("interactive", "embedding", 3, ["embedding"], "target", true),
   embedding_retry: definition("repair_retry", "embedding", 0, ["embedding"], "target", true),
-  reflection: definition("evolution", "evolution_llm", 20, ["summary", "evolution"]),
+  reflection: definition("evolution", "evolution_llm", 20, ["summary", "evolution"], "episode"),
   reward: definition("evolution", "evolution_llm", 30, ["summary", "evolution"], "episode"),
   span_big_turn: definition("evolution", "summary", 35, ["summary"]),
   negative_experience: definition("evolution", "evolution_llm", 100, ["evolution"], "episode"),
@@ -86,7 +86,7 @@ const DEFINITIONS: Readonly<Record<PolicyJobType, PolicyDefinition>> = Object.fr
   skill_trial_resolve: definition("evolution", "database", 80, [], "episode"),
   work_memory_extract: definition("evolution", "summary", 100, ["summary", "embedding"], "user_project"),
   work_memory_idle_flush: definition("evolution", "database", 100, [], "user_project"),
-  feedback_experience: definition("evolution", "evolution_llm", 100, ["evolution"])
+  feedback_experience: definition("evolution", "evolution_llm", 100, ["evolution", "embedding"])
 });
 
 export const REGISTERED_JOB_TYPES = Object.freeze(Object.keys(DEFINITIONS) as PolicyJobType[]);

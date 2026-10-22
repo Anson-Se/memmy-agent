@@ -17,6 +17,7 @@ export function createMemoryServiceFixture(): {
   ) => MemoryService;
   createTestRoot: (prefix?: string) => string;
   createTestService: (options?: {
+    concurrency?: ConstructorParameters<typeof MemoryService>[0]["concurrency"];
     mode?: "local" | "cloud" | "dev";
     config?: typeof DEFAULT_MEMMY_CONFIG;
     llm?: LlmClient;
@@ -57,6 +58,7 @@ export function createMemoryServiceFixture(): {
   }
 
   function createTestService(options: {
+    concurrency?: ConstructorParameters<typeof MemoryService>[0]["concurrency"];
     mode?: "local" | "cloud" | "dev";
     config?: typeof DEFAULT_MEMMY_CONFIG;
     llm?: LlmClient;
@@ -77,6 +79,7 @@ export function createMemoryServiceFixture(): {
       root,
       db,
       service: createTestMemoryService({
+        concurrency: options.concurrency,
         db,
         mode: options.mode ?? "dev",
         config: options.config,

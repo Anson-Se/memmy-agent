@@ -3637,6 +3637,26 @@ export class RuntimeRepository {
       .all(...eligibility.params, input.limit) as SqlEmbeddingRetryRow[]).map(embeddingRetryFromSql);
   }
 
+  /** Legacy ordering for resource admission, paged without acquiring a lease. */
+  previewLegacyJobPage(input: QueueEligibilityOptions & {
+    at: string; limit: number; offset?: number;
+  }): Array<{ job: EvolutionJobRecord; priority: number }> {
+    if (input.limit <= 0) return [];
+    const eligibility = mainQueueEligibility(input.at, input);
+    const rows = this.db.prepare(`SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
+      FROM evolution_jobs WHERE ${eligibility.sql} ORDER BY ${evolutionJobOrderSql()} LIMIT ? OFFSET ?`)
+      .all(...eligibility.params, Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as Array<SqlJobRow & { queue_priority: number }>;
+    return rows.map(row => ({ job: jobFromSql(row), priority: row.queue_priority }));
+  }
+
+  previewLegacyRetryPage(input: { now: number; limit: number; offset?: number; targetMemoryIds?: readonly string[] }): EmbeddingRetryRecord[] {
+    if (input.limit <= 0) return [];
+    const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
+    return (this.db.prepare(`SELECT q.* FROM embedding_retry_queue q LEFT JOIN memories m ON m.id = q.target_id
+      WHERE ${eligibility.sql} ORDER BY ${embeddingRetryOrderSql()} LIMIT ? OFFSET ?`)
+      .all(...eligibility.params, Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as SqlEmbeddingRetryRow[]).map(embeddingRetryFromSql);
+  }
+
   leaseQueuedJobs(
     limit = 10,
     leaseSeconds = 60,

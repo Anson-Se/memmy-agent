@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ModelHttpError } from "../../../src/model/http.js";
 import { MemoryDb } from "../../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
+import { WorkerConcurrencyController } from "../../../src/service/worker/worker-concurrency.js";
 import { WorkerRunner, type WorkerRunnerDeps } from "../../../src/service/worker/worker-runner.js";
 import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
 
@@ -18,13 +19,13 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 /** Real SQLite and worker lifecycle; only model/business work is substituted. */
-function harness(processJob: WorkerRunnerDeps["jobHandlers"]["processJob"] = async () => {}) {
+function harness(processJob: WorkerRunnerDeps["jobHandlers"]["processJob"] = async () => {}, concurrency?: WorkerConcurrencyController) {
   const root = mkdtempSync(join(tmpdir(), "memmy-lease-safety-"));
   const db = new MemoryDb({ path: join(root, "memory.sqlite") });
   resources.push({ root, db });
   const repos = new Repositories(db.db);
   const deps: WorkerRunnerDeps = {
-    repos,
+    repos, concurrency,
     embedder: createCapturingEmbedder([]),
     capture: { embedAfterCapture: true },
     embeddingRetryWorkerId: "lease-safety-runner",
@@ -128,33 +129,33 @@ describe("worker lease ownership and recovery", () => {
     expect(h.repos.runtime.getJob(claim!.id)).toMatchObject({ status: "leased", leaseToken: claim!.leaseToken });
   });
 
-  it("renews a long serial batch including unstarted leases, and clears its heartbeat", async () => {
+  it("renews active work while capacity-blocked tasks remain queued without lease tokens", async () => {
     vi.useFakeTimers(); vi.setSystemTime(epoch);
-    const gate = deferred(); const started: string[] = [];
-    const h = harness(async (j) => {
-      started.push(j.id);
-      if (j.id === "serial-0") await gate.promise;
-    });
+    const gate = deferred(), entered = deferred(); const started: string[] = [];
+    const h = harness(async (job) => {
+      started.push(job.id);
+      if (job.id === "serial-0") { entered.resolve(); await gate.promise; }
+    }, new WorkerConcurrencyController({ maxActiveJobs: 1 }, {}));
     for (let i = 0; i < 4; i++) h.job(`serial-${i}`);
     const run = h.runner.runWorkerOnce(4);
+    await entered.promise;
     try {
-      await Promise.resolve();
       const initial = h.repos.runtime.getJob("serial-0")!;
       await vi.advanceTimersByTimeAsync(125_000);
       expect(started).toEqual(["serial-0"]);
-      for (let i = 0; i < 4; i++) {
-        const row = h.repos.runtime.getJob(`serial-${i}`)!;
-        expect(row.status).toBe("leased");
-        expect(Date.parse(row.leasedUntil!)).toBeGreaterThan(Date.now());
+      const active = h.repos.runtime.getJob("serial-0")!;
+      expect(active).toMatchObject({ status: "leased", leaseToken: initial.leaseToken });
+      expect(Date.parse(active.leasedUntil!)).toBeGreaterThan(Date.now());
+      expect(h.repos.runtime.claimQueuedJob("serial-0", { owner: "competing-worker" })).toBeUndefined();
+      for (let i = 1; i < 4; i++) {
+        expect(h.repos.runtime.getJob(`serial-${i}`)).toMatchObject({ status: "queued", attempts: 0,
+          leaseToken: null, leasedUntil: null, leaseOwner: null });
       }
-      expect(h.repos.runtime.getJob("serial-0")!.leaseToken).toBe(initial.leaseToken);
-      expect(h.repos.runtime.leaseQueuedJobs(4)).toEqual([]);
     } finally { gate.resolve(); await run; }
     expect(started).toHaveLength(4);
     expect(vi.getTimerCount()).toBe(0);
     expect(h.repos.runtime.getJob("serial-0")).toMatchObject({ status: "succeeded", failureCount: 0 });
   });
-
   it("clears its heartbeat after a handler fails", async () => {
     vi.useFakeTimers(); vi.setSystemTime(epoch);
     const gate = deferred();
@@ -450,7 +451,7 @@ describe("in-flight embedding configuration changes", () => {
       if (calls === 1) { entered.resolve(); await gate.promise; }
       throw new ModelHttpError("unauthorized", "test", 401, undefined, "invalid API key");
     };
-    const oldRun = h.runner.runWorkerOnce(4);
+    const oldRun = h.runner.runWorkerOnce(1);
     await entered.promise;
     fingerprint = "config-B";
     h.runner.resumeJobsAfterConfigurationChange();

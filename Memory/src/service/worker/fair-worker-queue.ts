@@ -1,12 +1,22 @@
 import { createHash } from "node:crypto";
 import type { Repositories, EvolutionJobRecord, EmbeddingRetryRecord } from "../../storage/repositories.js";
 import type { QueueEligibilityOptions } from "../../storage/queue-eligibility.js";
+import type { SchedulingCandidate } from "../../storage/queue-scheduling-store.js";
 import { LaneQueueSelector } from "./lane-queue-selector.js";
 import { QUEUE_LANES } from "./job-policy-registry.js";
 import type { ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 
-export type FairClaimedWork = { queue: "main"; job: EvolutionJobRecord } |
-  { queue: "embedding_retry"; retry: EmbeddingRetryRecord };
+export interface WorkAdmission { release(): void }
+export type FairClaimedWork = ({ queue: "main"; job: EvolutionJobRecord } |
+  { queue: "embedding_retry"; retry: EmbeddingRetryRecord }) & { admission?: WorkAdmission };
+export interface FairWorkerClaimInput extends QueueEligibilityOptions {
+  at: string; limit: number; includeRetries: boolean; owner: string;
+  retryOwner: string; leaseSeconds: number; retryLeaseMs: number;
+  options: ResolvedWorkerSchedulingOptions;
+  priorityCohortOnly?: boolean;
+  /** Must synchronously acquire all execution permits or return undefined. */
+  admit?: (work: FairClaimedWork) => WorkAdmission | undefined;
+}
 const CURSOR_KEY = "worker.scheduler.wrr_cursor.v1";
 export const FAIR_CLAIM_BATCH_LIMIT = 200;
 
@@ -29,12 +39,9 @@ function scopeCursorKey(filters: QueueEligibilityOptions & { includeRetries: boo
 /** Both backing tables share one selection, one budget and one atomic cursor. */
 export function claimFairWorkerBatch(
   repos: Pick<Repositories, "transaction" | "runtime">,
-  input: QueueEligibilityOptions & {
-    at: string; limit: number; includeRetries: boolean; owner: string;
-    retryOwner: string; leaseSeconds: number; retryLeaseMs: number;
-    options: ResolvedWorkerSchedulingOptions;
-  }
+  input: FairWorkerClaimInput
 ): FairClaimedWork[] {
+  if (input.admit) return claimAdmittedWorkerBatch(repos, input);
   const request = { ...input,
     targetMemoryIds: normalizeFilter(input.targetMemoryIds),
     allowedJobTypes: normalizeFilter(input.allowedJobTypes),
@@ -76,4 +83,126 @@ export function claimFairWorkerBatch(
     if (claimed.length > 0) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor() }, input.at);
     return claimed;
   });
+}
+
+/** Admission and ID-CAS share the transaction; waiting tasks retain their FIFO position. */
+function claimAdmittedWorkerBatch(
+  repos: Pick<Repositories, "transaction" | "runtime">, input: FairWorkerClaimInput
+): FairClaimedWork[] {
+  const request = { ...input,
+    targetMemoryIds: normalizeFilter(input.targetMemoryIds),
+    allowedJobTypes: normalizeFilter(input.allowedJobTypes),
+    excludedJobTypes: normalizeFilter(input.excludedJobTypes),
+    includeDueFailed: input.options.algorithm === "wrr"
+  };
+  const admissions: WorkAdmission[] = [];
+  const limit = Math.max(0, Math.min(FAIR_CLAIM_BATCH_LIMIT, Math.floor(input.limit)));
+  function tryClaim(work: FairClaimedWork): FairClaimedWork | undefined {
+    const acquired = input.admit!(work);
+    if (!acquired) return undefined;
+    let released = false;
+    const admission = { release() {
+      if (released) return;
+      released = true;
+      acquired.release();
+    } };
+    admissions.push(admission);
+    if (work.queue === "main") {
+      const job = repos.runtime.claimQueuedJob(work.job.id, request);
+      if (job) return { queue: "main", job, admission };
+    } else {
+      const retry = repos.runtime.claimEmbeddingRetryById(work.retry.id, {
+        now: Date.parse(input.at), workerId: input.retryOwner,
+        leaseUntil: Date.parse(input.at) + input.retryLeaseMs,
+        targetMemoryIds: request.targetMemoryIds
+      });
+      if (retry) return { queue: "embedding_retry", retry, admission };
+    }
+    admission.release();
+    return undefined;
+  }
+  try {
+    return repos.transaction(() => {
+      if (limit === 0) return [];
+      const claimed: FairClaimedWork[] = [];
+      if (input.options.algorithm === "legacy") {
+        // Offset counts only examined rows still eligible after our own CAS.
+        // Permits may exclude a high-priority resource; the first admitted main
+        // row establishes the cohort, without consuming retry spare capacity.
+        let offset = 0, cohort: number | undefined;
+        mainPages: for (;;) {
+          const page = repos.runtime.previewLegacyJobPage({ ...request, limit: 200, offset });
+          if (page.length === 0) break;
+          let removed = 0;
+          for (const { job, priority } of page) {
+            if (claimed.length >= limit || (input.priorityCohortOnly && cohort !== undefined && priority !== cohort)) break mainPages;
+            const result = tryClaim({ queue: "main", job });
+            if (result) { claimed.push(result); removed++; cohort ??= priority; }
+          }
+          if (page.length < 200) break;
+          offset += page.length - removed;
+        }
+        offset = 0;
+        while (input.includeRetries && claimed.length < limit) {
+          const page = repos.runtime.previewLegacyRetryPage({ now: Date.parse(input.at), targetMemoryIds: request.targetMemoryIds, limit: 200, offset });
+          if (page.length === 0) break;
+          let removed = 0;
+          for (const retry of page) {
+            if (claimed.length >= limit) break;
+            const result = tryClaim({ queue: "embedding_retry", retry });
+            if (result) { claimed.push(result); removed++; }
+          }
+          if (page.length < 200) break;
+          offset += page.length - removed;
+        }
+        return claimed;
+      }
+
+      repos.runtime.scheduling.refreshRunnablePolicies(request);
+      const cursorKey = scopeCursorKey(request);
+      const weightsKey = QUEUE_LANES.map(lane => input.options.laneWeights[lane]).join("/");
+      const saved = repos.runtime.getKv(cursorKey)?.value as { weightsKey?: unknown; cursor?: unknown } | undefined;
+      const cursor = saved?.weightsKey === weightsKey && Number.isSafeInteger(saved.cursor) && Number(saved.cursor) >= 0 ? Number(saved.cursor) : 0;
+      const selector = new LaneQueueSelector(input.options.laneWeights, cursor);
+      const buckets = QUEUE_LANES.flatMap(lane => (input.includeRetries ? ["main", "embedding_retry"] as const : ["main"] as const)
+        .map(queue => ({ lane, queue, after: 0, exhausted: false })));
+      const candidates: SchedulingCandidate[] = [];
+      function refill() {
+        for (const bucket of buckets) {
+          if (bucket.exhausted || candidates.some(candidate => candidate.queue === bucket.queue && candidate.lane === bucket.lane)) continue;
+          const page = repos.runtime.scheduling.candidatePage({ ...request, ...bucket, limit: 200,
+            afterEnqueueSeq: bucket.after, includeUnregistered: true });
+          if (page.length) bucket.after = page[page.length - 1]!.enqueueSeq;
+          bucket.exhausted = page.length < 200;
+          candidates.push(...page);
+        }
+      }
+      while (claimed.length < limit) {
+        refill();
+        const before = selector.getCursor();
+        const chosen = selector.select(candidates, 1).selected[0];
+        if (!chosen) break;
+        candidates.splice(candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id), 1);
+        let result: FairClaimedWork | undefined;
+        if (chosen.queue === "main") {
+          const job = repos.runtime.getJob(chosen.id);
+          if (job) result = tryClaim({ queue: "main", job });
+        } else {
+          const retry = repos.runtime.getEmbeddingRetry(chosen.id);
+          if (retry) result = tryClaim({ queue: "embedding_retry", retry });
+        }
+        if (result) claimed.push(result);
+        else selector.setCursor(before);
+      }
+      if (claimed.length) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor() }, input.at);
+      return claimed;
+    });
+  } catch (error) {
+    // Rollback also covers successful earlier CAS operations. Returning all
+    // permits here prevents a failed transaction from leaking execution slots.
+    for (const admission of admissions) {
+      try { admission.release(); } catch { /* Keep releasing the remaining permits and preserve the transaction error. */ }
+    }
+    throw error;
+  }
 }

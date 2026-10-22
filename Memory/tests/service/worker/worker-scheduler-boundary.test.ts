@@ -10,6 +10,8 @@ import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.j
 
 const resources: Array<{ root: string; db: MemoryDb }> = [];
 
+async function flushWorker() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
+
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -101,6 +103,7 @@ describe("unified worker execution boundary", () => {
     const b = h.runner.runWorkerOnce(1, { targetMemoryIds: ["B"] });
     const c = h.runner.runWorkerOnce(1, { targetMemoryIds: ["C"] });
     try {
+      await flushWorker();
       expect(started).toEqual(["A"]);
       for (const id of ["B", "C"]) expect(h.repos.runtime.getJob(id)).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
     } finally { gate.resolve(); }
@@ -168,7 +171,7 @@ describe("unified worker execution boundary", () => {
     const h = harness(async () => { active++; peak = Math.max(peak, active); await gate.promise; active--; });
     for (let i = 0; i < 100; i++) h.job(`summary-${i}`, "trace_summary");
     const run = h.runner.runWorkerOnce();
-    try { expect(active).toBe(4); expect(peak).toBe(4); }
+    try { await flushWorker(); expect(active).toBe(4); expect(peak).toBe(4); }
     finally { gate.resolve(); }
     expect(await run).toMatchObject({ leased: 100, succeeded: 100 });
     expect(peak).toBe(4);

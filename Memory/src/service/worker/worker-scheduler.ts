@@ -28,8 +28,8 @@ interface PendingRequest {
 
 /**
  * The single execution boundary shared by automatic, manual and retry drains.
- * Stage 4 serializes existing drains; a drain can still run its existing batch
- * concurrently. Resource permits and continuous refill belong to stage 6.
+ * Requests retain their own budgets and filters. The admitted runner uses the
+ * shared resource controller to execute and continuously refill within a drain.
  */
 export class WorkerScheduler {
   private readonly pending: PendingRequest[] = [];

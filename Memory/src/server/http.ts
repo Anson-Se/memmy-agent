@@ -445,6 +445,7 @@ function createAutoWorkerDrain(
     if (disposed) {
       return;
     }
+    service.notifyWorkerWorkAvailable();
     startupReleased = true;
     requested = true;
     if (startupTimer) {

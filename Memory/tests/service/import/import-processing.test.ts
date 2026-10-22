@@ -101,7 +101,9 @@ describe("MemoryService / import / processing", () => {
       { job_type: "import_summary", status: "queued", target_memory_id: added.id }
     ]);
 
-    const summaryRun = await service.runWorkerOnce(100);
+    // A one-job budget exposes summary_pending -> embedding_pending before
+    // continuous admission is allowed to complete the downstream embedding.
+    const summaryRun = await service.runWorkerOnce(1);
     expect(summaryRun.jobs.map((job) => job.jobType)).toEqual(["import_summary"]);
     expect(llmCalls.map((call) => call.options.operation)).toEqual(["capture.summarize"]);
     const summaryCall = llmCalls.find((call) => call.options.operation === "capture.summarize");
@@ -1111,7 +1113,7 @@ describe("MemoryService / import / processing", () => {
     const first = addAgentSourceImport(service, namespace, "first targeted import", "targeted-first");
     const unrelated = addAgentSourceImport(service, namespace, "unrelated import", "targeted-unrelated");
 
-    const summaryRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
+    const summaryRun = await service.runWorkerOnce(1, { targetMemoryIds: [first.id] });
     const embeddingRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
 
     expect(summaryRun.jobs).toEqual([
@@ -1163,8 +1165,8 @@ describe("MemoryService / import / processing", () => {
     db.db.prepare(`UPDATE memories SET updated_at = ? WHERE id = ?`).run("2026-06-10T13:00:00.000Z", older.id);
     db.db.prepare(`UPDATE memories SET updated_at = ? WHERE id = ?`).run("2026-06-10T12:00:00.000Z", newer.id);
 
-    const summaryRun = await service.runWorkerOnce(10);
-    const embeddingRun = await service.runWorkerOnce(10);
+    const summaryRun = await service.runWorkerOnce(2);
+    const embeddingRun = await service.runWorkerOnce(2);
 
     expect(summaryRun.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
     expect(embeddingRun.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
@@ -1173,7 +1175,7 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("preserves older import summaries before embeddings appended later in the same lane", async () => {
+  it("preserves FIFO within available import resources while downstream embeddings progress", async () => {
     const root = createTestRoot("mindock-memory-import-interleave-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1195,32 +1197,32 @@ describe("MemoryService / import / processing", () => {
       userId: "user-import-interleave"
     };
 
+    const importedIds: string[] = [];
     for (let index = 0; index < 25; index += 1) {
-      addAgentSourceImport(
+      const imported = addAgentSourceImport(
         service,
         namespace,
         `imported query ${index}`,
         `interleave-${index}`,
         new Date(Date.UTC(2026, 5, 10, 10, index)).toISOString()
       );
+      importedIds.push(imported.id);
     }
 
-    const summaryRun = await service.runWorkerOnce(20);
-    const embeddingRun = await service.runWorkerOnce(20);
-
-    expect(summaryRun.jobs.map((job) => job.jobType)).toEqual(Array.from({ length: 20 }, () => "import_summary"));
-    expect(embeddingRun.jobs.map((job) => job.jobType)).toEqual([
-      ...Array.from({ length: 5 }, () => "import_summary"),
-      ...Array.from({ length: 15 }, () => "embedding")
-    ]);
+    // A busy summary provider does not block ready embedding work. The drain
+    // keeps filling available resources while each resource retains its FIFO.
+    const run = await service.runWorkerOnce(60);
+    expect(run.jobs).toHaveLength(50);
+    expect(run.jobs.filter(job => job.jobType === "import_summary").map(job => job.targetMemoryId)).toEqual(importedIds);
+    expect(run.jobs.filter(job => job.jobType === "embedding").map(job => job.targetMemoryId)).toEqual(importedIds);
+    expect(run.failed).toBe(0);
     expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(25);
-    expect(embeddingTexts).toHaveLength(15);
     const remainingSummaries = db.db.prepare(
       `SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type = 'import_summary' AND status = 'queued'`
     ).get() as { count: number };
     expect(remainingSummaries.count).toBe(0);
     const finalRun = await service.runWorkerOnce(20);
-    expect(finalRun.jobs.map((job) => job.jobType)).toEqual(Array.from({ length: 10 }, () => "embedding"));
+    expect(finalRun.jobs).toEqual([]);
     expect(embeddingTexts).toHaveLength(25);
     expect(embeddingTexts.every((text) => text.includes("Summary: LLM batch summary"))).toBe(true);
     expect(embeddingTexts.every((text) => text.includes("Original exchange:"))).toBe(true);
@@ -1337,7 +1339,7 @@ describe("MemoryService / import / processing", () => {
       "2026-06-10T12:00:00.000Z"
     );
 
-    const run = await service.runWorkerOnce(10);
+    const run = await service.runWorkerOnce(2);
 
     expect(run.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
     expect(embeddingTexts).toEqual([]);
@@ -1471,14 +1473,14 @@ describe("MemoryService / import / processing", () => {
     const reportEmbeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const liveSummaryRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
 
-    expect(reportSummaryRun.jobs.slice(0, 3)).toEqual([
-      expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId }),
-      expect.objectContaining({ jobType: "episode_title" }),
-      expect.objectContaining({ jobType: "import_summary", targetMemoryId: firstReport.id })
-    ]);
     const reportPolicy = db.db.prepare("SELECT queue_lane, base_priority FROM evolution_jobs WHERE target_memory_id = ? AND job_type = 'import_summary'").get(firstReport.id);
     expect(reportPolicy).toEqual({ queue_lane: "interactive", base_priority: -100 });
     const completed = [reportSummaryRun, reportEmbeddingRun, liveSummaryRun].flatMap((run) => run.jobs);
+    // A database-only idle close can start while the local model is occupied.
+    // Check ordering among the actual model summaries, rather than timer jobs.
+    expect(completed.filter(job => job.jobType === "trace_summary" || job.jobType === "import_summary")
+      .map(job => job.targetMemoryId)).toEqual([live.l1MemoryId, firstReport.id, scanned.id]);
+    expect(completed).toEqual(expect.arrayContaining([expect.objectContaining({ jobType: "episode_title" })]));
     const interactiveEmbeddings = completed.filter((job) => job.jobType === "embedding" &&
       [live.l1MemoryId, firstReport.id].includes(job.targetMemoryId ?? ""));
     expect(interactiveEmbeddings.map((job) => job.targetMemoryId)).toEqual([live.l1MemoryId, firstReport.id]);
@@ -1519,7 +1521,7 @@ describe("MemoryService / import / processing", () => {
       )`
     ).run(namespace.userId, added.id, "2026-06-10T10:00:00.000Z", "2026-06-10T10:00:00.000Z");
 
-    const firstRun = await service.runWorkerOnce(100);
+    const firstRun = await service.runWorkerOnce(1);
 
     expect(firstRun.jobs).toEqual([
       expect.objectContaining({

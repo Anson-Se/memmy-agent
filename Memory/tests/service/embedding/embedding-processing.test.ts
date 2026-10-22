@@ -131,9 +131,11 @@ describe("MemoryService / embedding / processing", () => {
       .prepare(`SELECT version FROM memories WHERE id = ?`)
       .get(complete.l1MemoryId) as { version: number };
 
-    const summaryRun = await service.runWorkerOnce(20, { priorityCohortOnly: true });
+    // Use an explicit one-job budget to inspect the intermediate state before
+    // continuous admission can immediately start the generated embedding.
+    const summaryRun = await service.runWorkerOnce(1, { targetMemoryIds: [complete.l1MemoryId] });
     expect(summaryRun.jobs.some((job) => job.jobType === "trace_summary" && job.status === "succeeded")).toBe(true);
-    const firstRun = await service.runWorkerOnce(20, { priorityCohortOnly: true });
+    const firstRun = await service.runWorkerOnce(1, { targetMemoryIds: [complete.l1MemoryId] });
     const failedEmbedding = firstRun.jobs.find((job) => job.jobType === "embedding" && job.status === "failed");
     expect(failedEmbedding?.jobId).toBeTruthy();
     const failedJob = db.db.prepare(
@@ -186,7 +188,10 @@ describe("MemoryService / embedding / processing", () => {
       .prepare(`SELECT version FROM memories WHERE id = ?`)
       .get(complete.l1MemoryId) as { version: number };
     const reindexRun = await service.runWorkerOnce(20, { priorityCohortOnly: true });
-    expect(reindexRun.jobs.some((job) => job.jobType === "embedding" && job.status === "succeeded")).toBe(true);
+    const afterReflection = [...reflectionRun.jobs, ...reindexRun.jobs];
+    expect(afterReflection.some((job) => job.jobType === "embedding" && job.status === "succeeded")).toBe(true);
+    expect(afterReflection.findIndex(job => job.jobType === "reflection"))
+      .toBeLessThan(afterReflection.findIndex(job => job.jobType === "embedding"));
     expect(new Repositories(db.db).processing.get(complete.l1MemoryId)?.state).toBe("ready");
     const memory = db.db
       .prepare(
@@ -231,8 +236,9 @@ describe("MemoryService / embedding / processing", () => {
       answer: "BAD_EMBEDDING_ITEM"
     });
 
-    await service.runWorkerOnce(20, { priorityCohortOnly: true });
-    const embeddingRun = await service.runWorkerOnce(20, { priorityCohortOnly: true });
+    const targets = { targetMemoryIds: [good.l1MemoryId, bad.l1MemoryId] };
+    await service.runWorkerOnce(2, targets);
+    const embeddingRun = await service.runWorkerOnce(2, targets);
     const repositories = new Repositories(db.db);
 
     expect(embeddingRun.jobs).toEqual(expect.arrayContaining([
@@ -491,11 +497,13 @@ describe("MemoryService / embedding / processing", () => {
     expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(1);
     expect(llmCalls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(false);
     const embeddingRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(embeddingRun.jobs).toEqual(expect.arrayContaining([
+    // Newly produced embedding work may finish in the original drain.
+    const completed = [...openEpisodeRun.jobs, ...embeddingRun.jobs];
+    expect(completed).toEqual(expect.arrayContaining([
       expect.objectContaining({ jobType: "embedding", targetMemoryId: complete.l1MemoryId })
     ]));
-    const reflectionIndex = embeddingRun.jobs.findIndex((job) => job.jobType === "reflection");
-    const embeddingIndex = embeddingRun.jobs.findIndex((job) => job.jobType === "embedding");
+    const reflectionIndex = completed.findIndex((job) => job.jobType === "reflection");
+    const embeddingIndex = completed.findIndex((job) => job.jobType === "embedding");
     if (reflectionIndex >= 0) expect(embeddingIndex).toBeLessThan(reflectionIndex);
     const auxiliaryJobs = [...openEpisodeRun.jobs, ...embeddingRun.jobs].map((job) => job.jobType);
     expect(auxiliaryJobs).toEqual(expect.arrayContaining(["episode_title", "episode_idle_close"]));
