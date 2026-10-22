@@ -74,7 +74,7 @@ static BOOL CALLBACK printDialogChild(HWND window, LPARAM count) {
 static BOOL CALLBACK diagnoseDialog(HWND window, LPARAM unused) {
     (void)unused; DWORD owner = 0; wchar_t kind[64] = {};
     GetWindowThreadProcessId(window, &owner);
-    if (owner != GetCurrentProcessId() || !IsWindowVisible(window)) return TRUE;
+    if (owner != GetCurrentProcessId()) return TRUE;
     GetClassNameW(window, kind, 64);
     if (wcscmp(kind, L"#32770")) return TRUE;
     // Only inspect this headless worker's own error dialog. Never acknowledge
@@ -122,6 +122,7 @@ static DWORD WINAPI diagnoseStartup(void *thread) {
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
     SymInitialize(GetCurrentProcess(), "", TRUE); // No symbol servers or external services.
     DWORD main = GetThreadId((HANDLE)thread), own = GetCurrentThreadId();
+    EnumThreadWindows(main, diagnoseDialog, 0);
     dumpThread((HANDLE)thread, main); CloseHandle((HANDLE)thread);
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot != INVALID_HANDLE_VALUE) {
@@ -129,6 +130,7 @@ static DWORD WINAPI diagnoseStartup(void *thread) {
         int count = 0;
         if (Thread32First(snapshot, &entry)) do {
             if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == own || entry.th32ThreadID == main) continue;
+            EnumThreadWindows(entry.th32ThreadID, diagnoseDialog, 0);
             HANDLE worker = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
             if (worker) { dumpThread(worker, entry.th32ThreadID); CloseHandle(worker); }
             if (++count >= 16) break;
