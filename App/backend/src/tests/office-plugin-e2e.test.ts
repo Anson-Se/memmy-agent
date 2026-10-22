@@ -34,7 +34,9 @@ const pluginRoot = join(repo, "plugins/office");
 const releaseRoot = join(pluginRoot, "release");
 const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 const cleanup: Array<() => unknown> = [];
-afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
+// A verified renderer contains tens of thousands of files; Windows ACL cleanup
+// and antivirus scanning take longer than Vitest's default ten-second hook.
+afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); }, 120000);
 
 describe("Office MPP end to end", () => {
   it("publishes immutable registry releases and rejects tampered artifacts", async () => {

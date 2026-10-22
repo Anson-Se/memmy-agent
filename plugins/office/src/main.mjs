@@ -471,7 +471,8 @@ async function handle(call) {
       const executable = path.join(path.dirname(__filename), "execute.cjs");
       const root = path.dirname(executable);
       const response = await new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, ["--permission", "--max-old-space-size=256", `--allow-fs-read=${root}`, `--allow-fs-read=${executionDirectory}`,
+        const child = spawn(process.execPath, [...(process.platform === "win32" ? ["--preserve-symlinks", "--preserve-symlinks-main"] : []),
+          "--permission", "--max-old-space-size=256", `--allow-fs-read=${root}`, `--allow-fs-read=${executionDirectory}`,
           `--allow-fs-write=${executionDirectory}`, executable], { cwd: executionDirectory, shell: false,
           env: { PATH: process.env.PATH, ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TEMP: executionDirectory, TMP: executionDirectory } : {}), LANG: "C.UTF-8", ELECTRON_RUN_AS_NODE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
         children.add(child);

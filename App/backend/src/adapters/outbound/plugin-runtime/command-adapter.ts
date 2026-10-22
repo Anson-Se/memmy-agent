@@ -492,7 +492,9 @@ export async function buildPluginSandboxLaunch(
     await access(resolve(dirname(script), "Sandbox.cs"), fsConstants.R_OK);
     const plan = {
       profile: `memmy.plugin.${createHash("sha256").update(`${context.plugin.id}\0${root}`).digest("hex").slice(0, 32)}`,
-      command: runtimeCommand, args: runtimeArgs, cwd,
+      // The Host has already canonicalized the entrypoint. Node's default CJS
+      // resolver otherwise lstats every ancestor up to C:\, outside the grant.
+      command: runtimeCommand, args: interpreter === "node" ? ["--preserve-symlinks", "--preserve-symlinks-main", ...runtimeArgs] : runtimeArgs, cwd,
       readRoots: [...new Set([root, ...(runtimeRoot ? [runtimeRoot] : []), ...runtimeReadRoots,
         ...filesystem.filter(rule => !rule.writable).map(rule => rule.path)])],
       writeRoots: [...new Set(filesystem.filter(rule => rule.writable).map(rule => rule.path))]

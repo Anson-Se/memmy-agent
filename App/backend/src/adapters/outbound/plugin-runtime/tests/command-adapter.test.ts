@@ -419,7 +419,7 @@ describe("CommandPluginAdapter", () => {
     expect(launch.command).toMatch(/powershell\.exe$/);
     const plan = JSON.parse(Buffer.from(launch.args[launch.args.indexOf("-Plan") + 1]!, "base64").toString("utf8"));
     expect(plan.command).toBe(realpathSync(process.execPath));
-    expect(plan.args).toEqual([realpathSync(join(root!, "runtime/plugin")), "a b", "中文", 'quote"value']);
+    expect(plan.args).toEqual(["--preserve-symlinks", "--preserve-symlinks-main", realpathSync(join(root!, "runtime/plugin")), "a b", "中文", 'quote"value']);
     expect(plan.readRoots).toContain(realpathSync(root!)); expect(plan.writeRoots).toEqual([]);
     expect(plan.profile).toMatch(/^memmy\.plugin\.[a-f0-9]{32}$/);
     await expect(buildPluginSandboxLaunch(pluginContext, { command: "runtime/plugin", interpreter: "node", args: [], cwd: "." }, "win32", true)).rejects.toThrow(/no network/);

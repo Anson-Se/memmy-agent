@@ -85,6 +85,8 @@ function spawnLauncher(plan: unknown) {
   const helper = fileURLToPath(new URL("../windows/launch.ps1", import.meta.url));
   return spawn(join(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "-Plan", Buffer.from(JSON.stringify(plan)).toString("base64")], { stdio: ["pipe", "pipe", "pipe"], env: {
     SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+    WINDIR: process.env.SystemRoot ?? "C:\\Windows",
+    PATH: join(process.env.SystemRoot ?? "C:\\Windows", "System32"),
     MEMMY_SANDBOX_TRACE: "1",
     MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify({ SystemRoot: process.env.SystemRoot ?? "C:\\Windows", LOCALAPPDATA: "untrusted-profile", TEMP: tmpdir(), TMP: tmpdir(), ELECTRON_RUN_AS_NODE: "1" })).toString("base64")
   } });

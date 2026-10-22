@@ -1,6 +1,7 @@
 param([Parameter(Mandatory=$true)][string]$Plan)
 $ErrorActionPreference = 'Stop'
 try {
+  if ($env:MEMMY_SANDBOX_TRACE -eq '1') { [Console]::Error.WriteLine('Memmy AppContainer: preparing launcher') }
   $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Plan)) | ConvertFrom-Json
   # Compilation runs at Host privilege: never use a plugin-writable TEMP.
   # CreateProcessW resolves the AppContainer profile from the launcher's
@@ -22,6 +23,7 @@ try {
   $env:TEMP = $compilerRoot
   $env:TMP = $compilerRoot
   # Compile only Host-packaged source, never source supplied by a plugin.
+  if ($env:MEMMY_SANDBOX_TRACE -eq '1') { [Console]::Error.WriteLine('Memmy AppContainer: compiling launcher') }
   Add-Type -Path (Join-Path $PSScriptRoot 'Sandbox.cs')
   $childEnvironment = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MEMMY_SANDBOX_CHILD_ENV)) | ConvertFrom-Json
   $dictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
