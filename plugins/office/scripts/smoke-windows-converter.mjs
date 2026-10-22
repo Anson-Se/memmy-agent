@@ -32,7 +32,7 @@ export async function smokeWindowsConverter(executable) {
     await rm(join(output, "smoke.pdf"));
     const launcher = fileURLToPath(new URL("../../../App/backend/src/adapters/outbound/plugin-runtime/windows/launch.ps1", import.meta.url));
     const args = [`-env:UserInstallation=${pathToFileURL(profile).href}`, "--headless", "--convert-to", "pdf", "--outdir", output, input];
-    const plan = Buffer.from(JSON.stringify({ profile: `MemmyOfficeSmoke-${randomUUID()}`, command: executable, args, cwd: root,
+    const plan = Buffer.from(JSON.stringify({ profile: `memmy.plugin.office.smoke-${randomUUID()}`, command: executable, args, cwd: root,
       readRoots: [resolve(dirname(executable), "..")], writeRoots: [root] })).toString("base64");
     const hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(env)).toString("base64") };
     const handles = [openSync(join(root, "sandbox-output"), "w"), openSync(join(root, "sandbox-errors"), "w")];
