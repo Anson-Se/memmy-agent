@@ -62,6 +62,8 @@ export interface CreatePluginServiceOptions {
   /** Resolves whether the signed-in account holds a manifest-declared entitlement. */
   isAuthenticated?: () => boolean;
   isEntitlementGranted?: (entitlement: string) => boolean;
+  /** Private plugin IDs discoverable through server-issued account entitlements. */
+  catalogPluginIds?: () => readonly string[];
 }
 
 export function createPluginService(options: CreatePluginServiceOptions): PluginService {
@@ -111,8 +113,19 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
       return options.repository.list().map((plugin) => ({ ...publicPlugin(plugin), eligibility: eligibility(plugin.manifest) }));
     },
     async catalog() {
-      const manifests = await options.registry.list?.() ?? [];
-      return manifests.filter((manifest) => eligibility(manifest).visible).map((manifest) => ({
+      const listed = await options.registry.list?.() ?? [];
+      const manifests = new Map(listed.map((manifest) => [manifest.id, manifest]));
+      const privatePluginIds = [...new Set(options.catalogPluginIds?.() ?? [])]
+        .filter((pluginId) => !manifests.has(pluginId));
+      const privateReleases = await Promise.allSettled(
+        privatePluginIds.map((pluginId) => options.registry.resolve(pluginId))
+      );
+      for (const result of privateReleases) {
+        if (result.status === "fulfilled") {
+          manifests.set(result.value.manifest.id, result.value.manifest);
+        }
+      }
+      return [...manifests.values()].filter((manifest) => eligibility(manifest).visible).map((manifest) => ({
         manifest, eligibility: eligibility(manifest),
         ...(options.repository.get(manifest.id) ? { installed: this.list().find((plugin) => plugin.id === manifest.id) } : {})
       }));

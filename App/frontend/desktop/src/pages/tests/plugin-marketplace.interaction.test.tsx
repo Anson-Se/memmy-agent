@@ -26,6 +26,14 @@ const pending = InstalledPluginSchema.parse({
     capabilities: [{ id: "review", name: "Review", description: "Review", inputSchema: {}, outputSchema: {}, execution: "job" }] }
 });
 
+const legal = InstalledPluginSchema.parse({
+  id: "legal-labor", version: "0.1.0-test.1", state: "active", config: {},
+  approvedPermissions: [], lastError: null, createdAt: "2026-10-22T00:00:00Z", updatedAt: "2026-10-22T00:00:00Z",
+  manifest: { apiVersion: "memmy/v1", id: "legal-labor", name: "用工合规诊断", version: "0.1.0-test.1",
+    requiredEntitlement: "plugin:legal-labor", runtime: { adapter: "command" }, permissions: [],
+    capabilities: [{ id: "session-start", name: "开始诊断", description: "收集材料并生成用工合规诊断报告。", inputSchema: {}, outputSchema: {}, execution: "request" }] }
+});
+
 describe("live marketplace controller", () => {
   let root: Root;
   let container: HTMLDivElement;
@@ -200,6 +208,35 @@ describe("live marketplace controller", () => {
     expect(clients.plugins.uninstall).toHaveBeenCalledWith("literature-review");
     expect(button("安装文献综述").disabled).toBe(false);
     expect(addToChatButton()).toBeNull();
+  });
+
+  it("keeps an entitled legal plugin visible after uninstall and allows reinstall", async () => {
+    records = [legal];
+    clients.plugins.catalog.mockResolvedValue([{
+      manifest: legal.manifest,
+      eligibility: { visible: true, canInstall: true, canUse: true, reason: null }
+    }]);
+    clients.plugins.install.mockImplementationOnce(async () => {
+      records = [{ ...legal, state: "installed" }];
+      return records[0];
+    });
+    await render();
+
+    const legalCard = container.querySelector('article[aria-label="用工合规诊断"]')!;
+    expect(legalCard).not.toBeNull();
+    expect(legalCard.querySelector(".plugin-marketplace-icon--legal")).not.toBeNull();
+    await click("用工合规诊断更多操作");
+    await click("卸载");
+    await click("卸载", document.querySelector("[role=dialog]")!);
+
+    expect(clients.plugins.uninstall).toHaveBeenCalledWith("legal-labor");
+    expect(container.querySelector('article[aria-label="用工合规诊断"]')).not.toBeNull();
+    expect(button("安装用工合规诊断").disabled).toBe(false);
+
+    await click("安装用工合规诊断");
+    expect(clients.plugins.install).toHaveBeenCalledWith("legal-labor", "0.1.0-test.1");
+    expect(clients.plugins.enable).toHaveBeenCalledWith("legal-labor");
+    expect(container.querySelector('article[aria-label="用工合规诊断"] [aria-label="将用工合规诊断加入对话"]')).not.toBeNull();
   });
 
   it("adds the plugin command to the current chat composer and opens the chat", async () => {

@@ -93,7 +93,9 @@ describe("ToolsPageView", () => {
   it("保留页面骨架，三个分类共用紧凑目录的布局", () => {
     const html = renderView(initialToolsState);
 
-    expect(html).toContain("app-frame-page-content h-full overflow-y-auto py-6");
+    expect(html).toContain('padding-top:calc(var(--codex-toolbar-height) + var(--app-frame-topbar-offset, 0px))');
+    expect(html).toContain('class="app-frame-page-content h-full overflow-y-auto tools-page-content"');
+    expect(html).toContain('style="padding-top:0;padding-bottom:24px"');
     expect(html).toContain('data-tour-anchor="product-tour-tools-content"');
     expect(html).toContain("plugin-marketplace-grid");
     expect(html).toContain("extension-catalog-heading");

@@ -105,7 +105,7 @@ export function PluginMarketplace() {
   const plugins: MarketplacePlugin[] = catalog ? catalog.map((entry) => ({
     id: entry.manifest.id, name: entry.manifest.name, eligibility: entry.eligibility,
     description: entry.manifest.capabilities[0]?.description ?? "",
-    category: "other", version: entry.manifest.version,
+    category: pluginCategory(entry.manifest.id), version: entry.manifest.version,
     requiresLogin: entry.eligibility.reason === "login_required" || entry.manifest.rules?.requiresLogin,
     requiresOfficialModel: entry.manifest.rules?.recommendsOfficialModel,
     installable: entry.eligibility.canInstall,
@@ -156,4 +156,11 @@ export function PluginMarketplace() {
     onSignIn={() => dispatch(appActions.navigate("/welcome"))}
     />
   </>;
+}
+
+function pluginCategory(pluginId: string): MarketplacePlugin["category"] {
+  if (pluginId === "legal-labor") return "legal";
+  if (pluginId === "literature-review") return "research";
+  if (pluginId === "office") return "office";
+  return "other";
 }
