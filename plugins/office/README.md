@@ -28,8 +28,8 @@ Prepare an independent registry directory:
 
 ```sh
 node plugins/office/scripts/publish.mjs --root /absolute/path/office-registry \
-  --descriptor plugins/office/release/office-0.2.0.release.json \
-  --artifact plugins/office/release/office-0.2.0.mpp.zip --set-default
+  --descriptor plugins/office/release/office-0.2.1.release.json \
+  --artifact plugins/office/release/office-0.2.1.mpp.zip --set-default
 ```
 
 The output uses the same descriptor/catalog format as the legal and literature
