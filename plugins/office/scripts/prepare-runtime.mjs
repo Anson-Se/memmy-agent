@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { access, chmod, copyFile, cp, mkdir, open, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { buildWindowsConverter } from "./build-windows-converter.mjs";
+import { smokeWindowsConverter } from "./smoke-windows-converter.mjs";
 
 const destination = resolve(process.argv[2] ?? "release/runtime-tree");
 await mkdir(destination, { recursive: false }); // never merge a new release into stale binaries
@@ -24,6 +25,7 @@ if (process.platform === "win32") {
     await access(source); // fail the release rather than shipping a partially portable runtime
     for (const bin of ["LibreOffice/program", "poppler/Library/bin"]) await copyFile(source, join(destination, bin, file));
   }
+  await smokeWindowsConverter(join(destination, tools.soffice));
 } else if (process.platform === "darwin") {
   const libreoffice = process.env.OFFICE_BUILD_LIBREOFFICE ?? "/Applications/LibreOffice.app";
   await cp(libreoffice, join(destination, "LibreOffice.app"), { recursive: true, dereference: true });

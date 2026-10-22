@@ -77,7 +77,7 @@ namespace Memmy {
       // A private, non-interactive window station lets rendering libraries use
       // GDI/internal windows without access to the user's desktop or clipboard.
       string owner = WindowsIdentity.GetCurrent().User.Value;
-      string security = "D:(A;;GA;;;SY)(A;;GA;;;" + owner + ")(A;;GA;;;" + identity.Value + ")S:(ML;;NW;;;LW)";
+      string security = "D:P(A;;GA;;;SY)(A;;GA;;;" + owner + ")(A;;GA;;;" + identity.Value + ")S:(ML;;NW;;;LW)";
       try {
         Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(security, 1, out descriptor, IntPtr.Zero), "Private desktop security");
         var attributes = new SecurityAttributes { length = Marshal.SizeOf(typeof(SecurityAttributes)), descriptor = descriptor, inherit = false };

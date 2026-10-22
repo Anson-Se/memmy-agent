@@ -13,6 +13,36 @@
 #pragma comment(lib, "user32.lib")
 
 static const char *stage = "startup";
+static LONG exceptionCount = 0;
+static LONG CALLBACK diagnosticException(EXCEPTION_POINTERS *exception) {
+    if (exception->ExceptionRecord->ExceptionCode != 0xe06d7363 || InterlockedIncrement(&exceptionCount) > 128) return EXCEPTION_CONTINUE_SEARCH;
+    // MSVC x64/ARM64 exception metadata uses image-relative type descriptors.
+    // Diagnostics only: never consume or alter the engine's exception handling.
+    __try {
+        const ULONG_PTR *args = exception->ExceptionRecord->ExceptionInformation;
+        if (exception->ExceptionRecord->NumberParameters >= 4 && args[2] && args[3]) {
+            const unsigned char *image = (const unsigned char *)args[3];
+            const DWORD *info = (const DWORD *)args[2];
+            const DWORD *types = (const DWORD *)(image + info[3]);
+            if (types[0] && types[0] < 128) {
+                const DWORD *type = (const DWORD *)(image + types[1]);
+                const char *name = (const char *)(image + type[1] + 2 * sizeof(void *));
+                fprintf(stderr, "LibreOfficeKit C++ exception at %s: %.500s", stage, name);
+                if (strstr(name, "@sun@com@@") && args[1]) {
+                    const unsigned char *text = *(const unsigned char **)(args[1] + sizeof(void *));
+                    int length = *(const int *)(text + 4);
+                    if (length > 0 && length < 1000) {
+                        char message[4096];
+                        int bytes = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t *)(text + 8), length, message, 4095, NULL, NULL);
+                        if (bytes > 0) { message[bytes] = 0; fprintf(stderr, ": %s", message); }
+                    }
+                }
+                fputc('\n', stderr); fflush(stderr);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* Some native exceptions have different metadata. */ }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static void trace(const char *value) {
     wchar_t enabled[2]; stage = value;
     if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", enabled, 2) == 1 && enabled[0] == L'1') { fprintf(stderr, "LibreOfficeKit: %s\n", value); fflush(stderr); }
@@ -71,7 +101,7 @@ static int error(Kit *kit, const char *stage) {
     return 1;
 }
 static int convert(int argc, wchar_t **argv) {
-    wchar_t directory[32768], library[32768], output[32768];
+    wchar_t directory[32768], library[32768], output[32768], working[32768], local[32768], roaming[32768];
     const wchar_t *profile = NULL, *input = NULL, *outdir = NULL, *format = NULL, *base, *dot;
     HMODULE module; Initialize initialize; Kit *kit; Document *document;
     char *install, *user, *source, *target; const char *extension;
@@ -88,6 +118,21 @@ static int convert(int argc, wchar_t **argv) {
     if (!GetModuleFileNameW(NULL, directory, 32768)) return error(NULL, "module path");
     base = wcsrchr(directory, L'\\'); if (!base) return 2;
     directory[base - directory] = 0;
+    if (!GetCurrentDirectoryW(32768, working)) return error(NULL, "working directory");
+    swprintf_s(local, 32768, L"%ls\\local", working);
+    swprintf_s(roaming, 32768, L"%ls\\roaming", working);
+    if (!CreateDirectoryW(local, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return error(NULL, "local profile directory");
+    if (!CreateDirectoryW(roaming, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return error(NULL, "roaming profile directory");
+    // Windows libraries expect these variables even with UserInstallation set.
+    // Initialize them before loading the engine/its CRT, using only task storage.
+    SetEnvironmentVariableW(L"USERPROFILE", working);
+    SetEnvironmentVariableW(L"LOCALAPPDATA", local);
+    SetEnvironmentVariableW(L"APPDATA", roaming);
+    if (working[1] == L':') {
+        wchar_t drive[3] = { working[0], L':', 0 };
+        SetEnvironmentVariableW(L"HOMEDRIVE", drive);
+        SetEnvironmentVariableW(L"HOMEPATH", working + 2);
+    }
     trace("checking private desktop");
     WNDCLASSW probe = {};
     probe.lpfnWndProc = DefWindowProcW; probe.hInstance = GetModuleHandleW(NULL); probe.lpszClassName = L"MemmyOfficeHeadlessProbe";
@@ -145,7 +190,10 @@ static int convert(int argc, wchar_t **argv) {
 int wmain(int argc, wchar_t **argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_invalid_parameter_handler(invalidParameter);
-    if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", NULL, 0)) SetEnvironmentVariableW(L"SAL_LOG", L"+WARN");
+    if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", NULL, 0)) {
+        SetEnvironmentVariableW(L"SAL_LOG", L"+WARN");
+        AddVectoredExceptionHandler(1, diagnosticException);
+    }
     try { return convert(argc, argv); }
     catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage, failure.what()); }
     catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage); }
