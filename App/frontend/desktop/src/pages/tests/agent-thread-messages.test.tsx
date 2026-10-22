@@ -2036,6 +2036,9 @@ describe("AgentThreadMessages", () => {
     expect(localArtifactPathFromHref("file:///Users/yuan/deck.pptx")).toBe("/Users/yuan/deck.pptx");
     expect(localArtifactPathFromHref("C:\\Users\\yuan\\deck.pptx")).toBe("C:\\Users\\yuan\\deck.pptx");
     expect(localArtifactPathFromHref("/api/media/sig/payload")).toBeNull();
+    expect(localArtifactPathFromHref("/api/icon.png")).toBeNull();
+    expect(localArtifactPathFromHref("/assets/app.js")).toBeNull();
+    expect(localArtifactPathFromHref("/static/logo.svg")).toBeNull();
     expect(localArtifactPathFromHref("https://example.com/deck.pptx")).toBeNull();
   });
 
@@ -2102,7 +2105,8 @@ describe("AgentThreadMessages", () => {
             {
               id: "answer",
               role: "assistant",
-              content: "文件 /Users/yuan/deck.pptx。\nWindows C:\\Users\\yuan\\result.png\n目录 /Users/yuan/.memmy/workspace\n普通文本 foo/bar"
+              content:
+                "文件 /Users/yuan/deck.pptx）。\nWindows C:\\Users\\yuan\\result.png\n目录 /Users/yuan/.memmy/workspace\n普通文本 foo/bar\n接口 /api/icon.png\n资源 /assets/app.js\n静态 /static/logo.svg"
             }
           ]}
         />
@@ -2113,11 +2117,18 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain("C:\\Users\\yuan\\result.png");
     expect(html).toContain("/Users/yuan/.memmy/workspace");
     expect(html).toContain("foo/bar");
+    expect(html).toContain("）。");
+    expect(html).toContain("/api/icon.png");
+    expect(html).toContain("/assets/app.js");
+    expect(html).toContain("/static/logo.svg");
     expect(html.match(/agent-message-content__file-chip/g)).toHaveLength(2);
     expect(html).toContain('title="/Users/yuan/deck.pptx"');
     expect(html).toContain('title="C:\\Users\\yuan\\result.png"');
     expect(html).not.toContain('title="/Users/yuan/.memmy/workspace"');
     expect(html).not.toContain('title="foo/bar"');
+    expect(html).not.toContain('title="/api/icon.png"');
+    expect(html).not.toContain('title="/assets/app.js"');
+    expect(html).not.toContain('title="/static/logo.svg"');
   });
 
   it("renders structured file media as attachment chips instead of images", () => {

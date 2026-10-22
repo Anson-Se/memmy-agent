@@ -45,7 +45,9 @@ interface AgentMessageContentProps {
 }
 
 const TRAILING_PUNCTUATION_RE = /[.,;:!?，。；：！？)）\]]+$/;
+// Match through adjacent punctuation, then split it back out before rendering the file chip.
 const BARE_LOCAL_PATH_RE = /(^|[\s([{（【:：])((?:~\/|\/|[A-Za-z]:[\\/])[^\s<>"'`]+)/gu;
+const APP_RELATIVE_URL_PATH_RE = /^\/(?:api|assets|static)(?:\/|$)/i;
 const LONG_TEXT_WRAP_CLASS = "break-words [overflow-wrap:anywhere]";
 const LIST_ITEM_BLOCK_TAGS = new Set(["p", "pre", "blockquote", "table", "ul", "ol", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "div"]);
 
@@ -861,10 +863,16 @@ export function localArtifactPathFromHref(href: string | undefined): string | nu
 }
 
 function isLikelyLocalPath(value: string): boolean {
-  if (!value || isDirectMediaUrl(value) || /^[a-z][a-z0-9+.-]*:/i.test(value)) {
-    return /^[A-Za-z]:[\\/]/.test(value);
-  }
+  if (!value || isDirectMediaUrl(value) || APP_RELATIVE_URL_PATH_RE.test(value)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
   return value.includes("/") && (value.startsWith("/") || value.startsWith("~/") || /^[A-Za-z0-9_.@+-]+\//.test(value));
+}
+
+function parseLocalFileToken(rawPath: string): { path: string; suffix: string } | null {
+  const path = cleanPathToken(rawPath);
+  if (!rawPath.startsWith(path) || !isLikelyLocalFilePath(path)) return null;
+  return { path, suffix: rawPath.slice(path.length) };
 }
 
 function withBareLocalFileReferences(children: ReactNode, props: AgentMessageContentProps): ReactNode {
@@ -875,15 +883,15 @@ function withBareLocalFileReferences(children: ReactNode, props: AgentMessageCon
     let pathIndex = 0;
     for (const match of child.matchAll(BARE_LOCAL_PATH_RE)) {
       const rawPath = match[2] ?? "";
-      const cleanPath = cleanPathToken(rawPath);
-      if (!isLikelyLocalFilePath(cleanPath)) continue;
+      const parsed = parseLocalFileToken(rawPath);
+      if (!parsed) continue;
       const start = (match.index ?? 0) + (match[1]?.length ?? 0);
       if (start > cursor) nodes.push(child.slice(cursor, start));
       nodes.push(
         <FileReferenceChip
           key={`bare-local-file-${childIndex}-${pathIndex}`}
-          path={cleanPath}
-          label={cleanPath}
+          path={parsed.path}
+          label={parsed.path}
           isStreaming={props.isStreaming}
           artifactClient={props.artifactClient}
           onPreviewFile={props.onPreviewFile}
@@ -891,7 +899,7 @@ function withBareLocalFileReferences(children: ReactNode, props: AgentMessageCon
       );
       pathIndex += 1;
       const rawEnd = start + rawPath.length;
-      if (cleanPath.length < rawPath.length) nodes.push(rawPath.slice(cleanPath.length));
+      if (parsed.suffix) nodes.push(parsed.suffix);
       cursor = rawEnd;
     }
     if (cursor === 0) return child;
