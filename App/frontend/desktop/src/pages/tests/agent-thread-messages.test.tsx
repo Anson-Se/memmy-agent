@@ -2069,7 +2069,7 @@ describe("AgentThreadMessages", () => {
     expect(html).not.toContain('href="file:///Users/yuan/deck.pptx"');
   });
 
-  it("renders inline code local paths as normal markdown code", () => {
+  it("renders inline code local paths as clickable chips without changing ordinary inline code", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">
         <AgentThreadMessages
@@ -2078,7 +2078,7 @@ describe("AgentThreadMessages", () => {
             {
               id: "answer",
               role: "assistant",
-              content: "`/Users/yuan/deck.pptx`"
+              content: "`/Users/yuan/deck.pptx` and `npm run test`"
             }
           ]}
         />
@@ -2087,7 +2087,9 @@ describe("AgentThreadMessages", () => {
 
     expect(html).toContain("agent-message-content__inline-code");
     expect(html).toContain("/Users/yuan/deck.pptx");
-    expect(html).not.toContain("agent-message-content__file-chip");
+    expect(html).toContain("npm run test");
+    expect(html).toContain("agent-message-content__file-chip");
+    expect(html).toContain('title="/Users/yuan/deck.pptx"');
     expect(html).not.toContain('href="file:///Users/yuan/deck.pptx"');
   });
 

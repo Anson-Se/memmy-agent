@@ -198,6 +198,10 @@ export const AgentMessageContent = memo(function AgentMessageContent(props: Agen
       const language = /language-([A-Za-z0-9_+-]+)/.exec(className ?? "")?.[1] ?? null;
       const isInline = !language && !raw.includes("\n");
       if (isInline) {
+        const localPath = cleanPathToken(code);
+        if (isLikelyLocalFilePath(localPath)) {
+          return <FileReferenceChip path={localPath} label={localPath} isStreaming={props.isStreaming} artifactClient={props.artifactClient} onPreviewFile={props.onPreviewFile} />;
+        }
         return <code className={`agent-message-content__inline-code ${INLINE_CODE_WRAP_CLASS}`}>{code}</code>;
       }
       return <CodeBlock code={code} language={language} highlight={!props.isStreaming} />;
