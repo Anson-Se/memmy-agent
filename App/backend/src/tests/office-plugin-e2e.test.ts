@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify from "fastify";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -61,7 +61,7 @@ describe("Office MPP end to end", () => {
   });
 
   it("installs the real release, runs all formats through MCP/Agent, renders actual pages, delivers files and unregisters on disable/uninstall", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "office-installed-e2e-")));
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "office-installed-e2e-")));
     cleanup.push(() => rmSync(root, { recursive: true, force: true }));
     const workspace = join(root, "workspace"), uploads = join(root, "uploads"), dataRoot = join(root, "plugin-data");
     mkdirSync(workspace); mkdirSync(uploads);
@@ -167,7 +167,7 @@ describe("Office MPP end to end", () => {
       const delivered = await call("office_deliver", { taskId: document.taskId, file: document.file, revision: rendered.revision, reviewedPages: pageNumbers,
         reviewNotes: "Automated transport check only; retained PNGs require separate visual review." });
       const artifact = delivered.artifacts[0] as PluginArtifactRef;
-      expect(artifact.path).toContain(join(workspace, "outputs/office", document.taskId));
+      expect(dirname(realpathSync.native(artifact.path!))).toBe(realpathSync.native(join(workspace, "outputs/office", document.taskId)));
       const preview = await api.inject({ method: "GET", url: artifact.uri });
       const download = await api.inject({ method: "GET", url: artifact.downloadUri! });
       expect(preview.statusCode).toBe(200); expect(download.statusCode).toBe(200);
