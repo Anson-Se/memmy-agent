@@ -84,9 +84,11 @@ describe("mandatory MemMate permission", () => {
     const requests: any[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_url, init) => { requests.push(JSON.parse(init.body)); return Response.json({ decision }); }));
     const execute = vi.fn(async () => "written");
-    const app = createApp(async () => {
+    const app = createApp(async (args: any) => {
+      await args.onProgress("", { toolEvents: [{ phase: "start", call_id: "correlated", name: "write_file", arguments: { path: "a" } }] });
       await new AgentRunner().executeTools(new AgentRunSpec({ tools: { execute, get: () => ({ readOnly: false }) } as any }),
         [new ToolCallRequest({ id: "correlated", name: "write_file", arguments: { path: "a" } })]);
+      await args.onProgress("", { toolEvents: [{ phase: decision === "allow" ? "end" : "error", call_id: "correlated", name: "write_file", result: "written", error: "denied" }] });
       return "finished";
     });
     const response = await app.fetch(new Request("http://127.0.0.1/v1/chat/completions", {
@@ -98,6 +100,48 @@ describe("mandatory MemMate permission", () => {
     expect(events.map(event => [event.type, event.callId])).toEqual([["tool_call", "correlated"], ["tool_result", "correlated"]]);
     expect(events[1].ok).toBe(decision === "allow");
     expect(execute).toHaveBeenCalledTimes(decision === "allow" ? 1 : 0);
+  });
+
+  it.each([true, false])("keeps approval pending beyond the legacy deadline and authenticates explicit stop (stream=%s)", async stream => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    vi.stubEnv("MEMMATE_RUNTIME_TOKEN", "b".repeat(64));
+    let approvalSignal!: AbortSignal;
+    vi.stubGlobal("fetch", vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      approvalSignal = init.signal;
+      approvalSignal.addEventListener("abort", () => reject(approvalSignal.reason), { once: true });
+    })));
+    const execute = vi.fn();
+    const app = createApp(async () => {
+      await authorizeMemmateTool("write_file", { path: "a" });
+      await execute();
+      return "written";
+    }, "memmy", 0.001);
+    const responsePromise = app.fetch(new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json", "x-memmate-runtime-token": "b".repeat(64) },
+      body: JSON.stringify({ stream, session_id: "s", request_id: "r", messages: [{ role: "user", content: "test" }], memmate_permission: credential })
+    }));
+    await vi.waitFor(() => expect(approvalSignal).toBeDefined());
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(app.context.activeRequests.size).toBe(1);
+    expect(approvalSignal.aborted).toBe(false);
+    const cancel = (token?: string) => app.fetch(new Request("http://127.0.0.1/v1/chat/cancel", {
+      method: "POST", headers: { "content-type": "application/json", ...(token ? { "x-memmate-runtime-token": token } : {}) },
+      body: JSON.stringify({ session_id: "s", request_id: "r" })
+    }));
+    expect((await cancel()).status).toBe(401);
+    expect(approvalSignal.aborted).toBe(false);
+    expect((await cancel("b".repeat(64))).status).toBe(200);
+    const response = await responsePromise;
+    if (stream) {
+      const text = await response.text();
+      expect(text).toContain('"code":"cancelled"');
+      expect(text).not.toContain("[DONE]");
+    } else {
+      expect(response.status).toBe(409);
+    }
+    expect(approvalSignal.aborted).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
+    expect(app.context.activeRequests.size).toBe(0);
   });
 
 });
