@@ -9,6 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <exception>
+
+static const char *stage = "startup";
+static void trace(const char *value) {
+    wchar_t enabled[2]; stage = value;
+    if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", enabled, 2) == 1 && enabled[0] == L'1') { fprintf(stderr, "LibreOfficeKit: %s\n", value); fflush(stderr); }
+}
+static void invalidParameter(const wchar_t *expression, const wchar_t *function, const wchar_t *file, unsigned line, uintptr_t reserved) {
+    (void)reserved;
+    fwprintf(stderr, L"LibreOfficeKit CRT parameter failure at %hs: %ls %ls %ls:%u\n", stage,
+        function ? function : L"?", expression ? expression : L"?", file ? file : L"?", line);
+    fflush(stderr); ExitProcess(2);
+}
 
 typedef struct Kit Kit;
 typedef struct Document Document;
@@ -56,7 +69,7 @@ static int error(Kit *kit, const char *stage) {
     if (message && kit->methods->size >= offsetof(KitMethods, freeError) + sizeof(kit->methods->freeError)) kit->methods->freeError(message);
     return 1;
 }
-int wmain(int argc, wchar_t **argv) {
+static int convert(int argc, wchar_t **argv) {
     wchar_t directory[32768], library[32768], output[32768];
     const wchar_t *profile = NULL, *input = NULL, *outdir = NULL, *format = NULL, *base, *dot;
     HMODULE module; Initialize initialize; Kit *kit; Document *document;
@@ -74,8 +87,15 @@ int wmain(int argc, wchar_t **argv) {
     if (!GetModuleFileNameW(NULL, directory, 32768)) return error(NULL, "module path");
     base = wcsrchr(directory, L'\\'); if (!base) return 2;
     directory[base - directory] = 0;
+    trace("loading engine");
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
     if (!AddDllDirectory(directory)) return error(NULL, "DLL directory");
+    HMODULE crt = LoadLibraryExW(L"ucrtbase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (crt) {
+        typedef _invalid_parameter_handler (__cdecl *SetHandler)(_invalid_parameter_handler);
+        SetHandler handler = (SetHandler)(void *)GetProcAddress(crt, "_set_invalid_parameter_handler");
+        if (handler) handler(invalidParameter);
+    }
     swprintf_s(library, 32768, L"%ls\\mergedlo.dll", directory);
     module = LoadLibraryExW(library, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
     if (!module) {
@@ -83,15 +103,18 @@ int wmain(int argc, wchar_t **argv) {
         module = LoadLibraryExW(library, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
     }
     if (!module) return error(NULL, "library load");
+    trace("engine loaded");
     initialize = (Initialize)(void *)GetProcAddress(module, "libreofficekit_hook_2");
     if (!initialize) return error(NULL, "entrypoint");
     install = utf8(directory); user = utf8(profile); source = fileUrl(input);
     if (!install || !user || !source) return 2;
     SetEnvironmentVariableW(L"SAL_USE_VCLPLUGIN", L"svp");
     SetEnvironmentVariableW(L"SAL_DISABLE_OPENCL", L"1");
+    trace("initializing engine");
     kit = initialize(install, user);
     free(install); free(user);
     if (!kit) { free(source); return error(NULL, "initialization"); }
+    trace("loading document");
     // The profile disables macros and external-link refresh before loading.
     document = kit->methods->loadOptions(kit, source, "Batch=true,EnableMacrosExecution=false,MacroSecurityLevel=3");
     free(source);
@@ -101,10 +124,21 @@ int wmain(int argc, wchar_t **argv) {
     extension = !wcscmp(format, L"pdf") ? "pdf" : "xlsx";
     swprintf_s(output, 32768, L"%ls\\%.*ls.%ls", outdir, (int)(dot - base), base, !strcmp(extension, "pdf") ? L"pdf" : L"xlsx");
     target = fileUrl(output); if (!target) return 2;
+    trace("saving document");
     saved = document->methods->save(document, target, extension, NULL);
     free(target);
     if (!saved) return error(kit, "save");
+    trace("closing document");
     document->methods->destroy(document);
     kit->methods->destroy(kit);
     return 0;
+}
+int wmain(int argc, wchar_t **argv) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    _set_invalid_parameter_handler(invalidParameter);
+    if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", NULL, 0)) SetEnvironmentVariableW(L"SAL_LOG", L"+WARN");
+    try { return convert(argc, argv); }
+    catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage, failure.what()); }
+    catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage); }
+    return 1;
 }
