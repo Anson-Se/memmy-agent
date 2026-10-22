@@ -8,6 +8,7 @@ import {
   type ModelAssignments,
   type ModelConfigInput
 } from "@memmy/local-api-contracts";
+import { readCatalogEndpointApiKey } from "../index.js";
 import {
   InvalidModelConfigError,
   ModelConfigChangedError,
@@ -67,6 +68,59 @@ function openAiInput(revision: string, presetId?: string): ModelConfigInput {
     modelAssignments: emptyAssignments()
   };
 }
+
+describe("independent endpoint inheritance", () => {
+  it("round-trips isolated no-auth memory endpoints without borrowing Provider defaults or changing cloud models", async () => {
+    const file = fixture({ app: { userMode: "byok" }, modelAssignments: emptyAssignments() });
+    const input = openAiInput((await readModelConfigCatalog(file)).configRevision);
+    input.providers[0]!.apiKey = "provider-secret";
+    input.providers[0]!.extraHeaders = { Authorization: "Bearer provider-header", "x-provider": "global" };
+    input.providers[0]!.extraBody = { providerOption: true, temperature: 0.8 };
+    input.providers[0]!.endpoints.push(
+      { endpointId: "memory", apiBase: "http://127.0.0.1:18789/v1", protocol: "openai-chat-completions", inheritProviderDefaults: false, extraHeaders: { "x-memory": "local" }, extraBody: { temperature: 0 } },
+      { endpointId: "embed", apiBase: "http://127.0.0.1:18789/v1", protocol: "openai-embeddings", inheritProviderDefaults: false }
+    );
+    input.providers[0]!.models.push(
+      { endpointId: "memory", model: "memory-no-auth", source: "byok", capabilities: ["memory_evolution"] },
+      { endpointId: "memory", model: "summary-no-auth", source: "byok", capabilities: ["memory_summary"] },
+      { endpointId: "embed", model: "embedding-no-auth", source: "byok", capabilities: ["embedding"] }
+    );
+    const created = await writeModelConfigCatalog(file, input);
+    const models = created.providers[0]!.models;
+    const cloud = models.find(model => model.model === "gpt-5")!.presetId;
+    const memory = models.find(model => model.model === "memory-no-auth")!.presetId;
+    const summary = models.find(model => model.model === "summary-no-auth")!.presetId;
+    const embed = models.find(model => model.model === "embedding-no-auth")!.presetId;
+    expect(models.every(model => model.available)).toBe(true);
+    expect(created.providers[0]!.endpoints.find(endpoint => endpoint.endpointId === "memory"))
+      .toMatchObject({ inheritProviderDefaults: false, hasApiKey: false, apiKeyMasked: "" });
+    const save = { ...input, configRevision: created.configRevision,
+      providers: [{ ...input.providers[0]!, apiKey: "", models: models.map(model => ({ ...model })) }],
+      modelAssignments: { ...created.modelAssignments, byok: { ...created.modelAssignments.byok,
+        agent: { candidates: [cloud], default: cloud }, memorySummary: summary, memoryEvolution: memory, embedding: embed } } };
+    const saved = await writeModelConfigCatalog(file, save);
+    const raw = YAML.parse(readFileSync(file, "utf8")) as any;
+    for (const role of ["summary", "evolution"]) {
+      expect(raw.memmyMemory[role]).toMatchObject({ endpoint: "http://127.0.0.1:18789/v1", model: role === "summary" ? "summary-no-auth" : "memory-no-auth", extraHeaders: { "x-memory": "local" }, extraBody: { temperature: 0 } });
+      expect(raw.memmyMemory[role]).not.toHaveProperty("apiKey");
+      expect(raw.memmyMemory[role].extraHeaders).not.toHaveProperty("Authorization");
+      expect(raw.memmyMemory[role].extraBody).not.toHaveProperty("providerOption");
+    }
+    expect(raw.memmyMemory.embedding).toMatchObject({ mode: "custom", model: "embedding-no-auth" });
+    expect(raw.memmyMemory.embedding).not.toHaveProperty("apiKey");
+    expect(raw.memmyMemory.embedding).not.toHaveProperty("extraHeaders");
+    expect(raw.providers.openai.apiKey).toBe("provider-secret");
+    expect(await readCatalogEndpointApiKey(file, "openai", "memory")).toBeNull();
+    expect(await readCatalogEndpointApiKey(file, "openai", "chat")).toBe("provider-secret");
+    const clear = { ...save, configRevision: saved.configRevision, modelAssignments: structuredClone(saved.modelAssignments) };
+    clear.modelAssignments.byok.embedding = null;
+    await writeModelConfigCatalog(file, clear);
+    const local = YAML.parse(readFileSync(file, "utf8")) as any;
+    expect(local.memmyMemory.embedding).toMatchObject({ provider: "local", mode: "local" });
+    expect(local.memmyMemory.embedding).not.toHaveProperty("endpoint");
+    expect(local.providers.openai).toEqual(raw.providers.openai);
+  });
+});
 
 describe("model config catalog", () => {
   it("round-trips StepFun and Xiaomi MiMo connections back into the view", async () => {

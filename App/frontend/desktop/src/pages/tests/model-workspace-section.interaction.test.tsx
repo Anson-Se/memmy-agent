@@ -89,6 +89,33 @@ describe("ModelWorkspaceSection BYOK connection deletion", () => {
     expect(alert.className).toContain("mb-5");
   });
 
+  it("tests and saves an existing independent no-auth connection without borrowing the Provider mask", async () => {
+    const seedConfig = createSeedConfig(1), endpoint = seedConfig.catalog!.providers[0]!.endpoints[0]!;
+    endpoint.inheritProviderDefaults = false;
+    endpoint.hasApiKey = false; endpoint.apiKeyMasked = ""; endpoint.apiKey = "";
+    const configClient = {
+      getModelConfig: vi.fn(async () => seedConfig),
+      saveModelCatalog: vi.fn(async (_input: unknown) => seedConfig),
+      testModelConfig: vi.fn(async (_input: unknown) => ({ ok: true, message: "ok", checkedAt: "2026-08-13T00:00:00.000Z" }))
+    };
+    await act(async () => {
+      root.render(<I18nProvider language="zh-CN"><ModelWorkspaceSection mode="byok" seedConfig={seedConfig} configClient={configClient} /></I18nProvider>);
+      await Promise.resolve();
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑 openai 配置"]')!.click());
+    const save = container.querySelector<HTMLButtonElement>('button[aria-label="保存"]')!;
+    expect(save.disabled).toBe(false);
+    expect(container.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
+    const test = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "测试")!;
+    await act(async () => { test.click(); await Promise.resolve(); });
+    expect(configClient.testModelConfig).toHaveBeenCalledWith(expect.objectContaining({ apiKey: "", apiKeyMasked: "", endpointId: endpoint.endpointId }), "chat", expect.anything());
+    await act(async () => { save.click(); await Promise.resolve(); });
+    await vi.waitFor(() => expect(configClient.saveModelCatalog).toHaveBeenCalledTimes(1));
+    const input = configClient.saveModelCatalog.mock.calls[0]![0] as { providers: Array<{ endpoints: Array<{ inheritProviderDefaults?: boolean; apiKey?: string }> }> };
+    expect(input.providers[0]!.endpoints[0]).toMatchObject({ inheritProviderDefaults: false });
+    expect(input.providers[0]!.endpoints[0]!.apiKey).toBeUndefined();
+  });
+
   it("inherits the embedding connection type when adding bge-m3", async () => {
     const seedConfig = createEmbeddingSeedConfig();
     const configClient = {

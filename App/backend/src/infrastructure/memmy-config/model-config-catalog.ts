@@ -320,9 +320,7 @@ function memoryConnection(config: ConfigRecord, presetId: string): ConfigRecord 
   const endpoint = record(record(provider.endpoints)[endpointId]);
   const apiBase = stringValue(endpoint.apiBase);
   if (!apiBase) return null;
-  const apiKey = stringValue(endpoint.apiKey) ?? stringValue(provider.apiKey);
-  const extraHeaders = { ...record(provider.extraHeaders), ...record(endpoint.extraHeaders) };
-  const extraBody = { ...record(provider.extraBody), ...record(endpoint.extraBody) };
+  const { apiKey, extraHeaders, extraBody } = effectiveEndpoint(provider, endpoint);
   return {
     provider: memoryProvider(providerId),
     sourceProvider: providerId,
@@ -331,6 +329,15 @@ function memoryConnection(config: ConfigRecord, presetId: string): ConfigRecord 
     ...(apiKey ? { apiKey } : {}),
     ...(Object.keys(extraHeaders).length ? { extraHeaders } : {}),
     ...(Object.keys(extraBody).length ? { extraBody } : {})
+  };
+}
+
+function effectiveEndpoint(provider: ConfigRecord, endpoint: ConfigRecord) {
+  const inherited = endpoint.inheritProviderDefaults === false ? {} : provider;
+  return {
+    apiKey: stringValue(endpoint.apiKey) ?? stringValue(inherited.apiKey),
+    extraHeaders: { ...record(inherited.extraHeaders), ...record(endpoint.extraHeaders) },
+    extraBody: { ...record(inherited.extraBody), ...record(endpoint.extraBody) }
   };
 }
 
@@ -462,6 +469,7 @@ function mergeEndpoint(previous: ConfigRecord, input: CatalogEndpointInput): Con
     apiBase: input.apiBase,
     protocol: input.protocol
   };
+  if (input.inheritProviderDefaults !== undefined) next.inheritProviderDefaults = input.inheritProviderDefaults;
   setOptionalSecret(next, "apiKey", input.apiKey, previous.apiKey);
   setOptionalRecord(next, "extraHeaders", input.extraHeaders, previous.extraHeaders);
   setOptionalRecord(next, "extraBody", input.extraBody, previous.extraBody);
@@ -472,13 +480,14 @@ function validateEndpointDefinitions(input: TextModelProviderInput, provider: Co
   const signatures = new Set<string>();
   for (const endpoint of input.endpoints) {
     const merged = record(record(provider.endpoints)[endpoint.endpointId]);
+    const effective = effectiveEndpoint(provider, merged);
     const signature = stableJson({
       provider: input.provider,
       protocol: merged.protocol,
       apiBase: normalizeApiBase(stringValue(merged.apiBase) ?? ""),
-      apiKey: stringValue(merged.apiKey) ?? stringValue(provider.apiKey) ?? null,
-      extraHeaders: merged.extraHeaders ?? provider.extraHeaders ?? null,
-      extraBody: merged.extraBody ?? provider.extraBody ?? null
+      apiKey: effective.apiKey ?? null,
+      extraHeaders: effective.extraHeaders,
+      extraBody: effective.extraBody
     });
     if (signatures.has(signature)) {
       throw new InvalidModelConfigError(`Duplicate endpoint definition for Provider ${input.provider}`);
@@ -671,6 +680,7 @@ function providerView(
       endpointId,
       apiBase,
       protocol,
+      ...(typeof endpoint.inheritProviderDefaults === "boolean" ? { inheritProviderDefaults: endpoint.inheritProviderDefaults } : {}),
       hasApiKey: Boolean(endpointApiKey),
       apiKeyMasked: maskSecret(endpointApiKey),
       apiKey: ""
@@ -700,7 +710,7 @@ function presetView(
   const protocol = endpoint.protocol as ModelEndpointProtocol;
   const source = preset.source as "account" | "byok";
   const providerId = preset.provider as CatalogProviderId;
-  const hasCredential = Boolean(stringValue(endpoint.apiKey) ?? stringValue(provider.apiKey));
+  const hasCredential = Boolean(effectiveEndpoint(provider, endpoint).apiKey);
   const ownerMatches = source === "byok" || (
     stringValue(preset.ownerAccountId)
     && stringValue(preset.ownerAccountId) === stringValue(provider.ownerAccountId)
@@ -714,7 +724,7 @@ function presetView(
     source,
     ...(stringValue(preset.ownerAccountId) ? { ownerAccountId: stringValue(preset.ownerAccountId)! } : {}),
     capabilities: arrayValue(preset.capabilities).filter(isModelCapability),
-    available: Boolean((hasCredential || API_KEY_OPTIONAL_PROVIDERS.has(providerId)) && ownerMatches)
+    available: Boolean((hasCredential || (source === "byok" && endpoint.inheritProviderDefaults === false) || API_KEY_OPTIONAL_PROVIDERS.has(providerId)) && ownerMatches)
   };
 }
 

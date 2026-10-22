@@ -557,7 +557,8 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
     const providerChanged = Boolean(
       existing && protocolFromConnection(existing.provider) !== editor.provider
     );
-    if (!editor.apiKey.trim() && (!existing?.apiKeyMasked || providerChanged)) {
+    if (!editor.apiKey.trim() && (!existing?.apiKeyMasked || providerChanged)
+      && !(existing?.inheritProviderDefaults === false && !providerChanged)) {
       setEditorTest({ status: "error", message: t("settings.modelWorkspace.testKeyRequired") });
       return;
     }
@@ -692,6 +693,7 @@ export function ModelWorkspaceSection(props: ModelWorkspaceSectionProps) {
   const editorHasUsableKey = Boolean(
     editor?.apiKey.trim()
     || (editorExistingConnection?.apiKeyMasked && !editorProviderChanged)
+    || (editorExistingConnection?.inheritProviderDefaults === false && !editorProviderChanged)
   );
   const canSaveConnection = Boolean(
     editor

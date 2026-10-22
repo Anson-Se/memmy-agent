@@ -32,6 +32,7 @@ export interface ModelConnection {
   endpoint: string;
   protocol: ModelEndpointProtocol;
   apiKeyMasked: string;
+  inheritProviderDefaults?: boolean;
   models: string[];
   modelEntries: ModelConnectionModel[];
   modelCapabilities: Record<string, ModelCapability>;
@@ -78,6 +79,7 @@ export interface ModelConnectionInput {
   endpointId?: string;
   endpoint: string;
   protocol?: ModelEndpointProtocol;
+  inheritProviderDefaults?: boolean;
   apiKey?: string;
   apiKeyMasked?: string;
   models: string[];
@@ -100,6 +102,7 @@ export interface ByokPresetInput {
   endpointId?: string;
   endpoint: string;
   protocol: ModelEndpointProtocol;
+  inheritProviderDefaults?: boolean;
   apiKey?: string;
   apiKeyMasked?: string;
   model: string;
@@ -243,6 +246,7 @@ export function upsertByokPreset(
       endpointId: newId("endpoint"),
       apiBase,
       protocol: input.protocol,
+      ...(input.inheritProviderDefaults !== undefined ? { inheritProviderDefaults: input.inheritProviderDefaults } : {}),
       hasApiKey: Boolean(input.apiKey),
       apiKeyMasked: input.apiKey ? maskApiKey(input.apiKey) : input.apiKeyMasked ?? "",
       apiKey: input.apiKey ?? ""
@@ -253,6 +257,7 @@ export function upsertByokPreset(
     endpoint.apiKeyMasked = maskApiKey(input.apiKey);
     endpoint.hasApiKey = true;
   }
+  if (input.inheritProviderDefaults !== undefined) endpoint.inheritProviderDefaults = input.inheritProviderDefaults;
   const existing = provider.models.find((item) => (
     item.source === "byok"
     && item.endpointId === endpoint!.endpointId
@@ -447,10 +452,13 @@ export function upsertModelConnection(
     next.providers.push(provider);
   }
 
+  const inheritProviderDefaults = input.inheritProviderDefaults
+    ?? (existingConnection?.provider === providerId ? existingConnection.inheritProviderDefaults : undefined);
   provider.endpoints.push({
     endpointId,
     apiBase: endpoint,
     protocol,
+    ...(inheritProviderDefaults !== undefined ? { inheritProviderDefaults } : {}),
     hasApiKey: Boolean(input.apiKey || input.apiKeyMasked),
     apiKeyMasked: input.apiKey ? maskApiKey(input.apiKey) : input.apiKeyMasked ?? "",
     apiKey: input.apiKey ?? ""
@@ -658,7 +666,8 @@ function createSpace(catalog: ModelConfigView, mode: ModelWorkspaceMode): ModelW
       endpointId: endpoint.endpointId,
       endpoint: endpoint.apiBase,
       protocol: endpoint.protocol,
-      apiKeyMasked: endpoint.apiKeyMasked || provider.apiKeyMasked,
+      apiKeyMasked: endpoint.apiKeyMasked || (endpoint.inheritProviderDefaults === false ? "" : provider.apiKeyMasked),
+      ...(endpoint.inheritProviderDefaults !== undefined ? { inheritProviderDefaults: endpoint.inheritProviderDefaults } : {}),
       models: models.map((model) => model.model),
       modelEntries: models.map((model) => ({
         presetId: model.presetId,
@@ -708,6 +717,7 @@ function endpointInput(endpoint: ModelConfigView["providers"][number]["endpoints
     endpointId: endpoint.endpointId,
     apiBase: endpoint.apiBase,
     protocol: endpoint.protocol,
+    ...(endpoint.inheritProviderDefaults !== undefined ? { inheritProviderDefaults: endpoint.inheritProviderDefaults } : {}),
     ...(endpoint.apiKey ? { apiKey: endpoint.apiKey } : {})
   };
 }

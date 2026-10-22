@@ -9,6 +9,8 @@ export interface RuntimeCatalogEndpoint {
     apiBase: string;
     protocol: ModelEndpointProtocol;
     apiKey?: string;
+    /** False keeps credentials and request options local to this endpoint. */
+    inheritProviderDefaults?: boolean;
     extraHeaders?: Record<string, string>;
     extraBody?: Record<string, unknown>;
 }
@@ -151,10 +153,12 @@ export function resolveAssignedModel(input: ResolveAssignedModelInput): ModelSel
     }
     if (!providerOwnerMatches(preset, provider, input.activeAccountId)) return UNAVAILABLE;
 
+    const inherited = endpoint.inheritProviderDefaults === false ? {} : provider;
+    const apiKey = endpoint.apiKey ?? inherited.apiKey;
     let extraBody: Readonly<Record<string, unknown>>;
     try {
         extraBody = deepFreeze(structuredClone({
-            ...(provider.extraBody ?? {}),
+            ...(inherited.extraBody ?? {}),
             ...(endpoint.extraBody ?? {})
         }));
     } catch {
@@ -178,12 +182,12 @@ export function resolveAssignedModel(input: ResolveAssignedModelInput): ModelSel
         endpointId: preset.endpoint,
         protocol: endpoint.protocol,
         apiBase: endpoint.apiBase,
-        ...(endpoint.apiKey ?? provider.apiKey
-            ? { apiKey: endpoint.apiKey ?? provider.apiKey }
+        ...(apiKey
+            ? { apiKey }
             : {}),
         ...(provider.ownerAccountId ? { ownerAccountId: provider.ownerAccountId } : {}),
         extraHeaders: Object.freeze({
-            ...(provider.extraHeaders ?? {}),
+            ...(inherited.extraHeaders ?? {}),
             ...(endpoint.extraHeaders ?? {})
         }),
         extraBody
@@ -319,6 +323,7 @@ function isRuntimeEndpoint(value: unknown): value is RuntimeCatalogEndpoint {
         && typeof value.protocol === "string"
         && PROTOCOLS.has(value.protocol as ModelEndpointProtocol)
         && (value.apiKey === undefined || typeof value.apiKey === "string")
+        && (value.inheritProviderDefaults === undefined || typeof value.inheritProviderDefaults === "boolean")
         && validStringRecord(value.extraHeaders)
         && validUnknownRecord(value.extraBody);
 }
