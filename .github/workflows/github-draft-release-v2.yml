@@ -359,7 +359,7 @@ jobs:
             pr_success="false"
             for attempt in 1 2 3; do
               rm -f "$pr_response"
-              if gh api --paginate \
+              if gh api \
                 -H "Accept: application/vnd.github+json" \
                 "repos/${GITHUB_REPOSITORY}/commits/${commit_sha}/pulls?per_page=100" \
                 > "$pr_response" \
