@@ -1,8 +1,8 @@
 /**
- * Stage 1 diagnostic baseline, before changing the scheduler.
+ * Stage 1 diagnostics, with repaired cases converted to stage 2 regressions.
  *
- * These assertions describe the existing failure modes, not desired behavior.
- * Convert each to an acceptance regression as the corresponding fix lands.
+ * Scheduling cases still describe existing failure modes pending stages 3–6.
+ * Lease/recovery/backoff cases assert the repaired stage 2 behavior.
  * SQLite, schema, repositories and WorkerRunner are real. Business handlers and
  * model requests are controlled local substitutes so queue timing is repeatable.
  */
@@ -203,7 +203,7 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
       h.job(`new-job-${i}`, "import_summary", { target: `new-memory-${i}`, createdAt: at });
       const [claimed] = h.repos.runtime.leaseQueuedJobs(1);
       selected.push(claimed!.id);
-      h.repos.runtime.completeJob(claimed!.id);
+      h.repos.runtime.completeJob(claimed!.id, undefined, claimed);
     }
     expect(selected.every((id) => id !== "old-job")).toBe(true);
     expect(h.repos.runtime.getJob("old-job")).toMatchObject({ status: "queued", attempts: 0 });
@@ -267,8 +267,8 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     expect(started).toHaveLength(8);
   });
 
-  it("reclaims a queued-in-memory serial batch after 61 seconds while its first handler still runs", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+  it("keeps a serial batch leased while its first handler runs beyond 60 seconds", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
     const gate = deferred(); const started: string[] = [];
     const h = harness(async (j) => { started.push(j.id); if (j.id === "serial-0") await gate.promise; });
     for (let i = 0; i < 4; i++) h.job(`serial-${i}`, "reflection");
@@ -276,29 +276,29 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     try {
       expect(started).toEqual(["serial-0"]);
       expect(h.repos.runtime.getJob("serial-3")!.status).toBe("leased");
-      vi.setSystemTime(epoch + 61_000);
+      await vi.advanceTimersByTimeAsync(61_000);
       const reclaimed = h.repos.runtime.leaseQueuedJobs(4);
-      expect(reclaimed.map((j) => j.id)).toEqual(["serial-0", "serial-1", "serial-2", "serial-3"]);
-      expect(reclaimed.every((j) => j.attempts === 2)).toBe(true);
-      record("serial_prefetch_expiry", { actualStarted: 1, leased: 4, elapsedClockSeconds: 61, reclaimable: 4 });
+      expect(reclaimed).toEqual([]);
+      expect(h.repos.runtime.getJob("serial-0")!.failureCount).toBe(0);
+      record("serial_prefetch_expiry", { actualStarted: 1, leased: 4, elapsedClockSeconds: 61, reclaimable: 0 });
     } finally { gate.resolve(); await run; }
   });
 
-  it("lets an old execution overwrite a newer successful lease with failure", () => {
+  it("rejects an old failure after a newer lease has succeeded", () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
     const h = harness(); h.job("stale-result", "reflection");
     const [a] = h.repos.runtime.leaseQueuedJobs(1);
     vi.setSystemTime(epoch + 61_000);
     const [b] = h.repos.runtime.leaseQueuedJobs(1);
-    expect(a!.id).toBe(b!.id); expect(b!.attempts).toBe(2);
+    expect(a!.id).toBe(b!.id); expect(b!.leaseToken).not.toBe(a!.leaseToken);
     h.runner.completeLeasedWorkerJob(b!);
     expect(h.repos.runtime.getJob(b!.id)!.status).toBe("succeeded");
     h.runner.failLeasedWorkerJob(a!, new Error("late error from old execution"));
-    expect(h.repos.runtime.getJob(b!.id)!.status).toBe("failed");
-    record("stale_execution_overwrite", { newExecution: "succeeded", afterOldFailure: "failed", leaseGenerationGuard: false });
+    expect(h.repos.runtime.getJob(b!.id)!.status).toBe("succeeded");
+    record("stale_execution_overwrite", { newExecution: "succeeded", afterOldFailure: "succeeded", leaseGenerationGuard: true });
   });
 
-  it("exhausts three business attempts at the same clock time with no generic backoff", async () => {
+  it("does not retry temporary failures before their backoff expires", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
     const h = harness(async () => { throw new Error("temporary timeout"); });
     h.job("temporary-failure", "reflection");
@@ -307,21 +307,21 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
       await h.runner.runWorkerOnce(1);
       attempts.push(h.repos.runtime.getJob("temporary-failure")!.attempts);
     }
-    expect(attempts).toEqual([1, 2, 3]);
-    expect(h.repos.runtime.getJob("temporary-failure")!.status).toBe("dead_letter");
-    record("generic_failure_backoff", { attempts, clockAdvancedMs: 0, terminal: "dead_letter" });
+    expect(attempts).toEqual([1, 1, 1]);
+    expect(h.repos.runtime.getJob("temporary-failure")).toMatchObject({ status: "failed", failureCount: 1 });
+    record("generic_failure_backoff", { attempts, clockAdvancedMs: 0, terminal: "failed" });
   });
 
-  it("startup recovery resets a valid main lease and a valid embedding retry lease", () => {
+  it("startup recovery preserves valid main and embedding retry leases", () => {
     const h = harness(); h.job("valid-main", "reflection");
     h.memory("valid-retry-target"); h.retry("valid-retry", "valid-retry-target");
     h.repos.runtime.leaseQueuedJobs(1, 600);
     h.repos.runtime.claimDueEmbeddingRetries({ now: Date.now(), workerId: "active-owner", leaseUntil: Date.now() + 600_000 });
     const result = h.runner.reconcileWorkerStartup(100);
-    expect(result).toMatchObject({ requeuedJobs: 1, requeuedEmbeddingRetries: 1 });
-    expect(h.repos.runtime.getJob("valid-main")!.status).toBe("queued");
-    expect(h.repos.runtime.getEmbeddingRetry("valid-retry")!.status).toBe("pending");
-    record("restart_valid_leases", { validMainLease: "requeued", validRetryLease: "pending", remainingSecondsBeforeRecovery: 600 });
+    expect(result).toMatchObject({ requeuedJobs: 0, requeuedEmbeddingRetries: 0 });
+    expect(h.repos.runtime.getJob("valid-main")!.status).toBe("leased");
+    expect(h.repos.runtime.getEmbeddingRetry("valid-retry")!.status).toBe("in_progress");
+    record("restart_valid_leases", { validMainLease: "leased", validRetryLease: "in_progress", remainingSecondsBeforeRecovery: 600 });
   });
 
   it("already rejects an obsolete embedding retry owner after a replacement claim (control)", () => {

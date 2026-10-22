@@ -18,6 +18,7 @@ import {
   createFailingLlm,
   createMemoryServiceFixture,
   runWorkerRounds,
+  runWorkerRoundsWithDueRetries,
   stableTestVector
 } from "../../fixtures/memory-service-fixture.js";
 
@@ -375,11 +376,7 @@ describe("MemoryService / import / processing", () => {
       "summary-fallback"
     );
 
-    const runs = [
-      await service.runWorkerOnce(100),
-      await service.runWorkerOnce(100),
-      await service.runWorkerOnce(100)
-    ];
+    const runs = await runWorkerRoundsWithDueRetries(service, db, [added.id], 3);
 
     expect(runs.flatMap((run) => run.jobs).map((job) => job.jobType)).toEqual([
       "import_summary",
@@ -517,7 +514,7 @@ describe("MemoryService / import / processing", () => {
     expect(failed).toMatchObject({
       state: "failed",
       stage: "summary",
-      attemptCount: 1,
+      attemptCount: 0,
       retryAction: "open_settings",
       errorCode: "model_configuration"
     });
@@ -559,8 +556,7 @@ describe("MemoryService / import / processing", () => {
       errorMessage: "429 second provider failure",
       autoRetryScheduled: true
     });
-    await service.runWorkerOnce(1);
-    await service.runWorkerOnce(1);
+    await runWorkerRoundsWithDueRetries(service, db, [added.id], 2, 1);
     const secondFailure = service.memoryProcessingStatus([added.id], { namespace }).items[0];
     expect(secondFailure).toMatchObject({
       state: "failed",
@@ -698,7 +694,7 @@ describe("MemoryService / import / processing", () => {
     expect(service.memoryProcessingStatus([added.id], { namespace }).items[0]).toMatchObject({
       state: "failed",
       stage: "summary",
-      attemptCount: 1,
+      attemptCount: 0,
       retryAction: "open_settings",
       errorCode: "model_configuration",
       errorMessage: expect.stringContaining("HTTP 200")
@@ -764,9 +760,7 @@ describe("MemoryService / import / processing", () => {
     const added = addAgentSourceImport(service, namespace, "retry only the vector stage", "embedding-stage");
 
     await service.runWorkerOnce(1);
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await service.runWorkerOnce(1);
-    }
+    await runWorkerRoundsWithDueRetries(service, db, [added.id], 6, 1);
     expect(service.memoryProcessingStatus([added.id], { namespace }).items[0]).toMatchObject({
       state: "failed",
       stage: "embedding",

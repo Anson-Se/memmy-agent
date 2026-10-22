@@ -41,6 +41,7 @@ import { newId, stableHash } from "../utils/id.js";
 import { asStringArray, parseJson, toJson } from "../utils/json.js";
 import { firstSemanticUserLine } from "../utils/text.js";
 import { nowIso } from "../utils/time.js";
+import { assertCurrentJobLease, withoutJobLeaseGuard } from "./job-lease-context.js";
 import {
   attachMemoryVectors,
   dirtyMemoryVectorEntries,
@@ -320,6 +321,13 @@ export interface EvolutionJobRecord {
   attempts: number;
   maxAttempts: number;
   leasedUntil?: string | null;
+  leaseOwner?: string | null;
+  leaseToken?: string | null;
+  availableAt?: string | null;
+  blockedReason?: string | null;
+  failureCount?: number;
+  leaseCount?: number;
+  leaseRecoveryCount?: number;
   lastError?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -441,6 +449,7 @@ export interface EmbeddingRetryRecord {
   nextAttemptAt: number;
   claimedBy?: string | null;
   leaseUntil?: number | null;
+  blockedReason?: string | null;
   lastError?: string | null;
   createdAt: number;
   updatedAt: number;
@@ -1814,6 +1823,7 @@ function sourceTurnCaptureFromSql(row: Record<string, unknown>): SourceTurnCaptu
 }
 
 export class RuntimeRepository {
+  private readonly leaseOwner = newId("worker");
   private readonly scheduledLogPrunes = new Set<LogTableName>();
   private historyLogCompactionScheduled = false;
   private historyLogCompactionCursor = 0;
@@ -1827,7 +1837,7 @@ export class RuntimeRepository {
     if (reset) this.historyLogCompactionCursor = 0;
     if (this.historyLogCompactionScheduled || !this.db.open || this.db.readonly) return;
     this.historyLogCompactionScheduled = true;
-    setImmediate(() => {
+    withoutJobLeaseGuard(() => setImmediate(() => {
       this.historyLogCompactionScheduled = false;
       if (!this.db.open || this.db.readonly) return;
       try {
@@ -1848,7 +1858,7 @@ export class RuntimeRepository {
         // Best-effort maintenance must not interfere with capture or worker writes.
         // An interrupted pass is retried on the next service start.
       }
-    });
+    }));
   }
 
   getKv(key: string): { value: unknown; updatedAt: string } | undefined {
@@ -3232,22 +3242,30 @@ export class RuntimeRepository {
     if (existing) {
       const updatedAt = job.updatedAt ?? nowIso();
       const payload = mergeJobPayload(existing.payload, job.payload);
+      const manualRetry = existing.status === "failed" && job.payload.source === "memory.processing.manual_retry";
       this.db
         .prepare(
           `UPDATE evolution_jobs
-           SET status = CASE WHEN status = 'failed' THEN 'queued' ELSE status END,
+           SET status = CASE WHEN @manualRetry = 1 THEN 'queued' ELSE status END,
+               attempts = CASE WHEN @manualRetry = 1 THEN 0 ELSE attempts END,
+               failure_count = CASE WHEN @manualRetry = 1 THEN 0 ELSE failure_count END,
+               available_at = CASE WHEN @manualRetry = 1 THEN NULL ELSE available_at END,
+               blocked_reason = CASE WHEN @manualRetry = 1 THEN NULL ELSE blocked_reason END,
+               lease_owner = CASE WHEN @manualRetry = 1 THEN NULL ELSE lease_owner END,
+               lease_token = CASE WHEN @manualRetry = 1 THEN NULL ELSE lease_token END,
+               leased_until = CASE WHEN @manualRetry = 1 THEN NULL ELSE leased_until END,
+               last_error = CASE WHEN @manualRetry = 1 THEN NULL ELSE last_error END,
                session_id = COALESCE(@sessionId, session_id),
                episode_id = COALESCE(@episodeId, episode_id),
                target_memory_id = COALESCE(@targetMemoryId, target_memory_id),
                payload_json = @payloadJson,
                max_attempts = MAX(max_attempts, @maxAttempts),
-               leased_until = CASE WHEN status = 'failed' THEN NULL ELSE leased_until END,
-               last_error = CASE WHEN status = 'failed' THEN NULL ELSE last_error END,
                updated_at = @updatedAt
            WHERE id = @id`
         )
         .run({
           id: existing.id,
+          manualRetry: manualRetry ? 1 : 0,
           sessionId: job.sessionId ?? null,
           episodeId: job.episodeId ?? null,
           targetMemoryId: job.targetMemoryId ?? null,
@@ -3259,9 +3277,7 @@ export class RuntimeRepository {
         ...existing,
         payload,
         updatedAt,
-        status: existing.status === "failed" ? "queued" : existing.status,
-        leasedUntil: existing.status === "failed" ? null : existing.leasedUntil,
-        lastError: existing.status === "failed" ? null : existing.lastError
+        status: existing.status
       };
     }
     this.db
@@ -3288,7 +3304,7 @@ export class RuntimeRepository {
         leasedUntil: job.leasedUntil ?? null,
         lastError: job.lastError ?? null
       });
-    return job;
+    return this.getJob(job.id) ?? job;
   }
 
   /** Allocate the next FIFO sequence for Work Memory jobs in a merge scope. */
@@ -3374,6 +3390,8 @@ export class RuntimeRepository {
              payload_json = ?,
              attempts = 0,
              leased_until = NULL,
+             lease_owner = NULL, lease_token = NULL,
+             available_at = NULL, blocked_reason = NULL, failure_count = 0,
              last_error = NULL,
              updated_at = ?
          WHERE id = ?`
@@ -3449,11 +3467,13 @@ export class RuntimeRepository {
     ];
     const queuedJob = this.db
       .prepare(
-        `SELECT CAST(json_extract(payload_json, '$.runAfter') AS TEXT) AS run_after
+        `SELECT MAX(COALESCE(available_at, ''),
+                    COALESCE(CAST(json_extract(payload_json, '$.runAfter') AS TEXT), '')) AS run_after
          FROM evolution_jobs
-         WHERE status = 'queued'
-           AND attempts < max_attempts
-           AND json_type(payload_json, '$.runAfter') = 'text'
+         WHERE status IN ('queued', 'failed')
+           AND failure_count < max_attempts
+           AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
+           AND (available_at IS NOT NULL OR json_type(payload_json, '$.runAfter') = 'text')
            ${jobTypeFilter}
            ${excludeFilter}
          ORDER BY run_after ASC
@@ -3465,7 +3485,7 @@ export class RuntimeRepository {
         `SELECT leased_until
          FROM evolution_jobs
          WHERE status = 'leased'
-           AND attempts < max_attempts
+           AND failure_count < max_attempts
            AND leased_until IS NOT NULL
            ${jobTypeFilter}
            ${excludeFilter}
@@ -3595,7 +3615,8 @@ export class RuntimeRepository {
     targetMemoryIds?: readonly string[],
     priorityCohortOnly = false,
     allowedJobTypes?: readonly string[],
-    excludedJobTypes?: readonly string[]
+    excludedJobTypes?: readonly string[],
+    owner = this.leaseOwner
   ): EvolutionJobRecord[] {
     if (targetMemoryIds?.length === 0 || allowedJobTypes?.length === 0) {
       return [];
@@ -3611,8 +3632,10 @@ export class RuntimeRepository {
           `SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
            FROM evolution_jobs
            WHERE (status = 'queued'
-              OR (status = 'leased' AND leased_until IS NOT NULL AND leased_until <= ?))
-             AND attempts < max_attempts
+              OR (status = 'leased' AND (leased_until IS NULL OR leased_until <= ?)))
+             AND failure_count < max_attempts
+             AND (available_at IS NULL OR available_at <= ?)
+             AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
              AND NOT (
                job_type = 'reward'
                AND json_extract(payload_json, '$.l1MemoryId') IS NOT NULL
@@ -3671,7 +3694,7 @@ export class RuntimeRepository {
            ORDER BY ${evolutionJobOrderSql()}
            LIMIT ?`
         )
-        .all(at, at, ...(allowedJobTypes ?? []), ...(excludedJobTypes ?? []), ...(targetMemoryIds ?? []), limit) as Array<SqlJobRow & {
+        .all(at, at, at, ...(allowedJobTypes ?? []), ...(excludedJobTypes ?? []), ...(targetMemoryIds ?? []), limit) as Array<SqlJobRow & {
           queue_priority: number;
         }>;
       const queuePriority = candidates[0]?.queue_priority;
@@ -3679,51 +3702,90 @@ export class RuntimeRepository {
         ? candidates.filter((row) => row.queue_priority === queuePriority)
         : candidates;
 
+      const claimed: EvolutionJobRecord[] = [];
       for (const row of rows) {
+        const token = newId("lease");
+        const recovered = row.status === "leased" ? 1 : 0;
         this.db
           .prepare(
             `UPDATE evolution_jobs
              SET status = 'leased',
-                 attempts = attempts + 1,
+                 attempts = attempts + 1 - ?,
                  leased_until = ?,
+                 lease_owner = ?, lease_token = ?,
+                 lease_count = lease_count + 1,
+                 lease_recovery_count = lease_recovery_count + ?,
+                 available_at = NULL,
                  updated_at = ?
              WHERE id = ?`
           )
-          .run(leaseUntil, at, row.id);
+          .run(recovered, leaseUntil, owner, token, recovered, at, row.id);
+        claimed.push(this.getJob(row.id)!);
       }
-      return rows.map((row) =>
-        jobFromSql({
-          ...row,
-          status: "leased",
-          attempts: row.attempts + 1,
-          leased_until: leaseUntil,
-          updated_at: at
-        })
-      );
+      return claimed;
     });
     return transaction();
   }
 
-  completeJob(id: string, at = nowIso()): EvolutionJobRecord | undefined {
-    this.db
-      .prepare(
-        `UPDATE evolution_jobs
-         SET status = 'succeeded',
-             leased_until = NULL,
-             updated_at = ?
-         WHERE id = ?`
-      )
-      .run(at, id);
-    return this.getJob(id);
+  /** A missing claim is reserved for unowned legacy/admin rows only. */
+  private jobClaimWhere(claim: EvolutionJobRecord | undefined, at: string): { sql: string; params: SqlValue[] } {
+    return claim ? {
+      sql: "status = 'leased' AND lease_owner = ? AND lease_token = ? AND leased_until > ?",
+      params: [claim.leaseOwner ?? "", claim.leaseToken ?? "", at]
+    } : { sql: "status IN ('queued', 'leased') AND lease_owner IS NULL AND lease_token IS NULL", params: [] };
+  }
+
+  isJobLeaseHeld(job: EvolutionJobRecord, at = nowIso()): boolean {
+    if (!job.leaseOwner || !job.leaseToken) return false;
+    const claim = this.jobClaimWhere(job, at);
+    return Boolean(this.db.prepare(`SELECT 1 FROM evolution_jobs WHERE id = ? AND ${claim.sql}`)
+      .get(job.id, ...claim.params));
+  }
+
+  renewJobLease(job: EvolutionJobRecord, leaseSeconds = 60, at = nowIso()): EvolutionJobRecord | undefined {
+    if (!job.leaseOwner || !job.leaseToken) return undefined;
+    const claim = this.jobClaimWhere(job, at);
+    const until = new Date(Date.parse(at) + Math.max(1, leaseSeconds) * 1000).toISOString();
+    const result = this.db.prepare(`UPDATE evolution_jobs SET leased_until = MAX(leased_until, ?), updated_at = ?
+      WHERE id = ? AND ${claim.sql}`).run(until, at, job.id, ...claim.params);
+    return result.changes > 0 ? this.getJob(job.id) : undefined;
+  }
+
+  completeJob(id: string, at = nowIso(), claim?: EvolutionJobRecord): EvolutionJobRecord | undefined {
+    const where = this.jobClaimWhere(claim, at);
+    const result = this.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded',
+      leased_until = NULL, lease_owner = NULL, lease_token = NULL,
+      available_at = NULL, blocked_reason = NULL, updated_at = ?
+      WHERE id = ? AND ${where.sql}`).run(at, id, ...where.params);
+    return result.changes > 0 ? this.getJob(id) : undefined;
   }
 
   /** Waiting for a dependency is not a model failure and does not consume an attempt. */
-  deferProcessingJob(id: string, runAfter: string, at = nowIso()): EvolutionJobRecord | undefined {
-    this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', leased_until = NULL,
+  deferProcessingJob(id: string, runAfter: string, at = nowIso(), claim?: EvolutionJobRecord): EvolutionJobRecord | undefined {
+    const where = this.jobClaimWhere(claim, at);
+    const result = this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', leased_until = NULL,
+      lease_owner = NULL, lease_token = NULL, available_at = ?, blocked_reason = NULL,
       attempts = MAX(0, attempts - 1), updated_at = ?,
       payload_json = json_set(payload_json, '$.runAfter', ?)
-      WHERE id = ? AND status = 'leased'`).run(at, runAfter, id);
-    return this.getJob(id);
+      WHERE id = ? AND ${where.sql}`).run(runAfter, at, runAfter, id, ...where.params);
+    return result.changes > 0 ? this.getJob(id) : undefined;
+  }
+
+  releaseClaimedJobs(jobs: readonly EvolutionJobRecord[], at = nowIso()): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
+    return this.db.transaction(() => {
+      const result: Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> = [];
+      for (const job of jobs) {
+        if (!this.isJobLeaseHeld(job, at)) continue;
+        const before = this.getJob(job.id)!;
+        const where = this.jobClaimWhere(job, at);
+        const changed = this.db.prepare(`UPDATE evolution_jobs SET status = 'queued',
+          leased_until = NULL, lease_owner = NULL, lease_token = NULL,
+          attempts = MAX(0, attempts - 1), updated_at = ?
+          WHERE id = ? AND ${where.sql}`).run(at, job.id, ...where.params);
+        if (changed.changes > 0) result.push({ before, after: this.getJob(job.id)! });
+      }
+      return result;
+    })();
   }
 
   requeueFailedJobs(
@@ -3743,12 +3805,14 @@ export class RuntimeRepository {
           `SELECT *
            FROM evolution_jobs
            WHERE status = 'failed'
-             AND attempts < max_attempts
+             AND failure_count < max_attempts
+             AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
+             AND (available_at IS NULL OR available_at <= ?)
              ${targetFilter}
            ORDER BY ${evolutionJobOrderSql()}
            LIMIT ?`
         )
-        .all(...(targetMemoryIds ?? []), limit) as SqlJobRow[];
+        .all(at, ...(targetMemoryIds ?? []), limit) as SqlJobRow[];
 
       for (const row of rows) {
         this.db
@@ -3756,6 +3820,7 @@ export class RuntimeRepository {
             `UPDATE evolution_jobs
              SET status = 'queued',
                  leased_until = NULL,
+                 lease_owner = NULL, lease_token = NULL,
                  updated_at = ?
              WHERE id = ?`
           )
@@ -3778,41 +3843,21 @@ export class RuntimeRepository {
   requeueLeasedJobsAfterRestart(
     at = nowIso()
   ): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
-    const transaction = this.db.transaction(() => {
-      const rows = this.db
-        .prepare(
-          `SELECT *
-           FROM evolution_jobs
-           WHERE status = 'leased'
-           ORDER BY ${evolutionJobOrderSql()}`
-        )
-        .all() as SqlJobRow[];
+    return this.requeueLeasedJobsWhere(
+      "status = 'leased' AND (leased_until IS NULL OR leased_until <= ?)", [at], at
+    );
+  }
 
-      for (const row of rows) {
-        this.db
-          .prepare(
-            `UPDATE evolution_jobs
-             SET status = 'queued',
-                 attempts = MAX(0, attempts - 1),
-                 leased_until = NULL,
-                 updated_at = ?
-             WHERE id = ?`
-          )
-          .run(at, row.id);
-      }
-
-      return rows.map((row) => ({
-        before: jobFromSql(row),
-        after: jobFromSql({
-          ...row,
-          status: "queued",
-          attempts: Math.max(0, row.attempts - 1),
-          leased_until: null,
-          updated_at: at
-        })
-      }));
-    });
-    return transaction();
+  resumeConfigurationBlockedJobs(at = nowIso()): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM evolution_jobs
+        WHERE status = 'failed' AND blocked_reason = 'configuration'`).all() as SqlJobRow[];
+      return rows.map((row) => {
+        this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', available_at = ?,
+          blocked_reason = NULL, updated_at = ? WHERE id = ?`).run(at, at, row.id);
+        return { before: jobFromSql(row), after: this.getJob(row.id)! };
+      });
+    })();
   }
 
   requeueUnstartedLeasedJobs(
@@ -3823,9 +3868,10 @@ export class RuntimeRepository {
       return [];
     }
     return this.requeueLeasedJobsWhere(
-      `status = 'leased' AND id IN (${ids.map(() => "?").join(", ")})`,
+      `status = 'leased' AND lease_owner IS NULL AND lease_token IS NULL AND id IN (${ids.map(() => "?").join(", ")})`,
       [...ids],
-      at
+      at,
+      false
     );
   }
 
@@ -3849,7 +3895,8 @@ export class RuntimeRepository {
   private requeueLeasedJobsWhere(
     whereSql: string,
     params: readonly unknown[],
-    at: string
+    at: string,
+    recovery = true
   ): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
     const transaction = this.db.transaction(() => {
       const rows = this.db
@@ -3868,21 +3915,17 @@ export class RuntimeRepository {
              SET status = 'queued',
                  attempts = MAX(0, attempts - 1),
                  leased_until = NULL,
+                 lease_owner = NULL, lease_token = NULL,
+                 lease_recovery_count = lease_recovery_count + ?,
                  updated_at = ?
              WHERE id = ?`
           )
-          .run(at, row.id);
+          .run(recovery ? 1 : 0, at, row.id);
       }
 
       return rows.map((row) => ({
         before: jobFromSql(row),
-        after: jobFromSql({
-          ...row,
-          status: "queued",
-          attempts: Math.max(0, row.attempts - 1),
-          leased_until: null,
-          updated_at: at
-        })
+        after: this.getJob(row.id)!
       }));
     });
     return transaction();
@@ -3892,27 +3935,34 @@ export class RuntimeRepository {
     id: string,
     error: string,
     at = nowIso(),
-    forceDeadLetter = false
+    forceDeadLetter = false,
+    claim?: EvolutionJobRecord,
+    options: { availableAt?: string | null; blockedReason?: string | null; countFailure?: boolean } = {}
   ): EvolutionJobRecord | undefined {
+    const where = this.jobClaimWhere(claim, at);
     return this.db.transaction(() => {
       const row = this.db
-        .prepare(`SELECT * FROM evolution_jobs WHERE id = ?`)
-        .get(id) as SqlJobRow | undefined;
+        .prepare(`SELECT * FROM evolution_jobs WHERE id = ? AND ${where.sql}`)
+        .get(id, ...where.params) as SqlJobRow | undefined;
       if (!row) return undefined;
       if (row.status === "dead_letter") return jobFromSql(row);
-      const status: JobStatus = forceDeadLetter || row.attempts >= row.max_attempts
+      const failures = row.failure_count + (options.countFailure === false ? 0 : 1);
+      const status: JobStatus = forceDeadLetter || failures >= row.max_attempts
         ? "dead_letter"
         : "failed";
       this.db
         .prepare(
           `UPDATE evolution_jobs
            SET status = ?,
-               leased_until = NULL,
+               leased_until = NULL, lease_owner = NULL, lease_token = NULL,
+               failure_count = ?, attempts = MAX(0, attempts - ?),
+               available_at = ?, blocked_reason = ?,
                last_error = ?,
                updated_at = ?
-           WHERE id = ?`
+           WHERE id = ? AND ${where.sql}`
         )
-        .run(status, error, at, id);
+        .run(status, failures, options.countFailure === false ? 1 : 0,
+          options.availableAt ?? null, options.blockedReason ?? null, error, at, id, ...where.params);
       if (status === "dead_letter" && row.job_type === "l3_world_model_update") {
         const payload = parseJson<Record<string, unknown>>(row.payload_json, {});
         const batchId = typeof payload.batchId === "string" ? payload.batchId : undefined;
@@ -3954,6 +4004,9 @@ export class RuntimeRepository {
     now?: number;
   }): EmbeddingRetryRecord {
     const now = input.now ?? Date.now();
+    const unchangedActive = `(embedding_retry_queue.source_text = excluded.source_text
+      AND embedding_retry_queue.embed_role = excluded.embed_role
+      AND embedding_retry_queue.status IN ('pending', 'in_progress'))`;
     this.db
       .prepare(
         `INSERT INTO embedding_retry_queue (
@@ -3968,22 +4021,14 @@ export class RuntimeRepository {
         ON CONFLICT(target_kind, target_id, vector_field) DO UPDATE SET
           source_text = excluded.source_text,
           embed_role = excluded.embed_role,
-          status = CASE
-            WHEN embedding_retry_queue.status IN ('failed', 'succeeded') THEN 'pending'
-            ELSE embedding_retry_queue.status
-          END,
-          attempts = CASE
-            WHEN embedding_retry_queue.status IN ('failed', 'succeeded') THEN 0
-            ELSE embedding_retry_queue.attempts
-          END,
+          status = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.status ELSE 'pending' END,
+          attempts = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.attempts ELSE 0 END,
           max_attempts = excluded.max_attempts,
-          next_attempt_at = MIN(embedding_retry_queue.next_attempt_at, excluded.next_attempt_at),
-          claimed_by = NULL,
-          lease_until = NULL,
-          last_error = CASE
-            WHEN embedding_retry_queue.status IN ('failed', 'succeeded') THEN NULL
-            ELSE embedding_retry_queue.last_error
-          END,
+          next_attempt_at = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.next_attempt_at ELSE excluded.next_attempt_at END,
+          claimed_by = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.claimed_by ELSE NULL END,
+          lease_until = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.lease_until ELSE NULL END,
+          blocked_reason = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.blocked_reason ELSE NULL END,
+          last_error = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.last_error ELSE NULL END,
           updated_at = excluded.updated_at`
       )
       .run({
@@ -4072,17 +4117,16 @@ export class RuntimeRepository {
         .prepare(
           `SELECT *
            FROM embedding_retry_queue
-           WHERE status IN ('in_progress', 'failed')
+           WHERE status = 'in_progress' AND (lease_until IS NULL OR lease_until <= ?)
            ORDER BY updated_at ASC, id ASC`
         )
-        .all() as SqlEmbeddingRetryRow[];
+        .all(now) as SqlEmbeddingRetryRow[];
 
       for (const row of rows) {
         this.db
           .prepare(
             `UPDATE embedding_retry_queue
              SET status = 'pending',
-                 attempts = CASE WHEN status = 'failed' THEN 0 ELSE attempts END,
                  next_attempt_at = ?,
                  claimed_by = NULL,
                  lease_until = NULL,
@@ -4097,7 +4141,7 @@ export class RuntimeRepository {
         after: embeddingRetryFromSql({
           ...row,
           status: "pending",
-          attempts: row.status === "failed" ? 0 : row.attempts,
+          attempts: row.attempts,
           next_attempt_at: now,
           claimed_by: null,
           lease_until: null,
@@ -4170,10 +4214,46 @@ export class RuntimeRepository {
     return transaction();
   }
 
+  markEmbeddingRetryConfigurationBlockedClaimed(id: string, input: {
+    workerId: string; leaseUntil: number; error: string; now: number;
+  }): EmbeddingRetryRecord | undefined {
+    const result = this.db.prepare(`UPDATE embedding_retry_queue SET status = 'failed',
+      blocked_reason = 'configuration', claimed_by = NULL, lease_until = NULL,
+      last_error = ?, updated_at = ?
+      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_until > ?`)
+      .run(input.error, input.now, id, input.workerId, input.leaseUntil, input.now);
+    return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
+  }
+
+  resumeConfigurationBlockedEmbeddingRetries(now = Date.now()): Array<{ before: EmbeddingRetryRecord; after: EmbeddingRetryRecord }> {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM embedding_retry_queue
+        WHERE status = 'failed' AND blocked_reason = 'configuration'`).all() as SqlEmbeddingRetryRow[];
+      return rows.map((row) => {
+        this.db.prepare(`UPDATE embedding_retry_queue SET status = 'pending', blocked_reason = NULL,
+          next_attempt_at = ?, updated_at = ? WHERE id = ?`).run(now, now, row.id);
+        return { before: embeddingRetryFromSql(row), after: this.getEmbeddingRetry(row.id)! };
+      });
+    })();
+  }
+
+  renewEmbeddingRetryClaim(
+    id: string,
+    claim: { workerId: string; leaseUntil: number },
+    newUntil: number,
+    now = Date.now()
+  ): EmbeddingRetryRecord | undefined {
+    if (newUntil <= now) return undefined;
+    const result = this.db.prepare(`UPDATE embedding_retry_queue SET lease_until = ?, updated_at = ?
+      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_until > ?`)
+      .run(Math.max(claim.leaseUntil, newUntil), now, id, claim.workerId, claim.leaseUntil, now);
+    return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
+  }
+
   isEmbeddingRetryClaimHeld(id: string, input: {
     workerId: string;
     leaseUntil: number;
-  }): boolean {
+  }, now = Date.now()): boolean {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS count
@@ -4181,9 +4261,10 @@ export class RuntimeRepository {
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
-           AND lease_until = ?`
+           AND lease_until = ?
+           AND lease_until > ?`
       )
-      .get(id, input.workerId, input.leaseUntil) as { count: number } | undefined;
+      .get(id, input.workerId, input.leaseUntil, now) as { count: number } | undefined;
     return (row?.count ?? 0) > 0;
   }
 
@@ -4198,7 +4279,7 @@ export class RuntimeRepository {
     const result = this.db
       .prepare(
         `UPDATE embedding_retry_queue
-         SET status = 'pending',
+         SET status = 'pending', blocked_reason = NULL,
              attempts = ?,
              next_attempt_at = ?,
              claimed_by = NULL,
@@ -4208,7 +4289,8 @@ export class RuntimeRepository {
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
-           AND lease_until = ?`
+           AND lease_until = ?
+           AND lease_until > ?`
       )
       .run(
         input.attempts,
@@ -4217,7 +4299,8 @@ export class RuntimeRepository {
         input.now,
         id,
         input.workerId,
-        input.leaseUntil
+        input.leaseUntil,
+        input.now
       );
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
@@ -4232,7 +4315,7 @@ export class RuntimeRepository {
     const result = this.db
       .prepare(
         `UPDATE embedding_retry_queue
-         SET status = 'failed',
+         SET status = 'failed', blocked_reason = NULL,
              attempts = ?,
              claimed_by = NULL,
              lease_until = NULL,
@@ -4241,9 +4324,10 @@ export class RuntimeRepository {
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
-           AND lease_until = ?`
+           AND lease_until = ?
+           AND lease_until > ?`
       )
-      .run(input.attempts, input.error, input.now, id, input.workerId, input.leaseUntil);
+      .run(input.attempts, input.error, input.now, id, input.workerId, input.leaseUntil, input.now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
@@ -4255,7 +4339,7 @@ export class RuntimeRepository {
     const result = this.db
       .prepare(
         `UPDATE embedding_retry_queue
-         SET status = 'succeeded',
+         SET status = 'succeeded', blocked_reason = NULL,
              next_attempt_at = ?,
              claimed_by = NULL,
              lease_until = NULL,
@@ -4263,9 +4347,10 @@ export class RuntimeRepository {
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
-           AND lease_until = ?`
+           AND lease_until = ?
+           AND lease_until > ?`
       )
-      .run(input.now, input.now, id, input.workerId, input.leaseUntil);
+      .run(input.now, input.now, id, input.workerId, input.leaseUntil, input.now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
@@ -4969,14 +5054,14 @@ export class RuntimeRepository {
       return;
     }
     this.scheduledLogPrunes.add(table);
-    setImmediate(() => {
+    withoutJobLeaseGuard(() => setImmediate(() => {
       this.scheduledLogPrunes.delete(table);
       try {
         this.pruneLogTable(table);
       } catch {
         // Log retention is best-effort and must not affect memory write paths.
       }
-    });
+    }));
   }
 
   private pruneLogTable(table: LogTableName): number {
@@ -6013,7 +6098,10 @@ export class Repositories {
   }
 
   transaction<T>(fn: () => T): T {
-    return this.db.transaction(fn)();
+    return this.db.transaction(() => {
+      assertCurrentJobLease();
+      return fn();
+    })();
   }
 
   clearAllMemoryData(): Record<string, number> {
@@ -7485,6 +7573,13 @@ interface SqlJobRow {
   attempts: number;
   max_attempts: number;
   leased_until: string | null;
+  lease_owner: string | null;
+  lease_token: string | null;
+  available_at: string | null;
+  blocked_reason: string | null;
+  failure_count: number;
+  lease_count: number;
+  lease_recovery_count: number;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -7518,6 +7613,7 @@ interface SqlEmbeddingRetryRow {
   next_attempt_at: number;
   claimed_by: string | null;
   lease_until: number | null;
+  blocked_reason: string | null;
   last_error: string | null;
   created_at: number;
   updated_at: number;
@@ -7618,6 +7714,13 @@ function jobFromSql(row: SqlJobRow): EvolutionJobRecord {
     attempts: row.attempts,
     maxAttempts: row.max_attempts,
     leasedUntil: row.leased_until,
+    leaseOwner: row.lease_owner,
+    leaseToken: row.lease_token,
+    availableAt: row.available_at,
+    blockedReason: row.blocked_reason,
+    failureCount: row.failure_count,
+    leaseCount: row.lease_count,
+    leaseRecoveryCount: row.lease_recovery_count,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -7668,6 +7771,7 @@ function embeddingRetryFromSql(row: SqlEmbeddingRetryRow): EmbeddingRetryRecord 
     nextAttemptAt: row.next_attempt_at,
     claimedBy: row.claimed_by,
     leaseUntil: row.lease_until,
+    blockedReason: row.blocked_reason,
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at

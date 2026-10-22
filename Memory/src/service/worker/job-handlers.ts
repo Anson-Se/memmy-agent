@@ -24,7 +24,6 @@ import {
 import { episodeTitleIsCurrent } from "../episode-title/episode-title-service.js";
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import { observationMemoryState } from "../observation-memory-state.js";
-import { isTerminalL3WorldModelError } from "../evolution/l3-world-model-pipeline.js";
 import {
   namespaceForMemory,
   namespaceForSession
@@ -254,19 +253,7 @@ export async function processJob(
       await deps.processors.evolution.abstractL3(job);
       return;
     case "l3_world_model_update":
-      try {
-        await deps.processors.evolution.updateL3WorldModel(job);
-      } catch (error) {
-        if (isTerminalL3WorldModelError(error)) {
-          deps.repos.runtime.failJob(
-            job.id,
-            error instanceof Error ? error.message : String(error),
-            deps.nowIso(),
-            true
-          );
-        }
-        throw error;
-      }
+      await deps.processors.evolution.updateL3WorldModel(job);
       return;
     case "project_environment_profile":
       await deps.processors.evolution.updateProjectEnvironment(job);

@@ -121,6 +121,25 @@ export async function runWorkerRounds(
   }
 }
 
+/** Lifecycle tests can explicitly make selected retries due without real sleeps.
+ * Backoff timing itself is covered by worker-lease-safety using a fake clock.
+ * Configuration blocks are never bypassed by this helper.
+ */
+export async function runWorkerRoundsWithDueRetries(
+  service: MemoryService, db: MemoryDb, memoryIds: readonly string[], rounds: number, limit = 100
+) {
+  if (memoryIds.length === 0) throw new Error("retry test requires explicit memory ids");
+  const placeholders = memoryIds.map(() => "?").join(", ");
+  const results = [];
+  for (let index = 0; index < rounds; index += 1) {
+    db.db.prepare(`UPDATE evolution_jobs SET available_at = ?
+      WHERE status = 'failed' AND blocked_reason IS NULL AND target_memory_id IN (${placeholders})`)
+      .run(new Date().toISOString(), ...memoryIds);
+    results.push(await service.runWorkerOnce(limit));
+  }
+  return results;
+}
+
 export function addAgentSourceImport(
   service: MemoryService,
   namespace: { source: string; profileId: string; userId: string },

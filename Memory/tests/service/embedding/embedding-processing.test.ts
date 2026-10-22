@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MEMMY_CONFIG,
   MemoryDb,
@@ -32,7 +32,7 @@ const {
   createTestService
 } = createMemoryServiceFixture();
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe("MemoryService / embedding / processing", () => {
   it("embeds Skill retrieval metadata instead of the full SKILL.md when short metadata exists", () => {
@@ -103,6 +103,7 @@ describe("MemoryService / embedding / processing", () => {
   });
 
   it("retries trace embedding jobs without leaving the processing state stuck", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const root = createTestRoot("mindock-memory-embedding-retry-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -160,6 +161,9 @@ describe("MemoryService / embedding / processing", () => {
       attemptCount: 1
     });
 
+    const retryAt = new Repositories(db.db).runtime.getJob(failedJob.id)!.availableAt!;
+    expect(Date.parse(retryAt)).toBeGreaterThan(Date.now());
+    vi.setSystemTime(Date.parse(retryAt));
     const secondRun = await service.runWorkerOnce(20, { priorityCohortOnly: true });
     expect(secondRun.jobs).toEqual(expect.arrayContaining([
       expect.objectContaining({ jobId: failedJob.id, jobType: "embedding", status: "succeeded" })
@@ -245,7 +249,7 @@ describe("MemoryService / embedding / processing", () => {
     db.close();
   });
 
-  it("terminates a legacy embedding retry after a deterministic provider failure", async () => {
+  it("holds a forbidden legacy embedding retry for configuration repair without consuming an attempt", async () => {
     const { db, service } = createTestService({ embedder: createForbiddenEmbedder() });
     const repositories = new Repositories(db.db);
     const memory = skillMemory();
@@ -262,11 +266,12 @@ describe("MemoryService / embedding / processing", () => {
     const run = await service.runWorkerOnce(10);
 
     expect(run.embeddingRetries.items).toEqual([
-      expect.objectContaining({ id: retry.id, status: "failed", attempts: 1 })
+      expect.objectContaining({ id: retry.id, status: "failed", attempts: 0 })
     ]);
     expect(repositories.runtime.getEmbeddingRetry(retry.id)).toMatchObject({
       status: "failed",
-      attempts: 1,
+      attempts: 0,
+      blockedReason: "configuration",
       lastError: "Access to the configured model is forbidden."
     });
     db.close();

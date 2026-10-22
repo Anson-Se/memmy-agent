@@ -1,3 +1,4 @@
+import { withoutJobLeaseGuard } from "../storage/job-lease-context.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -558,6 +559,11 @@ export class MemoryService {
       memoryBudgetNextWakeAtMs: () => this.tokenBudgetLedger.nextWakeAtMs(),
       memoryBudgetNextReconcileAtMs: () => this.nextAppBudgetReconcileAtMs(),
       summaryModelConfigured: () => workerRunnerOwner.llm.isConfigured(),
+      configurationFingerprint: () => {
+        const config = workerRunnerOwner.effectiveModelConfig();
+        return stableHash({ summary: config.summary, evolution: config.evolution,
+          embedding: config.embedding, roleRouting: config.roleRouting });
+      },
       nowIso,
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
       namespaceIdFromMemory,
@@ -885,12 +891,14 @@ export class MemoryService {
     ]);
   }
 
+  private effectiveModelConfig(): MemmyConfig {
+    return this.options.configPath || this.options.configLoader
+      ? (this.options.configLoader ?? loadMemmyConfig)(this.options.configPath).config
+      : this.config;
+  }
+
   private resolveModelTaskContext(): MemoryModelTaskContext {
-    const taskConfig = cloneMemmyConfig(
-      this.options.configPath || this.options.configLoader
-        ? (this.options.configLoader ?? loadMemmyConfig)(this.options.configPath).config
-        : this.config
-    );
+    const taskConfig = cloneMemmyConfig(this.effectiveModelConfig());
     const summary = this.options.llm
       ?? this.createConfiguredMemoryLlm(taskConfig, "memory_summary");
     const evolution = this.options.skillLlm
@@ -1049,6 +1057,7 @@ export class MemoryService {
     this.appBudgetReconcile.nextAttemptAtMs = 0;
     this.startAppBudgetReconcile();
     if (!requiresRestart && request.restartFailedProcessing !== false) {
+      this.workerRunner.resumeJobsAfterConfigurationChange();
       this.restartFailedProcessing(reloadedAt);
     }
     serviceLogger.info("config.reloaded", {
@@ -3125,10 +3134,12 @@ export class MemoryService {
       priorityCohortOnly?: boolean;
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
-    await this.ensureAppBudgetReconciled();
-    const result = await this.workerRunner.runWorkerOnce(limit, request);
-    this.reconcileAutomaticHistorySkills(nowIso());
-    return result;
+    return withoutJobLeaseGuard(async () => {
+      await this.ensureAppBudgetReconciled();
+      const result = await this.workerRunner.runWorkerOnce(limit, request);
+      this.reconcileAutomaticHistorySkills(nowIso());
+      return result;
+    });
   }
 
   private async queryVector(query: string): Promise<number[] | undefined> {
