@@ -1568,7 +1568,14 @@ function snapshot(overrides: Partial<ComputerHistorySnapshot> = {}): ComputerHis
   };
 }
 
-describe("computer history exclusion icons", () => {
+describe("computer history source dialog styles", () => {
+  it("keeps the application picker anchor visible while selected apps scroll", () => {
+    const styles = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../styles.css"), "utf8");
+    const addAppRule = styles.match(/\.ch-source-dialog__add--app \{[^}]+\}/u)?.[0] ?? "";
+    expect(addAppRule).toContain("position: sticky");
+    expect(addAppRule).toContain("top: 0");
+  });
+
   it("does not let a missing application icon grow with the exclusion row", () => {
     const styles = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../styles.css"), "utf8");
     const nameRule = styles.match(/\.ch-source-dialog__rules li span:not\(\.ch-app-icon\) \{[^}]+\}/u)?.[0] ?? "";

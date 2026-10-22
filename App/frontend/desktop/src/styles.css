@@ -13982,6 +13982,13 @@ body.memmy-platform-windows :is(
   cursor: pointer;
 }
 
+.ch-source-dialog__add--app {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: color-mix(in srgb, var(--color-background-paper) 96%, var(--color-canvas-oat));
+}
+
 .ch-source-dialog__add-icon {
   display: grid;
   place-items: center;

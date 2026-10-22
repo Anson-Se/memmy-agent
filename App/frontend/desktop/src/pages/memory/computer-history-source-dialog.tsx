@@ -282,7 +282,7 @@ export function ComputerHistorySourceDialog(props: {
               <ChevronDown size={16} aria-hidden="true" />
             </label>
             <div className="ch-source-dialog__list">
-              {scope === "app" ? <button ref={addAppRef} type="button" className="ch-source-dialog__add" disabled={busy}
+              {scope === "app" ? <button ref={addAppRef} type="button" className="ch-source-dialog__add ch-source-dialog__add--app" disabled={busy}
                 aria-expanded={appMenuOpen} aria-haspopup="listbox" aria-controls="ch-app-menu"
                 onClick={() => {
                   if (appMenuOpen) {
