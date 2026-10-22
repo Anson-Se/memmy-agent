@@ -261,6 +261,7 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
         principal,
         Boolean(options.onShutdownRequested),
         pluginRuntimeAnalytics,
+        agentSources,
         requestId
       );
       if (request.method === "POST" && url.pathname === "/api/v1/admin/shutdown") {
@@ -551,6 +552,7 @@ async function routeRequest(
   principal: AuthPrincipal,
   canShutdown: boolean,
   pluginRuntimeAnalytics: PluginRuntimeAnalytics,
+  agentSources: AgentSourceExecutor,
   requestId: string
 ): Promise<unknown> {
   const path = url.pathname;
@@ -968,7 +970,7 @@ async function routeRequest(
 
   if (method === "DELETE" && path === "/api/v1/admin/data") {
     requireMemoryWrite(principal);
-    return service.clearAllData();
+    return agentSources.clearAllData();
   }
 
   if (method === "GET" && path === "/api/v1/panel/analysis") {

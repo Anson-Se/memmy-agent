@@ -115,6 +115,7 @@ export interface ScanControlResult { ok: true; outcome: "applied" | "already_ter
 
 export interface AgentSourceExecutor {
   list(): Promise<{ executorAvailable: true; sources: AgentSourceView[] }>;
+  clearAllData(): Promise<ReturnType<MemoryService["clearAllData"]>>;
   startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string; version?: ScanVersion }>;
   scanStatus(): AgentSourceScanState;
   pauseScan(input?: ScanControlInput): Promise<ScanControlResult>;
@@ -188,6 +189,8 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   let resumePausedScan: (() => void) | undefined;
   let disposed = false;
   let canceling = false;
+  let clearing = false;
+  let automationStarted = false;
   const activeScans = new Set<Promise<void>>();
   const canceledScanJobs = new Set<string>();
   let activeAutomation: Promise<void> | undefined;
@@ -243,6 +246,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   async function startScan(input: unknown): Promise<{ accepted: true; jobId: string; attemptId?: string; attemptStartedAt?: string; version?: ScanVersion }> {
+    if (clearing) throw new MemoryServiceError("conflict", "Clearing Memory data; try again after it completes");
     if (canceling) throw new MemoryServiceError("conflict", "Canceling the previous scan");
     if (disposed) throw new MemoryServiceError("conflict", "Agent source executor is shutting down");
     const expected = (input ?? {}) as ScanControlInput;
@@ -547,6 +551,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   async function pauseScan(input: ScanControlInput = {}): Promise<ScanControlResult> {
+    if (clearing) return controlResult("conflict");
     if (!matchesScanExecution(scan, input.expectedExecution) || (input.expectedVersion && (!scan.version || compareScanVersions(scan.version, input.expectedVersion) !== 0))) return controlResult("conflict");
     if (canceling) return controlResult("conflict");
     if (scan.completedAt) return controlResult("already_terminal");
@@ -689,7 +694,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   function scheduleAutomation(delay: number, startup: boolean): void {
-    if (disposed) return;
+    if (disposed || clearing) return;
     scanTimer = setTimeout(() => {
       scanTimer = undefined;
       activeAutomation = runAutomation(startup)
@@ -703,12 +708,12 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
   }
 
   async function runAutomation(startup: boolean): Promise<void> {
-    if (disposed || scan.running || scanPaused || scan.progress?.phase === "stopped") return;
+    if (disposed || clearing || scan.running || scanPaused || scan.progress?.phase === "stopped") return;
     const config = loadMemmyConfig(configPath).config.agentAccess;
     if (config.autoInjectSkill) {
       const discovered = await list();
       for (const source of discovered.sources) {
-        if (disposed) return;
+        if (disposed || clearing) return;
         if (!source.available || source.status !== "not_connected") continue;
         try {
           await mutateConnection(source.sourceId, agentConnectionKind(source.sourceId), "POST");
@@ -718,11 +723,62 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       }
     }
     const enabled = startup ? config.autoScanKnownAgents : config.watchFileChanges;
-    if (enabled && !disposed) await startScan({ sourceId: "all" });
+    if (enabled && !disposed && !clearing) await startScan({ sourceId: "all" });
+  }
+
+  async function clearAllData(): Promise<ReturnType<MemoryService["clearAllData"]>> {
+    if (disposed) throw new MemoryServiceError("conflict", "Agent source executor is shutting down");
+    if (clearing) throw new MemoryServiceError("conflict", "Memory data is already being cleared");
+    clearing = true;
+    if (scanTimer) clearTimeout(scanTimer);
+    scanTimer = undefined;
+    try {
+      if (scan.running || scanPaused || scan.progress?.phase === "stopped") {
+        const cancelled = await cancelScan({ expectedVersion: scan.version });
+        if (cancelled.outcome === "conflict") {
+          throw new MemoryServiceError("conflict", "Could not stop the Agent source scan before clearing Memory data");
+        }
+      }
+      if (activeAutomation) await activeAutomation;
+      await Promise.all([...activeScans]);
+
+      const current = await readState();
+      const sources = Object.fromEntries(Object.entries(current.sources).map(([sourceId, source]) => [sourceId, {
+        status: source.status,
+        messageCount: 0,
+        lastScannedAt: null,
+        latestSeenAt: null
+      } satisfies PersistedSourceState]));
+      const resetState: PersistedState = { version: 2, legacyRecoveryChecked: true, sources };
+      await persist(resetState);
+      statePromise = Promise.resolve(resetState);
+
+      await removeScanDatabases(scanStoreDirectory);
+      await removeSQLiteDatabase(`${statePath}.checkpoints.sqlite`);
+      scanPaused = false;
+      activeScanRequest = undefined;
+      progressBeforePause = null;
+      resumePausedScan = undefined;
+      setScan(emptyScanState());
+
+      return await options.service.clearAllData();
+    } finally {
+      clearing = false;
+      if (!disposed && automationStarted) {
+        const config = loadMemmyConfig(configPath).config.agentAccess;
+        scheduleAutomation(
+          config.autoScanKnownAgents
+            ? options.initialScanDelayMs ?? INITIAL_SCAN_DELAY_MS
+            : options.scheduledScanIntervalMs ?? SCHEDULED_SCAN_INTERVAL_MS,
+          config.autoScanKnownAgents
+        );
+      }
+    }
   }
 
   return {
     list,
+    clearAllData,
     startScan,
     scanStatus: snapshot,
     pauseScan,
@@ -730,6 +786,7 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     scanResults,
     mutateConnection,
     startAutomation() {
+      automationStarted = true;
       if (scanTimer || disposed) return;
       const config = loadMemmyConfig(configPath).config.agentAccess;
       scheduleAutomation(
@@ -751,6 +808,22 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
       await Promise.all(activeScans);
     }
   };
+}
+
+async function removeScanDatabases(directory: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  const databases = entries.filter((entry) => /\.sqlite(?:-(?:wal|shm))?$/.test(entry));
+  await Promise.all(databases.map((entry) => rm(join(directory, entry), { force: true })));
+}
+
+async function removeSQLiteDatabase(path: string): Promise<void> {
+  await Promise.all([path, `${path}-wal`, `${path}-shm`].map((file) => rm(file, { force: true })));
 }
 
 function findReusableScanJob(directory: string, sourceId: string, mode?: string, excludedJobs: ReadonlySet<string> = new Set()): string | null {

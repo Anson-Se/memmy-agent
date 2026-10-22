@@ -107,6 +107,9 @@ export type AppAction =
   | { type: "agentSources/refreshed"; sources: AgentSourceView[] }
   | { type: "agentSources/error"; message: string }
   | { type: "agentSources/scanAvailability"; unavailable: AgentSourceScanUnavailable | null }
+  | { type: "agentSources/restartStarted"; baseGeneration: number | null }
+  | { type: "agentSources/restartFinished" }
+  | { type: "agentSources/restartStateSynchronized"; generation: number; status: AgentSourceScanStatusResponse }
   | { type: "agentSources/scanResumeAcknowledged"; token: string; jobId: string; attemptId?: string }
   | { type: "agentSources/scanStarted"; sourceId: string }
   | { type: "agentSources/scanStatus"; status: AgentSourceScanStatusResponse; requestGeneration?: number; cancelledExecution?: { token: string; jobId: string; attemptId?: string } }
@@ -199,6 +202,18 @@ export const appActions = {
 
   agentSourceScanAvailability(unavailable: AgentSourceScanUnavailable | null): AppAction {
     return { type: "agentSources/scanAvailability", unavailable };
+  },
+
+  agentSourceRestartStarted(baseGeneration: number | null): AppAction {
+    return { type: "agentSources/restartStarted", baseGeneration };
+  },
+
+  agentSourceRestartFinished(): AppAction {
+    return { type: "agentSources/restartFinished" };
+  },
+
+  agentSourceRestartStateSynchronized(generation: number, status: AgentSourceScanStatusResponse): AppAction {
+    return { type: "agentSources/restartStateSynchronized", generation, status };
   },
 
   /** Handles agent sources failed. */

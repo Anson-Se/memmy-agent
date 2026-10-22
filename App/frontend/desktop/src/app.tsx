@@ -16,6 +16,7 @@ import {
   type AgentTaskStateCoordinator
 } from "./app/agent-runtime-bridge.js";
 import { AppProviders, useApiClients } from "./app/providers.js";
+import { AgentSourceScanReconciler } from "./app/agent-source-scan-reconciler.js";
 import { AppRouter } from "./app/router.js";
 import { UpdateCoordinatorProvider } from "./app/update-coordinator.js";
 import { CampaignPromptHost } from "./components/campaign-prompt-host.js";
@@ -331,6 +332,7 @@ function RuntimeApp() {
     <UpdateCoordinatorProvider>
       <AgentRuntimeBridge taskStateCoordinator={taskStateCoordinator ?? undefined}>
         <NotificationCenterProvider>
+        <AgentSourceScanReconciler />
           <AppRouter onRetry={retry} />
           <HistoryLaunchPromptHost />
           <CampaignPromptHost />

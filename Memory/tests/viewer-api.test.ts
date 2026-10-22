@@ -235,6 +235,7 @@ describe("local Viewer API", () => {
     const cancelScan = vi.fn(async () => ({ ok: true as const, outcome: "applied" as const, snapshot }));
     const agentSourceExecutor: AgentSourceExecutor = {
       list: async () => ({ executorAvailable: true, sources: [] }),
+      clearAllData: async () => ({ ok: true, cleared: {}, clearedAt: new Date().toISOString(), serverTime: new Date().toISOString() }),
       startScan: async () => ({ accepted: true, jobId: "scan-1" }),
       scanStatus: () => ({
         running: true,

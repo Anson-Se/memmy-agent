@@ -1,4 +1,4 @@
-import { acceptsScanUpdate, type ScanStamp, agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
+import { acceptsScanUpdate, compareScanVersions, type ScanStamp, agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
 /** App reducer module. */
 import { ASR_DEFAULT_BASE_URL, QWEN_ASR_MODEL_ID, type AgentSourceView, type AgentSourceScanUnavailable, type AppBootstrapResponse, type ScanPreferences } from "@memmy/local-api-contracts";
 import type { AppRoutePath, PreferredMode } from "../app/routes.js";
@@ -27,6 +27,10 @@ export interface NavigationState {
 export interface AgentSourcesState {
   scanStamp?: ScanStamp;
   scanRequestGeneration?: number;
+  memoryServiceRestarting: boolean;
+  scanStateSyncRequired: boolean;
+  scanStateSyncGeneration: number;
+  scanStateSyncBaseGeneration: number | null;
   scanControl?: { control: "start" | "pause" | "resume" | "cancel"; token: string } | null;
   scanUnavailable: AgentSourceScanUnavailable | null;
   items: AgentSourceView[];
@@ -128,6 +132,10 @@ export function createInitialAppState(windowVisible = true): AppState {
       windowVisible
     },
     agentSources: {
+      memoryServiceRestarting: false,
+      scanStateSyncRequired: false,
+      scanStateSyncGeneration: 0,
+      scanStateSyncBaseGeneration: null,
       scanUnavailable: null,
       items: [],
       isLoading: false,
@@ -283,6 +291,23 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     case "agentSources/scanAvailability":
       return { ...state, agentSources: { ...state.agentSources, scanUnavailable: action.unavailable } };
+    case "agentSources/restartStarted":
+      return { ...state, agentSources: { ...state.agentSources, memoryServiceRestarting: true,
+        scanStateSyncRequired: true, scanStateSyncGeneration: state.agentSources.scanStateSyncGeneration + 1,
+        scanStateSyncBaseGeneration: action.baseGeneration } };
+    case "agentSources/restartFinished":
+      return { ...state, agentSources: { ...state.agentSources, memoryServiceRestarting: false } };
+    case "agentSources/restartStateSynchronized": {
+      if (action.generation !== state.agentSources.scanStateSyncGeneration || state.agentSources.memoryServiceRestarting || action.status.unavailable) return state;
+      const currentVersion = state.agentSources.scanStamp?.version;
+      const incomingVersion = action.status.version;
+      const baseGeneration = state.agentSources.scanStateSyncBaseGeneration;
+      if (baseGeneration !== null && (!incomingVersion || incomingVersion.generation <= baseGeneration)) return state;
+      if (currentVersion && (!incomingVersion || compareScanVersions(incomingVersion, currentVersion) < 0)) return state;
+      const reconciled = appReducer(state, { type: "agentSources/scanStatus", status: action.status });
+      return { ...reconciled, agentSources: { ...reconciled.agentSources, scanStateSyncRequired: false,
+        scanStateSyncBaseGeneration: null } };
+    }
     case "agentSources/error":
       return {
         ...state,

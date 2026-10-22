@@ -58,7 +58,6 @@ import {
 type MemoryServiceStatus = "checking" | "ok" | "unavailable";
 const MEMORY_SERVICE_HEALTH_INTERVAL_MS = 5_000;
 const MEMORY_SERVICE_HEALTH_TIMEOUT_MS = 10_000;
-const MEMORY_SCAN_STATUS_TIMEOUT_MS = 5_000;
 const MEMORY_SERVICE_RESTART_TIMEOUT_MS = 30_000;
 
 function withTimeout<T>(
@@ -141,10 +140,10 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const [dataDir, setDataDir] = useState("");
   const [memoryServiceStatus, setMemoryServiceStatus] = useState<MemoryServiceStatus>(() => memoryServiceStatusFromBootstrap(state.bootstrap?.health.memory));
   const [memoryServiceBusy, setMemoryServiceBusy] = useState(false);
-  const [scanStateSyncRequired, setScanStateSyncRequired] = useState(false);
   const [memoryServiceMessage, setMemoryServiceMessage] = useState("");
   const [memoryServiceError, setMemoryServiceError] = useState("");
   const memoryServiceMonitor = useRef<MemoryServiceMonitor | null>(null);
+  const restartFeedbackPending = useRef(false);
   const memoryServiceTranslate = useRef(t);
   memoryServiceTranslate.current = t;
   const [cliInstallBusy, setCliInstallBusy] = useState(false);
@@ -163,7 +162,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
   const scanCancelling = Boolean(state.agentSources.cancellingScanJobId || state.agentSources.scanControl?.control === "cancel");
-  const scanControlBusy = memoryServiceBusy || scanStateSyncRequired || Boolean(state.agentSources.scanControl);
+  const scanControlBusy = memoryServiceBusy || state.agentSources.memoryServiceRestarting || state.agentSources.scanStateSyncRequired || Boolean(state.agentSources.scanControl);
   const showScanProgress = isScanning || scanStopped || scanCancelling;
   const hasDeterminateScanProgress = Boolean(scanProgress && scanProgress.phase !== "scan" && scanProgress.phase !== "stopped" && scanProgress.total > 0);
   const memoryUnavailable = memoryServiceStatus === "unavailable";
@@ -299,43 +298,12 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   }, [clients, dispatch]);
 
   useEffect(() => {
-    if (!clients || memoryServiceBusy || !scanStateSyncRequired) return;
-    let active = true;
-    let pending = false;
-    const reconcile = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const health = await withTimeout(
-          (signal) => clients.memoryRuntime.health(signal),
-          MEMORY_SERVICE_HEALTH_TIMEOUT_MS,
-          t("memory.healthCheckTimeout")
-        );
-        if (!health.ok || !health.storage.ready) return;
-        const scanStatus = await withTimeout(
-          (signal) => clients.agentSources.getScanStatus({ signal }),
-          MEMORY_SCAN_STATUS_TIMEOUT_MS,
-          t("memory.restartServiceStillUnavailable")
-        );
-        if (!active) return;
-        dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
-        if (scanStatus.unavailable) return;
-        dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
-        setMemoryServiceStatus("ok");
-        setMemoryServiceError("");
-        setScanStateSyncRequired(false);
-      } catch {
-        // Keep scan actions locked until a fresh full snapshot can be read.
-      } finally {
-        pending = false;
-      }
-    };
-    const timer = window.setInterval(() => void reconcile(), 1_000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [clients, dispatch, memoryServiceBusy, scanStateSyncRequired, t]);
+    if (state.agentSources.scanStateSyncRequired || state.agentSources.memoryServiceRestarting || !restartFeedbackPending.current) return;
+    restartFeedbackPending.current = false;
+    setMemoryServiceStatus("ok");
+    setMemoryServiceError("");
+    setMemoryServiceMessage(t("memory.restartServiceDone"));
+  }, [state.agentSources.memoryServiceRestarting, state.agentSources.scanStateSyncRequired, t]);
 
   useEffect(() => {
     if (!clients) return;
@@ -413,7 +381,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
 
   function restartMemoryService() {
     const monitor = memoryServiceMonitor.current;
-    if (!clients || !monitor?.active || monitor.clients !== clients || monitor.restarting || memoryServiceBusy) {
+    if (!clients || !monitor?.active || monitor.clients !== clients || monitor.restarting || memoryServiceBusy || state.agentSources.memoryServiceRestarting) {
       return;
     }
 
@@ -432,49 +400,25 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
     monitor.healthController = null;
     monitor.pendingHealth = null;
     setMemoryServiceBusy(true);
-    setScanStateSyncRequired(true);
+    dispatch(appActions.agentSourceRestartStarted(state.agentSources.scanStamp?.version?.generation ?? null));
+    restartFeedbackPending.current = true;
     setMemoryServiceStatus("checking");
     setMemoryServiceMessage("");
     setMemoryServiceError("");
     void withTimeout(async (signal) => {
       await restart();
-      if (signal.aborted || !isCurrent()) return;
+      if (signal.aborted) return;
       clearMemoryPanelCache();
-
-      const health = await withTimeout(
-        (healthSignal) => clients.memoryRuntime.health(healthSignal),
-        MEMORY_SERVICE_HEALTH_TIMEOUT_MS,
-        t("memory.healthCheckTimeout"),
-        signal
-      );
-      if (signal.aborted || !isCurrent()) return;
-      if (!health.ok || !health.storage.ready) {
-        throw new Error(t("memory.restartServiceStillUnavailable"));
-      }
-      setMemoryServiceStatus("ok");
-      setMemoryServiceError("");
-
-      const scanStatus = await withTimeout(
-        (statusSignal) => clients.agentSources.getScanStatus({ signal: statusSignal }),
-        MEMORY_SCAN_STATUS_TIMEOUT_MS,
-        t("memory.restartServiceStillUnavailable"),
-        signal
-      );
-      if (signal.aborted || !isCurrent()) return;
-      dispatch(appActions.agentSourceScanAvailability(scanStatus.unavailable ?? null));
-      if (scanStatus.unavailable) {
-        throw new Error(t("memory.restartServiceStillUnavailable"));
-      }
-      dispatch(appActions.agentSourceScanStatusReceived(scanStatus));
-      setScanStateSyncRequired(false);
-      setMemoryServiceMessage(t("memory.restartServiceDone"));
     }, MEMORY_SERVICE_RESTART_TIMEOUT_MS, t("memory.restartServiceFailed", { reason: t("memory.restartServiceStillUnavailable") }))
       .catch((error) => {
-        if (!isCurrent()) return;
-        setMemoryServiceStatus("unavailable");
-        setMemoryServiceError(t("memory.restartServiceFailed", { reason: formatErrorMessage(error) }));
+        restartFeedbackPending.current = false;
+        if (isCurrent()) {
+          setMemoryServiceStatus("unavailable");
+          setMemoryServiceError(t("memory.restartServiceFailed", { reason: formatErrorMessage(error) }));
+        }
       })
       .finally(() => {
+        dispatch(appActions.agentSourceRestartFinished());
         monitor.restarting = false;
         if (isCurrent()) setMemoryServiceBusy(false);
       });
@@ -893,11 +837,11 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
             errLabel={t("memory.daemonUnavailable")}
             checkingLabel={t("common.loading")}
             value={memoryServiceAddress ?? t("memory.daemonAddressUnavailable")}
-            actionLabel={t(memoryServiceBusy ? "memory.restartServiceBusy" : "memory.restartService")}
+            actionLabel={t(memoryServiceBusy || state.agentSources.memoryServiceRestarting ? "memory.restartServiceBusy" : "memory.restartService")}
             actionTone="success"
             onAction={restartMemoryService}
-            actionDisabled={!clients || memoryServiceBusy}
-            actionBusy={memoryServiceBusy}
+            actionDisabled={!clients || memoryServiceBusy || state.agentSources.memoryServiceRestarting}
+            actionBusy={memoryServiceBusy || state.agentSources.memoryServiceRestarting}
             bordered
             feedback={
               <>

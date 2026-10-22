@@ -77,6 +77,48 @@ describe("unified scan behavior", () => {
     expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8"))).toEqual(state);
   });
 
+  it("keeps cleared import progress cleared across restart even when legacy rows remain", async () => {
+    const directory = root();
+    const legacy = join(directory, "app.sqlite");
+    seedLegacy(legacy);
+    const scanOptions: Array<Parameters<SourceAdapter["scan"]>[0]> = [];
+    const source: SourceAdapter = {
+      ...adapter(),
+      async *scan(options) {
+        scanOptions.push(options);
+        yield* turn("one");
+      }
+    };
+    let memoryId = 0;
+    const addMemory = vi.fn(() => ({ id: "memory-" + (++memoryId), duplicate: false }));
+    const clearAllData = vi.fn(() => ({ ok: true as const, cleared: { memories: 1 }, clearedAt: new Date().toISOString(), serverTime: new Date().toISOString() }));
+    const memory = service({ addMemory, clearAllData });
+    const first = executor(directory, source, memory, { legacyDatabasePath: legacy });
+
+    await first.list();
+    await first.startScan({ sourceId: "fixture", mode: "full" });
+    expect((await done(first)).error).toBeNull();
+    expect(addMemory).toHaveBeenCalledOnce();
+    const oldGeneration = first.scanStatus().version!.generation;
+
+    await first.clearAllData();
+    expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8"))).toMatchObject({
+      legacyRecoveryChecked: true,
+      sources: { fixture: { messageCount: 0, lastScannedAt: null, latestSeenAt: null } }
+    });
+    await first.dispose();
+
+    const restarted = executor(directory, source, memory, { legacyDatabasePath: legacy });
+    expect(restarted.scanStatus()).toMatchObject({ status: "idle", running: false, version: { generation: oldGeneration + 1 } });
+    await restarted.list();
+    expect(JSON.parse(readFileSync(join(directory, "state.json"), "utf8")).sources.fixture).not.toHaveProperty("recoveryPending");
+    await restarted.startScan({ sourceId: "fixture" });
+    expect((await done(restarted)).error).toBeNull();
+    expect(addMemory).toHaveBeenCalledTimes(2);
+    expect(scanOptions[1]).toMatchObject({ fullHistory: true, order: "recent_first" });
+    expect(scanOptions[1]?.since).toBeUndefined();
+  });
+
   it("does not overwrite newer Memory source state during legacy inspection", async () => {
     const directory = root(), legacy = join(directory, "app.sqlite"); seedLegacy(legacy);
     const source = { status: "not_connected", messageCount: 88, lastScannedAt: "2099-01-01T00:00:00.000Z", latestSeenAt: "2099-01-01T00:00:00.000Z", contentHash: "newer" };

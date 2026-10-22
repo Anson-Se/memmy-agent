@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as waitForIO } from "node:timers/promises";
@@ -223,6 +223,152 @@ describe("standalone Agent source executor", () => {
         }
       }
     });
+  });
+
+  it("clears import checkpoints so ordinary single-source and all-source scans reimport deleted history", async () => {
+    const root = tempRoot();
+    const statePath = join(root, "agent-sources.json");
+    const checkpointPath = `${statePath}.checkpoints.sqlite`;
+    const scanStoreDirectory = join(root, "agent-source-scans");
+    writeFileSync(statePath, JSON.stringify({ version: 2, legacyRecoveryChecked: true, sources: {
+      alpha: { status: "plugin_installed", messageCount: 4, lastScannedAt: "2026-08-27T01:00:00.000Z", latestSeenAt: "2026-08-27T01:00:00.000Z", contentHash: "old-hash" }
+    } }));
+    let imported: Array<{ sourceId: string; memoryId: string }> = [];
+    let sequence = 0;
+    const addMemory = vi.fn((input: { source: string }) => {
+      const memoryId = `memory-${++sequence}`;
+      imported.push({ sourceId: input.source, memoryId });
+      return { id: memoryId, duplicate: false };
+    });
+    const clearMemory = vi.fn(() => {
+      const memories = imported.length;
+      imported = [];
+      return { ok: true as const, cleared: { memories }, clearedAt: new Date().toISOString(), serverTime: new Date().toISOString() };
+    });
+    const enqueuePendingImportSummaries = vi.fn();
+    const scanOptions: Array<{ sourceId: string; options: Parameters<SourceAdapter["scan"]>[0] }> = [];
+    const createAdapter = (sourceId: string): SourceAdapter => ({
+      descriptor: { sourceId, displayName: sourceId, builtin: true, dataPath: join(root, sourceId) },
+      detect: async () => true,
+      async *scan(options) {
+        scanOptions.push({ sourceId, options });
+        yield* completeTurn(`${sourceId}-conversation`, "2026-08-28T01:00:00.000Z").map((message) => ({
+          ...message,
+          sourceId,
+          content: `${sourceId}: ${message.content}`
+        }));
+      }
+    });
+    const executor = createAgentSourceExecutor({
+      service: { addMemory, clearAllData: clearMemory, enqueuePendingImportSummaries } as unknown as MemoryService,
+      configPath: join(root, "config.yaml"),
+      statePath,
+      scanStoreDirectory,
+      sourceRegistry: createSourceRegistry([createAdapter("alpha"), createAdapter("beta")])
+    });
+
+    try {
+      await executor.startScan({ sourceId: "alpha", mode: "full" });
+      await waitForScan(executor);
+      expect(addMemory).toHaveBeenCalledTimes(1);
+      expect(scanOptions[0]?.options).toMatchObject({ fullHistory: true, order: "source_default" });
+      expect(scanOptions[0]?.options.since).toBeUndefined();
+      expect(existsSync(checkpointPath)).toBe(true);
+      expect(readdirSync(scanStoreDirectory).some((name) => name.endsWith(".sqlite"))).toBe(true);
+
+      await executor.clearAllData();
+      expect(clearMemory).toHaveBeenCalledOnce();
+      expect(imported).toEqual([]);
+      expect(executor.scanStatus()).toMatchObject({ running: false, status: "idle", progress: null });
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toMatchObject({
+        version: 2,
+        legacyRecoveryChecked: true,
+        sources: { alpha: { status: "plugin_installed", messageCount: 0, lastScannedAt: null, latestSeenAt: null } }
+      });
+      expect(JSON.parse(readFileSync(statePath, "utf8")).sources.alpha).not.toHaveProperty("recoveryPending");
+      expect(existsSync(checkpointPath)).toBe(false);
+      expect(readdirSync(scanStoreDirectory)).toEqual(["state-generation.json"]);
+
+      await executor.startScan({ sourceId: "alpha" });
+      await waitForScan(executor);
+      expect(addMemory).toHaveBeenCalledTimes(2);
+      expect(scanOptions[1]?.options).toMatchObject({ fullHistory: true, order: "recent_first" });
+      expect(scanOptions[1]?.options.since).toBeUndefined();
+
+      await executor.clearAllData();
+      scanOptions.length = 0;
+      await executor.startScan({ sourceId: "all" });
+      await waitForScan(executor);
+      expect(scanOptions.map(({ sourceId }) => sourceId)).toEqual(["alpha", "beta"]);
+      expect(addMemory).toHaveBeenCalledTimes(4);
+      expect(scanOptions.map(({ sourceId, options }) => ({ sourceId, fullHistory: options.fullHistory, since: options.since }))).toEqual([
+        { sourceId: "alpha", fullHistory: true, since: undefined },
+        { sourceId: "beta", fullHistory: true, since: undefined }
+      ]);
+    } finally {
+      await executor.dispose();
+    }
+  });
+
+  it("stops an active scan and rejects new scans until clearing has removed its writers", async () => {
+    const root = tempRoot();
+    let releaseDetection!: () => void;
+    let markDetectionStarted!: () => void;
+    const detectionStarted = new Promise<void>((resolve) => { markDetectionStarted = resolve; });
+    const blockedDetection = new Promise<void>((resolve) => { releaseDetection = resolve; });
+    let firstDetection = true;
+    const scan = vi.fn(async function* (options: Parameters<SourceAdapter["scan"]>[0]) {
+      yield* completeTurn("fixture-agent-conversation", "2026-08-28T01:00:00.000Z");
+      void options;
+    });
+    const addMemory = vi.fn(() => ({ id: "memory-after-clear", duplicate: false }));
+    const cleared = { ok: true as const, cleared: { memories: 1 }, clearedAt: "2026-08-28T01:00:00.000Z", serverTime: "2026-08-28T01:00:00.000Z" };
+    let finishClear!: (result: typeof cleared) => void;
+    const clearingMemory = new Promise<typeof cleared>((resolve) => { finishClear = resolve; });
+    const clearMemory = vi.fn(() => clearingMemory);
+    const executor = createAgentSourceExecutor({
+      service: { addMemory, clearAllData: clearMemory } as unknown as MemoryService,
+      configPath: join(root, "config.yaml"),
+      sourceRegistry: createSourceRegistry([{
+        descriptor: { sourceId: "fixture-agent", displayName: "Fixture Agent", builtin: true, dataPath: root },
+        async detect() {
+          if (firstDetection) {
+            firstDetection = false;
+            markDetectionStarted();
+            await blockedDetection;
+          }
+          return true;
+        },
+        scan
+      }])
+    });
+
+    try {
+      await executor.startScan({ sourceId: "fixture-agent", mode: "full" });
+      await detectionStarted;
+      const clearing = executor.clearAllData();
+      await expect(executor.startScan({ sourceId: "fixture-agent" })).rejects.toThrow("Clearing Memory data");
+      expect(clearMemory).not.toHaveBeenCalled();
+      releaseDetection();
+      await vi.waitFor(() => expect(clearMemory).toHaveBeenCalledOnce());
+      await expect(executor.startScan({ sourceId: "fixture-agent" })).rejects.toThrow("Clearing Memory data");
+      finishClear(cleared);
+      await clearing;
+      expect(clearMemory).toHaveBeenCalledOnce();
+      expect(scan).toHaveBeenCalledOnce();
+      expect(scan.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+      expect(addMemory).not.toHaveBeenCalled();
+      expect(executor.scanStatus()).toMatchObject({ running: false, status: "idle", progress: null });
+
+      await executor.startScan({ sourceId: "fixture-agent" });
+      await waitForScan(executor);
+      expect(scan).toHaveBeenCalledTimes(2);
+      expect(addMemory).toHaveBeenCalledOnce();
+    } finally {
+      releaseDetection();
+      finishClear(cleared);
+      await executor.dispose();
+    }
   });
 
   it("uses an injected Agent Skill root without reading the developer home", async () => {

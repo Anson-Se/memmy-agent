@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppClients } from "../../../api/client-types.js";
 import { AppProviders, useApiClients } from "../../../app/providers.js";
+import { AgentSourceScanReconciler } from "../../../app/agent-source-scan-reconciler.js";
 import { useAppState } from "../../../state/app-state.js";
 import { appActions } from "../../../state/app-actions.js";
 import { SourcesSubPage } from "../sources-sub-page.js";
@@ -46,9 +47,9 @@ describe("SourcesSubPage memory service recovery", () => {
     vi.restoreAllMocks();
   });
 
-  async function render(clients: AppClients) {
+  async function render(clients: AppClients, showPage = true) {
     await act(async () => {
-      root.render(<AppProviders><ClientsHarness clients={clients} /></AppProviders>);
+      root.render(<AppProviders><ClientsHarness clients={clients} showPage={showPage} /></AppProviders>);
     });
   }
 
@@ -95,6 +96,66 @@ describe("SourcesSubPage memory service recovery", () => {
     expect(clients.agentSources.startScan).toHaveBeenCalledWith({ sourceId: "all", expectedVersion: version });
     expect(stateApi.state.agentSources.scanProgress?.jobId).toBe("new-job");
     expect(stateApi.state.agentSources.error).toBeNull();
+  });
+
+  it("reconciles restart state while the sources page is unmounted, then starts the first scan on return", async () => {
+    const clients = createClients(async () => healthy);
+    const restarting = deferred<{ ok: true }>();
+    let restartCompleted = false;
+    const version = { generation: 2, sequence: 0 };
+    restart.mockImplementation(() => restarting.promise.then((value) => { restartCompleted = true; return value; }));
+    clients.agentSources.getScanStatus = vi.fn(async () => restartCompleted
+      ? { active: false, progress: null, status: "idle", version }
+      : { active: false, progress: null, status: "idle", version: { generation: 1, sequence: 7 } });
+    clients.agentSources.startScan = vi.fn(async (input) => {
+      if (input?.expectedVersion?.generation !== version.generation) throw new Error("Scan state changed");
+      return { jobId: "first-after-restart", version: { generation: 2, sequence: 1 } };
+    });
+    clients.config.updateOnboarding = vi.fn(async () => ({ scanPermission: "scan_only" } as never));
+    await render(clients);
+    await act(async () => {
+      stateApi.dispatch(appActions.agentSourceScanStatusReceived({ active: false, progress: null, status: "idle", version: { generation: 1, sequence: 7 } }));
+    });
+
+    await act(async () => { restartButton().click(); });
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
+    await render(clients, false);
+    expect(container.querySelector("button")).toBeNull();
+
+    await act(async () => {
+      restarting.resolve({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(clients.agentSources.getScanStatus).toHaveBeenCalled();
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(version);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(false);
+
+    await render(clients);
+    const scan = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "同步新增");
+    expect(scan?.disabled).toBe(false);
+    await act(async () => { scan?.click(); });
+    expect(clients.agentSources.startScan).toHaveBeenCalledWith({ sourceId: "all", expectedVersion: version });
+  });
+
+  it("does not unlock scans on a healthy service that still reports the pre-restart generation", async () => {
+    const clients = createClients(async () => healthy);
+    let generation = 1;
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, status: "idle", version: { generation, sequence: 8 } }));
+    await render(clients);
+    await act(async () => {
+      stateApi.dispatch(appActions.agentSourceScanStatusReceived({ active: false, progress: null, status: "idle", version: { generation: 1, sequence: 7 } }));
+    });
+
+    await act(async () => { restartButton().click(); });
+    const scan = () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "同步新增");
+    expect(scan()?.disabled).toBe(true);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
+
+    generation = 2;
+    await advance(1_000);
+    expect(stateApi.state.agentSources.scanStamp?.version?.generation).toBe(2);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(scan()?.disabled).toBe(false);
   });
 
   it("keeps scan actions blocked until the post-restart snapshot arrives", async () => {
@@ -274,7 +335,7 @@ describe("SourcesSubPage memory service recovery", () => {
     expect(container.textContent).not.toContain("暂不可用");
   });
 
-  it("bounds the fresh probe after restart so its timeout releases the restart button", async () => {
+  it("keeps scans locked until a fresh snapshot succeeds after a health timeout", async () => {
     let restartSignal: AbortSignal | undefined;
     const health = vi.fn()
       .mockResolvedValueOnce(healthy)
@@ -285,7 +346,8 @@ describe("SourcesSubPage memory service recovery", () => {
       .mockResolvedValue(healthy);
     await render(createClients(health));
     await act(async () => { restartButton().click(); });
-    expect(restartButton().disabled).toBe(true);
+    const scan = () => [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增");
+    expect(scan()?.disabled).toBe(true);
 
     await advance(10_000);
     expect(restartSignal?.aborted).toBe(true);
@@ -293,6 +355,7 @@ describe("SourcesSubPage memory service recovery", () => {
     await advance(5_000);
     expect(container.textContent).toContain("运行中");
     expect(container.textContent).not.toContain("重启中");
+    expect(scan()?.disabled).toBe(false);
   });
 
   it("releases restart controls on failure and subsequently recovers through polling", async () => {
@@ -328,26 +391,29 @@ describe("SourcesSubPage memory service recovery", () => {
   it("bounds a never-settling restart and unlocks scans only after a fresh snapshot", async () => {
     const clients = createClients(async () => healthy);
     restart.mockReturnValue(new Promise(() => undefined));
-    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, status: "idle", version: { generation: 2, sequence: 0 } }));
+    const pendingStatus = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
+    clients.agentSources.getScanStatus = vi.fn(() => pendingStatus.promise);
     await render(clients);
-    const scan = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")!;
+    const scan = () => [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增");
     await act(async () => { restartButton().click(); });
-    expect(scan.disabled).toBe(true);
+    expect(scan()?.disabled).toBe(true);
 
     await advance(30_000);
     expect(restartButton().disabled).toBe(false);
-    expect(scan.disabled).toBe(true);
+    expect(scan()?.disabled).toBe(true);
     expect(container.textContent).not.toContain("记忆服务已重新启动");
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
 
-    await advance(1_000);
     expect(clients.agentSources.getScanStatus).toHaveBeenCalled();
+    await act(async () => { pendingStatus.resolve({ active: false, progress: null, status: "idle", version: { generation: 2, sequence: 0 } }); });
     expect(stateApi.state.agentSources.scanStamp?.version).toEqual({ generation: 2, sequence: 0 });
-    expect(scan.disabled).toBe(false);
+    expect(scan()?.disabled).toBe(false);
   });
 
   it("aborts a hanging post-restart status read and ignores its late result", async () => {
     const clients = createClients(async () => healthy);
     const late = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
+    const retry = deferred<Awaited<ReturnType<AppClients["agentSources"]["getScanStatus"]>>>();
     let statusCalls = 0;
     let statusSignal: AbortSignal | undefined;
     const fresh = { active: false, progress: null, status: "idle" as const, version: { generation: 3, sequence: 0 } };
@@ -357,7 +423,7 @@ describe("SourcesSubPage memory service recovery", () => {
         statusSignal = options?.signal;
         return late.promise;
       }
-      return Promise.resolve(fresh);
+      return retry.promise;
     });
     await render(clients);
     const scan = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")!;
@@ -367,21 +433,23 @@ describe("SourcesSubPage memory service recovery", () => {
     await advance(5_000);
     expect(statusSignal?.aborted).toBe(true);
     expect(restartButton().disabled).toBe(false);
-    expect(scan.disabled).toBe(true);
+    expect([...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")?.disabled).toBe(true);
     await advance(1_000);
+    expect(statusCalls).toBe(2);
+    await act(async () => { retry.resolve(fresh); });
     expect(stateApi.state.agentSources.scanStamp?.version).toEqual(fresh.version);
-    expect(scan.disabled).toBe(false);
+    expect([...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增")?.disabled).toBe(false);
 
     await act(async () => { late.resolve({ active: true, progress: null, status: "idle", version: { generation: 2, sequence: 99 } }); });
     expect(stateApi.state.agentSources.scanStamp?.version).toEqual(fresh.version);
   });
 });
 
-function ClientsHarness(props: { clients: AppClients }) {
+function ClientsHarness(props: { clients: AppClients; showPage?: boolean }) {
   const { setClients } = useApiClients();
   stateApi = useAppState();
   useEffect(() => { setClients(props.clients); }, [props.clients, setClients]);
-  return <SourcesSubPage />;
+  return <><AgentSourceScanReconciler />{props.showPage === false ? null : <SourcesSubPage />}</>;
 }
 
 function createClients(health: (signal?: AbortSignal) => Promise<unknown>): AppClients {
