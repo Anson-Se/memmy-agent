@@ -41,6 +41,7 @@ interface AgentMessageContentProps {
 }
 
 const TRAILING_PUNCTUATION_RE = /[.,;:!?，。；：！？)）\]]+$/;
+const BARE_LOCAL_PATH_RE = /(^|[\s([{（【:：])((?:~\/|\/|[A-Za-z]:[\\/])[^\s<>"'`]+)/gu;
 const LONG_TEXT_WRAP_CLASS = "break-words [overflow-wrap:anywhere]";
 const LIST_ITEM_BLOCK_TAGS = new Set(["p", "pre", "blockquote", "table", "ul", "ol", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "div"]);
 
@@ -202,10 +203,10 @@ export const AgentMessageContent = memo(function AgentMessageContent(props: Agen
       return <CodeBlock code={code} language={language} highlight={!props.isStreaming} />;
     },
     p({ children }) {
-      return <p className={`agent-message-content__p ${LONG_TEXT_WRAP_CLASS}`}>{children}</p>;
+      return <p className={`agent-message-content__p ${LONG_TEXT_WRAP_CLASS}`}>{withBareLocalFileReferences(children, props)}</p>;
     },
     li({ children, className }) {
-      return <li className={className}>{withListItemLead(children)}</li>;
+      return <li className={className}>{withListItemLead(withBareLocalFileReferences(children, props))}</li>;
     },
     ul({ children }) {
       return <ul className={`agent-message-content__list agent-message-content__list--unordered ${LONG_TEXT_WRAP_CLASS}`}>{children}</ul>;
@@ -837,9 +838,47 @@ export function localArtifactPathFromHref(href: string | undefined): string | nu
 
 function isLikelyLocalPath(value: string): boolean {
   if (!value || isDirectMediaUrl(value) || /^[a-z][a-z0-9+.-]*:/i.test(value)) {
-    return false;
+    return /^[A-Za-z]:[\\/]/.test(value);
   }
   return value.includes("/") && (value.startsWith("/") || value.startsWith("~/") || /^[A-Za-z0-9_.@+-]+\//.test(value));
+}
+
+function withBareLocalFileReferences(children: ReactNode, props: AgentMessageContentProps): ReactNode {
+  return Children.map(children, (child, childIndex) => {
+    if (typeof child !== "string") return child;
+    const nodes: ReactNode[] = [];
+    let cursor = 0;
+    let pathIndex = 0;
+    for (const match of child.matchAll(BARE_LOCAL_PATH_RE)) {
+      const rawPath = match[2] ?? "";
+      const cleanPath = cleanPathToken(rawPath);
+      if (!isLikelyLocalFilePath(cleanPath)) continue;
+      const start = (match.index ?? 0) + (match[1]?.length ?? 0);
+      if (start > cursor) nodes.push(child.slice(cursor, start));
+      nodes.push(
+        <FileReferenceChip
+          key={`bare-local-file-${childIndex}-${pathIndex}`}
+          path={cleanPath}
+          label={cleanPath}
+          isStreaming={props.isStreaming}
+          artifactClient={props.artifactClient}
+          onPreviewFile={props.onPreviewFile}
+        />
+      );
+      pathIndex += 1;
+      const rawEnd = start + rawPath.length;
+      if (cleanPath.length < rawPath.length) nodes.push(rawPath.slice(cleanPath.length));
+      cursor = rawEnd;
+    }
+    if (cursor === 0) return child;
+    if (cursor < child.length) nodes.push(child.slice(cursor));
+    return nodes;
+  });
+}
+
+function isLikelyLocalFilePath(value: string): boolean {
+  const name = basename(value);
+  return isLikelyLocalPath(value) && name.includes(".") && !name.endsWith(".");
 }
 
 function basename(value: string): string {

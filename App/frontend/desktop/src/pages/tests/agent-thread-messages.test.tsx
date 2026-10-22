@@ -1928,7 +1928,7 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain("const");
     expect(html).toContain("ok");
     expect(html).toContain("/Users/yuan/result.md");
-    expect(html).not.toContain('title="/Users/yuan/result.md"');
+    expect(html).toContain('title="/Users/yuan/result.md"');
     expect(html).not.toContain('href="file:///Users/yuan/result.md"');
   });
 
@@ -2034,6 +2034,7 @@ describe("AgentThreadMessages", () => {
   it("detects local artifact paths from markdown link hrefs", () => {
     expect(localArtifactPathFromHref("/Users/yuan/deck.pptx")).toBe("/Users/yuan/deck.pptx");
     expect(localArtifactPathFromHref("file:///Users/yuan/deck.pptx")).toBe("/Users/yuan/deck.pptx");
+    expect(localArtifactPathFromHref("C:\\Users\\yuan\\deck.pptx")).toBe("C:\\Users\\yuan\\deck.pptx");
     expect(localArtifactPathFromHref("/api/media/sig/payload")).toBeNull();
     expect(localArtifactPathFromHref("https://example.com/deck.pptx")).toBeNull();
   });
@@ -2090,7 +2091,7 @@ describe("AgentThreadMessages", () => {
     expect(html).not.toContain('href="file:///Users/yuan/deck.pptx"');
   });
 
-  it("renders bare local file and directory paths as plain text", () => {
+  it("renders bare local file paths as clickable chips without changing directories or relative paths", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">
         <AgentThreadMessages
@@ -2099,7 +2100,7 @@ describe("AgentThreadMessages", () => {
             {
               id: "answer",
               role: "assistant",
-              content: "文件 /Users/yuan/deck.pptx\n目录 /Users/yuan/.memmy/workspace\n普通文本 foo/bar"
+              content: "文件 /Users/yuan/deck.pptx。\nWindows C:\\Users\\yuan\\result.png\n目录 /Users/yuan/.memmy/workspace\n普通文本 foo/bar"
             }
           ]}
         />
@@ -2107,13 +2108,14 @@ describe("AgentThreadMessages", () => {
     );
 
     expect(html).toContain("/Users/yuan/deck.pptx");
+    expect(html).toContain("C:\\Users\\yuan\\result.png");
     expect(html).toContain("/Users/yuan/.memmy/workspace");
     expect(html).toContain("foo/bar");
-    expect(html).not.toContain('href="file:///Users/yuan/deck.pptx"');
-    expect(html).not.toContain('href="file:///Users/yuan/.memmy/workspace"');
-    expect(html).not.toContain('href="file://foo/bar"');
-    expect(html).not.toContain('href="file:///bar"');
-    expect(html).not.toContain("agent-message-content__file-chip");
+    expect(html.match(/agent-message-content__file-chip/g)).toHaveLength(2);
+    expect(html).toContain('title="/Users/yuan/deck.pptx"');
+    expect(html).toContain('title="C:\\Users\\yuan\\result.png"');
+    expect(html).not.toContain('title="/Users/yuan/.memmy/workspace"');
+    expect(html).not.toContain('title="foo/bar"');
   });
 
   it("renders structured file media as attachment chips instead of images", () => {
