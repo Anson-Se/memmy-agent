@@ -572,7 +572,7 @@ export async function resolveOfficeRuntime(platform: NodeJS.Platform = process.p
   const override = process.env.MEMMY_PLUGIN_OFFICE_ROOT;
   if (override && !isAbsolute(override)) throw new Error("MEMMY_PLUGIN_OFFICE_ROOT must be absolute");
   const defaults = platform === "darwin"
-    ? ["/Applications/LibreOffice.app/Contents", "/opt/homebrew", "/usr/local"]
+    ? ["/Applications/LibreOffice.app", "/opt/homebrew", "/usr/local"]
     : platform === "linux" ? ["/usr", "/opt/libreoffice"]
       : platform === "win32" ? [win32.join(process.env.ProgramFiles ?? "C:\\Program Files", "LibreOffice")] : [];
   const roots = process.env.MEMMY_OFFICE_RUNTIME_PREFER_MANAGED === "1" && installer ? [] : [...(override ? [override] : []), ...defaults];
@@ -583,7 +583,7 @@ export async function resolveOfficeRuntime(platform: NodeJS.Platform = process.p
     for (const name of ["soffice", "pdfinfo", "pdftoppm", "pdftotext"]) {
       if (tools[name]) continue;
       const binaryName = platform === "win32" ? `${name}.exe` : name;
-      const candidates = [resolve(root, "bin", binaryName), resolve(root, "MacOS", binaryName), resolve(root, "program", binaryName),
+      const candidates = [resolve(root, "bin", binaryName), resolve(root, "MacOS", binaryName), resolve(root, "Contents", "MacOS", binaryName), resolve(root, "program", binaryName),
         resolve(root, "libreoffice", "program", binaryName), resolve(root, "poppler", "Library", "bin", binaryName),
         resolve(root, "bin", "override", binaryName), resolve(root, "native", "poppler", "bin", binaryName)];
       const binary = await firstExecutable(candidates);

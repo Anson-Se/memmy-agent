@@ -181,6 +181,24 @@ async function convertFile(input, outputDir, format, csv) {
     // LibreOffice falls back here when the OS sandbox denies /tmp and /var/tmp.
     // Keep the Unix socket name short and relative to this private working dir.
     const options = [`-env:UserInstallation=${profile}`, "-env:OSL_SOCKET_PATH=.", "--headless", "--norestore", "--nodefault", "--nolockcheck"];
+    const tools = await runtime();
+    if (process.platform === "darwin" && tools.soffice) {
+      // The native macOS spellchecker calls NSApplicationLoad even in headless
+      // mode. Use a per-conversion UNO registry without that GUI-only service;
+      // keep Hunspell and leave the verified renderer installation untouched.
+      const services = path.resolve(path.dirname(tools.soffice), "../Resources/services/services.rdb");
+      const registry = parseXml(await fs.readFile(services));
+      const implementations = nodes(registry, "http://openoffice.org/2010/uno-components", "implementation");
+      const native = implementations.find(item => item.getAttribute("name") === "org.openoffice.lingu.MacOSXSpellChecker");
+      if (native) {
+        const component = native.parentNode;
+        component.removeChild(native);
+        if (!nodes(component, "http://openoffice.org/2010/uno-components", "implementation").length) component.parentNode.removeChild(component);
+        const headless = path.join(work, "headless-services.rdb");
+        await fs.writeFile(headless, xml(registry));
+        options.push(`-env:URE_MORE_SERVICES=${pathToFileURL(headless).href}`);
+      }
+    }
     if (["csv", "tsv"].includes(ext(input))) {
       if (!csv) throw fail("csv_policy_required", "CSV/TSV needs an explicit UTF-8 encoding and delimiter");
       const delimiter = csv.delimiter.charCodeAt(0);
