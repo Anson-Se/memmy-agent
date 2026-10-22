@@ -27,8 +27,8 @@ function duplicateCapability(config: RuntimeConfigDocument, id: string, preset: 
   return isPlatformMemoryConnection(config, capability, {
     provider: "openai", model: preset.model, apiBase: endpoint.apiBase,
     apiKey: endpoint.apiKey ?? provider.apiKey,
-    extraHeaders: endpoint.extraHeaders ?? provider.extraHeaders,
-    extraBody: endpoint.extraBody ?? provider.extraBody,
+    extraHeaders: { ...record(provider.extraHeaders), ...record(endpoint.extraHeaders) },
+    extraBody: { ...record(provider.extraBody), ...record(endpoint.extraBody) },
   }) ? capability : null;
 }
 

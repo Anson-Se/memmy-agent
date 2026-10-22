@@ -9,6 +9,7 @@ import { addOpenComputerUseMcpV116 } from "./migrations/v1.1.6/0001-add-open-com
 import { removeLegacyMemoryEmbeddingV119 } from "./migrations/v1.1.9/0001-remove-legacy-memory-embedding.js";
 import { renameMemmyComputerUseMcpV119 } from "./migrations/v1.1.9/0002-rename-memmy-computer-use-mcp.js";
 import { removePlatformMemoryDuplicatesV124 } from "./migrations/v1.2.4/0001-remove-platform-memory-duplicates.js";
+import { removeReintroducedPlatformMemoryDuplicatesV124 } from "./migrations/v1.2.4/0002-remove-reintroduced-platform-memory-duplicates.js";
 import { MigrationError, type MigrationDefinition } from "./types.js";
 
 const STABLE_SEMVER_PATTERN =
@@ -34,6 +35,7 @@ export const migrations: readonly MigrationDefinition[] = [
   removeLegacyMemoryEmbeddingV119,
   renameMemmyComputerUseMcpV119,
   removePlatformMemoryDuplicatesV124,
+  removeReintroducedPlatformMemoryDuplicatesV124,
 ];
 
 function definitionError(message: string, migrationId: string | null = null): never {

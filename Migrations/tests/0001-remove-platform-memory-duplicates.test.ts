@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeRuntimeModelCatalogForTest } from "../src/migrations/v1.0.7/0001-normalize-runtime-model-catalog.js";
 import { removePlatformMemoryDuplicatesV124 as cleanup } from "../src/migrations/v1.2.4/0001-remove-platform-memory-duplicates.js";
 import { migrations } from "../src/registry.js";
+import { runMigrationsForTest } from "../src/runner.js";
 
 const roots: string[] = [];
 const apiBase = "https://platform.example.test/api/agentExternal/v1";
@@ -77,6 +78,58 @@ describe("MEMMY-700 platform Memory duplicates", () => {
     expect(result.providers.openai.endpoints.chat).toEqual(initial.providers.openai.endpoints.chat);
   });
 
+  it.each(["extraHeaders", "extraBody"])("preserves effective provider-level %s and BYOK selections", async field => {
+    const initial = config();
+    initial.providers.memmy_account[field] = { base: "platform" };
+    initial.providers.memmy_account.endpoints.platform[field] = { base: "platform" };
+    initial.providers.openai[field] = { base: "platform", userOption: "keep" };
+    initial.providers.openai.endpoints.chat[field] = { base: "platform" };
+    initial.providers.openai.endpoints.embedding[field] = { base: "platform" };
+    const f = await fixture(initial);
+    expect(await cleanup.up(f.context)).toMatchObject({ changed: 0 });
+    expect(await f.read()).toEqual(initial);
+    expect(await cleanup.up(f.context)).toMatchObject({ changed: 0 });
+  });
+
+  it.each(["extraHeaders", "extraBody"])("merges platform %s and applies endpoint overrides on both sides", async field => {
+    const initial = config();
+    initial.providers.memmy_account[field] = { inherited: "yes", overridden: "old-platform" };
+    initial.providers.memmy_account.endpoints.platform[field] = { overridden: "final" };
+    initial.providers.openai[field] = { inherited: "yes", overridden: "old-user" };
+    initial.providers.openai.endpoints.chat[field] = { overridden: "final" };
+    initial.providers.openai.endpoints.embedding[field] = { inherited: "yes", overridden: "final" };
+    const f = await fixture(initial); await cleanup.up(f.context);
+    expect(Object.keys((await f.read()).modelPresets)).toEqual(models.map(m => `platform-${m}`));
+    expect(await cleanup.up(f.context)).toMatchObject({ changed: 0 });
+  });
+
+  it.each(["extraHeaders", "extraBody"])("keeps a candidate missing inherited platform %s", async field => {
+    const initial = config();
+    initial.providers.memmy_account[field] = { inherited: "platform" };
+    initial.providers.memmy_account.endpoints.platform[field] = { base: "same" };
+    initial.providers.openai.endpoints.chat[field] = { base: "same" };
+    initial.providers.openai.endpoints.embedding[field] = { base: "same" };
+    const f = await fixture(initial); await cleanup.up(f.context);
+    expect(await f.read()).toEqual(initial);
+  });
+
+  it.each(["extraHeaders", "extraBody"])("compares merged platform %s during legacy import", async field => {
+    const initial = config(); delete initial.providers.openai;
+    for (const id of ids) delete initial.modelPresets[id];
+    delete initial.modelAssignments.byok;
+    initial.providers.memmy_account[field] = { inherited: "platform", overridden: "old" };
+    initial.providers.memmy_account.endpoints.platform[field] = { overridden: "final" };
+    initial.memmyMemory = { roleRouting: { evolution: "fixed" }, evolution: {
+      provider: "openai_compatible", endpoint: apiBase, apiKey: "fixture-token", model: "memory_evolution",
+      [field]: { inherited: "platform", overridden: "final" },
+    } };
+    const f = await fixture(initial); await normalizeRuntimeModelCatalogForTest(f.context);
+    expect(Object.values((await f.read()).modelPresets).filter((p: any) => p.source === "byok")).toEqual([]);
+    initial.memmyMemory.evolution[field].userOption = "custom";
+    const custom = await fixture(initial); await normalizeRuntimeModelCatalogForTest(custom.context);
+    expect(Object.values((await custom.read()).modelPresets)).toContainEqual(expect.objectContaining({ model: "memory_evolution", source: "byok" }));
+  });
+
   it("keeps a shared endpoint and unrelated models, and repairs only the current owner's account references", async () => {
     const initial = config();
     initial.modelPresets.custom = { provider: "openai", endpoint: "chat", model: "custom", source: "byok", capabilities: ["agent"] };
@@ -131,7 +184,31 @@ describe("MEMMY-700 platform Memory duplicates", () => {
     expect(Object.values(result.modelPresets)).toContainEqual(expect.objectContaining({ model: "memory_summary", source: "byok" }));
   });
 
+  it("cleans new exact copies after the original cleanup already ran, retaining unknown old credentials", async () => {
+    const f = await fixture(config());
+    const options = { targets: { agentWorkspace: f.context.profileWorkspace, runtimeConfigFile: f.file, sessionDagDir: f.context.sessionDagDir }, logger: f.context.logger };
+    await runMigrationsForTest(options, { definitions: [cleanup] });
+    // An older startup writer reintroduced a copy after migration 0001.
+    const reintroduced = config();
+    reintroduced.modelAssignments.account.embedding = ids[2];
+    reintroduced.providers.openai.endpoints.stale = { apiBase, protocol: "openai-embeddings", apiKey: "old-or-user-key" };
+    const staleId = `memmy-memory-${createHash("sha256").update("openai\0stale\0embedding").digest("hex").slice(0, 16)}`;
+    reintroduced.modelPresets[staleId] = { provider: "openai", endpoint: "stale", model: "embedding", source: "byok", capabilities: ["embedding"] };
+    await fs.writeFile(f.file, YAML.stringify(reintroduced));
+    const definitions = migrations.filter(m => m.id.startsWith("v1.2.4/"));
+    const upgraded = await runMigrationsForTest(options, { definitions });
+    expect(upgraded.skipped).toContain(cleanup.id);
+    expect(upgraded.applied.map(m => m.id)).toEqual(["v1.2.4/0002-remove-reintroduced-platform-memory-duplicates"]);
+    const saved = await f.read();
+    expect(saved.modelAssignments.account.embedding).toBe("platform-embedding");
+    expect(Object.keys(saved.modelPresets)).toEqual([...models.map(m => `platform-${m}`), staleId]);
+    expect(saved.providers.openai.endpoints.stale).toEqual(reintroduced.providers.openai.endpoints.stale);
+    const once = await fs.readFile(f.file, "utf8");
+    expect((await runMigrationsForTest(options, { definitions })).applied).toHaveLength(0);
+    expect(await fs.readFile(f.file, "utf8")).toBe(once);
+  });
+
   it("registers cleanup after previous migrations so completed upgrades receive it", () => {
-    expect(migrations.at(-1)).toBe(cleanup);
+    expect(migrations).toContain(cleanup);
   });
 });

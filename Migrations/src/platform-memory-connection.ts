@@ -44,6 +44,6 @@ export function isPlatformMemoryConnection(
     if (!address(endpoint.apiBase) || address(connection.apiBase) !== address(endpoint.apiBase)) return false;
     if (key !== (endpoint.apiKey ?? account.apiKey)) return false;
     return ["extraHeaders", "extraBody"].every((field) =>
-      stable(connection[field] ?? {}) === stable(endpoint[field] ?? account[field] ?? {}));
+      stable(connection[field] ?? {}) === stable({ ...record(account[field]), ...record(endpoint[field]) }));
   });
 }
