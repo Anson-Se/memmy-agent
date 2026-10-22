@@ -108,6 +108,10 @@ export function providerDescriptor(config: {
     voyage: "https://api.voyageai.com/v1/embeddings", mistral: "https://api.mistral.ai/v1/embeddings"
   };
   let endpoint = (config.endpoint || defaultEndpoints[config.provider ?? ""] || "").trim().replace(/\/+$/, "");
+  // Mirror HttpLlmClient's actual URL construction before deriving the root:
+  // a bare Anthropic base and its default /v1/messages endpoint send to the
+  // same place, while an explicit /v1 base actually sends /v1/v1/messages.
+  if (config.provider === "anthropic" && !endpoint.endsWith("/v1/messages")) endpoint += "/v1/messages";
   let hostname = "";
   if (endpoint) {
     try {
@@ -150,7 +154,7 @@ export class WorkerConcurrencyController {
   private readonly scopes = new Set<string>();
   private embeddingRequests = 0;
   private readonly states = new WeakMap<WorkerPermit, PermitState>();
-  private readonly context = new AsyncLocalStorage<PermitState>();
+  private readonly context = new AsyncLocalStorage<PermitState | undefined>();
   private readonly waiters = new Set<() => void>();
   private readonly listeners = new Set<() => void>();
   private readonly groups = new Set<ReservationGroup>();
@@ -169,6 +173,15 @@ export class WorkerConcurrencyController {
   hasActiveWorkerPermit(): boolean {
     const state = this.context.getStore();
     return state !== undefined && !state.released && state.logicalJobs > 0;
+  }
+  /** Only a new router business boundary may discard a completed foreground
+   * request's inherited ALS. Released worker permits remain fenced, including
+   * their late callbacks; an active foreground reservation is never discarded. */
+  runNewForegroundTask<T>(operation: () => T): T {
+    const state = this.context.getStore();
+    return state?.released && state.logicalJobs === 0
+      ? this.context.run(undefined, operation)
+      : operation();
   }
   close(): Promise<void> {
     if (this.closed) return this.closed;

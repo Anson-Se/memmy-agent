@@ -37,6 +37,8 @@ export class WorkerScheduler {
   private stopped = false;
   private readonly idleWaiters: Array<() => void> = [];
 
+  hasPendingRequests(): boolean { return this.pending.length > 0; }
+
   run<T>(execute: () => T | Promise<T>): Promise<T> {
     if (this.isReentry()) return Promise.reject(new WorkerSchedulerReentryError());
     if (this.stopped) return Promise.reject(new WorkerSchedulerStoppedError());

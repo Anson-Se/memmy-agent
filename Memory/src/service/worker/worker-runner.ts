@@ -97,6 +97,12 @@ export interface WorkerRunSummary {
   serverTime: string;
 }
 
+/** Internal execution controls; the HTTP manual request does not expose these. */
+export interface WorkerRunExecution {
+  continuous?: boolean;
+  signal?: AbortSignal;
+}
+
 export interface WorkerStartupReconciliation {
   requeuedJobs: number;
   requeuedEmbeddingRetries: number;
@@ -440,15 +446,23 @@ export class WorkerRunner {
     request: RequestEnvelope & {
       targetMemoryIds?: string[];
       priorityCohortOnly?: boolean;
-    } = {}
+    } = {},
+    execution: WorkerRunExecution = {}
   ): Promise<WorkerRunSummary> {
     // Wake callbacks may originate from an earlier job's async context. A new
     // drain establishes fresh per-job guards instead of inheriting that claim.
-    this.notifyWorkAvailable();
-    return this.runScheduled(() => this.runWorkerOnceUnscoped(limit, request));
+    return this.runScheduled(async () => {
+      const wake = () => this.notifyWorkAvailable();
+      execution.signal?.addEventListener("abort", wake, { once: true });
+      try { return await this.runWorkerOnceUnscoped(limit, request, execution); }
+      finally { execution.signal?.removeEventListener("abort", wake); }
+    });
   }
 
   private runScheduled<T>(execute: () => Promise<T>): Promise<T> {
+    // Every entry, including retry-only requests, must wake an automatic pump
+    // so it can yield the shared entry boundary to the waiting request.
+    this.notifyWorkAvailable();
     return withoutJobLeaseGuard(() => this.scheduler.run(async () => {
       if (this.deps.beforeRun) await this.deps.beforeRun();
       const result = await execute();
@@ -472,7 +486,8 @@ export class WorkerRunner {
 
   private async runWorkerOnceUnscoped(
     limit: number,
-    request: RequestEnvelope & { targetMemoryIds?: string[]; priorityCohortOnly?: boolean }
+    request: RequestEnvelope & { targetMemoryIds?: string[]; priorityCohortOnly?: boolean },
+    execution: WorkerRunExecution = {}
   ): Promise<WorkerRunSummary> {
     if (!this.deps.memoryAddEnabled()) {
       return this.deps.runWorkerNoWrite(request);
@@ -526,20 +541,25 @@ export class WorkerRunner {
         workerLogger.warn("scheduler.shadow_failed", memoryErrorFields(error));
       }
     }
-    return this.runFairWorkerOnce(normalizedLimit, request, options);
+    return this.runFairWorkerOnce(normalizedLimit, request, options, false, execution);
   }
 
   private async runFairWorkerOnce(
     limit: number,
     request: RequestEnvelope & { targetMemoryIds?: string[]; priorityCohortOnly?: boolean },
     options: ResolvedWorkerSchedulingOptions,
-    retryOnly = false
+    retryOnly = false,
+    execution: WorkerRunExecution = {}
   ): Promise<WorkerRunSummary> {
     type Admission = { permit: WorkerPermit; execution: PreparedWorkerExecution; group: symbol; release(): void };
-    let remaining = limit;
+    // Automatic execution stays open across refill waves. Finite manual requests
+    // retain their exact budget and target filters through the same scheduler.
+    let remaining = execution.continuous ? Number.POSITIVE_INFINITY : limit;
     let leased = 0;
     let fatal: unknown;
     let failedDrain = false;
+    let attemptedReconcileDeadline: number | undefined;
+    let filled = false;
     const active = new Set<Promise<void>>();
     const selectedMain: string[] = [];
     const claimKey = (job: EvolutionJobRecord) => `${job.id}:${job.leaseToken}`;
@@ -555,7 +575,18 @@ export class WorkerRunner {
       return { promise, dispose: () => this.wakeListeners.delete(wake) };
     };
     try {
-      while (remaining > 0 && !this.stopping && !failedDrain) {
+      while (remaining > 0 && !this.stopping && !failedDrain && !execution.signal?.aborted &&
+        !(execution.continuous && this.scheduler.hasPendingRequests())) {
+        const reconcileAt = this.deps.memoryBudgetNextReconcileAtMs?.();
+        if (execution.continuous && this.deps.beforeRun && reconcileAt !== undefined &&
+          Number.isFinite(reconcileAt) && reconcileAt <= this.nowMs() && reconcileAt !== attemptedReconcileDeadline) {
+          // A long automatic run no longer re-enters beforeRun every four jobs.
+          // Preserve budget reconciliation at its due time, without retrying an
+          // unchanged in-flight deadline on every completion/refill.
+          attemptedReconcileDeadline = reconcileAt;
+          await this.deps.beforeRun();
+          if (this.stopping || failedDrain || execution.signal?.aborted || this.scheduler.hasPendingRequests()) break;
+        }
         let denied = false;
         const admissions = new Map<string, Admission>();
         let previous: { key: string; permit: WorkerPermit; group: symbol; count: number } | undefined;
@@ -563,6 +594,14 @@ export class WorkerRunner {
         const paused = this.deps.memoryBudgetPaused();
         const prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
         const capacity = Math.min(remaining, this.concurrency.availableJobs(), FAIR_CLAIM_BATCH_LIMIT);
+        if (filled && capacity > 0 && !retryOnly && options.algorithm === "legacy") {
+          // Legacy selection requires an explicit failed -> queued transition.
+          // A deadline wake within a long run must perform that same step.
+          for (const { before, after } of this.deps.repos.runtime.requeueFailedJobs(
+            capacity, this.deps.nowIso(), request.targetMemoryIds
+          )) this.deps.appendJobChange(after, "queued", before);
+        }
+        filled = true;
         const work = capacity > 0 ? claimFairWorkerBatch(this.deps.repos, {
           at: this.deps.nowIso(), limit: capacity, targetMemoryIds: request.targetMemoryIds,
           priorityCohortOnly: request.priorityCohortOnly,
@@ -647,14 +686,22 @@ export class WorkerRunner {
           });
           active.add(task);
         }
-        if (remaining <= 0 || this.stopping || failedDrain) break;
+        if (remaining <= 0 || this.stopping || failedDrain || execution.signal?.aborted ||
+          (execution.continuous && this.scheduler.hasPendingRequests())) break;
         if (active.size === 0) {
           const snapshot = this.concurrency.snapshot();
           if (!denied || (snapshot.activeJobs === 0 && snapshot.embeddingRequests === 0 && Object.keys(snapshot.providers).length === 0)) break;
         }
         const wake = waitForWake(this.wakeVersion);
+        const now = this.nowMs();
+        const deadline = this.nextAdmissionDeadline(now, request.targetMemoryIds, retryOnly);
+        // Already due rows may be blocked on a permit or dependency. They must
+        // not hide a future deadline or create a repeating zero-delay timer.
+        const timer = deadline === undefined ? undefined : setTimeout(
+          () => this.notifyWorkAvailable(), Math.min(2_147_483_647, Math.max(1, deadline - now))
+        );
         try { await Promise.race([...active, wake.promise]); }
-        finally { wake.dispose(); }
+        finally { if (timer !== undefined) clearTimeout(timer); wake.dispose(); }
       }
     } catch (error) { failedDrain = true; fatal = error; }
     // Stop admission first, then wait for every guarded execution before releasing
@@ -672,6 +719,20 @@ export class WorkerRunner {
     const changeSeq = this.deps.repos.runtime.latestChangeSeq();
     return { leased, succeeded, failed, jobs: ordered.map(item => item.ref), embeddingRetries: retries,
       changeSeq, syncCursor: this.deps.encodeChangeCursor(changeSeq), serverTime: this.deps.nowIso() };
+  }
+
+  private nextAdmissionDeadline(now: number, targetMemoryIds: string[] | undefined, retryOnly: boolean): number | undefined {
+    const paused = this.deps.memoryBudgetPaused();
+    const scheduled = this.deps.repos.runtime.nextWorkerRunAt({
+      futureAfterMs: now, targetMemoryIds,
+      jobTypes: retryOnly ? [] : paused ? allowedMemoryBudgetJobTypes(this.deps.memoryBudgetModelSources()) : undefined,
+      excludedJobTypes: this.summaryJobsHeld(),
+      includeEmbeddingRetries: !(paused && this.deps.memoryBudgetJobConsumes("embedding"))
+    });
+    const times = [scheduled, this.deps.memoryBudgetNextReconcileAtMs?.(),
+      ...(paused ? [this.deps.memoryBudgetNextWakeAtMs()] : [])]
+      .filter((time): time is number => time !== undefined && Number.isFinite(time) && time > now);
+    return times.length ? Math.min(...times) : undefined;
   }
 
   private async runClaimedMainJobs(jobs: EvolutionJobRecord[], results: WorkerJobRunResult[], preserveRoleOrder = false): Promise<void> {

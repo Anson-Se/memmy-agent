@@ -360,6 +360,7 @@ function createAutoWorkerDrain(
   let activeDrain: Promise<void> | undefined;
   const maxCycles = 40;
   const workerBatchSize = 4;
+  const admissionAbort = new AbortController();
 
   function drain(): Promise<void> {
     // A wake-up can originate from a running job's async descendants. It queues
@@ -393,7 +394,7 @@ function createAutoWorkerDrain(
         for (let cycle = 0; cycle < maxCycles && !disposed; cycle += 1) {
           const result = await service.runWorkerOnce(workerBatchSize, {
             priorityCohortOnly: true
-          });
+          }, { continuous: true, signal: admissionAbort.signal });
           if (result.leased === 0 && result.embeddingRetries.leased === 0) {
             break;
           }
@@ -475,7 +476,8 @@ function createAutoWorkerDrain(
       clearTimeout(delayedTimer);
       delayedTimer = undefined;
     }
-    scheduleNextDueJob();
+    service.notifyWorkerWorkAvailable();
+    if (!running) scheduleNextDueJob();
   });
 
   service.setPersistRecoveredListener(() => {
@@ -511,6 +513,7 @@ function createAutoWorkerDrain(
     schedule,
     async dispose(): Promise<void> {
       disposed = true;
+      admissionAbort.abort();
       service.setAppBudgetReconcileListener(undefined);
       service.setPersistRecoveredListener(undefined);
       requested = false;

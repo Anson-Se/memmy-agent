@@ -3457,6 +3457,9 @@ export class RuntimeRepository {
     jobTypes?: readonly string[];
     excludedJobTypes?: readonly string[];
     includeEmbeddingRetries?: boolean;
+    targetMemoryIds?: readonly string[];
+    /** Ignore already due rows when scheduling a running pump's next wake. */
+    futureAfterMs?: number;
   }): number | undefined {
     const jobTypes = options?.jobTypes ?? (options?.jobType ? [options.jobType] : undefined);
     const jobTypeFilter = jobTypes
@@ -3472,6 +3475,13 @@ export class RuntimeRepository {
       ...(jobTypes && jobTypes.length > 0 ? jobTypes : []),
       ...(excluded ?? [])
     ];
+    const targets = options?.targetMemoryIds;
+    if (targets?.length === 0) return undefined;
+    const targetFilter = targets ? `AND target_memory_id IN (${targets.map(() => "?").join(", ")})` : "";
+    const retryTargetFilter = targets ? `AND target_id IN (${targets.map(() => "?").join(", ")})` : "";
+    const future = options?.futureAfterMs;
+    const futureIso = future === undefined ? undefined : new Date(future).toISOString();
+    const mainParams = [...jobTypeParams, ...(targets ?? []), ...(futureIso ? [futureIso] : [])];
     const queuedJob = this.db
       .prepare(
         `SELECT MAX(COALESCE(available_at, ''),
@@ -3483,10 +3493,12 @@ export class RuntimeRepository {
            AND (available_at IS NOT NULL OR json_type(payload_json, '$.runAfter') = 'text')
            ${jobTypeFilter}
            ${excludeFilter}
+           ${targetFilter}
+           ${futureIso ? "AND MAX(COALESCE(available_at, ''), COALESCE(CAST(json_extract(payload_json, '$.runAfter') AS TEXT), '')) > ?" : ""}
          ORDER BY run_after ASC
          LIMIT 1`
       )
-      .get(...jobTypeParams) as { run_after: string } | undefined;
+      .get(...mainParams) as { run_after: string } | undefined;
     const leasedJob = this.db
       .prepare(
         `SELECT leased_until
@@ -3496,10 +3508,12 @@ export class RuntimeRepository {
            AND leased_until IS NOT NULL
            ${jobTypeFilter}
            ${excludeFilter}
+           ${targetFilter}
+           ${futureIso ? "AND leased_until > ?" : ""}
          ORDER BY leased_until ASC
          LIMIT 1`
       )
-      .get(...jobTypeParams) as { leased_until: string } | undefined;
+      .get(...mainParams) as { leased_until: string } | undefined;
     const includeEmbeddingRetries = options?.includeEmbeddingRetries !== false;
     const pendingEmbedding = includeEmbeddingRetries
       ? this.db
@@ -3507,10 +3521,12 @@ export class RuntimeRepository {
           `SELECT next_attempt_at
            FROM embedding_retry_queue
            WHERE status = 'pending'
+             ${retryTargetFilter}
+             ${future !== undefined ? "AND next_attempt_at > ?" : ""}
            ORDER BY next_attempt_at ASC
            LIMIT 1`
         )
-        .get() as { next_attempt_at: number } | undefined
+        .get(...(targets ?? []), ...(future === undefined ? [] : [future])) as { next_attempt_at: number } | undefined
       : undefined;
     const inProgressEmbedding = includeEmbeddingRetries
       ? this.db
@@ -3519,10 +3535,12 @@ export class RuntimeRepository {
            FROM embedding_retry_queue
            WHERE status = 'in_progress'
              AND lease_until IS NOT NULL
+             ${retryTargetFilter}
+             ${future !== undefined ? "AND MAX(next_attempt_at, lease_until) > ?" : ""}
            ORDER BY run_at ASC
            LIMIT 1`
         )
-        .get() as { run_at: number } | undefined
+        .get(...(targets ?? []), ...(future === undefined ? [] : [future])) as { run_at: number } | undefined
       : undefined;
     const times = [
       queuedJob ? Date.parse(queuedJob.run_after) : Number.NaN,

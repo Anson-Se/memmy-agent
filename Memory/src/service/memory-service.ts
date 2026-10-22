@@ -197,7 +197,7 @@ import {
   type ClosedEpisodeTrigger,
   type EnqueueJobInput
 } from "./worker/job-handlers.js";
-import { WorkerRunner } from "./worker/worker-runner.js";
+import { WorkerRunner, type WorkerRunExecution } from "./worker/worker-runner.js";
 import { WorkerConcurrencyController, providerDescriptor, workerModelBatchKey, type PreparedWorkerExecution } from "./worker/worker-concurrency.js";
 import { jobPolicyRegistry, UnknownJobPolicyError } from "./worker/job-policy-registry.js";
 import type { FairClaimedWork } from "./worker/fair-worker-queue.js";
@@ -3194,9 +3194,10 @@ export class MemoryService {
     request: RequestEnvelope & {
       targetMemoryIds?: string[];
       priorityCohortOnly?: boolean;
-    } = {}
+    } = {},
+    execution: WorkerRunExecution = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
-    return this.workerRunner.runWorkerOnce(limit, request);
+    return this.workerRunner.runWorkerOnce(limit, request, execution);
   }
 
   private async queryVector(query: string): Promise<number[] | undefined> {

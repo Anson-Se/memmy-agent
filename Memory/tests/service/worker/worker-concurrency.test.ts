@@ -1,8 +1,53 @@
 import { describe, expect, it } from "vitest";
 import { WorkerConcurrencyController, providerDescriptor, workerModelBatchKey, type WorkerRequirements } from "../../../src/service/worker/worker-concurrency.js";
+import { DEFAULT_MEMMY_CONFIG } from "../../../src/config/index.js";
+import { createLlmClient } from "../../../src/model/llm.js";
+import { MemoryModelTaskRouter } from "../../../src/model/task-routing.js";
+import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
 const req = (changes: Partial<WorkerRequirements> = {}): WorkerRequirements => ({ resourceClass: "summary", providers: [], scopeKeys: [], ...changes });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 describe("atomic worker admission and real model requests", () => {
+  it("shares Anthropic admission for equivalent actual request URLs", () => {
+    const missing = providerDescriptor({ provider: "anthropic", model: "same" });
+    const bare = providerDescriptor({ provider: "anthropic", model: "same", endpoint: "https://api.anthropic.com" });
+    const full = providerDescriptor({ provider: "anthropic", model: "same", endpoint: "https://api.anthropic.com/v1/messages" });
+    expect(missing.providers).toEqual(bare.providers);
+    expect(missing.providers).toEqual(full.providers);
+    // HttpLlmClient appends /v1/messages unless already present. A /v1
+    // endpoint therefore really sends /v1/v1/messages and must stay distinct.
+    expect(providerDescriptor({ provider: "anthropic", endpoint: "https://api.anthropic.com/v1", model: "same" }).providers)
+      .not.toEqual(missing.providers);
+  });
+
+  it("caps real Anthropic calls across default and explicit base endpoints at cloud concurrency", async () => {
+    const config = { ...DEFAULT_MEMMY_CONFIG.summary, provider: "anthropic" as const,
+      model: "claude-3-haiku-20240307", apiKey: "synthetic-test-key", maxRetries: 0, malformedRetries: 0 };
+    const summary = createLlmClient({ ...config, endpoint: undefined });
+    const evolution = createLlmClient({ ...config, endpoint: "https://api.anthropic.com" });
+    const c = new WorkerConcurrencyController({}, {});
+    const router = new MemoryModelTaskRouter(() => ({ config: DEFAULT_MEMMY_CONFIG, summary, evolution,
+      embedding: createCapturingEmbedder([]) }), c);
+    let active = 0, maximum = 0;
+    const urls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async input => {
+      urls.push(String(input)); maximum = Math.max(maximum, ++active);
+      await tick(); active--;
+      return new Response(JSON.stringify({ content: [{ type: "text", text: "OK" }], stop_reason: "end_turn" }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      await Promise.all((["summary", "evolution", "summary", "evolution"] as const).map(role =>
+        router.client(role).complete([{ role: "user", content: "test" }], { operation: "test.provider-limit", maxTokens: 64 })));
+      expect([...new Set(urls)]).toEqual(["https://api.anthropic.com/v1/messages"]);
+      expect(maximum).toBe(c.limits.cloudModelConcurrency);
+      expect(c.snapshot().providers).toEqual({});
+    } finally {
+      globalThis.fetch = originalFetch;
+      await Promise.all([router.stop(), c.close()]);
+    }
+  });
+
   it("separates batches after credential/header reload without exposing secret values", () => {
     const first = { endpoint: "https://example.test/v1", model: "same", apiKey: "private-key-one",
       extraHeaders: { Authorization: "Bearer private-header-one", "X-Account": "first" }, extraBody: { nested: { beta: 2, alpha: 1 } } };

@@ -35,9 +35,17 @@ export function workerWorkRequirements(
     const session = job?.sessionId ? repos.runtime.getSession(job.sessionId) : undefined;
     const batch = job?.jobType === "l3_world_model_update" && text(payload.batchId)
       ? repos.l3WorldModels?.getBatch(String(payload.batchId)) : undefined;
-    const memory = !batch && !session && targetId ? repos.memories.get(targetId) : undefined;
+    // Assignment discovers its destination cluster only after model work. Both
+    // Skill operations therefore reserve the project, using their persisted
+    // episode/cluster rather than a missing target or a possibly absent session.
+    const skillOperation = job?.jobType === "skill_cluster_assign" || job?.jobType === "skill_batch_evolve";
+    const skillEpisode = skillOperation && job?.episodeId ? repos.runtime.getEpisode(job.episodeId) : undefined;
+    const skillCluster = job?.jobType === "skill_batch_evolve" && text(payload.clusterId)
+      ? repos.runtime.getSkillCluster(String(payload.clusterId)) : undefined;
+    const memory = !batch && !session && !skillEpisode && !skillCluster && targetId ? repos.memories.get(targetId) : undefined;
     const internal = memory?.properties.internal_info;
-    const project = batch ? batch.projectId ?? null : session ? session.projectId ?? null
+    const project = batch ? batch.projectId ?? null : skillCluster ? skillCluster.projectId ?? null
+      : skillEpisode ? skillEpisode.projectId ?? null : session ? session.projectId ?? null
       : text(payload.projectId) ?? text(payload.project_id) ?? text(internal?.project_id)
         ?? text(internal?.projectId) ?? job?.scopeKey ?? null;
     scopeKeys.push(JSON.stringify(["user_project", job?.userId ?? memory?.userId, project]));

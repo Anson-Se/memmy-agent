@@ -66,6 +66,39 @@ function embedder(name: string): Embedder {
 }
 
 describe("MemoryModelTaskRouter", () => {
+  it.each(["foreground", "worker"] as const)("distinguishes new foreground business from a released %s request callback", async kind => {
+    const c = new WorkerConcurrencyController({}, {});
+    const task = context("callback");
+    const router = new MemoryModelTaskRouter(() => task, c);
+    let finish!: (result: { value?: string; error?: unknown }) => void;
+    const callback = new Promise<{ value?: string; error?: unknown }>(resolve => { finish = resolve; });
+    let calls = 0;
+    task.summary.complete = async () => {
+      calls++;
+      if (calls === 1) setImmediate(() => {
+        void router.client("summary").complete([], { operation: "test.new-business" })
+          .then(value => finish({ value }), error => finish({ error }));
+      });
+      return `call-${calls}`;
+    };
+    const first = () => router.client("summary").complete([], { operation: "test.original" });
+    const permit = kind === "worker" ? c.tryAcquire({ resourceClass: "summary",
+      providers: providerDescriptor(task.summary.config, c.limits).providers, scopeKeys: [] })! : undefined;
+    try {
+      expect(await (permit ? permit.run(() => router.runWith(task, first)) : router.run(first))).toBe("call-1");
+      permit?.release();
+      const result = await callback;
+      if (kind === "foreground") {
+        expect(result.error).toBeUndefined(); expect(result.value).toBe("call-2"); expect(calls).toBe(2);
+      } else {
+        // A late callback from a finished worker remains fenced; it cannot turn
+        // itself into an unleased foreground model request after token release.
+        expect(result.error).toBeInstanceOf(Error); expect(calls).toBe(1);
+      }
+      expect(c.snapshot()).toMatchObject({ activeJobs: 0, providers: {}, embeddingRequests: 0 });
+    } finally { permit?.release(); await Promise.all([router.stop(), c.close()]); }
+  });
+
   it("allows shutdown from an inherited callback after its foreground task completed", async () => {
     const router = new MemoryModelTaskRouter(() => context("completed"));
     let continueCallback!: () => void;

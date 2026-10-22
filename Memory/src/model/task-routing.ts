@@ -63,7 +63,8 @@ export class MemoryModelTaskRouter {
   run<T>(operation: () => T): T {
     if (this.storage.getStore() && this.isActiveTask()) return operation();
     if (this.closing) throw new Error("Model task router is closing");
-    return this.track(() => this.storage.run(this.resolveContext(), operation));
+    const start = () => this.storage.run(this.resolveContext(), operation);
+    return this.track(() => this.concurrency ? this.concurrency.runNewForegroundTask(start) : start());
   }
 
   assertCanStop(): void {

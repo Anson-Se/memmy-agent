@@ -51,7 +51,8 @@ describe("Memory HTTP unified worker entry", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ enqueued: 0 });
     await waitFor(() => service.memoryProcessingStatus([added.id], { namespace }).items[0]?.state === "ready", 1_000);
-    expect(run).toHaveBeenCalledWith(4, { priorityCohortOnly: true });
+    expect(run).toHaveBeenCalledWith(expect.any(Number), { priorityCohortOnly: true },
+      expect.objectContaining({ continuous: true, signal: expect.any(AbortSignal) }));
   });
 
   it("shares one execution boundary between automatic drain and a manual HTTP worker call", async () => {
@@ -120,12 +121,21 @@ describe("Memory HTTP unified worker entry", () => {
     await closing;
     await manual;
     const completedRuns = await Promise.all(run.mock.results.map(result => result.value));
-    expect(completedRuns.reduce((sum, result) => sum + result.leased + result.embeddingRetries.leased, 0)).toBe(8);
+    const automaticIndex = run.mock.calls.findIndex(([, , execution]) => execution?.continuous === true);
+    const manualIndex = run.mock.calls.findIndex(([, , execution]) => execution?.continuous !== true);
+    expect(automaticIndex).toBeGreaterThanOrEqual(0);
+    expect(manualIndex).toBeGreaterThanOrEqual(0);
+    // Shutdown cancels further automatic admission. Its sole active local-model
+    // task settles, and the already accepted manual request retains budget four.
+    const automatic = completedRuns[automaticIndex]!;
+    const manualResult = completedRuns[manualIndex]!;
+    expect(automatic.leased + automatic.embeddingRetries.leased).toBe(1);
+    expect(manualResult.leased + manualResult.embeddingRetries.leased).toBe(4);
     expect(entered).toBeGreaterThan(1);
     const completedSummaries = db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE job_type='import_summary' AND status='succeeded'").get() as { n: number };
     expect(completedSummaries.n).toBe(entered);
-    // Continuous drains can finish generated embedding jobs within the same
-    // budget. Every accepted execution settles; work not admitted stays queued.
+    // Every admitted execution settles; work not admitted before cancellation
+    // or beyond the finite manual budget stays queued without lease history.
     expect((db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='leased'").get() as { n: number }).n).toBe(0);
     const waiting = db.db.prepare("SELECT attempts,lease_token FROM evolution_jobs WHERE status='queued'").all();
     expect(waiting.every(row => (row as { attempts: number; lease_token: string | null }).attempts === 0

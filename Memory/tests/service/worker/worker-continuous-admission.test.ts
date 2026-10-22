@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -610,6 +611,159 @@ describe("continuous worker admission with real SQLite", () => {
       expect(h.executed).toEqual(["provider-waiting"]);
     } finally { gate.resolve(); await foreground; h.runner.notifyWorkAvailable(); await run; claim.mockRestore(); }
     expectNoPermits(h);
+  });
+
+
+  it("wakes naturally at runAfter while an unrelated slow task still occupies one slot", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const gate = deferred();
+    const h = harness({ process: async job => { if (job.id === "slow") await gate.promise; } });
+    h.job("slow", "trace_summary");
+    h.job("scheduled-database", "l2_association", { payload: { runAfter: new Date(epoch + 5_000).toISOString() } });
+    const run = h.runner.runWorkerOnce(100);
+    try {
+      await flushPump();
+      expect(h.executed).toEqual(["slow"]);
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(h.executed).toEqual(["slow", "scheduled-database"]);
+      expect(h.repos.runtime.getJob("scheduled-database")!.status).toBe("succeeded");
+      expect(h.repos.runtime.getJob("slow")!.status).toBe("leased");
+    } finally { gate.resolve(); await run; }
+    expectNoPermits(h);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["wrr", "legacy"] as const)("wakes naturally when a failed main task's backoff expires without an explicit notify (%s)", async algorithm => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const gate = deferred();
+    let attempts = 0;
+    const h = harness({ algorithm, process: async job => {
+      if (job.id === "slow") await gate.promise;
+      if (job.id === "retry-after-backoff" && attempts++ === 0) throw new Error("temporary timeout");
+    } });
+    h.job("retry-after-backoff", "trace_summary"); h.job("slow", "trace_summary");
+    const run = h.runner.runWorkerOnce(3, {}, { continuous: true });
+    let result;
+    try {
+      await flushPump();
+      const failed = h.repos.runtime.getJob("retry-after-backoff")!;
+      expect(failed).toMatchObject({ status: "failed", failureCount: 1 });
+      await vi.advanceTimersByTimeAsync(Date.parse(failed.availableAt!) - epoch + 1);
+      expect(attempts).toBe(2);
+      expect(h.repos.runtime.getJob("retry-after-backoff")!.status).toBe("succeeded");
+      expect(h.repos.runtime.getJob("slow")!.status).toBe("leased");
+    } finally { gate.resolve(); result = await run; }
+    expect(result).toMatchObject({ leased: 3, succeeded: 2, failed: 1 });
+    expectNoPermits(h);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("wakes naturally when an Embedding retry reaches nextAttemptAt", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const gate = deferred();
+    const h = harness({ process: async job => { if (job.id === "slow") await gate.promise; } });
+    h.job("slow", "trace_summary"); const retry = h.retry("delayed-retry");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET next_attempt_at=? WHERE id=?").run(epoch + 5_000, retry.id);
+    const run = h.runner.runWorkerOnce(2);
+    try {
+      await flushPump();
+      expect(h.repos.runtime.getEmbeddingRetry(retry.id)).toMatchObject({ status: "pending", attempts: 0, leaseToken: null });
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(h.repos.runtime.getEmbeddingRetry(retry.id)!.status).toBe("succeeded");
+      expect(h.repos.runtime.getJob("slow")!.status).toBe("leased");
+    } finally { gate.resolve(); await run; }
+    expectNoPermits(h);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("wakes at an expired foreign lease without waiting for an unrelated running task", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const gate = deferred();
+    const h = harness({ process: async job => { if (job.id === "slow") await gate.promise; } });
+    h.job("recover-expired", "trace_summary");
+    const foreign = h.repos.runtime.leaseQueuedJobs(1, 5)[0]!;
+    h.job("slow", "trace_summary");
+    const run = h.runner.runWorkerOnce(2);
+    try {
+      await flushPump();
+      expect(h.executed).toEqual(["slow"]);
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(h.executed).toEqual(["slow", "recover-expired"]);
+      expect(h.repos.runtime.getJob("recover-expired")).toMatchObject({ status: "succeeded", leaseRecoveryCount: 1,
+        failureCount: 0, attempts: foreign.attempts });
+    } finally { gate.resolve(); await run; }
+    expectNoPermits(h);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+
+  it("reconciles a naturally due budget deadline during continuous execution before the slow task finishes", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const gate = deferred();
+    let paused = true, reconcileCalls = 0;
+    const h = harness({ process: async job => { if (job.id === "slow-database") await gate.promise; } });
+    h.deps.memoryBudgetPaused = () => paused;
+    h.deps.memoryBudgetJobConsumes = type => type === "trace_summary";
+    h.deps.memoryBudgetModelSources = () => ({ memory_summary: { source: "byok" }, memory_evolution: { source: "byok" },
+      embedding: { source: "byok", mode: "remote" } });
+    h.deps.memoryBudgetNextWakeAtMs = () => epoch + 86_400_000;
+    h.deps.memoryBudgetNextReconcileAtMs = () => epoch + 5_000;
+    h.deps.beforeRun = async () => {
+      reconcileCalls++;
+      if (Date.now() >= epoch + 5_000) paused = false;
+    };
+    h.job("slow-database", "l2_association"); h.job("budget-held-summary", "trace_summary");
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true });
+    try {
+      await flushPump();
+      expect(h.executed).toEqual(["slow-database"]);
+      expect(reconcileCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(h.executed).toEqual(["slow-database", "budget-held-summary"]);
+      expect(h.repos.runtime.getJob("budget-held-summary")!.status).toBe("succeeded");
+      expect(h.repos.runtime.getJob("slow-database")!.status).toBe("leased");
+      expect(reconcileCalls).toBe(2);
+      // A still-stale callback deadline must not cause a reconcile busy loop.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(reconcileCalls).toBe(2);
+    } finally { gate.resolve(); await run; }
+    expectNoPermits(h);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+
+  it("does not admit more work when continuous execution is aborted during an awaited budget reconciliation", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(epoch);
+    const slow = deferred(), reconcile = deferred(), reconciling = deferred();
+    const abort = new AbortController();
+    let paused = true;
+    const h = harness({ process: async job => { if (job.id === "slow-database") await slow.promise; } });
+    h.deps.memoryBudgetPaused = () => paused;
+    h.deps.memoryBudgetJobConsumes = type => type === "trace_summary";
+    h.deps.memoryBudgetModelSources = () => ({ memory_summary: { source: "byok" }, memory_evolution: { source: "byok" },
+      embedding: { source: "byok", mode: "remote" } });
+    h.deps.memoryBudgetNextWakeAtMs = () => epoch + 86_400_000;
+    h.deps.memoryBudgetNextReconcileAtMs = () => epoch + 5_000;
+    h.deps.beforeRun = async () => {
+      if (Date.now() >= epoch + 5_000) {
+        reconciling.resolve(); await reconcile.promise; paused = false;
+      }
+    };
+    h.job("slow-database", "l2_association"); h.job("not-admitted-after-abort", "trace_summary");
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      await flushPump();
+      await vi.advanceTimersByTimeAsync(5_001);
+      await reconciling.promise;
+      abort.abort(); reconcile.resolve();
+      await flushPump();
+      expect(h.executed).toEqual(["slow-database"]);
+      expect(h.repos.runtime.getJob("not-admitted-after-abort")).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
+      expect(h.repos.runtime.getJob("slow-database")!.status).toBe("leased");
+    } finally { abort.abort(); reconcile.resolve(); slow.resolve(); await run; }
+    expectNoPermits(h);
+    expect(getEventListeners(abort.signal, "abort")).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
 });
