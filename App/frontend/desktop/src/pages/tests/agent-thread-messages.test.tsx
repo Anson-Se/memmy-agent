@@ -2131,6 +2131,26 @@ describe("AgentThreadMessages", () => {
     expect(html).not.toContain('title="/static/logo.svg"');
   });
 
+  it("renders bare local file paths in table cells as clickable chips", () => {
+    const html = renderToString(
+      <I18nProvider language="zh-CN">
+        <AgentThreadMessages
+          chatScopeKey="chat-table-local-path"
+          messages={[
+            {
+              id: "answer",
+              role: "assistant",
+              content: "| 文件 |\n| --- |\n| /Users/yuan/table.csv |"
+            }
+          ]}
+        />
+      </I18nProvider>
+    );
+
+    expect(html).toContain("agent-message-content__file-chip");
+    expect(html).toContain('title="/Users/yuan/table.csv"');
+  });
+
   it("renders structured file media as attachment chips instead of images", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">

@@ -46,6 +46,7 @@ interface AgentMessageContentProps {
 
 const TRAILING_PUNCTUATION_RE = /[.,;:!?，。；：！？)）\]]+$/;
 // Match through adjacent punctuation, then split it back out before rendering the file chip.
+// Bare prose stays absolute-only because relative paths are ambiguous outside inline code.
 const BARE_LOCAL_PATH_RE = /(^|[\s([{（【:：])((?:~\/|\/|[A-Za-z]:[\\/])[^\s<>"'`]+)/gu;
 const APP_RELATIVE_URL_PATH_RE = /^\/(?:api|assets|static)(?:\/|$)/i;
 const LONG_TEXT_WRAP_CLASS = "break-words [overflow-wrap:anywhere]";
@@ -240,10 +241,10 @@ export const AgentMessageContent = memo(function AgentMessageContent(props: Agen
       );
     },
     th({ children, style }) {
-      return <th className={`agent-message-content__th ${LONG_TEXT_WRAP_CLASS}`} style={style}>{children}</th>;
+      return <th className={`agent-message-content__th ${LONG_TEXT_WRAP_CLASS}`} style={style}>{withBareLocalFileReferences(children, props)}</th>;
     },
     td({ children, style }) {
-      return <td className={`agent-message-content__td ${LONG_TEXT_WRAP_CLASS}`} style={style}>{children}</td>;
+      return <td className={`agent-message-content__td ${LONG_TEXT_WRAP_CLASS}`} style={style}>{withBareLocalFileReferences(children, props)}</td>;
     }
   }), [props.artifactClient, props.isStreaming, props.onPreviewFile]);
 
@@ -871,7 +872,7 @@ function isLikelyLocalPath(value: string): boolean {
 
 function parseLocalFileToken(rawPath: string): { path: string; suffix: string } | null {
   const path = cleanPathToken(rawPath);
-  if (!rawPath.startsWith(path) || !isLikelyLocalFilePath(path)) return null;
+  if (!isLikelyLocalFilePath(path)) return null;
   return { path, suffix: rawPath.slice(path.length) };
 }
 
@@ -898,9 +899,9 @@ function withBareLocalFileReferences(children: ReactNode, props: AgentMessageCon
         />
       );
       pathIndex += 1;
-      const rawEnd = start + rawPath.length;
+      const matchEnd = start + rawPath.length;
       if (parsed.suffix) nodes.push(parsed.suffix);
-      cursor = rawEnd;
+      cursor = matchEnd;
     }
     if (cursor === 0) return child;
     if (cursor < child.length) nodes.push(child.slice(cursor));
@@ -909,6 +910,7 @@ function withBareLocalFileReferences(children: ReactNode, props: AgentMessageCon
 }
 
 function isLikelyLocalFilePath(value: string): boolean {
+  // Requiring an extension avoids turning directories and shell commands into file chips.
   const name = basename(value);
   return isLikelyLocalPath(value) && name.includes(".") && !name.endsWith(".");
 }
