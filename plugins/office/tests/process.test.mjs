@@ -26,3 +26,12 @@ test("file-backed subprocesses reject oversized output", async t => {
   await assert.rejects(runProcess(process.execPath, ["-e", "process.stdout.write('x'.repeat(4096))"], { ...config, maxOutput: 1024 }), /output exceeded/);
   assert.deepEqual(await readdir(config.cwd), []);
 });
+test("bounded diagnostics keep startup context and the final failure after noisy engine warnings", async t => {
+  const config = await options(t);
+  const result = await runProcess(process.execPath, ["-e", "process.stderr.write('startup context\\n'+'warning\\n'.repeat(4096)+'final failure');process.exitCode=2"], config);
+  assert.equal(result.code, 2);
+  assert.ok(result.stderr.startsWith("startup context\n"));
+  assert.ok(result.stderr.endsWith("final failure"));
+  assert.ok(result.stderr.length < 8300);
+  assert.deepEqual(await readdir(config.cwd), []);
+});

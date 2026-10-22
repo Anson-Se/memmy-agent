@@ -2,12 +2,16 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-async function diagnosticPrefix(file) {
+async function diagnosticExcerpt(file) {
   const handle = await fs.open(file, "r");
   try {
     const buffer = Buffer.alloc(8192);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    return buffer.toString("utf8", 0, bytesRead);
+    const { size } = await handle.stat();
+    const { bytesRead } = await handle.read(buffer, 0, size > buffer.length ? 4096 : buffer.length, 0);
+    const prefix = buffer.toString("utf8", 0, bytesRead);
+    if (size <= buffer.length) return prefix;
+    const tail = await handle.read(buffer, 0, 4096, size - 4096);
+    return `${prefix}\n[earlier diagnostics omitted]\n${buffer.toString("utf8", 0, tail.bytesRead)}`;
   } finally { await handle.close(); }
 }
 
@@ -40,13 +44,13 @@ export async function runProcess(command, args, { cwd, env, input = "", timeout 
     const result = await exit;
     trace(`exited ${result.code ?? result.signal}`);
     if (failure) {
-      const diagnostic = await diagnosticPrefix(files[2]);
+      const diagnostic = await diagnosticExcerpt(files[2]);
       failure.message = `${path.basename(command)}: ${failure.message}${diagnostic ? `: ${diagnostic}` : ""}`;
       throw failure;
     }
     const sizes = await Promise.all(handles.slice(1).map(handle => handle.stat()));
     if (sizes.some(info => info.size > maxOutput)) throw new Error("Tool output exceeded limit");
-    return { ...result, stdout: await fs.readFile(files[1], "utf8"), stderr: (await fs.readFile(files[2], "utf8")).slice(0, 8192) };
+    return { ...result, stdout: await fs.readFile(files[1], "utf8"), stderr: await diagnosticExcerpt(files[2]) };
   } finally {
     clearTimeout(timer); clearInterval(monitor);
     if (child) children?.delete(child);
