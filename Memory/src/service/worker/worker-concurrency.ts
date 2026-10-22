@@ -120,6 +120,9 @@ export function providerDescriptor(config: {
       if (hostname === "localhost" || hostname === "[::1]" || /^127\./.test(hostname)) url.hostname = "localhost";
       url.username = ""; url.password = ""; url.search = ""; url.hash = "";
       if (config.provider === "openai_compatible") url.pathname = url.pathname.replace(/\/(?:chat\/completions|embeddings)\/?$/, "");
+      // Native Mistral embeddings share the API service with compatible chat.
+      // Keep the host and preceding base path so independent proxies stay separate.
+      if (config.provider === "mistral") url.pathname = url.pathname.replace(/\/embeddings\/?$/, "");
       if (config.provider === "anthropic") url.pathname = url.pathname.replace(/\/messages\/?$/, "");
       endpoint = url.toString().replace(/\/+$/, "");
     } catch { throw new TypeError("Invalid model provider endpoint"); }

@@ -2,11 +2,60 @@ import { describe, expect, it } from "vitest";
 import { WorkerConcurrencyController, providerDescriptor, workerModelBatchKey, type WorkerRequirements } from "../../../src/service/worker/worker-concurrency.js";
 import { DEFAULT_MEMMY_CONFIG } from "../../../src/config/index.js";
 import { createLlmClient } from "../../../src/model/llm.js";
+import { createEmbedder } from "../../../src/model/embedder.js";
 import { MemoryModelTaskRouter } from "../../../src/model/task-routing.js";
 import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
 const req = (changes: Partial<WorkerRequirements> = {}): WorkerRequirements => ({ resourceClass: "summary", providers: [], scopeKeys: [], ...changes });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 describe("atomic worker admission and real model requests", () => {
+  it("shares the Mistral service root across native embeddings and compatible chat without merging other bases", () => {
+    const chat = providerDescriptor({ provider: "openai_compatible", endpoint: "https://api.mistral.ai/v1", model: "chat" });
+    const native = providerDescriptor({ provider: "mistral", model: "mistral-embed" });
+    const explicit = providerDescriptor({ provider: "mistral", endpoint: "https://api.mistral.ai/v1/embeddings", model: "mistral-embed" });
+    expect(native.providers[0]).toEqual(chat.providers[0]);
+    expect(explicit.providers[0]).toEqual(chat.providers[0]);
+    expect(native.providers[1]!.key).not.toBe(chat.providers[1]!.key);
+    const custom = providerDescriptor({ provider: "mistral", endpoint: "https://proxy.example.test/tenant/v1/embeddings" });
+    expect(custom.providers[0]).toEqual(providerDescriptor({ provider: "openai_compatible", endpoint: "https://proxy.example.test/tenant/v1" }).providers[0]);
+    expect(custom.providers[0]).not.toEqual(chat.providers[0]);
+    expect(custom.providers[0]).not.toEqual(providerDescriptor({ provider: "openai_compatible", endpoint: "https://proxy.example.test/other/v1" }).providers[0]);
+  });
+
+  it.each([undefined, "https://api.mistral.ai/v1/embeddings"])("caps real Mistral chat and native embedding calls together (embedding endpoint %s)", async endpoint => {
+    const summary = createLlmClient({ ...DEFAULT_MEMMY_CONFIG.summary, provider: "openai_compatible",
+      sourceProvider: "mistral", endpoint: "https://api.mistral.ai/v1", model: "mistral-small-latest",
+      apiKey: "synthetic-test-key", maxRetries: 0, malformedRetries: 0 });
+    const embedding = createEmbedder({ ...DEFAULT_MEMMY_CONFIG.embedding, provider: "mistral", mode: "custom",
+      endpoint, model: "mistral-embed", apiKey: "synthetic-test-key", maxRetries: 0, cache: false });
+    const c = new WorkerConcurrencyController({}, {});
+    const router = new MemoryModelTaskRouter(() => ({ config: DEFAULT_MEMMY_CONFIG, summary, evolution: summary, embedding }), c);
+    let active = 0, maximum = 0;
+    const urls: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async input => {
+      const url = String(input);
+      urls.push(url); maximum = Math.max(maximum, ++active);
+      await tick(); active--;
+      const response = url.endsWith("/embeddings") ? { data: [{ embedding: [1, 0, 0] }] }
+        : { choices: [{ message: { content: "OK" }, finish_reason: "stop" }] };
+      return new Response(JSON.stringify(response), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      await Promise.all([
+        router.client("summary").complete([{ role: "user", content: "first" }], { operation: "test.provider-limit" }),
+        router.client("summary").complete([{ role: "user", content: "second" }], { operation: "test.provider-limit" }),
+        router.embedder().embed(["document"])
+      ]);
+      expect(urls.filter(url => url === "https://api.mistral.ai/v1/chat/completions")).toHaveLength(2);
+      expect(urls.filter(url => url === "https://api.mistral.ai/v1/embeddings")).toHaveLength(1);
+      expect(maximum).toBe(c.limits.cloudModelConcurrency);
+      expect(c.snapshot()).toMatchObject({ providers: {}, embeddingRequests: 0 });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await Promise.all([router.stop(), c.close()]);
+    }
+  });
+
   it("shares Anthropic admission for equivalent actual request URLs", () => {
     const missing = providerDescriptor({ provider: "anthropic", model: "same" });
     const bare = providerDescriptor({ provider: "anthropic", model: "same", endpoint: "https://api.anthropic.com" });

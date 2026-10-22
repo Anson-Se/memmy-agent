@@ -1122,6 +1122,7 @@ export class MemoryService {
       this.workerRunner.resumeJobsAfterConfigurationChange();
       this.restartFailedProcessing(reloadedAt);
     }
+    this.workerRunner.notifyWorkAvailable();
     serviceLogger.info("config.reloaded", {
       changed,
       requiresRestart,

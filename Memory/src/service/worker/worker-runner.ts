@@ -7,6 +7,7 @@
 import {
   allowedMemoryBudgetJobTypes
 } from "@memmy/agent-source-core";
+import { setImmediate as yieldWorkerTurn } from "node:timers/promises";
 import type { Embedder } from "../../model/types.js";
 import {
   retrievalDocumentIsCurrent,
@@ -62,6 +63,7 @@ export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
 export const WORKER_LEASE_SECONDS = 60;
 export const WORKER_HEARTBEAT_MS = 20_000;
 const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "observation_extract", "episode_title"];
+const WORKER_TURN_JOB_LIMIT = 32;
 
 const workerLogger = createMemoryLogger("worker");
 
@@ -560,6 +562,7 @@ export class WorkerRunner {
     let failedDrain = false;
     let attemptedReconcileDeadline: number | undefined;
     let filled = false;
+    let jobsThisTurn = 0;
     const active = new Set<Promise<void>>();
     const selectedMain: string[] = [];
     const claimKey = (job: EvolutionJobRecord) => `${job.id}:${job.leaseToken}`;
@@ -575,8 +578,16 @@ export class WorkerRunner {
       return { promise, dispose: () => this.wakeListeners.delete(wake) };
     };
     try {
-      while (remaining > 0 && !this.stopping && !failedDrain && !execution.signal?.aborted &&
+      while (remaining > 0 && this.deps.memoryAddEnabled() && !this.stopping && !failedDrain && !execution.signal?.aborted &&
         !(execution.continuous && this.scheduler.hasPendingRequests())) {
+        if (jobsThisTurn >= WORKER_TURN_JOB_LIMIT) {
+          // Resolved promises alone do not give HTTP, cancellation or timers a
+          // turn. Yield before the next admission wave, not before starting
+          // already claimed work. Re-enter the guards after the macro task.
+          await yieldWorkerTurn();
+          jobsThisTurn = 0;
+          continue;
+        }
         const reconcileAt = this.deps.memoryBudgetNextReconcileAtMs?.();
         if (execution.continuous && this.deps.beforeRun && reconcileAt !== undefined &&
           Number.isFinite(reconcileAt) && reconcileAt <= this.nowMs() && reconcileAt !== attemptedReconcileDeadline) {
@@ -585,7 +596,7 @@ export class WorkerRunner {
           // unchanged in-flight deadline on every completion/refill.
           attemptedReconcileDeadline = reconcileAt;
           await this.deps.beforeRun();
-          if (this.stopping || failedDrain || execution.signal?.aborted || this.scheduler.hasPendingRequests()) break;
+          if (!this.deps.memoryAddEnabled() || this.stopping || failedDrain || execution.signal?.aborted || this.scheduler.hasPendingRequests()) break;
         }
         let denied = false;
         const admissions = new Map<string, Admission>();
@@ -645,6 +656,7 @@ export class WorkerRunner {
           }
         }) : [];
         remaining -= work.length;
+        jobsThisTurn += work.length;
         const groups: Array<{ work: FairClaimedWork[]; admission: Admission }> = [];
         for (const item of work) {
           const admission = admissions.get(keyOf(item))!;
@@ -686,7 +698,7 @@ export class WorkerRunner {
           });
           active.add(task);
         }
-        if (remaining <= 0 || this.stopping || failedDrain || execution.signal?.aborted ||
+        if (remaining <= 0 || !this.deps.memoryAddEnabled() || this.stopping || failedDrain || execution.signal?.aborted ||
           (execution.continuous && this.scheduler.hasPendingRequests())) break;
         if (active.size === 0) {
           const snapshot = this.concurrency.snapshot();
@@ -1035,6 +1047,7 @@ export class WorkerRunner {
     targetMemoryIds?: readonly string[]
   ): Promise<EmbeddingRetryRunSummary> {
     return this.runScheduled(async () => {
+      if (!this.deps.memoryAddEnabled()) return { leased: 0, succeeded: 0, failed: 0, items: [] };
       const options = resolveWorkerSchedulingOptions(this.deps.scheduling);
       this.refreshConfigurationBlockedJobs();
       return (await this.runFairWorkerOnce(Math.max(1, Math.floor(limit)),
