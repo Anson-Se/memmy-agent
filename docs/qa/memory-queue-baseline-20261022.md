@@ -59,7 +59,15 @@ R1 还加入原生 trace_summary 对照：在导入积压仍存在时，原生�
 
 ## 验证与重跑
 
-在该独立工作区根目录运行：
+下列结果是阶段 1 提交 `726468f4` 的历史记录。后续阶段已修改实现和部分断言，在当前分支重跑不能重现全部修复前结果。
+
+若要复核原始 14 项诊断，应从 `726468f4` 创建独立工作区，并在该工作区按 README 准备依赖，再运行以下命令。不要在当前开发分支切换或回退代码。原始证据 JSON 保留不变。
+
+```sh
+git worktree add --detach /private/tmp/memmy-queue-stage1-replay 726468f4
+```
+
+在上述历史工作区根目录运行：
 
 ```sh
 node node_modules/typescript/bin/tsc -p AgentSourceCore/tsconfig.json
@@ -70,6 +78,8 @@ MEMMY_QUEUE_BASELINE_RESULTS=/private/tmp/memmy-queue-baseline-v126-20261022/res
   Memory/tests/service/worker/worker-runtime.test.ts --reporter=verbose
 node node_modules/typescript/bin/tsc -p Memory/tsconfig.json --noEmit
 ```
+
+当前分支的结果导出另外记录实际 `testedCommit` 和 `workingTreeDirty`；`MEMMY_QUEUE_BASELINE_REF` 仅作 `referenceLabel`，不能证明运行的是历史代码。历史提交的旧导出器没有这项检查，复核时必须另外记录 `git rev-parse HEAD` 和工作区状态。
 
 - 新增诊断及对照 14 项、现有 worker-runtime 19 项：**33/33 通过**。
 - Memory TypeScript 检查：通过。

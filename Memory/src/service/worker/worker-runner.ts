@@ -104,6 +104,7 @@ export interface WorkerStartupReconciliation {
 export interface EmbeddingRetryClaim {
   workerId: string;
   leaseUntil: number;
+  leaseToken: string;
 }
 
 type EmbeddingRetryResult = {
@@ -170,6 +171,7 @@ export interface WorkerRunnerDeps {
 
 export class WorkerRunner {
   private readonly leaseOwner = newId("worker");
+  private readonly executionConfiguration = new WeakMap<object, string>();
 
   constructor(private readonly deps: WorkerRunnerDeps) {}
 
@@ -328,6 +330,9 @@ export class WorkerRunner {
     for (const memory of this.deps.repos.memories.listImportMemoriesNeedingSummary(limit)) {
       const processing = this.deps.repos.processing.get(memory.id);
       if (processing?.state === "summary_pending" || processing?.state === "summarizing") continue;
+      // Startup reconciliation must not erase an explicit failure or recreate a
+      // terminal task. Manual retry/configuration recovery owns those states.
+      if (processing?.state === "failed") continue;
       const jobType = summaryProcessingJobType(memory);
       let job = this.deps.repos.runtime.getPendingJob(memory.id, jobType, memory.contentHash ?? undefined, String(observationMemoryState(memory)?.generation ?? "") || undefined);
       if (!job) {
@@ -545,6 +550,7 @@ export class WorkerRunner {
     this.markProcessingJobLeased(job);
     workerLogger.info("job.started", workerJobLogFields(job));
     try {
+      this.captureExecutionConfiguration(job);
       await this.withJobLease(job, () => this.deps.jobHandlers.processJob(job));
       return this.completeLeasedWorkerJob(job);
     } catch (error) {
@@ -585,6 +591,7 @@ export class WorkerRunner {
       if (batch.length === 0) continue;
 
       try {
+        for (const item of batch) this.captureExecutionConfiguration(item.job);
         const vectors = await this.deps.embedder.embed(batch.map((item) => item.text || "(empty)"), role);
         for (const [index, item] of batch.entries()) {
           try {
@@ -611,6 +618,7 @@ export class WorkerRunner {
 
   async runLeasedEmbeddingItem(item: PreparedEmbeddingJob): Promise<WorkerJobRunResult> {
     try {
+      this.captureExecutionConfiguration(item.job);
       const vector = await this.deps.embedder.embedOne(item.text || "(empty)", item.role);
       this.withJobLease(item.job, () => this.deps.embeddingJobs.applyEmbeddingVector(item, vector));
       return this.completeLeasedWorkerJob(item.job);
@@ -684,6 +692,9 @@ export class WorkerRunner {
     const failOp = failedJob.status === "dead_letter" ? "dead_letter" : "failed";
     this.deps.appendJobChange(failedJob, failOp, job);
     this.updateProcessingAfterJobFailure(failedJob, error);
+    const resumed = configurationBlocked && this.executionConfigurationChanged(job)
+      ? this.resumeConfigurationBlockedMainJobs([job.id])[0]?.after
+      : undefined;
     workerLogger.error("job.failed", {
       ...workerJobLogFields(failedJob),
       terminal: failedJob.status === "dead_letter",
@@ -696,7 +707,7 @@ export class WorkerRunner {
       failed: 1,
       ref: {
         ...jobToRef(job),
-        status: failedJob.status === "dead_letter" ? "dead_letter" : "failed"
+        status: resumed?.status ?? (failedJob.status === "dead_letter" ? "dead_letter" : "failed")
       }
     };
   }
@@ -780,7 +791,8 @@ export class WorkerRunner {
     for (const retry of retries) {
       const claim = {
         workerId: this.deps.embeddingRetryWorkerId,
-        leaseUntil: retry.leaseUntil ?? now + EMBEDDING_RETRY_LEASE_MS
+        leaseUntil: retry.leaseUntil ?? now + EMBEDDING_RETRY_LEASE_MS,
+        leaseToken: retry.leaseToken!
       };
       if (!this.deps.repos.runtime.isEmbeddingRetryClaimHeld(retry.id, claim)) {
         results.push({ succeeded: 0, failed: 0, item: null });
@@ -795,6 +807,7 @@ export class WorkerRunner {
         if (batch.length === 0) continue;
 
         try {
+          for (const item of batch) this.captureExecutionConfiguration(item.claim);
           const vectors = await this.deps.embedder.embed(
             batch.map((item) => item.retry.sourceText || "(empty)"),
             role
@@ -837,6 +850,7 @@ export class WorkerRunner {
     attemptNo: number
   ): Promise<EmbeddingRetryResult> {
     try {
+      this.captureExecutionConfiguration(claim);
       const vector = await this.deps.embedder.embedOne(retry.sourceText || "(empty)", retry.embedRole);
       return this.applyEmbeddingRetryVector(retry, claim, vector);
     } catch (error) {
@@ -940,7 +954,11 @@ export class WorkerRunner {
       } else {
         workerLogger.warn("embedding_retry.retry_scheduled", fields);
       }
-      return { succeeded: 0, failed: 1, item: embeddingRetryToRunItem(updated) };
+      const resumed = configurationBlocked && this.executionConfigurationChanged(claim)
+        ? this.deps.repos.runtime.resumeConfigurationBlockedEmbeddingRetries(this.nowMs(), [retry.id])[0]?.after
+        : undefined;
+      if (resumed) this.deps.appendEmbeddingRetryChange(resumed, "queued", updated);
+      return { succeeded: 0, failed: 1, item: embeddingRetryToRunItem(resumed ?? updated) };
     }
     return { succeeded: 0, failed: 0, item: null };
   }
@@ -1042,21 +1060,42 @@ export class WorkerRunner {
     return () => clearInterval(timer);
   }
 
+  private captureExecutionConfiguration(execution: object): void {
+    const fingerprint = this.deps.configurationFingerprint?.();
+    if (fingerprint) this.executionConfiguration.set(execution, fingerprint);
+  }
+
+  private executionConfigurationChanged(execution: object): boolean {
+    const startedWith = this.executionConfiguration.get(execution);
+    const current = this.deps.configurationFingerprint?.();
+    // A config reload can happen while a request from the previous config is
+    // still in flight. Its late failure must not block work under the new config.
+    // Resume only this execution, so a genuinely invalid current config stays held.
+    return Boolean(startedWith && current && startedWith !== current);
+  }
+
+  private resumeConfigurationBlockedMainJobs(ids?: readonly string[]) {
+    const transitions = this.deps.repos.runtime.resumeConfigurationBlockedJobs(this.deps.nowIso(), ids);
+    for (const { before, after } of transitions) {
+      const stage = processingStageForJob(after.jobType);
+      if (after.targetMemoryId && stage) {
+        this.deps.repos.processing.update(after.targetMemoryId, {
+          state: stage === "summary" ? "summary_pending" : "embedding_pending", stage,
+          activeJobId: after.id, attemptCount: after.attempts, retryAction: "retry",
+          errorCode: null, errorMessage: null, failedAt: null, updatedAt: this.deps.nowIso()
+        }, ["failed"]);
+      }
+      this.deps.appendJobChange(after, "queued", before);
+    }
+    return transitions;
+  }
+
   private refreshConfigurationBlockedJobs(): void {
     const fingerprint = this.deps.configurationFingerprint?.();
     if (!fingerprint) return;
     const key = "worker.model_configuration_fingerprint";
     if (this.deps.repos.runtime.getKv(key)?.value === fingerprint) return;
-    for (const { before, after } of this.deps.repos.runtime.resumeConfigurationBlockedJobs(this.deps.nowIso())) {
-      const stage = processingStageForJob(after.jobType);
-      if (after.targetMemoryId && stage) {
-        this.deps.repos.processing.update(after.targetMemoryId, {
-          state: stage === "summary" ? "summary_pending" : "embedding_pending", stage,
-          activeJobId: after.id, attemptCount: after.attempts, retryAction: "retry", updatedAt: this.deps.nowIso()
-        }, ["failed"]);
-      }
-      this.deps.appendJobChange(after, "queued", before);
-    }
+    this.resumeConfigurationBlockedMainJobs();
     for (const { before, after } of this.deps.repos.runtime.resumeConfigurationBlockedEmbeddingRetries(this.nowMs())) {
       this.deps.appendEmbeddingRetryChange(after, "queued", before);
     }

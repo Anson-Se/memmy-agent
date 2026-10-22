@@ -411,3 +411,49 @@ describe("embedding retry configuration recovery", () => {
     expect(h.repos.runtime.getEmbeddingRetry("invalid-input-retry")).toMatchObject({ status: "failed", attempts: 1 });
   });
 });
+
+describe("in-flight main-job configuration changes", () => {
+  it("does not resume another job that failed under the current configuration", async () => {
+    const entered = deferred(); const gate = deferred();
+    let fingerprint = "config-A";
+    const h = harness(async (job) => {
+      if (job.id === "old-config-job") { entered.resolve(); await gate.promise; }
+      throw new Error("unauthorized API key");
+    });
+    h.deps.configurationFingerprint = () => fingerprint;
+    h.job("old-config-job", "trace_summary");
+    const oldRun = h.runner.runWorkerOnce(1);
+    await entered.promise;
+    fingerprint = "config-B"; h.runner.resumeJobsAfterConfigurationChange();
+    h.job("current-config-job", "trace_summary");
+    await h.runner.runWorkerOnce(1);
+    expect(h.repos.runtime.getJob("current-config-job")).toMatchObject({ status: "failed", blockedReason: "configuration" });
+    gate.resolve(); await oldRun;
+    expect(h.repos.runtime.getJob("old-config-job")).toMatchObject({ status: "queued", blockedReason: null });
+    expect(h.repos.runtime.getJob("current-config-job")).toMatchObject({ status: "failed", blockedReason: "configuration" });
+  });
+});
+
+describe("in-flight embedding configuration changes", () => {
+  it("requeues a late old-config failure once and holds failures from the current config", async () => {
+    const h = harness(); h.retry("old-config-retry");
+    let fingerprint = "config-A";
+    h.deps.configurationFingerprint = () => fingerprint;
+    const gate = deferred(); const entered = deferred(); let calls = 0;
+    h.deps.embedder.embed = async () => {
+      calls++;
+      if (calls === 1) { entered.resolve(); await gate.promise; }
+      throw new ModelHttpError("unauthorized", "test", 401, undefined, "invalid API key");
+    };
+    const oldRun = h.runner.runWorkerOnce(4);
+    await entered.promise;
+    fingerprint = "config-B";
+    h.runner.resumeJobsAfterConfigurationChange();
+    gate.resolve(); await oldRun;
+    expect(h.repos.runtime.getEmbeddingRetry("old-config-retry")).toMatchObject({ status: "pending", blockedReason: null, attempts: 0 });
+    expect((await h.runner.runWorkerOnce(4)).embeddingRetries.leased).toBe(1);
+    expect(h.repos.runtime.getEmbeddingRetry("old-config-retry")).toMatchObject({ status: "failed", blockedReason: "configuration", attempts: 0 });
+    expect((await h.runner.runWorkerOnce(4)).embeddingRetries.leased).toBe(0);
+    expect(calls).toBe(2);
+  });
+});

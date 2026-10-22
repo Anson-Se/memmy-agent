@@ -9,6 +9,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
@@ -110,9 +111,19 @@ afterEach(() => {
 afterAll(() => {
   const path = process.env.MEMMY_QUEUE_BASELINE_RESULTS;
   if (path) {
+    // The same diagnostics become regression tests as implementation advances.
+    // A caller-supplied label must never masquerade as the code actually run.
+    let testedCommit = "unavailable";
+    let workingTreeDirty: boolean | null = null;
+    try {
+      testedCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      workingTreeDirty = execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim().length > 0;
+    } catch { /* An exported source archive may not include Git metadata. */ }
     mkdirSync(join(path, ".."), { recursive: true });
     writeFileSync(path, JSON.stringify({
-      baseline: process.env.MEMMY_QUEUE_BASELINE_REF ?? "not recorded; set MEMMY_QUEUE_BASELINE_REF",
+      testedCommit,
+      workingTreeDirty,
+      referenceLabel: process.env.MEMMY_QUEUE_BASELINE_REF ?? null,
       method: "real SQLite and WorkerRunner; local substitute business/model handlers",
       observations
     }, null, 2));
@@ -327,10 +338,10 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
   it("already rejects an obsolete embedding retry owner after a replacement claim (control)", () => {
     const h = harness(); h.memory("fenced-target"); h.retry("fenced-retry", "fenced-target");
     const now = Date.now();
-    h.repos.runtime.claimDueEmbeddingRetries({ now, workerId: "A", leaseUntil: now + 1_000 });
+    const [oldClaim] = h.repos.runtime.claimDueEmbeddingRetries({ now, workerId: "A", leaseUntil: now + 1_000 });
     h.repos.runtime.claimDueEmbeddingRetries({ now: now + 1_001, workerId: "B", leaseUntil: now + 60_000 });
     const oldCompletion = h.repos.runtime.markEmbeddingRetrySucceededClaimed("fenced-retry", {
-      workerId: "A", leaseUntil: now + 1_000, now: now + 1_002
+      workerId: "A", leaseUntil: now + 1_000, leaseToken: oldClaim!.leaseToken!, now: now + 1_002
     });
     expect(oldCompletion).toBeUndefined();
     expect(h.repos.runtime.getEmbeddingRetry("fenced-retry")).toMatchObject({ status: "in_progress", claimedBy: "B" });

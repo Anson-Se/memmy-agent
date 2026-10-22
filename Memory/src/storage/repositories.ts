@@ -449,6 +449,7 @@ export interface EmbeddingRetryRecord {
   nextAttemptAt: number;
   claimedBy?: string | null;
   leaseUntil?: number | null;
+  leaseToken?: string | null;
   blockedReason?: string | null;
   lastError?: string | null;
   createdAt: number;
@@ -3848,10 +3849,12 @@ export class RuntimeRepository {
     );
   }
 
-  resumeConfigurationBlockedJobs(at = nowIso()): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
+  resumeConfigurationBlockedJobs(at = nowIso(), ids?: readonly string[]): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
+    if (ids?.length === 0) return [];
     return this.db.transaction(() => {
+      const filter = ids ? ` AND id IN (${ids.map(() => "?").join(", ")})` : "";
       const rows = this.db.prepare(`SELECT * FROM evolution_jobs
-        WHERE status = 'failed' AND blocked_reason = 'configuration'`).all() as SqlJobRow[];
+        WHERE status = 'failed' AND blocked_reason = 'configuration'${filter}`).all(...(ids ?? [])) as SqlJobRow[];
       return rows.map((row) => {
         this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', available_at = ?,
           blocked_reason = NULL, updated_at = ? WHERE id = ?`).run(at, at, row.id);
@@ -4027,6 +4030,7 @@ export class RuntimeRepository {
           next_attempt_at = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.next_attempt_at ELSE excluded.next_attempt_at END,
           claimed_by = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.claimed_by ELSE NULL END,
           lease_until = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.lease_until ELSE NULL END,
+          lease_token = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.lease_token ELSE NULL END,
           blocked_reason = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.blocked_reason ELSE NULL END,
           last_error = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.last_error ELSE NULL END,
           updated_at = excluded.updated_at`
@@ -4130,6 +4134,7 @@ export class RuntimeRepository {
                  next_attempt_at = ?,
                  claimed_by = NULL,
                  lease_until = NULL,
+                 lease_token = NULL,
                  updated_at = ?
              WHERE id = ?`
           )
@@ -4145,6 +4150,7 @@ export class RuntimeRepository {
           next_attempt_at: now,
           claimed_by: null,
           lease_until: null,
+          lease_token: null,
           updated_at: now
         })
       }));
@@ -4184,12 +4190,14 @@ export class RuntimeRepository {
         .all(input.now, input.now, ...(input.targetMemoryIds ?? []), limit) as SqlEmbeddingRetryRow[];
       const claimed: EmbeddingRetryRecord[] = [];
       for (const row of rows) {
+        const leaseToken = newId("retry_lease");
         const result = this.db
           .prepare(
             `UPDATE embedding_retry_queue
              SET status = 'in_progress',
                  claimed_by = ?,
                  lease_until = ?,
+                 lease_token = ?,
                  updated_at = ?
              WHERE id = ?
                AND (
@@ -4198,13 +4206,14 @@ export class RuntimeRepository {
                )
                AND next_attempt_at <= ?`
           )
-          .run(input.workerId, input.leaseUntil, input.now, row.id, input.now, input.now);
+          .run(input.workerId, input.leaseUntil, leaseToken, input.now, row.id, input.now, input.now);
         if (result.changes > 0) {
           claimed.push(embeddingRetryFromSql({
             ...row,
             status: "in_progress",
             claimed_by: input.workerId,
             lease_until: input.leaseUntil,
+            lease_token: leaseToken,
             updated_at: input.now
           }));
         }
@@ -4215,20 +4224,22 @@ export class RuntimeRepository {
   }
 
   markEmbeddingRetryConfigurationBlockedClaimed(id: string, input: {
-    workerId: string; leaseUntil: number; error: string; now: number;
+    workerId: string; leaseUntil: number; leaseToken: string; error: string; now: number;
   }): EmbeddingRetryRecord | undefined {
     const result = this.db.prepare(`UPDATE embedding_retry_queue SET status = 'failed',
-      blocked_reason = 'configuration', claimed_by = NULL, lease_until = NULL,
+      blocked_reason = 'configuration', claimed_by = NULL, lease_until = NULL, lease_token = NULL,
       last_error = ?, updated_at = ?
-      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_until > ?`)
-      .run(input.error, input.now, id, input.workerId, input.leaseUntil, input.now);
+      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_token = ? AND lease_until > ?`)
+      .run(input.error, input.now, id, input.workerId, input.leaseUntil, input.leaseToken, input.now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
-  resumeConfigurationBlockedEmbeddingRetries(now = Date.now()): Array<{ before: EmbeddingRetryRecord; after: EmbeddingRetryRecord }> {
+  resumeConfigurationBlockedEmbeddingRetries(now = Date.now(), ids?: readonly string[]): Array<{ before: EmbeddingRetryRecord; after: EmbeddingRetryRecord }> {
+    if (ids?.length === 0) return [];
+    const targetFilter = ids ? ` AND id IN (${ids.map(() => "?").join(", ")})` : "";
     return this.db.transaction(() => {
       const rows = this.db.prepare(`SELECT * FROM embedding_retry_queue
-        WHERE status = 'failed' AND blocked_reason = 'configuration'`).all() as SqlEmbeddingRetryRow[];
+        WHERE status = 'failed' AND blocked_reason = 'configuration'${targetFilter}`).all(...(ids ?? [])) as SqlEmbeddingRetryRow[];
       return rows.map((row) => {
         this.db.prepare(`UPDATE embedding_retry_queue SET status = 'pending', blocked_reason = NULL,
           next_attempt_at = ?, updated_at = ? WHERE id = ?`).run(now, now, row.id);
@@ -4239,20 +4250,21 @@ export class RuntimeRepository {
 
   renewEmbeddingRetryClaim(
     id: string,
-    claim: { workerId: string; leaseUntil: number },
+    claim: { workerId: string; leaseUntil: number; leaseToken: string },
     newUntil: number,
     now = Date.now()
   ): EmbeddingRetryRecord | undefined {
     if (newUntil <= now) return undefined;
     const result = this.db.prepare(`UPDATE embedding_retry_queue SET lease_until = ?, updated_at = ?
-      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_until > ?`)
-      .run(Math.max(claim.leaseUntil, newUntil), now, id, claim.workerId, claim.leaseUntil, now);
+      WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_until = ? AND lease_token = ? AND lease_until > ?`)
+      .run(Math.max(claim.leaseUntil, newUntil), now, id, claim.workerId, claim.leaseUntil, claim.leaseToken, now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
   isEmbeddingRetryClaimHeld(id: string, input: {
     workerId: string;
     leaseUntil: number;
+    leaseToken: string;
   }, now = Date.now()): boolean {
     const row = this.db
       .prepare(
@@ -4262,15 +4274,17 @@ export class RuntimeRepository {
            AND status = 'in_progress'
            AND claimed_by = ?
            AND lease_until = ?
+           AND lease_token = ?
            AND lease_until > ?`
       )
-      .get(id, input.workerId, input.leaseUntil, now) as { count: number } | undefined;
+      .get(id, input.workerId, input.leaseUntil, input.leaseToken, now) as { count: number } | undefined;
     return (row?.count ?? 0) > 0;
   }
 
   markEmbeddingRetryRetryClaimed(id: string, input: {
     workerId: string;
     leaseUntil: number;
+    leaseToken: string;
     attempts: number;
     nextAttemptAt: number;
     error: string;
@@ -4284,12 +4298,14 @@ export class RuntimeRepository {
              next_attempt_at = ?,
              claimed_by = NULL,
              lease_until = NULL,
+             lease_token = NULL,
              last_error = ?,
              updated_at = ?
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
            AND lease_until = ?
+           AND lease_token = ?
            AND lease_until > ?`
       )
       .run(
@@ -4300,6 +4316,7 @@ export class RuntimeRepository {
         id,
         input.workerId,
         input.leaseUntil,
+        input.leaseToken,
         input.now
       );
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
@@ -4308,6 +4325,7 @@ export class RuntimeRepository {
   markEmbeddingRetryFailedClaimed(id: string, input: {
     workerId: string;
     leaseUntil: number;
+    leaseToken: string;
     attempts: number;
     error: string;
     now: number;
@@ -4319,21 +4337,24 @@ export class RuntimeRepository {
              attempts = ?,
              claimed_by = NULL,
              lease_until = NULL,
+             lease_token = NULL,
              last_error = ?,
              updated_at = ?
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
            AND lease_until = ?
+           AND lease_token = ?
            AND lease_until > ?`
       )
-      .run(input.attempts, input.error, input.now, id, input.workerId, input.leaseUntil, input.now);
+      .run(input.attempts, input.error, input.now, id, input.workerId, input.leaseUntil, input.leaseToken, input.now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
   markEmbeddingRetrySucceededClaimed(id: string, input: {
     workerId: string;
     leaseUntil: number;
+    leaseToken: string;
     now: number;
   }): EmbeddingRetryRecord | undefined {
     const result = this.db
@@ -4343,14 +4364,16 @@ export class RuntimeRepository {
              next_attempt_at = ?,
              claimed_by = NULL,
              lease_until = NULL,
+             lease_token = NULL,
              updated_at = ?
          WHERE id = ?
            AND status = 'in_progress'
            AND claimed_by = ?
            AND lease_until = ?
+           AND lease_token = ?
            AND lease_until > ?`
       )
-      .run(input.now, input.now, id, input.workerId, input.leaseUntil, input.now);
+      .run(input.now, input.now, id, input.workerId, input.leaseUntil, input.leaseToken, input.now);
     return result.changes > 0 ? this.getEmbeddingRetry(id) : undefined;
   }
 
@@ -7613,6 +7636,7 @@ interface SqlEmbeddingRetryRow {
   next_attempt_at: number;
   claimed_by: string | null;
   lease_until: number | null;
+  lease_token: string | null;
   blocked_reason: string | null;
   last_error: string | null;
   created_at: number;
@@ -7771,6 +7795,7 @@ function embeddingRetryFromSql(row: SqlEmbeddingRetryRow): EmbeddingRetryRecord 
     nextAttemptAt: row.next_attempt_at,
     claimedBy: row.claimed_by,
     leaseUntil: row.lease_until,
+    leaseToken: row.lease_token,
     blockedReason: row.blocked_reason,
     lastError: row.last_error,
     createdAt: row.created_at,

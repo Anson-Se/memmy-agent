@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { memoryCaptureQaHash, normalizeMemoryCaptureSource } from "../utils/memory-capture-claim.js";
 
-export const SCHEMA_VERSION = 10;
-export const SCHEMA_MIGRATION_ID = "010_worker_lease_safety";
+export const SCHEMA_VERSION = 11;
+export const SCHEMA_MIGRATION_ID = "011_embedding_retry_lease_token";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -616,6 +616,7 @@ const statements = [
     next_attempt_at INTEGER NOT NULL,
     claimed_by TEXT,
     lease_until INTEGER,
+    lease_token TEXT,
     blocked_reason TEXT,
     last_error TEXT,
     created_at INTEGER NOT NULL,
@@ -699,7 +700,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -739,6 +740,7 @@ export function migrate(db: Database.Database): void {
       }
       if (tableExists(db, "embedding_retry_queue")) {
         addColumnIfMissing(db, "embedding_retry_queue", "blocked_reason", "TEXT");
+        addColumnIfMissing(db, "embedding_retry_queue", "lease_token", "TEXT");
       }
       for (const statement of statements) {
         db.prepare(statement).run();
