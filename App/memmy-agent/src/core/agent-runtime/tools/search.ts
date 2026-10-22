@@ -1,4 +1,4 @@
-import { authorizeMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
+import { withMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -163,18 +163,15 @@ export class SearchTool extends Tool {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
-      await authorizeMemmateReadPath(root);
       yield root;
       return;
     }
     if (!stat.isDirectory()) return;
-    await authorizeMemmateReadPath(root);
-    const entries = await fs.readdir(root, { withFileTypes: true });
+    const entries = await withMemmateReadPath(root, () => fs.readdir(root, { withFileTypes: true }));
     const dirs = entries.filter((entry) => entry.isDirectory() && !IGNORE_DIRS.has(entry.name)).map((entry) => entry.name).sort();
     const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
     for (const file of files) {
       const target = path.join(root, file);
-      await authorizeMemmateReadPath(target);
       yield target;
     }
     for (const dir of dirs) yield* this.iterFiles(path.join(root, dir));
@@ -225,19 +222,16 @@ export class FindFilesTool extends SearchTool {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
-      await authorizeMemmateReadPath(root);
       yield root;
       return;
     }
     if (!stat.isDirectory()) return;
-    await authorizeMemmateReadPath(root);
+    const entries = await withMemmateReadPath(root, () => fs.readdir(root, { withFileTypes: true }));
     if (includeDirs) yield root;
-    const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = entries.filter((entry) => entry.isDirectory() && !IGNORE_DIRS.has(entry.name)).map((entry) => entry.name).sort();
     const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
     for (const file of files) {
       const target = path.join(root, file);
-      await authorizeMemmateReadPath(target);
       yield target;
     }
     for (const dir of dirs) {
@@ -286,7 +280,9 @@ export class FindFilesTool extends SearchTool {
         if (candidateStat.isFile() && !matchesType(name, params.type)) continue;
         if (candidateStat.isDirectory() && params.type) continue;
         if (!matchesQuery(displayPath, params.query)) continue;
-        matches.push({ display: displayPath + (candidateStat.isDirectory() ? "/" : ""), mtime: candidateStat.mtimeMs });
+        const add = async () => { matches.push({ display: displayPath + (candidateStat.isDirectory() ? "/" : ""), mtime: candidateStat.mtimeMs }); };
+        if (candidateStat.isDirectory()) await add();
+        else await withMemmateReadPath(candidate, add);
       }
 
       matches.sort((a, b) => (sort === "modified" ? b.mtime - a.mtime || a.display.localeCompare(b.display) : a.display.localeCompare(b.display)));
@@ -437,13 +433,13 @@ export class GrepTool extends SearchTool {
         }
         let content: string;
         if (memmatePermissionRequired() && [".pdf", ".docx"].includes(path.extname(filePath).toLowerCase())) {
-          const extracted = await extractText(filePath, { maxChars: null });
+          const extracted = await withMemmateReadPath(filePath, () => extractText(filePath, { maxChars: null }));
           if (extracted == null || extracted.startsWith("[error:")) {
             return `Error searching document ${this.displayPath(filePath, root)}: ${extracted ?? "unsupported format"}`;
           }
           content = extracted;
         } else {
-          const raw = await fs.readFile(filePath).catch(() => null);
+          const raw = await withMemmateReadPath(filePath, () => fs.readFile(filePath).catch(() => null));
           if (!raw || isBinary(raw)) {
             skippedBinary += 1;
             continue;

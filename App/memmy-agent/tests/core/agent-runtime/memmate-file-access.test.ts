@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { createMemmatePermissionScope, withMemmatePermission } from "../../../src/core/agent-runtime/memmate-permission.js";
+import { createMemmatePermissionScope, withMemmatePermission, withMemmateFileCall, withMemmateReadPath } from "../../../src/core/agent-runtime/memmate-permission.js";
 import { AgentRunner, AgentRunSpec } from "../../../src/core/agent-runtime/runner.js";
 import { ToolCallRequest } from "../../../src/providers/base.js";
 import { writePdf, writeDocx } from "../../helpers/long-document-fixtures.js";
@@ -27,18 +27,28 @@ async function fixture(name: string, decide: (input: any) => Promise<string> = a
     return Response.json({ decision: await decide(request), reason: "test_policy" });
   }));
   const scope = createMemmatePermissionScope({ url: "http://127.0.0.1:12345/authorize", token: "a".repeat(64) }, new AbortController().signal);
+  const events: Record<string, unknown>[] = [];
+  scope.onEvent = event => { events.push(event); };
   const run = (args: Record<string, unknown> = { path: ".", recursive: true, pattern: "needle" }) => withMemmatePermission(scope, () => new AgentRunner().executeTools(new AgentRunSpec({
     workspace, tools: { get: () => tool, prepareCall: (_name: string, args: any) => [tool, args, null] } as any
   }), [new ToolCallRequest({ id: "parent", name, arguments: args })]));
-  return { workspace, requests, run, scope, tool };
+  return { workspace, requests, run, scope, tool, events };
 }
 it.each(["list_dir", "find_files", "grep"])("%s checks every visited path and preserves the parent call id", async name => {
-  const { workspace, requests, run } = await fixture(name);
+  const { workspace, requests, run, events } = await fixture(name);
   const results = await run();
   expect(results[0].event.status).toBe("ok"); expect(results[0].result).toContain("private.txt");
   expect(requests[0]).toMatchObject({ callId: "parent", fileAccessProtocol: 1, args: { path: workspace } });
   const children = requests.slice(1);
   expect(children.map(r => r.args.path)).toEqual([workspace, path.join(workspace, "nested"), path.join(workspace, "nested", "private.txt")]);
+  expect(new Set(children.map(r => r.callId)).size).toBe(children.length);
+  for (const child of children) {
+    expect(child.callId).not.toBe("parent");
+    expect(events.filter(event => event.callId === child.callId)).toEqual([
+      { type: "tool_call", callId: child.callId, name: "read_file", input: { path: child.args.path } },
+      { type: "tool_result", callId: child.callId, name: "read_file", ok: true, output: "File access completed" }
+    ]);
+  }
   expect(children.every(r => r.parentCallId === "parent" && r.toolName === "memmate_read_path")).toBe(true);
 });
 it.each(["list_dir", "find_files", "grep"])("%s stops on a denied descendant without leaking partial results", async name => {
@@ -88,4 +98,18 @@ it("denied document search never calls the parser", async () => {
   const result = (await run({ path: file, pattern: "PRIVATE" }))[0];
   expect(result.event.status).toBe("error");
   expect(read.mock.calls.filter(args => String(args[0]) === file)).toHaveLength(0);
+});
+
+it("path outcome follows the actual access and reports access errors", async () => {
+  const { workspace, scope, events } = await fixture("grep");
+  let finish!: () => void;
+  const pending = withMemmatePermission(scope, () => withMemmateFileCall("parent", () =>
+    withMemmateReadPath(workspace, () => new Promise<void>(resolve => { finish = resolve; }))));
+  await vi.waitFor(() => expect(finish).toBeDefined());
+  expect(events.map(event => event.type)).toEqual(["tool_call"]);
+  finish(); await pending;
+  expect(events[1]).toMatchObject({ type: "tool_result", ok: true, callId: events[0].callId });
+  await expect(withMemmatePermission(scope, () => withMemmateFileCall("parent", () =>
+    withMemmateReadPath(workspace, async () => { throw new Error("read failed"); })))).rejects.toThrow("read failed");
+  expect(events[3]).toMatchObject({ type: "tool_result", ok: false, callId: events[2].callId, output: "Error: read failed" });
 });

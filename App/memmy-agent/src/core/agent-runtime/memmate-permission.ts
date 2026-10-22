@@ -10,11 +10,24 @@ export function withMemmateFileCall<T>(callId: string, run: () => T): T {
 }
 
 /** Traversal grants never cover descendants: check every path before returning or reading it. */
-export async function authorizeMemmateReadPath(path: string): Promise<void> {
-  if (!memmatePermissionRequired()) return;
+export async function withMemmateReadPath<T>(path: string, read: () => Promise<T>): Promise<T> {
+  if (!memmatePermissionRequired()) return read();
   const parentCallId = fileCalls.getStore();
   if (!parentCallId) throw new Error("MemMate file access context is missing");
-  await authorizeMemmateTool("memmate_read_path", { path }, undefined, randomUUID(), parentCallId);
+  const callId = randomUUID();
+  emitMemmateToolEvent({ type: "tool_call", callId, name: "read_file", input: { path } });
+  try {
+    await authorizeMemmateTool("memmate_read_path", { path }, undefined, callId, parentCallId);
+    const result = await read();
+    const scope = scopes.getStore();
+    if (!scope?.active || scope.signal.aborted) throw new Error("MemMate run has ended");
+    emitMemmateToolEvent({ type: "tool_result", callId, name: "read_file", ok: true, output: "File access completed" });
+    return result;
+  } catch (error) {
+    emitMemmateToolEvent({ type: "tool_result", callId, name: "read_file", ok: false,
+      output: `Error: ${error instanceof Error ? error.message : String(error)}` });
+    throw error;
+  }
 }
 
 export function memmatePermissionRequired(): boolean {

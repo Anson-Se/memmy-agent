@@ -1,4 +1,4 @@
-import { authorizeMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
+import { withMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -1106,8 +1106,7 @@ export class ListDirTool extends Tool {
     const maxEntries = params.max_entries ?? params.maxEntries ?? 200;
     const rows: string[] = [];
     const walk = async (dir: string) => {
-      await authorizeMemmateReadPath(dir);
-      const entries = (await fs.readdir(dir, { withFileTypes: true }))
+      const entries = (await withMemmateReadPath(dir, () => fs.readdir(dir, { withFileTypes: true })))
         .filter((entry) => !IGNORED_DIRS.has(entry.name))
         .sort((a, b) => a.name.localeCompare(b.name));
       for (const entry of entries) {
@@ -1117,8 +1116,7 @@ export class ListDirTool extends Tool {
           rows.push(rel);
           await walk(full);
         } else {
-          await authorizeMemmateReadPath(full);
-          rows.push(rel);
+          await withMemmateReadPath(full, async () => { rows.push(rel); });
         }
       }
     };
