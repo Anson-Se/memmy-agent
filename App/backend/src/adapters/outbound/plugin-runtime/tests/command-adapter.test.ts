@@ -17,6 +17,8 @@ let root: string | undefined;
 afterEach(() => {
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 function context(outputMode: "json" | "ndjson" = "json"): PluginRuntimeContext {
@@ -382,6 +384,56 @@ describe("CommandPluginAdapter", () => {
     expect(profile).toContain(`(subpath ${JSON.stringify(dependency.executableRoots[0])})`);
   });
 
+  it("builds a trusted Windows launcher plan with explicit roots and exact arguments", async () => {
+    const pluginContext = context();
+    const launch = await buildPluginSandboxLaunch(pluginContext, { command: "runtime/plugin", interpreter: "node", args: ["a b", "中文", 'quote"value'], cwd: "." }, "win32");
+    expect(launch.command).toMatch(/powershell\.exe$/);
+    const plan = JSON.parse(Buffer.from(launch.args[launch.args.indexOf("-Plan") + 1]!, "base64").toString("utf8"));
+    expect(plan.command).toBe(realpathSync(process.execPath));
+    expect(plan.args).toEqual([realpathSync(join(root!, "runtime/plugin")), "a b", "中文", 'quote"value']);
+    expect(plan.readRoots).toContain(realpathSync(root!)); expect(plan.writeRoots).toEqual([]);
+    expect(plan.profile).toMatch(/^memmy\.plugin\.[a-f0-9]{32}$/);
+    await expect(buildPluginSandboxLaunch(pluginContext, { command: "runtime/plugin", interpreter: "node", args: [], cwd: "." }, "win32", true)).rejects.toThrow(/no network/);
+  });
+
+  it("resolves the default runtime route against the registry origin, including bases with /api", async () => {
+    const pluginContext = context();
+    vi.stubEnv("MEMMY_PLUGIN_REGISTRY_URL", "http://127.0.0.1:19391/api");
+    vi.stubEnv("MEMMY_OFFICE_RUNTIME_PREFER_MANAGED", "1");
+    vi.stubEnv("MEMMY_OFFICE_RUNTIME_CATALOG_URL", "");
+    delete process.env.MEMMY_OFFICE_RUNTIME_CATALOG_URL;
+    const fetchFn = vi.fn(async (_input: unknown) => new Response("not provisioned", { status: 404 })); vi.stubGlobal("fetch", fetchFn);
+    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, runtimeDependencies: ["office"] };
+    await expect(createCommandPluginAdapter({ platform: "win32", pluginDataRoot: join(root!, "plugin-data") }).activate(pluginContext)).rejects.toThrow(/HTTP 404/);
+    expect(String(fetchFn.mock.calls[0]?.[0])).toBe(`http://127.0.0.1:19391/api/v1/plugins/office/runtimes/win32-${process.arch}`);
+  });
+
+  it("keeps plugin CLR/PowerShell variables out of the privileged Windows launcher", async () => {
+    const pluginContext = context();
+    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, interpreter: "node", env: { COR_ENABLE_PROFILING: "1", COR_PROFILER_PATH: "untrusted.dll", PSModulePath: "untrusted-modules", SystemRoot: "untrusted-root" } };
+    let launcherEnv: Record<string, string> = {};
+    const adapter = createCommandPluginAdapter({ platform: "win32", spawnFn: ((command, _args, options) => {
+      expect(command).toMatch(/powershell\.exe$/); launcherEnv = options?.env as Record<string, string>;
+      return spawn(process.execPath, ["-e", "console.log('{}')"], options as Parameters<typeof spawn>[2]);
+    }) as typeof spawn });
+    const session = await adapter.activate(pluginContext);
+    await collect(adapter.invoke(session, { callId: "env-test", pluginId: pluginContext.plugin.id, capabilityId: "run", conversationId: "test", input: {} }));
+    expect(launcherEnv.COR_ENABLE_PROFILING).toBeUndefined(); expect(launcherEnv.COR_PROFILER_PATH).toBeUndefined(); expect(launcherEnv.PSModulePath).toBeUndefined();
+    expect(launcherEnv.SystemRoot).not.toBe("untrusted-root");
+    const isolatedEnv = JSON.parse(Buffer.from(launcherEnv.MEMMY_SANDBOX_CHILD_ENV!, "base64").toString("utf8"));
+    expect(isolatedEnv.COR_PROFILER_PATH).toBe("untrusted.dll");
+  });
+
+  it("injects only the Host-installed portable Office tools into the runtime", async () => {
+    context(); vi.stubEnv("MEMMY_OFFICE_RUNTIME_PREFER_MANAGED", "1");
+    const tools = Object.fromEntries(["soffice", "pdfinfo", "pdftoppm", "pdftotext"].map(name => [name, join(root!, "runtime", `${name}.exe`)]));
+    const ensure = vi.fn(async () => ({ root: root!, version: "test-1", tools }));
+    const dependencies = await resolveCommandRuntimeDependencies(["office"], "win32", { ensure });
+    expect(ensure).toHaveBeenCalledWith("win32", process.arch);
+    expect(JSON.parse(dependencies.environment.MEMMY_OFFICE_TOOLS!)).toEqual(tools);
+    expect(dependencies.readRoots).toEqual([root]); expect(dependencies.executableRoots).toEqual([root]);
+  });
+
   describe("sandbox: none", () => {
     /**
      * Activates a `sandbox: "none"` plugin and reports the command that was
@@ -450,8 +502,7 @@ describe("CommandPluginAdapter", () => {
     });
 
     it.each(["plugin:legal-labor", "plugin:literature-review"])("runs unsandboxed on Windows with %s", async (entitlement) => {
-      // Windows has no sandbox implementation, so an entitled first-party
-      // plugin is the only way a command plugin runs there at all.
+      // Existing entitled exemptions remain compatible with Windows.
       const command = await spawnedCommandFor({
         entitlement,
         granted: [entitlement],
@@ -461,22 +512,9 @@ describe("CommandPluginAdapter", () => {
       expect(command).not.toMatch(/sandbox-exec|bwrap/u);
     });
 
-    it.each([null, "plugin:literature-review"])("refuses Windows activation without a grant for %s", async (entitlement) => {
-      const adapter = createCommandPluginAdapter({
-        platform: "win32",
-        isEntitlementGranted: () => false
-      });
-      const pluginContext = context();
-      pluginContext.plugin.manifest.runtime.config = {
-        ...pluginContext.plugin.manifest.runtime.config,
-        sandbox: "none"
-      };
-
-      if (entitlement) pluginContext.plugin.manifest.requiredEntitlement = entitlement;
-
-      // Falling back to an unsandboxed child process here would hand every
-      // third-party plugin the thing the sandbox exists to prevent.
-      await expect(adapter.activate(pluginContext)).rejects.toThrow(/unsupported on win32/u);
+    it.each([null, "plugin:literature-review"])("uses AppContainer on Windows without a grant for %s", async (entitlement) => {
+      const command = await spawnedCommandFor({ entitlement, granted: [], platform: "win32" });
+      expect(command).toMatch(/powershell\.exe$/u);
     });
   });
 });
