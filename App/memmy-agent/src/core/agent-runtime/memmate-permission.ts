@@ -63,7 +63,7 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
     method: "POST", redirect: "error",
     headers: { "content-type": "application/json", authorization: `Bearer ${scope.token}` },
     body: JSON.stringify({ callId, toolName: name, args: approvedArgs,
-      ...(["list_dir", "find_files", "grep", "memmate_read_path"].includes(name) ? { fileAccessProtocol: 1 } : {}),
+      ...(["read_file", "list_dir", "find_files", "grep", "memmate_read_path"].includes(name) ? { fileAccessProtocol: 1 } : {}),
       ...(parentCallId ? { parentCallId } : {}) }),
     signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(125_000)])
   });

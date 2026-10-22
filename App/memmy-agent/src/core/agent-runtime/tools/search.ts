@@ -1,8 +1,9 @@
-import { authorizeMemmateReadPath } from "../memmate-permission.js";
+import { authorizeMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import { minimatch } from "minimatch";
+import { extractText } from "../../../utils/document.js";
 import { Tool } from "./base.js";
 import { isPathInside, resolveWorkspacePath, workspaceRelative } from "./path-utils.js";
 import { getMediaDir } from "../../../config/paths.js";
@@ -322,7 +323,7 @@ export class GrepTool extends SearchTool {
     return (
       "Search file contents with a regex pattern. " +
       "Default output_mode is files_with_matches (file paths only); use content mode for matching lines with context. " +
-      "Prefer this over shell grep for ordinary workspace searches. Skips binary and files >2 MB. Supports glob/type filtering."
+      "Prefer this over shell grep for ordinary workspace searches. In MemMate managed runs, also searches PDF and DOCX text. Skips other binary files and files >2 MB. Supports glob/type filtering."
     );
   }
 
@@ -434,17 +435,20 @@ export class GrepTool extends SearchTool {
           skippedLarge += 1;
           continue;
         }
-        const raw = await fs.readFile(filePath).catch(() => null);
-        if (!raw || isBinary(raw)) {
-          skippedBinary += 1;
-          continue;
-        }
         let content: string;
-        try {
+        if (memmatePermissionRequired() && [".pdf", ".docx"].includes(path.extname(filePath).toLowerCase())) {
+          const extracted = await extractText(filePath, { maxChars: null });
+          if (extracted == null || extracted.startsWith("[error:")) {
+            return `Error searching document ${this.displayPath(filePath, root)}: ${extracted ?? "unsupported format"}`;
+          }
+          content = extracted;
+        } else {
+          const raw = await fs.readFile(filePath).catch(() => null);
+          if (!raw || isBinary(raw)) {
+            skippedBinary += 1;
+            continue;
+          }
           content = raw.toString("utf8");
-        } catch {
-          skippedBinary += 1;
-          continue;
         }
 
         const lines = content.split(/\r?\n/);
