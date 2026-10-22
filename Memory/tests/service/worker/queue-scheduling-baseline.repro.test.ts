@@ -3,6 +3,7 @@
  *
  * Scheduling cases still describe existing failure modes pending stages 3–6.
  * Lease/recovery/backoff cases assert the repaired stage 2 behavior.
+ * Cross-entry overlap is a repaired stage 4 regression.
  * SQLite, schema, repositories and WorkerRunner are real. Business handlers and
  * model requests are controlled local substitutes so queue timing is repeatable.
  */
@@ -243,15 +244,18 @@ describe("queue scheduler: pre-change diagnostic baseline", () => {
     record("priority_cohort_underfill", { limit: 4, leased: 1, otherRunnable: 3 });
   });
 
-  it("allows two concurrent worker entry calls to execute eight handlers", async () => {
+  it("shares one execution boundary across two concurrent worker entry calls", async () => {
     const gate = deferred();
     let active = 0; let peak = 0;
     const h = harness(async () => { active++; peak = Math.max(peak, active); await gate.promise; active--; });
     for (let i = 0; i < 8; i++) h.job(`parallel-${i}`, "trace_summary");
     const a = h.runner.runWorkerOnce(4);
     const b = h.runner.runWorkerOnce(4);
-    try { expect(active).toBe(8); expect(peak).toBe(8); }
-    finally { gate.resolve(); await Promise.all([a, b]); }
+    try {
+      expect(active).toBe(4); expect(peak).toBe(4);
+      expect(h.repos.runtime.getJob("parallel-4")).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
+    } finally { gate.resolve(); await Promise.all([a, b]); }
+    expect(peak).toBe(4);
     record("multiple_entries_concurrency", { calls: 2, perCallLimit: 4, peakHandlers: peak });
   });
 

@@ -30,6 +30,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_NAMESPACE_SOURCE } from "../types.js";
 import { MemoryService } from "../service/memory-service.js";
+import { withoutWorkerSchedulerContext } from "../service/worker/worker-scheduler.js";
 import { MemoryServiceError, statusForCode } from "../utils/error.js";
 import { stableHash } from "../utils/id.js";
 import { resolveTimeZone } from "../utils/time.js";
@@ -360,7 +361,13 @@ function createAutoWorkerDrain(
   const maxCycles = 40;
   const workerBatchSize = 4;
 
-  async function drain(): Promise<void> {
+  function drain(): Promise<void> {
+    // A wake-up can originate from a running job's async descendants. It queues
+    // independent work rather than awaiting that job's own execution boundary.
+    return withoutWorkerSchedulerContext(drainUnscoped);
+  }
+
+  async function drainUnscoped(): Promise<void> {
     if (disposed) {
       return;
     }
@@ -916,9 +923,9 @@ async function routeRequest(
       "worker.import-summaries.enqueue.memoryIds"
     );
     const result = service.enqueuePendingImportSummaries(10_000, memoryIds);
-    if (result.enqueued > 0) {
-      autoWorker.schedule();
-    }
+    // An existing queued task also needs a wake-up. Producers enqueue and
+    // observe status instead of starting their own targeted worker execution.
+    autoWorker.schedule();
     return result;
   }
 

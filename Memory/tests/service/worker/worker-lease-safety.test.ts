@@ -414,21 +414,26 @@ describe("embedding retry configuration recovery", () => {
 
 describe("in-flight main-job configuration changes", () => {
   it("does not resume another job that failed under the current configuration", async () => {
-    const entered = deferred(); const gate = deferred();
+    const gate = deferred();
     let fingerprint = "config-A";
     const h = harness(async (job) => {
-      if (job.id === "old-config-job") { entered.resolve(); await gate.promise; }
+      if (job.id === "old-config-job") {
+        // Requests may still overlap inside one admitted parallel batch. The
+        // second item starts after the configuration change, under config B.
+        fingerprint = "config-B";
+        h.runner.resumeJobsAfterConfigurationChange();
+        await gate.promise;
+      }
       throw new Error("unauthorized API key");
     });
     h.deps.configurationFingerprint = () => fingerprint;
     h.job("old-config-job", "trace_summary");
-    const oldRun = h.runner.runWorkerOnce(1);
-    await entered.promise;
-    fingerprint = "config-B"; h.runner.resumeJobsAfterConfigurationChange();
     h.job("current-config-job", "trace_summary");
-    await h.runner.runWorkerOnce(1);
-    expect(h.repos.runtime.getJob("current-config-job")).toMatchObject({ status: "failed", blockedReason: "configuration" });
-    gate.resolve(); await oldRun;
+    const run = h.runner.runWorkerOnce(2);
+    try {
+      await vi.waitFor(() => expect(h.repos.runtime.getJob("current-config-job"))
+        .toMatchObject({ status: "failed", blockedReason: "configuration" }));
+    } finally { gate.resolve(); await run; }
     expect(h.repos.runtime.getJob("old-config-job")).toMatchObject({ status: "queued", blockedReason: null });
     expect(h.repos.runtime.getJob("current-config-job")).toMatchObject({ status: "failed", blockedReason: "configuration" });
   });

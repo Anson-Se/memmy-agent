@@ -376,12 +376,19 @@ describe("History meaningful-memory processing", () => {
     const oldEmbedding = service.runWorkerOnce(1);
     await started;
     service.syncExternalEvidence({ ...evidence, revision: "2026-10-09T10:12:00.000Z", content: `${evidence.content} Extra window switch.` });
-    await service.runWorkerOnce(1);
+    const newerSummary = service.runWorkerOnce(1);
+    try {
+      // A second generation can be queued while the old embedding is in flight,
+      // but it cannot create a second worker drain outside the shared boundary.
+      expect(service.memoryProcessingStatus([row.id]).items[0]?.state).toBe("summary_pending");
+      expect(db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE target_memory_id = ? AND job_type = 'embedding'").get(row.id)).toEqual({ n: 1 });
+    } finally { release(); await oldEmbedding; }
+    expect(["summary_pending", "summarizing"]).toContain(service.memoryProcessingStatus([row.id]).items[0]?.state);
+    await newerSummary;
     const jobs = db.db.prepare("SELECT id, status FROM evolution_jobs WHERE target_memory_id = ? AND job_type = 'embedding'").all(row.id) as Array<{ id: string; status: string }>;
     expect(jobs).toHaveLength(2);
     expect(new Set(jobs.map((job) => job.id)).size).toBe(2);
     const newerJob = jobs.find((job) => job.status === "queued")!;
-    release(); await oldEmbedding;
     expect(service.memoryProcessingStatus([row.id]).items[0]).toMatchObject({ state: "embedding_pending", activeJobId: newerJob.id });
     await service.runWorkerOnce(1);
     expect(service.memoryProcessingStatus([row.id]).items[0]?.state).toBe("ready");

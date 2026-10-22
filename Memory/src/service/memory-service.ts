@@ -1,4 +1,3 @@
-import { withoutJobLeaseGuard } from "../storage/job-lease-context.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -320,6 +319,7 @@ export class MemoryService {
   };
   private persistRecoveredListener?: () => void;
   private closing = false;
+  private stopping?: Promise<void>;
   private viewerEndpoint?: string;
 
   constructor(private readonly options: MemoryServiceOptions) {
@@ -564,6 +564,8 @@ export class MemoryService {
         return stableHash({ summary: config.summary, evolution: config.evolution,
           embedding: config.embedding, roleRouting: config.roleRouting });
       },
+      beforeRun: this.ensureAppBudgetReconciled.bind(this),
+      afterRun: () => { this.reconcileAutomaticHistorySkills(nowIso()); },
       nowIso,
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
       namespaceIdFromMemory,
@@ -741,12 +743,13 @@ export class MemoryService {
   }
 
   async stop(): Promise<void> {
-    if (this.closing) {
-      return;
-    }
+    const stopped = this.workerRunner.stop();
+    if (this.stopping) return this.stopping;
     this.closing = true;
     this.tokenUsageRecorder.stop();
     this.budgetAbort.abort();
+    this.stopping = stopped;
+    return this.stopping;
   }
 
   private createConfiguredMemoryLlm(config: MemmyConfig, modelRole: MemoryLlmModelRole): LlmClient {
@@ -3134,12 +3137,7 @@ export class MemoryService {
       priorityCohortOnly?: boolean;
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
-    return withoutJobLeaseGuard(async () => {
-      await this.ensureAppBudgetReconciled();
-      const result = await this.workerRunner.runWorkerOnce(limit, request);
-      this.reconcileAutomaticHistorySkills(nowIso());
-      return result;
-    });
+    return this.workerRunner.runWorkerOnce(limit, request);
   }
 
   private async queryVector(query: string): Promise<number[] | undefined> {

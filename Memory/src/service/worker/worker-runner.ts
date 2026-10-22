@@ -50,6 +50,7 @@ import { ObservationDependenciesPendingError } from "../evidence/observation-mem
 import { isObservationMemory, observationJobPayload, observationMemoryState, OBSERVATION_SUMMARY_MODEL_UNCONFIGURED } from "../observation-memory-state.js";
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
 import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
+import { WorkerScheduler } from "./worker-scheduler.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -132,6 +133,8 @@ export interface WorkerRunnerDeps {
   memoryBudgetNextReconcileAtMs?: () => number | undefined;
   summaryModelConfigured: () => boolean;
   configurationFingerprint?: () => string;
+  beforeRun?: () => Promise<void>;
+  afterRun?: () => void;
   schedulingShadow?: {
     enabled?: boolean;
     onComparison?: (comparison: WorkerSchedulingComparison) => void;
@@ -175,6 +178,7 @@ export interface WorkerRunnerDeps {
 }
 
 export class WorkerRunner {
+  private readonly scheduler = new WorkerScheduler();
   private readonly leaseOwner = newId("worker");
   private readonly executionConfiguration = new WeakMap<object, string>();
   private readonly schedulingShadow: WorkerSchedulingShadow;
@@ -421,7 +425,20 @@ export class WorkerRunner {
   ): Promise<WorkerRunSummary> {
     // Wake callbacks may originate from an earlier job's async context. A new
     // drain establishes fresh per-job guards instead of inheriting that claim.
-    return withoutJobLeaseGuard(() => this.runWorkerOnceUnscoped(limit, request));
+    return this.runScheduled(() => this.runWorkerOnceUnscoped(limit, request));
+  }
+
+  private runScheduled<T>(execute: () => Promise<T>): Promise<T> {
+    return withoutJobLeaseGuard(() => this.scheduler.run(async () => {
+      if (this.deps.beforeRun) await this.deps.beforeRun();
+      const result = await execute();
+      this.deps.afterRun?.();
+      return result;
+    }));
+  }
+
+  stop(): Promise<void> {
+    return this.scheduler.close();
   }
 
   private async runWorkerOnceUnscoped(
@@ -539,7 +556,7 @@ export class WorkerRunner {
       }
       const embeddingHeld = this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding");
       const embeddingRetries = !embeddingHeld && retryCapacity > 0
-        ? await this.runEmbeddingRetryOnce(retryCapacity, targetMemoryIds)
+        ? await this.runEmbeddingRetryOnceUnscoped(retryCapacity, targetMemoryIds)
         : { leased: 0, succeeded: 0, failed: 0, items: [] };
 
       const succeeded = results.reduce((sum, result) => sum + result.succeeded, 0);
@@ -799,7 +816,14 @@ export class WorkerRunner {
       : ["embedding_pending", "embedding", "failed"]);
   }
 
-  async runEmbeddingRetryOnce(
+  runEmbeddingRetryOnce(
+    limit: number,
+    targetMemoryIds?: readonly string[]
+  ): Promise<EmbeddingRetryRunSummary> {
+    return this.runScheduled(() => this.runEmbeddingRetryOnceUnscoped(limit, targetMemoryIds));
+  }
+
+  private async runEmbeddingRetryOnceUnscoped(
     limit: number,
     targetMemoryIds?: readonly string[]
   ): Promise<EmbeddingRetryRunSummary> {

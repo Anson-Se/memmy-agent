@@ -30,6 +30,7 @@ let db: DatabaseSync | undefined;
 let tempDir: string | undefined;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   db?.close();
   db = undefined;
   if (tempDir) {
@@ -671,14 +672,7 @@ describe("agent source service", () => {
     await service.scanAll();
 
     expect(enqueueCalls).toEqual([["memory-cursor", "memory-custom"]]);
-    expect(workerCalls).toEqual([
-      expect.objectContaining({
-        limit: 1,
-        targetMemoryIds: ["memory-cursor", "memory-custom"],
-        priorityCohortOnly: true,
-        timeoutMs: 2_400_000
-      })
-    ]);
+    expect(workerCalls).toEqual([]);
   });
 
   it("reconciles summary progress when another worker finishes the scan memories", async () => {
@@ -734,67 +728,43 @@ describe("agent source service", () => {
       }
     })).resolves.toEqual([]);
 
-    expect(workerTargets).toEqual([["memory-a", "memory-b"]]);
-    expect(workerLimits).toEqual([1]);
-    expect(workerPriorityCohorts).toEqual([true]);
+    expect(workerTargets).toEqual([]);
+    expect(workerLimits).toEqual([]);
+    expect(workerPriorityCohorts).toEqual([]);
     expect(progress).toEqual([
       { current: 0, total: 2 },
       { current: 2, total: 2 }
     ]);
   });
 
-  it("emits persisted summary progress while the worker call remains pending", async () => {
+  it("polls persisted progress while the shared scheduler works without starting its own worker", async () => {
     const baseMemoryClient = createMockMemoryClient();
-    let releaseWorker = () => undefined;
-    let workerSettled = false;
-    const workerGate = new Promise<void>((resolve) => {
-      releaseWorker = resolve;
+    const runWorker = vi.fn(async (input: Parameters<MemoryClient["runWorker"]>[0]) => baseMemoryClient.runWorker(input));
+    let polls = 0;
+    const getMemoryProcessingStatus = vi.fn(async (memoryIds: string[]) => {
+      polls += 1;
+      return {
+        items: memoryIds.map((memoryId) => ({
+          memoryId,
+          state: polls === 1 ? "summary_pending" as const : "ready" as const,
+          attemptCount: 0, manualRetryCount: 0, retryAction: "none" as const,
+          updatedAt: "2026-05-28T10:00:00.000Z"
+        })),
+        serverTime: "2026-05-28T10:00:00.000Z"
+      };
     });
-    const service = createService({
-      memoryClient: {
-        ...baseMemoryClient,
-        async enqueueImportSummaries(memoryIds) {
-          return { enqueued: memoryIds?.length ?? 0, memoryIds: memoryIds ?? [], serverTime: "2026-05-28T10:00:00.000Z" };
-        },
-        async runWorker(input) {
-          await workerGate;
-          workerSettled = true;
-          return baseMemoryClient.runWorker(input);
-        },
-        async getMemoryProcessingStatus(memoryIds) {
-          return {
-            items: memoryIds.map((memoryId) => ({
-              memoryId,
-              state: "ready" as const,
-              stage: null,
-              activeJobId: null,
-              attemptCount: 1,
-              manualRetryCount: 0,
-              retryAction: "retry" as const,
-              errorCode: null,
-              errorMessage: null,
-              failedAt: null,
-              updatedAt: "2026-05-28T10:00:00.000Z"
-            })),
-            serverTime: "2026-05-28T10:00:00.000Z"
-          };
-        }
-      }
-    });
+    const service = createService({ memoryClient: {
+      ...baseMemoryClient, runWorker, getMemoryProcessingStatus
+    } });
     const progress: number[] = [];
-    const processing = service.processImportSummaries(["memory-a"], {
+    await expect(service.processImportSummaries(["memory-a"], {
       onProgress(event) {
         if (event.phase === "summarize") progress.push(event.current);
       }
-    });
-
-    try {
-      await vi.waitFor(() => expect(progress).toContain(1), { timeout: 1_000, interval: 25 });
-      expect(workerSettled).toBe(false);
-    } finally {
-      releaseWorker();
-      await processing;
-    }
+    })).resolves.toEqual([]);
+    expect(progress).toEqual([0, 0, 1]);
+    expect(getMemoryProcessingStatus).toHaveBeenCalledTimes(2);
+    expect(runWorker).not.toHaveBeenCalled();
   });
 
   it("finishes an empty owned-memory batch without starting the worker", async () => {
@@ -871,7 +841,46 @@ describe("agent source service", () => {
 
     expect(enqueueCalls.map((ids) => ids.length)).toEqual([100, 100, 5]);
     expect(statusCalls.map((ids) => ids.length)).toEqual([100, 100, 5]);
-    expect(workerTargets).toEqual(statusCalls);
+    expect(workerTargets).toEqual([]);
+  });
+
+  it("cancels a status waiter without issuing a worker call or waiting for the next poll", async () => {
+    const baseMemoryClient = createMockMemoryClient();
+    const controller = new AbortController();
+    const runWorker = vi.fn(baseMemoryClient.runWorker);
+    const getMemoryProcessingStatus = vi.fn(async () => ({
+      items: [{ memoryId: "memory-waiting", state: "summary_pending" as const,
+        attemptCount: 0, manualRetryCount: 0, retryAction: "none" as const,
+        updatedAt: "2026-05-28T10:00:00.000Z" }],
+      serverTime: "2026-05-28T10:00:00.000Z"
+    }));
+    const service = createService({ memoryClient: { ...baseMemoryClient, runWorker, getMemoryProcessingStatus } });
+    await expect(service.processImportSummaries(["memory-waiting"], {
+      signal: controller.signal,
+      onProgress(event) {
+        if (event.phase === "summarize" && getMemoryProcessingStatus.mock.calls.length > 0) controller.abort();
+      }
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(runWorker).not.toHaveBeenCalled();
+    expect(getMemoryProcessingStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("times out when a shared task remains pending without durable progress", async () => {
+    const baseMemoryClient = createMockMemoryClient();
+    let clock = 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const runWorker = vi.fn(baseMemoryClient.runWorker);
+    const service = createService({ memoryClient: { ...baseMemoryClient, runWorker,
+      async getMemoryProcessingStatus() {
+        clock += 2_400_000;
+        return { items: [{ memoryId: "memory-waiting", state: "embedding_pending" as const,
+          attemptCount: 0, manualRetryCount: 0, retryAction: "none" as const,
+          updatedAt: "2026-05-28T10:00:00.000Z" }], serverTime: "2026-05-28T10:00:00.000Z" };
+      }
+    } });
+    await expect(service.processImportSummaries(["memory-waiting"]))
+      .rejects.toThrow("Timed out waiting for 1 imported memories to finish indexing");
+    expect(runWorker).not.toHaveBeenCalled();
   });
 
   it("treats a terminal processing failure as completed progress and reports its reason", async () => {
