@@ -10,6 +10,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <exception>
+#pragma comment(lib, "user32.lib")
 
 static const char *stage = "startup";
 static void trace(const char *value) {
@@ -20,7 +21,7 @@ static void invalidParameter(const wchar_t *expression, const wchar_t *function,
     (void)reserved;
     fwprintf(stderr, L"LibreOfficeKit CRT parameter failure at %hs: %ls %ls %ls:%u\n", stage,
         function ? function : L"?", expression ? expression : L"?", file ? file : L"?", line);
-    fflush(stderr); ExitProcess(2);
+    fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
 }
 
 typedef struct Kit Kit;
@@ -87,6 +88,14 @@ static int convert(int argc, wchar_t **argv) {
     if (!GetModuleFileNameW(NULL, directory, 32768)) return error(NULL, "module path");
     base = wcsrchr(directory, L'\\'); if (!base) return 2;
     directory[base - directory] = 0;
+    trace("checking private desktop");
+    WNDCLASSW probe = {};
+    probe.lpfnWndProc = DefWindowProcW; probe.hInstance = GetModuleHandleW(NULL); probe.lpszClassName = L"MemmyOfficeHeadlessProbe";
+    if (!RegisterClassW(&probe)) return error(NULL, "desktop window class");
+    HWND window = CreateWindowExW(0, probe.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, NULL, NULL, probe.hInstance, NULL);
+    if (!window) return error(NULL, "private desktop window");
+    DestroyWindow(window); UnregisterClassW(probe.lpszClassName, probe.hInstance);
+    trace("private desktop ready");
     trace("loading engine");
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
     if (!AddDllDirectory(directory)) return error(NULL, "DLL directory");
@@ -140,5 +149,8 @@ int wmain(int argc, wchar_t **argv) {
     try { return convert(argc, argv); }
     catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage, failure.what()); }
     catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage); }
+    // Engine initialization may leave a worker holding a DLL lock. A failed
+    // short-lived conversion must not hang in CRT/DLL process-detach cleanup.
+    fflush(stderr); TerminateProcess(GetCurrentProcess(), 1);
     return 1;
 }

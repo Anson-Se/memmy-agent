@@ -2,6 +2,15 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+async function diagnosticPrefix(file) {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(8192);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally { await handle.close(); }
+}
+
 // File-backed stdio also works in Windows AppContainer with Electron's libuv,
 // whose child-process pipes use an unsupported global named-pipe namespace.
 export async function runProcess(command, args, { cwd, env, input = "", timeout = 120000, maxOutput = 8 * 1024 * 1024, children }) {
@@ -30,7 +39,11 @@ export async function runProcess(command, args, { cwd, env, input = "", timeout 
     }, 100);
     const result = await exit;
     trace(`exited ${result.code ?? result.signal}`);
-    if (failure) throw failure;
+    if (failure) {
+      const diagnostic = await diagnosticPrefix(files[2]);
+      failure.message = `${path.basename(command)}: ${failure.message}${diagnostic ? `: ${diagnostic}` : ""}`;
+      throw failure;
+    }
     const sizes = await Promise.all(handles.slice(1).map(handle => handle.stat()));
     if (sizes.some(info => info.size > maxOutput)) throw new Error("Tool output exceeded limit");
     return { ...result, stdout: await fs.readFile(files[1], "utf8"), stderr: (await fs.readFile(files[2], "utf8")).slice(0, 8192) };

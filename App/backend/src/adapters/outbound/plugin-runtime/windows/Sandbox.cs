@@ -22,6 +22,7 @@ namespace Memmy {
     }
     [StructLayout(LayoutKind.Sequential)] struct StartupInfoEx { public StartupInfo info; public IntPtr attributes; }
     [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process, thread; public uint processId, threadId; }
+    [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes { public int length; public IntPtr descriptor; [MarshalAs(UnmanagedType.Bool)] public bool inherit; }
     [StructLayout(LayoutKind.Sequential)] struct BasicJobLimit {
       public long perProcessTime, perJobTime; public uint flags;
       public UIntPtr minWorkingSet, maxWorkingSet; public uint activeProcessLimit;
@@ -35,6 +36,14 @@ namespace Memmy {
     [DllImport("userenv.dll", CharSet=CharSet.Unicode)] static extern int CreateAppContainerProfile(string name, string display, string description, IntPtr caps, uint count, out IntPtr sid);
     [DllImport("userenv.dll", CharSet=CharSet.Unicode)] static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
     [DllImport("advapi32.dll")] static extern IntPtr FreeSid(IntPtr sid);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string value, uint revision, out IntPtr descriptor, IntPtr size);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateWindowStationW(string name, uint flags, uint access, ref SecurityAttributes attributes);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SetProcessWindowStation(IntPtr station);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateDesktopW(string name, string device, IntPtr mode, uint flags, uint access, ref SecurityAttributes attributes);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("user32.dll")] static extern bool CloseWindowStation(IntPtr station);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref UIntPtr size);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, UIntPtr attribute, IntPtr value, UIntPtr size, IntPtr previous, IntPtr returned);
     [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
@@ -59,6 +68,28 @@ namespace Memmy {
     }
     static void Trace(string stage) {
       if (Environment.GetEnvironmentVariable("MEMMY_SANDBOX_TRACE") == "1") Console.Error.WriteLine("Memmy AppContainer: " + stage);
+    }
+
+    static string IsolatedDesktop(SecurityIdentifier identity, out IntPtr station, out IntPtr desktop) {
+      station = IntPtr.Zero; desktop = IntPtr.Zero;
+      IntPtr descriptor = IntPtr.Zero, previous = GetProcessWindowStation();
+      string name = "Memmy_" + Guid.NewGuid().ToString("N");
+      // A private, non-interactive window station lets rendering libraries use
+      // GDI/internal windows without access to the user's desktop or clipboard.
+      string owner = WindowsIdentity.GetCurrent().User.Value;
+      string security = "D:(A;;GA;;;SY)(A;;GA;;;" + owner + ")(A;;GA;;;" + identity.Value + ")S:(ML;;NW;;;LW)";
+      try {
+        Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(security, 1, out descriptor, IntPtr.Zero), "Private desktop security");
+        var attributes = new SecurityAttributes { length = Marshal.SizeOf(typeof(SecurityAttributes)), descriptor = descriptor, inherit = false };
+        station = CreateWindowStationW(name, 0, 0x10000000, ref attributes);
+        Check(station != IntPtr.Zero, "CreateWindowStationW");
+        Check(SetProcessWindowStation(station), "SetProcessWindowStation");
+        try {
+          desktop = CreateDesktopW("Office", null, IntPtr.Zero, 0, 0x10000000, ref attributes);
+          Check(desktop != IntPtr.Zero, "CreateDesktopW");
+        } finally { Check(SetProcessWindowStation(previous), "Restore window station"); }
+        return name + "\\Office";
+      } finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
     }
     static string Quote(string value) {
       var result = new StringBuilder("\""); int slashes = 0;
@@ -87,7 +118,7 @@ namespace Memmy {
 
     public static int Run(string profile, string command, string[] args, string cwd, string[] readRoots, string[] writeRoots, Dictionary<string, string> environment) {
       if (!profile.StartsWith("memmy.plugin.", StringComparison.Ordinal) || !Path.IsPathRooted(command) || !File.Exists(command)) throw new ArgumentException("Invalid sandbox launch plan");
-      IntPtr sid = IntPtr.Zero, attributes = IntPtr.Zero, capsPointer = IntPtr.Zero, handlesPointer = IntPtr.Zero, job = IntPtr.Zero, environmentPointer = IntPtr.Zero;
+      IntPtr sid = IntPtr.Zero, attributes = IntPtr.Zero, capsPointer = IntPtr.Zero, handlesPointer = IntPtr.Zero, job = IntPtr.Zero, environmentPointer = IntPtr.Zero, station = IntPtr.Zero, desktop = IntPtr.Zero;
       var inherited = new List<IntPtr>(); var process = new ProcessInfo(); bool resumed = false, attributesInitialized = false;
       try {
         Trace("creating profile");
@@ -123,6 +154,8 @@ namespace Memmy {
         for (int i=0; i<inherited.Count; i++) Marshal.WriteIntPtr(handlesPointer, i * IntPtr.Size, inherited[i]);
         Check(UpdateProcThreadAttribute(attributes, 0, new UIntPtr(0x00020002), handlesPointer, new UIntPtr((uint)(IntPtr.Size * inherited.Count)), IntPtr.Zero, IntPtr.Zero));
         var startup = new StartupInfoEx(); startup.info.cb = Marshal.SizeOf(typeof(StartupInfoEx));
+        Trace("creating private desktop");
+        startup.info.desktop = IsolatedDesktop(identity, out station, out desktop);
         startup.info.flags = 0x100; startup.info.stdin = inherited[0]; startup.info.stdout = inherited[1]; startup.info.stderr = inherited[2]; startup.attributes = attributes;
         var line = new StringBuilder(Quote(command)); foreach (var arg in args) line.Append(' ').Append(Quote(arg));
         job = CreateJobObject(IntPtr.Zero, null); Check(job != IntPtr.Zero);
@@ -161,6 +194,8 @@ namespace Memmy {
         if (capsPointer != IntPtr.Zero) Marshal.FreeHGlobal(capsPointer);
         if (handlesPointer != IntPtr.Zero) Marshal.FreeHGlobal(handlesPointer);
         if (environmentPointer != IntPtr.Zero) Marshal.FreeHGlobal(environmentPointer);
+        if (desktop != IntPtr.Zero) CloseDesktop(desktop);
+        if (station != IntPtr.Zero) CloseWindowStation(station);
         if (sid != IntPtr.Zero) FreeSid(sid);
       }
     }

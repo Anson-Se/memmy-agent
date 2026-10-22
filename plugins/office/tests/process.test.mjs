@@ -18,7 +18,7 @@ test("file-backed subprocess stdio transports input, output, diagnostics and exi
 });
 test("file-backed subprocesses enforce deadlines and remove temporary transport files", async t => {
   const config = await options(t);
-  await assert.rejects(runProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"], { ...config, timeout: 200 }), /timed out/);
+  await assert.rejects(runProcess(process.execPath, ["-e", "console.error('engine initialization blocked');setInterval(()=>{},1000)"], { ...config, timeout: 1000 }), /timed out: engine initialization blocked/);
   assert.equal(config.children.size, 0); assert.deepEqual(await readdir(config.cwd), []);
 });
 test("file-backed subprocesses reject oversized output", async t => {
