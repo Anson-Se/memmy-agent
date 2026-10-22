@@ -30,6 +30,29 @@ export async function withMemmateReadPath<T>(path: string, read: () => Promise<T
   }
 }
 
+class MemmatePathDeniedError extends Error {}
+
+/** One batch owns its skipped-path count; a denied root never becomes a partial success. */
+export class MemmateReadBatch {
+  deniedPaths = 0;
+  constructor(private readonly root: string) {}
+
+  async read<T>(path: string, read: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await withMemmateReadPath(path, read);
+    } catch (error) {
+      if (path === this.root || !(error instanceof MemmatePathDeniedError)) throw error;
+      this.deniedPaths += 1;
+      return undefined;
+    }
+  }
+
+  format(result: string): string {
+    if (!this.deniedPaths) return result;
+    return `Partial results: skipped ${this.deniedPaths} denied path(s). The results below cover authorized paths only; counts are not the directory total. Do not retry denied paths. Other authorized files remain usable.\n\n${result}`;
+  }
+}
+
 export function memmatePermissionRequired(): boolean {
   return process.env.MEMMATE_PERMISSION_REQUIRED === "1";
 }
@@ -82,8 +105,14 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
   });
   if (!response.ok) throw new Error("MemMate approval service is unavailable");
   const result = await response.json() as { decision?: string; reason?: string; result?: unknown };
-  if (result.decision !== "allow") throw new Error(`MemMate denied this operation: ${result.reason ?? "denied"}`);
   if (!scope.active || scope.signal.aborted || signal?.aborted) throw new Error("MemMate run has ended");
+  if (result.decision !== "allow") {
+    const message = `MemMate denied this operation: ${result.reason ?? "denied"}`;
+    if (result.decision === "deny" && ["operator_rejected", "denied_by_policy", "policy_denied", "unconfigured_deny"].includes(result.reason ?? "")) {
+      throw new MemmatePathDeniedError(message);
+    }
+    throw new Error(message);
+  }
   if (name === "web_fetch" && typeof result.result !== "string") throw new Error("MemMate web execution result is missing");
   return { args: approvedArgs, ...(typeof result.result === "string" ? { result: result.result } : {}) };
 }
