@@ -10,11 +10,12 @@
 #include <string.h>
 #include <wchar.h>
 #include <exception>
+#include <atomic>
 #include <dbghelp.h>
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "dbghelp.lib")
 
-static const char *stage = "startup";
+static std::atomic<const char *> stage{"startup"};
 static LONG exceptionCount = 0;
 static LONG CALLBACK diagnosticException(EXCEPTION_POINTERS *exception) {
     if (exception->ExceptionRecord->ExceptionCode != 0xe06d7363 || InterlockedIncrement(&exceptionCount) > 128) return EXCEPTION_CONTINUE_SEARCH;
@@ -29,7 +30,7 @@ static LONG CALLBACK diagnosticException(EXCEPTION_POINTERS *exception) {
             if (types[0] && types[0] < 128) {
                 const DWORD *type = (const DWORD *)(image + types[1]);
                 const char *name = (const char *)(image + type[1] + 2 * sizeof(void *));
-                fprintf(stderr, "LibreOfficeKit C++ exception at %s: %.500s", stage, name);
+                fprintf(stderr, "LibreOfficeKit C++ exception at %s: %.500s", stage.load(), name);
                 if (strstr(name, "@sun@com@@") && args[1]) {
                     // UNO exception classes are non-polymorphic: Message is
                     // the first member, with no preceding vtable pointer.
@@ -53,7 +54,7 @@ static void trace(const char *value) {
 }
 static void invalidParameter(const wchar_t *expression, const wchar_t *function, const wchar_t *file, unsigned line, uintptr_t reserved) {
     (void)reserved;
-    fwprintf(stderr, L"LibreOfficeKit CRT parameter failure at %hs: %ls %ls %ls:%u\n", stage,
+    fwprintf(stderr, L"LibreOfficeKit CRT parameter failure at %hs: %ls %ls %ls:%u\n", stage.load(),
         function ? function : L"?", expression ? expression : L"?", file ? file : L"?", line);
     fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
 }
@@ -67,7 +68,7 @@ static DWORD WINAPI diagnoseStartup(void *thread) {
     BOOL captured = GetThreadContext((HANDLE)thread, &context);
     ResumeThread((HANDLE)thread);
     if (!captured) return 0;
-    fprintf(stderr, "LibreOfficeKit startup stack at %s:\n", stage);
+    fprintf(stderr, "LibreOfficeKit startup stack at %s:\n", stage.load());
     STACKFRAME64 frame = {};
 #if defined(_M_ARM64)
     DWORD machine = IMAGE_FILE_MACHINE_ARM64;
@@ -181,6 +182,10 @@ static int convert(int argc, wchar_t **argv) {
     // rasterization before loading its CRT/engine, avoiding GPU enumeration
     // and graphics-driver initialization inside the restricted container.
     SetEnvironmentVariableW(L"SAL_SKIA", L"raster");
+    // This worker performs synchronous load/save calls and has no interactive
+    // event loop. Initialize VCL on this thread rather than waiting for the
+    // desktop application's background startup/RequestHandler handshake.
+    SetEnvironmentVariableW(L"SAL_LOK_OPTIONS", L"unipoll");
     SetEnvironmentVariableW(L"SAL_USE_VCLPLUGIN", L"svp");
     SetEnvironmentVariableW(L"SAL_DISABLE_OPENCL", L"1");
     trace("checking private desktop");
@@ -248,8 +253,8 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
     try { return convert(argc, argv); }
-    catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage, failure.what()); }
-    catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage); }
+    catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage.load(), failure.what()); }
+    catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage.load()); }
     // Engine initialization may leave a worker holding a DLL lock. A failed
     // short-lived conversion must not hang in CRT/DLL process-detach cleanup.
     fflush(stderr); TerminateProcess(GetCurrentProcess(), 1);
