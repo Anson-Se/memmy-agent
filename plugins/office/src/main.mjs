@@ -166,7 +166,7 @@ async function command(name, args, directory) {
     });
     child.stderr.on("data", bytes => { if (errors.length < 8192) errors += bytes; });
     child.once("error", done);
-    child.once("close", code => done(code === 0 ? null : fail("office_conversion_failed", `${name} failed (${code}): ${errors}`)));
+    child.once("close", code => done(code === 0 ? null : fail("office_conversion_failed", `${name} failed (${code}): ${errors || output || "no diagnostic output"}`)));
   });
 }
 async function convertFile(input, outputDir, format, csv) {

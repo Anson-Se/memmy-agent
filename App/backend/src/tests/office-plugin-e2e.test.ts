@@ -106,7 +106,7 @@ describe("Office MPP end to end", () => {
       const result = await client.callTool({ name: toolName(id), arguments: args, _meta: { "memmy.dev/session-key": "office-e2e" } });
       const text = (result.content as Array<{ type: string; text?: string }>).find(c => c.type === "text")?.text ?? "";
       if (expectedError) { expect(result.isError).toBe(true); expect(text).toContain(expectedError); return {}; }
-      expect(result.isError, text).not.toBe(true);
+      expect(result.isError, `${id}: ${text}`).not.toBe(true);
       const output = JSON.parse(text); results.push(output);
       if (id === "office_review_page") expect((result.content as Array<{ type: string }>).some(c => c.type === "image")).toBe(true);
       return output;

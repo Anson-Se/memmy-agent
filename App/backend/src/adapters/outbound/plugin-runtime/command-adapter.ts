@@ -202,6 +202,13 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
         stdio: ["pipe", "pipe", "pipe"]
       });
       session.children.set(call.callId, child);
+      // A write callback does not consume the stream's separate error event.
+      // Cancellation or an early plugin exit can close stdin during a reply.
+      let inputError: Error | undefined;
+      child.stdin.on("error", (error: Error) => {
+        inputError = error;
+        terminate(child);
+      });
       child.once("close", () => abortHostServices(session, call.callId));
       if (session.config.inputMode === "stdin-json") child.stdin.write(`${request}\n`);
       if (!session.config.interactive) child.stdin.end();
@@ -285,6 +292,7 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
         }
         const { code, signal } = await exit;
         if (timedOut) throw Object.assign(new Error("Plugin command timed out"), { code: "plugin_timeout" });
+        if (inputError) throw inputError;
         if (code !== 0) throw new Error(`Plugin command exited with ${code ?? signal}: ${stderr.trim() || "no stderr"}`);
         if (jsonOutput) {
           const output = JSON.parse(jsonOutput.toString("utf8"));

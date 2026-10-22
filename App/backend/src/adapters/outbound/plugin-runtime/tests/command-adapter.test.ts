@@ -296,6 +296,35 @@ describe("CommandPluginAdapter", () => {
     await expect(pending).rejects.toBeDefined();
   });
 
+  it("reports a closed response pipe as a call failure without an uncaught stream error", async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const adapter = createCommandPluginAdapter({
+      hostServices: { invoke },
+      buildLaunch: async () => ({
+        command: process.execPath,
+        args: ["-e", `
+          require('node:readline').createInterface({input:process.stdin}).once('line', () => {
+            require('node:fs').closeSync(0);
+            console.log(JSON.stringify({type:'host-service-request',requestId:'closed-pipe',service:'model-inference',input:{}}));
+            setInterval(() => {}, 1000);
+          });
+        `], cwd: root!
+      })
+    });
+    const pluginContext = context("ndjson");
+    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, interactive: true };
+    const permission = { type: "host-service" as const, services: ["model-inference"] };
+    pluginContext.plugin.manifest.permissions = [permission];
+    pluginContext.plugin.approvedPermissions = [permission];
+    const session = await adapter.activate(pluginContext);
+    try {
+      await expect(collect(adapter.invoke(session, {
+        callId: "call-closed-pipe", pluginId: pluginContext.plugin.id, capabilityId: "run", conversationId: "conversation-1", input: {}
+      }))).rejects.toMatchObject({ code: "EPIPE" });
+      expect(invoke).toHaveBeenCalledOnce();
+    } finally { await adapter.deactivate(session); }
+  });
+
   it("denies unapproved Host-service requests without invoking the service", async () => {
     const invoke = vi.fn();
     const adapter = createCommandPluginAdapter({
