@@ -120,6 +120,21 @@ static char *utf8(const wchar_t *value) {
     if (!size || !result || !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, result, size, NULL, NULL)) return NULL;
     return result;
 }
+static void setEnvironment(const wchar_t *name, const wchar_t *value) {
+    // SetEnvironmentVariable does not update an already initialized CRT's
+    // getenv snapshot. Our /MT wrapper and LibreOffice's shared UCRT each own
+    // a copy; configure both before engine initialization.
+    if (_wputenv_s(name, value) != 0) TerminateProcess(GetCurrentProcess(), 2);
+    HMODULE crt = GetModuleHandleW(L"ucrtbase.dll");
+    if (crt) {
+        typedef int (__cdecl *PutEnvironment)(const wchar_t *, const wchar_t *);
+        PutEnvironment put = (PutEnvironment)(void *)GetProcAddress(crt, "_wputenv_s");
+        if (!put || put(name, value) != 0) {
+            fwprintf(stderr, L"Cannot configure LibreOffice runtime environment: %ls\n", name);
+            fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
+        }
+    }
+}
 static char *fileUrl(const wchar_t *value) {
     char *bytes = utf8(value), *result, *out;
     const unsigned char *p;
@@ -166,28 +181,28 @@ static int convert(int argc, wchar_t **argv) {
     if (!CreateDirectoryW(roaming, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return error(NULL, "roaming profile directory");
     // Windows libraries expect these variables even with UserInstallation set.
     // Initialize them before loading the engine/its CRT, using only task storage.
-    SetEnvironmentVariableW(L"USERPROFILE", working);
-    SetEnvironmentVariableW(L"LOCALAPPDATA", local);
-    SetEnvironmentVariableW(L"APPDATA", roaming);
+    setEnvironment(L"USERPROFILE", working);
+    setEnvironment(L"LOCALAPPDATA", local);
+    setEnvironment(L"APPDATA", roaming);
     // These bootstrap overrides precede Windows Known Folder lookups. The
     // container must not depend on access to the user's Documents/AppData.
-    SetEnvironmentVariableW(L"SYSUSERHOME", profile);
-    SetEnvironmentVariableW(L"SYSUSERCONFIG", profile);
+    setEnvironment(L"SYSUSERHOME", profile);
+    setEnvironment(L"SYSUSERCONFIG", profile);
     if (working[1] == L':') {
         wchar_t drive[3] = { working[0], L':', 0 };
-        SetEnvironmentVariableW(L"HOMEDRIVE", drive);
-        SetEnvironmentVariableW(L"HOMEPATH", working + 2);
+        setEnvironment(L"HOMEDRIVE", drive);
+        setEnvironment(L"HOMEPATH", working + 2);
     }
     // The Windows VCL backend uses Skia even in headless mode. Select CPU
     // rasterization before loading its CRT/engine, avoiding GPU enumeration
     // and graphics-driver initialization inside the restricted container.
-    SetEnvironmentVariableW(L"SAL_SKIA", L"raster");
+    setEnvironment(L"SAL_SKIA", L"raster");
     // This worker performs synchronous load/save calls and has no interactive
     // event loop. Initialize VCL on this thread rather than waiting for the
     // desktop application's background startup/RequestHandler handshake.
-    SetEnvironmentVariableW(L"SAL_LOK_OPTIONS", L"unipoll");
-    SetEnvironmentVariableW(L"SAL_USE_VCLPLUGIN", L"svp");
-    SetEnvironmentVariableW(L"SAL_DISABLE_OPENCL", L"1");
+    setEnvironment(L"SAL_LOK_OPTIONS", L"unipoll");
+    setEnvironment(L"SAL_USE_VCLPLUGIN", L"svp");
+    setEnvironment(L"SAL_DISABLE_OPENCL", L"1");
     trace("checking private desktop");
     WNDCLASSW probe = {};
     probe.lpfnWndProc = DefWindowProcW; probe.hInstance = GetModuleHandleW(NULL); probe.lpszClassName = L"MemmyOfficeHeadlessProbe";
@@ -244,7 +259,7 @@ int wmain(int argc, wchar_t **argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_invalid_parameter_handler(invalidParameter);
     if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", NULL, 0)) {
-        SetEnvironmentVariableW(L"SAL_LOG", L"+WARN");
+        setEnvironment(L"SAL_LOG", L"+WARN");
         AddVectoredExceptionHandler(1, diagnosticException);
         HANDLE current = NULL;
         if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &current, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
