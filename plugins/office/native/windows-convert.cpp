@@ -135,6 +135,12 @@ static int convert(int argc, wchar_t **argv) {
         SetEnvironmentVariableW(L"HOMEDRIVE", drive);
         SetEnvironmentVariableW(L"HOMEPATH", working + 2);
     }
+    // The Windows VCL backend uses Skia even in headless mode. Select CPU
+    // rasterization before loading its CRT/engine, avoiding GPU enumeration
+    // and graphics-driver initialization inside the restricted container.
+    SetEnvironmentVariableW(L"SAL_SKIA", L"raster");
+    SetEnvironmentVariableW(L"SAL_USE_VCLPLUGIN", L"svp");
+    SetEnvironmentVariableW(L"SAL_DISABLE_OPENCL", L"1");
     trace("checking private desktop");
     WNDCLASSW probe = {};
     probe.lpfnWndProc = DefWindowProcW; probe.hInstance = GetModuleHandleW(NULL); probe.lpszClassName = L"MemmyOfficeHeadlessProbe";
@@ -164,8 +170,6 @@ static int convert(int argc, wchar_t **argv) {
     if (!initialize) return error(NULL, "entrypoint");
     install = utf8(directory); user = utf8(profile); source = fileUrl(input);
     if (!install || !user || !source) return 2;
-    SetEnvironmentVariableW(L"SAL_USE_VCLPLUGIN", L"svp");
-    SetEnvironmentVariableW(L"SAL_DISABLE_OPENCL", L"1");
     trace("initializing engine");
     kit = initialize(install, user);
     free(install); free(user);
