@@ -59,18 +59,20 @@ jobs:
           $root = Get-ChildItem $unpacked -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'Library/bin/pdfinfo.exe') } | Select-Object -First 1
           if (!$root) { throw 'Poppler portable layout not found' }
           "OFFICE_BUILD_POPPLER=$($root.FullName)" >> $env:GITHUB_ENV
+      - name: Install plugin build dependencies
+        run: npm ci --prefix plugins/office
+      - name: Prepare and smoke-test portable renderer
+        run: node plugins/office/scripts/prepare-runtime.mjs "$RUNNER_TEMP/office-runtime-tree"
       - name: Install build dependencies
         run: |
           npm ci
           npm install --prefix App/memmy-agent --ignore-scripts --no-audit --no-fund
-          npm ci --prefix plugins/office
           npm run build -w @memmy/local-api-contracts
           npm run build -w @memmy/knowledge
           npm run build -w @memmy/agent-source-core
           npm run build -w @memmy/migrations
       - name: Build portable runtime archive
         run: |
-          node plugins/office/scripts/prepare-runtime.mjs "$RUNNER_TEMP/office-runtime-tree"
           TARGET=$(node -p 'process.platform + "-" + process.arch')
           node plugins/office/scripts/package-runtime.mjs --root "$RUNNER_TEMP/office-runtime-tree" --destination plugins/office/release --target "$TARGET" --version "ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --tools "$RUNNER_TEMP/office-runtime-tree/runtime-tools.json" --set-default
       - name: Verify runtime and permission boundaries
