@@ -500,6 +500,14 @@ describe("GitHub Draft Release v2 workflow", () => {
     );
   });
 
+  it("retries and validates per-commit GitHub PR metadata before building the snapshot", () => {
+    const snapshot = draftScript("Build complete release change snapshot");
+    expect(snapshot).toContain("PR_" + "$" + "{commit_sha}.json");
+    expect(snapshot).toContain("for attempt in 1 2 3");
+    expect(snapshot).toContain("jq -e -s");
+    expect(snapshot).toContain("Could not fetch valid associated PRs for commit");
+    expect(snapshot).toContain("sleep \"$((attempt * 2))\"");
+  });
   it("cleans up a half-created Draft Release if asset upload fails", () => {
     const create = draftScript("Create draft release and upload every asset");
     expect(create).toContain("cleanup_draft_release()");
