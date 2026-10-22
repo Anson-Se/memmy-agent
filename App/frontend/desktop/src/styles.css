@@ -3064,6 +3064,21 @@ body.memmy-thread-panel-fullscreen .app-frame-main {
   padding: 8px 24px 32px;
 }
 
+.agent-activity-output-file {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 100%;
+  font-size: 13px;
+}
+.agent-activity-output-file__notice { margin-top: 6px; font-size: 12px; opacity: .65; }
+.thread-preview__paged { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; }
+.thread-preview__text-pager { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 8px; padding: 8px 12px; font-size: 12px; }
+.thread-preview__text-pager button { flex-shrink: 0; white-space: nowrap; }
+.thread-preview__text-pager span { flex-basis: 100%; opacity: .65; }
+.thread-preview__text-page { flex: 1 1 auto; min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; font-size: 13px; }
+
 .thread-preview__code,
 .thread-preview__table-wrap {
   min-height: 0;
