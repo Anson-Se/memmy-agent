@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ describe.runIf(process.platform === "win32")("Windows AppContainer", () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "memmy-win-sandbox-"))); roots.push(root);
     const allowed = join(root, "allowed"), denied = join(root, "private");
     await mkdir(allowed); await mkdir(denied); await writeFile(join(denied, "secret.txt"), "private");
+    const node = await isolatedNode(root);
     const server = createServer(socket => socket.end("forbidden"));
     await new Promise<void>(ok => server.listen(0, "127.0.0.1", ok));
     try {
@@ -23,21 +24,23 @@ describe.runIf(process.platform === "win32")("Windows AppContainer", () => {
         try{fs.writeFileSync(${JSON.stringify(join(denied, "escape.txt"))},'escape');write=true}catch{}
         fs.writeFileSync(${JSON.stringify(join(allowed, "ok.txt"))},'ok');
         const descendant=cp.spawnSync(process.execPath,['-e',${JSON.stringify(`try{require('fs').readFileSync(${JSON.stringify(join(denied, "secret.txt"))});process.exit(9)}catch{process.exit(0)}`)}]);
-        const socket=net.connect(${port},'127.0.0.1');let done=false;const finish=network=>{if(done)return;done=true;socket.destroy();console.log(JSON.stringify({read,write,network,descendant:descendant.status}));};
+        const profileReady=require('path').win32.isAbsolute(process.env.LOCALAPPDATA||'');
+        const socket=net.connect(${port},'127.0.0.1');let done=false;const finish=network=>{if(done)return;done=true;socket.destroy();console.log(JSON.stringify({read,write,network,descendant:descendant.status,profileReady}));};
         socket.on('connect',()=>finish(true));socket.on('error',()=>finish(false));setTimeout(()=>finish(false),1500);`;
       await writeFile(join(allowed, "test.cjs"), code);
-      const plan = { profile: `memmy.plugin.test.${Date.now()}`, command: process.execPath, args: [join(allowed, "test.cjs")], cwd: allowed, readRoots: [await realpath(dirname(process.execPath))], writeRoots: [allowed] };
+      const plan = { profile: `memmy.plugin.test.${Date.now()}`, command: node, args: [join(allowed, "test.cjs")], cwd: allowed, readRoots: [dirname(node)], writeRoots: [allowed] };
       const result = await launch(plan);
       expect(result.code, result.errors).toBe(0);
-      expect(JSON.parse(result.output)).toEqual({ read: false, write: false, network: false, descendant: 0 });
+      expect(JSON.parse(result.output)).toEqual({ read: false, write: false, network: false, descendant: 0, profileReady: true });
     } finally { await new Promise<void>(ok => server.close(() => ok())); }
   }, 60000);
   it("kills the plugin and its descendants when the Host cancels the launcher", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "memmy-win-job-"))); roots.push(root);
+    const node = await isolatedNode(root);
     const tick = join(root, "tick.txt");
     const childCode = `setInterval(()=>require('fs').writeFileSync(${JSON.stringify(tick)},String(Date.now())),100)`;
     const parentCode = `const child=require('child_process').spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});console.log(child.pid);setInterval(()=>{},1000);`;
-    const plan = { profile: `memmy.plugin.job.${Date.now()}`, command: process.execPath, args: ["-e", parentCode], cwd: root, readRoots: [await realpath(dirname(process.execPath))], writeRoots: [root] };
+    const plan = { profile: `memmy.plugin.job.${Date.now()}`, command: node, args: ["-e", parentCode], cwd: root, readRoots: [dirname(node)], writeRoots: [root] };
     const child = spawnLauncher(plan); let errors = "";
     child.stderr.on("data", b => { errors += b; });
     try {
@@ -59,11 +62,20 @@ describe.runIf(process.platform === "win32")("Windows AppContainer", () => {
     } finally { child.kill(); }
   }, 60000);
 });
+async function isolatedNode(root: string) {
+  // Grant the actual interpreter, not the hosted tool cache's entire npm tree.
+  // Unique test profiles otherwise recursively rewrite thousands of shared ACLs.
+  const directory = join(root, "interpreter"); await mkdir(directory);
+  const executable = join(directory, "node.exe"); await copyFile(process.execPath, executable);
+  return executable;
+}
 async function launch(plan: unknown) {
   return await new Promise<{code: number | null; output: string; errors: string}>((ok, reject) => {
     const child = spawnLauncher(plan);
     let output = "", errors = ""; child.stdout.on("data", b => { output += b; }); child.stderr.on("data", b => { errors += b; });
-    child.once("error", reject); child.once("close", code => ok({code, output, errors})); child.stdin.end();
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`Sandbox launch timed out: ${errors}`)); }, 45000);
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("close", code => { clearTimeout(timer); ok({code, output, errors}); }); child.stdin.end();
   });
 }
 
@@ -73,6 +85,7 @@ function spawnLauncher(plan: unknown) {
   const helper = fileURLToPath(new URL("../windows/launch.ps1", import.meta.url));
   return spawn(join(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "-Plan", Buffer.from(JSON.stringify(plan)).toString("base64")], { stdio: ["pipe", "pipe", "pipe"], env: {
     SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
-    MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify({ SystemRoot: process.env.SystemRoot ?? "C:\\Windows", TEMP: tmpdir(), TMP: tmpdir(), ELECTRON_RUN_AS_NODE: "1" })).toString("base64")
+    MEMMY_SANDBOX_TRACE: "1",
+    MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify({ SystemRoot: process.env.SystemRoot ?? "C:\\Windows", LOCALAPPDATA: "untrusted-profile", TEMP: tmpdir(), TMP: tmpdir(), ELECTRON_RUN_AS_NODE: "1" })).toString("base64")
   } });
 }

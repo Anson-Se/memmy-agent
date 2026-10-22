@@ -57,6 +57,9 @@ namespace Memmy {
         throw new Win32Exception(code, operation + " failed (Win32 " + code + "): " + new Win32Exception(code).Message);
       }
     }
+    static void Trace(string stage) {
+      if (Environment.GetEnvironmentVariable("MEMMY_SANDBOX_TRACE") == "1") Console.Error.WriteLine("Memmy AppContainer: " + stage);
+    }
     static string Quote(string value) {
       var result = new StringBuilder("\""); int slashes = 0;
       foreach (char c in value) {
@@ -87,10 +90,12 @@ namespace Memmy {
       IntPtr sid = IntPtr.Zero, attributes = IntPtr.Zero, capsPointer = IntPtr.Zero, handlesPointer = IntPtr.Zero, job = IntPtr.Zero, environmentPointer = IntPtr.Zero;
       var inherited = new List<IntPtr>(); var process = new ProcessInfo(); bool resumed = false, attributesInitialized = false;
       try {
+        Trace("creating profile");
         int status = CreateAppContainerProfile(profile, "Memmy plugin", "Memmy isolated command plugin", IntPtr.Zero, 0, out sid);
         if (status == unchecked((int)0x800700B7)) status = DeriveAppContainerSidFromAppContainerName(profile, out sid);
         if (status < 0) Marshal.ThrowExceptionForHR(status);
         var identity = new SecurityIdentifier(sid);
+        Trace("granting approved roots");
         using (var mutex = new Mutex(false, "Local\\MemmyPluginSandboxPermissions")) {
           bool held = false;
           try {
@@ -100,6 +105,7 @@ namespace Memmy {
             foreach (var root in writeRoots) Grant(root, identity, true);
           } finally { if (held) mutex.ReleaseMutex(); }
         }
+        Trace("approved roots ready");
         foreach (int number in new int[] { -10, -11, -12 }) {
           IntPtr handle;
           Check(DuplicateHandle(GetCurrentProcess(), GetStdHandle(number), GetCurrentProcess(), out handle, 0, true, 2));
@@ -122,6 +128,13 @@ namespace Memmy {
         job = CreateJobObject(IntPtr.Zero, null); Check(job != IntPtr.Zero);
         var limits = new ExtendedJobLimit(); limits.basic.flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedJobLimit))));
+        // Windows also needs LOCALAPPDATA in an explicit environment block to
+        // construct the AppContainer process. Restoring only the launcher env
+        // is insufficient. Keep plugin values out of this OS bootstrap field.
+        environment = new Dictionary<string, string>(environment, StringComparer.OrdinalIgnoreCase);
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (String.IsNullOrEmpty(localAppData) || !Path.IsPathRooted(localAppData)) throw new InvalidOperationException("LocalApplicationData is unavailable");
+        environment["LOCALAPPDATA"] = localAppData;
         var variables = new List<string>(environment.Keys); variables.Sort(StringComparer.OrdinalIgnoreCase);
         var block = new StringBuilder();
         foreach (var key in variables) {
@@ -130,10 +143,12 @@ namespace Memmy {
           block.Append(key).Append('=').Append(value).Append('\0');
         }
         block.Append('\0'); environmentPointer = Marshal.StringToHGlobalUni(block.ToString());
+        Trace("creating child process");
         Check(CreateProcessW(command, line, IntPtr.Zero, IntPtr.Zero, true, 0x00080000 | 0x00000004 | 0x08000000 | 0x00000400, environmentPointer, cwd, ref startup, out process), "CreateProcessW(AppContainer)");
         Check(AssignProcessToJobObject(job, process.process));
         if (ResumeThread(process.thread) == uint.MaxValue) Check(false);
         resumed = true;
+        Trace("child running");
         if (WaitForSingleObject(process.process, uint.MaxValue) != 0) Check(false);
         uint exitCode; Check(GetExitCodeProcess(process.process, out exitCode)); return unchecked((int)exitCode);
       } finally {
