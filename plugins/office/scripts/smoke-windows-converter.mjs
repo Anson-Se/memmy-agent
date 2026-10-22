@@ -1,9 +1,11 @@
 /** Build-time test with a trusted generated document; never used for user files. */
 import { spawnSync } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import JSZip from "jszip";
 
 export async function smokeWindowsConverter(executable) {
@@ -25,5 +27,24 @@ export async function smokeWindowsConverter(executable) {
     if (result.error || result.status !== 0) throw new Error(`Windows renderer build smoke failed (${result.status}): ${result.error?.message ?? result.stderr}`);
     if (!(await readFile(join(output, "smoke.pdf"))).subarray(0, 5).equals(Buffer.from("%PDF-"))) throw new Error("Windows renderer smoke did not produce a PDF");
     console.log("Windows renderer build smoke passed");
+    // Fail before publishing if the same engine cannot start under the actual
+    // Host's AppContainer launcher. Only this trusted fixture runs in CI here.
+    await rm(join(output, "smoke.pdf"));
+    const launcher = fileURLToPath(new URL("../../../App/backend/src/adapters/outbound/plugin-runtime/windows/launch.ps1", import.meta.url));
+    const args = [`-env:UserInstallation=${pathToFileURL(profile).href}`, "--headless", "--convert-to", "pdf", "--outdir", output, input];
+    const plan = Buffer.from(JSON.stringify({ profile: `MemmyOfficeSmoke-${randomUUID()}`, command: executable, args, cwd: root,
+      readRoots: [resolve(dirname(executable), "..")], writeRoots: [root] })).toString("base64");
+    const hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(env)).toString("base64") };
+    const handles = [openSync(join(root, "sandbox-output"), "w"), openSync(join(root, "sandbox-errors"), "w")];
+    let isolated;
+    try {
+      isolated = spawnSync(join(env.SystemRoot, "System32/WindowsPowerShell/v1.0/powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", launcher, "-Plan", plan],
+        { cwd: root, env: hostEnv, stdio: ["ignore", ...handles], timeout: 120_000, windowsHide: true });
+    } finally { for (const handle of handles) closeSync(handle); }
+    const diagnostic = await readFile(join(root, "sandbox-errors"), "utf8");
+    console.log(diagnostic);
+    if (isolated.error || isolated.status !== 0) throw new Error(`Windows renderer AppContainer smoke failed (${isolated.status}): ${isolated.error?.message ?? diagnostic}`);
+    if (!(await readFile(join(output, "smoke.pdf"))).subarray(0, 5).equals(Buffer.from("%PDF-"))) throw new Error("Isolated Windows renderer smoke did not produce a PDF");
+    console.log("Windows renderer AppContainer smoke passed");
   } finally { await rm(root, { recursive: true, force: true }); }
 }

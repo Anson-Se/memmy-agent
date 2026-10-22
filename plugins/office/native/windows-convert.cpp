@@ -29,7 +29,9 @@ static LONG CALLBACK diagnosticException(EXCEPTION_POINTERS *exception) {
                 const char *name = (const char *)(image + type[1] + 2 * sizeof(void *));
                 fprintf(stderr, "LibreOfficeKit C++ exception at %s: %.500s", stage, name);
                 if (strstr(name, "@sun@com@@") && args[1]) {
-                    const unsigned char *text = *(const unsigned char **)(args[1] + sizeof(void *));
+                    // UNO exception classes are non-polymorphic: Message is
+                    // the first member, with no preceding vtable pointer.
+                    const unsigned char *text = *(const unsigned char **)args[1];
                     int length = *(const int *)(text + 4);
                     if (length > 0 && length < 1000) {
                         char message[4096];
