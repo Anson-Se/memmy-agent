@@ -218,7 +218,11 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
 
       let stderr = "";
       child.stderr.on("data", (chunk: Buffer) => {
-        if (stderr.length < MAX_STDERR_BYTES) stderr += chunk.toString("utf8", 0, MAX_STDERR_BYTES - stderr.length);
+        if (stderr.length < MAX_STDERR_BYTES) {
+          const diagnostic = chunk.toString("utf8", 0, MAX_STDERR_BYTES - stderr.length);
+          stderr += diagnostic;
+          if (process.env.MEMMY_PLUGIN_SANDBOX_TRACE === "1") console.info(`Plugin sandbox stderr: ${JSON.stringify(diagnostic)}`);
+        }
       });
       const exit = processExit(child);
       let timedOut = false;
@@ -583,7 +587,9 @@ export async function resolveOfficeRuntime(platform: NodeJS.Platform = process.p
     if (!root) continue;
     for (const name of ["soffice", "pdfinfo", "pdftoppm", "pdftotext"]) {
       if (tools[name]) continue;
-      const binaryName = platform === "win32" ? `${name}.exe` : name;
+      // Desktop soffice uses global named pipes that AppContainer rejects.
+      // Windows requires the headless LibreOfficeKit bridge in our runtime.
+      const binaryName = platform === "win32" ? name === "soffice" ? "memmy-office-convert.exe" : `${name}.exe` : name;
       const candidates = [resolve(root, "bin", binaryName), resolve(root, "MacOS", binaryName), resolve(root, "Contents", "MacOS", binaryName), resolve(root, "program", binaryName),
         resolve(root, "libreoffice", "program", binaryName), resolve(root, "poppler", "Library", "bin", binaryName),
         resolve(root, "bin", "override", binaryName), resolve(root, "native", "poppler", "bin", binaryName)];

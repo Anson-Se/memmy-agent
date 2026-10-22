@@ -96,19 +96,26 @@ macOS uses Seatbelt, Linux uses bubblewrap, and Windows uses the Host-packaged
 AppContainer launcher with no network capabilities. Approved input/runtime paths
 receive read access; plugin data receives write access. Descendants inherit the
 container; a Job Object kills the process tree when the Host cancels the launcher.
-PowerShell compiles only Host-owned C# from an isolated Host compiler directory.
+PowerShell compiles only Host-owned C# in an isolated Host compiler directory,
+then reuses a source-hashed assembly cache in that private directory.
 Plugin environment variables are passed only into the isolated child; they cannot
 configure the privileged launcher or inject CLR profilers/PowerShell modules.
 The helper is copied into backend build assets and unpacked from Electron ASAR.
 Windows paths, `.exe` tools, temporary directories and system fonts are handled
 explicitly. The Office plugin requires no entitlement or sandbox exemption.
+Windows conversion uses a small LibreOfficeKit bridge in the downloaded runtime;
+the desktop LibreOffice launcher's global single-instance pipes are incompatible
+with AppContainer. Subprocess transport uses temporary files instead of Node's
+global named pipes. macOS permits local IPC only within plugin-data and excludes
+the GUI-only native spellchecker from each conversion's temporary UNO registry.
 Other Windows command plugins requesting network capabilities fail explicitly;
 existing entitled first-party exemptions retain their prior behavior.
 
 ### Build and publish portable runtimes
 
 Release builders need LibreOffice and Poppler; end users do not. On macOS install
-build inputs with Homebrew. On Windows install LibreOffice on the build worker
+build inputs with Homebrew. On Windows install LibreOffice and Visual Studio C++
+Build Tools on the build worker (the C toolchain is not needed by end users),
 and set `OFFICE_BUILD_POPPLER` to the extracted upstream portable Poppler directory
 containing `Library/bin`. `OFFICE_BUILD_LIBREOFFICE` may override the LibreOffice
 application/install directory. Windows preparation includes app-local VC++ DLLs;

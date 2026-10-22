@@ -22,9 +22,33 @@ try {
   [IO.Directory]::SetAccessControl($compilerRoot, $acl)
   $env:TEMP = $compilerRoot
   $env:TMP = $compilerRoot
-  # Compile only Host-packaged source, never source supplied by a plugin.
-  if ($env:MEMMY_SANDBOX_TRACE -eq '1') { [Console]::Error.WriteLine('Memmy AppContainer: compiling launcher') }
-  Add-Type -Path (Join-Path $PSScriptRoot 'Sandbox.cs')
+  # Cache only Host-packaged source in the private compiler directory. Reusing
+  # its assembly avoids invoking the C# compiler for every document operation.
+  $source = Join-Path $PSScriptRoot 'Sandbox.cs'
+  $digest = [Security.Cryptography.SHA256]::Create()
+  try { $hash = [BitConverter]::ToString($digest.ComputeHash([IO.File]::ReadAllBytes($source))).Replace('-', '').ToLowerInvariant() }
+  finally { $digest.Dispose() }
+  $assembly = Join-Path $compilerRoot ("sandbox-" + $hash + '.dll')
+  $mutex = [Threading.Mutex]::new($false, ("Local\MemmySandboxCompiler-" + $hash))
+  $held = $false
+  try {
+    try { $held = $mutex.WaitOne(120000) } catch [Threading.AbandonedMutexException] { $held = $true }
+    if (!$held) { throw 'Sandbox compiler cache is busy' }
+    if ([IO.File]::Exists($assembly)) {
+      if (([IO.File]::GetAttributes($assembly) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Unsafe compiler cache file' }
+      try { [void][Reflection.AssemblyName]::GetAssemblyName($assembly) }
+      catch { [IO.File]::Delete($assembly) }
+    }
+    if (![IO.File]::Exists($assembly)) {
+      if ($env:MEMMY_SANDBOX_TRACE -eq '1') { [Console]::Error.WriteLine('Memmy AppContainer: compiling launcher') }
+      [Environment]::CurrentDirectory = $compilerRoot
+      Add-Type -Path $source -OutputAssembly $assembly
+    }
+    Add-Type -Path $assembly
+  } finally {
+    if ($held) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
+  }
   $childEnvironment = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MEMMY_SANDBOX_CHILD_ENV)) | ConvertFrom-Json
   $dictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
   foreach ($property in $childEnvironment.PSObject.Properties) { $dictionary.Add($property.Name, [string]$property.Value) }

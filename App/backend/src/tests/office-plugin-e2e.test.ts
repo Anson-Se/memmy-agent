@@ -272,5 +272,5 @@ describe("Office MPP end to end", () => {
       managedRuntime: managed, runtimeInstallationStages: [...new Set(installationStages)],
       liveModel: Boolean(liveRun), visualReview: liveRun ? "Live Agent inspected rendered pages" : "PNG inspection required separately", formats: ["docx", "pdf", "pptx", "xlsx"], steps: results.length, agentTools: run.toolsUsed,
       ...(liveRun ? { liveAgentTools: liveRun.toolsUsed, liveAgentFinal: liveRun.finalContent } : {}) }, null, 2));
-  }, process.env.OFFICE_LIVE_AGENT === "1" ? 900000 : 600000);
+  }, process.env.OFFICE_LIVE_AGENT === "1" ? 900000 : process.platform === "win32" ? 1800000 : 600000);
 });

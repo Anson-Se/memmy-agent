@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { constants } from "node:fs";
 import { access, chmod, copyFile, cp, mkdir, open, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { buildWindowsConverter } from "./build-windows-converter.mjs";
 
 const destination = resolve(process.argv[2] ?? "release/runtime-tree");
 await mkdir(destination, { recursive: false }); // never merge a new release into stale binaries
@@ -13,7 +14,8 @@ if (process.platform === "win32") {
   if (!poppler) throw new Error("OFFICE_BUILD_POPPLER must point to the extracted Poppler root containing Library/bin");
   await cp(libreoffice, join(destination, "LibreOffice"), { recursive: true, dereference: true });
   await cp(poppler, join(destination, "poppler"), { recursive: true, dereference: true });
-  tools.soffice = "LibreOffice/program/soffice.exe";
+  await buildWindowsConverter(join(destination, "LibreOffice/program"));
+  tools.soffice = "LibreOffice/program/memmy-office-convert.exe";
   for (const name of ["pdfinfo", "pdftoppm", "pdftotext"]) tools[name] = `poppler/Library/bin/${name}.exe`;
   // Portable VC++ runtime: place app-local DLLs next to both tool families.
   // Release operators must retain Microsoft's redistribution terms in notices.
