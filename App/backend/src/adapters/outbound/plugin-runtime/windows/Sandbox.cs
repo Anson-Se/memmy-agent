@@ -51,7 +51,12 @@ namespace Memmy {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess, out IntPtr target, uint access, bool inherit, uint options);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
 
-    static void Check(bool success) { if (!success) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    static void Check(bool success, string operation = "Win32 sandbox operation") {
+      if (!success) {
+        int code = Marshal.GetLastWin32Error();
+        throw new Win32Exception(code, operation + " failed (Win32 " + code + "): " + new Win32Exception(code).Message);
+      }
+    }
     static string Quote(string value) {
       var result = new StringBuilder("\""); int slashes = 0;
       foreach (char c in value) {
@@ -125,7 +130,7 @@ namespace Memmy {
           block.Append(key).Append('=').Append(value).Append('\0');
         }
         block.Append('\0'); environmentPointer = Marshal.StringToHGlobalUni(block.ToString());
-        Check(CreateProcessW(command, line, IntPtr.Zero, IntPtr.Zero, true, 0x00080000 | 0x00000004 | 0x08000000 | 0x00000400, environmentPointer, cwd, ref startup, out process));
+        Check(CreateProcessW(command, line, IntPtr.Zero, IntPtr.Zero, true, 0x00080000 | 0x00000004 | 0x08000000 | 0x00000400, environmentPointer, cwd, ref startup, out process), "CreateProcessW(AppContainer)");
         Check(AssignProcessToJobObject(job, process.process));
         if (ResumeThread(process.thread) == uint.MaxValue) Check(false);
         resumed = true;

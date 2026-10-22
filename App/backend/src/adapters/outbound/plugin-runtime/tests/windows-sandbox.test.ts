@@ -68,6 +68,8 @@ async function launch(plan: unknown) {
 }
 
 function spawnLauncher(plan: unknown) {
+  // Deliberately omit LOCALAPPDATA: the Host launcher must restore its own
+  // known-folder value before CreateProcessW, without inheriting plugin values.
   const helper = fileURLToPath(new URL("../windows/launch.ps1", import.meta.url));
   return spawn(join(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "-Plan", Buffer.from(JSON.stringify(plan)).toString("base64")], { stdio: ["pipe", "pipe", "pipe"], env: {
     SystemRoot: process.env.SystemRoot ?? "C:\\Windows",

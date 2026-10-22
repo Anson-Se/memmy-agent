@@ -3,7 +3,14 @@ $ErrorActionPreference = 'Stop'
 try {
   $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Plan)) | ConvertFrom-Json
   # Compilation runs at Host privilege: never use a plugin-writable TEMP.
-  $compilerRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Memmy/SandboxCompiler'
+  # CreateProcessW resolves the AppContainer profile from the launcher's
+  # LOCALAPPDATA even when an explicit child environment block is provided.
+  # The Host strips inherited variables; derive this value from the current
+  # user's known folder, never from the plugin's child environment.
+  $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+  if ([String]::IsNullOrWhiteSpace($localAppData) -or ![IO.Path]::IsPathRooted($localAppData)) { throw 'LocalApplicationData is unavailable' }
+  $env:LOCALAPPDATA = $localAppData
+  $compilerRoot = Join-Path $localAppData 'Memmy/SandboxCompiler'
   [IO.Directory]::CreateDirectory($compilerRoot) | Out-Null
   if (([IO.File]::GetAttributes($compilerRoot) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Unsafe compiler directory' }
   $acl = New-Object System.Security.AccessControl.DirectorySecurity

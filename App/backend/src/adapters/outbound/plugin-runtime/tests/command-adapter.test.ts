@@ -410,7 +410,7 @@ describe("CommandPluginAdapter", () => {
 
   it("keeps plugin CLR/PowerShell variables out of the privileged Windows launcher", async () => {
     const pluginContext = context();
-    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, interpreter: "node", env: { COR_ENABLE_PROFILING: "1", COR_PROFILER_PATH: "untrusted.dll", PSModulePath: "untrusted-modules", SystemRoot: "untrusted-root" } };
+    pluginContext.plugin.manifest.runtime.config = { ...pluginContext.plugin.manifest.runtime.config, interpreter: "node", env: { COR_ENABLE_PROFILING: "1", COR_PROFILER_PATH: "untrusted.dll", PSModulePath: "untrusted-modules", SystemRoot: "untrusted-root", LOCALAPPDATA: "untrusted-profile" } };
     let launcherEnv: Record<string, string> = {};
     const adapter = createCommandPluginAdapter({ platform: "win32", spawnFn: ((command, _args, options) => {
       expect(command).toMatch(/powershell\.exe$/); launcherEnv = options?.env as Record<string, string>;
@@ -420,8 +420,10 @@ describe("CommandPluginAdapter", () => {
     await collect(adapter.invoke(session, { callId: "env-test", pluginId: pluginContext.plugin.id, capabilityId: "run", conversationId: "test", input: {} }));
     expect(launcherEnv.COR_ENABLE_PROFILING).toBeUndefined(); expect(launcherEnv.COR_PROFILER_PATH).toBeUndefined(); expect(launcherEnv.PSModulePath).toBeUndefined();
     expect(launcherEnv.SystemRoot).not.toBe("untrusted-root");
+    expect(launcherEnv.LOCALAPPDATA).toBeUndefined();
     const isolatedEnv = JSON.parse(Buffer.from(launcherEnv.MEMMY_SANDBOX_CHILD_ENV!, "base64").toString("utf8"));
     expect(isolatedEnv.COR_PROFILER_PATH).toBe("untrusted.dll");
+    expect(isolatedEnv.LOCALAPPDATA).toBe("untrusted-profile");
   });
 
   it("injects only the Host-installed portable Office tools into the runtime", async () => {
