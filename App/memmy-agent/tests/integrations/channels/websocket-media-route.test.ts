@@ -67,6 +67,35 @@ describe("WebSocket media route", () => {
     expect(channel.handleMediaFetch('invalid', payload, { headers: { range: "bytes=0-1" } }).status).toBe(401);
   });
 
+  it.each(["txt", "json", "ts"])("distinguishes empty .%s files from missing files and nonempty ranges", (ext) => {
+    const data = tmpDataDir("empty-range");
+    const media = path.join(data, "media"); fs.mkdirSync(media);
+    const target = path.join(media, `empty.${ext}`);
+    fs.writeFileSync(target, "");
+    const channel = new WebSocketChannel({}, new MessageBus());
+    const [sig,payload] = channel.signMediaPath(target)!.slice("/api/media/".length).split("/");
+    const range = {headers:{range:"bytes=0-262146"}};
+    const empty = channel.handleMediaFetch(sig,payload,range);
+    expect(empty.status).toBe(416);
+    expect(empty.headers["content-range"]).toBe("bytes */0");
+    expect(empty.body).toEqual(Buffer.alloc(0));
+    expect(channel.handleMediaFetch(sig,payload).status).toBe(200);
+    expect(channel.handleMediaFetch(sig,payload).body).toEqual(Buffer.alloc(0));
+    expect(channel.handleMediaFetch("invalid",payload,range).status).toBe(401);
+    fs.writeFileSync(target,"abc");
+    const valid = channel.handleMediaFetch(sig,payload,range);
+    expect(valid.status).toBe(206);
+    expect(valid.headers["content-range"]).toBe("bytes 0-2/3");
+    expect(valid.body).toEqual(Buffer.from("abc"));
+    const beyond = channel.handleMediaFetch(sig,payload,{headers:{range:"bytes=3-"}});
+    expect(beyond.status).toBe(416);
+    expect(beyond.headers["content-range"]).toBe("bytes */3");
+    fs.rmSync(target);
+    const missing = channel.handleMediaFetch(sig,payload,range);
+    expect(missing.status).toBe(404);
+    expect(missing.headers["content-range"]).toBeUndefined();
+  });
+
   it("keeps media route root stable when users configure trailing slashes", () => {
     expect(normalizeConfigPath("/media/")).toBe("/media");
     expect(normalizeConfigPath("")).toBe("/");

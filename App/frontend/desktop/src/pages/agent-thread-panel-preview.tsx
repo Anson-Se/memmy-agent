@@ -295,6 +295,11 @@ type TextPage = { status: "ready"; kind: "paged-text"; text: string; start: numb
 
 async function readTextPage(url: string, offset: number, fetchFn: typeof fetch = fetch): Promise<TextPage | Response> {
   const response = await fetchFn(url, { cache: "no-store", headers: { Range: `bytes=${offset}-${offset + TEXT_PAGE_BYTES + 2}` } });
+  // A readable empty file cannot satisfy a byte range. Only the initial
+  // request with an explicit zero total should enter the normal empty preview.
+  if (offset === 0 && response.status === 416 && response.headers.get("content-range")?.trim() === "bytes */0") {
+    return { status: "ready", kind: "paged-text", text: "", start: 0, end: 0, total: 0, url };
+  }
   if (!response.ok) throw new Error(`preview request failed: ${response.status}`);
   if (response.status !== 206) return response;
   const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
