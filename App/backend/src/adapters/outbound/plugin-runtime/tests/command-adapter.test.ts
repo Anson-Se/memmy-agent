@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CapabilityEvent } from "@memmy/local-api-contracts";
@@ -69,6 +70,48 @@ async function collect(iterable: AsyncIterable<CapabilityEvent>): Promise<Capabi
 }
 
 describe("CommandPluginAdapter", () => {
+  it.runIf(process.platform === "darwin" && process.env.CODEX_SANDBOX !== "seatbelt")(
+    "allows private plugin IPC while denying sockets outside plugin-data and loopback TCP", async () => {
+      const data = realpathSync(mkdtempSync("/private/tmp/memmy-ipc-"));
+      const unix = createServer(socket => socket.end());
+      const tcp = createServer(socket => socket.end());
+      await new Promise<void>(ok => unix.listen(join(data, "host.sock"), ok));
+      await new Promise<void>(ok => tcp.listen(0, "127.0.0.1", ok));
+      try {
+        const pluginContext = context();
+        const permission = { type: "host-service" as const, services: ["plugin-data"] };
+        pluginContext.plugin.manifest.permissions = [permission];
+        pluginContext.plugin.approvedPermissions = [permission];
+        execFileSync("/usr/bin/clang", ["-x", "c", "-o", join(root!, "runtime/plugin"), "-"], { input: `
+          #include <sys/socket.h>
+          #include <sys/un.h>
+          #include <netinet/in.h>
+          #include <unistd.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(int argc,char **argv) {
+            chdir(argv[1]); struct sockaddr_un own={0}; own.sun_family=AF_UNIX; strcpy(own.sun_path,"inside.sock");
+            int a=socket(AF_UNIX,SOCK_STREAM,0); int bound=bind(a,(struct sockaddr*)&own,sizeof(own))==0;
+            struct sockaddr_un other={0}; other.sun_family=AF_UNIX; strcpy(other.sun_path,argv[2]);
+            int b=socket(AF_UNIX,SOCK_STREAM,0); int external=connect(b,(struct sockaddr*)&other,sizeof(other))==0;
+            struct sockaddr_in remote={0}; remote.sin_family=AF_INET; remote.sin_addr.s_addr=htonl(0x7f000001); remote.sin_port=htons(${(tcp.address() as { port: number }).port});
+            int c=socket(AF_INET,SOCK_STREAM,0); int network=connect(c,(struct sockaddr*)&remote,sizeof(remote))==0;
+            printf("{\\"bound\\":%s,\\"external\\":%s,\\"network\\":%s}\\n",bound?"true":"false",external?"true":"false",network?"true":"false");
+            close(a);close(b);close(c);return 0;
+          }` });
+        pluginContext.plugin.manifest.runtime.config = { command: "runtime/plugin", args: [join(data, pluginContext.plugin.id), join(data, "host.sock")] };
+        const adapter = createCommandPluginAdapter({ pluginDataRoot: data });
+        const session = await adapter.activate(pluginContext);
+        try {
+          expect(await collect(adapter.invoke(session, {callId:"ipc",pluginId:pluginContext.plugin.id,capabilityId:"run",conversationId:"test",input:{}})))
+            .toEqual([{ type: "result", output: { bound: true, external: false, network: false } }]);
+        } finally { await adapter.deactivate(session); }
+      } finally {
+        await Promise.all([new Promise<void>(ok => unix.close(() => ok())), new Promise<void>(ok => tcp.close(() => ok()))]);
+        rmSync(data, { recursive: true, force: true });
+      }
+    }, 30000
+  );
   it.runIf(process.platform === "darwin" && process.env.CODEX_SANDBOX !== "seatbelt")(
     "executes an artifact command through the macOS sandbox",
     async () => {

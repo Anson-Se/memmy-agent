@@ -167,6 +167,8 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
           env.TEMP = temporary; env.TMP = temporary;
         }
       }
+      if (platform === "win32") env.MEMMY_PLUGIN_INPUT_ROOTS = JSON.stringify(approvedHostService(context, "file-input")
+        ? await Promise.all((options.fileInputRoots ?? []).map(root => realpath(root))) : []);
       return {
         pluginId: context.plugin.id,
         launch: await buildLaunch(context, config, requestedNetworkHosts.length > 0, runtimeDependencies),
@@ -508,9 +510,10 @@ export async function buildPluginSandboxLaunch(
   }
 
   if (platform === "darwin") {
+    const ipcRoot = await resolvePluginDataPath(context, pluginDataRoot);
     return {
       command: "/usr/bin/sandbox-exec",
-      args: ["-p", seatbeltProfile(root, filesystem, networkEnabled, runtimeRoot, runtimeReadRoots, runtimeExecutableRoots), "--", runtimeCommand, ...runtimeArgs],
+      args: ["-p", seatbeltProfile(root, filesystem, networkEnabled, runtimeRoot, runtimeReadRoots, runtimeExecutableRoots, ipcRoot), "--", runtimeCommand, ...runtimeArgs],
       cwd
     };
   }
@@ -678,7 +681,8 @@ function seatbeltProfile(
   networkEnabled: boolean,
   runtimeRoot: string | null,
   runtimeReadRoots: readonly string[],
-  runtimeExecutableRoots: readonly string[]
+  runtimeExecutableRoots: readonly string[],
+  ipcRoot: string | null
 ): string {
   const readPaths = [
     root,
@@ -707,6 +711,11 @@ function seatbeltProfile(
     `(allow file-read* ${readPaths.map(seatbeltSubpath).join(" ")})`
   ];
   if (writePaths.length) clauses.push(`(allow file-write* ${writePaths.map(seatbeltSubpath).join(" ")})`);
+  if (ipcRoot) clauses.push(
+    "(allow system-socket (socket-domain AF_UNIX))",
+    `(allow network-bind network-inbound (local unix-socket ${seatbeltSubpath(ipcRoot)}))`,
+    `(allow network-outbound (remote unix-socket ${seatbeltSubpath(ipcRoot)}))`
+  );
   if (networkEnabled) clauses.push("(allow network-outbound)");
   return clauses.join("\n");
 }

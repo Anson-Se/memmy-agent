@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
-import { spawn } from "node:child_process";
+import { runProcess } from "./process.mjs";
 import JSZip from "jszip";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
 import { Document, Packer, Paragraph, HeadingLevel } from "docx";
@@ -53,10 +53,26 @@ async function regular(file) {
   if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_FILE) throw fail("unsafe_file", "Expected a regular file no larger than 40 MiB");
   return file;
 }
+// AppContainer cannot query the Windows Mount Manager used by native realpath.
+// These roots are canonicalized by the Host before granting the OS sandbox.
+// Walk every component inside a granted root and reject all reparse points.
+async function canonicalPath(file) {
+  if (process.platform !== "win32") return fs.realpath(file);
+  const roots = [process.env.MEMMY_PLUGIN_DATA_DIR, ...JSON.parse(process.env.MEMMY_PLUGIN_INPUT_ROOTS ?? "[]")].filter(Boolean);
+  const absolute = path.resolve(file);
+  const root = roots.find(root => { const rel = path.relative(root, absolute); return !path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`); });
+  if (!root) throw fail("unsafe_file", "Path is outside Host-approved roots");
+  let current = root;
+  for (const component of ["", ...path.relative(root, absolute).split(path.sep).filter(Boolean)]) {
+    current = path.join(current, component);
+    if ((await fs.lstat(current)).isSymbolicLink()) throw fail("unsafe_file", "Path cannot traverse symbolic links");
+  }
+  return absolute;
+}
 async function storeRoot() {
   const configured = process.env.MEMMY_PLUGIN_DATA_DIR;
   if (!configured || !path.isAbsolute(configured)) throw fail("plugin_data_unavailable", "Host did not provide plugin-data");
-  const root = await fs.realpath(configured);
+  const root = await canonicalPath(configured);
   await fs.mkdir(path.join(root, "tasks"), { recursive: true });
   return root;
 }
@@ -64,7 +80,7 @@ async function taskDirectory(id) {
   if (!/^[0-9a-f-]{36}$/.test(id ?? "")) throw fail("invalid_task", "Invalid Office task ID");
   const root = await storeRoot();
   const dir = path.join(root, "tasks", id);
-  if ((await fs.lstat(dir)).isSymbolicLink() || await fs.realpath(dir) !== dir) throw fail("invalid_task", "Task directory is unsafe");
+  if ((await fs.lstat(dir)).isSymbolicLink() || await canonicalPath(dir) !== dir) throw fail("invalid_task", "Task directory is unsafe");
   return dir;
 }
 async function newTask() {
@@ -148,26 +164,11 @@ async function command(name, args, directory) {
     ? [path.join(process.env.SystemRoot ?? "C:\\Windows", "Fonts")]
     : ["/System/Library/Fonts", "/Library/Fonts", "/usr/share/fonts", "/usr/local/share/fonts"];
   await fs.writeFile(fontConfig, `<?xml version="1.0"?><fontconfig>${fontDirectories.map(dir => `<dir>${xml(dir)}</dir>`).join("")}<cachedir>${xml(directory)}/font-cache</cachedir></fontconfig>`);
-  return await new Promise((resolve, reject) => {
-    const child = spawn(tools[name], args, { shell: false, windowsHide: true, cwd: directory,
-      env: { ...process.env, HOME: directory, TMPDIR: directory, TEMP: directory, TMP: directory,
-        XDG_CONFIG_HOME: path.join(directory, "config"), XDG_CACHE_HOME: path.join(directory, "cache"), FONTCONFIG_FILE: fontConfig } });
-    children.add(child);
-    let output = "", errors = "", settled = false;
-    const done = (error) => {
-      if (settled) return;
-      settled = true; clearTimeout(timer); children.delete(child);
-      if (error) reject(error); else resolve(output);
-    };
-    const timer = setTimeout(() => { child.kill("SIGKILL"); done(fail("office_timeout", `${name} timed out`)); }, 120000);
-    child.stdout.on("data", bytes => {
-      if (output.length + bytes.length > 8 * 1024 * 1024) { child.kill("SIGKILL"); done(fail("output_limit", "Tool output exceeded limit")); }
-      else output += bytes;
-    });
-    child.stderr.on("data", bytes => { if (errors.length < 8192) errors += bytes; });
-    child.once("error", done);
-    child.once("close", code => done(code === 0 ? null : fail("office_conversion_failed", `${name} failed (${code}): ${errors || output || "no diagnostic output"}`)));
-  });
+  const result = await runProcess(tools[name], args, { cwd: directory, children,
+    env: { ...process.env, HOME: directory, TMPDIR: directory, TEMP: directory, TMP: directory,
+      XDG_CONFIG_HOME: path.join(directory, "config"), XDG_CACHE_HOME: path.join(directory, "cache"), FONTCONFIG_FILE: fontConfig } });
+  if (result.code !== 0) throw fail("office_conversion_failed", `${name} failed (${result.code ?? result.signal}): ${result.stderr || result.stdout.slice(0, 8192) || "no diagnostic output"}`);
+  return result.stdout;
 }
 async function convertFile(input, outputDir, format, csv) {
   const work = await fs.mkdtemp(path.join(outputDir, "conversion-"));
@@ -177,7 +178,9 @@ async function convertFile(input, outputDir, format, csv) {
     const profileDirectory = path.join(work, "profile", "user");
     await fs.mkdir(profileDirectory, { recursive: true });
     await fs.writeFile(path.join(profileDirectory, "registrymodifications.xcu"), `<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry"><item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item><item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item></oor:items>`);
-    const options = [`-env:UserInstallation=${profile}`, "--headless", "--norestore", "--nodefault", "--nolockcheck"];
+    // LibreOffice falls back here when the OS sandbox denies /tmp and /var/tmp.
+    // Keep the Unix socket name short and relative to this private working dir.
+    const options = [`-env:UserInstallation=${profile}`, "-env:OSL_SOCKET_PATH=.", "--headless", "--norestore", "--nodefault", "--nolockcheck"];
     if (["csv", "tsv"].includes(ext(input))) {
       if (!csv) throw fail("csv_policy_required", "CSV/TSV needs an explicit UTF-8 encoding and delimiter");
       const delimiter = csv.delimiter.charCodeAt(0);
@@ -470,24 +473,15 @@ async function handle(call) {
       // __filename survives the CommonJS bundle; it is never derived from input.
       const executable = path.join(path.dirname(__filename), "execute.cjs");
       const root = path.dirname(executable);
-      const response = await new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [...(process.platform === "win32" ? ["--preserve-symlinks", "--preserve-symlinks-main"] : []),
-          "--permission", "--max-old-space-size=256", `--allow-fs-read=${root}`, `--allow-fs-read=${executionDirectory}`,
-          `--allow-fs-write=${executionDirectory}`, executable], { cwd: executionDirectory, shell: false,
-          env: { PATH: process.env.PATH, ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TEMP: executionDirectory, TMP: executionDirectory } : {}), LANG: "C.UTF-8", ELECTRON_RUN_AS_NODE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
-        children.add(child);
-        let output = "", errors = "", settled = false;
-        const finish = error => {
-          if (settled) return; settled = true; clearTimeout(timer); children.delete(child);
-          if (error) reject(error); else { try { resolve(JSON.parse(output)); } catch { reject(fail("invalid_execution_result", "Code must return {files:[names]}")); } }
-        };
-        const timer = setTimeout(() => { child.kill("SIGKILL"); finish(fail("execution_timeout", "Office code exceeded 60 seconds")); }, 60000);
-        child.stdout.on("data", bytes => { output += bytes; if (output.length > 1048576) { child.kill("SIGKILL"); finish(fail("output_limit", "Execution output exceeds 1 MiB")); } });
-        child.stderr.on("data", bytes => { if (errors.length < 8192) errors += bytes; });
-        child.once("error", finish);
-        child.once("close", code => finish(code === 0 ? null : fail("office_execution_failed", errors || "Office code failed")));
-        child.stdin.end(JSON.stringify({ code: input.code, workspace: executionDirectory }));
-      });
+      const executed = await runProcess(process.execPath, [...(process.platform === "win32" ? ["--preserve-symlinks", "--preserve-symlinks-main"] : []),
+        "--permission", "--max-old-space-size=256", `--allow-fs-read=${root}`, `--allow-fs-read=${executionDirectory}`,
+        `--allow-fs-write=${executionDirectory}`, executable], { cwd: executionDirectory, children, timeout: 60000, maxOutput: 1048576,
+        input: JSON.stringify({ code: input.code, workspace: executionDirectory }),
+        env: { PATH: process.env.PATH, ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TEMP: executionDirectory, TMP: executionDirectory } : {}), LANG: "C.UTF-8", ELECTRON_RUN_AS_NODE: "1" } });
+      if (executed.code !== 0) throw fail("office_execution_failed", executed.stderr || "Office code failed");
+      let response;
+      try { response = JSON.parse(executed.stdout); }
+      catch { throw fail("invalid_execution_result", "Code must return {files:[names]}"); }
       if (!response || !Array.isArray(response.files) || !response.files.length || response.files.length > 30) throw fail("invalid_execution_result", "Return 1–30 output file names");
       for (const name of response.files) {
         safeName(name);
@@ -503,7 +497,7 @@ async function handle(call) {
     case "office_import": {
       if (!path.isAbsolute(input.path)) throw fail("invalid_path", "Upload path must be absolute");
       await regular(input.path);
-      if (await fs.realpath(input.path) !== input.path) throw fail("unsafe_file", "Upload cannot traverse symbolic links");
+      if (await canonicalPath(input.path) !== input.path) throw fail("unsafe_file", "Upload cannot traverse symbolic links");
       const format = ext(input.path);
       if (!["docx", "pdf", "pptx", "xlsx", "csv", "tsv"].includes(format)) throw fail("unsupported_format", "Unsupported upload format");
       const task = await newTask(); const name = safeName(path.basename(input.path));
