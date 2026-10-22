@@ -1,0 +1,339 @@
+/**
+ * Stage 1 diagnostic baseline, before changing the scheduler.
+ *
+ * These assertions describe the existing failure modes, not desired behavior.
+ * Convert each to an acceptance regression as the corresponding fix lands.
+ * SQLite, schema, repositories and WorkerRunner are real. Business handlers and
+ * model requests are controlled local substitutes so queue timing is repeatable.
+ */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryDb } from "../../../src/storage/db.js";
+import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
+import { WorkerRunner, type WorkerRunnerDeps } from "../../../src/service/worker/worker-runner.js";
+import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
+
+const resources: Array<{ root: string; db: MemoryDb }> = [];
+const observations: Array<{ scenario: string; [key: string]: unknown }> = [];
+const epoch = Date.parse("2026-10-22T00:00:00.000Z");
+
+function record(scenario: string, values: Record<string, unknown>): void {
+  observations.push({ scenario, ...values });
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function harness(processJob: WorkerRunnerDeps["jobHandlers"]["processJob"] = async () => {}) {
+  const root = mkdtempSync(join(tmpdir(), "memmy-queue-baseline-"));
+  const db = new MemoryDb({ path: join(root, "memory.sqlite") });
+  resources.push({ root, db });
+  const repos = new Repositories(db.db);
+  const deps: WorkerRunnerDeps = {
+    repos,
+    embedder: createCapturingEmbedder([]),
+    capture: { embedAfterCapture: true },
+    embeddingRetryWorkerId: "baseline-runner",
+    memoryAddEnabled: () => true,
+    memoryBudgetPaused: () => false,
+    memoryBudgetJobConsumes: () => false,
+    memoryBudgetModelSources: () => ({ embedding: { mode: "local" } }),
+    memoryBudgetNextWakeAtMs: () => Date.now(),
+    summaryModelConfigured: () => true,
+    nowIso: () => new Date().toISOString(),
+    encodeChangeCursor: String,
+    namespaceIdFromMemory: () => "baseline",
+    runWorkerNoWrite: async () => { throw new Error("unexpected disabled worker"); },
+    restartFailedProcessing: () => 0,
+    previewPolicyEvidenceReconciliation: () => ({
+      orphanPolicyIds: [], affectedWorldModelIds: [], affectedSkillIds: [], restorablePolicyIds: []
+    }),
+    reconcileOrphanedPolicies: () => 0,
+    enqueueJob: () => { throw new Error("unexpected startup enqueue"); },
+    enqueueEmbeddingRetry: () => { throw new Error("unexpected replacement retry"); },
+    appendJobChange: () => {},
+    appendEmbeddingRetryChange: () => {},
+    jobHandlers: { processJob },
+    embeddingJobs: {
+      prepareEmbeddingJob: () => { throw new Error("unexpected main embedding job"); },
+      applyEmbeddingVector: () => {},
+      // Only the queue-state transition is relevant to these tests.
+      persistEmbeddingVector: (input) => {
+        const target = repos.memories.get(input.memoryId);
+        if (!target) throw new Error("missing synthetic retry target");
+        input.finalize?.(target, false, new Date().toISOString());
+        return target;
+      },
+      enqueueEmbeddingRetryAfterFailure: () => false
+    }
+  };
+  const runner = new WorkerRunner(deps);
+  function memory(id: string, createdAt = new Date(epoch).toISOString(), imported = true): void {
+    db.db.prepare(`INSERT INTO memories
+      (id, timeline, user_id, memory_value, memory_layer, tags_json, created_at, updated_at)
+      VALUES (?, ?, 'baseline-user', ?, 'L1', ?, ?, ?)`)
+      .run(id, createdAt, `synthetic memory ${id}`, imported ? '["agent-source"]' : '[]', createdAt, createdAt);
+  }
+  function job(id: string, jobType: EvolutionJobRecord["jobType"], options: {
+    target?: string; source?: string; createdAt?: string; runAfter?: string;
+  } = {}): void {
+    const at = options.createdAt ?? new Date(epoch).toISOString();
+    repos.runtime.enqueueJob({
+      id, jobType, status: "queued", userId: "baseline-user", targetMemoryId: options.target,
+      payload: { ...(options.source ? { source: options.source } : {}),
+        ...(options.runAfter ? { runAfter: options.runAfter } : {}) },
+      attempts: 0, maxAttempts: 3, createdAt: at, updatedAt: at
+    });
+  }
+  function retry(id: string, target: string): void {
+    repos.runtime.enqueueEmbeddingRetry({
+      id, targetKind: "trace", targetId: target, vectorField: "vec_summary",
+      sourceText: `synthetic memory ${target}`, now: Date.now()
+    });
+  }
+  return { db, repos, runner, memory, job, retry };
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+  for (const { root, db } of resources.splice(0)) {
+    if (db.db.open) db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+afterAll(() => {
+  const path = process.env.MEMMY_QUEUE_BASELINE_RESULTS;
+  if (path) {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      baseline: process.env.MEMMY_QUEUE_BASELINE_REF ?? "not recorded; set MEMMY_QUEUE_BASELINE_REF",
+      method: "real SQLite and WorkerRunner; local substitute business/model handlers",
+      observations
+    }, null, 2));
+  }
+});
+
+describe("queue scheduler: pre-change diagnostic baseline", () => {
+  it("leaves runnable reflection and embedding retry untouched across 50 full import rounds", async () => {
+    const h = harness();
+    h.db.db.transaction(() => {
+      for (let i = 0; i < 10_000; i++) {
+        h.memory(`import-${i}`);
+        h.job(`job-import-${i}`, "import_summary", { target: `import-${i}` });
+      }
+    })();
+    h.memory("retry-target");
+    h.retry("retry-waiting", "retry-target");
+    h.job("reflection-waiting", "reflection");
+    h.job("maintenance-waiting", "import_summary", {
+      source: "startup.placeholder_summary_repair"
+    });
+    const start = performance.now();
+    const rounds = [];
+    for (let i = 0; i < 50; i++) rounds.push(await h.runner.runWorkerOnce(4, { priorityCohortOnly: true }));
+    expect(rounds.every((r) => r.leased === 4 && r.succeeded === 4 && r.embeddingRetries.leased === 0)).toBe(true);
+    expect(h.repos.runtime.getJob("reflection-waiting")).toMatchObject({ status: "queued", attempts: 0 });
+    expect(h.repos.runtime.getJob("maintenance-waiting")).toMatchObject({ status: "queued", attempts: 0 });
+    expect(h.repos.runtime.getEmbeddingRetry("retry-waiting")).toMatchObject({ status: "pending", attempts: 0 });
+    const runnable = h.repos.runtime.claimDueEmbeddingRetries({
+      now: Date.now(), workerId: "runnable-probe", leaseUntil: Date.now() + 60_000, limit: 1
+    });
+    expect(runnable.map((r) => r.id)).toEqual(["retry-waiting"]);
+    const reflectionProbe = h.repos.runtime.leaseQueuedJobs(1, 60, undefined, false, ["reflection"]);
+    expect(reflectionProbe.map((j) => j.id)).toEqual(["reflection-waiting"]);
+    // Control: a new native task still outranks the import backlog.
+    h.memory("native-target", undefined, false);
+    h.job("interactive-probe", "trace_summary", { target: "native-target" });
+    const interactive = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
+    expect(interactive.jobs.map((j) => j.jobId)).toEqual(["interactive-probe"]);
+    record("10000_import_backlog", {
+      seededImports: 10_000, rounds: 50, completedImports: 200, remainingImports: 9_800,
+      retryLeased: 0, reflectionStarted: 0, maintenanceStarted: 0, retryDirectClaimControl: true,
+      reflectionDirectClaimControl: true,
+      nativeTaskControl: "runs next round", elapsedMs: Math.round(performance.now() - start)
+    });
+  });
+
+  it("runs a due embedding retry with free capacity (control)", async () => {
+    const h = harness();
+    h.memory("free-target");
+    h.retry("free-retry", "free-target");
+    const result = await h.runner.runWorkerOnce(4);
+    expect(result).toMatchObject({ leased: 0, embeddingRetries: { leased: 1, succeeded: 1, failed: 0 } });
+    record("retry_free_capacity_control", { leased: 1, succeeded: 1 });
+  });
+
+  it("already places startup repair after reflection in the current target branch (control)", () => {
+    const h = harness();
+    for (let i = 0; i < 10_000; i++) h.job(`startup-${i}`, "import_summary", {
+      source: "startup.placeholder_summary_repair"
+    });
+    h.job("normal-reflection", "reflection");
+    const leased = h.repos.runtime.leaseQueuedJobs(4, 60, undefined, true);
+    expect(leased.map((j) => j.id)).toEqual(["normal-reflection"]);
+    record("startup_repair_priority_control", { startupBacklog: 10_000, firstClaim: "reflection", leased: 1 });
+  });
+
+  it("keeps an onboarding first report ahead of native and imported summaries (control)", () => {
+    const h = harness();
+    h.memory("onboarding"); h.memory("native", undefined, false); h.memory("imported");
+    h.db.db.prepare("UPDATE memories SET tags_json = '[\"first-encounter-report\"]' WHERE id = 'onboarding'").run();
+    h.job("onboarding-report", "import_summary", { target: "onboarding" });
+    h.job("native-summary", "trace_summary", { target: "native" });
+    h.job("import-summary", "import_summary", { target: "imported" });
+    const leased = h.repos.runtime.leaseQueuedJobs(4, 60, undefined, true);
+    expect(leased.map((j) => j.id)).toEqual(["onboarding-report"]);
+    record("onboarding_priority_control", { firstClaim: "onboarding-first-report" });
+  });
+
+  it("lets continuously newer imports overtake an older queued import", () => {
+    const h = harness();
+    h.memory("old-memory");
+    h.job("old-job", "import_summary", { target: "old-memory" });
+    const selected = [];
+    for (let i = 1; i <= 25; i++) {
+      const at = new Date(epoch + i * 1_000).toISOString();
+      h.memory(`new-memory-${i}`, at);
+      h.job(`new-job-${i}`, "import_summary", { target: `new-memory-${i}`, createdAt: at });
+      const [claimed] = h.repos.runtime.leaseQueuedJobs(1);
+      selected.push(claimed!.id);
+      h.repos.runtime.completeJob(claimed!.id);
+    }
+    expect(selected.every((id) => id !== "old-job")).toBe(true);
+    expect(h.repos.runtime.getJob("old-job")).toMatchObject({ status: "queued", attempts: 0 });
+    record("new_imports_overtake_old", { rounds: 25, newerCompleted: 25, oldestAttempts: 0 });
+  });
+
+  it("also prefers a newer memory over an older due embedding retry", () => {
+    const h = harness();
+    h.memory("retry-old"); h.retry("old-retry", "retry-old");
+    h.memory("retry-new", new Date(epoch + 60_000).toISOString()); h.retry("new-retry", "retry-new");
+    const [claimed] = h.repos.runtime.claimDueEmbeddingRetries({
+      now: Date.now(), workerId: "probe", leaseUntil: Date.now() + 60_000, limit: 1
+    });
+    expect(claimed!.id).toBe("new-retry");
+    expect(h.repos.runtime.getEmbeddingRetry("old-retry")!.status).toBe("pending");
+    record("retry_order_control", { firstClaim: "newer-memory", olderRetry: "pending" });
+  });
+
+  it("does not fill lower-tier slots after filtering a one-job priority cohort", async () => {
+    const h = harness();
+    h.job("one-summary", "trace_summary");
+    for (let i = 0; i < 3; i++) h.job(`waiting-reflection-${i}`, "reflection");
+    const result = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
+    expect(result.leased).toBe(1);
+    expect(h.repos.runtime.getJob("waiting-reflection-0")!.attempts).toBe(0);
+    record("priority_cohort_underfill", { limit: 4, leased: 1, otherRunnable: 3 });
+  });
+
+  it("allows two concurrent worker entry calls to execute eight handlers", async () => {
+    const gate = deferred();
+    let active = 0; let peak = 0;
+    const h = harness(async () => { active++; peak = Math.max(peak, active); await gate.promise; active--; });
+    for (let i = 0; i < 8; i++) h.job(`parallel-${i}`, "trace_summary");
+    const a = h.runner.runWorkerOnce(4);
+    const b = h.runner.runWorkerOnce(4);
+    try { expect(active).toBe(8); expect(peak).toBe(8); }
+    finally { gate.resolve(); await Promise.all([a, b]); }
+    record("multiple_entries_concurrency", { calls: 2, perCallLimit: 4, peakHandlers: peak });
+  });
+
+  it("waits for the slowest summary in the first group before starting the fifth", async () => {
+    const fast = deferred(); const slow = deferred();
+    const started: string[] = [];
+    let active = 0;
+    const h = harness(async (j) => {
+      started.push(j.id); active++;
+      await (j.id === "summary-0" ? slow.promise : fast.promise);
+      active--;
+    });
+    for (let i = 0; i < 8; i++) h.job(`summary-${i}`, "trace_summary");
+    const run = h.runner.runWorkerOnce(8);
+    try {
+      expect(started).toHaveLength(4);
+      fast.resolve();
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      expect(active).toBe(1);
+      expect(started).toHaveLength(4);
+      expect(h.repos.runtime.getJob("summary-4")!.status).toBe("leased");
+      record("summary_batch_barrier", { limit: 8, finished: 3, active: 1, unstartedButLeased: 4, fifthStarted: false });
+    } finally { fast.resolve(); slow.resolve(); await run; }
+    expect(started).toHaveLength(8);
+  });
+
+  it("reclaims a queued-in-memory serial batch after 61 seconds while its first handler still runs", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+    const gate = deferred(); const started: string[] = [];
+    const h = harness(async (j) => { started.push(j.id); if (j.id === "serial-0") await gate.promise; });
+    for (let i = 0; i < 4; i++) h.job(`serial-${i}`, "reflection");
+    const run = h.runner.runWorkerOnce(4);
+    try {
+      expect(started).toEqual(["serial-0"]);
+      expect(h.repos.runtime.getJob("serial-3")!.status).toBe("leased");
+      vi.setSystemTime(epoch + 61_000);
+      const reclaimed = h.repos.runtime.leaseQueuedJobs(4);
+      expect(reclaimed.map((j) => j.id)).toEqual(["serial-0", "serial-1", "serial-2", "serial-3"]);
+      expect(reclaimed.every((j) => j.attempts === 2)).toBe(true);
+      record("serial_prefetch_expiry", { actualStarted: 1, leased: 4, elapsedClockSeconds: 61, reclaimable: 4 });
+    } finally { gate.resolve(); await run; }
+  });
+
+  it("lets an old execution overwrite a newer successful lease with failure", () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+    const h = harness(); h.job("stale-result", "reflection");
+    const [a] = h.repos.runtime.leaseQueuedJobs(1);
+    vi.setSystemTime(epoch + 61_000);
+    const [b] = h.repos.runtime.leaseQueuedJobs(1);
+    expect(a!.id).toBe(b!.id); expect(b!.attempts).toBe(2);
+    h.runner.completeLeasedWorkerJob(b!);
+    expect(h.repos.runtime.getJob(b!.id)!.status).toBe("succeeded");
+    h.runner.failLeasedWorkerJob(a!, new Error("late error from old execution"));
+    expect(h.repos.runtime.getJob(b!.id)!.status).toBe("failed");
+    record("stale_execution_overwrite", { newExecution: "succeeded", afterOldFailure: "failed", leaseGenerationGuard: false });
+  });
+
+  it("exhausts three business attempts at the same clock time with no generic backoff", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+    const h = harness(async () => { throw new Error("temporary timeout"); });
+    h.job("temporary-failure", "reflection");
+    const attempts = [];
+    for (let i = 0; i < 3; i++) {
+      await h.runner.runWorkerOnce(1);
+      attempts.push(h.repos.runtime.getJob("temporary-failure")!.attempts);
+    }
+    expect(attempts).toEqual([1, 2, 3]);
+    expect(h.repos.runtime.getJob("temporary-failure")!.status).toBe("dead_letter");
+    record("generic_failure_backoff", { attempts, clockAdvancedMs: 0, terminal: "dead_letter" });
+  });
+
+  it("startup recovery resets a valid main lease and a valid embedding retry lease", () => {
+    const h = harness(); h.job("valid-main", "reflection");
+    h.memory("valid-retry-target"); h.retry("valid-retry", "valid-retry-target");
+    h.repos.runtime.leaseQueuedJobs(1, 600);
+    h.repos.runtime.claimDueEmbeddingRetries({ now: Date.now(), workerId: "active-owner", leaseUntil: Date.now() + 600_000 });
+    const result = h.runner.reconcileWorkerStartup(100);
+    expect(result).toMatchObject({ requeuedJobs: 1, requeuedEmbeddingRetries: 1 });
+    expect(h.repos.runtime.getJob("valid-main")!.status).toBe("queued");
+    expect(h.repos.runtime.getEmbeddingRetry("valid-retry")!.status).toBe("pending");
+    record("restart_valid_leases", { validMainLease: "requeued", validRetryLease: "pending", remainingSecondsBeforeRecovery: 600 });
+  });
+
+  it("already rejects an obsolete embedding retry owner after a replacement claim (control)", () => {
+    const h = harness(); h.memory("fenced-target"); h.retry("fenced-retry", "fenced-target");
+    const now = Date.now();
+    h.repos.runtime.claimDueEmbeddingRetries({ now, workerId: "A", leaseUntil: now + 1_000 });
+    h.repos.runtime.claimDueEmbeddingRetries({ now: now + 1_001, workerId: "B", leaseUntil: now + 60_000 });
+    const oldCompletion = h.repos.runtime.markEmbeddingRetrySucceededClaimed("fenced-retry", {
+      workerId: "A", leaseUntil: now + 1_000, now: now + 1_002
+    });
+    expect(oldCompletion).toBeUndefined();
+    expect(h.repos.runtime.getEmbeddingRetry("fenced-retry")).toMatchObject({ status: "in_progress", claimedBy: "B" });
+    record("embedding_existing_claim_guard", { staleCompletionRejected: true, currentOwner: "B" });
+  });
+});
