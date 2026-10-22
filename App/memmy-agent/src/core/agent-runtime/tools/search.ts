@@ -1,3 +1,4 @@
+import { authorizeMemmateReadPath } from "../memmate-permission.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -161,14 +162,20 @@ export class SearchTool extends Tool {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
+      await authorizeMemmateReadPath(root);
       yield root;
       return;
     }
     if (!stat.isDirectory()) return;
+    await authorizeMemmateReadPath(root);
     const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = entries.filter((entry) => entry.isDirectory() && !IGNORE_DIRS.has(entry.name)).map((entry) => entry.name).sort();
     const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
-    for (const file of files) yield path.join(root, file);
+    for (const file of files) {
+      const target = path.join(root, file);
+      await authorizeMemmateReadPath(target);
+      yield target;
+    }
     for (const dir of dirs) yield* this.iterFiles(path.join(root, dir));
   }
 }
@@ -217,18 +224,23 @@ export class FindFilesTool extends SearchTool {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
+      await authorizeMemmateReadPath(root);
       yield root;
       return;
     }
     if (!stat.isDirectory()) return;
+    await authorizeMemmateReadPath(root);
     if (includeDirs) yield root;
     const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = entries.filter((entry) => entry.isDirectory() && !IGNORE_DIRS.has(entry.name)).map((entry) => entry.name).sort();
     const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
-    for (const file of files) yield path.join(root, file);
+    for (const file of files) {
+      const target = path.join(root, file);
+      await authorizeMemmateReadPath(target);
+      yield target;
+    }
     for (const dir of dirs) {
       const child = path.join(root, dir);
-      if (includeDirs) yield child;
       yield* this.iterPaths(child, { includeDirs });
     }
   }

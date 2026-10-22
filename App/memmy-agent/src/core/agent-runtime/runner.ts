@@ -1,5 +1,5 @@
 import { resolveWorkspacePath as resolveManagedFilePath } from "./tools/path-utils.js";
-import { authorizeMemmateTool, emitMemmateToolEvent, memmatePermissionRequired } from "./memmate-permission.js";
+import { authorizeMemmateTool, emitMemmateToolEvent, memmatePermissionRequired, withMemmateFileCall } from "./memmate-permission.js";
 import { requestTiming } from "../../utils/request-timing.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
@@ -1110,8 +1110,9 @@ export class AgentRunner {
         const executionName = call.name;
         await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
         if (call.name !== executionName) throw new Error("Tool name changed before MemMate approval");
-        if (["read_file", "write_file", "edit_file", "list_dir"].includes(executionName) && typeof params?.path === "string") {
-          params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params.path) };
+        if (["read_file", "write_file", "edit_file", "list_dir", "find_files", "grep"].includes(executionName)
+          && (typeof params?.path === "string" || ["find_files", "grep"].includes(executionName))) {
+          params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params?.path ?? ".") };
         }
         const authorized = await authorizeMemmateTool(executionName, params, spec.abortSignal, call.id);
         params = authorized.args;
@@ -1167,9 +1168,9 @@ export class AgentRunner {
           });
         },
       };
-      const run = managedResult !== undefined ? managedResult : tool && typeof tool.execute === "function"
+      const run = withMemmateFileCall(call.id, () => managedResult !== undefined ? managedResult : tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
-        : spec.tools.execute(call.name, params, toolContext);
+        : spec.tools.execute(call.name, params, toolContext));
       raw = await withAbort(Promise.resolve(run), spec.abortSignal);
       if (spec.abortSignal?.aborted) throw createAbortError();
       let event: Record<string, any>;

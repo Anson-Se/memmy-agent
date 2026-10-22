@@ -1,4 +1,4 @@
-import { memmatePermissionRequired } from "../memmate-permission.js";
+import { authorizeMemmateReadPath, memmatePermissionRequired } from "../memmate-permission.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -1106,14 +1106,20 @@ export class ListDirTool extends Tool {
     const maxEntries = params.max_entries ?? params.maxEntries ?? 200;
     const rows: string[] = [];
     const walk = async (dir: string) => {
+      await authorizeMemmateReadPath(dir);
       const entries = (await fs.readdir(dir, { withFileTypes: true }))
         .filter((entry) => !IGNORED_DIRS.has(entry.name))
         .sort((a, b) => a.name.localeCompare(b.name));
       for (const entry of entries) {
         const full = path.join(dir, entry.name);
         const rel = workspaceRelative(this.workspace, full).replaceAll(path.sep, "/") + (entry.isDirectory() ? "/" : "");
-        rows.push(rel);
-        if (params.recursive && entry.isDirectory()) await walk(full);
+        if (params.recursive && entry.isDirectory()) {
+          rows.push(rel);
+          await walk(full);
+        } else {
+          await authorizeMemmateReadPath(full);
+          rows.push(rel);
+        }
       }
     };
     if (!fsSync.existsSync(target)) return `Error: path not found: ${params.path}`;

@@ -3,6 +3,19 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 
 type PermissionScope = { url: string; token: string; active: boolean; signal: AbortSignal; onEvent?: (event: Record<string, unknown>) => void };
 const scopes = new AsyncLocalStorage<PermissionScope>();
+const fileCalls = new AsyncLocalStorage<string>();
+
+export function withMemmateFileCall<T>(callId: string, run: () => T): T {
+  return fileCalls.run(callId, run);
+}
+
+/** Traversal grants never cover descendants: check every path before returning or reading it. */
+export async function authorizeMemmateReadPath(path: string): Promise<void> {
+  if (!memmatePermissionRequired()) return;
+  const parentCallId = fileCalls.getStore();
+  if (!parentCallId) throw new Error("MemMate file access context is missing");
+  await authorizeMemmateTool("memmate_read_path", { path }, undefined, randomUUID(), parentCallId);
+}
 
 export function memmatePermissionRequired(): boolean {
   return process.env.MEMMATE_PERMISSION_REQUIRED === "1";
@@ -36,7 +49,7 @@ export function withMemmatePermission<T>(scope: PermissionScope | undefined, run
 }
 
 /** Outside the authenticated request scope, managed runtimes cannot execute tools. */
-export async function authorizeMemmateTool(name: string, args: unknown, signal?: AbortSignal | null, callId: string = randomUUID()): Promise<{ args: unknown; result?: string }> {
+export async function authorizeMemmateTool(name: string, args: unknown, signal?: AbortSignal | null, callId: string = randomUUID(), parentCallId?: string): Promise<{ args: unknown; result?: string }> {
   const scope = scopes.getStore();
   if (!scope) {
     if (memmatePermissionRequired()) throw new Error("MemMate approval context is missing");
@@ -45,11 +58,13 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
   if (!scope.active || scope.signal.aborted || signal?.aborted) throw new Error("MemMate run has ended");
   // A detached copy prevents a hook or parallel caller from changing approved parameters.
   const approvedArgs = JSON.parse(JSON.stringify(args));
-  emitMemmateToolEvent({ type: "tool_call", callId, name, input: approvedArgs });
+  if (!parentCallId) emitMemmateToolEvent({ type: "tool_call", callId, name, input: approvedArgs });
   const response = await fetch(scope.url, {
     method: "POST", redirect: "error",
     headers: { "content-type": "application/json", authorization: `Bearer ${scope.token}` },
-    body: JSON.stringify({ callId, toolName: name, args: approvedArgs }),
+    body: JSON.stringify({ callId, toolName: name, args: approvedArgs,
+      ...(["list_dir", "find_files", "grep", "memmate_read_path"].includes(name) ? { fileAccessProtocol: 1 } : {}),
+      ...(parentCallId ? { parentCallId } : {}) }),
     signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(125_000)])
   });
   if (!response.ok) throw new Error("MemMate approval service is unavailable");
