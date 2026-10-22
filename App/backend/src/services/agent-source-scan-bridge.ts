@@ -31,7 +31,7 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
   function publish(state: MemoryAgentSourceScanState) {
     if (stopped || !state.jobId || !state.sourceId) return;
     if (state.progress && !state.completedAt && (state.running || state.progress.phase === "stopped")) {
-      const progress = { ...desktopProgress(state.progress), ...identity(state) };
+      const progress = { ...desktopProgress(state.progress), ...identity(state), requestedSourceId: state.sourceId, ...(state.mode ? { mode: state.mode } : {}) };
       const key = JSON.stringify(progress);
       if (key !== lastProgress) {
         lastProgress = key;
@@ -74,6 +74,8 @@ export function createAgentSourceScanBridge(client: AgentSourceScanClient | unde
       active: state.running,
       progress: state.jobId && !state.completedAt && (state.running || state.progress?.phase === "stopped") ? {
         ...identity(state),
+        requestedSourceId: state.sourceId ?? undefined,
+        ...(state.mode ? { mode: state.mode } : {}),
         ...desktopProgress(state.progress ?? { sourceId: state.sourceId ?? "all", phase: "scan" as const, current: 0, total: 0 })
       } : null,
       ...(state.jobId && state.sourceId && state.completedAt ? { completion: {

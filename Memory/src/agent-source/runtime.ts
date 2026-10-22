@@ -53,7 +53,7 @@ import {
   legacyTurnRequestId,
   type ScanStore
 } from "@memmy/agent-source-core";
-import { openMemoryAgentSourceScanStore, type MemoryAgentSourceScanStore } from "./scan-store.js";
+import { openMemoryAgentSourceScanStore, readScanRequestedMode, type MemoryAgentSourceScanStore } from "./scan-store.js";
 import { createWorkbuddySourceAdapter } from "./adapters/workbuddy/index.js";
 import { createClaudeCodeSkillTarget } from "./integration/claude-code/index.js";
 import { createCodexSkillTarget } from "./integration/codex/index.js";
@@ -360,6 +360,10 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental", phase: "stage",
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
       });
+      const requestedMode = store.requestedMode();
+      if (request.mode === undefined && requestedMode !== undefined) request.mode = requestedMode ?? undefined;
+      if (requestedMode === undefined) store.saveRequestedMode(request.mode ?? null);
+      setScan({ ...scan, mode: request.mode ?? null });
       store.beginAttempt(scan.attemptId!, scan.startedAt ?? undefined);
       // Legacy waitForProcessing requests/options no longer change scan completion.
       // Processing belongs to durable background jobs, independently of this scan.
@@ -507,6 +511,13 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           skipped: 0, memoryIdCount: summary.memories, errorCount: summary.errors, errors }] });
       }
       await checkpoint();
+      // A recovered job can contain staged work for a source whose path is
+      // temporarily unavailable (or no longer registered). Keep the job
+      // retryable rather than publishing success for only the visible sources.
+      const unavailableSources = store.unfinishedSourceIds().filter(sourceId => !available.some(adapter => adapter.descriptor.sourceId === sourceId));
+      if (unavailableSources.length > 0) {
+        throw new Error(`Agent source scan has unfinished unavailable sources: ${unavailableSources.join(", ")}`);
+      }
       if (failureCount > 0) {
         throw new Error(`Agent source scan completed with ${failureCount} import failure${failureCount === 1 ? "" : "s"}: ${failures.slice(0, 3).join("; ")}`);
       }
@@ -751,6 +762,7 @@ function findReusableScanJob(directory: string, sourceId: string, mode?: string,
     try {
       db = new Database(path, { readonly: true });
       const row = db.prepare("SELECT job_id AS jobId, source_id AS sourceId, mode, phase, updated_at AS updatedAt FROM scan_meta WHERE id=1").get() as { jobId: string; sourceId: string; mode?: string; phase: string; updatedAt: string } | undefined;
+      const requestedMode = readScanRequestedMode(db);
       db.close();
       db = undefined;
       if (row && excludedJobs.has(row.jobId)) continue;
@@ -763,7 +775,7 @@ function findReusableScanJob(directory: string, sourceId: string, mode?: string,
         }
         continue;
       }
-      if (row && row.sourceId === sourceId && (!mode || !row.mode || row.mode === mode)) {
+      if (row && row.sourceId === sourceId && (!mode || (requestedMode === undefined ? !row.mode || row.mode === mode : requestedMode === mode))) {
         const updatedAt = Date.parse(row.updatedAt);
         if (!selected || updatedAt > selected.updatedAt) selected = { jobId: row.jobId, updatedAt };
       }
@@ -1677,8 +1689,12 @@ function restoredScanState(directory: string): AgentSourceScanState {
       latestAt = Date.parse(row.updated_at);
       if (row.completion) { latest = JSON.parse(row.completion) as AgentSourceScanState; continue; }
       if (row.phase === "done") { latest = emptyScanState(); continue; }
+      // scan_meta.mode describes the last source, not the global request.
+      // Legacy global jobs have no reliable request mode; retain their per-source
+      // recovery behavior instead of forcing one source's mode on all others.
+      const requestedMode = readScanRequestedMode(db);
       latest = { ...emptyScanState(), attemptId: row.attempt_id ?? `${row.job_id}:legacy`,
-        ...(row.phase === "failed" ? { completedAt: row.updated_at, error: row.error ?? "Agent source import failed" } : {}), jobId: row.job_id, sourceId: row.source_id, mode: row.mode,
+        ...(row.phase === "failed" ? { completedAt: row.updated_at, error: row.error ?? "Agent source import failed" } : {}), jobId: row.job_id, sourceId: row.source_id, mode: requestedMode === undefined ? (row.source_id === "all" ? null : row.mode) : requestedMode,
         startedAt: row.attempt_started_at ?? row.created_at,
         progress: row.phase === "failed" ? null : { sourceId: row.source_id, phase: "stopped", current: 0, total: 0, message: "Interrupted scan is ready to resume" }
       };

@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as waitForIO } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createAgentSourceExecutor,
@@ -803,9 +804,12 @@ function fixtureMessage(
 }
 
 async function waitForFakeTimerScan(executor: ReturnType<typeof createAgentSourceExecutor>): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     if (!executor.scanStatus().running) return;
-    await vi.advanceTimersByTimeAsync(1);
+    // Filesystem promises need real event-loop time. Advancing the fake clock
+    // alone races disk IO and can also trigger the next scheduled scan.
+    await waitForIO(10);
+    await vi.advanceTimersByTimeAsync(0);
   }
   throw new Error("automatic scan did not complete");
 }

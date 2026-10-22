@@ -38,6 +38,8 @@ export type EventConnectionStatus = "pending" | "connecting" | "connected" | "he
 
 /** Contract for agent source scan progress. */
 export interface AgentSourceScanProgress extends importScanStamp {
+  requestedSourceId?: string;
+  mode?: import("@memmy/local-api-contracts").AgentSourceScanMode;
   jobId: string;
   attemptId?: string;
   attemptStartedAt?: string;

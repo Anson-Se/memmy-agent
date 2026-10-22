@@ -103,3 +103,39 @@ it("accepts a successful legacy resume without accepting unsolicited running pro
   expect(stateApi.state.agentSources.scanProgress?.phase).toBe("scan");
   expect(button("暂停").disabled).toBe(false);
 });
+
+it("adjacent: resume must not reuse a previous full scan mode for an external incremental task", async () => {
+ await mount();
+ await act(async () => {stateApi.dispatch(a.agentSourceScanStatusReceived({active:false,progress:null,status:"cancelled",version:{generation:1,sequence:2},execution:{jobId:"job",attemptId:"a"}}));});
+ const clickText=async (label:string)=>{await act(async()=>{const b=[...container.querySelectorAll<HTMLButtonElement>("button")].find(x=>x.textContent?.includes(label));if(!b)throw Error("missing "+label);b.click();});};
+ vi.mocked(clients.agentSources.startScan).mockResolvedValue({jobId:"full",attemptId:"f"});
+ vi.mocked(clients.agentSources.getScanStatus).mockResolvedValue({active:true,progress:{...progress(3),jobId:"full",attemptId:"f"},version:{generation:1,sequence:3}});
+ await clickText("高级");await clickText("扫描全部历史");
+ await act(async()=>{(container.querySelector('input[type="radio"]') as HTMLElement).click();});
+ await clickText("开始全量扫描");
+ expect(clients.agentSources.startScan).toHaveBeenLastCalledWith(expect.objectContaining({mode:"full"}));
+ await act(async()=>{stateApi.dispatch(a.agentSourceScanProgressReceived({...progress(5,"stopped"),jobId:"external-incremental",attemptId:"e",mode:"incremental"}));});
+ vi.mocked(clients.agentSources.startScan).mockClear();
+ await act(async()=>{button("继续").click();});
+ expect(vi.mocked(clients.agentSources.startScan).mock.calls[0]?.[0].mode).toBe("incremental");
+});
+
+
+it.each(["full", "incremental", "initial_subset"] as const)("resumes the service-confirmed %s mode after page remount", async mode => {
+  await mount();
+  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(2, "stopped"), mode })); });
+  vi.mocked(clients.agentSources.startScan).mockResolvedValue({ jobId: "job", attemptId: "a" });
+  vi.mocked(clients.agentSources.getScanStatus).mockResolvedValue(status(3));
+  await act(async () => { button("继续").click(); });
+  expect(clients.agentSources.startScan).toHaveBeenLastCalledWith({ sourceId: "all", mode, expectedExecution: { jobId: "job", attemptId: "a" } });
+});
+
+
+it("continues an all-source execution paused on one source without narrowing its scope", async () => {
+  await mount();
+  await act(async () => { stateApi.dispatch(a.agentSourceScanProgressReceived({ ...progress(2, "stopped"), sourceId: "pi", requestedSourceId: "all", mode: "full" })); });
+  vi.mocked(clients.agentSources.startScan).mockResolvedValue({ jobId: "job", attemptId: "a" });
+  vi.mocked(clients.agentSources.getScanStatus).mockResolvedValue(status(3));
+  await act(async () => { button("继续").click(); });
+  expect(clients.agentSources.startScan).toHaveBeenLastCalledWith({ sourceId: "all", mode: "full", expectedExecution: { jobId: "job", attemptId: "a" } });
+});

@@ -8,6 +8,8 @@ import type { ConversationMessage, SourceAdapter } from "../src/agent-source/ada
 import type { MemoryService } from "../src/service/memory-service.js";
 import { createMemoryServiceFixture } from "./fixtures/memory-service-fixture.js";
 
+import { openMemoryAgentSourceScanStore } from "../src/agent-source/scan-store.js";
+
 const fixture = createMemoryServiceFixture();
 const scans: ReturnType<typeof createAgentSourceExecutor>[] = [];
 afterEach(async () => { for (const scan of scans.splice(0)) await scan.dispose(); fixture.cleanup(); });
@@ -155,3 +157,79 @@ describe("backend scan behavior preserved in Memory", () => {
     expect(state(root).sources.other.messageCount).toBe(4);
   });
 });
+
+
+it.each(["stage", "prepare", "ingest", "failed", "missing"])("retains unavailable staged work in %s and imports it after restart", async phase => {
+  const { root, service, db } = fixture.createTestService();
+  const messages = turn("unavailable");
+  const store = await openMemoryAgentSourceScanStore(join(root, "scans", "interrupted.sqlite"), {
+    jobId: "interrupted", sourceId: "all", mode: "full", phase: "ingest",
+    createdAt: "2026-10-21T00:00:00Z", updatedAt: "2026-10-21T00:00:00Z"
+  });
+  store.stageBatch(messages);
+  if (phase !== "missing") store.saveSourceState({ sourceId: "fixture", mode: "full", phase: phase as "stage", messageCount: 2, resultCount: 0, errorCount: 0, updatedAt: "2026-10-21T00:00:00Z" });
+  store.close();
+  const source = adapter(messages); source.detect = async () => false;
+  const scan = create(root, service, [source]);
+  const failed = await run(scan, "all", "full");
+  expect(failed.error).toContain("unfinished unavailable sources: fixture");
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM memories").get()).toEqual({ count: 0 });
+  await scan.dispose();
+  source.detect = async () => true;
+  const next = create(root, service, [source]);
+  const recovered = await run(next, "all", "full");
+  expect(recovered.jobId).toBe("interrupted");
+  expect(recovered.error).toBeNull();
+  expect(state(root).sources.fixture.messageCount).toBe(2);
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM memories WHERE deleted_at IS NULL").get()).toEqual({ count: 1 });
+  expect((await run(next, "all", "full")).error).toBeNull();
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM memories WHERE deleted_at IS NULL").get()).toEqual({ count: 1 });
+});
+
+it("preserves full scope for unstarted sources when resuming the confirmed mode", async () => {
+ const {root, service, db} = fixture.createTestService();
+ let entered!: () => void; const reached = new Promise<void>(r => entered=r);
+ const a=adapter([], "a");
+ a.scan=async function*(options) { entered(); await new Promise<void>(r => { if(options.signal?.aborted) r(); else options.signal?.addEventListener("abort", () => r(), {once:true}); }); yield* turn("first",0,"a"); };
+ const b=adapter(Array.from({length:1200},(_,i)=>turn(`history-${i}`,i,"b")).flat(),"b");
+ const first=create(root,service,[a,b]);
+ const started=await first.startScan({sourceId:"all", mode:"full"});
+ await reached; await first.dispose();
+ a.scan=async function*() {};
+ const optionsSeen:unknown[]=[]; const original=b.scan;
+ b.scan=async function*(opts) { optionsSeen.push(opts); yield* original(opts); };
+ const restored=create(root,service,[a,b]);
+ expect(restored.scanStatus()).toMatchObject({jobId:started.jobId, mode:"full", status:"paused"});
+ const resumed=await restored.startScan({sourceId:"all", mode: restored.scanStatus().mode, expectedExecution:{jobId:started.jobId,attemptId:started.attemptId}});
+ expect(resumed.jobId).toBe(started.jobId);
+ await vi.waitFor(()=>expect(restored.scanStatus().running).toBe(false),{timeout:20000});
+ expect(restored.scanStatus().error).toBeNull();
+ const count=db.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE deleted_at IS NULL").get();
+ expect(optionsSeen).toEqual([expect.objectContaining({ order: "source_default", fullHistory: true })]);
+ expect(count).toEqual({n:1200});
+},30000);
+
+
+it("preserves automatic per-source modes after interrupting a new source before a known source", async () => {
+  const { root, service, db } = fixture.createTestService();
+  let reached!: () => void; const staging = new Promise<void>(resolve => { reached = resolve; });
+  const firstSource = adapter([], "new");
+  firstSource.scan = async function* (options) {
+    reached();
+    await new Promise<void>(resolve => { options.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+  };
+  const messages = turn("old", 0, "known");
+  const knownSource = adapter(messages, "known");
+  const first = create(root, service, [firstSource, knownSource]);
+  expect((await run(first, "known", "full")).error).toBeNull();
+  messages.push(...Array.from({ length: 1200 }, (_, i) => turn(`new-${i}`, i + 1, "known")).flat());
+  const started = await first.startScan({ sourceId: "all" });
+  await staging; await first.dispose();
+  firstSource.scan = async function* () {};
+  const restored = create(root, service, [firstSource, knownSource]);
+  expect(restored.scanStatus()).toMatchObject({ status: "paused", mode: null, jobId: started.jobId });
+  await restored.startScan({ sourceId: "all", expectedExecution: { jobId: started.jobId, attemptId: started.attemptId } });
+  await vi.waitFor(() => expect(restored.scanStatus().running).toBe(false), { timeout: 20_000 });
+  expect(restored.scanStatus().error).toBeNull();
+  expect(db.db.prepare("SELECT COUNT(*) AS count FROM memories WHERE deleted_at IS NULL").get()).toEqual({ count: 1201 });
+}, 30_000);

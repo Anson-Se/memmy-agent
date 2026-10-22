@@ -1036,6 +1036,10 @@ function HubTab({
 
 // ─── Cross-Agent access tab ──────────────────────────────────────────
 
+// Settings tabs unmount on navigation; consuming a completion belongs to the
+// Viewer session, not to one mount of the Agent tab.
+const completedScanExecutions = new Set<string>();
+
 export function AgentAccessTab({
   agentAccess,
   onPatch,
@@ -1065,9 +1069,14 @@ export function AgentAccessTab({
   const latestScan = useRef<AgentSourceScanState | null>(null);
   const operationGeneration = useRef(0);
   const pendingControl = useRef<string | null>(null);
-  const completedExecutions = useRef(new Set<string>());
+  const scanQuerySequence = useRef(0);
+  const acceptedScanQuery = useRef(0);
+  const scanViewActive = useRef(true);
   const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(completionTimer.current), []);
+  useEffect(() => {
+    scanViewActive.current = true;
+    return () => { scanViewActive.current = false; clearTimeout(completionTimer.current); };
+  }, []);
   const scannableSources = visibleAgentSources(sources);
   const scanPaused = scanStatus?.progress?.phase === "stopped";
   const scanSessionActive = scanStatus?.running === true || scanPaused;
@@ -1095,10 +1104,13 @@ export function AgentAccessTab({
     }
   };
 
-  const receiveScan = (next: AgentSourceScanState, requestGeneration?: number) => {
+  const receiveScan = (next: AgentSourceScanState, requestGeneration?: number, querySequence?: number) => {
+    if (!scanViewActive.current) return;
     const stamp = (value: AgentSourceScanState | null) => value ? { ...value, attemptStartedAt: value.startedAt ?? undefined } : null;
     if (!acceptsScanUpdate(stamp(latestScan.current), stamp(next)!)) return;
     if (!next.version && requestGeneration !== undefined && requestGeneration !== operationGeneration.current) return;
+    if (!next.version && querySequence !== undefined && querySequence < acceptedScanQuery.current) return;
+    if (querySequence !== undefined) acceptedScanQuery.current = Math.max(acceptedScanQuery.current, querySequence);
     latestScan.current = next;
     if (!next.completedAt && (next.running || next.progress?.phase === "stopped")) {
       setScanStatus(next);
@@ -1111,14 +1123,21 @@ export function AgentAccessTab({
     setBusySource(null);
     if (next.status === "cancelled" || !next.completedAt || !next.jobId) return;
     const key = scanExecutionKey(next);
-    if (completedExecutions.current.has(key)) return;
-    completedExecutions.current.add(key);
-    if (completedExecutions.current.size > 100) completedExecutions.current.delete(completedExecutions.current.values().next().value!);
+    if (completedScanExecutions.has(key)) return;
+    completedScanExecutions.add(key);
+    if (completedScanExecutions.size > 100) completedScanExecutions.delete(completedScanExecutions.values().next().value!);
     if (next.error) setMessage(next.error);
     else setScanCompletion(t("settings.agents.scanCompletedNotice", { agent: sourceDisplayName(next.sourceId ?? "all", sourcesRef.current) }));
     clearTimeout(completionTimer.current);
     completionTimer.current = setTimeout(() => setScanCompletion(null), 5_000);
     void loadSources();
+  };
+
+  const readScan = async () => {
+    const generation = operationGeneration.current;
+    const sequence = ++scanQuerySequence.current;
+    const next = await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status");
+    receiveScan(next, generation, sequence);
   };
 
   useEffect(() => {
@@ -1136,9 +1155,10 @@ export function AgentAccessTab({
     let active = true;
     const refreshScan = async () => {
       const generation = operationGeneration.current;
+      const sequence = ++scanQuerySequence.current;
       try {
         const next = await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status");
-        if (active) receiveScan(next, generation);
+        if (active) receiveScan(next, generation, sequence);
       } catch { /* next poll reconciles transport failures */ }
     };
     void refreshScan();
@@ -1177,7 +1197,7 @@ export function AgentAccessTab({
 
   const restartService = async () => {
     if (serviceBusy) return;
-    const generation = ++operationGeneration.current;
+    ++operationGeneration.current;
     setServiceBusy(true);
     setServiceFeedback(null);
     try {
@@ -1186,7 +1206,7 @@ export function AgentAccessTab({
       await api.post("/api/v1/system/restart", {});
       const running = await waitForMemoryService(before.uptimeMs, requestedAt);
       if (!running) throw new Error(t("settings.agents.serviceRestartFailed"));
-      receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation);
+      await readScan();
       setServiceFeedback({ kind: "ok", text: t("settings.agents.serviceRestarted") });
     } catch (error) {
       setServiceFeedback({
@@ -1210,10 +1230,10 @@ export function AgentAccessTab({
       : { expectedVersion: previous?.version };
     try {
       await api.post("/api/v1/agent-sources/scan", { sourceId, ...(mode ? { mode } : {}), ...expected });
-      receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation);
+      await readScan();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-      try { receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"), generation); } catch { /* next poll */ }
+      try { await readScan(); } catch { /* next poll */ }
       if (operationGeneration.current === generation && !latestScan.current?.running) setBusySource(null);
     }
   };
@@ -1221,7 +1241,8 @@ export function AgentAccessTab({
   const controlScan = async (kind: "pause" | "cancel") => {
     const previous = latestScan.current;
     if (serviceBusy || !previous?.jobId || pendingControl.current) return;
-    const token = `${++operationGeneration.current}:${kind}`;
+    const generation = ++operationGeneration.current;
+    const token = `${generation}:${kind}`;
     pendingControl.current = token;
     setScanControlBusy(kind);
     setMessage(null);
@@ -1229,10 +1250,11 @@ export function AgentAccessTab({
       const result = await api.post<{ snapshot?: AgentSourceScanState }>(`/api/v1/agent-sources/scan/${kind === "pause" ? "stop" : "cancel"}`, {
         expectedExecution: { jobId: previous.jobId, attemptId: previous.attemptId }
       });
-      receiveScan(result.snapshot ?? await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status"));
+      if (result.snapshot) receiveScan(result.snapshot, generation);
+      else await readScan();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
-      try { receiveScan(await api.get<AgentSourceScanState>("/api/v1/agent-sources/scan/status")); } catch { /* next poll */ }
+      try { await readScan(); } catch { /* next poll */ }
     } finally {
       if (pendingControl.current === token) { pendingControl.current = null; setScanControlBusy(null); }
     }

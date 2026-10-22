@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { MemoryAgentSourceScanState } from "@memmy/local-api-contracts";
+import { AgentSourceScanProgressPayloadSchema, type MemoryAgentSourceScanState } from "@memmy/local-api-contracts";
 import type { AgentSourceScanClient } from "../../adapters/outbound/memory-client/types.js";
 import { createAgentSourceScanBridge } from "../agent-source-scan-bridge.js";
 import { createProgressBus } from "../progress-bus.js";
@@ -142,4 +142,26 @@ it("starts a fresh status read after restart instead of reusing an outstanding o
     release(old);
     expect((await pending).version).toEqual(current.version);
   } finally { release(old); await pending; await bridge.dispose(); }
+});
+
+
+it.each(["full", "incremental", "initial_subset"] as const)("forwards the confirmed %s mode through status and events", async mode => {
+  const state: MemoryAgentSourceScanState = { ...empty(), jobId: "job", attemptId: "a", sourceId: "all", mode, status: "paused", version: { generation: 2, sequence: 0 }, progress: { sourceId: "all", phase: "stopped", current: 0, total: 0 } };
+  const bus = createProgressBus(), progress = vi.fn(); bus.on("agent_source.scan_progress", progress);
+  const bridge = createAgentSourceScanBridge({ status: async () => state } as AgentSourceScanClient, bus, 60_000);
+  try {
+    expect(AgentSourceScanProgressPayloadSchema.parse((await bridge.status()).progress).mode).toBe(mode);
+    expect(AgentSourceScanProgressPayloadSchema.parse(progress.mock.calls[0]![0]).mode).toBe(mode);
+  } finally { await bridge.dispose(); }
+});
+
+
+it("keeps the all-source task scope separate from its current source progress", async () => {
+  const state: MemoryAgentSourceScanState = { ...empty(), jobId: "job", attemptId: "a", sourceId: "all", mode: "full", status: "paused", version: { generation: 2, sequence: 0 }, progress: { sourceId: "pi", phase: "stopped", current: 3, total: 10 } };
+  const bus = createProgressBus(), progress = vi.fn(); bus.on("agent_source.scan_progress", progress);
+  const bridge = createAgentSourceScanBridge({ status: async () => state } as AgentSourceScanClient, bus, 60_000);
+  try {
+    expect(AgentSourceScanProgressPayloadSchema.parse((await bridge.status()).progress)).toMatchObject({ sourceId: "pi", requestedSourceId: "all", mode: "full" });
+    expect(AgentSourceScanProgressPayloadSchema.parse(progress.mock.calls[0]![0])).toMatchObject({ sourceId: "pi", requestedSourceId: "all", mode: "full" });
+  } finally { await bridge.dispose(); }
 });

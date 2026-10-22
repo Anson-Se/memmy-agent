@@ -97,7 +97,6 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const [showAdvancedActions, setShowAdvancedActions] = useState(false);
   const [showFullScanConfirm, setShowFullScanConfirm] = useState(false);
   const [fullScanTargetSourceId, setFullScanTargetSourceId] = useState("");
-  const [lastScanMode, setLastScanMode] = useState<AgentSourceScanMode | undefined>();
   const [localDataBusy, setLocalDataBusy] = useState<"reveal" | "export" | "clear" | null>(null);
   const [localDataError, setLocalDataError] = useState("");
   const [localDataExportMessage, setLocalDataExportMessage] = useState("");
@@ -445,7 +444,6 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
       return;
     }
 
-    setLastScanMode(mode);
     const scanSource = sourceId === "all"
       ? undefined
       : state.agentSources.items.find((source) => source.sourceId === sourceId);
@@ -486,7 +484,9 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   }
 
   function continueScan() {
-    scanSources(resolveScanContinueSourceId(scanProgress), lastScanMode);
+    // The current execution may have been started by another page. The
+    // service's confirmed mode must win over this page's previous choice.
+    scanSources(resolveScanContinueSourceId(scanProgress), scanProgress?.mode);
   }
 
   function openFullScanConfirm() {
@@ -1831,7 +1831,7 @@ export function formatScanProgressTail(
 }
 
 export function resolveScanContinueSourceId(progress: AgentSourceScanProgress | null): string {
-  return progress?.phase === "stopped" ? progress.sourceId : "all";
+  return progress?.phase === "stopped" ? progress.requestedSourceId ?? progress.sourceId : "all";
 }
 
 /**

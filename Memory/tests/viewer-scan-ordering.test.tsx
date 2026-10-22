@@ -105,3 +105,48 @@ it("does not report restart success when the full scan-state read fails", async 
   expect(container.textContent).not.toContain("记忆服务已重新启动");
   expect(control(0).disabled).toBe(false);
 });
+
+
+it("ignores a legacy idle read that returns after a newer external scan", async () => {
+  const idle: AgentSourceScanState = { ...running(), version: undefined, running: false, jobId: null, attemptId: undefined, startedAt: null, progress: null };
+  const old = deferred<AgentSourceScanState>();
+  nextStatus = () => old.promise;
+  await mount();
+  nextStatus = async () => ({ ...running(), version: undefined });
+  await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+  expect(card()).not.toBeNull();
+  await act(async () => { old.resolve(idle); });
+  expect(card()).not.toBeNull();
+  // A subsequently issued idle read must still reconcile external cancellation.
+  nextStatus = async () => idle;
+  await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+  expect(card()).toBeNull();
+});
+
+it.each([null, "scan failed"])("does not replay consumed completion after tab remount: %s", async error => {
+  const done: AgentSourceScanState = { ...running(3), jobId: `remount-${error}`, running: false, status: error ? "failed" : "completed", completedAt: "2026-10-21T00:01:00Z", progress: null, error };
+  nextStatus = async () => done;
+  await mount();
+  expect(container.textContent).toContain(error ?? "同步完成");
+  await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+  act(() => render(null, container));
+  await mount();
+  expect(container.textContent).not.toContain(error ?? "同步完成");
+  // A retry is a different execution and must produce fresh feedback.
+  nextStatus = async () => ({ ...done, attemptId: "retry", version: { generation: 1, sequence: 4 } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+  expect(container.textContent).toContain(error ?? "同步完成");
+});
+
+
+it("does not consume completion in a control callback after unmount", async () => {
+  await mount();
+  const pending = deferred<unknown>(); vi.mocked(api.post).mockReturnValue(pending.promise);
+  await act(async () => { control(0).click(); });
+  act(() => render(null, container));
+  const done: AgentSourceScanState = { ...running(3), jobId: "unmounted-control", running: false, status: "completed", completedAt: "2026-10-21T00:01:00Z", progress: null };
+  await act(async () => { pending.resolve({ snapshot: done }); });
+  nextStatus = async () => done;
+  await mount();
+  expect(container.textContent).toContain("同步完成");
+});

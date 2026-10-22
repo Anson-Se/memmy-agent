@@ -533,6 +533,8 @@ export const AgentSourceScanJobResponseSchema = z.object({
 export type AgentSourceScanJobResponse = z.infer<typeof AgentSourceScanJobResponseSchema>;
 
 export const AgentSourceScanProgressPayloadSchema = z.object({
+    requestedSourceId: z.string().min(1).optional(),
+    mode: AgentSourceScanModeSchema.optional(),
     version: ScanVersionSchema.optional(),
     status: ScanLifecycleSchema.optional(),
     attemptId: z.string().min(1).optional(),

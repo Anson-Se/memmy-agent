@@ -8,13 +8,23 @@ import type { ConversationCheckpoint, ConversationMessage, MessageCursor, Prepar
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const MAX_PAGE_BYTES = 8 * 1024 * 1024;
 
+/** Undefined denotes a legacy job which did not retain the request mode. */
+export function readScanRequestedMode(db: InstanceType<typeof Database>): "initial_subset" | "incremental" | "full" | null | undefined {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scan_options'").get()) return undefined;
+  const row = db.prepare("SELECT value FROM scan_options WHERE key='requested_mode'").get() as { value: string } | undefined;
+  return row?.value === "auto" ? null : row?.value === "full" || row?.value === "incremental" || row?.value === "initial_subset" ? row.value : undefined;
+}
+
 export interface MemoryScanJobMeta { jobId: string; sourceId: string; mode: string; phase: string; createdAt: string; updatedAt: string; error?: string; attemptId?: string; attemptStartedAt?: string; completion?: string; }
 export interface MemoryAgentSourceScanStore extends ScanStore { readonly path: string;
+  requestedMode(): "initial_subset" | "incremental" | "full" | null | undefined;
+  saveRequestedMode(mode: "initial_subset" | "incremental" | "full" | null): void;
   beginAttempt(attemptId: string, startedAt?: string): void;
   resolveItem(sourceId: string, conversationId: string, itemKey: string): void;
   saveResult(result: ScanStoredResult & { itemKey?: string }): void;
   checkpointPage(sourceId: string, afterConversationId?: string): ConversationCheckpoint[];
   unresolvedSourceIds(): string[];
+  unfinishedSourceIds(): string[];
   errorDetails(sourceId: string): Array<{ conversationId: string; reason: string }>;
   resultSummary(sourceId: string): { conversations: number; memories: number; errors: number };
   setWaitForProcessing(): void;
@@ -75,6 +85,8 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
   );
   const store: MemoryAgentSourceScanStore = {
     path,
+    requestedMode() { return readScanRequestedMode(db); },
+    saveRequestedMode(mode) { db.prepare("INSERT OR REPLACE INTO scan_options(key,value) VALUES('requested_mode',?)").run(mode ?? "auto"); },
     beginAttempt(id, startedAt) {
       attemptId = id;
       db.prepare("UPDATE scan_meta SET attempt_id=?, attempt_started_at=?, phase='stage', updated_at=?, completion=NULL, error=NULL").run(id, startedAt ?? new Date().toISOString(), new Date().toISOString());
@@ -161,6 +173,12 @@ export async function openMemoryAgentSourceScanStore(path: string, job: MemorySc
     },
     unresolvedSourceIds() {
       return (db.prepare("SELECT DISTINCT source_id FROM scan_results WHERE active=1 AND error IS NOT NULL").all() as Array<{source_id:string}>).map((row) => row.source_id);
+    },
+    unfinishedSourceIds() {
+      return (db.prepare(`SELECT source_id FROM scan_source_state WHERE phase != 'done'
+        UNION SELECT DISTINCT m.source_id FROM staged_messages m
+        WHERE m.job_id=? AND NOT EXISTS (SELECT 1 FROM scan_source_state s WHERE s.source_id=m.source_id)`)
+        .all(job.jobId) as Array<{ source_id: string }>).map(row => row.source_id);
     },
     errorDetails(sourceId) {
       return db.prepare("SELECT conversation_id AS conversationId,error AS reason FROM scan_results WHERE active=1 AND error IS NOT NULL AND source_id=? ORDER BY id LIMIT 500").all(sourceId) as Array<{conversationId:string;reason:string}>;
