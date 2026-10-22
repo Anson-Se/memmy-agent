@@ -295,6 +295,23 @@ describe("webui transcript replay", () => {
     expect(messages[1].activitySegmentId).toBe(messages[2].activitySegmentId);
   });
 
+  it("replays a draft interrupted by a same-turn steer as visible assistant text", () => {
+    const messages = replayTranscriptToUiMessages([
+      { event: "user", turn_id: "turn-steer", text: "开始" },
+      { event: "delta", turn_id: "turn-steer", text: "更早的过程说明" },
+      { event: "stream_end", turn_id: "turn-steer", text: "更早的过程说明", resuming: true },
+      { event: "delta", turn_id: "turn-steer", text: "已经生成的内容" },
+      { event: "stream_end", turn_id: "turn-steer", text: "已经生成的内容", resuming: true },
+      { event: "user", turn_id: "turn-steer", text: "调整主题" }
+    ]);
+
+    expect(messages.find((message) => message.content === "已经生成的内容")).toMatchObject({
+      role: "assistant"
+    });
+    expect(messages.find((message) => message.content === "已经生成的内容")?.kind).toBeUndefined();
+    expect(messages.find((message) => message.content === "更早的过程说明")?.kind).toBe("narration");
+  });
+
   it("does not strand an answer prefix when reasoning interleaves with content", () => {
     const draft = "The document is complete and consistent. Let me finalize the deliverable.";
     const messages = replayTranscriptToUiMessages([

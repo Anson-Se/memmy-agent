@@ -996,6 +996,24 @@ export function replayTranscriptToUiMessages(lines: Dict[], options: ReplayTrans
     activeActivitySegmentId = segment;
   }
 
+  function promoteInterruptedNarration(): void {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.turnId !== activeReplayTurnId
+        || message.kind !== "narration"
+        || !String(message.content ?? "").trim()
+      ) {
+        continue;
+      }
+      const promoted = { ...message };
+      delete promoted.kind;
+      delete promoted.activitySegmentId;
+      messages[index] = promoted;
+      return;
+    }
+  }
+
   function detachOpenAnswerBeforeActivity(): void {
     closedAnswerMessageId = null;
     bufferMessageId = null;
@@ -1235,6 +1253,12 @@ export function replayTranscriptToUiMessages(lines: Dict[], options: ReplayTrans
     activateReplayState(rec);
     const ev = rec.event;
     if (ev === "user") {
+      if (
+        activeReplayTurnId
+        && messages.some((message) => message.role === "user" && message.turnId === activeReplayTurnId)
+      ) {
+        promoteInterruptedNarration();
+      }
       suppressUntilTurnEnd = false;
       activeActivitySegmentId = null;
       activeFileEditSegmentId = null;
