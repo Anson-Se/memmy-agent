@@ -52,6 +52,7 @@
     "eventsource": "^4.1.0",
     "exceljs": "^4.4.0",
     "fast-xml-parser": "^5.8.0",
+    "fzstd": "^0.1.1",
     "grammy": "^1.43.0",
     "html-validate": "10.17.0",
     "iconv-lite": "^0.7.2",
