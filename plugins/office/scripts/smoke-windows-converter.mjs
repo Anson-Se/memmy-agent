@@ -38,8 +38,10 @@ export async function smokeWindowsConverter(executable) {
     await writeFile(join(isolatedProfile, "user/registrymodifications.xcu"), initialConfiguration);
     const launcher = fileURLToPath(new URL("../../../App/backend/src/adapters/outbound/plugin-runtime/windows/launch.ps1", import.meta.url));
     const args = [`-env:UserInstallation=${pathToFileURL(isolatedProfile).href}`, "--headless", "--convert-to", "pdf", "--outdir", isolatedOutput, input];
+    // Match the Host grant for the verified portable archive. LibreOffice's
+    // base-installation checks also query metadata above its program folder.
     const plan = Buffer.from(JSON.stringify({ profile: `memmy.plugin.office.smoke-${randomUUID()}`, command: executable, args, cwd: isolatedWork,
-      readRoots: [resolve(dirname(executable), "..")], writeRoots: [root] })).toString("base64");
+      readRoots: [resolve(dirname(executable), "../..")], writeRoots: [root] })).toString("base64");
     const childEnv = { ...env, TEMP: isolatedWork, TMP: isolatedWork, TMPDIR: isolatedWork, HOME: isolatedWork };
     const hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(childEnv)).toString("base64") };
     const isolated = await runProcess(join(env.SystemRoot, "System32/WindowsPowerShell/v1.0/powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", launcher, "-Plan", plan],
