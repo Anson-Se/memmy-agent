@@ -106,7 +106,7 @@ Create L1 when the turn holds work a future agent could continue, reuse, or chec
 - Reusable work constraints, decisions, verified tool results, durable project facts, or task feedback that says something about the result.
 Do not create L1 for a turn without such work: greetings, tests, and bare acknowledgements; answers that only repeat recalled memory; general-knowledge questions answered from common knowledge; facts and preferences about the user as a person (they go to User Memory). If the turn also holds such work, create L1 for that work.
 Real-time lookups: if the turn only looks up a value of the outside world that changes on its own, return l1: null, even when a tool fetched the value, because the value is out of date by the time the record is read; if the turn also does other work, record that work without the value. The user's own project, code, and environment are not the outside world, and discussing or building something about such a topic, or an instruction for the future, is not a lookup.
-A durable convention for how the agent should work from now on MUST create both L1 and User Memory.
+A durable convention for how the agent should work from now on MUST create both L1 and User Memory, unless it is tied to a named project, repository, or directory: then it creates only L1.
 
 When creating L1:
 The full text of the turn is stored separately. The summary is what this record is searched by, the title and summary are shown first when it is recalled, and the title tells later turns of this task what has been recorded: write the core of the turn and leave details to the stored text.
@@ -123,9 +123,11 @@ The full text of the turn is stored separately. The summary is what this record 
 ATTACHMENT METADATA is internal context: summarize the actual request, content, or outcome, never its wrapper or generic file wording.
 
 # Part 4: User Memory
-Use only what USER explicitly states about the user or about how the agent should work; never infer from other sections.
-- Questions, recalled answers, temporary requests, and one-off commands => null.
-- Durable personal facts => User Fact. Durable preferences, habits, or stable Agent work conventions => User Preference.
+Use only what USER explicitly states about the user or about how the agent should work; never infer from other sections or from text USER quotes from the assistant.
+- Durable personal facts => User Fact. A way of working USER states as a default for future conversations (such as 以后, 每次, from now on), or as a lasting habit of their own => User Preference.
+- Questions, recalled answers, temporary requests, and one-off commands => null. So are requests, choices, decisions, and corrections that belong to the current task, even when phrased as rules; project status; conventions tied to a named project, repository, or directory; and USER's views on how a project or system should be designed. Part 3 records these when the turn holds work.
+- A preference USER only shows by acting the same way again and again, without stating it, is not recorded here.
+- A durable fact about the user that USER mentions in passing inside a task request is still a User Fact; only the request itself stays with the task.
 - For a durable claim, choose one action:
   - correct: USER explicitly says the old claim was wrong and gives the correction. The candidate is replaced.
   - confirm: same meaning as a candidate, with no new fact/scope/time. The candidate is kept and this turn is recorded as another source.
@@ -144,6 +146,11 @@ USER=以后每次提交前先跑测试 => l1 created (kind user_directive) and u
 USER=Should we split this into two PRs? (discussed and decided) => l1 created, "unverified_answer": false
 USER=第二个方案不错，就它了，今天先到这 (picking one of the options the previous reply offered) => l1 created (kind decision)
 User Memory:
+USER=只审核，不改任何文件，中文输出。帮我看看这份评测代码有什么问题 => l1 created (kind task_request); user null (constraints of this request)
+USER=把定时任务改到早上七点 => l1 created; user null (a one-off change)
+USER=这个仓库以后提交前都先跑 lint => l1 created (kind user_directive); user null (tied to this repository)
+USER=我觉得这个系统的检索应该按用途分层 => l1 created (kind decision); user null (a view on the system's design)
+USER=我在找数据分析的岗位，帮我改一下简历里的项目描述 => l1 created (kind task_request); user create (User Fact: 在找数据分析的岗位), not the request to edit the resume
 USER=我现在最喜欢西瓜; candidate um1=我最喜欢苹果 => l1 null; user create, not correct (a change, not a statement that um1 was wrong)
 USER=前面说错了，我最喜欢西瓜，不是苹果; candidate um1=我最喜欢苹果 => l1 created (kind correction); user correct, target um1, replacement 我最喜欢西瓜
 
