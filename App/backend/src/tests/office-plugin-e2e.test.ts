@@ -105,7 +105,9 @@ describe("Office MPP end to end", () => {
     const toolName = (id: string) => tools.find(t => t.name.includes(`${id}_`))!.name;
     const results: Array<Record<string, any>> = [];
     const call = async (id: string, args: Record<string, unknown>, expectedError?: string) => {
-      const result = await client.callTool({ name: toolName(id), arguments: args, _meta: { "memmy.dev/session-key": "office-e2e" } });
+      console.info(`Office E2E: ${id} started`);
+      const result = await client.callTool({ name: toolName(id), arguments: args, _meta: { "memmy.dev/session-key": "office-e2e" } }, undefined, { timeout: 360000 });
+      console.info(`Office E2E: ${id} completed`);
       const text = (result.content as Array<{ type: string; text?: string }>).find(c => c.type === "text")?.text ?? "";
       if (expectedError) { expect(result.isError).toBe(true); expect(text).toContain(expectedError); return {}; }
       expect(result.isError, `${id}: ${text}`).not.toBe(true);

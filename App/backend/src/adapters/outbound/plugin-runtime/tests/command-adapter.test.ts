@@ -346,11 +346,14 @@ describe("CommandPluginAdapter", () => {
       buildLaunch: async () => ({
         command: process.execPath,
         args: ["-e", `
-          require('node:readline').createInterface({input:process.stdin}).once('line', () => {
-            require('node:fs').closeSync(0);
-            console.log(JSON.stringify({type:'host-service-request',requestId:'closed-pipe',service:'model-inference',input:{}}));
-            setInterval(() => {}, 1000);
-          });
+          const fs=require('node:fs');
+          fs.readSync(0,Buffer.alloc(65536),0,65536,null);
+          fs.closeSync(0);
+          // Keep descriptor zero occupied so libuv cannot reuse it for an
+          // internal handle (some Node 24 builds assert when closing fd 0).
+          fs.openSync(process.platform==='win32'?'NUL':'/dev/null','r');
+          console.log(JSON.stringify({type:'host-service-request',requestId:'closed-pipe',service:'model-inference',input:{}}));
+          setInterval(() => {}, 1000);
         `], cwd: root!
       })
     });
@@ -490,7 +493,8 @@ describe("CommandPluginAdapter", () => {
     }) as typeof spawn });
     const session = await adapter.activate(pluginContext);
     await collect(adapter.invoke(session, { callId: "env-test", pluginId: pluginContext.plugin.id, capabilityId: "run", conversationId: "test", input: {} }));
-    expect(launcherEnv.COR_ENABLE_PROFILING).toBeUndefined(); expect(launcherEnv.COR_PROFILER_PATH).toBeUndefined(); expect(launcherEnv.PSModulePath).toBeUndefined();
+    expect(launcherEnv.COR_ENABLE_PROFILING).toBeUndefined(); expect(launcherEnv.COR_PROFILER_PATH).toBeUndefined();
+    expect(launcherEnv.PSModulePath).toBe(`${launcherEnv.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\Modules`);
     expect(launcherEnv.SystemRoot).not.toBe("untrusted-root");
     expect(launcherEnv.LOCALAPPDATA).toBeUndefined();
     const isolatedEnv = JSON.parse(Buffer.from(launcherEnv.MEMMY_SANDBOX_CHILD_ENV!, "base64").toString("utf8"));

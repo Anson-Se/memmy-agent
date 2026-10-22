@@ -159,6 +159,7 @@ export function createCommandPluginAdapter(options: CreateCommandPluginAdapterOp
       // compatibility mode.  The variable is harmless when process.execPath is
       // already a standalone Node binary.
       if (config.interpreter === "node") env.ELECTRON_RUN_AS_NODE = "1";
+      if (process.env.MEMMY_PLUGIN_SANDBOX_TRACE === "1") env.MEMMY_OFFICE_TRACE = "1";
       const pluginDataPath = await resolvePluginDataPath(context, options.pluginDataRoot);
       if (pluginDataPath) {
         env.MEMMY_PLUGIN_DATA_DIR = pluginDataPath;
@@ -808,6 +809,8 @@ function windowsLauncherEnvironment(childEnvironment: Record<string, string>): R
   const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
   return { SystemRoot: systemRoot, WINDIR: systemRoot,
     PATH: win32.join(systemRoot, "System32"),
+    PSModulePath: win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+    ...(process.env.MEMMY_PLUGIN_SANDBOX_TRACE === "1" ? { MEMMY_SANDBOX_TRACE: "1" } : {}),
     MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(childEnvironment)).toString("base64") };
 }
 

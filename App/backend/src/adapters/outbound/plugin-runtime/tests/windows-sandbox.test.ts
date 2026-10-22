@@ -19,14 +19,14 @@ describe.runIf(process.platform === "win32")("Windows AppContainer", () => {
     await new Promise<void>(ok => server.listen(0, "127.0.0.1", ok));
     try {
       const port = (server.address() as { port: number }).port;
-      const code = `const fs=require('fs'),net=require('net'),cp=require('child_process');
+      const code = `const fs=require('fs'),net=require('net'),cp=require('child_process');(async()=>{
         let read=false,write=false; try{fs.readFileSync(${JSON.stringify(join(denied, "secret.txt"))});read=true}catch{}
         try{fs.writeFileSync(${JSON.stringify(join(denied, "escape.txt"))},'escape');write=true}catch{}
         fs.writeFileSync(${JSON.stringify(join(allowed, "ok.txt"))},'ok');
-        const descendant=cp.spawnSync(process.execPath,['-e',${JSON.stringify(`try{require('fs').readFileSync(${JSON.stringify(join(denied, "secret.txt"))});process.exit(9)}catch{process.exit(0)}`)}],{stdio:'inherit'});
+        const descendant=await new Promise((ok,reject)=>{const child=cp.spawn(process.execPath,['-e',${JSON.stringify(`try{require('fs').readFileSync(${JSON.stringify(join(denied, "secret.txt"))});process.exit(9)}catch{process.exit(0)}`)}],{stdio:'inherit'});child.once('error',reject);child.once('exit',status=>ok(status));});
         const profileReady=require('path').win32.isAbsolute(process.env.LOCALAPPDATA||'');
-        const socket=net.connect(${port},'127.0.0.1');let done=false;const finish=network=>{if(done)return;done=true;socket.destroy();console.log(JSON.stringify({read,write,network,descendant:descendant.status,profileReady}));};
-        socket.on('connect',()=>finish(true));socket.on('error',()=>finish(false));setTimeout(()=>finish(false),1500);`;
+        const socket=net.connect(${port},'127.0.0.1');let done=false;const finish=network=>{if(done)return;done=true;socket.destroy();console.log(JSON.stringify({read,write,network,descendant,profileReady}));};
+        socket.on('connect',()=>finish(true));socket.on('error',()=>finish(false));setTimeout(()=>finish(false),1500);})().catch(error=>{console.error(error);process.exitCode=1});`;
       await writeFile(join(allowed, "test.cjs"), code);
       const plan = { profile: `memmy.plugin.test.${Date.now()}`, command: node, args: ["--preserve-symlinks", "--preserve-symlinks-main", join(allowed, "test.cjs")], cwd: allowed, readRoots: [dirname(node)], writeRoots: [allowed] };
       const result = await launch(plan);
@@ -87,6 +87,7 @@ function spawnLauncher(plan: unknown) {
     SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
     WINDIR: process.env.SystemRoot ?? "C:\\Windows",
     PATH: join(process.env.SystemRoot ?? "C:\\Windows", "System32"),
+    PSModulePath: join(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/Modules"),
     MEMMY_SANDBOX_TRACE: "1",
     MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify({ SystemRoot: process.env.SystemRoot ?? "C:\\Windows", LOCALAPPDATA: "untrusted-profile", TEMP: tmpdir(), TMP: tmpdir(), ELECTRON_RUN_AS_NODE: "1" })).toString("base64")
   } });

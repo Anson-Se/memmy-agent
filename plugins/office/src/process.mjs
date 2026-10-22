@@ -9,10 +9,13 @@ export async function runProcess(command, args, { cwd, env, input = "", timeout 
   const handles = [];
   let child, timer, monitor, failure;
   const files = ["input", "output", "errors"].map(name => path.join(directory, name));
+  const trace = message => { if (process.env.MEMMY_OFFICE_TRACE === "1") console.error(`Office process ${path.basename(command)}: ${message}`); };
   try {
     await fs.writeFile(files[0], input, { flag: "wx" });
     for (const [index, file] of files.entries()) handles.push(await fs.open(file, index === 0 ? "r" : "wx"));
+    trace("starting");
     child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, stdio: handles.map(handle => handle.fd) });
+    child.once("spawn", () => trace("running"));
     children?.add(child);
     const stop = message => { failure ??= new Error(message); child.kill("SIGKILL"); };
     const exit = new Promise((resolve, reject) => {
@@ -26,6 +29,7 @@ export async function runProcess(command, args, { cwd, env, input = "", timeout 
       }).catch(() => {}); // Handles can close after the process exits.
     }, 100);
     const result = await exit;
+    trace(`exited ${result.code ?? result.signal}`);
     if (failure) throw failure;
     const sizes = await Promise.all(handles.slice(1).map(handle => handle.stat()));
     if (sizes.some(info => info.size > maxOutput)) throw new Error("Tool output exceeded limit");

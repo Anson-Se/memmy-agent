@@ -40,7 +40,7 @@ jobs:
       - name: Provision release-build inputs on macOS
         if: runner.os == 'macOS'
         run: |
-          brew install --cask libreoffice
+          node plugins/office/scripts/provision-macos.mjs
           brew install poppler
       - name: Provision release-build inputs on Windows
         if: runner.os == 'Windows'
@@ -81,6 +81,7 @@ jobs:
       - name: Cold install and run four-format end-to-end validation
         env:
           OFFICE_E2E_MANAGED_RUNTIME: "1"
+          MEMMY_PLUGIN_SANDBOX_TRACE: "1"
           OFFICE_E2E_QA_DIR: ${{ runner.temp }}/office-qa
           OFFICE_E2E_REPORT: ${{ runner.temp }}/office-e2e.json
         run: npm run test:office-plugin:e2e
