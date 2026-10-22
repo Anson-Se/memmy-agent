@@ -437,15 +437,25 @@ function isVisibleAssistantAnswer(message: AgentChatMessage): boolean {
  */
 function findFinalAssistantAnswerUnitIndex(units: AgentDisplayUnit[], options: { isSending?: boolean } = {}): number {
   const lastUserUnitIndex = findLastUserUnitIndex(units);
+  let laterActivityInTurn = false;
   for (let index = units.length - 1; index >= 0; index -= 1) {
     const unit = units[index];
+    if (unit?.type === "activity") {
+      laterActivityInTurn = true;
+      continue;
+    }
     if (unit?.type !== "single") continue;
+    if (unit.message.role === "user") {
+      laterActivityInTurn = false;
+      continue;
+    }
     if (options.isSending && index > lastUserUnitIndex) continue;
     const message = unit.message;
     if (message.role === "assistant"
       && message.kind !== "trace"
       && message.kind !== "narration"
       && message.kind !== "context_compaction"
+      && !laterActivityInTurn
       && message.content.trim().length > 0) {
       return index;
     }
