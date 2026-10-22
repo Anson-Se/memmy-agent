@@ -485,14 +485,20 @@ describe("MemoryService / embedding / processing", () => {
     });
     expect(recall.hits.some((hit) => hit.id === complete.l1MemoryId)).toBe(false);
     const openEpisodeRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(openEpisodeRun.jobs.map((job) => job.jobType)).toEqual(["trace_summary"]);
+    expect(openEpisodeRun.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ jobType: "trace_summary", targetMemoryId: complete.l1MemoryId })
+    ]));
     expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(1);
+    expect(llmCalls.some((call) => call.options.operation === "capture.reflection.batch.v13")).toBe(false);
     const embeddingRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(embeddingRun.jobs.map((job) => job.jobType)).toEqual(["embedding"]);
-    const episodeRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(episodeRun.jobs.map((job) => job.jobType)).toEqual(["episode_idle_close"]);
-    const titleRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(titleRun.jobs.map((job) => job.jobType)).toEqual(["episode_title"]);
+    expect(embeddingRun.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ jobType: "embedding", targetMemoryId: complete.l1MemoryId })
+    ]));
+    const reflectionIndex = embeddingRun.jobs.findIndex((job) => job.jobType === "reflection");
+    const embeddingIndex = embeddingRun.jobs.findIndex((job) => job.jobType === "embedding");
+    if (reflectionIndex >= 0) expect(embeddingIndex).toBeLessThan(reflectionIndex);
+    const auxiliaryJobs = [...openEpisodeRun.jobs, ...embeddingRun.jobs].map((job) => job.jobType);
+    expect(auxiliaryJobs).toEqual(expect.arrayContaining(["episode_title", "episode_idle_close"]));
     expect(embeddingTexts).toHaveLength(1);
     expect(db.db.prepare(
       `SELECT COUNT(*) AS count FROM evolution_jobs

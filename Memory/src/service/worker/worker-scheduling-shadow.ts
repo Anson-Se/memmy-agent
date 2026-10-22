@@ -1,12 +1,14 @@
 import type { RuntimeRepository } from "../../storage/repositories.js";
 import type { QueueEligibilityOptions } from "../../storage/queue-eligibility.js";
 import { ShadowQueueSelector, type ShadowQueueSelection } from "./shadow-queue-selector.js";
+import type { QueueLane } from "./job-policy-registry.js";
 
 export interface WorkerSchedulingShadowInput extends QueueEligibilityOptions {
   at: string;
   limit: number;
   priorityCohortOnly?: boolean;
   includeRetries?: boolean;
+  laneWeights?: Readonly<Record<QueueLane, number>>;
 }
 export interface WorkerSchedulingComparison {
   mode: "shadow";
@@ -28,7 +30,8 @@ export interface WorkerSchedulingComparison {
 /** Observe at most once per five seconds, capped at 32 choices per sample. */
 export class WorkerSchedulingShadow {
   private lastSampleAt: number | undefined;
-  private readonly selector = new ShadowQueueSelector();
+  private selector = new ShadowQueueSelector();
+  private weightsKey: string | undefined;
 
   constructor(private readonly runtime: RuntimeRepository) {}
 
@@ -36,6 +39,10 @@ export class WorkerSchedulingShadow {
     const now = Date.parse(input.at);
     if (this.lastSampleAt !== undefined && now >= this.lastSampleAt && now - this.lastSampleAt < 5_000) return;
     this.lastSampleAt = now;
+    if (input.laneWeights && JSON.stringify(input.laneWeights) !== this.weightsKey) {
+      this.selector = new ShadowQueueSelector(input.laneWeights);
+      this.weightsKey = JSON.stringify(input.laneWeights);
+    }
     const sampleLimit = Math.max(1, Math.min(32, Math.floor(input.limit)));
     // Only the new projection fields are refreshed. Claims, task state, attempt
     // counts, deadlines and change cursors remain entirely on the legacy path.

@@ -5,7 +5,7 @@ import type { LlmMessage, LlmCompletionOptions } from "../../../src/model/types.
 import { Repositories } from "../../../src/storage/repositories.js";
 import { observationMemoryState } from "../../../src/service/observation-memory-state.js";
 import { prepareObservationExtractionInput } from "../../../src/service/evidence/observation-memory-pipeline.js";
-import { createCapturingEmbedder, createMemoryServiceFixture, runWorkerRounds } from "../../fixtures/memory-service-fixture.js";
+import { addAgentSourceImport, createCapturingEmbedder, createMemoryServiceFixture, runWorkerRounds } from "../../fixtures/memory-service-fixture.js";
 
 const { cleanup, createTestService } = createMemoryServiceFixture();
 afterEach(() => { cleanup(); vi.useRealTimers(); });
@@ -230,12 +230,12 @@ describe("History meaningful-memory processing", () => {
 
   it("extracts a fresh History window before an older Agent-history backlog", async () => {
     const { service, db } = createTestService({ llm: model() });
-    const session = service.openSession({ namespace: { ...namespace, source: "cursor" } });
-    const backlog = Array.from({ length: 3 }, (_value, index) => service.completeTurn(`cursor-backfill-${index}`, {
-      sessionId: session.sessionId, query: `Old Cursor question ${index}`, answer: `Old Cursor answer ${index}`
-    }).l1MemoryId);
-    const backdate = db.db.prepare("UPDATE memories SET created_at = ? WHERE id = ?");
-    backlog.forEach((id, index) => backdate.run(`2026-08-18T0${index}:00:00.000Z`, id));
+    const backlog = Array.from({ length: 3 }, (_value, index) => addAgentSourceImport(
+      service, { ...namespace, source: "cursor" }, `Old Cursor question ${index}`, `cursor-backfill-${index}`,
+      `2026-08-18T0${index}:00:00.000Z`
+    ).id);
+    const backlogPolicies = db.db.prepare("SELECT queue_lane FROM evolution_jobs WHERE target_memory_id IN (?, ?, ?)").all(...backlog);
+    expect(backlogPolicies).toEqual(Array.from({ length: 3 }, () => ({ queue_lane: "import" })));
     const history = service.syncExternalEvidence(evidence);
     const run = await service.runWorkerOnce(1, { priorityCohortOnly: true });
     expect(run.jobs).toEqual([expect.objectContaining({ jobType: "observation_extract", targetMemoryId: history.id })]);

@@ -16,6 +16,7 @@ export interface SchedulingCandidate {
   lane: QueueLane;
   enqueueSeq: number;
   basePriority: number;
+  unregistered?: boolean;
 }
 export interface SchedulingMetadata {
   queueLane?: string | null;
@@ -61,6 +62,41 @@ export class QueueSchedulingStore {
     })();
   }
 
+  /**
+   * Complete the projection for the currently runnable set before real FIFO
+   * selection. A bounded preview may omit older dirty rows; real selection may
+   * not. Terminal history, future deadlines and blocked dependencies are skipped.
+   */
+  refreshRunnablePolicies(input: QueueEligibilityOptions & { at: string; includeRetries?: boolean }): PolicyRefreshResult {
+    const result: PolicyRefreshResult = { refreshed: 0, unknown: [] };
+    if (this.db.readonly) return result;
+    const main = mainQueueEligibility(input.at, input);
+    const retry = retryQueueEligibility(Date.parse(input.at), input.targetMemoryIds);
+    return this.db.transaction(() => {
+      for (const queue of ["main", "embedding_retry"] as const) {
+        if (queue === "embedding_retry" && input.includeRetries === false) continue;
+        const table = queue === "main" ? "evolution_jobs" : "embedding_retry_queue";
+        const target = queue === "main" ? "q.target_memory_id" : "q.target_id";
+        const ready = queue === "main"
+          ? `q.id IN (SELECT id FROM evolution_jobs WHERE ${main.sql})`
+          : retry.sql;
+        const parameters = queue === "main" ? main.params : retry.params;
+        for (;;) {
+          const rows = this.db.prepare(`SELECT q.id,
+            ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
+            m.agent_id, m.memory_layer, m.tags_json,
+            json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm
+            FROM ${table} q LEFT JOIN memories m ON m.id = ${target}
+            WHERE (q.policy_version IS NULL OR q.policy_version != ?) AND (${ready})
+            ORDER BY q.enqueue_seq LIMIT 200`).all(JOB_POLICY_VERSION, ...parameters) as PolicyRow[];
+          if (rows.length === 0) break;
+          for (const row of rows) this.writePolicy(table, row, result);
+        }
+      }
+      return result;
+    })();
+  }
+
   refreshOne(queue: SchedulingCandidate["queue"], id: string): PolicyRefreshResult {
     const result: PolicyRefreshResult = { refreshed: 0, unknown: [] };
     try {
@@ -84,14 +120,21 @@ export class QueueSchedulingStore {
   private writePolicy(table: string, row: PolicyRow, result: PolicyRefreshResult): void {
     let policy: { queueLane: string; resourceClass: string; basePriority: number; policyVersion: number };
     try {
-      policy = jobPolicyRegistry.resolve({ jobType: row.job_type, payload: JSON.parse(row.payload_json), target: {
-        agentId: row.agent_id ?? undefined, memoryLayer: row.memory_layer ?? undefined,
-        tags: row.tags_json ? JSON.parse(row.tags_json) : [], pluginAlgorithm: row.plugin_algorithm ?? undefined
-      } });
+      const payload: unknown = JSON.parse(row.payload_json);
+      const tags: unknown = row.tags_json ? JSON.parse(row.tags_json) : [];
+      policy = jobPolicyRegistry.resolve({ jobType: row.job_type,
+        payload: payload && typeof payload === "object" && !Array.isArray(payload)
+          ? payload as Record<string, unknown> : {}, target: {
+          agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
+          memoryLayer: typeof row.memory_layer === "string" ? row.memory_layer : undefined,
+          tags: Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === "string") : [],
+          pluginAlgorithm: typeof row.plugin_algorithm === "string" ? row.plugin_algorithm : undefined
+        }
+      });
     } catch (error) {
       if (!(error instanceof UnknownJobPolicyError)) throw error;
-      // Explicit quarantine in the projection. Legacy execution remains responsible
-      // for its existing unsupported-type handling, never silently use a default lane.
+      // Keep quarantine explicit. WRR admits these only for terminal cleanup;
+      // legacy retains unsupported-type handling. Never silently assign a policy.
       result.unknown.push({ id: row.id, jobType: row.job_type });
       logger.warn("scheduler.unregistered_job", { jobId: row.id, jobType: row.job_type });
       policy = { queueLane: "unregistered", resourceClass: "unregistered",
@@ -118,28 +161,36 @@ export class QueueSchedulingStore {
 
   /** Fetch bounded candidates per lane/table. Type filters apply to main jobs,
    * matching legacy semantics; includeRetries separately gates the retry table. */
-  candidates(input: QueueEligibilityOptions & { at: string; limit: number; includeRetries?: boolean }): SchedulingCandidate[] {
+  candidates(input: QueueEligibilityOptions & {
+    at: string; limit: number; includeRetries?: boolean; includeUnregistered?: boolean;
+  }): SchedulingCandidate[] {
     const result: SchedulingCandidate[] = [];
     if (input.limit <= 0) return result;
     const main = mainQueueEligibility(input.at, input);
     const retry = retryQueueEligibility(Date.parse(input.at), input.targetMemoryIds);
     const limit = Math.max(1, Math.min(200, Math.floor(input.limit)));
     for (const lane of QUEUE_LANES) {
+      const includeUnknown = input.includeUnregistered === true && lane === "maintenance";
+      const laneFilter = includeUnknown ? "queue_lane IN (?, 'unregistered')" : "queue_lane = ?";
       const rows = this.db.prepare(`SELECT id, job_type, queue_lane, enqueue_seq, base_priority FROM evolution_jobs
-        WHERE ${main.sql} AND queue_lane = ? AND policy_version = ?
+        WHERE ${main.sql} AND ${laneFilter} AND policy_version = ?
         ORDER BY enqueue_seq LIMIT ?`).all(...main.params, lane, JOB_POLICY_VERSION, limit) as Array<{
-          id: string; job_type: string; queue_lane: QueueLane; enqueue_seq: number; base_priority: number
+          id: string; job_type: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
         }>;
       result.push(...rows.map((row) => ({ queue: "main" as const, id: row.id, jobType: row.job_type,
-        lane: row.queue_lane, enqueueSeq: row.enqueue_seq, basePriority: row.base_priority })));
+        lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
+        enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
+        ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) })));
       if (input.includeRetries === false) continue;
       const retries = this.db.prepare(`SELECT q.id, q.queue_lane, q.enqueue_seq, q.base_priority FROM embedding_retry_queue q
-        WHERE ${retry.sql} AND q.queue_lane = ? AND q.policy_version = ?
+        WHERE ${retry.sql} AND q.${laneFilter} AND q.policy_version = ?
         ORDER BY q.enqueue_seq LIMIT ?`).all(...retry.params, lane, JOB_POLICY_VERSION, limit) as Array<{
-          id: string; queue_lane: QueueLane; enqueue_seq: number; base_priority: number
+          id: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
         }>;
       result.push(...retries.map((row) => ({ queue: "embedding_retry" as const, id: row.id, jobType: "embedding_retry",
-        lane: row.queue_lane, enqueueSeq: row.enqueue_seq, basePriority: row.base_priority })));
+        lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
+        enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
+        ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) })));
     }
     return result;
   }

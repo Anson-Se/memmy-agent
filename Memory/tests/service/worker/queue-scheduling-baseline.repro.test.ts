@@ -1,7 +1,7 @@
 /**
  * Stage 1 diagnostics, with repaired cases converted to stage 2 regressions.
  *
- * Scheduling cases still describe existing failure modes pending stages 3–6.
+ * Scheduling diagnostics explicitly select the legacy rollback algorithm.
  * Lease/recovery/backoff cases assert the repaired stage 2 behavior.
  * Cross-entry overlap is a repaired stage 4 regression.
  * SQLite, schema, repositories and WorkerRunner are real. Business handlers and
@@ -38,6 +38,7 @@ function harness(processJob: WorkerRunnerDeps["jobHandlers"]["processJob"] = asy
   const repos = new Repositories(db.db);
   const deps: WorkerRunnerDeps = {
     repos,
+    scheduling: { algorithm: "legacy" },
     embedder: createCapturingEmbedder([]),
     capture: { embedAfterCapture: true },
     embeddingRetryWorkerId: "baseline-runner",
@@ -125,6 +126,7 @@ afterAll(() => {
       testedCommit,
       workingTreeDirty,
       referenceLabel: process.env.MEMMY_QUEUE_BASELINE_REF ?? null,
+      schedulingAlgorithm: "legacy",
       method: "real SQLite and WorkerRunner; local substitute business/model handlers",
       observations
     }, null, 2));

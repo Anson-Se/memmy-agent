@@ -93,7 +93,7 @@ describe("worker shadow scheduling integration", () => {
 
   it("executes the legacy selection even when shadow recommends a retry and evolution", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
-    const h = harness();
+    const h = harness(); h.deps.scheduling = { algorithm: "legacy" };
     for (let i = 0; i < 4; i++) h.job(`import-${i}`, "import_summary");
     h.job("reflection"); h.retry("retry");
     const result = await h.runner.runWorkerOnce(4, { priorityCohortOnly: true });
@@ -107,7 +107,7 @@ describe("worker shadow scheduling integration", () => {
 
   it.each(["preview", "observer"] as const)("isolates %s failures from actual work", async (failure) => {
     const h = harness(); h.job("still-runs");
-    if (failure === "preview") vi.spyOn(h.repos.runtime.scheduling, "candidates").mockImplementation(() => { throw new Error("synthetic preview failure"); });
+    if (failure === "preview") vi.spyOn(h.repos.runtime.scheduling, "candidates").mockImplementationOnce(() => { throw new Error("synthetic preview failure"); });
     else h.deps.schedulingShadow!.onComparison = () => { throw new Error("synthetic observer failure"); };
     expect(await h.runner.runWorkerOnce(1)).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
     expect(h.executed).toEqual(["still-runs"]);
@@ -117,7 +117,7 @@ describe("worker shadow scheduling integration", () => {
     const h = harness(); h.job("still-runs");
     if (mode === "environment") { h.deps.schedulingShadow = undefined; vi.stubEnv("MEMMY_WORKER_SCHEDULER_SHADOW", "0"); }
     else { h.deps.schedulingShadow!.enabled = false; vi.stubEnv("MEMMY_WORKER_SCHEDULER_SHADOW", "1"); }
-    const preview = vi.spyOn(h.repos.runtime.scheduling, "candidates");
+    const preview = vi.spyOn(h.repos.runtime.scheduling, "refreshPolicies");
     expect((await h.runner.runWorkerOnce(1)).succeeded).toBe(1);
     expect(preview).not.toHaveBeenCalled(); expect(h.comparisons).toHaveLength(0);
   });

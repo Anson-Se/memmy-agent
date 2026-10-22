@@ -71,6 +71,6 @@ describe("read-only shadow WRR and runnable FIFO", () => {
     expect(() => selector.select([], -1)).toThrow(RangeError);
     expect(() => selector.select([candidate("import", 0)], 1)).toThrow(RangeError);
     const duplicate = candidate("import", 1);
-    expect(() => selector.select([duplicate, duplicate], 2)).toThrow("Duplicate shadow candidate");
+    expect(() => selector.select([duplicate, duplicate], 2)).toThrow("Duplicate queue candidate");
   });
 });

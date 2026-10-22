@@ -56,7 +56,7 @@ import {
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
 import { QueueSchedulingStore, type SchedulingMetadata } from "./queue-scheduling-store.js";
-import { mainQueueEligibility, retryQueueEligibility } from "./queue-eligibility.js";
+import { mainQueueEligibility, retryQueueEligibility, type QueueEligibilityOptions } from "./queue-eligibility.js";
 import { compactHistoryChangePayload, compactHistoryChangeRow } from "./history-change-snapshot.js";
 
 type SqlValue = string | number | Buffer | null;
@@ -3686,6 +3686,25 @@ export class RuntimeRepository {
     return transaction();
   }
 
+  /** Claim the specific WRR-selected candidate; never substitute a legacy head. */
+  claimQueuedJob(id: string, input: QueueEligibilityOptions & {
+    at?: string; leaseSeconds?: number; owner?: string;
+  } = {}): EvolutionJobRecord | undefined {
+    const at = input.at ?? nowIso();
+    const leaseUntil = new Date(Date.parse(at) + (input.leaseSeconds ?? 60) * 1000).toISOString();
+    const eligibility = mainQueueEligibility(at, input);
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`UPDATE evolution_jobs SET
+          attempts = attempts + CASE WHEN status = 'leased' THEN 0 ELSE 1 END,
+          lease_recovery_count = lease_recovery_count + CASE WHEN status = 'leased' THEN 1 ELSE 0 END,
+          status = 'leased', leased_until = ?, lease_owner = ?, lease_token = ?,
+          lease_count = lease_count + 1, available_at = NULL, updated_at = ?
+        WHERE id = ? AND (${eligibility.sql}) RETURNING *`)
+        .get(leaseUntil, input.owner ?? this.leaseOwner, newId("lease"), at, id, ...eligibility.params) as SqlJobRow | undefined;
+      return row ? jobFromSql(row) : undefined;
+    })();
+  }
+
   /** A missing claim is reserved for unowned legacy/admin rows only. */
   private jobClaimWhere(claim: EvolutionJobRecord | undefined, at: string): { sql: string; params: SqlValue[] } {
     return claim ? {
@@ -4167,6 +4186,38 @@ export class RuntimeRepository {
       return claimed;
     });
     return transaction();
+  }
+
+  /** Claim only the chosen retry id, rechecking readiness under the write lock. */
+  claimEmbeddingRetryById(id: string, input: {
+    now: number; workerId: string; leaseUntil: number; targetMemoryIds?: readonly string[];
+  }): EmbeddingRetryRecord | undefined {
+    const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`UPDATE embedding_retry_queue AS q SET status = 'in_progress',
+          claimed_by = ?, lease_until = ?, lease_token = ?, updated_at = ?
+        WHERE q.id = ? AND (${eligibility.sql}) RETURNING *`)
+        .get(input.workerId, input.leaseUntil, newId("retry_lease"), input.now, id, ...eligibility.params) as SqlEmbeddingRetryRow | undefined;
+      return row ? embeddingRetryFromSql(row) : undefined;
+    })();
+  }
+
+  /** Return unstarted retry claims without changing retry/attempt history. */
+  releaseClaimedEmbeddingRetries(retries: readonly EmbeddingRetryRecord[], now = Date.now()): Array<{ before: EmbeddingRetryRecord; after: EmbeddingRetryRecord }> {
+    return this.db.transaction(() => {
+      const transitions: Array<{ before: EmbeddingRetryRecord; after: EmbeddingRetryRecord }> = [];
+      for (const retry of retries) {
+        if (!retry.claimedBy || !retry.leaseToken || retry.leaseUntil == null) continue;
+        const before = this.getEmbeddingRetry(retry.id);
+        const row = this.db.prepare(`UPDATE embedding_retry_queue SET status = 'pending',
+            claimed_by = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?
+          WHERE id = ? AND status = 'in_progress' AND claimed_by = ? AND lease_token = ?
+            AND lease_until = ? AND lease_until > ? RETURNING *`)
+          .get(now, retry.id, retry.claimedBy, retry.leaseToken, retry.leaseUntil, now) as SqlEmbeddingRetryRow | undefined;
+        if (row && before) transitions.push({ before, after: embeddingRetryFromSql(row) });
+      }
+      return transitions;
+    })();
   }
 
   markEmbeddingRetryConfigurationBlockedClaimed(id: string, input: {

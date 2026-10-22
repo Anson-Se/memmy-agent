@@ -285,7 +285,7 @@ describe("MemoryService / worker / runtime", () => {
     expect(failedRow.status).toBe("dead_letter");
     expect(failedRow.attempts).toBe(1);
     expect(failedRow.leased_until).toBeNull();
-    expect(failedRow.last_error).toContain("unsupported job type");
+    expect(failedRow.last_error).toContain("No scheduling policy registered for job type");
 
     const secondRun = await service.runWorkerOnce(1);
     expect(secondRun.jobs).toEqual([]);
@@ -343,7 +343,7 @@ describe("MemoryService / worker / runtime", () => {
     expect(row.status).toBe("dead_letter");
     expect(row.attempts).toBe(1);
     expect(row.leased_until).toBeNull();
-    expect(row.last_error).toContain("unsupported job type");
+    expect(row.last_error).toContain("No scheduling policy registered for job type");
 
     const ops = db.db.prepare(
       `SELECT op

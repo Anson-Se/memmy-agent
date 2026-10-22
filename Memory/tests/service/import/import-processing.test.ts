@@ -1125,7 +1125,7 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("orders import summaries by newest panel memories before embedding jobs", async () => {
+  it("orders import work by enqueue FIFO regardless of panel memory recency", async () => {
     const root = createTestRoot("mindock-memory-import-order-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1166,14 +1166,14 @@ describe("MemoryService / import / processing", () => {
     const summaryRun = await service.runWorkerOnce(10);
     const embeddingRun = await service.runWorkerOnce(10);
 
-    expect(summaryRun.jobs.map((job) => job.targetMemoryId)).toEqual([newer.id, older.id]);
-    expect(embeddingRun.jobs.map((job) => job.targetMemoryId)).toEqual([newer.id, older.id]);
-    expect(llmCalls[0]?.messages.find((message) => message.role === "user")?.content).toContain("newer memory query");
+    expect(summaryRun.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
+    expect(embeddingRun.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
+    expect(llmCalls[0]?.messages.find((message) => message.role === "user")?.content).toContain("older memory query");
 
     db.close();
   });
 
-  it("embeds summarized import memories before continuing later import summaries", async () => {
+  it("preserves older import summaries before embeddings appended later in the same lane", async () => {
     const root = createTestRoot("mindock-memory-import-interleave-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1209,20 +1209,22 @@ describe("MemoryService / import / processing", () => {
     const embeddingRun = await service.runWorkerOnce(20);
 
     expect(summaryRun.jobs.map((job) => job.jobType)).toEqual(Array.from({ length: 20 }, () => "import_summary"));
-    expect(embeddingRun.jobs.map((job) => job.jobType)).toEqual(Array.from({ length: 20 }, () => "embedding"));
-    expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(20);
-    expect(embeddingTexts).toHaveLength(20);
+    expect(embeddingRun.jobs.map((job) => job.jobType)).toEqual([
+      ...Array.from({ length: 5 }, () => "import_summary"),
+      ...Array.from({ length: 15 }, () => "embedding")
+    ]);
+    expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(25);
+    expect(embeddingTexts).toHaveLength(15);
+    const remainingSummaries = db.db.prepare(
+      `SELECT COUNT(*) AS count FROM evolution_jobs WHERE job_type = 'import_summary' AND status = 'queued'`
+    ).get() as { count: number };
+    expect(remainingSummaries.count).toBe(0);
+    const finalRun = await service.runWorkerOnce(20);
+    expect(finalRun.jobs.map((job) => job.jobType)).toEqual(Array.from({ length: 10 }, () => "embedding"));
+    expect(embeddingTexts).toHaveLength(25);
     expect(embeddingTexts.every((text) => text.includes("Summary: LLM batch summary"))).toBe(true);
     expect(embeddingTexts.every((text) => text.includes("Original exchange:"))).toBe(true);
     expect(embeddingTexts.every((text) => text.includes("imported query"))).toBe(true);
-    const remainingSummaries = db.db.prepare(
-      `SELECT COUNT(*) AS count
-       FROM evolution_jobs
-       WHERE job_type = 'import_summary'
-         AND status = 'queued'`
-    ).get() as { count: number };
-    expect(remainingSummaries.count).toBe(5);
-
     db.close();
   });
 
@@ -1280,7 +1282,7 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("orders placeholder import embeddings by newest role heading", async () => {
+  it("keeps placeholder import embeddings in FIFO order and repairs their summaries first", async () => {
     const root = createTestRoot("mindock-memory-import-placeholder-order-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1337,7 +1339,7 @@ describe("MemoryService / import / processing", () => {
 
     const run = await service.runWorkerOnce(10);
 
-    expect(run.jobs.map((job) => job.targetMemoryId)).toEqual([newer.id, older.id]);
+    expect(run.jobs.map((job) => job.targetMemoryId)).toEqual([older.id, newer.id]);
     expect(embeddingTexts).toEqual([]);
     const queuedSummary = db.db.prepare(
       `SELECT job_type, status
@@ -1349,7 +1351,7 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("finishes a new Memmy chat memory before draining scanned-memory backlog", async () => {
+  it("gives a new Memmy chat memory interactive opportunities alongside scanned backlog", async () => {
     const root = createTestRoot("mindock-memory-live-priority-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1396,22 +1398,23 @@ describe("MemoryService / import / processing", () => {
     const embeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const scanRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
 
-    expect(summaryRun.jobs).toEqual([
-      expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
-    ]);
-    expect(embeddingRun.jobs).toEqual([
-      expect.objectContaining({ jobType: "embedding", targetMemoryId: live.l1MemoryId })
-    ]);
-    expect(scanRun.jobs.map((job) => job.targetMemoryId)).toEqual([recentImport.id, oldImport.id]);
-    expect(scanRun.jobs.every((job) => job.jobType === "import_summary")).toBe(true);
+    expect(summaryRun.jobs[0]).toMatchObject({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId });
+    const runs = [summaryRun, embeddingRun, scanRun];
+    const completed = runs.flatMap((run) => run.jobs);
+    const imports = completed.filter((job) => job.jobType === "import_summary");
+    expect(imports.map((job) => job.targetMemoryId)).toEqual([oldImport.id, recentImport.id]);
+    const embeddings = completed.filter((job) => job.jobType === "embedding");
+    expect(embeddings.map((job) => job.targetMemoryId)).toEqual([live.l1MemoryId, oldImport.id, recentImport.id]);
+    for (const memoryId of [live.l1MemoryId, oldImport.id, recentImport.id]) {
+      expect(service.memoryProcessingStatus([memoryId], { namespace }).items[0]?.state).toBe("ready");
+    }
     expect(llmCalls[0]?.messages.find((message) => message.role === "user")?.content)
       .toContain("new interactive preference");
-    expect(embeddingTexts).toHaveLength(1);
-
+    expect(embeddingTexts).toHaveLength(3);
     db.close();
   });
 
-  it("finishes the Memmy first-report memory before interactive and scanned-memory work", async () => {
+  it("keeps the first report interactive while preserving earlier interactive FIFO", async () => {
     const root = createTestRoot("mindock-memory-first-report-priority-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
@@ -1468,18 +1471,22 @@ describe("MemoryService / import / processing", () => {
     const reportEmbeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const liveSummaryRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
 
-    expect(reportSummaryRun.jobs).toEqual([
+    expect(reportSummaryRun.jobs.slice(0, 3)).toEqual([
+      expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId }),
+      expect.objectContaining({ jobType: "episode_title" }),
       expect.objectContaining({ jobType: "import_summary", targetMemoryId: firstReport.id })
     ]);
-    expect(reportEmbeddingRun.jobs).toEqual([
-      expect.objectContaining({ jobType: "embedding", targetMemoryId: firstReport.id })
-    ]);
-    expect(liveSummaryRun.jobs).toEqual([
-      expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
-    ]);
-    expect(liveSummaryRun.jobs.map((job) => job.targetMemoryId)).not.toContain(scanned.id);
+    const reportPolicy = db.db.prepare("SELECT queue_lane, base_priority FROM evolution_jobs WHERE target_memory_id = ? AND job_type = 'import_summary'").get(firstReport.id);
+    expect(reportPolicy).toEqual({ queue_lane: "interactive", base_priority: -100 });
+    const completed = [reportSummaryRun, reportEmbeddingRun, liveSummaryRun].flatMap((run) => run.jobs);
+    const interactiveEmbeddings = completed.filter((job) => job.jobType === "embedding" &&
+      [live.l1MemoryId, firstReport.id].includes(job.targetMemoryId ?? ""));
+    expect(interactiveEmbeddings.map((job) => job.targetMemoryId)).toEqual([live.l1MemoryId, firstReport.id]);
+    expect(completed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ jobType: "import_summary", targetMemoryId: scanned.id })
+    ]));
     expect(service.memoryProcessingStatus([firstReport.id], { namespace }).items[0]?.state).toBe("ready");
-
+    expect(service.memoryProcessingStatus([live.l1MemoryId], { namespace }).items[0]?.state).toBe("ready");
     db.close();
   });
 

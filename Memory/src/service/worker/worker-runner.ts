@@ -51,6 +51,9 @@ import { isObservationMemory, observationJobPayload, observationMemoryState, OBS
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
 import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
 import { WorkerScheduler } from "./worker-scheduler.js";
+import { claimFairWorkerBatch, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
+import { resolveWorkerSchedulingOptions, type WorkerSchedulingOptions, type ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
+import { UnknownJobPolicyError } from "./job-policy-registry.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -135,6 +138,7 @@ export interface WorkerRunnerDeps {
   configurationFingerprint?: () => string;
   beforeRun?: () => Promise<void>;
   afterRun?: () => void;
+  scheduling?: WorkerSchedulingOptions;
   schedulingShadow?: {
     enabled?: boolean;
     onComparison?: (comparison: WorkerSchedulingComparison) => void;
@@ -184,6 +188,9 @@ export class WorkerRunner {
   private readonly schedulingShadow: WorkerSchedulingShadow;
 
   constructor(private readonly deps: WorkerRunnerDeps) {
+    // Environment settings are fixed at process launch. Reject invalid startup
+    // configuration instead of repeatedly waking an un-runnable worker.
+    resolveWorkerSchedulingOptions(deps.scheduling);
     this.schedulingShadow = new WorkerSchedulingShadow(deps.repos.runtime);
   }
 
@@ -448,6 +455,7 @@ export class WorkerRunner {
     if (!this.deps.memoryAddEnabled()) {
       return this.deps.runWorkerNoWrite(request);
     }
+    const options = resolveWorkerSchedulingOptions(this.deps.scheduling);
     const normalizedLimit = Math.max(1, Math.floor(limit));
     const targetMemoryIds = request.targetMemoryIds;
     this.refreshConfigurationBlockedJobs();
@@ -478,12 +486,12 @@ export class WorkerRunner {
         this.deps.appendJobChange(after, "queued", before);
       }
     }
-    // Phase 3 observes the alternative only. A preview failure cannot prevent
+    // Diagnostics compare both algorithms; they never control real claims. A preview failure cannot prevent
     // the existing worker from claiming or executing its normal selection.
     if ((this.deps.schedulingShadow?.enabled ?? process.env.MEMMY_WORKER_SCHEDULER_SHADOW !== "0")) {
       try {
         const comparison = this.schedulingShadow.sample({
-          at: this.deps.nowIso(), limit: normalizedLimit, targetMemoryIds,
+          at: this.deps.nowIso(), limit: normalizedLimit, targetMemoryIds, laneWeights: options.laneWeights,
           priorityCohortOnly: request.priorityCohortOnly,
           allowedJobTypes: allowedWhenPaused, excludedJobTypes: this.summaryJobsHeld(),
           includeRetries: !(this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding"))
@@ -496,6 +504,8 @@ export class WorkerRunner {
         workerLogger.warn("scheduler.shadow_failed", memoryErrorFields(error));
       }
     }
+    if (options.algorithm === "wrr") return this.runFairWorkerOnce(normalizedLimit, request, options);
+
     const jobs = this.deps.repos.runtime.leaseQueuedJobs(
       normalizedLimit,
       WORKER_LEASE_SECONDS,
@@ -511,49 +521,7 @@ export class WorkerRunner {
     try {
       const retryCapacity = Math.max(0, normalizedLimit - jobs.length);
       const results: WorkerJobRunResult[] = [];
-      const queue = [...jobs];
-      while (queue.length > 0) {
-        if (this.deps.memoryBudgetPaused()) {
-          const hold = queue.filter((job) => this.deps.memoryBudgetJobConsumes(job.jobType));
-          this.requeueUnstartedBudgetedJobs(hold);
-          for (const job of hold) {
-            const index = queue.indexOf(job);
-            if (index >= 0) queue.splice(index, 1);
-          }
-          if (queue.length === 0) {
-            break;
-          }
-        }
-        const job = queue[0]!;
-        if (workerJobCanRunInParallel(job)) {
-          const batchType = job.jobType;
-          const batch: EvolutionJobRecord[] = [];
-          while (queue.length > 0 && queue[0]?.jobType === batchType) {
-            batch.push(queue.shift()!);
-          }
-          if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
-            this.requeueUnstartedBudgetedJobs(batch);
-            continue;
-          }
-          if (batchType === "embedding") {
-            results.push(...await this.runLeasedEmbeddingJobs(batch));
-          } else {
-            for (let offset = 0; offset < batch.length; offset += SUMMARY_WORKER_CONCURRENCY) {
-              if (offset > 0 && this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
-                this.requeueUnstartedBudgetedJobs(batch.slice(offset));
-                break;
-              }
-              results.push(...await Promise.all(
-                batch.slice(offset, offset + SUMMARY_WORKER_CONCURRENCY)
-                  .map((item) => this.runLeasedWorkerJob(item))
-              ));
-            }
-          }
-          continue;
-        }
-        queue.shift();
-        results.push(await this.runLeasedWorkerJob(job));
-      }
+      await this.runClaimedMainJobs(jobs, results);
       const embeddingHeld = this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding");
       const embeddingRetries = !embeddingHeld && retryCapacity > 0
         ? await this.runEmbeddingRetryOnceUnscoped(retryCapacity, targetMemoryIds)
@@ -563,6 +531,7 @@ export class WorkerRunner {
       const failed = results.reduce((sum, result) => sum + result.failed, 0);
       if (jobs.length > 0 || embeddingRetries.leased > 0) {
         workerLogger.info("drain.completed", {
+          algorithm: "legacy",
           leased: jobs.length,
           succeeded,
           failed,
@@ -587,12 +556,135 @@ export class WorkerRunner {
     }
   }
 
+  private async runFairWorkerOnce(
+    limit: number,
+    request: RequestEnvelope & { targetMemoryIds?: string[] },
+    options: ResolvedWorkerSchedulingOptions,
+    retryOnly = false
+  ): Promise<WorkerRunSummary> {
+    let remaining = limit;
+    let leased = 0;
+    const results: WorkerJobRunResult[] = [];
+    const retries: EmbeddingRetryRunSummary = { leased: 0, succeeded: 0, failed: 0, items: [] };
+    while (remaining > 0) {
+      const take = Math.min(remaining, FAIR_CLAIM_BATCH_LIMIT);
+      const paused = this.deps.memoryBudgetPaused();
+      const work = claimFairWorkerBatch(this.deps.repos, {
+        at: this.deps.nowIso(), limit: take, targetMemoryIds: request.targetMemoryIds,
+        allowedJobTypes: retryOnly ? [] : paused ? allowedMemoryBudgetJobTypes(this.deps.memoryBudgetModelSources()) : undefined,
+        excludedJobTypes: this.summaryJobsHeld(),
+        includeRetries: !(paused && this.deps.memoryBudgetJobConsumes("embedding")),
+        owner: this.leaseOwner, retryOwner: this.deps.embeddingRetryWorkerId,
+        leaseSeconds: WORKER_LEASE_SECONDS, retryLeaseMs: EMBEDDING_RETRY_LEASE_MS, options
+      });
+      if (work.length === 0) break;
+      const jobs = work.flatMap((item) => item.queue === "main" ? [item.job] : []);
+      const retryRows = work.flatMap((item) => item.queue === "embedding_retry" ? [item.retry] : []);
+      leased += jobs.length;
+      const claims = new Map(retryRows.map((retry) => [retry.id, {
+        workerId: this.deps.embeddingRetryWorkerId, leaseUntil: retry.leaseUntil!, leaseToken: retry.leaseToken!
+      }]));
+      const stopMainHeartbeat = this.startLeaseHeartbeat(jobs);
+      const stopRetryHeartbeat = this.startEmbeddingRetryHeartbeat(retryRows.map((retry) => ({ retry, claim: claims.get(retry.id)! })));
+      try {
+        const queue: FairClaimedWork[] = [...work];
+        while (queue.length > 0) {
+          if (queue[0]!.queue === "main") {
+            const batch: EvolutionJobRecord[] = [];
+            while (queue[0]?.queue === "main") batch.push((queue.shift() as Extract<FairClaimedWork, { queue: "main" }>).job);
+            await this.runClaimedMainJobs(batch, results, true);
+          } else {
+            // Keep FIFO across role boundaries as well as across backing tables.
+            const role = (queue[0] as Extract<FairClaimedWork, { queue: "embedding_retry" }>).retry.embedRole;
+            const batch: EmbeddingRetryRecord[] = [];
+            while (queue[0]?.queue === "embedding_retry" && queue[0].retry.embedRole === role) {
+              batch.push((queue.shift() as Extract<FairClaimedWork, { queue: "embedding_retry" }>).retry);
+            }
+            if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding")) {
+              const released = this.deps.repos.runtime.releaseClaimedEmbeddingRetries(batch, this.nowMs());
+              retries.leased += batch.length;
+              for (const { before, after } of released) {
+                this.deps.appendEmbeddingRetryChange(after, "queued", before);
+                retries.items.push(embeddingRetryToRunItem(after));
+              }
+            } else {
+              const result = await this.runLeasedEmbeddingRetries(batch, claims);
+              retries.leased += result.leased;
+              retries.succeeded += result.succeeded;
+              retries.failed += result.failed;
+              retries.items.push(...result.items);
+            }
+          }
+        }
+      } finally { stopMainHeartbeat(); stopRetryHeartbeat(); }
+      remaining -= work.length;
+      if (work.length < take) break;
+    }
+    const succeeded = results.reduce((sum, item) => sum + item.succeeded, 0);
+    const failed = results.reduce((sum, item) => sum + item.failed, 0);
+    if (leased > 0 || retries.leased > 0) workerLogger.info("drain.completed", {
+      algorithm: "wrr", laneWeights: options.laneWeights, leased, succeeded, failed,
+      embeddingRetriesLeased: retries.leased, embeddingRetriesSucceeded: retries.succeeded,
+      embeddingRetriesFailed: retries.failed
+    });
+    const changeSeq = this.deps.repos.runtime.latestChangeSeq();
+    return { leased, succeeded, failed, jobs: results.map((item) => item.ref), embeddingRetries: retries,
+      changeSeq, syncCursor: this.deps.encodeChangeCursor(changeSeq), serverTime: this.deps.nowIso() };
+  }
+
+  private async runClaimedMainJobs(jobs: EvolutionJobRecord[], results: WorkerJobRunResult[], preserveRoleOrder = false): Promise<void> {
+    const queue = [...jobs];
+    while (queue.length > 0) {
+      if (this.deps.memoryBudgetPaused()) {
+        const hold = queue.filter((job) => this.deps.memoryBudgetJobConsumes(job.jobType));
+        this.requeueUnstartedBudgetedJobs(hold);
+        for (const job of hold) {
+          const index = queue.indexOf(job);
+          if (index >= 0) queue.splice(index, 1);
+        }
+        if (queue.length === 0) {
+          break;
+        }
+      }
+      const job = queue[0]!;
+      if (workerJobCanRunInParallel(job)) {
+        const batchType = job.jobType;
+        const batch: EvolutionJobRecord[] = [];
+        while (queue.length > 0 && queue[0]?.jobType === batchType) {
+          batch.push(queue.shift()!);
+        }
+        if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
+          this.requeueUnstartedBudgetedJobs(batch);
+          continue;
+        }
+        if (batchType === "embedding") {
+          results.push(...await this.runLeasedEmbeddingJobs(batch, preserveRoleOrder));
+        } else {
+          for (let offset = 0; offset < batch.length; offset += SUMMARY_WORKER_CONCURRENCY) {
+            if (offset > 0 && this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
+              this.requeueUnstartedBudgetedJobs(batch.slice(offset));
+              break;
+            }
+            results.push(...await Promise.all(
+              batch.slice(offset, offset + SUMMARY_WORKER_CONCURRENCY)
+                .map((item) => this.runLeasedWorkerJob(item))
+            ));
+          }
+        }
+        continue;
+      }
+      queue.shift();
+      results.push(await this.runLeasedWorkerJob(job));
+    }
+  }
+
   async runLeasedWorkerJob(job: EvolutionJobRecord): Promise<WorkerJobRunResult> {
     if (!this.deps.repos.runtime.isJobLeaseHeld(job, this.deps.nowIso())) return this.lostLeaseResult(job);
     this.deps.appendJobChange(job, "leased");
     this.markProcessingJobLeased(job);
     workerLogger.info("job.started", workerJobLogFields(job));
     try {
+      if (job.queueLane === "unregistered") throw new UnknownJobPolicyError(job.jobType);
       this.captureExecutionConfiguration(job);
       await this.withJobLease(job, () => this.deps.jobHandlers.processJob(job));
       return this.completeLeasedWorkerJob(job);
@@ -605,7 +697,7 @@ export class WorkerRunner {
     }
   }
 
-  async runLeasedEmbeddingJobs(jobs: EvolutionJobRecord[]): Promise<WorkerJobRunResult[]> {
+  async runLeasedEmbeddingJobs(jobs: EvolutionJobRecord[], preserveRoleOrder = false): Promise<WorkerJobRunResult[]> {
     const results: WorkerJobRunResult[] = [];
     const prepared: PreparedEmbeddingJob[] = [];
 
@@ -629,9 +721,19 @@ export class WorkerRunner {
       }
     }
 
-    for (const role of ["document", "query"] as const) {
-      const batch = prepared.filter((item) => item.role === role);
+    const batches: PreparedEmbeddingJob[][] = [];
+    if (preserveRoleOrder) {
+      for (const item of prepared) {
+        const last = batches.at(-1);
+        if (last?.[0]?.role === item.role) last.push(item);
+        else batches.push([item]);
+      }
+    } else {
+      for (const role of ["document", "query"] as const) batches.push(prepared.filter((item) => item.role === role));
+    }
+    for (const batch of batches) {
       if (batch.length === 0) continue;
+      const role = batch[0]!.role;
 
       try {
         for (const item of batch) this.captureExecutionConfiguration(item.job);
@@ -718,6 +820,7 @@ export class WorkerRunner {
     const configurationBlocked = classification.retryAction === "open_settings" && classification.code !== "40309";
     const forceDeadLetter = classification.code === "40309"
       || classification.retryAction === "none"
+      || error instanceof UnknownJobPolicyError
       || isTerminalL3WorldModelError(error)
       || /unsupported job type/i.test(errorMessage);
     const failureNo = (job.failureCount ?? 0) + 1;
@@ -820,7 +923,13 @@ export class WorkerRunner {
     limit: number,
     targetMemoryIds?: readonly string[]
   ): Promise<EmbeddingRetryRunSummary> {
-    return this.runScheduled(() => this.runEmbeddingRetryOnceUnscoped(limit, targetMemoryIds));
+    return this.runScheduled(async () => {
+      const options = resolveWorkerSchedulingOptions(this.deps.scheduling);
+      if (options.algorithm === "legacy") return this.runEmbeddingRetryOnceUnscoped(limit, targetMemoryIds);
+      this.refreshConfigurationBlockedJobs();
+      return (await this.runFairWorkerOnce(Math.max(1, Math.floor(limit)),
+        { targetMemoryIds: targetMemoryIds ? [...targetMemoryIds] : undefined }, options, true)).embeddingRetries;
+    });
   }
 
   private async runEmbeddingRetryOnceUnscoped(
@@ -835,11 +944,18 @@ export class WorkerRunner {
       limit,
       targetMemoryIds
     });
+    return this.runLeasedEmbeddingRetries(retries);
+  }
+
+  private async runLeasedEmbeddingRetries(
+    retries: EmbeddingRetryRecord[], prefetchedClaims?: ReadonlyMap<string, EmbeddingRetryClaim>
+  ): Promise<EmbeddingRetryRunSummary> {
+    const now = this.nowMs();
     const results: EmbeddingRetryResult[] = [];
     const claimed: Array<{ retry: EmbeddingRetryRecord; claim: EmbeddingRetryClaim; attemptNo: number }> = [];
 
     for (const retry of retries) {
-      const claim = {
+      const claim = prefetchedClaims?.get(retry.id) ?? {
         workerId: this.deps.embeddingRetryWorkerId,
         leaseUntil: retry.leaseUntil ?? now + EMBEDDING_RETRY_LEASE_MS,
         leaseToken: retry.leaseToken!
@@ -850,7 +966,7 @@ export class WorkerRunner {
       }
       claimed.push({ retry, claim, attemptNo: retry.attempts + 1 });
     }
-    const stopHeartbeat = this.startEmbeddingRetryHeartbeat(claimed);
+    const stopHeartbeat = prefetchedClaims ? () => {} : this.startEmbeddingRetryHeartbeat(claimed);
     try {
       for (const role of ["document", "query"] as const) {
         const batch = claimed.filter((item) => item.retry.embedRole === role);
@@ -1199,6 +1315,8 @@ function workerJobLogFields(job: EvolutionJobRecord): Record<string, unknown> {
   return {
     jobId: job.id,
     jobType: job.jobType,
+    queueLane: job.queueLane,
+    enqueueSeq: job.enqueueSeq,
     status: job.status,
     attempt: job.attempts,
     maxAttempts: job.maxAttempts,
@@ -1211,6 +1329,8 @@ function workerJobLogFields(job: EvolutionJobRecord): Record<string, unknown> {
 function embeddingRetryLogFields(retry: EmbeddingRetryRecord): Record<string, unknown> {
   return {
     retryId: retry.id,
+    queueLane: retry.queueLane,
+    enqueueSeq: retry.enqueueSeq,
     targetKind: retry.targetKind,
     targetMemoryId: retry.targetId,
     vectorField: retry.vectorField,

@@ -112,7 +112,7 @@ describe("unified worker execution boundary", () => {
   it("shares the boundary with direct retry drains and still runs the internal retry path", async () => {
     const gate = deferred();
     const h = harness(async () => { await gate.promise; });
-    h.job("main"); h.retry("retry");
+    h.job("main", "trace_summary"); h.retry("retry");
     const main = h.runner.runWorkerOnce(1);
     const retry = h.runner.runEmbeddingRetryOnce(1);
     try { expect(h.repos.runtime.getEmbeddingRetry("retry")).toMatchObject({ status: "pending", leaseToken: null }); }
@@ -125,7 +125,7 @@ describe("unified worker execution boundary", () => {
 
   it("releases the entry boundary after an unexpected leasing error", async () => {
     const h = harness(); h.job("survivor");
-    vi.spyOn(h.repos.runtime, "leaseQueuedJobs").mockImplementationOnce(() => { throw new Error("synthetic database unavailable"); });
+    vi.spyOn(h.repos.runtime, "claimQueuedJob").mockImplementationOnce(() => { throw new Error("synthetic database unavailable"); });
     const failed = h.runner.runWorkerOnce(1);
     const next = h.runner.runWorkerOnce(1);
     await expect(failed).rejects.toThrow("synthetic database unavailable");

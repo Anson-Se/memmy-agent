@@ -270,3 +270,68 @@ describe("queue scheduling metadata and read-only candidates", () => {
     expect(h.runtime.getEmbeddingRetry("retry")!.status).toBe("pending");
   });
 });
+
+describe("real-scheduler policy preparation", () => {
+  it("finishes more than one projection batch before FIFO selection without touching terminal history", () => {
+    const h = harness();
+    h.db.db.transaction(() => {
+      for (let i = 0; i < 501; i++) h.rawJob(`old-${i}`, "import_summary");
+      for (const status of ["succeeded", "dead_letter", "failed"] as const) {
+        h.rawJob(`terminal-${status}`);
+        h.db.db.prepare("UPDATE evolution_jobs SET status=? WHERE id=?").run(status, `terminal-${status}`);
+      }
+      h.rawJob("future", "reflection", { payload: { runAfter: new Date(now + 1_000).toISOString() } });
+      h.job("new-already-classified", "import_summary");
+      h.retry("ready-retry");
+      h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL WHERE id='ready-retry'").run();
+    })();
+    expect(h.store.refreshRunnablePolicies({ at })).toEqual({ refreshed: 502, unknown: [] });
+    expect(h.store.pendingPolicyCount()).toBe(4);
+    const candidates = h.store.candidates({ at, limit: 5 });
+    expect(candidates.filter(c => c.lane === "import").map(c => c.id)).toEqual(["old-0", "old-1", "old-2", "old-3", "old-4"]);
+    expect(candidates.map(c => c.id)).toContain("ready-retry");
+    expect(h.runtime.getJob("terminal-succeeded")!.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ at }).refreshed).toBe(0);
+    expect(h.store.refreshRunnablePolicies({ at: new Date(now + 1_000).toISOString() }).refreshed).toBe(1);
+  });
+
+  it("limits policy preparation to the same runnable targets/types and retry gate", () => {
+    const h = harness();
+    h.rawJob("inside", "reflection", { target: "selected" });
+    h.rawJob("outside", "reflection", { target: "other" });
+    h.rawJob("other-type", "episode_title", { target: "selected" });
+    h.retry("retry", "selected");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL WHERE id='retry'").run();
+    expect(h.store.refreshRunnablePolicies({ at, targetMemoryIds: ["selected"], allowedJobTypes: ["reflection"], includeRetries: false }).refreshed).toBe(1);
+    expect(h.runtime.getJob("outside")!.policyVersion).toBeNull();
+    expect(h.runtime.getJob("other-type")!.policyVersion).toBeNull();
+    expect(h.runtime.getEmbeddingRetry("retry")!.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ at, targetMemoryIds: [], includeRetries: true }).refreshed).toBe(0);
+    expect(h.store.refreshRunnablePolicies({ at, allowedJobTypes: [], includeRetries: true }).refreshed).toBe(1);
+  });
+
+  it("normalizes valid JSON with malformed metadata shapes so one row cannot poison the runnable set", () => {
+    const h = harness(); h.memory("bad-shapes");
+    h.db.db.prepare("UPDATE memories SET tags_json=?, properties_json=? WHERE id='bad-shapes'")
+      .run('[null,2,"agent-source"]', '{"internal_info":{"plugin_algorithm":42}}');
+    h.rawJob("malformed-payload", "embedding", { target: "bad-shapes" });
+    h.db.db.prepare("UPDATE evolution_jobs SET payload_json='null' WHERE id='malformed-payload'").run();
+    h.rawJob("healthy", "reflection");
+    expect(h.store.refreshRunnablePolicies({ at })).toEqual({ refreshed: 2, unknown: [] });
+    expect(h.runtime.getJob("malformed-payload")).toMatchObject({ queueLane: "import", policyVersion: JOB_POLICY_VERSION });
+    expect(h.ids()).toEqual(["healthy", "malformed-payload"]);
+    h.db.db.prepare("UPDATE memories SET tags_json='{}' WHERE id='bad-shapes'").run();
+    expect(h.store.refreshRunnablePolicies({ at }).refreshed).toBe(1);
+    expect(h.runtime.getJob("malformed-payload")!.queueLane).toBe("interactive");
+  });
+
+  it("exposes unknown jobs only through explicit maintenance quarantine admission", () => {
+    const h = harness(); h.rawJob("unknown", "not_registered_yet");
+    expect(h.store.refreshRunnablePolicies({ at })).toEqual({ refreshed: 1, unknown: [{ id: "unknown", jobType: "not_registered_yet" }] });
+    expect(h.store.candidates({ at, limit: 2 })).toEqual([]);
+    expect(h.store.candidates({ at, limit: 2, includeUnregistered: true })).toEqual([
+      expect.objectContaining({ id: "unknown", queue: "main", lane: "maintenance", unregistered: true })
+    ]);
+    expect(h.runtime.getJob("unknown")).toMatchObject({ queueLane: "unregistered", status: "queued", attempts: 0 });
+  });
+});
