@@ -10,7 +10,9 @@
 #include <string.h>
 #include <wchar.h>
 #include <exception>
+#include <dbghelp.h>
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "dbghelp.lib")
 
 static const char *stage = "startup";
 static LONG exceptionCount = 0;
@@ -54,6 +56,42 @@ static void invalidParameter(const wchar_t *expression, const wchar_t *function,
     fwprintf(stderr, L"LibreOfficeKit CRT parameter failure at %hs: %ls %ls %ls:%u\n", stage,
         function ? function : L"?", expression ? expression : L"?", file ? file : L"?", line);
     fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
+}
+
+static DWORD WINAPI diagnoseStartup(void *thread) {
+    // CI-only diagnostics for a headless engine stuck in native startup. Resume
+    // immediately after copying context so symbol lookup never holds its locks.
+    Sleep(15000);
+    CONTEXT context = {}; context.ContextFlags = CONTEXT_FULL;
+    if (SuspendThread((HANDLE)thread) == (DWORD)-1) return 0;
+    BOOL captured = GetThreadContext((HANDLE)thread, &context);
+    ResumeThread((HANDLE)thread);
+    if (!captured) return 0;
+    fprintf(stderr, "LibreOfficeKit startup stack at %s:\n", stage);
+    STACKFRAME64 frame = {};
+#if defined(_M_ARM64)
+    DWORD machine = IMAGE_FILE_MACHINE_ARM64;
+    frame.AddrPC.Offset = context.Pc; frame.AddrStack.Offset = context.Sp; frame.AddrFrame.Offset = context.Fp;
+#else
+    DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+    frame.AddrPC.Offset = context.Rip; frame.AddrStack.Offset = context.Rsp; frame.AddrFrame.Offset = context.Rbp;
+#endif
+    frame.AddrPC.Mode = frame.AddrStack.Mode = frame.AddrFrame.Mode = AddrModeFlat;
+    HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+    SymInitialize(process, "", TRUE); // No symbol servers or external services.
+    for (int i = 0; i < 40 && frame.AddrPC.Offset; ++i) {
+        char storage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+        SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 displacement = 0;
+        if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol))
+            fprintf(stderr, "  %s+0x%llx\n", symbol->Name, displacement);
+        else fprintf(stderr, "  0x%llx\n", frame.AddrPC.Offset);
+        if (!StackWalk64(machine, process, (HANDLE)thread, &frame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) break;
+    }
+    fflush(stderr); SymCleanup(process); CloseHandle((HANDLE)thread);
+    return 0;
 }
 
 typedef struct Kit Kit;
@@ -130,6 +168,10 @@ static int convert(int argc, wchar_t **argv) {
     SetEnvironmentVariableW(L"USERPROFILE", working);
     SetEnvironmentVariableW(L"LOCALAPPDATA", local);
     SetEnvironmentVariableW(L"APPDATA", roaming);
+    // These bootstrap overrides precede Windows Known Folder lookups. The
+    // container must not depend on access to the user's Documents/AppData.
+    SetEnvironmentVariableW(L"SYSUSERHOME", profile);
+    SetEnvironmentVariableW(L"SYSUSERCONFIG", profile);
     if (working[1] == L':') {
         wchar_t drive[3] = { working[0], L':', 0 };
         SetEnvironmentVariableW(L"HOMEDRIVE", drive);
@@ -199,6 +241,11 @@ int wmain(int argc, wchar_t **argv) {
     if (GetEnvironmentVariableW(L"MEMMY_OFFICE_TRACE", NULL, 0)) {
         SetEnvironmentVariableW(L"SAL_LOG", L"+WARN");
         AddVectoredExceptionHandler(1, diagnosticException);
+        HANDLE current = NULL;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &current, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            HANDLE monitor = CreateThread(NULL, 0, diagnoseStartup, current, 0, NULL);
+            if (monitor) CloseHandle(monitor); else CloseHandle(current);
+        }
     }
     try { return convert(argc, argv); }
     catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage, failure.what()); }
