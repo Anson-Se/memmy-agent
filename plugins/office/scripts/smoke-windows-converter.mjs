@@ -30,11 +30,15 @@ export async function smokeWindowsConverter(executable) {
     // Fail before publishing if the same engine cannot start under the actual
     // Host's AppContainer launcher. Only this trusted fixture runs in CI here.
     await rm(join(output, "smoke.pdf"));
+    const isolatedProfile = join(root, "isolated-profile");
+    await mkdir(join(isolatedProfile, "user"), { recursive: true });
+    await writeFile(join(isolatedProfile, "user/registrymodifications.xcu"), await readFile(join(profile, "user/registrymodifications.xcu")));
     const launcher = fileURLToPath(new URL("../../../App/backend/src/adapters/outbound/plugin-runtime/windows/launch.ps1", import.meta.url));
-    const args = [`-env:UserInstallation=${pathToFileURL(profile).href}`, "--headless", "--convert-to", "pdf", "--outdir", output, input];
+    const args = [`-env:UserInstallation=${pathToFileURL(isolatedProfile).href}`, "--headless", "--convert-to", "pdf", "--outdir", output, input];
     const plan = Buffer.from(JSON.stringify({ profile: `memmy.plugin.office.smoke-${randomUUID()}`, command: executable, args, cwd: root,
       readRoots: [resolve(dirname(executable), "..")], writeRoots: [root] })).toString("base64");
-    const hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(env)).toString("base64") };
+    const childEnv = { ...env, TEMP: root, TMP: root, TMPDIR: root, HOME: root };
+    const hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(childEnv)).toString("base64") };
     const handles = [openSync(join(root, "sandbox-output"), "w"), openSync(join(root, "sandbox-errors"), "w")];
     let isolated;
     try {
