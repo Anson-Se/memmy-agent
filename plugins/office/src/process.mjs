@@ -11,7 +11,7 @@ export async function runProcess(command, args, { cwd, env, input = "", timeout 
   const files = ["input", "output", "errors"].map(name => path.join(directory, name));
   try {
     await fs.writeFile(files[0], input, { flag: "wx" });
-    handles.push(await fs.open(files[0], "r"), await fs.open(files[1], "wx"), await fs.open(files[2], "wx"));
+    for (const [index, file] of files.entries()) handles.push(await fs.open(file, index === 0 ? "r" : "wx"));
     child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, stdio: handles.map(handle => handle.fd) });
     children?.add(child);
     const stop = message => { failure ??= new Error(message); child.kill("SIGKILL"); };

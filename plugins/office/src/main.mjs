@@ -477,7 +477,8 @@ async function handle(call) {
         "--permission", "--max-old-space-size=256", `--allow-fs-read=${root}`, `--allow-fs-read=${executionDirectory}`,
         `--allow-fs-write=${executionDirectory}`, executable], { cwd: executionDirectory, children, timeout: 60000, maxOutput: 1048576,
         input: JSON.stringify({ code: input.code, workspace: executionDirectory }),
-        env: { PATH: process.env.PATH, ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TEMP: executionDirectory, TMP: executionDirectory } : {}), LANG: "C.UTF-8", ELECTRON_RUN_AS_NODE: "1" } });
+        env: { PATH: process.env.PATH, ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
+          LOCALAPPDATA: process.env.LOCALAPPDATA, TEMP: executionDirectory, TMP: executionDirectory } : {}), LANG: "C.UTF-8", ELECTRON_RUN_AS_NODE: "1" } });
       if (executed.code !== 0) throw fail("office_execution_failed", executed.stderr || "Office code failed");
       let response;
       try { response = JSON.parse(executed.stdout); }
