@@ -171,9 +171,20 @@ async function command(name, args, directory) {
   return result.stdout;
 }
 async function convertFile(input, outputDir, format, csv) {
-  const work = await fs.mkdtemp(path.join(outputDir, "conversion-"));
+  // Windows extension registries append long names below UserInstallation.
+  // Deep task/QA paths can exceed native limits despite longPathAware. Keep
+  // each conversion in a short, unique directory inside approved plugin-data.
+  const windows = process.platform === "win32";
+  const work = await fs.mkdtemp(path.join(windows ? await storeRoot() : outputDir, windows ? "r-" : "conversion-"));
   const profile = pathToFileURL(path.join(work, "profile")).href;
   try {
+    let source = input, convertedDirectory = work;
+    if (windows) {
+      source = path.join(work, `source.${ext(input)}`);
+      await writeNew(source, await fs.readFile(input));
+      convertedDirectory = path.join(work, "out");
+      await fs.mkdir(convertedDirectory);
+    }
     // LibreOffice must not run embedded macros or refresh external links.
     const profileDirectory = path.join(work, "profile", "user");
     await fs.mkdir(profileDirectory, { recursive: true });
@@ -205,8 +216,8 @@ async function convertFile(input, outputDir, format, csv) {
       options.push(`--infilter=Text - txt - csv (StarCalc):${delimiter},34,76,1,,0,false,true,false,false,false,0,false`);
     }
     const filters = { pdf: "pdf", xlsx: "xlsx:Calc MS Excel 2007 XML" };
-    await command("soffice", [...options, "--convert-to", filters[format], "--outdir", work, input], work);
-    const converted = path.join(work, `${path.basename(input, path.extname(input))}.${format}`);
+    await command("soffice", [...options, "--convert-to", filters[format], "--outdir", convertedDirectory, source], work);
+    const converted = path.join(convertedDirectory, `${path.basename(source, path.extname(source))}.${format}`);
     await regular(converted);
     const output = path.join(outputDir, `${randomUUID()}.${format}`);
     await writeNew(output, await fs.readFile(converted));

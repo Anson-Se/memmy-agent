@@ -106,7 +106,8 @@ explicitly. The Office plugin requires no entitlement or sandbox exemption.
 Windows conversion uses a small LibreOfficeKit bridge in the downloaded runtime;
 the desktop LibreOffice launcher's global single-instance pipes are incompatible
 with AppContainer. Rendering uses a private non-interactive desktop and Skia CPU
-rasterization, with temporary profiles confined to task storage. Runtime builds
+rasterization, with short per-conversion profiles and input/output paths inside
+approved plugin storage to avoid Windows extension-registry path limits. Runtime builds
 verify a generated document both directly and through the real AppContainer
 launcher before publishing the archive. Subprocess transport uses temporary files instead of Node's
 global named pipes. macOS permits local IPC only within plugin-data and excludes
