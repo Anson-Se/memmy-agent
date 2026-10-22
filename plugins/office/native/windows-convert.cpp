@@ -12,6 +12,7 @@
 #include <exception>
 #include <atomic>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "dbghelp.lib")
 
@@ -59,16 +60,15 @@ static void invalidParameter(const wchar_t *expression, const wchar_t *function,
     fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
 }
 
-static DWORD WINAPI diagnoseStartup(void *thread) {
+static void dumpThread(HANDLE thread, DWORD id) {
     // CI-only diagnostics for a headless engine stuck in native startup. Resume
     // immediately after copying context so symbol lookup never holds its locks.
-    Sleep(15000);
     CONTEXT context = {}; context.ContextFlags = CONTEXT_FULL;
-    if (SuspendThread((HANDLE)thread) == (DWORD)-1) return 0;
-    BOOL captured = GetThreadContext((HANDLE)thread, &context);
-    ResumeThread((HANDLE)thread);
-    if (!captured) return 0;
-    fprintf(stderr, "LibreOfficeKit startup stack at %s:\n", stage.load());
+    if (SuspendThread(thread) == (DWORD)-1) return;
+    BOOL captured = GetThreadContext(thread, &context);
+    ResumeThread(thread);
+    if (!captured) return;
+    fprintf(stderr, "LibreOfficeKit thread %lu stack at %s:\n", id, stage.load());
     STACKFRAME64 frame = {};
 #if defined(_M_ARM64)
     DWORD machine = IMAGE_FILE_MACHINE_ARM64;
@@ -79,8 +79,6 @@ static DWORD WINAPI diagnoseStartup(void *thread) {
 #endif
     frame.AddrPC.Mode = frame.AddrStack.Mode = frame.AddrFrame.Mode = AddrModeFlat;
     HANDLE process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
-    SymInitialize(process, "", TRUE); // No symbol servers or external services.
     for (int i = 0; i < 40 && frame.AddrPC.Offset; ++i) {
         char storage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
         SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
@@ -89,9 +87,29 @@ static DWORD WINAPI diagnoseStartup(void *thread) {
         if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol))
             fprintf(stderr, "  %s+0x%llx\n", symbol->Name, displacement);
         else fprintf(stderr, "  0x%llx\n", frame.AddrPC.Offset);
-        if (!StackWalk64(machine, process, (HANDLE)thread, &frame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) break;
+        if (!StackWalk64(machine, process, thread, &frame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) break;
     }
-    fflush(stderr); SymCleanup(process); CloseHandle((HANDLE)thread);
+    fflush(stderr);
+}
+static DWORD WINAPI diagnoseStartup(void *thread) {
+    Sleep(15000);
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+    SymInitialize(GetCurrentProcess(), "", TRUE); // No symbol servers or external services.
+    DWORD main = GetThreadId((HANDLE)thread), own = GetCurrentThreadId();
+    dumpThread((HANDLE)thread, main); CloseHandle((HANDLE)thread);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry = {}; entry.dwSize = sizeof(entry);
+        int count = 0;
+        if (Thread32First(snapshot, &entry)) do {
+            if (entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == own || entry.th32ThreadID == main) continue;
+            HANDLE worker = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (worker) { dumpThread(worker, entry.th32ThreadID); CloseHandle(worker); }
+            if (++count >= 16) break;
+        } while (Thread32Next(snapshot, &entry));
+        CloseHandle(snapshot);
+    }
+    SymCleanup(GetCurrentProcess());
     return 0;
 }
 
@@ -197,10 +215,6 @@ static int convert(int argc, wchar_t **argv) {
     // rasterization before loading its CRT/engine, avoiding GPU enumeration
     // and graphics-driver initialization inside the restricted container.
     setEnvironment(L"SAL_SKIA", L"raster");
-    // This worker performs synchronous load/save calls and has no interactive
-    // event loop. Initialize VCL on this thread rather than waiting for the
-    // desktop application's background startup/RequestHandler handshake.
-    setEnvironment(L"SAL_LOK_OPTIONS", L"unipoll");
     setEnvironment(L"SAL_USE_VCLPLUGIN", L"svp");
     setEnvironment(L"SAL_DISABLE_OPENCL", L"1");
     trace("checking private desktop");
