@@ -854,7 +854,11 @@ export class MCPPromptWrapper extends Tool {
   }
 }
 
-type Stack = { close?: () => Promise<void>; aclose: () => Promise<void>; refreshTools?: (registry?: ToolRegistry) => Promise<void> };
+type Stack = {
+  close?: () => Promise<void>;
+  aclose: () => Promise<void>;
+  refreshTools?: (registry: ToolRegistry) => Promise<void>;
+};
 
 async function enterMaybe(context: any, stack: Array<() => Promise<void>>): Promise<any> {
   const value = await context;
@@ -1002,8 +1006,12 @@ export async function connectMcpServers(
       const enabledTools = new Set(cfgValue(cfg, "enabled_tools", "enabledTools") ?? ["*"]);
       const allowAll = enabledTools.has("*");
       const registeredTools = new Set<string>();
-      const registerTools = (tools: any, targetRegistry = registry) => {
-        for (const toolName of registeredTools) targetRegistry.unregister(toolName);
+      let registeredRegistry = registry;
+      const registerTools = (tools: any, targetRegistry = registeredRegistry) => {
+        for (const toolName of registeredTools) {
+          registeredRegistry.unregister(toolName);
+          if (targetRegistry !== registeredRegistry) targetRegistry.unregister(toolName);
+        }
         registeredTools.clear();
         const matched = new Set<string>();
         const availableRaw = (tools?.tools ?? []).map((tool: any) => tool.name);
@@ -1027,6 +1035,7 @@ export async function connectMcpServers(
             );
           }
         }
+        registeredRegistry = targetRegistry;
       };
       registerTools(discovered.tools);
       for (const resource of discovered.resources) {
@@ -1036,7 +1045,7 @@ export async function connectMcpServers(
         registry.register(new MCPPromptWrapper(liveSession, name, prompt, cfgValue(cfg, "tool_timeout", "toolTimeout") ?? 30));
       }
       stacks[name] = {
-        refreshTools: async (targetRegistry = registry) => {
+        refreshTools: async (targetRegistry) => {
           // Discover first so a temporary failure does not discard usable tools or interrupt active calls.
           const tools = await timeoutPromise(liveSession.listTools?.(), 15, `MCP server '${name}' tool refresh timed out`);
           registerTools(tools, targetRegistry);
@@ -1295,7 +1304,6 @@ export async function reloadServers(state: McpState, registry: ToolRegistry): Pr
       const refresh = state.mcpStacks?.plugins?.refreshTools;
       if (refresh) {
         try {
-          // Runtime initialization can replace the registry after this transport connected.
           await refresh(registry);
           refreshed.push("plugins");
         } catch {

@@ -203,6 +203,30 @@ describe("MCP connection helpers", () => {
     expect(closed).toEqual([]);
     await connection!.aclose();
   });
+  it("refreshes plugin tools into the replacement live registry", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const servers = { plugins: { command: "plugin-bridge" } };
+    saveConfig(new Config({ tools: { mcpServers: servers } }));
+    const names: string[] = [];
+    const session = fakeSession(names);
+    setMcpRuntimeForTest(runtimeFor({ "plugin-bridge": session }) as any);
+    const startupRegistry = new ToolRegistry();
+    const state = { mcpServers: servers, mcpStacks: await connectMcpServers(servers, startupRegistry) };
+    const liveRegistry = new ToolRegistry();
+
+    names.push("plugin_session-start", "plugin_material-collect");
+    await expect(reloadServers(state, liveRegistry)).resolves.toMatchObject({
+      ok: true,
+      refreshed: ["plugins"],
+      tool_counts: { plugins: 2 },
+    });
+    expect(liveRegistry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    expect(liveRegistry.has("mcp_plugins_plugin_material-collect")).toBe(true);
+    expect(startupRegistry.toolNames).toEqual([]);
+
+    await state.mcpStacks.plugins!.aclose();
+  });
   it.runIf(process.platform === 'darwin')('uses the private Desktop guide instead of doctor through the real MCP registration', async () => {
     vi.stubEnv('MEMMY_DESKTOP_MANAGED_GATEWAY', '1');
     const prepare = vi.spyOn(desktopOnboardingClient, 'prepare').mockResolvedValue({ app: 'com.example.Memmy', pid: 42 });

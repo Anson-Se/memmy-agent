@@ -38,19 +38,21 @@ export function buildPluginMcpServer(
 ): Server {
   const server = new Server({ name: "memmy-plugins", version: "1.0.0" }, { capabilities: { tools: {} } });
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [...(skillContent ? [{
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const tools = capabilityTools(plugins);
+    const hasActiveCloudSkill = tools.some(({ plugin }) => plugin.manifest.skills?.some((skill) => skill.cloud));
+    return { tools: [...(skillContent && hasActiveCloudSkill ? [{
       name: "read_plugin_skill",
       description: "Activate private plugin instructions for this conversation. Returns only a version reference; the runtime loads instructions in memory before the next model request. Requires a cloud-skill-aware Memmy client.",
       inputSchema: { type: "object", properties: { pluginId: { type: "string" }, skillId: { type: "string" } }, required: ["pluginId", "skillId"], additionalProperties: false }
-    }] : []), ...capabilityTools(plugins).map(({ name, plugin, capability, wrapsInput }) => ({
+    }] : []), ...tools.map(({ name, plugin, capability, wrapsInput }) => ({
       name,
       description: `[${plugin.manifest.name}] ${capability.description}${
         capability.examples?.length ? `\nExamples: ${capability.examples.join("; ")}` : ""
       }`,
       inputSchema: mcpInputSchema(capability.inputSchema, wrapsInput)
-    }))]
-  }));
+    }))] };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if (request.params.name === "read_plugin_skill" || request.params.name === "resolve_plugin_skill_context") {

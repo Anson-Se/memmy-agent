@@ -409,7 +409,9 @@ it("lets the user submit while a staged recording is still transcribing, then co
     await act(async () => finish());
     // The plugin never saw this recording, so its transcript arrives as the
     // file itself — not also as attached text, which would double it.
-    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", { files: [transcriptFile] });
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", {
+      files: [transcriptFile], recordingDeliverables: [audio, transcriptFile]
+    });
   } finally { await act(async () => root.unmount()); container.remove(); }
 });
 
@@ -434,7 +436,9 @@ it("attaches a staged recording's transcript to the recording the plugin already
     });
     await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
     expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", {
-      files: [], transcripts: { [audio.path]: { text: "现场访谈内容", segments: [] } }
+      files: [],
+      transcripts: { [audio.path]: { text: "现场访谈内容", segments: [] } },
+      recordingDeliverables: [audio, transcriptFile]
     });
   } finally { await act(async () => root.unmount()); container.remove(); }
 });

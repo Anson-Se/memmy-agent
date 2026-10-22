@@ -93,7 +93,7 @@ import { RecordingEntryCard, RecordingEntryPage, useRecordingEntry, type Recordi
 import { PluginArtifactPreviewPanel } from "./plugin-artifact-preview-panel.js";
 import { AgentThreadPanel, useAgentThreadPanel } from "./agent-thread-panel.js";
 import { hasPendingBrowserOpen, MEMMY_BROWSER_OPEN_EVENT } from "./browser-panel.js";
-import { threadTabForInAppPreview, threadTabForPath } from "./agent-thread-panel-model.js";
+import { normalizeThreadPath, threadTabForInAppPreview, threadTabForPath, type ThreadArtifact } from "./agent-thread-panel-model.js";
 import { THREAD_SEARCH_SCROLL_OFFSET } from "./agent-thread-search.js";
 import { AgentThreadToolbar } from "./agent-thread-toolbar.js";
 import { AgentWorkspaceContext } from "./agent-workspace-context.js";
@@ -727,6 +727,31 @@ export function selectRecordingDeliveryFiles(recordings: readonly RecordingArchi
     .flatMap((entry) => (entry.files ?? []).map((file) => ({
       id: `recording:${file.path}`, name: file.name, mediaType: file.mime, uri: file.url, path: file.path
     })));
+}
+
+/** Files produced by plugins live outside Agent messages but still belong in the task overview. */
+export function selectPluginThreadArtifacts(
+  calls: readonly PluginUiCall[],
+  recordingFiles: readonly PluginArtifactRef[] = []
+): ThreadArtifact[] {
+  const artifacts = new Map<string, ThreadArtifact>();
+  const names = new Set<string>();
+  const add = (artifact: PluginArtifactRef) => {
+    if (artifact.role === "setup") return;
+    const path = artifact.path?.trim() || undefined;
+    const url = artifact.uri?.trim() || undefined;
+    const key = normalizeThreadPath(path ?? url ?? "");
+    if (!key || artifacts.has(key)) return;
+    artifacts.set(key, { key, name: artifact.name, ...(path ? { path } : {}), ...(url ? { url } : {}) });
+    names.add(artifact.name);
+  };
+  for (const call of calls) {
+    for (const event of call.events) if (event.type === "artifact") add(event.artifact);
+  }
+  // The recording UI is also an artifact producer. Once the plugin publishes
+  // the task-owned copy, its same-name artifact takes precedence here.
+  for (const artifact of recordingFiles) if (!names.has(artifact.name)) add(artifact);
+  return [...artifacts.values()];
 }
 
 /** Keeps the global plugin event stream scoped to the conversation on screen. */
@@ -1494,6 +1519,17 @@ export function HomePage() {
   const visiblePluginCalls = useMemo(
     () => selectPluginCallsForConversation(pluginUiCalls, state.agent.currentChatId, state.agent.currentSessionKey, chatScopeKey),
     [chatScopeKey, pluginUiCalls, state.agent.currentChatId, state.agent.currentSessionKey]
+  );
+  const legalRecordingDeliveryFiles = useMemo(
+    () => selectRecordingDeliveryFiles(
+      recordingEntry.session.recordings,
+      state.agent.currentChatId ?? state.agent.currentSessionKey
+    ),
+    [recordingEntry.session.recordings, state.agent.currentChatId, state.agent.currentSessionKey]
+  );
+  const pluginThreadArtifacts = useMemo(
+    () => selectPluginThreadArtifacts(visiblePluginCalls, legalRecordingDeliveryFiles),
+    [legalRecordingDeliveryFiles, visiblePluginCalls]
   );
   const pinnedPluginCapabilities = useMemo(
     () => new Set(installedPlugins.flatMap((plugin) => (plugin.manifest.commands ?? [])
@@ -3097,26 +3133,9 @@ export function HomePage() {
   function runExactLocalSlashCommand(command: string): boolean {
     const normalized = command.trim().toLowerCase();
     const pluginInvocation = parsePluginCommandInvocation(command, pluginCommandTargets);
-    // A command with agentSkillId goes to the Agent too, so it is NOT intercepted
-    // here as a terminal action. But if it also declares a capabilityId the card
-    // should open immediately — we fire the invoke side-effect and then return
-    // false so the caller still sends the agent message.
+    // An Agent-routed command stays on the normal message path. The explicit
+    // Skill prompt lets the Agent invoke the capability in its own tool turn.
     if (pluginInvocation?.contribution.agentSkillId) {
-      if (pluginInvocation.contribution.capabilityId && clients && pendingAttachments.length === 0) {
-        const { plugin, contribution, arguments: commandArguments } = pluginInvocation;
-        const conversationId = state.agent.currentChatId ?? state.agent.currentSessionKey ?? chatScopeKey;
-        void clients.plugins.invoke(plugin.id, contribution.capabilityId, {
-          conversationId,
-          input: { command: contribution.command, arguments: commandArguments, context: { ...(draftTarget.kind === "project" ? { projectId: draftTarget.projectId } : {}), references: contextChips } },
-          origin: "user"
-        }).catch((error) => {
-          dispatch(agentActions.operationFailed("chat", createAgentOperationError({
-            source: "send",
-            message: pluginInvocationError(error),
-            scopeKey: chatScopeKey
-          })));
-        });
-      }
       return false;
     }
     if (pluginInvocation && pendingAttachments.length > 0) return false;
@@ -4302,6 +4321,7 @@ export function HomePage() {
         <AgentThreadPanel
           controller={threadPanel}
           messages={state.agent.messages}
+          artifacts={pluginThreadArtifacts}
           workspaceRoot={activeTask?.cwd.trim() || workspaceEnvironment.data?.snapshot.cwd || null}
           previewContext={{
             artifactClient: sessionArtifactClient,
@@ -4568,7 +4588,7 @@ export function HomePage() {
                 calls={visiblePluginCalls}
                 legalDelivery={{
                   ready: !isCurrentAgentRunning,
-                  recordings: selectRecordingDeliveryFiles(recordingEntry.session.recordings, state.agent.currentChatId ?? state.agent.currentSessionKey)
+                  recordings: legalRecordingDeliveryFiles
                 }}
                 plugins={installedPlugins}
                 client={clients?.plugins ?? null}

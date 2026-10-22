@@ -31,6 +31,7 @@ import {
   THREAD_LIST_DEFAULT_WIDTH,
   THREAD_PANEL_MIN_WIDTH,
   THREAD_PANEL_NARROW_WIDTH,
+  type ThreadArtifact,
   type ThreadPanelTab,
   type ThreadPanelView,
   type ThreadTabState,
@@ -296,17 +297,28 @@ const EMPTY_BROWSER_SESSION: BrowserSession = {
 export function AgentThreadPanel(props: {
   controller: AgentThreadPanelController;
   messages: AgentChatMessage[];
+  /** Host/plugin files that are delivered outside the Agent transcript. */
+  artifacts?: ThreadArtifact[];
   workspaceRoot: string | null;
   previewContext: ThreadPreviewContext;
 }) {
   const { t } = useTranslation();
   const panel = props.controller;
-  const artifacts = useMemo(() => collectThreadArtifacts(props.messages), [props.messages]);
+  const artifacts = useMemo(() => {
+    const merged = new Map<string, ThreadArtifact>();
+    for (const artifact of [...collectThreadArtifacts(props.messages), ...(props.artifacts ?? [])]) {
+      const key = normalizeThreadPath(artifact.path ?? artifact.url ?? artifact.key);
+      if (key && !merged.has(key)) merged.set(key, { ...artifact, key });
+    }
+    return [...merged.values()];
+  }, [props.artifacts, props.messages]);
   const changes = useMemo(() => collectThreadFileChanges(props.messages), [props.messages]);
-  const filesRefreshToken = useMemo(
-    () => changes.map((change) => `${change.key}:${change.added}:${change.deleted}`).join("|") + `#${artifacts.length}`,
-    [artifacts.length, changes],
-  );
+  const filesRefreshToken = useMemo(() => [
+    changes.map((change) => `${change.key}:${change.added}:${change.deleted}`).join("|"),
+    artifacts.map((artifact) => [artifact.key, artifact.path ?? "", artifact.url ?? ""].join(":"))
+      .sort()
+      .join("|"),
+  ].join("#"), [artifacts, changes]);
   const activeTab = panel.tabState.tabs.find((tab) => tab.id === panel.tabState.activeId) ?? null;
   const activeFileKey = activeTab?.type === "file" ? normalizeThreadPath(activeTab.path ?? activeTab.url ?? "") : null;
   const activeChangeKey = activeTab?.type === "change" ? activeTab.id.slice("change:".length) : null;

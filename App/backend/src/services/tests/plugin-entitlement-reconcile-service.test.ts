@@ -70,13 +70,36 @@ describe("entitled plugin reconciliation", () => {
     }
   });
 
-  it("does not resolve an unpinned grant when the catalog is empty or unavailable", async () => {
+  it("installs an entitled private plugin omitted from the public catalog", async () => {
     const plugins = fakePluginService();
     await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
-    expect(plugins.calls).toEqual([]);
+    expect(plugins.calls).toEqual([
+      "install:vertical-demo",
+      "approvePermissions:vertical-demo",
+      "enable:vertical-demo"
+    ]);
+    expect(plugins.service.install).toHaveBeenCalledWith("vertical-demo");
+  });
+
+  it("still reconciles entitlement-only plugins when the public catalog is unavailable", async () => {
+    const plugins = fakePluginService();
     vi.spyOn(plugins.service, "catalog").mockRejectedValue(new Error("offline"));
     const failures = await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
-    expect(failures).toHaveLength(1);
+    expect(failures).toEqual([{ pluginId: "catalog", message: "Error: offline" }]);
+    expect(plugins.calls).toEqual([
+      "install:vertical-demo",
+      "approvePermissions:vertical-demo",
+      "enable:vertical-demo"
+    ]);
+  });
+
+  it("does not reinstall an entitled private plugin the user explicitly removed", async () => {
+    const plugins = fakePluginService();
+    await reconcileEntitledPlugins({
+      plugins: plugins.service,
+      entitlements: ["plugin:vertical-demo"],
+      userUninstalledIds: new Set(["vertical-demo"])
+    });
     expect(plugins.calls).toEqual([]);
   });
 
@@ -133,16 +156,16 @@ function fakePluginService(initial: InstalledPlugin[] = [], failing: ReadonlySet
       manifest: { ...manifest(id), version: "2.0.0", rules: { installation: "automatic" } },
       eligibility: { visible: true, canInstall: true, canUse: true, reason: null }
     })),
-    install: async (id: string) => {
+    install: vi.fn(async (id: string) => {
       record("install", id);
       const plugin = installed(id, "installed");
       state.set(id, plugin);
       return plugin;
-    },
-    update: async (id: string) => {
+    }),
+    update: vi.fn(async (id: string) => {
       record("update", id);
       return state.get(id)!;
-    },
+    }),
     approvePermissions: async (id: string) => {
       record("approvePermissions", id);
       return state.get(id)!;

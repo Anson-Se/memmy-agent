@@ -76,7 +76,7 @@ import { createTurnService, type TurnService } from "./turn-service.js";
 import { createPluginService, type PluginRuntimeHost, type PluginService } from "./plugin-service.js";
 import { createPluginLocalArtifactService } from "./plugin-local-artifact-service.js";
 import { createPluginModelInferenceService } from "./plugin-model-inference-service.js";
-import { reconcileEntitledPlugins } from "./plugin-entitlement-reconcile-service.js";
+import { entitledPluginIds, reconcileEntitledPlugins } from "./plugin-entitlement-reconcile-service.js";
 import { createPluginAsrService } from "./plugin-asr-service.js";
 import { createPluginAssetKeyService } from "./plugin-asset-key-service.js";
 import { createPluginHostServiceRouter } from "./plugin-host-service-router.js";
@@ -258,7 +258,8 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
       }
     }),
     isAuthenticated: () => accountSessionRepository.get().authenticated,
-    isEntitlementGranted
+    isEntitlementGranted,
+    catalogPluginIds: () => entitledPluginIds(accountSessionRepository.getEntitlements())
   });
   const pluginToolSignature = () => JSON.stringify(plugins.list()
     .filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)

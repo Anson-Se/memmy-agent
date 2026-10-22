@@ -10,7 +10,7 @@ import type { MarketplacePlugin } from "./plugin-marketplace-section.js";
 export const OFFICIAL_PLUGIN_POLICIES = {
   "literature-review": { audience: "public", defaultInstalled: true, requiresLogin: true, requiresOfficialModel: true },
   "office": { audience: "public" },
-  "legal": { audience: "beta", requiresLogin: true }
+  "legal-labor": { audience: "beta", requiresLogin: true }
 } as const;
 
 export function pluginRequiresOfficialModel(pluginId: string | null | undefined): boolean {
@@ -47,15 +47,15 @@ export function officialPluginCatalog(options: {
       installed: installedOf("office")
     },
     {
-      id: "legal", category: "legal",
-      name: en ? "Legal" : "法律",
+      id: "legal-labor", category: "legal",
+      name: en ? "Employment Compliance Diagnosis" : "用工合规诊断",
       description: en
         ? "Organize employment research materials, verify information, and draft reports for professional review."
         : "整理劳动用工调研材料、核实信息并起草报告，供专业人员审核。",
-      ...OFFICIAL_PLUGIN_POLICIES["legal"],
-      version: installedOf("legal")?.version,
+      ...OFFICIAL_PLUGIN_POLICIES["legal-labor"],
+      version: installedOf("legal-labor")?.version,
       installable: true,
-      installed: installedOf("legal")
+      installed: installedOf("legal-labor")
     }
   ];
 }

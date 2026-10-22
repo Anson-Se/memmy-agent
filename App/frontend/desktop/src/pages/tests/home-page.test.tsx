@@ -26,10 +26,12 @@ import {
   agentStatusText,
   agentChatScopeKey,
   attachmentFilesFromDataTransfer,
+  buildAgentRoutedPluginPrompt,
   buildComposerCommandDraft,
   collectPluginCommandTargets,
   selectConversationPinnedCommands,
   selectPluginCallsForConversation,
+  selectPluginThreadArtifacts,
   selectRecordingDeliveryFiles,
   selectRecordingMaterialFiles,
   clipboardAttachmentFilesFromDataTransfer,
@@ -122,6 +124,31 @@ describe("HomePage", () => {
       .toEqual(["earlier.webm", "earlier.txt", "later.webm", "later.txt"]);
     expect(selectRecordingDeliveryFiles(recordings, "chat-1")[1]).toMatchObject({ path: "/ws/recordings/earlier.txt", mediaType: "text/plain" });
     expect(selectRecordingDeliveryFiles(recordings, null)).toEqual([]);
+  });
+
+  it("adds plugin and recording deliveries to the task overview and omits setup files", () => {
+    const calls: PluginUiCall[] = [{
+      pluginId: "legal-labor",
+      capabilityId: "report-render",
+      callId: "report-1",
+      conversationId: "websocket:chat-1",
+      origin: "agent",
+      events: [
+        { type: "artifact", artifact: { id: "setup", name: "诊断表.xlsx", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", uri: "file:///plugin/setup.xlsx", path: "/workspace/setup.xlsx", role: "setup" } },
+        { type: "artifact", artifact: { id: "audio", name: "访谈录音.webm", mediaType: "audio/webm", uri: "file:///plugin/audio.webm", path: "/workspace/outputs/访谈录音.webm", role: "deliverable" } },
+        { type: "artifact", artifact: { id: "report", name: "诊断报告.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", uri: "file:///plugin/report.docx", path: "/workspace/outputs/诊断报告.docx", role: "deliverable" } },
+      ]
+    }];
+    const recordings = [
+      { id: "archive-audio", name: "访谈录音.webm", mediaType: "audio/webm", uri: "/media/audio", path: "/global/recordings/访谈录音.webm" },
+      { id: "archive-text", name: "访谈转写.txt", mediaType: "text/plain", uri: "/media/text", path: "/global/recordings/访谈转写.txt" },
+    ];
+
+    expect(selectPluginThreadArtifacts(calls, recordings)).toEqual([
+      { key: "/workspace/outputs/访谈录音.webm", name: "访谈录音.webm", path: "/workspace/outputs/访谈录音.webm", url: "file:///plugin/audio.webm" },
+      { key: "/workspace/outputs/诊断报告.docx", name: "诊断报告.docx", path: "/workspace/outputs/诊断报告.docx", url: "file:///plugin/report.docx" },
+      { key: "/global/recordings/访谈转写.txt", name: "访谈转写.txt", path: "/global/recordings/访谈转写.txt", url: "/media/text" },
+    ]);
   });
 
   it("allows Goal steering when source metadata is missing without opening TUI or IM turns", () => {
@@ -571,6 +598,14 @@ describe("HomePage", () => {
 
     expect(sendBlock).toContain("if (runExactLocalSlashCommand(input))");
     expect(sendBlock.indexOf("runExactLocalSlashCommand(input)")).toBeLessThan(sendBlock.indexOf("submitAgentComposerMessage({"));
+    const agentSkillBlock = localSlashBlock.slice(
+      localSlashBlock.indexOf("if (pluginInvocation?.contribution.agentSkillId)"),
+      localSlashBlock.indexOf("if (pluginInvocation && pendingAttachments.length > 0)")
+    );
+    expect(agentSkillBlock).not.toContain("clients.plugins.invoke");
+    expect(sendBlock).toContain("content: agentRoutedPluginPrompt ?? input");
+    expect(sendBlock).not.toContain("invokeAgentRoutedPluginCapability");
+    expect(sendBlock).not.toContain("deferAgentSubmission");
     expect(localSlashBlock).toContain("if (pendingAttachments.length > 0) return false;");
     expect(localSlashBlock).toContain('normalized === "/last-compaction"');
     expect(localSlashBlock).toContain("requestLastCompactionPanel();");
@@ -2196,4 +2231,27 @@ it("hides legal composer shortcuts until the current conversation actually invok
   const invocation: PluginUiCall={pluginId:"legal-labor", capabilityId:"session-start",callId:"starting",conversationId:"law-chat",origin:"agent",events:[]};
   expect(selectConversationPinnedCommands(targets,[invocation])).toHaveLength(2);
   expect(selectConversationPinnedCommands(targets,[{...invocation,pluginId:"another-plugin"}])).toEqual([]);
+});
+
+it("routes a legal diagnosis command to the Agent Skill instead of opening the card locally", () => {
+  const legal = InstalledPluginSchema.parse({
+    id: "legal-labor", version: "1.0.0", state: "active", approvedPermissions: [], config: {}, lastError: null,
+    createdAt: "2026-10-13T00:00:00Z", updatedAt: "2026-10-13T00:00:00Z", manifest: {
+      apiVersion: "memmy/v1", id: "legal-labor", name: "Legal", version: "1.0.0", runtime: { adapter: "http" }, permissions: [],
+      capabilities: [{ id: "session-start", name: "Guide", description: "Guide", inputSchema: {}, outputSchema: {}, execution: "job" }],
+      skills: [{
+        id: "labor-risk-diagnosis", name: "用工合规风险诊断", description: "Diagnosis",
+        entry: "skills/labor-risk-diagnosis/SKILL.md"
+      }],
+      commands: [{
+        command: "/legal-diagnosis", name: "用工诊断", description: "Diagnosis", capabilityId: "session-start",
+        agentSkillId: "labor-risk-diagnosis"
+      }]
+    }
+  });
+
+  expect(buildAgentRoutedPluginPrompt(
+    "/legal-diagnosis 帮我生成用工风险诊断报告",
+    collectPluginCommandTargets([legal])
+  )).toBe("$labor-risk-diagnosis 帮我生成用工风险诊断报告");
 });

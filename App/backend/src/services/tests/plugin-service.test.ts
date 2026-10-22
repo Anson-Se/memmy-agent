@@ -53,7 +53,9 @@ const release = {
 function createContext(
   releases: PluginRelease[] = [release],
   localArtifactService?: PluginLocalArtifactService,
-  isAuthenticated?: () => boolean
+  isAuthenticated?: () => boolean,
+  catalogPluginIds?: () => readonly string[],
+  isEntitlementGranted?: (entitlement: string) => boolean
 ) {
   root = mkdtempSync(join(tmpdir(), "memmy-plugin-service-"));
   store = createAppStateStore({ databasePath: join(root, "app.sqlite") });
@@ -79,24 +81,91 @@ function createContext(
     activate: vi.fn(async () => undefined),
     deactivate: vi.fn(async () => undefined)
   };
+  const registry = createInMemoryPluginRegistry(releases);
   return {
+    registry,
     runtimeHost,
     artifactManager,
     skillManager,
     service: createPluginService({
       repository: store.repositories.plugins,
       secretStore: store.secretStore,
-      registry: createInMemoryPluginRegistry(releases),
+      registry,
       runtimeHost,
       artifactManager,
       skillManager,
       localArtifactService,
-      isAuthenticated
+      isAuthenticated,
+      catalogPluginIds,
+      isEntitlementGranted
     })
   };
 }
 
 describe("PluginService", () => {
+  it("does not expose a private plugin from the public registry without its entitlement", async () => {
+    const publicRelease: PluginRelease = { manifest: {
+      ...release.manifest, id: "office", permissions: [], configSchema: undefined
+    } };
+    const legalRelease: PluginRelease = { manifest: {
+      ...release.manifest,
+      id: "legal-labor",
+      name: "用工合规诊断",
+      permissions: [],
+      configSchema: undefined,
+      requiredEntitlement: "plugin:legal-labor",
+      rules: { distribution: "account", installation: "automatic", requiresLogin: true,
+        unavailableVisibility: "hidden", autoUpdate: true, recommendsOfficialModel: false }
+    } };
+    const { service } = createContext(
+      [publicRelease, legalRelease],
+      undefined,
+      () => true,
+      () => [],
+      () => false
+    );
+
+    expect((await service.catalog()).map((entry) => entry.manifest.id)).toEqual(["office"]);
+  });
+
+  it("adds entitled private releases to the catalog and keeps them visible after uninstall", async () => {
+    const publicRelease: PluginRelease = { manifest: {
+      ...release.manifest, id: "office", permissions: [], configSchema: undefined
+    } };
+    const legalRelease: PluginRelease = { manifest: {
+      ...release.manifest,
+      id: "legal-labor",
+      name: "用工合规诊断",
+      permissions: [],
+      configSchema: undefined,
+      requiredEntitlement: "plugin:legal-labor",
+      rules: { distribution: "account", installation: "automatic", requiresLogin: true,
+        unavailableVisibility: "hidden", autoUpdate: true, recommendsOfficialModel: false }
+    } };
+    const { service, registry } = createContext(
+      [publicRelease, legalRelease],
+      undefined,
+      () => true,
+      () => ["legal-labor"],
+      (entitlement) => entitlement === "plugin:legal-labor"
+    );
+    vi.spyOn(registry, "list").mockResolvedValue([publicRelease.manifest]);
+
+    expect((await service.catalog()).map((entry) => entry.manifest.id)).toEqual(["office", "legal-labor"]);
+    await service.install("legal-labor", legalRelease.manifest.version);
+    await service.approvePermissions("legal-labor", []);
+    await service.enable("legal-labor");
+    expect((await service.catalog()).find((entry) => entry.manifest.id === "legal-labor")?.installed?.state).toBe("active");
+
+    await service.uninstall("legal-labor");
+    const uninstalled = (await service.catalog()).find((entry) => entry.manifest.id === "legal-labor");
+    expect(uninstalled?.installed).toBeUndefined();
+    expect(uninstalled?.eligibility).toMatchObject({ visible: true, canInstall: true, canUse: true });
+
+    await service.install("legal-labor", legalRelease.manifest.version);
+    expect(store!.repositories.plugins.listUserUninstalledIds()).toEqual([]);
+  });
+
   it("does not download or reinstall an unchanged installed release on account refresh", async () => {
     const { service, artifactManager } = createContext();
     await service.install(release.manifest.id);

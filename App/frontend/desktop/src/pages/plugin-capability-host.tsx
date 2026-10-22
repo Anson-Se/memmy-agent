@@ -1153,6 +1153,11 @@ function transcriptField(transcripts: Record<string, unknown>): { transcripts?: 
   return Object.keys(transcripts).length ? { transcripts } : {};
 }
 
+/** Keeps recording files out of the material list while still handing them to the final delivery. */
+function recordingDeliverableField(files: UploadedAgentMedia[]): { recordingDeliverables?: UploadedAgentMedia[] } {
+  return files.length ? { recordingDeliverables: files } : {};
+}
+
 /**
  * How a staged recording's transcription is doing, under its file name.
  *
@@ -1248,6 +1253,7 @@ export function FileInputCard(props: {
    */
   const collectStaged = async (keepPending = false) => {
     const transcripts: Record<string, { text: string; segments: PluginRecordingTranscript["segments"] }> = {};
+    const recordingDeliverables: UploadedAgentMedia[] = [];
     const jobs = stagedFiles.map((file) => transcriptionJobs?.transcriptionJob(file.path));
     if (jobs.some((job) => job && job.state.status !== "ready")) setWaitingForTranscripts(true);
     try {
@@ -1255,13 +1261,15 @@ export function FileInputCard(props: {
       const files: UploadedAgentMedia[] = [];
       const retained: PluginRecordingMaterial[] = [];
       stagedFiles.forEach((file, index) => {
-        const { collected, pending: _pending, pendingAudio: _audio, ...media } = file;
+        const { collected, pending: _pending, pendingAudio, ...media } = file;
         if (!file.pending) {
           if (!collected) files.push(media);
           return;
         }
         const result = results[index];
         if (result) {
+          if (pendingAudio) recordingDeliverables.push(pendingAudio);
+          if (result.transcriptFile) recordingDeliverables.push(result.transcriptFile);
           // A recording the plugin already holds gets its text attached to that
           // material, keyed by the recording's path. One it never saw arrives
           // as the transcript file instead. Sending both would put the same
@@ -1279,7 +1287,7 @@ export function FileInputCard(props: {
         // needs nothing, which is the case once its text has been delivered.
         if (!collected && file.pendingAudio) files.push(file.pendingAudio);
       });
-      return { transcripts, files, retained };
+      return { transcripts, files, recordingDeliverables, retained };
     } finally {
       setWaitingForTranscripts(false);
     }
@@ -1294,7 +1302,12 @@ export function FileInputCard(props: {
       // A recording still being transcribed keeps its row, so its text travels
       // with the next card instead of being lost with this one.
       const staged = await collectStaged(true);
-      await props.onRespond(props.request.interactionId, { action: "skip", files: staged.files, ...transcriptField(staged.transcripts) });
+      await props.onRespond(props.request.interactionId, {
+        action: "skip",
+        files: staged.files,
+        ...transcriptField(staged.transcripts),
+        ...recordingDeliverableField(staged.recordingDeliverables)
+      });
       recordingMaterials.update(staged.retained);
       props.onStatus("answered");
       props.onGenerateDiagnosis?.();
@@ -1357,9 +1370,14 @@ export function FileInputCard(props: {
         pendingFeedback.current = null;
         fileDrafts?.set(fileDraftKey, files);
         await props.onRespond(props.request.interactionId, { action: "chat-feedback", ...feedback, files: [],
-          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: submitted }, ...transcriptField(staged.transcripts) });
+          values: { selectedFileNames: files.map((file) => file.name), stagedFiles: submitted },
+          ...transcriptField(staged.transcripts), ...recordingDeliverableField(staged.recordingDeliverables) });
       } else {
-        await props.onRespond(props.request.interactionId, { files: submitted, ...transcriptField(staged.transcripts) });
+        await props.onRespond(props.request.interactionId, {
+          files: submitted,
+          ...transcriptField(staged.transcripts),
+          ...recordingDeliverableField(staged.recordingDeliverables)
+        });
         recordingMaterials.update(staged.retained);
         fileDrafts?.delete(fileDraftKey);
       }

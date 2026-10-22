@@ -197,8 +197,11 @@ export function ToolsPageView(props: ToolsPageViewProps) {
   const modalConnection = modalIntegration ? selectConnectionForIntegration(props.tools, modalIntegration) : undefined;
 
   return (
-    <AppFrame title={t("tools.hubTitle")}>
-      <div className="app-frame-page-content h-full overflow-y-auto py-6 tools-page-content">
+    <AppFrame title={t("tools.hubTitle")} topBarInset={true}>
+      <div
+        className="app-frame-page-content h-full overflow-y-auto tools-page-content"
+        style={{ paddingTop: 0, paddingBottom: 24 }}
+      >
         <div role="tablist" aria-label={t("tools.hubTitle")} className="plugin-marketplace-tabs" data-window-drag-exclusion="tools-tabs">
           {(["connections", "channels", "plugins"] as const).map((item) => (
             <button key={item} type="button" role="tab" id={`tools-tab-${item}`}
