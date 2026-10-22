@@ -199,7 +199,7 @@ export function ToolsPageView(props: ToolsPageViewProps) {
   return (
     <AppFrame title={t("tools.hubTitle")}>
       <div className="app-frame-page-content h-full overflow-y-auto py-6 tools-page-content">
-        <div role="tablist" aria-label={t("tools.hubTitle")} className="plugin-marketplace-tabs">
+        <div role="tablist" aria-label={t("tools.hubTitle")} className="plugin-marketplace-tabs" data-window-drag-exclusion="tools-tabs">
           {(["connections", "channels", "plugins"] as const).map((item) => (
             <button key={item} type="button" role="tab" id={`tools-tab-${item}`}
               aria-selected={section === item} aria-controls={`tools-panel-${item}`}
