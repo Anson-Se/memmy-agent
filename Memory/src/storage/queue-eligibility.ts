@@ -3,6 +3,8 @@ export interface QueueEligibilityOptions {
   targetMemoryIds?: readonly string[];
   allowedJobTypes?: readonly string[];
   excludedJobTypes?: readonly string[];
+  /** WRR admits due failures directly; legacy leasing still requires requeue. */
+  includeDueFailed?: boolean;
 }
 
 export function mainQueueEligibility(at: string, options: QueueEligibilityOptions = {}): {
@@ -15,6 +17,7 @@ export function mainQueueEligibility(at: string, options: QueueEligibilityOption
     : "";
   return {
     sql: `(status = 'queued'
+              ${options.includeDueFailed ? "OR status = 'failed'" : ""}
               OR (status = 'leased' AND (leased_until IS NULL OR leased_until <= ?)))
              AND failure_count < max_attempts
              AND (available_at IS NULL OR available_at <= ?)

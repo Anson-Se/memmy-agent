@@ -464,11 +464,11 @@ export class WorkerRunner {
     if (!targetMemoryIds && this.deps.summaryModelConfigured() && !this.deps.memoryBudgetPaused()) {
       this.deps.enqueueObservationBackfill?.(Math.min(normalizedLimit, 100), this.deps.nowIso());
     }
-    const requeuedJobs = this.deps.repos.runtime.requeueFailedJobs(
+    const requeuedJobs = options.algorithm === "legacy" ? this.deps.repos.runtime.requeueFailedJobs(
       normalizedLimit,
       this.deps.nowIso(),
       targetMemoryIds
-    );
+    ) : [];
     for (const { before, after } of requeuedJobs) {
       this.deps.appendJobChange(after, "queued", before);
     }
@@ -731,8 +731,13 @@ export class WorkerRunner {
     } else {
       for (const role of ["document", "query"] as const) batches.push(prepared.filter((item) => item.role === role));
     }
-    for (const batch of batches) {
+    for (let offset = 0; offset < batches.length; offset++) {
+      const batch = batches[offset]!;
       if (batch.length === 0) continue;
+      if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding")) {
+        results.push(...this.holdPreparedEmbeddingJobs(batches.slice(offset).flat()));
+        break;
+      }
       const role = batch[0]!.role;
 
       try {
@@ -762,6 +767,9 @@ export class WorkerRunner {
   }
 
   async runLeasedEmbeddingItem(item: PreparedEmbeddingJob): Promise<WorkerJobRunResult> {
+    if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding")) {
+      return this.holdPreparedEmbeddingJobs([item])[0]!;
+    }
     try {
       this.captureExecutionConfiguration(item.job);
       const vector = await this.deps.embedder.embedOne(item.text || "(empty)", item.role);
@@ -971,6 +979,10 @@ export class WorkerRunner {
       for (const role of ["document", "query"] as const) {
         const batch = claimed.filter((item) => item.retry.embedRole === role);
         if (batch.length === 0) continue;
+        if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding")) {
+          for (const item of batch) results.push(this.holdUnstartedEmbeddingRetry(item.retry));
+          continue;
+        }
 
         try {
           for (const item of batch) this.captureExecutionConfiguration(item.claim);
@@ -1015,6 +1027,9 @@ export class WorkerRunner {
     claim: EmbeddingRetryClaim,
     attemptNo: number
   ): Promise<EmbeddingRetryResult> {
+    if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding")) {
+      return this.holdUnstartedEmbeddingRetry(retry);
+    }
     try {
       this.captureExecutionConfiguration(claim);
       const vector = await this.deps.embedder.embedOne(retry.sourceText || "(empty)", retry.embedRole);
@@ -1184,6 +1199,40 @@ export class WorkerRunner {
     for (const { before, after } of requeued) {
       this.deps.appendJobChange(after, "queued", before);
     }
+  }
+
+  /** Prepared items are marked embedding already, but no new request may start
+   * after a budget pause. Return their claims and processing state atomically;
+   * a replacement lease or another active job must retain its own state. */
+  private holdPreparedEmbeddingJobs(items: readonly PreparedEmbeddingJob[]): WorkerJobRunResult[] {
+    const transitions = this.deps.repos.transaction(() => {
+      const released = this.deps.repos.runtime.releaseClaimedJobs(items.map(item => item.job), this.deps.nowIso());
+      for (const { before, after } of released) {
+        if (!after.targetMemoryId) continue;
+        const processing = this.deps.repos.processing.get(after.targetMemoryId);
+        const memory = this.deps.repos.memories.get(after.targetMemoryId);
+        if (processing?.activeJobId !== before.id || !memory || !processingJobMatchesMemory(before, memory)) continue;
+        this.deps.repos.processing.update(after.targetMemoryId, {
+          state: "embedding_pending", stage: "embedding", activeJobId: after.id,
+          attemptCount: after.attempts, updatedAt: this.deps.nowIso()
+        }, ["embedding"]);
+      }
+      return released;
+    });
+    const releasedById = new Map(transitions.map(transition => [transition.after.id, transition]));
+    return items.map(({ job }) => {
+      const transition = releasedById.get(job.id);
+      if (!transition) return this.lostLeaseResult(job);
+      this.deps.appendJobChange(transition.after, "queued", transition.before);
+      return { succeeded: 0, failed: 0, ref: jobToRef(transition.after) };
+    });
+  }
+
+  private holdUnstartedEmbeddingRetry(retry: EmbeddingRetryRecord): EmbeddingRetryResult {
+    const released = this.deps.repos.runtime.releaseClaimedEmbeddingRetries([retry], this.nowMs())[0];
+    if (!released) return { succeeded: 0, failed: 0, item: null };
+    this.deps.appendEmbeddingRetryChange(released.after, "queued", released.before);
+    return { succeeded: 0, failed: 0, item: embeddingRetryToRunItem(released.after) };
   }
 
   private nowMs(): number {

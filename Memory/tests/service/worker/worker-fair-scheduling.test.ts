@@ -88,6 +88,82 @@ afterEach(() => {
 });
 
 describe("production WRR and runnable FIFO", () => {
+  it("keeps global lane opportunities when targeted maintenance drains interleave", async () => {
+    const h = harness();
+    for (let i = 0; i < 30; i++) {
+      h.job(`native-${i}`, "trace_summary"); h.job(`repair-${i}`, "decision_repair");
+      h.job(`import-${i}`, "import_summary"); h.job(`evolution-${i}`);
+      h.job(`maintenance-${i}`, "project_environment_profile");
+    }
+    for (let i = 0; i < 12; i++) h.job(`targeted-${i}`, "import_summary", {
+      target: `manual-${i}`, source: "startup.placeholder_summary_repair"
+    });
+    const counts = Object.fromEntries(QUEUE_LANES.map(lane => [lane, 0])) as Record<QueueLane, number>;
+    for (let round = 0; round < 12; round++) {
+      const auto = await h.runner.runWorkerOnce(4);
+      for (const ref of auto.jobs) counts[h.repos.runtime.getJob(ref.jobId)!.queueLane as QueueLane]++;
+      const targeted = await h.runner.runWorkerOnce(1, { targetMemoryIds: [`manual-${round}`] });
+      expect(targeted.jobs.map(ref => ref.jobId)).toEqual([`targeted-${round}`]);
+    }
+    expect(counts).toEqual({ interactive: 16, repair_retry: 12, import: 8, evolution: 8, maintenance: 4 });
+  });
+
+  it("preserves a targeted lane round without consuming the global cursor", async () => {
+    const h = harness();
+    for (let i = 0; i < 8; i++) {
+      h.job(`global-${i}`, "trace_summary");
+      h.job(`target-native-${i}`, "trace_summary", { target: "target" });
+      h.job(`target-evolution-${i}`, "reflection", { target: "target" });
+    }
+    await h.runner.runWorkerOnce(2);
+    const globalCursor = h.repos.runtime.getKv("worker.scheduler.wrr_cursor.v1")!.value;
+    const selected: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      selected.push((await h.runner.runWorkerOnce(1, { targetMemoryIds: ["target"] })).jobs[0]!.jobId);
+      expect(h.repos.runtime.getKv("worker.scheduler.wrr_cursor.v1")!.value).toEqual(globalCursor);
+    }
+    expect(selected.filter(id => id.startsWith("target-native"))).toHaveLength(4);
+    expect(selected.filter(id => id.startsWith("target-evolution"))).toHaveLength(2);
+  });
+
+  it("does not let a public retry-only drain consume global repair opportunities", async () => {
+    const h = harness();
+    for (let i = 0; i < 8; i++) h.job(`native-${i}`, "trace_summary");
+    h.job("manual-repair", "decision_repair");
+    h.retry("retry-first"); h.retry("retry-second");
+    await h.runner.runWorkerOnce(4);
+    const globalCursor = h.repos.runtime.getKv("worker.scheduler.wrr_cursor.v1")!.value;
+    expect((await h.runner.runEmbeddingRetryOnce(1)).leased).toBe(1);
+    expect(h.repos.runtime.getKv("worker.scheduler.wrr_cursor.v1")!.value).toEqual(globalCursor);
+    expect((await h.runner.runWorkerOnce(1)).jobs[0]?.jobId).toBe("manual-repair");
+  });
+
+  it("retries the older due failure before newer failures in the same lane", async () => {
+    const h = harness();
+    h.memory("older", "2026-10-20T00:00:00.000Z");
+    h.memory("newer", "2026-10-21T00:00:00.000Z");
+    const older = h.job("older-job", "import_summary", { target: "older" });
+    h.job("newer-job", "import_summary", { target: "newer" });
+    h.db.db.prepare("UPDATE evolution_jobs SET status='failed',failure_count=1,attempts=1,available_at=?").run(at);
+    const result = await h.runner.runWorkerOnce(1);
+    expect(result.jobs.map(job => job.jobId)).toEqual(["older-job"]);
+    expect(h.repos.runtime.getJob("older-job")).toMatchObject({ status: "succeeded", enqueueSeq: older.enqueueSeq,
+      failureCount: 1, attempts: 2 });
+    expect(h.repos.runtime.getJob("newer-job")).toMatchObject({ status: "failed", failureCount: 1, attempts: 1 });
+  });
+
+  it("gives every lane due-failure opportunities before old-priority recovery can hide them", async () => {
+    const h = harness();
+    for (let i = 0; i < 16; i++) h.job(`native-${i}`, "trace_summary");
+    h.job("repair", "decision_repair"); h.job("import", "import_summary");
+    h.job("evolution"); h.job("maintenance", "project_environment_profile");
+    h.db.db.prepare("UPDATE evolution_jobs SET status='failed',failure_count=1,attempts=1,available_at=?").run(at);
+    for (let i = 0; i < 12; i++) await h.runner.runWorkerOnce(1);
+    for (const id of ["repair", "import", "evolution", "maintenance"]) {
+      expect(h.repos.runtime.getJob(id)).toMatchObject({ status: "succeeded", failureCount: 1, attempts: 2 });
+    }
+  });
+
   it("gives retry, reflection and maintenance real execution under ten thousand imported summaries", async () => {
     const h = harness();
     h.repos.transaction(() => {
