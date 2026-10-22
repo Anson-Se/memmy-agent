@@ -60,6 +60,31 @@ static void invalidParameter(const wchar_t *expression, const wchar_t *function,
     fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
 }
 
+static void printDialogText(HWND window) {
+    wchar_t text[2048] = {}; DWORD_PTR length = 0;
+    if (!SendMessageTimeoutW(window, WM_GETTEXT, 2048, (LPARAM)text, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &length) || !length) return;
+    char message[8192];
+    int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, message, sizeof(message), NULL, NULL);
+    if (size > 0) fprintf(stderr, "LibreOfficeKit dialog: %s\n", message);
+}
+static BOOL CALLBACK printDialogChild(HWND window, LPARAM count) {
+    if (++*(int *)count > 16) return FALSE;
+    printDialogText(window); return TRUE;
+}
+static BOOL CALLBACK diagnoseDialog(HWND window, LPARAM unused) {
+    (void)unused; DWORD owner = 0; wchar_t kind[64] = {};
+    GetWindowThreadProcessId(window, &owner);
+    if (owner != GetCurrentProcessId() || !IsWindowVisible(window)) return TRUE;
+    GetClassNameW(window, kind, 64);
+    if (wcscmp(kind, L"#32770")) return TRUE;
+    // Only inspect this headless worker's own error dialog. Never acknowledge
+    // it or enumerate content belonging to the user's applications.
+    printDialogText(window); int count = 0;
+    EnumChildWindows(window, printDialogChild, (LPARAM)&count);
+    fflush(stderr); TerminateProcess(GetCurrentProcess(), 2);
+    return FALSE;
+}
+
 static void dumpThread(HANDLE thread, DWORD id) {
     // CI-only diagnostics for a headless engine stuck in native startup. Resume
     // immediately after copying context so symbol lookup never holds its locks.
@@ -93,6 +118,7 @@ static void dumpThread(HANDLE thread, DWORD id) {
 }
 static DWORD WINAPI diagnoseStartup(void *thread) {
     Sleep(15000);
+    EnumWindows(diagnoseDialog, 0);
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
     SymInitialize(GetCurrentProcess(), "", TRUE); // No symbol servers or external services.
     DWORD main = GetThreadId((HANDLE)thread), own = GetCurrentThreadId();
