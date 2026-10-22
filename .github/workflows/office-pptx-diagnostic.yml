@@ -14,8 +14,6 @@ jobs:
   compare:
     runs-on: windows-2025
     timeout-minutes: 20
-    env:
-      OFFICE_PPTX_DIAGNOSTICS: ${{ runner.temp }}/pptx-diagnostics
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +29,8 @@ jobs:
       - name: Install fixture dependencies
         run: npm ci --prefix plugins/office
       - name: Compare original and edited PPTX in native and AppContainer modes
+        env:
+          OFFICE_PPTX_DIAGNOSTICS: ${{ runner.temp }}/pptx-diagnostics
         run: node scripts/test-office-pptx-windows.mjs
       - name: Preserve full diagnostic evidence
         if: always()
