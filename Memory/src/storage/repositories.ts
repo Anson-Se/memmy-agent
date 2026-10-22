@@ -55,6 +55,8 @@ import {
   VECTOR_SEARCH_WINDOW,
   type VectorSearchCandidate
 } from "./sqlite-vec-store.js";
+import { QueueSchedulingStore, type SchedulingMetadata } from "./queue-scheduling-store.js";
+import { mainQueueEligibility, retryQueueEligibility } from "./queue-eligibility.js";
 import { compactHistoryChangePayload, compactHistoryChangeRow } from "./history-change-snapshot.js";
 
 type SqlValue = string | number | Buffer | null;
@@ -306,7 +308,7 @@ export interface ApiLogRecord {
   calledAt: string;
 }
 
-export interface EvolutionJobRecord {
+export interface EvolutionJobRecord extends SchedulingMetadata {
   id: string;
   jobType: JobType;
   status: JobStatus;
@@ -436,7 +438,7 @@ export interface MemoryVectorSearchOptions {
   anyOfTags?: string[];
 }
 
-export interface EmbeddingRetryRecord {
+export interface EmbeddingRetryRecord extends SchedulingMetadata {
   id: string;
   targetKind: EmbeddingRetryTargetKind;
   targetId: string;
@@ -1824,12 +1826,14 @@ function sourceTurnCaptureFromSql(row: Record<string, unknown>): SourceTurnCaptu
 }
 
 export class RuntimeRepository {
+  readonly scheduling: QueueSchedulingStore;
   private readonly leaseOwner = newId("worker");
   private readonly scheduledLogPrunes = new Set<LogTableName>();
   private historyLogCompactionScheduled = false;
   private historyLogCompactionCursor = 0;
 
   constructor(private readonly db: Database.Database) {
+    this.scheduling = new QueueSchedulingStore(db);
     this.scheduleHistoryLogCompaction();
   }
 
@@ -3274,6 +3278,7 @@ export class RuntimeRepository {
           maxAttempts: job.maxAttempts,
           updatedAt
         });
+      this.scheduling.refreshOne("main", existing.id);
       return this.getJob(existing.id) ?? {
         ...existing,
         payload,
@@ -3305,6 +3310,7 @@ export class RuntimeRepository {
         leasedUntil: job.leasedUntil ?? null,
         lastError: job.lastError ?? null
       });
+    this.scheduling.refreshOne("main", job.id);
     return this.getJob(job.id) ?? job;
   }
 
@@ -3610,6 +3616,27 @@ export class RuntimeRepository {
     return Boolean(row);
   }
 
+  /** Legacy order without side effects, for stage-3 shadow comparison only. */
+  previewQueuedJobs(input: {
+    at: string; limit: number; targetMemoryIds?: readonly string[];
+    priorityCohortOnly?: boolean; allowedJobTypes?: readonly string[]; excludedJobTypes?: readonly string[];
+  }): EvolutionJobRecord[] {
+    const eligibility = mainQueueEligibility(input.at, input);
+    const rows = this.db.prepare(`SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
+      FROM evolution_jobs WHERE ${eligibility.sql} ORDER BY ${evolutionJobOrderSql()} LIMIT ?`)
+      .all(...eligibility.params, input.limit) as Array<SqlJobRow & { queue_priority: number }>;
+    return (input.priorityCohortOnly && rows[0]
+      ? rows.filter((row) => row.queue_priority === rows[0]!.queue_priority) : rows).map(jobFromSql);
+  }
+
+  previewDueEmbeddingRetries(input: { now: number; limit: number; targetMemoryIds?: readonly string[] }): EmbeddingRetryRecord[] {
+    if (input.limit <= 0) return [];
+    const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
+    return (this.db.prepare(`SELECT q.* FROM embedding_retry_queue q LEFT JOIN memories m ON m.id = q.target_id
+      WHERE ${eligibility.sql} ORDER BY ${embeddingRetryOrderSql()} LIMIT ?`)
+      .all(...eligibility.params, input.limit) as SqlEmbeddingRetryRow[]).map(embeddingRetryFromSql);
+  }
+
   leaseQueuedJobs(
     limit = 10,
     leaseSeconds = 60,
@@ -3624,80 +3651,11 @@ export class RuntimeRepository {
     }
     const at = nowIso();
     const leaseUntil = new Date(Date.now() + leaseSeconds * 1000).toISOString();
-    const targetFilter = targetMemoryIds
-      ? `AND target_memory_id IN (${targetMemoryIds.map(() => "?").join(", ")})`
-      : "";
+    const eligibility = mainQueueEligibility(at, { targetMemoryIds, allowedJobTypes, excludedJobTypes });
     const transaction = this.db.transaction(() => {
-      const candidates = this.db
-        .prepare(
-          `SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
-           FROM evolution_jobs
-           WHERE (status = 'queued'
-              OR (status = 'leased' AND (leased_until IS NULL OR leased_until <= ?)))
-             AND failure_count < max_attempts
-             AND (available_at IS NULL OR available_at <= ?)
-             AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
-             AND NOT (
-               job_type = 'reward'
-               AND json_extract(payload_json, '$.l1MemoryId') IS NOT NULL
-               AND (
-                 json_extract(payload_json, '$.polarity') IS NULL
-                 OR json_extract(payload_json, '$.polarity') = 'positive'
-               )
-               AND EXISTS (
-                 SELECT 1
-                 FROM memory_processing_state
-                 JOIN memories ON memories.id = memory_processing_state.memory_id
-                 WHERE memory_processing_state.memory_id =
-                   CAST(json_extract(evolution_jobs.payload_json, '$.l1MemoryId') AS TEXT)
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM memory_vector_entries
-                     WHERE memory_vector_entries.memory_id = memory_processing_state.memory_id
-                       AND memory_vector_entries.vector_field = 'vec_summary'
-                   )
-                   AND (
-                     memory_processing_state.state IN ('embedding_pending', 'embedding')
-                   OR memory_processing_state.state IN ('summary_pending', 'summarizing')
-                   )
-               )
-             )
-             AND (
-               json_extract(payload_json, '$.runAfter') IS NULL
-               OR CAST(json_extract(payload_json, '$.runAfter') AS TEXT) <= ?
-             )
-             AND (
-               job_type NOT IN ('l3_world_model_update', 'work_memory_extract')
-               OR (
-                 scope_key IS NOT NULL
-                 AND scope_seq IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM evolution_jobs AS leased_l3_job
-                   WHERE leased_l3_job.job_type = evolution_jobs.job_type
-                     AND leased_l3_job.scope_key = evolution_jobs.scope_key
-                     AND leased_l3_job.status = 'leased'
-                     AND leased_l3_job.id <> evolution_jobs.id
-                 )
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM evolution_jobs AS earlier_l3_job
-                   WHERE earlier_l3_job.job_type = evolution_jobs.job_type
-                     AND earlier_l3_job.scope_key = evolution_jobs.scope_key
-                     AND earlier_l3_job.scope_seq < evolution_jobs.scope_seq
-                     AND earlier_l3_job.status IN ('queued', 'leased', 'failed')
-                 )
-               )
-             )
-             ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
-             ${excludedJobTypes?.length ? `AND job_type NOT IN (${excludedJobTypes.map(() => "?").join(", ")})` : ""}
-             ${targetFilter}
-           ORDER BY ${evolutionJobOrderSql()}
-           LIMIT ?`
-        )
-        .all(at, at, at, ...(allowedJobTypes ?? []), ...(excludedJobTypes ?? []), ...(targetMemoryIds ?? []), limit) as Array<SqlJobRow & {
-          queue_priority: number;
-        }>;
+      const candidates = this.db.prepare(`SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
+        FROM evolution_jobs WHERE ${eligibility.sql} ORDER BY ${evolutionJobOrderSql()} LIMIT ?`)
+        .all(...eligibility.params, limit) as Array<SqlJobRow & { queue_priority: number }>;
       const queuePriority = candidates[0]?.queue_priority;
       const rows = priorityCohortOnly && queuePriority !== undefined
         ? candidates.filter((row) => row.queue_priority === queuePriority)
@@ -4049,7 +4007,8 @@ export class RuntimeRepository {
     if (!record) {
       throw new Error(`embedding retry was not persisted: ${input.targetKind}:${input.targetId}`);
     }
-    return record;
+    this.scheduling.refreshOne("embedding_retry", record.id);
+    return this.getEmbeddingRetry(record.id)!;
   }
 
   getEmbeddingRetry(id: string): EmbeddingRetryRecord | undefined {
@@ -4169,25 +4128,12 @@ export class RuntimeRepository {
       return [];
     }
     const limit = Math.max(1, Math.min(200, Math.floor(input.limit ?? 25)));
-    const targetFilter = input.targetMemoryIds
-      ? `AND q.target_id IN (${input.targetMemoryIds.map(() => "?").join(", ")})`
-      : "";
+    const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
     const transaction = this.db.transaction(() => {
-      const rows = this.db
-        .prepare(
-          `SELECT q.*
-           FROM embedding_retry_queue q
-           LEFT JOIN memories m ON m.id = q.target_id
-           WHERE (
-             q.status = 'pending'
-             OR (q.status = 'in_progress' AND q.lease_until IS NOT NULL AND q.lease_until <= ?)
-           )
-             AND q.next_attempt_at <= ?
-             ${targetFilter}
-           ORDER BY ${embeddingRetryOrderSql()}
-           LIMIT ?`
-        )
-        .all(input.now, input.now, ...(input.targetMemoryIds ?? []), limit) as SqlEmbeddingRetryRow[];
+      const rows = this.db.prepare(`SELECT q.* FROM embedding_retry_queue q
+        LEFT JOIN memories m ON m.id = q.target_id WHERE ${eligibility.sql}
+        ORDER BY ${embeddingRetryOrderSql()} LIMIT ?`)
+        .all(...eligibility.params, limit) as SqlEmbeddingRetryRow[];
       const claimed: EmbeddingRetryRecord[] = [];
       for (const row of rows) {
         const leaseToken = newId("retry_lease");
@@ -7581,7 +7527,16 @@ function recallEventFromSql(row: SqlRecallEventRow): RecallEventRecord {
   };
 }
 
-interface SqlJobRow {
+interface SqlSchedulingMetadata {
+  queue_lane: string | null; resource_class: string | null; enqueue_seq: number | null;
+  first_queued_at: string | null; base_priority: number | null; policy_version: number | null;
+}
+function schedulingMetadataFromSql(row: SqlSchedulingMetadata): SchedulingMetadata {
+  return { queueLane: row.queue_lane, resourceClass: row.resource_class, enqueueSeq: row.enqueue_seq,
+    firstQueuedAt: row.first_queued_at, basePriority: row.base_priority, policyVersion: row.policy_version };
+}
+
+interface SqlJobRow extends SqlSchedulingMetadata {
   id: string;
   job_type: JobType;
   status: JobStatus;
@@ -7623,7 +7578,7 @@ interface SqlMemoryProcessingRow {
   updated_at: string;
 }
 
-interface SqlEmbeddingRetryRow {
+interface SqlEmbeddingRetryRow extends SqlSchedulingMetadata {
   id: string;
   target_kind: EmbeddingRetryTargetKind;
   target_id: string;
@@ -7724,6 +7679,7 @@ interface SqlAuditLogRow {
 
 function jobFromSql(row: SqlJobRow): EvolutionJobRecord {
   return {
+    ...schedulingMetadataFromSql(row),
     id: row.id,
     jobType: row.job_type,
     status: row.status,
@@ -7783,6 +7739,7 @@ function mergeJobPayload(existing: Record<string, unknown>, next: Record<string,
 
 function embeddingRetryFromSql(row: SqlEmbeddingRetryRow): EmbeddingRetryRecord {
   return {
+    ...schedulingMetadataFromSql(row),
     id: row.id,
     targetKind: row.target_kind,
     targetId: row.target_id,

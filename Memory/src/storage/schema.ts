@@ -1,8 +1,9 @@
 import type Database from "better-sqlite3";
+import { installQueueSchedulingSchema } from "./queue-scheduling-schema.js";
 import { memoryCaptureQaHash, normalizeMemoryCaptureSource } from "../utils/memory-capture-claim.js";
 
-export const SCHEMA_VERSION = 11;
-export const SCHEMA_MIGRATION_ID = "011_embedding_retry_lease_token";
+export const SCHEMA_VERSION = 12;
+export const SCHEMA_MIGRATION_ID = "012_queue_scheduling_metadata";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -700,7 +701,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -757,6 +758,8 @@ export function migrate(db: Database.Database): void {
          ON evolution_jobs (dedupe_key)
          WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'leased', 'failed')`
       ).run();
+
+      installQueueSchedulingSchema(db);
 
       // This boundary belongs to the Memory database and is shared by Hook and scanners.
       db.prepare(`INSERT INTO runtime_kv (key, value_json, updated_at)

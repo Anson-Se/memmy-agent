@@ -49,6 +49,7 @@ import {
 import { ObservationDependenciesPendingError } from "../evidence/observation-memory-pipeline.js";
 import { isObservationMemory, observationJobPayload, observationMemoryState, OBSERVATION_SUMMARY_MODEL_UNCONFIGURED } from "../observation-memory-state.js";
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
+import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -131,6 +132,10 @@ export interface WorkerRunnerDeps {
   memoryBudgetNextReconcileAtMs?: () => number | undefined;
   summaryModelConfigured: () => boolean;
   configurationFingerprint?: () => string;
+  schedulingShadow?: {
+    enabled?: boolean;
+    onComparison?: (comparison: WorkerSchedulingComparison) => void;
+  };
   nowIso: () => string;
   nowMs?: () => number;
   encodeChangeCursor: (changeSeq: number) => string;
@@ -172,8 +177,11 @@ export interface WorkerRunnerDeps {
 export class WorkerRunner {
   private readonly leaseOwner = newId("worker");
   private readonly executionConfiguration = new WeakMap<object, string>();
+  private readonly schedulingShadow: WorkerSchedulingShadow;
 
-  constructor(private readonly deps: WorkerRunnerDeps) {}
+  constructor(private readonly deps: WorkerRunnerDeps) {
+    this.schedulingShadow = new WorkerSchedulingShadow(deps.repos.runtime);
+  }
 
   nextWorkerRunAt(): number | undefined {
     if (!this.deps.memoryAddEnabled()) {
@@ -451,6 +459,24 @@ export class WorkerRunner {
       );
       for (const { before, after } of expiredBudgeted) {
         this.deps.appendJobChange(after, "queued", before);
+      }
+    }
+    // Phase 3 observes the alternative only. A preview failure cannot prevent
+    // the existing worker from claiming or executing its normal selection.
+    if ((this.deps.schedulingShadow?.enabled ?? process.env.MEMMY_WORKER_SCHEDULER_SHADOW !== "0")) {
+      try {
+        const comparison = this.schedulingShadow.sample({
+          at: this.deps.nowIso(), limit: normalizedLimit, targetMemoryIds,
+          priorityCohortOnly: request.priorityCohortOnly,
+          allowedJobTypes: allowedWhenPaused, excludedJobTypes: this.summaryJobsHeld(),
+          includeRetries: !(this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding"))
+        });
+        if (comparison) {
+          workerLogger.info("scheduler.shadow", { ...comparison });
+          this.deps.schedulingShadow?.onComparison?.(comparison);
+        }
+      } catch (error) {
+        workerLogger.warn("scheduler.shadow_failed", memoryErrorFields(error));
       }
     }
     const jobs = this.deps.repos.runtime.leaseQueuedJobs(

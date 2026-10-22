@@ -123,6 +123,7 @@ describe("worker lease schema migration", () => {
       const runtime = new Repositories(db.db).runtime;
       const retry = runtime.enqueueEmbeddingRetry({ targetKind: "trace", targetId: "legacy-retry", vectorField: "vec_summary", sourceText: "preserved", now });
       runtime.claimDueEmbeddingRetries({ now, workerId: "legacy", leaseUntil: now + 1_000 });
+      removeSchedulingSchema(db);
       db.db.exec("ALTER TABLE embedding_retry_queue DROP COLUMN lease_token");
       db.db.exec("DELETE FROM schema_migrations");
       db.db.prepare("INSERT INTO schema_migrations VALUES ('010_worker_lease_safety', 10, ?, 'legacy')").run(new Date(now).toISOString());
@@ -150,6 +151,7 @@ describe("worker lease schema migration", () => {
     try {
       db = new MemoryDb({ path });
       // Restore the prior v9 task-table shape to exercise an actual old file.
+      removeSchedulingSchema(db);
       db.db.exec("DROP INDEX idx_evolution_jobs_available");
       for (const column of ["lease_owner", "lease_token", "available_at", "blocked_reason",
         "failure_count", "lease_count", "lease_recovery_count"]) {
@@ -220,4 +222,18 @@ function usingDatabase(run: (runtime: Repositories["runtime"]) => void): void {
   const db = new MemoryDb({ path: join(root, "memory.sqlite") });
   try { run(new Repositories(db.db).runtime); }
   finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+}
+
+function removeSchedulingSchema(db: MemoryDb): void {
+  for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
+    for (const suffix of ["enqueue_sequence", "policy_dirty"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
+    for (const suffix of ["enqueue_seq", "lane_due", "lane_fifo", "policy_dirty"]) db.db.exec(`DROP INDEX ${table}_${suffix}`);
+  }
+  for (const suffix of ["dirty", "insert", "delete"]) db.db.exec(`DROP TRIGGER memories_worker_policy_${suffix}`);
+  for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
+    for (const column of ["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version"]) {
+      db.db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+    }
+  }
+  db.db.exec("DROP TABLE worker_enqueue_counter");
 }
