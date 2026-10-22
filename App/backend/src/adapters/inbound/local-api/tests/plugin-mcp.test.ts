@@ -112,6 +112,39 @@ describe("plugin MCP bridge", () => {
     expect((await client.listTools()).tools).toEqual([]);
   });
 
+  it("does not offer the cloud skill loader for a local packaged skill", async () => {
+    const { service } = createPlugins();
+    service.list = () => [{
+      ...plugin,
+      manifest: {
+        ...plugin.manifest,
+        skills: [{
+          id: "review",
+          name: "Review",
+          description: "Local packaged instructions",
+          entry: "skills/review/SKILL.md"
+        }]
+      }
+    }];
+    const bus = createProgressBus();
+    const reference = vi.fn();
+    const server = buildPluginMcpServer(service, bus, undefined, {
+      reference,
+      resolve: vi.fn(),
+      clear: vi.fn()
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test", version: "1" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    connections.push({ client, server });
+
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      capabilityToolName(plugin.id, "run")
+    ]);
+    expect(reference).not.toHaveBeenCalled();
+  });
+
   it("keeps an interactive tool transport active while waiting for the user", async () => {
     let release!: () => void;
     const response = new Promise<void>((resolve) => { release = resolve; });

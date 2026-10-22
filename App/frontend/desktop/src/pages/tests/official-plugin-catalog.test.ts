@@ -4,9 +4,9 @@ import { officialPluginCatalog, pluginRequiresOfficialModel } from "../official-
 
 describe("official plugin presentation policy", () => {
   it("lists the official plugins and binds host installations by id while ignoring unknown ones", () => {
-    const plugins = officialPluginCatalog({ language: "zh-CN", installed: [{ id: "legal", state: "active" } as InstalledPlugin, { id: "leftover" } as InstalledPlugin] });
-    expect(plugins.map((plugin) => plugin.id)).toEqual(["literature-review", "office", "legal"]);
-    expect(plugins.find((plugin) => plugin.id === "legal")?.installed?.id).toBe("legal");
+    const plugins = officialPluginCatalog({ language: "zh-CN", installed: [{ id: "legal-labor", state: "active" } as InstalledPlugin, { id: "leftover" } as InstalledPlugin] });
+    expect(plugins.map((plugin) => plugin.id)).toEqual(["literature-review", "office", "legal-labor"]);
+    expect(plugins.find((plugin) => plugin.id === "legal-labor")?.installed?.id).toBe("legal-labor");
     expect(plugins.find((plugin) => plugin.id === "office")?.installed).toBeUndefined();
     expect(plugins.some((plugin) => plugin.id === "leftover")).toBe(false);
   });

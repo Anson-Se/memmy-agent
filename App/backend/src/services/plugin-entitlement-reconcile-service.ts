@@ -52,6 +52,10 @@ async function reconcileOnce(
   }
   const declared = new Map(catalog.map((entry) => [entry.manifest.id, entry]));
   const candidates = new Set([
+    // Private plugins may deliberately be omitted from the public catalog.
+    // Their server-issued entitlement is the discovery signal; resolve still
+    // authenticates the account and returns an immutable release descriptor.
+    ...entitledPluginIds(options.entitlements),
     ...catalog.filter((entry) => entry.eligibility.canInstall && pluginRules(entry.manifest).installation === "automatic").map((entry) => entry.manifest.id)
   ]);
   for (const pluginId of candidates) {
@@ -60,11 +64,16 @@ async function reconcileOnce(
     try {
       const existing = options.plugins.list().find((plugin) => plugin.id === pluginId);
       // Freeze the catalog selection across resolve/download, even if the server default changes.
-      const entry = declared.get(pluginId)!;
+      const entry = declared.get(pluginId);
       let plugin = existing
         ? entry && (existing.version === entry.manifest.version || !pluginRules(entry.manifest).autoUpdate)
-          ? existing : await options.plugins.update(pluginId, entry.manifest.version)
-        : await options.plugins.install(pluginId, entry.manifest.version);
+          ? existing
+          : entry
+            ? await options.plugins.update(pluginId, entry.manifest.version)
+            : await options.plugins.update(pluginId)
+        : entry
+          ? await options.plugins.install(pluginId, entry.manifest.version)
+          : await options.plugins.install(pluginId);
       plugin = await options.plugins.approvePermissions(pluginId, plugin.manifest.permissions);
       if (plugin.state !== "active") {
         await options.plugins.enable(pluginId);

@@ -13,6 +13,7 @@ import {
   useAgentThreadPanel,
   type AgentThreadPanelController,
 } from "../agent-thread-panel.js";
+import type { ThreadArtifact } from "../agent-thread-panel-model.js";
 import type { ThreadPreviewContext } from "../agent-thread-panel-preview.js";
 import { requestBrowserNewTab, takePendingBrowserNewTab } from "../browser-panel.js";
 
@@ -22,6 +23,7 @@ const LAYOUT_WIDTH = 1248;
 
 type HarnessProps = {
   messages: AgentChatMessage[]; context: ThreadPreviewContext; workspaceRoot?: string | null;
+  artifacts?: ThreadArtifact[];
   scopeKey?: string; keepMounted?: boolean; onController?: (controller: AgentThreadPanelController) => void;
 };
 function Harness(props: HarnessProps) {
@@ -37,6 +39,7 @@ function Harness(props: HarnessProps) {
         <AgentThreadPanel
           controller={panel}
           messages={props.messages}
+          artifacts={props.artifacts}
           workspaceRoot={props.workspaceRoot ?? null}
           previewContext={props.context}
         />
@@ -464,6 +467,19 @@ describe("AgentThreadPanel", () => {
     expect(document.querySelector(".thread-overview__more")).toBeNull();
   });
 
+  it("shows plugin artifacts that were delivered outside the Agent transcript", () => {
+    render({
+      messages: [],
+      artifacts: [
+        { key: "/work/访谈录音.webm", name: "访谈录音.webm", path: "/work/访谈录音.webm" },
+        { key: "/work/访谈转写.txt", name: "访谈转写.txt", path: "/work/访谈转写.txt" },
+      ],
+      context: emptyContext(),
+    });
+
+    expect(itemTitles()).toEqual(["访谈录音.webm", "访谈转写.txt"]);
+  });
+
   it("opens the overview by hover and click with only browser tabs", () => {
     render({ messages: [], context: emptyContext() });
     act(() => document.querySelector<HTMLButtonElement>('[aria-label="浏览器"]')!.click());
@@ -510,10 +526,10 @@ describe("AgentThreadPanel", () => {
     expect(document.querySelector(".thread-panel__overview-button--inactive")).not.toBeNull();
 
     act(() => document.querySelector<HTMLButtonElement>(".thread-tab__close")!.click());
-    expect(document.querySelector(".thread-panel--closing")).not.toBeNull();
-    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 170)));
-    expect(document.querySelector(".thread-panel")).toBeNull();
-    expect(offset()).toBe(0);
+    expect(tabTitles()).toEqual([]);
+    expect(document.querySelector(".thread-panel--closing")).toBeNull();
+    expect(document.querySelector(".thread-panel__list")).not.toBeNull();
+    expect(offset()).toBe(360);
   });
 
   it("switches to changes and opens the git diff for a changed file", async () => {
@@ -695,6 +711,38 @@ describe("AgentThreadPanel", () => {
 
     expect(tabTitles()).toEqual(["index.ts"]);
     expect(document.querySelector(".thread-preview .workspace-diff-view")?.textContent).toContain("export {};");
+  });
+
+  it("refreshes workspace files when a delivered artifact moves into the task workspace", async () => {
+    let recordingPublished = false;
+    const readWorkspaceDirectory = vi.fn(async (rootPath: string, relativePath = "") => ({
+      rootPath,
+      relativePath,
+      truncated: false,
+      entries: recordingPublished
+        ? [{ name: "录音.webm", path: "/repo/录音.webm", relativePath: "录音.webm", kind: "file" as const }]
+        : [{ name: "报告.docx", path: "/repo/报告.docx", relativePath: "报告.docx", kind: "file" as const }],
+    }));
+    Object.defineProperty(window, "memmy", { configurable: true, value: { readWorkspaceDirectory } });
+    const context = { ...emptyContext(), artifactClient: artifactClient() };
+    render({
+      messages: [], workspaceRoot: "/repo", context,
+      artifacts: [{ key: "/recordings/录音.webm", name: "录音.webm", path: "/recordings/录音.webm" }],
+    });
+    act(() => document.querySelector<HTMLButtonElement>(".thread-view-pill")!.click());
+    act(() => clickText(".thread-view-menu__item", "工作空间文件"));
+    await flush();
+    expect(treeNames()).toEqual(["报告.docx"]);
+
+    recordingPublished = true;
+    render({
+      messages: [], workspaceRoot: "/repo", context,
+      artifacts: [{ key: "/repo/录音.webm", name: "录音.webm", path: "/repo/录音.webm" }],
+    }, false);
+    await flush();
+
+    expect(treeNames()).toEqual(["录音.webm"]);
+    expect(readWorkspaceDirectory).toHaveBeenCalledTimes(2);
   });
 
   it("remembers the resized width and leaves full screen with Escape", () => {
