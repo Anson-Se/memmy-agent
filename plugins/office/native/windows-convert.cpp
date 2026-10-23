@@ -150,6 +150,15 @@ typedef struct {
     char *(*error)(Kit *);
     Document *(*loadOptions)(Kit *, const char *, const char *);
     void (*freeError)(char *);
+    // Public LibreOfficeKit C ABI, through runLoop (verified with LO 26.2.6).
+    void (*registerCallback)(Kit *, void (*)(int, const char *, void *), void *);
+    char *(*getFilterTypes)(Kit *);
+    void (*setOptionalFeatures)(Kit *, unsigned long long);
+    void (*setDocumentPassword)(Kit *, const char *, const char *);
+    char *(*getVersionInfo)(Kit *);
+    int (*runMacro)(Kit *, const char *);
+    bool (*signDocument)(Kit *, const char *, const unsigned char *, int, const unsigned char *, int);
+    void (*runLoop)(Kit *, int (*)(void *, long long), void (*)(void *), void *);
 } KitMethods;
 typedef struct {
     size_t size;
@@ -202,12 +211,52 @@ static int error(Kit *kit, const char *stage) {
     if (message && kit->methods->size >= offsetof(KitMethods, freeError) + sizeof(kit->methods->freeError)) kit->methods->freeError(message);
     return 1;
 }
+
+static int convertDocument(Kit *kit, char *source, const wchar_t *input, const wchar_t *outdir, const wchar_t *format) {
+    Document *document; const wchar_t *base, *dot; const char *extension;
+    wchar_t output[32768]; char *target; int saved;
+    trace("loading document");
+    // The profile disables macros and external-link refresh before loading.
+    document = kit->methods->loadOptions(kit, source, "Batch=true,EnableMacrosExecution=false,MacroSecurityLevel=3");
+    free(source);
+    if (!document) return error(kit, "document load");
+    base = wcsrchr(input, L'\\'); if (!base) base = wcsrchr(input, L'/'); base = base ? base + 1 : input;
+    dot = wcsrchr(base, L'.'); if (!dot) dot = base + wcslen(base);
+    extension = !wcscmp(format, L"pdf") ? "pdf" : "xlsx";
+    swprintf_s(output, 32768, L"%ls\\%.*ls.%ls", outdir, (int)(dot - base), base, !strcmp(extension, "pdf") ? L"pdf" : L"xlsx");
+    target = fileUrl(output); if (!target) return 2;
+    trace("saving document");
+    saved = document->methods->save(document, target, extension, NULL);
+    free(target);
+    if (!saved) return error(kit, "save");
+    trace("closing document");
+    document->methods->destroy(document);
+    kit->methods->destroy(kit);
+    return 0;
+}
+struct ConversionJob { Kit *kit; char *source; const wchar_t *input, *outdir, *format; };
+static ConversionJob conversionJob;
+static void CALLBACK convertOnEventThread(HWND, UINT, UINT_PTR timer, DWORD) {
+    KillTimer(NULL, timer);
+    int code = 2;
+    try {
+        code = convertDocument(conversionJob.kit, conversionJob.source,
+            conversionJob.input, conversionJob.outdir, conversionJob.format);
+    }
+    catch (const std::exception &failure) { fprintf(stderr, "LibreOfficeKit exception at %s: %s\n", stage.load(), failure.what()); }
+    catch (...) { fprintf(stderr, "LibreOfficeKit native exception at %s\n", stage.load()); }
+    // save() and document/Kit disposal finish before success. This one-document
+    // worker must not return into soffice_main after destroying its Kit, nor
+    // enter Windows DLL-detach cleanup while its event loop is still active.
+    fflush(NULL); TerminateProcess(GetCurrentProcess(), code);
+}
+
 static int convert(int argc, wchar_t **argv) {
-    wchar_t directory[32768], library[32768], output[32768], working[32768], local[32768], roaming[32768];
-    const wchar_t *profile = NULL, *input = NULL, *outdir = NULL, *format = NULL, *base, *dot;
-    HMODULE module; Initialize initialize; Kit *kit; Document *document;
-    char *install, *user, *source, *target; const char *extension;
-    int i, saved;
+    wchar_t directory[32768], library[32768], working[32768], local[32768], roaming[32768];
+    const wchar_t *profile = NULL, *input = NULL, *outdir = NULL, *format = NULL, *base;
+    HMODULE module; Initialize initialize; Kit *kit;
+    char *install, *user, *source;
+    int i;
     for (i = 1; i < argc; ++i) {
         if (!wcsncmp(argv[i], L"-env:UserInstallation=", 22)) profile = argv[i] + 22;
         else if (!wcscmp(argv[i], L"--convert-to") && i + 1 < argc) format = argv[++i];
@@ -245,6 +294,10 @@ static int convert(int argc, wchar_t **argv) {
     setEnvironment(L"SAL_SKIA", L"raster");
     setEnvironment(L"SAL_USE_VCLPLUGIN", L"svp");
     setEnvironment(L"SAL_DISABLE_OPENCL", L"1");
+    // Windows views send synchronous window messages. Loading from a caller
+    // thread while the VCL event thread owns the frames can block in SetWindowPos
+    // under SolarMutex. Complete startup and conversion on the same event thread.
+    setEnvironment(L"SAL_LOK_OPTIONS", L"unipoll");
     trace("checking private desktop");
     WNDCLASSW probe = {};
     probe.lpfnWndProc = DefWindowProcW; probe.hInstance = GetModuleHandleW(NULL); probe.lpszClassName = L"MemmyOfficeHeadlessProbe";
@@ -278,25 +331,15 @@ static int convert(int argc, wchar_t **argv) {
     kit = initialize(install, user);
     free(install); free(user);
     if (!kit) { free(source); return error(NULL, "initialization"); }
-    trace("loading document");
-    // The profile disables macros and external-link refresh before loading.
-    document = kit->methods->loadOptions(kit, source, "Batch=true,EnableMacrosExecution=false,MacroSecurityLevel=3");
-    free(source);
-    if (!document) return error(kit, "document load");
-    base = wcsrchr(input, L'\\'); if (!base) base = wcsrchr(input, L'/'); base = base ? base + 1 : input;
-    dot = wcsrchr(base, L'.'); if (!dot) dot = base + wcslen(base);
-    extension = !wcscmp(format, L"pdf") ? "pdf" : "xlsx";
-    swprintf_s(output, 32768, L"%ls\\%.*ls.%ls", outdir, (int)(dot - base), base, !strcmp(extension, "pdf") ? L"pdf" : L"xlsx");
-    target = fileUrl(output); if (!target) return 2;
-    trace("saving document");
-    saved = document->methods->save(document, target, extension, NULL);
-    free(target);
-    if (!saved) return error(kit, "save");
-    trace("closing document");
-    document->methods->destroy(document);
-    kit->methods->destroy(kit);
-    return 0;
+    if (kit->methods->size < offsetof(KitMethods, runLoop) + sizeof(kit->methods->runLoop) || !kit->methods->runLoop)
+        return error(kit, "runLoop ABI");
+    conversionJob = {kit, source, input, outdir, format};
+    if (!SetTimer(NULL, 0, 500, convertOnEventThread)) return error(kit, "conversion timer");
+    trace("entering event loop");
+    kit->methods->runLoop(kit, NULL, NULL, NULL);
+    return error(NULL, "event loop returned before conversion");
 }
+
 int wmain(int argc, wchar_t **argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_invalid_parameter_handler(invalidParameter);

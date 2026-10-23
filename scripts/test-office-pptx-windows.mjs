@@ -1,5 +1,6 @@
 /** Trusted CI fixtures only. No user documents, no production runtime changes. */
 import { spawn, execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { cp, copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +9,7 @@ import { buildThreadProbe } from "./office-pptx-thread-probe.mjs";
 import { buildWindowsConverter } from "../plugins/office/scripts/build-windows-converter.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const { PDFDocument } = createRequire(join(repo, "plugins/office/package.json"))("pdf-lib");
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 
 // Persist file-backed stdio without excerpting or deleting diagnostics. The
@@ -101,7 +103,8 @@ async function main() {
           Object.assign(item, await capture(command, argv, work, hostEnv, join(evidence, id), threadProbe ? (mode === "native" ? 60000 : 90000) : (mode === "native" ? 120000 : 150000)));
           try {
             const pdf = await readFile(join(out, "source.pdf"));
-            item.validPdf = pdf.subarray(0, 5).equals(Buffer.from("%PDF-"));
+            item.pages = (await PDFDocument.load(pdf)).getPageCount();
+            item.validPdf = pdf.subarray(0, 5).equals(Buffer.from("%PDF-")) && item.pages > 0;
             await writeFile(join(evidence, `${id}.pdf`), pdf);
           } catch { item.validPdf = false; }
           item.state = item.code === 0 && !item.timedOut && item.validPdf ? "passed" : "failed";
