@@ -447,6 +447,10 @@ export interface EmbeddingRetryRecord extends SchedulingMetadata {
   embedRole: "document" | "query";
   status: EmbeddingRetryStatus;
   attempts: number;
+  /** Cumulative claims; migrated history is a lower bound. */
+  leaseCount?: number;
+  /** Expired-lease recoveries observed since counter migration. */
+  leaseRecoveryCount?: number;
   maxAttempts: number;
   nextAttemptAt: number;
   claimedBy?: string | null;
@@ -4178,6 +4182,7 @@ export class RuntimeRepository {
             `UPDATE embedding_retry_queue
              SET status = 'pending',
                  next_attempt_at = ?,
+                 lease_recovery_count = lease_recovery_count + 1,
                  claimed_by = NULL,
                  lease_until = NULL,
                  lease_token = NULL,
@@ -4193,6 +4198,7 @@ export class RuntimeRepository {
           ...row,
           status: "pending",
           attempts: row.attempts,
+          lease_recovery_count: row.lease_recovery_count + 1,
           next_attempt_at: now,
           claimed_by: null,
           lease_until: null,
@@ -4227,7 +4233,9 @@ export class RuntimeRepository {
         const result = this.db
           .prepare(
             `UPDATE embedding_retry_queue
-             SET status = 'in_progress',
+             SET lease_count = lease_count + 1,
+                 lease_recovery_count = lease_recovery_count + CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END,
+                 status = 'in_progress',
                  claimed_by = ?,
                  lease_until = ?,
                  lease_token = ?,
@@ -4244,6 +4252,8 @@ export class RuntimeRepository {
           claimed.push(embeddingRetryFromSql({
             ...row,
             status: "in_progress",
+            lease_count: row.lease_count + 1,
+            lease_recovery_count: row.lease_recovery_count + (row.status === "in_progress" ? 1 : 0),
             claimed_by: input.workerId,
             lease_until: input.leaseUntil,
             lease_token: leaseToken,
@@ -4262,7 +4272,10 @@ export class RuntimeRepository {
   }): EmbeddingRetryRecord | undefined {
     const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
     return this.db.transaction(() => {
-      const row = this.db.prepare(`UPDATE embedding_retry_queue AS q SET status = 'in_progress',
+      const row = this.db.prepare(`UPDATE embedding_retry_queue AS q SET
+          lease_count = lease_count + 1,
+          lease_recovery_count = lease_recovery_count + CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END,
+          status = 'in_progress',
           claimed_by = ?, lease_until = ?, lease_token = ?, updated_at = ?
         WHERE q.id = ? AND (${eligibility.sql}) RETURNING *`)
         .get(input.workerId, input.leaseUntil, newId("retry_lease"), input.now, id, ...eligibility.params) as SqlEmbeddingRetryRow | undefined;
@@ -7706,6 +7719,8 @@ interface SqlEmbeddingRetryRow extends SqlSchedulingMetadata {
   embed_role: "document" | "query";
   status: EmbeddingRetryStatus;
   attempts: number;
+  lease_count: number;
+  lease_recovery_count: number;
   max_attempts: number;
   next_attempt_at: number;
   claimed_by: string | null;
@@ -7867,6 +7882,8 @@ function embeddingRetryFromSql(row: SqlEmbeddingRetryRow): EmbeddingRetryRecord 
     embedRole: row.embed_role,
     status: row.status,
     attempts: row.attempts,
+    leaseCount: row.lease_count,
+    leaseRecoveryCount: row.lease_recovery_count,
     maxAttempts: row.max_attempts,
     nextAttemptAt: row.next_attempt_at,
     claimedBy: row.claimed_by,

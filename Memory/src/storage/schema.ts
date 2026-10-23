@@ -2,8 +2,8 @@ import type Database from "better-sqlite3";
 import { installQueueSchedulingSchema } from "./queue-scheduling-schema.js";
 import { memoryCaptureQaHash, normalizeMemoryCaptureSource } from "../utils/memory-capture-claim.js";
 
-export const SCHEMA_VERSION = 12;
-export const SCHEMA_MIGRATION_ID = "012_queue_scheduling_metadata";
+export const SCHEMA_VERSION = 13;
+export const SCHEMA_MIGRATION_ID = "013_embedding_retry_lease_counters";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -618,6 +618,8 @@ const statements = [
     claimed_by TEXT,
     lease_until INTEGER,
     lease_token TEXT,
+    lease_count INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0),
+    lease_recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (lease_recovery_count >= 0),
     blocked_reason TEXT,
     last_error TEXT,
     created_at INTEGER NOT NULL,
@@ -701,7 +703,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -740,8 +742,18 @@ export function migrate(db: Database.Database): void {
         }
       }
       if (tableExists(db, "embedding_retry_queue")) {
+        const needsLeaseCountBackfill = !columnExists(db, "embedding_retry_queue", "lease_count");
         addColumnIfMissing(db, "embedding_retry_queue", "blocked_reason", "TEXT");
         addColumnIfMissing(db, "embedding_retry_queue", "lease_token", "TEXT");
+        addColumnIfMissing(db, "embedding_retry_queue", "lease_count", "INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0)");
+        addColumnIfMissing(db, "embedding_retry_queue", "lease_recovery_count", "INTEGER NOT NULL DEFAULT 0 CHECK (lease_recovery_count >= 0)");
+        if (version > 0 && version < 13 && needsLeaseCountBackfill) {
+          // Historic attempts count failures, so they prove only a lower bound
+          // on claims. An active/succeeded row proves one more claim. Previous
+          // recoveries cannot be reconstructed and start at zero after upgrade.
+          db.prepare(`UPDATE embedding_retry_queue SET lease_count = MAX(0, attempts)
+            + CASE WHEN status IN ('in_progress', 'succeeded') THEN 1 ELSE 0 END`).run();
+        }
       }
       for (const statement of statements) {
         db.prepare(statement).run();
