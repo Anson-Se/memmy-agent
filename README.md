@@ -96,6 +96,8 @@ memmy
 
 The installer enables the local Memory Service immediately as `memmy-memory.service`. The first bare `memmy` invocation opens the model setup wizard when needed, then enables `memmy-gateway.service`, waits for it to become ready, and enters the TUI. Both are `systemd --user` services bound to localhost and remain available after the TUI or terminal exits. They start again on later logins; the installer does not enable linger. Only the installer launcher activates this service management, so source-built Linux CLIs keep their existing behavior.
 
+During Gateway startup, temporary HTTP 503 responses from the bootstrap endpoint are retried until the Gateway becomes ready or the startup wait times out.
+
 Before starting or reconnecting to the Gateway, `memmy` refreshes a private `~/.memmy/systemd/gateway.env` file (mode `0600`) with configuration-referenced environment variables, common Provider credentials, and the terminal `PATH`. If those values change, the next bare `memmy` invocation restarts the user service with the new environment.
 
 ```bash
