@@ -65,6 +65,7 @@ function refused(): TypeError {
 describe("Linux systemd Gateway probing", () => {
   it.each([
     ["agent_runtime_initializing", "unavailable"],
+    ["Gateway is still starting", "unavailable"],
     ["upstream unavailable", "unexpected"],
   ])("classifies bootstrap 503 body %s as %s", async (body, status) => {
     const fetchImpl = vi.fn(async () => new Response(body, { status: 503 })) as unknown as typeof fetch;
