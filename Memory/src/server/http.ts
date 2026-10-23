@@ -1,3 +1,4 @@
+import { assertLocalAgentSourceRequest, isAgentSourceScanPath, routeAgentSourceScan } from "./agent-source-api.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
@@ -170,6 +171,7 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
   const agentSources = options.agentSourceExecutor ?? createAgentSourceExecutor({
     service: options.service,
     configPath: options.configPath,
+    legacyDatabasePath: process.env.MEMMY_APP_DATABASE,
     scheduleWorker: autoWorker.schedule,
     memoryAddAnalytics
   });
@@ -244,6 +246,13 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
           return;
         }
       }
+      if (isAgentSourceScanPath(url.pathname)) {
+        assertLocalAgentSourceRequest(request, principal.kind);
+        const scanResult = await routeAgentSourceScan(agentSources, request.method, url, body);
+        if (!scanResult) throw new MemoryServiceError("not_found", "Unknown Agent source operation");
+        writeJson(response, scanResult.status ?? 200, scanResult.body);
+        return;
+      }
       const result = await routeRequest(
         options.service,
         autoWorker,
@@ -253,6 +262,7 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
         principal,
         Boolean(options.onShutdownRequested),
         pluginRuntimeAnalytics,
+        agentSources,
         requestId
       );
       if (request.method === "POST" && url.pathname === "/api/v1/admin/shutdown") {
@@ -553,6 +563,7 @@ async function routeRequest(
   principal: AuthPrincipal,
   canShutdown: boolean,
   pluginRuntimeAnalytics: PluginRuntimeAnalytics,
+  agentSources: AgentSourceExecutor,
   requestId: string
 ): Promise<unknown> {
   const path = url.pathname;
@@ -970,7 +981,7 @@ async function routeRequest(
 
   if (method === "DELETE" && path === "/api/v1/admin/data") {
     requireMemoryWrite(principal);
-    return service.clearAllData();
+    return agentSources.clearAllData();
   }
 
   if (method === "GET" && path === "/api/v1/panel/analysis") {
