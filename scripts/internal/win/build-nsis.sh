@@ -76,13 +76,42 @@ npm_with_configured_script_shell() {
 resolve_electron_dist() {
   local electron_dist="${MEMMY_ELECTRON_DIST:-}"
 
-  if [ -z "$electron_dist" ] && [ -f "$DESKTOP_DIR/node_modules/electron/dist/electron.exe" ]; then
-    electron_dist="$DESKTOP_DIR/node_modules/electron/dist"
+  if [ -z "$electron_dist" ]; then
+    for candidate in \
+      "$DESKTOP_DIR/node_modules/electron/dist" \
+      "$ROOT_DIR/node_modules/electron/dist"; do
+      if [ -f "$candidate/electron.exe" ]; then
+        electron_dist="$candidate"
+        break
+      fi
+    done
   fi
 
   if [ -n "$electron_dist" ]; then
     to_node_readable_path "$electron_dist"
   fi
+}
+
+restore_electron_dist() {
+  if [ -f "$DESKTOP_DIR/node_modules/electron/dist/electron.exe" ] || \
+     [ -f "$ROOT_DIR/node_modules/electron/dist/electron.exe" ]; then
+    return
+  fi
+
+  local install_script=""
+  for candidate in \
+    "$ROOT_DIR/node_modules/electron/install.js" \
+    "$DESKTOP_DIR/node_modules/electron/install.js"; do
+    if [ -f "$candidate" ]; then
+      install_script="$candidate"
+      break
+    fi
+  done
+  if [ -z "$install_script" ]; then
+    echo "Electron install.js is missing; cannot materialize the Windows Electron runtime." >&2
+    exit 1
+  fi
+  node "$install_script"
 }
 
 if [ -n "${MEMMY_DESKTOP_VERSION:-}" ]; then
@@ -448,7 +477,9 @@ verify_windows_computer_use_surface() {
 
 verify_windows_better_sqlite3_runtime() {
   local runtime_dir="$1"
-  local electron_executable="$DESKTOP_DIR/node_modules/electron/dist/electron.exe"
+  local electron_dist
+  electron_dist="$(resolve_electron_dist)"
+  local electron_executable="$electron_dist/electron.exe"
   local node_runtime_dir
   node_runtime_dir="$(to_node_readable_path "$runtime_dir")"
 
@@ -769,12 +800,13 @@ fi
 package_step_start "Install root workspace dependencies if needed"
 if [ ! -d "$ROOT_DIR/node_modules" ]; then
   log "Installing root workspace dependencies"
-  npm_with_configured_script_shell install
+  npm_with_configured_script_shell install --ignore-scripts --package-lock=false --no-audit --no-fund
 else
   log "Root workspace dependencies already available"
 fi
+restore_electron_dist
 package_step_start "Install migrations workspace dev dependencies"
-npm_with_configured_script_shell install --workspace @memmy/migrations --include=dev
+npm_with_configured_script_shell install --workspace @memmy/migrations --include=dev --ignore-scripts --package-lock=false --no-audit --no-fund
 
 package_step_start "Build migrations package"
 npm_with_configured_script_shell run build --prefix "$MIGRATIONS_DIR"
@@ -783,7 +815,7 @@ package_step_start "Build local API contracts package"
 npm_with_configured_script_shell run build -w @memmy/local-api-contracts
 
 package_step_start "Install memmy-agent workspace dependencies"
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_with_configured_script_shell ci --prefix "$AGENT_DIR"
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_with_configured_script_shell ci --prefix "$AGENT_DIR" --ignore-scripts --no-audit --no-fund --os=win32 --cpu=x64
 
 package_step_start "Build Memory workspace"
 npm_with_configured_script_shell run build -w @memmy/memory
