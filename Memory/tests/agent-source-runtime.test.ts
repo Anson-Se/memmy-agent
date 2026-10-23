@@ -624,7 +624,8 @@ describe("standalone Agent source executor", () => {
   });
 
   it("owns startup and recurring scans in the Memory process", async () => {
-    vi.useFakeTimers();
+    // Control scheduling deadlines while adapter/filesystem event-loop work stays real.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const root = tempRoot();
     const configPath = join(root, "config.yaml");
     writeFileSync(configPath, [
@@ -643,7 +644,10 @@ describe("standalone Agent source executor", () => {
         builtin: true,
         dataPath: join(root, "history")
       },
-      detect: async () => true,
+      // Adapter I/O can span multiple event-loop turns without advancing scan deadlines.
+      detect: () => new Promise<boolean>((resolve) => {
+        setImmediate(() => setImmediate(() => resolve(true)));
+      }),
       async *scan() {
         sequence += 1;
         yield {
@@ -683,22 +687,27 @@ describe("standalone Agent source executor", () => {
       scheduleWorker
     });
 
-    executor.startAutomation();
-    await vi.advanceTimersByTimeAsync(9);
-    expect(addMemory).not.toHaveBeenCalled();
+    try {
+      executor.startAutomation();
+      await vi.advanceTimersByTimeAsync(9);
+      expect(addMemory).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(1);
-    await waitForFakeTimerScan(executor);
-    expect(addMemory).toHaveBeenCalledTimes(1);
-    expect(enqueuePendingImportSummaries).toHaveBeenLastCalledWith(1_000, ["memory-1"]);
-    expect(scheduleWorker).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await waitForFakeTimerScan(executor);
+      expect(addMemory).toHaveBeenCalledTimes(1);
+      expect(enqueuePendingImportSummaries).toHaveBeenLastCalledWith(1_000, ["memory-1"]);
+      expect(scheduleWorker).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(100);
-    await waitForFakeTimerScan(executor);
-    expect(addMemory).toHaveBeenCalledTimes(2);
-    expect(enqueuePendingImportSummaries).toHaveBeenLastCalledWith(1_000, ["memory-2"]);
-    expect(scheduleWorker).toHaveBeenCalledTimes(2);
-    executor.dispose();
+      await vi.advanceTimersByTimeAsync(99);
+      expect(addMemory).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await waitForFakeTimerScan(executor);
+      expect(addMemory).toHaveBeenCalledTimes(2);
+      expect(enqueuePendingImportSummaries).toHaveBeenLastCalledWith(1_000, ["memory-2"]);
+      expect(scheduleWorker).toHaveBeenCalledTimes(2);
+    } finally {
+      await executor.dispose();
+    }
   });
 
   it("emits memory_desktop add analytics for standalone scan writes", async () => {
