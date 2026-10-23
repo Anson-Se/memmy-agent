@@ -12,8 +12,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
-// `pkg` ships a prebuilt Node 24 binary for the standalone runtime.
-const PKG_NODE_RANGE = "node24";
+// Pin the patched runtime: a major-only range can select an older binary
+// from pkg-fetch's release table.
+const PKG_NODE_RANGE = "node24.22.1";
 
 const require = createRequire(import.meta.url);
 const scriptDir = dirname(fileURLToPath(import.meta.url));
