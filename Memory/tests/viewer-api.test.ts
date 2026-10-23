@@ -277,10 +277,12 @@ describe("local Viewer API", () => {
   });
 
   it("exposes standalone scan pause and cancel controls to the Viewer", async () => {
-    const pauseScan = vi.fn(async () => ({ ok: true as const }));
-    const cancelScan = vi.fn(async () => ({ ok: true as const }));
+    const snapshot = { running: false, jobId: "scan-1", attemptId: "attempt-1", sourceId: "codex", mode: null, progress: null, startedAt: null, completedAt: null, error: null, version: { generation: 1, sequence: 2 }, status: "cancelled" as const };
+    const pauseScan = vi.fn(async () => ({ ok: true as const, outcome: "applied" as const, snapshot }));
+    const cancelScan = vi.fn(async () => ({ ok: true as const, outcome: "applied" as const, snapshot }));
     const agentSourceExecutor: AgentSourceExecutor = {
       list: async () => ({ executorAvailable: true, sources: [] }),
+      clearAllData: async () => ({ ok: true, cleared: {}, clearedAt: new Date().toISOString(), serverTime: new Date().toISOString() }),
       startScan: async () => ({ accepted: true, jobId: "scan-1" }),
       scanStatus: () => ({
         running: true,
@@ -305,7 +307,7 @@ describe("local Viewer API", () => {
       body: "{}"
     });
     expect(paused.status).toBe(200);
-    expect(await paused.json()).toEqual({ ok: true });
+    expect(await paused.json()).toEqual({ ok: true, outcome: "applied", snapshot });
     expect(pauseScan).toHaveBeenCalledOnce();
 
     const canceled = await viewerFetch(fixture.baseUrl, "/api/v1/agent-sources/scan/cancel", {
@@ -313,7 +315,7 @@ describe("local Viewer API", () => {
       body: "{}"
     });
     expect(canceled.status).toBe(200);
-    expect(await canceled.json()).toEqual({ ok: true });
+    expect(await canceled.json()).toEqual({ ok: true, outcome: "applied", snapshot });
     expect(cancelScan).toHaveBeenCalledOnce();
   });
 
