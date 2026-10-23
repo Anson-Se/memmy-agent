@@ -12,7 +12,7 @@ import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
 import { agentReducer, initialAgentState } from "../../state/agent-chat-slice.js";
 import { AppProviders } from "../../app/providers.js";
 import { FOCUSED_AGENT_CHAT_STORAGE_KEY } from "../../app/routes.js";
-import type { SlashCommandPaletteItem, SlashCommandStorageLike } from "../agent-command-palette.js";
+import { filterSlashCommands, slashQueryFromInput, type SlashCommandPaletteItem, type SlashCommandStorageLike } from "../agent-command-palette.js";
 import { buildAgentDisplayUnits } from "../agent-thread-messages.js";
 import {
   AGENT_RESTART_STATE_STORAGE_KEY,
@@ -199,7 +199,13 @@ describe("HomePage", () => {
     );
 
     expect(html).toContain("分配一个任务或提问任何问题...");
-    expect(html).toContain("添加图片和文件");
+    const document = new Window().document;
+    document.body.innerHTML = html;
+    const attachMenu = document.querySelector<HTMLDetailsElement>(".agent-composer-attach-menu");
+    expect(attachMenu?.querySelector("summary")?.getAttribute("aria-label")).toBe("添加资料");
+    expect(attachMenu?.hasAttribute("open")).toBe(false);
+    expect(Array.from(attachMenu?.querySelectorAll('[role="menuitem"]') ?? []).map((item) => item.textContent))
+      .toEqual(["上传文件", "上传文件夹"]);
     expect(html).toContain("语音输入");
     expect(html).toContain("发送");
     expect(html).toContain("Agent 正在连接");
@@ -217,7 +223,7 @@ describe("HomePage", () => {
     expect(html).not.toContain('data-icon="image-plus"');
     expect(html).not.toContain('data-icon="pause"');
     expect(html).toContain("内容由 AI 生成，请仔细甄别");
-    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-4");
+    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-3");
     expect(html).not.toContain("未选择任何文件");
   });
 
@@ -255,13 +261,14 @@ describe("HomePage", () => {
     expect(chipStyles).toContain("font-weight: 500;");
     expect(chipStyles).toMatch(/\.composer-command-chip__icon\s*{[^}]*position:\s*absolute;/s);
     expect(chipStyles).toMatch(/\.composer-command-chip__leading\s*{[^}]*display:\s*inline-flex;/s);
-    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(2);
-    expect(source.match(/value=\{composerInput\}/g)).toHaveLength(2);
+    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(1);
+    expect(source.match(/\{renderComposerLeadingActions\(\)\}/g)).toHaveLength(2);
+    expect(source.match(/<(?:textarea|ComposerHighlightedTextarea)\b[^>]*value=\{composerInput\}/g)).toHaveLength(2);
     expect(source).toContain("setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, value));");
     expect(source).toContain("selectedComposerCommandsByScope[chatScopeKey] ?? null");
     expect(source).toContain("setSelectedComposerCommandForScope(chatScopeKey, COMPOSER_GOAL_COMMAND);");
     expect(source).toContain('label={t("home.command.goalChip")}');
-    expect(source).toContain('placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}');
+    expect(source.match(/placeholder=\{pendingQuestion \? t\("home.question.waitingInput"\) : selectedComposerCommand \? t\("home.goal.input"\) : t\("home.input"\)\}/g)).toHaveLength(2);
     expect(styles).toContain(".agent-composer-shell--expanded textarea.agent-composer-input--conversation");
   });
 
@@ -285,7 +292,10 @@ describe("HomePage", () => {
     expect(filterGoalModeSlashCommands(commands, false).map((item) => item.command)).toEqual([
       "/last-compaction"
     ]);
-    expect(source).toContain("const slashQuery = slashMenuDismissed ? null : slashQueryFromInput(composerInput);");
+    expect(slashQueryFromInput("消息 /new")).toBeNull();
+    expect(filterSlashCommands(filterGoalModeSlashCommands(commands, true), "new", [])).toEqual([]);
+    expect(filterSlashCommands(filterGoalModeSlashCommands(commands, true), "status", []).map((item) => item.command))
+      .toEqual(["/status"]);
     expect(source).toContain("clearAuxiliarySlashQuery();");
     expect(source).toContain('setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, ""));');
   });
@@ -397,8 +407,8 @@ describe("HomePage", () => {
       source.indexOf("  useEffect(() => {\n    if (!clients?.memmyAgent)")
     );
     const updateComposerInputBlock = source.slice(
-      source.indexOf("function updateComposerInput(value: string)"),
-      source.indexOf("  /**\n   * 自动收缩或展开输入框高度。")
+      source.indexOf("function updateComposerInput("),
+      source.indexOf("function clearSelectedComposerCommand()")
     );
 
     expect(source).not.toContain("SlashCommandsLoadStatus");
@@ -423,13 +433,18 @@ describe("HomePage", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
 
     expect(source).toContain("const slashMenuOpen = filteredSlashCommands.length > 0;");
-    expect(source.match(/\{slashMenuOpen && \(/g)).toHaveLength(2);
+    expect(source.match(/\{slashMenuOpen && !slashPickerOpen \? \(/g)).toHaveLength(2);
+    expect(source.match(/\{slashMenuOpen && slashPickerOpen \? \(/g)).toHaveLength(1);
     expect(source).toContain("const [lastCompactionPanel, setLastCompactionPanel] = useState<StatusPanelState>({ open: false });");
     expect(source).toContain("const lastCompactionSlashCommand: SlashCommandPaletteItem = {");
     expect(source).toContain('command: "/last-compaction"');
     expect(source).toContain("const slashCommandsWithLocal = [");
     expect(source).toContain("lastCompactionSlashCommand,");
-    expect(source).toContain('...localizedSlashCommands.filter((command) => command.command !== "/last-compaction")');
+    const localCommands = source.slice(source.indexOf("const slashCommandsWithLocal = ["), source.indexOf("const visibleSlashCommands ="));
+    expect(localCommands).toContain("pluginSlashCommands,");
+    expect(localCommands).toContain("goalSlashCommand,");
+    expect(localCommands).toContain('command.command !== COMPOSER_GOAL_COMMAND');
+    expect(localCommands).toContain('command.command !== "/last-compaction"');
     expect(source).toContain('buildVisibleSlashCommands(slashCommandsWithLocal, state.agent.isSending, stopSlashCommand, slashQuery ?? "")');
     expect(source).toContain("{statusPanel.open && !slashMenuOpen && (");
     expect(source).toContain("{lastCompactionPanel.open && !slashMenuOpen && (");
@@ -451,7 +466,8 @@ describe("HomePage", () => {
     expect(source).toContain("<AgentThreadToolbar");
     expect(source).toContain("title={activeConversationTitleDisplay}");
     expect(source).toContain("titleTrailing={activeImTitleDisplay ? <ImChannelTitleIcon");
-    expect(source).not.toContain("selectedDraftProject?.name");
+    const titleSelection = source.slice(source.indexOf("const activeConversationTitle ="), source.indexOf("const activeImTitleDisplay ="));
+    expect(titleSelection).not.toContain("selectedDraftProject?.name");
     expect(source).toContain("topBarBorder={hasActiveConversation}");
     expect(source).toContain("topBarInset={hasActiveConversation ? false : undefined}");
     expect(source).toContain("windowsTitlebarSafe={hasActiveConversation}");
@@ -794,10 +810,11 @@ describe("HomePage", () => {
     expect(composerRule).toContain("padding: 40px var(--codex-content-padding-x) 0;");
     expect(styles).toContain("container-name: agent-workspace;");
     expect(source).toContain("const threadPanel = useAgentThreadPanel({");
-    expect(source).toContain("className={`agent-workspace-layout ${threadPanelMotionClass}`}");
-    expect(source).toContain('style={{ "--thread-panel-offset": `${threadPanel.offset}px` } as CSSProperties}');
-    expect(source).toContain("topBarStyle={hasActiveConversation ? { right: threadPanel.offset } : undefined}");
-    expect(source).toContain("sidePanel={sidePanelMounted ? (\n        <AgentThreadPanel");
+    expect(source).toContain('className={`agent-workspace-layout ${threadPanelMotionClass}${legacySidePanelOpen ? " agent-workspace-layout--preview-open" : ""}`}');
+    expect(source).toContain('"--thread-panel-offset": `${visibleThreadPanelOffset}px`');
+    expect(source).toContain('"--agent-preview-panel-width": `${previewPanelWidth}px`');
+    expect(source).toContain("right: visibleThreadPanelOffset + (legacySidePanelOpen ? previewPanelWidth : 0)");
+    expect(source).toContain("sidePanel={sidePanelMounted && !recordingEntry.open && !recorderPaneOpen && !pluginArtifactPreview ? (\n        <AgentThreadPanel");
     expect(source).toContain("<AgentThreadPanel");
     expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-main\s*\{[^}]*isolation:\s*auto;/s);
     expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-content-topbar\.thread-topbar\s*\{[^}]*display:\s*none;/s);
@@ -1230,14 +1247,16 @@ describe("HomePage", () => {
     expect(focusInput).toHaveBeenCalledTimes(1);
   });
 
-  it("opens the system media picker directly from the plus button without rendering a floating media menu", () => {
-    const source = readFileSync(homePageSourcePath, "utf8");
-
-    expect(source).toContain("onClick={openMediaFilePicker}");
-    expect(source).not.toContain("function ComposerMediaMenu");
-    expect(source).not.toContain("setMediaMenuOpen");
-    expect(source).not.toContain("aria-haspopup=\"menu\"");
-    expect(source).not.toContain("role=\"menuitem\"");
+  it("offers file and folder uploads through the native disclosure menu", () => {
+    const html = renderToString(<AppProviders><AgentRuntimeBridge><HomePage /></AgentRuntimeBridge></AppProviders>);
+    const document = new Window().document;
+    document.body.innerHTML = html;
+    const menu = document.querySelector<HTMLDetailsElement>(".agent-composer-attach-menu");
+    expect(menu?.querySelector("summary")?.tagName).toBe("SUMMARY");
+    expect(menu?.querySelector("summary")?.getAttribute("title")).toBe("添加文件或文件夹");
+    expect(Array.from(menu?.querySelectorAll('button[role="menuitem"]') ?? []).map((item) => item.textContent))
+      .toEqual(["上传文件", "上传文件夹"]);
+    expect(menu?.open).toBe(false);
   });
 
   it("renders composer media previews as compact thumbnail and file chips", () => {
@@ -1274,35 +1293,47 @@ describe("HomePage", () => {
     expect(html).toContain("agent-attachment-card__name");
     expect(html).toContain("agent-attachment-card__meta");
     expect(html).toContain(">shot<");
-    expect(html).toContain(">report.pdf<");
-    expect(html).toContain(">brief.docx<");
-    expect(html).toContain(">sheet.xlsx<");
-    expect(html).toContain(">deck.pptx<");
-    expect(html).toContain(">notes.txt<");
-    expect(html).toContain(">table.csv<");
-    expect(html).toContain(">data.json<");
-    expect(html).toContain(">payload.xml<");
+    expect(html).toContain(">report<");
+    expect(renderedAttachmentTitle(html, "report")).toContain("report.pdf");
+    expect(html).toContain(">brief<");
+    expect(renderedAttachmentTitle(html, "brief")).toContain("brief.docx");
+    expect(html).toContain(">sheet<");
+    expect(renderedAttachmentTitle(html, "sheet")).toContain("sheet.xlsx");
+    expect(html).toContain(">deck<");
+    expect(renderedAttachmentTitle(html, "deck")).toContain("deck.pptx");
+    expect(html).toContain(">notes<");
+    expect(renderedAttachmentTitle(html, "notes")).toContain("notes.txt");
+    expect(html).toContain(">table<");
+    expect(renderedAttachmentTitle(html, "table")).toContain("table.csv");
+    expect(html).toContain(">data<");
+    expect(renderedAttachmentTitle(html, "data")).toContain("data.json");
+    expect(html).toContain(">payload<");
+    expect(renderedAttachmentTitle(html, "payload")).toContain("payload.xml");
     expect(compactHtml).toContain("XLSX · 2.0 KB");
     expect(compactHtml).toContain("PPTX · 1.5 KB");
     expect(compactHtml).toContain("TXT · 512 B");
     expect(compactHtml).toContain("CSV · 768 B");
     expect(compactHtml).toContain("JSON · 1.0 KB");
     expect(compactHtml).toContain("XML · 640 B");
-    expect(html).toContain('data-testid="agent-file-icon-pdf"');
-    expect(html).toContain('data-testid="agent-file-icon-docx"');
-    expect(html).toContain('data-testid="agent-file-icon-xlsx"');
-    expect(html).toContain('data-testid="agent-file-icon-pptx"');
-    expect(html).toContain('data-testid="agent-file-icon-file"');
-    expect(html).toContain("agent-attachment-card__file-tile--pdf");
-    expect(html).toContain("agent-attachment-card__file-tile--docx");
-    expect(html).toContain("agent-attachment-card__file-tile--xlsx");
-    expect(html).toContain("agent-attachment-card__file-tile--pptx");
-    expect(html).toContain("agent-attachment-card__file-tile--file");
-    expect(html).toContain('aria-label="PDF file"');
-    expect(html).toContain('aria-label="Word document"');
-    expect(html).toContain('aria-label="Spreadsheet file"');
-    expect(html).toContain('aria-label="Presentation file"');
-    expect(html).toContain('aria-label="File attachment"');
+    const previewDocument = new Window().document;
+    previewDocument.body.innerHTML = html;
+    for (const [filename, kind, label] of [
+      ["report.pdf", "pdf", "PDF document"],
+      ["brief.docx", "word", "Word document"],
+      ["sheet.xlsx", "spreadsheet", "Spreadsheet"],
+      ["deck.pptx", "presentation", "Presentation"],
+      ["notes.txt", "text", "Text document"],
+      ["table.csv", "spreadsheet", "Spreadsheet"],
+      ["data.json", "code", "Code or configuration file"],
+      ["payload.xml", "code", "Code or configuration file"]
+    ] as const) {
+      const card = Array.from(previewDocument.querySelectorAll<HTMLElement>('[data-testid="agent-attachment-card-file"]'))
+        .find((item) => item.getAttribute("title")?.includes(filename));
+      expect(card).toBeDefined();
+      const icon = card!.querySelector(`[data-file-kind="${kind}"]`);
+      expect(icon?.classList.contains("file-type-icon--card")).toBe(true);
+      expect(icon?.getAttribute("aria-label")).toBe(label);
+    }
     expect(html).not.toContain("absolute -right-1 -bottom-1");
     expect(html).not.toContain('data-testid="composer-file-kind-');
     expect(compactHtml).toContain("PNG · 2.0 KB");
@@ -1717,18 +1748,21 @@ describe("HomePage", () => {
   it("anchors composer popovers above the queue and keeps Goal next to the composer", () => {
     const source = readFileSync(homePageSourcePath, "utf8").replace(/\r\n/g, "\n");
     const flowStart = source.indexOf('<div className="agent-composer-flow">');
-    const slashStart = source.indexOf("{slashMenuOpen && (", flowStart);
-    const stackStart = source.indexOf('<div className="agent-composer-stack">', slashStart);
+    const stackStart = source.indexOf('<div className="agent-composer-stack">', flowStart);
     const queueStart = source.indexOf("<AgentQueuedMessageList", stackStart);
     const goalStart = source.indexOf("<AgentGoalBar", stackStart);
     const shellStart = source.indexOf('className="relative agent-composer-shell agent-composer-shell--expanded rounded-card-lg"', stackStart);
 
     expect(flowStart).toBeGreaterThan(0);
-    expect(slashStart).toBeGreaterThan(flowStart);
-    expect(stackStart).toBeGreaterThan(slashStart);
+    expect(stackStart).toBeGreaterThan(flowStart);
     expect(queueStart).toBeGreaterThan(stackStart);
     expect(goalStart).toBeGreaterThan(queueStart);
     expect(shellStart).toBeGreaterThan(goalStart);
+    const caretMenuStart = source.indexOf("<ComposerCaretMenu", shellStart);
+    const toolbarStart = source.indexOf('className="agent-composer-toolbar"', shellStart);
+    expect(caretMenuStart).toBeGreaterThan(shellStart);
+    expect(caretMenuStart).toBeLessThan(toolbarStart);
+    expect(source.slice(caretMenuStart, toolbarStart)).toContain('placement="above"');
     expect(source).toContain('ref={conversationPanelRef} className="agent-conversation-panel flex flex-col h-full"');
     expect(source).toContain('ref={composerOverlayRef} className="agent-conversation-composer"');
     expect(source).toContain("updateAgentComposerOverlayHeight(panel, composer, measuredHeight)");
@@ -2329,3 +2363,11 @@ it("routes a legal diagnosis command to the Agent Skill instead of opening the c
     collectPluginCommandTargets([legal])
   )).toBe("$labor-risk-diagnosis 帮我生成用工风险诊断报告");
 });
+
+function renderedAttachmentTitle(html: string, displayName: string): string | null | undefined {
+  const document = new Window().document;
+  document.body.innerHTML = html;
+  return Array.from(document.querySelectorAll<HTMLElement>(".agent-attachment-card"))
+    .find((card) => card.querySelector(".agent-attachment-card__name")?.textContent?.trim() === displayName)
+    ?.getAttribute("title");
+}

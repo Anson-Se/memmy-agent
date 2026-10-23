@@ -1,4 +1,6 @@
 /** Home page module. */
+import { buildLegalDiagnosisContinuationPrompt } from "../lib/legal-diagnosis-continuation.js";
+import { messageCatalogs, resolveLanguage } from "../i18n/messages.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type ClipboardEvent, type CSSProperties, type DragEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction, type UIEvent } from "react";
 import { resolveThinkingEnabled, resolveThinkingLevel, type AgentGatewayStartupIssue, type InstalledPlugin, type PluginArtifactRef, type PluginCommandContribution, type PluginScenarioContribution } from "@memmy/local-api-contracts";
 import { getRuntimeConfig } from "../api/runtime-config.js";
@@ -666,16 +668,14 @@ export function reconcileHiddenPluginCalls(hidden: Set<string>, hiddenSteps: Rea
   return next.size === hidden.size ? hidden : next;
 }
 
-export function buildLegalDiagnosisContinuation(call: PluginUiCall): string {
+export function buildLegalDiagnosisContinuation(call: PluginUiCall, language = "zh-CN"): string {
   const result = call.events.find((event) => event.type === "result");
   const output = result?.type === "result" && result.output && typeof result.output === "object"
     ? result.output as Record<string, unknown> : {};
   if (typeof output.sessionId !== "string" || !output.sessionId.trim()) {
-    throw new Error("诊断材料已上传，但未取得诊断会话 ID，请重新打开诊断指引后重试。");
+    throw new Error(messageCatalogs[resolveLanguage(language)]["home.legalDiagnosis.sessionMissing"]);
   }
-  return `/legal-diagnosis 已完成调研，继续已有法律诊断会话，sessionId=${JSON.stringify(output.sessionId)}。`
-    + "请使用这个 sessionId 调用 session-status 核对已上传材料与进度，再继续后续诊断并生成报告。"
-    + "本次是已有会话的继续操作，请跳过 skill 中新建会话的 session-start 步骤，不要再次弹出诊断指引或重复收集材料。";
+  return buildLegalDiagnosisContinuationPrompt(output.sessionId);
 }
 
 export function parsePluginCommandInvocation(input: string, targets: PluginCommandTarget[]): {
@@ -1453,10 +1453,17 @@ export function HomePage() {
   const [workspaceLayoutRef, workspaceLayoutWidth] = useSharedRowWidth<HTMLDivElement>();
   const pendingStatusChatRef = useRef<string | null>(null);
 
+  const dismissComposerAttachMenu = useCallback((restoreFocus = false) => {
+    const menu = composerAttachMenuRef.current;
+    if (!menu?.open) return;
+    menu.removeAttribute("open");
+    if (restoreFocus) menu.querySelector<HTMLElement>("summary")?.focus();
+  }, []);
+
   useEffect(() => {
     const closeAttachMenu = (event: PointerEvent) => {
       const menu = composerAttachMenuRef.current;
-      if (menu?.open && !menu.contains(event.target as Node)) menu.removeAttribute("open");
+      if (menu?.open && !menu.contains(event.target as Node)) dismissComposerAttachMenu();
       if (slashPickerOpen && !composerCapabilityMenuRef.current?.contains(event.target as Node)) {
         setSlashPickerOpen(false);
         setSlashMenuDismissed(true);
@@ -1464,7 +1471,8 @@ export function HomePage() {
     };
     const closeAttachMenuOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        composerAttachMenuRef.current?.removeAttribute("open");
+        dismissComposerAttachMenu(true);
+        if (slashPickerOpen) composerCapabilityMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
         setSlashPickerOpen(false);
         setSlashMenuDismissed(true);
       }
@@ -1475,7 +1483,7 @@ export function HomePage() {
       document.removeEventListener("pointerdown", closeAttachMenu);
       document.removeEventListener("keydown", closeAttachMenuOnEscape);
     };
-  }, [slashPickerOpen]);
+  }, [dismissComposerAttachMenu, slashPickerOpen]);
   const pendingLastCompactionChatRef = useRef<string | null>(null);
   const pendingHistoryDagChatRef = useRef<string | null>(null);
   const lastCompactionRequestIdRef = useRef(0);
@@ -2513,7 +2521,7 @@ export function HomePage() {
       if (preparedPluginCalls.some((pending) => pending.pluginId === call.pluginId && pending.origin === "agent"
         && pending.events.some((event) => event.type === "interaction")
         && !pending.events.some((event) => event.type === "result" || event.type === "error"))) {
-        throw new Error("材料已保存，当前 Agent 仍在等待另一张诊断卡片。请先完成该卡片，或停止当前任务后继续已有诊断会话。");
+        throw new Error(t("home.legalDiagnosis.cardPending"));
       }
       if (resolvedConversationModel.unavailable) throw new Error(t("home.modelSelector.unavailable"));
       if (resolvedConversationModel.candidate?.source === "platform" && isAccountTokenQuotaExhausted(state.bootstrap)) {
@@ -2524,8 +2532,8 @@ export function HomePage() {
         target: state.agent.currentChatId ? null : draftTarget,
         connection,
         ensureChatSubscription,
-        content: buildAgentRoutedPluginPrompt(buildLegalDiagnosisContinuation(call), pluginCommandTargets)
-          ?? buildLegalDiagnosisContinuation(call).replace("/legal-diagnosis", "$labor-risk-diagnosis"),
+        content: buildAgentRoutedPluginPrompt(buildLegalDiagnosisContinuation(call, language), pluginCommandTargets)
+          ?? buildLegalDiagnosisContinuation(call, language).replace("/legal-diagnosis", "$labor-risk-diagnosis"),
         displayContent: t("plugin.ui.generateDiagnosis"),
         language,
         pendingAttachments: [],
@@ -4064,8 +4072,8 @@ export function HomePage() {
             <button
               type="button"
               role="menuitem"
-              onClick={(event) => {
-                event.currentTarget.closest("details")?.removeAttribute("open");
+              onClick={() => {
+                dismissComposerAttachMenu(true);
                 openMediaFilePicker();
               }}
             >
@@ -4074,8 +4082,8 @@ export function HomePage() {
             <button
               type="button"
               role="menuitem"
-              onClick={(event) => {
-                event.currentTarget.closest("details")?.removeAttribute("open");
+              onClick={() => {
+                dismissComposerAttachMenu(true);
                 openFolderPicker();
               }}
             >

@@ -16492,8 +16492,19 @@ body:has(.sidebar-shell) .window-drag-region {
     transition: transform 160ms ease;
   }
 
-  .sidebar-shell > .sidebar-resize-handle {
+  .sidebar-shell--hidden .app-frame-sidebar {
+    transform: translateX(-100%);
+    pointer-events: none;
+  }
+
+  .sidebar-shell > .sidebar-resize-handle,
+  .sidebar-shell > :is(.sidebar-shell__body, .sidebar-shell__passthrough):has(> .app-frame-sidebar) > .sidebar-resize-handle {
     display: none;
+  }
+
+  .sidebar-shell--windows-titlebar .app-frame-sidebar,
+  .sidebar-shell--windows-titlebar .app-frame-sidebar-backdrop {
+    top: var(--codex-toolbar-height);
   }
 
   .app-frame-sidebar-backdrop {

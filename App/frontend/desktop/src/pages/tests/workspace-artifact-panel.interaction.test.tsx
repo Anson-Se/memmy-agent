@@ -12,6 +12,16 @@ import {
   type WorkspaceArtifactEntry
 } from "../workspace-artifact-panel.js";
 
+// These tests own tree/tab routing and FilePreview's load/MIME handoff.
+// PDF engine/browser Worker behavior belongs to the PDF preview boundary.
+const renderPdf = vi.hoisted(() => vi.fn<(data: ArrayBuffer) => void>());
+vi.mock("../file-preview/pdf-preview.js", () => ({
+  PdfPreview: ({ data }: { data: ArrayBuffer }) => {
+    renderPdf(data);
+    return <div className="pdf-preview" data-testid="workspace-pdf-preview-fixture" data-byte-length={data.byteLength} />;
+  }
+}));
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const SESSION_KEY = "websocket:chat-real";
@@ -93,6 +103,7 @@ describe("WorkspaceArtifactPanel", () => {
   let loadFile: ReturnType<typeof vi.fn<(path: string) => Promise<Blob>>>;
 
   beforeEach(async () => {
+    renderPdf.mockClear();
     if (typeof window.localStorage?.clear === "function") window.localStorage.clear();
     container = document.createElement("div");
     document.body.append(container);
@@ -339,7 +350,17 @@ describe("WorkspaceArtifactPanel", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(load).toHaveBeenCalled();
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector('[data-testid="workspace-pdf-preview-fixture"]')).not.toBeNull();
+        expect(renderPdf).toHaveBeenCalled();
+      });
+    });
+    expect(load).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(loadFile).not.toHaveBeenCalled();
+    expect(Array.from(new Uint8Array(renderPdf.mock.lastCall![0])))
+      .toEqual(Array.from(new TextEncoder().encode("%PDF-1.7")));
+    expect(container.querySelector('[data-testid="workspace-pdf-preview-fixture"]')?.getAttribute("data-byte-length")).toBe("8");
   });
 
   async function renderPreview(
