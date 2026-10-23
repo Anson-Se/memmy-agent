@@ -559,6 +559,7 @@ describe("BYOK displayed, tested and saved credentials", () => {
     expect(test(scenario.index).textContent).toBe("apiKey.testSuccess");
     await click(next());
     await vi.waitFor(() => expect(server.write).toHaveBeenCalled());
+    await vi.waitFor(() => expect(mocks.dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "navigation/changed" })));
     expect(await server.key(scenario.role)).toBe("sk-new-onboarding-9999");
   });
 
