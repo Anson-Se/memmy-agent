@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/office-pptx-diagnostic.yml"
       - "scripts/test-office-pptx-windows.mjs"
+      - "scripts/office-pptx-thread-probe.mjs"
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,7 @@ jobs:
         run: npm ci --prefix plugins/office
       - name: Compare original and edited PPTX in native and AppContainer modes
         env:
+          OFFICE_PPTX_THREAD_PROBE: "1"
           OFFICE_PPTX_DIAGNOSTICS: ${{ runner.temp }}/pptx-diagnostics
         run: node scripts/test-office-pptx-windows.mjs
       - name: Preserve full diagnostic evidence

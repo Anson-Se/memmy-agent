@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { cp, copyFile, mkdir, mkdtemp, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildThreadProbe } from "./office-pptx-thread-probe.mjs";
 import { buildWindowsConverter } from "../plugins/office/scripts/build-windows-converter.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,7 +52,9 @@ async function main() {
     const runtime = join(root, "rt");
     const program = join(runtime, "LibreOffice/program");
     await cp(join(process.env.ProgramFiles, "LibreOffice"), join(runtime, "LibreOffice"), { recursive: true, dereference: true });
-    await buildWindowsConverter(program);
+    const threadProbe = process.env.OFFICE_PPTX_THREAD_PROBE === "1";
+    if (threadProbe) await buildThreadProbe(repo, program, evidence);
+    else await buildWindowsConverter(program);
     for (const dll of ["msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll"]) {
       await copyFile(join(process.env.SystemRoot, "System32", dll), join(program, dll));
     }
@@ -69,7 +72,7 @@ async function main() {
     }
     const original = await plugin("office_create", { format: "pptx", name: "sample.pptx", slides: [{ title: "Office integration", body: ["Independent plugin", "Actual page rendering"], notes: "Preserved speaker notes" }] });
     const edited = await plugin("office_edit", { taskId: original.taskId, file: original.file, name: "edited.pptx", replacements: [{ from: "Office integration", to: "Office delivery verified" }] });
-    for (const [variant, document] of [["original", original], ["edited", edited]]) {
+    for (const [variant, document] of (threadProbe ? [["baseline", original], ["runloop", original]] : [["original", original], ["edited", edited]])) {
       const bytes = await readFile(join(data, "tasks", document.taskId, document.file));
       await writeFile(join(evidence, `${variant}.pptx`), bytes);
       for (const mode of ["native", "appcontainer"]) {
@@ -80,7 +83,7 @@ async function main() {
         await writeFile(join(profile, "user/registrymodifications.xcu"), '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry"><item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item><item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item></oor:items>');
         const env = {};
         for (const key of ["SystemRoot", "WINDIR", "PATH", "LOCALAPPDATA", "APPDATA", "USERPROFILE"]) if (process.env[key]) env[key] = process.env[key];
-        Object.assign(env, { MEMMY_OFFICE_TRACE: "1", TEMP: work, TMP: work, TMPDIR: work, HOME: work, XDG_CONFIG_HOME: join(work, "config"), XDG_CACHE_HOME: join(work, "cache") });
+        Object.assign(env, { MEMMY_OFFICE_TRACE: "1", ...(threadProbe ? { MEMMY_PPTX_THREAD_MODEL: variant } : {}), TEMP: work, TMP: work, TMPDIR: work, HOME: work, XDG_CONFIG_HOME: join(work, "config"), XDG_CACHE_HOME: join(work, "cache") });
         const args = [`-env:UserInstallation=${pathToFileURL(profile).href}`, "-env:OSL_SOCKET_PATH=.", "--headless", "--norestore", "--nodefault", "--nolockcheck", "--convert-to", "pdf", "--outdir", out, source];
         const item = { id, sourceSha256: hash(bytes), state: "running" };
         report.cases.push(item); await save();
@@ -95,7 +98,7 @@ async function main() {
             hostEnv = { ...env, MEMMY_SANDBOX_TRACE: "1", MEMMY_SANDBOX_CHILD_ENV: Buffer.from(JSON.stringify(env)).toString("base64") };
           }
           // Allow identical engine time plus a separate launcher allowance.
-          Object.assign(item, await capture(command, argv, work, hostEnv, join(evidence, id), mode === "native" ? 120000 : 150000));
+          Object.assign(item, await capture(command, argv, work, hostEnv, join(evidence, id), threadProbe ? (mode === "native" ? 60000 : 90000) : (mode === "native" ? 120000 : 150000)));
           try {
             const pdf = await readFile(join(out, "source.pdf"));
             item.validPdf = pdf.subarray(0, 5).equals(Buffer.from("%PDF-"));
