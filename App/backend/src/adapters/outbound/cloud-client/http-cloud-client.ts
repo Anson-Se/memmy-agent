@@ -69,6 +69,7 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+const CLOUD_SOCIAL_LOGIN_TIMEOUT_MS = 20_000;
 const CLOUD_COMPOSIO_ROUTER_TIMEOUT_MS = 60_000;
 /** fun-asr uses the same asynchronous file job for chat clips and long recordings. */
 const CLOUD_ASR_TIMEOUT_MS = 600_000;
@@ -156,7 +157,7 @@ export function createHttpCloudClient(options: CreateHttpCloudClientOptions = {}
       const data = await requestCloudData<Record<string, unknown>>(
         fetchImpl,
         baseUrl,
-        timeoutMs,
+        socialLoginTimeoutMs(timeoutMs),
         "/api/agentUser/oauth/start",
         {
           body: {
@@ -178,7 +179,7 @@ export function createHttpCloudClient(options: CreateHttpCloudClientOptions = {}
       const data = await requestCloudData<Record<string, unknown>>(
         fetchImpl,
         baseUrl,
-        timeoutMs,
+        socialLoginTimeoutMs(timeoutMs),
         "/api/agentUser/oauth/status",
         {
           body: { flowId: input.flowId, pollToken: input.pollToken },
@@ -544,6 +545,10 @@ async function requestCloudData<T>(
   }
 
   return envelope.data as T;
+}
+
+function socialLoginTimeoutMs(timeoutMs: number): number {
+  return Math.max(timeoutMs, CLOUD_SOCIAL_LOGIN_TIMEOUT_MS);
 }
 
 function normalizeAgentRegion(value: string | undefined): "cn" | "intl" {

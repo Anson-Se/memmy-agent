@@ -11,49 +11,48 @@ const previewExamples = {
   research: {
     icon: BookOpen,
     prompts: [
-      { icon: FileText, zh: "生成一篇关于 AI Memory 的文献综述", en: "Generate a literature review on AI Memory" },
-      { icon: ListTree, zh: "为这组论文整理文献综述大纲", en: "Outline a literature review from these papers" },
-      { icon: Quote, zh: "检查综述草稿，标出需要补充引用的段落", en: "Mark passages in my draft that need citations" }
+      { icon: FileText, key: "plugins.examples.generateALiteratureReviewOnAIMemory" },
+      { icon: ListTree, key: "plugins.examples.outlineALiteratureReviewFromThesePapers" },
+      { icon: Quote, key: "plugins.examples.markPassagesInMyDraftThatNeedCitations" }
     ]
   },
   office: {
     icon: Presentation,
     prompts: [
-      { icon: FileText, zh: "把这份会议纪要整理成 Word 文档", en: "Turn these meeting notes into a Word document" },
-      { icon: BarChart3, zh: "根据这份表格生成图表和数据摘要", en: "Create charts and a summary from this spreadsheet" },
-      { icon: Presentation, zh: "将这份项目计划整理成 PPT 初稿", en: "Turn this project plan into a draft slide deck" }
+      { icon: FileText, key: "plugins.examples.turnTheseMeetingNotesIntoAWordDocument" },
+      { icon: BarChart3, key: "plugins.examples.createChartsAndASummaryFromThisSpreadsheet" },
+      { icon: Presentation, key: "plugins.examples.turnThisProjectPlanIntoADraftSlide" }
     ]
   },
   legal: {
     icon: Scale,
     prompts: [
-      { icon: FolderOpen, zh: "整理这批劳动用工调研材料", en: "Organize these employment research materials" },
-      { icon: ListChecks, zh: "根据现有材料列出待核实的访谈问题", en: "Draft interview questions to verify the information" },
-      { icon: FileCheck2, zh: "生成一份供律师复核的报告草稿", en: "Prepare a report draft for a lawyer to review" }
+      { icon: FolderOpen, key: "plugins.examples.organizeTheseEmploymentResearchMaterials" },
+      { icon: ListChecks, key: "plugins.examples.draftInterviewQuestionsToVerifyTheInformation" },
+      { icon: FileCheck2, key: "plugins.examples.prepareAReportDraftForALawyerTo" }
     ]
   },
   other: {
     icon: Sparkles,
     prompts: [
-      { icon: FileText, zh: "整理这份材料，列出关键要点", en: "Organize this material and list its key points" },
-      { icon: ListChecks, zh: "根据这个目标，整理接下来的步骤", en: "Outline the next steps toward this goal" },
-      { icon: Sparkles, zh: "根据我的要求，准备一份可修改的初稿", en: "Prepare an editable first draft from my instructions" }
+      { icon: FileText, key: "plugins.examples.organizeThisMaterialAndListItsKeyPoints" },
+      { icon: ListChecks, key: "plugins.examples.outlineTheNextStepsTowardThisGoal" },
+      { icon: Sparkles, key: "plugins.examples.prepareAnEditableFirstDraftFromMyInstructions" }
     ]
   }
 } as const;
 
 /** A static introduction visual. Examples do not submit prompts or start tasks. */
 export function PluginDetailPreview(props: PluginDetailPreviewProps) {
-  const { language } = useTranslation();
-  const zh = language === "zh-CN";
+  const { t } = useTranslation();
   const config = previewExamples[props.category];
   const AmbientIcon = config.icon;
 
   return (
     <figure className={`plugin-detail-preview plugin-detail-preview--${props.category}`}
-      aria-label={zh ? "使用示例" : "Usage examples"}>
+      aria-label={t("plugins.examples.usageExamples")}>
       <figcaption className="plugin-detail-preview-caption">
-        {zh ? `${props.name}的使用示例` : `Examples of using ${props.name}`}
+        {t("plugins.examples.examplesOfUsing", { name: props.name })}
       </figcaption>
       <div className="plugin-detail-preview-ambient" aria-hidden="true">
         <span className="plugin-detail-preview-orbit" />
@@ -64,9 +63,9 @@ export function PluginDetailPreview(props: PluginDetailPreviewProps) {
         {config.prompts.map((prompt) => {
           const Icon = prompt.icon;
           return (
-            <li key={prompt.en} className="plugin-detail-preview-example">
+            <li key={prompt.key} className="plugin-detail-preview-example">
               <Icon className="plugin-detail-preview-example-icon" strokeWidth={1.6} aria-hidden="true" />
-              <span className="plugin-detail-preview-example-text">{zh ? prompt.zh : prompt.en}</span>
+              <span className="plugin-detail-preview-example-text">{t(prompt.key)}</span>
             </li>
           );
         })}

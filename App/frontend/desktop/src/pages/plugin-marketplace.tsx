@@ -17,8 +17,7 @@ import { writeSettingsTabHash } from "./settings-nav.js";
 export function PluginMarketplace() {
   const { clients } = useApiClients();
   const { state, dispatch } = useAppState();
-  const { language } = useTranslation();
-  const en = language === "en-US";
+  const { t } = useTranslation();
   const [catalog, setCatalog] = useState<PluginCatalogEntry[] | null>(null);
   const [installed, setInstalled] = useState<InstalledPlugin[]>([]);
   const [loading, setLoading] = useState(true);
@@ -48,7 +47,7 @@ export function PluginMarketplace() {
     }, () => {
       if (generation.current !== current) return;
       setOfficialModelReady(undefined);
-      setModelError(en ? "Could not read model settings. Refresh to check availability." : "无法读取模型配置，请刷新后查看模型状态。");
+      setModelError(t("plugins.ui.couldNotReadModelSettingsRefreshToCheck"));
     });
     try {
       await clients.account?.getSession?.();
@@ -61,11 +60,11 @@ export function PluginMarketplace() {
       setError(null);
     } catch {
       if (generation.current !== current) return;
-      setError(en ? "Could not load plugins. Please try again." : "插件列表加载失败，请重试。");
+      setError(t("plugins.ui.couldNotLoadPluginsPleaseTryAgain"));
     } finally {
       if (generation.current === current) setLoading(false);
     }
-  }, [clients, en, state.account.userId]);
+  }, [clients, t, state.account.userId]);
 
   useEffect(() => {
     void refresh();
@@ -85,9 +84,7 @@ export function PluginMarketplace() {
       // Read back even after partial failure (e.g. installed but activation failed).
       await refresh();
       if (failed) {
-        setActionError(en
-          ? `Could not complete the action for ${plugin.name}. Please try again.`
-          : `${plugin.name}操作未完成，请重试。`);
+        setActionError(t("plugins.ui.couldNotCompleteTheActionForPleaseTry", { name: plugin.name }));
         setActionErrorPluginId(plugin.id);
       }
     } finally {

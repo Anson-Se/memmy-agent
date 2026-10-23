@@ -1,3 +1,4 @@
+import { messageCatalogs, resolveLanguage, type MessageKey } from "../i18n/messages.js";
 import type { InstalledPlugin } from "@memmy/local-api-contracts";
 import type { MarketplacePlugin } from "./plugin-marketplace-section.js";
 
@@ -21,15 +22,13 @@ export function officialPluginCatalog(options: {
   language: string;
   installed: InstalledPlugin[];
 }): MarketplacePlugin[] {
-  const en = options.language === "en-US";
+  const t = (key: MessageKey) => messageCatalogs[resolveLanguage(options.language)][key];
   const installedOf = (id: string) => options.installed.find((plugin) => plugin.id === id);
   return [
     {
       id: "literature-review", category: "research",
-      name: en ? "Literature Review" : "文献综述",
-      description: en
-        ? "Find papers, organize evidence, and draft a referenced literature review."
-        : "检索论文、整理证据，生成带参考文献的综述初稿。",
+      name: t("plugins.ui.literatureReview"),
+      description: t("plugins.catalog.findPapersOrganizeEvidenceAndDraftAReferenced"),
       ...OFFICIAL_PLUGIN_POLICIES["literature-review"],
       version: installedOf("literature-review")?.version,
       installable: true,
@@ -38,9 +37,7 @@ export function officialPluginCatalog(options: {
     {
       id: "office", category: "office",
       name: "Office",
-      description: en
-        ? "Create and edit Word, Excel, and PowerPoint files, and work with PDFs."
-        : "创建和编辑 Word、Excel、PPT 文档，并处理 PDF 文件。",
+      description: t("plugins.catalog.createAndEditWordExcelAndPowerPointFiles"),
       ...OFFICIAL_PLUGIN_POLICIES["office"],
       version: installedOf("office")?.version,
       installable: true,
@@ -48,10 +45,8 @@ export function officialPluginCatalog(options: {
     },
     {
       id: "legal-labor", category: "legal",
-      name: en ? "Employment Compliance Diagnosis" : "用工合规诊断",
-      description: en
-        ? "Organize employment research materials, verify information, and draft reports for professional review."
-        : "整理劳动用工调研材料、核实信息并起草报告，供专业人员审核。",
+      name: t("plugins.catalog.employmentComplianceDiagnosis"),
+      description: t("plugins.catalog.organizeEmploymentResearchMaterialsVerifyInformationAndDraft"),
       ...OFFICIAL_PLUGIN_POLICIES["legal-labor"],
       version: installedOf("legal-labor")?.version,
       installable: true,

@@ -1,10 +1,11 @@
+import { Window } from "happy-dom";
 import { readFileSync } from "node:fs";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { WINDOW_CONTROLS_OVERLAY_SAFE_TOP_STYLE } from "../../theme/window-controls-overlay.js";
 import { AttachmentActionError, emailAddressFromMailtoHref, estimateDeferredMarkdownHeight, isLikelyExpensiveAgentMarkdown, isMailtoHref, localArtifactPathFromHref, runAttachmentAction } from "../agent-message-content.js";
-import { AgentThreadMessages, buildAgentDisplayUnits, CHAT_IMAGE_LIGHTBOX_CLOSE_BUTTON_CLASS, CHAT_IMAGE_LIGHTBOX_NAV_BUTTON_CLASS, copyImageToClipboard, resolveAgentMessageDisplayContent, saveImageToFile } from "../agent-thread-messages.js";
+import { AgentThreadMessages, buildAgentDisplayUnits, CHAT_IMAGE_LIGHTBOX_CLOSE_BUTTON_CLASS, CHAT_IMAGE_LIGHTBOX_NAV_BUTTON_CLASS, copyImageToClipboard, deliveredFileSaveName, resolveAgentMessageDisplayContent, runDeliveredFileMenuAction, saveImageToFile } from "../agent-thread-messages.js";
 import { type AgentQuestionCardPayload } from "../agent-question-card.js";
 
 const agentThreadMessagesSourceUrl = new URL("../agent-thread-messages.tsx", import.meta.url);
@@ -2191,7 +2192,8 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain('data-testid="user-file-attachment"');
     expect(html).toContain('data-testid="file-type-icon-pdf"');
     expect(html).toContain(">shot<");
-    expect(html).toContain(">report.pdf<");
+    expect(html).toContain(">report<");
+    expect(renderedAttachmentTitle(html, "report")).toContain("report.pdf");
     expect(html).toContain('title="report.pdf"');
     expect(html).toContain(">PNG<");
     expect(html).toContain(">PDF<");
@@ -2548,7 +2550,8 @@ describe("AgentThreadMessages", () => {
 
     expect(html).toContain("<button");
     expect(html).toContain('title="/Users/yuan/deck.pptx"');
-    expect(html).toContain(">deck.pptx<");
+    expect(html).toContain(">deck<");
+    expect(renderedAttachmentTitle(html, "deck")).toContain("deck.pptx");
     expect(html).toContain("agent-delivered-files");
     expect(html).toContain(">PPTX<");
     expect(html).toContain('data-testid="file-type-icon-presentation"');
@@ -2825,4 +2828,12 @@ function fileArtifact(path: string, name = "deck.pptx", mediaUrl?: string) {
     kind: "file" as const,
     ...(mediaUrl ? { media_url: mediaUrl } : {})
   };
+}
+
+function renderedAttachmentTitle(html: string, displayName: string): string | null | undefined {
+  const document = new Window().document;
+  document.body.innerHTML = html;
+  return Array.from(document.querySelectorAll<HTMLElement>(".agent-attachment-card"))
+    .find((card) => card.querySelector(".agent-attachment-card__name")?.textContent?.trim() === displayName)
+    ?.getAttribute("title");
 }
