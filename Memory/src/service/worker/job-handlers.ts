@@ -603,6 +603,12 @@ export function classifyProcessingError(error: unknown): {
   if (!hasStructuredCode && /\b40309\b/.test(normalized)) {
     return { code: "40309", retryAction: "open_settings" };
   }
+  // Rate limits and temporary upstream failures can mention API keys without
+  // requiring a configuration change. Prefer their HTTP status to keywords.
+  if (error instanceof ModelHttpError && (error.httpStatus === 408 || error.httpStatus === 429 ||
+    (error.httpStatus >= 500 && error.httpStatus < 600))) {
+    return { code: "transient_provider_error", retryAction: "retry" };
+  }
   if (/api.?key|unauthorized|forbidden|\b401\b|\b403\b|\b404\b|model.+not configured|missing.+model|expected json|html instead of json|configured model endpoint/.test(normalized)) {
     return { code: "model_configuration", retryAction: "open_settings" };
   }

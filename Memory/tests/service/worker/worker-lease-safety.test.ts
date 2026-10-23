@@ -7,6 +7,7 @@ import { MemoryDb } from "../../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
 import { WorkerConcurrencyController } from "../../../src/service/worker/worker-concurrency.js";
 import { WorkerRunner, type WorkerRunnerDeps } from "../../../src/service/worker/worker-runner.js";
+import { classifyProcessingError } from "../../../src/service/worker/job-handlers.js";
 import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
 
 const resources: Array<{ root: string; db: MemoryDb }> = [];
@@ -272,6 +273,59 @@ describe("worker lease ownership and recovery", () => {
 });
 
 describe("worker business failure policy", () => {
+  it.each([408, 429, 500, 503])("backs off HTTP %s even when its response mentions an API key", async httpStatus => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    let calls = 0;
+    const h = harness(async () => {
+      if (++calls === 1) throw new ModelHttpError("provider request failed", "test", httpStatus,
+        "temporary_provider_error", "Temporary API key service limit; please retry shortly");
+    });
+    h.deps.configurationFingerprint = () => "unchanged-config";
+    h.job("transient-key-response", "trace_summary");
+    expect(await h.runner.runWorkerOnce(1)).toMatchObject({ leased: 1, failed: 1 });
+    const failed = h.repos.runtime.getJob("transient-key-response")!;
+    expect(failed).toMatchObject({ status: "failed", blockedReason: null, failureCount: 1 });
+    expect(Date.parse(failed.availableAt!)).toBe(epoch + 5_000);
+    expect(h.runner.nextWorkerRunAt()).toBe(epoch + 5_000);
+    vi.setSystemTime(epoch + 4_999);
+    expect((await h.runner.runWorkerOnce(1)).leased).toBe(0);
+    vi.setSystemTime(epoch + 5_000);
+    expect(await h.runner.runWorkerOnce(1)).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
+    expect(calls).toBe(2);
+  });
+
+  it.each([
+    [401, "invalid API key", "model_configuration", "open_settings"],
+    [400, "invalid request body", "invalid_model_request", "none"],
+    [400, "maximum context length exceeded", "model_input_too_long", "none"]
+  ] as const)("preserves the HTTP %s classification for %s", (status, detail, code, retryAction) => {
+    expect(classifyProcessingError(new ModelHttpError("provider request failed", "test", status, undefined, detail)))
+      .toEqual({ code, retryAction });
+  });
+
+  it("keeps an explicit missing-model configuration error waiting for configuration", () => {
+    expect(classifyProcessingError(new Error("model is not configured: missing API key")))
+      .toEqual({ code: "model_configuration", retryAction: "open_settings" });
+  });
+
+  it("preserves the explicit 40309 business error before retryable HTTP status classification", () => {
+    expect(classifyProcessingError(new ModelHttpError("provider request failed", "test", 429, "40309", "API key quota exhausted")))
+      .toEqual({ code: "40309", retryAction: "open_settings" });
+  });
+
+  it("does not apply a transient HTTP failure after the execution loses its lease", async () => {
+    const h = harness(async job => {
+      h.db.db.prepare("UPDATE evolution_jobs SET lease_owner='replacement', lease_token='replacement-token' WHERE id=?")
+        .run(job.id);
+      throw new ModelHttpError("provider request failed", "test", 429, undefined, "Temporary API key rate limit");
+    });
+    h.job("lost-before-http-failure");
+    expect(await h.runner.runWorkerOnce(1)).toMatchObject({ leased: 1, succeeded: 0, failed: 0 });
+    expect(h.repos.runtime.getJob("lost-before-http-failure")).toMatchObject({ status: "leased",
+      leaseOwner: "replacement", leaseToken: "replacement-token", failureCount: 0, availableAt: null, blockedReason: null });
+  });
+
   it("schedules a temporary failure, skips early retries, then runs it when due", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
     vi.spyOn(Math, "random").mockReturnValue(0.5);
@@ -354,6 +408,25 @@ describe("worker business failure policy", () => {
 });
 
 describe("embedding retry configuration recovery", () => {
+  it.each([429, 503])("retries HTTP %s embedding failures mentioning API keys without waiting for configuration", async httpStatus => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
+    const h = harness(); h.retry("transient-key-retry");
+    let calls = 0;
+    h.deps.embedder.embed = async texts => {
+      if (++calls === 1) throw new ModelHttpError("provider request failed", "test", httpStatus, undefined,
+        "Temporary API key service limit; please retry shortly");
+      return texts.map(() => [1, 0, 0]);
+    };
+    h.deps.configurationFingerprint = () => "unchanged-config";
+    expect((await h.runner.runWorkerOnce(1)).embeddingRetries).toMatchObject({ leased: 1, failed: 1 });
+    const retry = h.repos.runtime.getEmbeddingRetry("transient-key-retry")!;
+    expect(retry).toMatchObject({ status: "pending", attempts: 1, blockedReason: null });
+    expect(retry.nextAttemptAt).toBeGreaterThan(epoch);
+    vi.setSystemTime(retry.nextAttemptAt);
+    expect((await h.runner.runWorkerOnce(1)).embeddingRetries).toMatchObject({ leased: 1, succeeded: 1, failed: 0 });
+    expect(calls).toBe(2);
+  });
+
   it("holds unauthorized embedding retries without consuming their failure budget", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(epoch);
     const h = harness(); h.retry("unauthorized-retry");
