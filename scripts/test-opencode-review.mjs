@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createOpencodeSkillTarget as backend } from "../App/backend/src/adapters/outbound/skill-writer/opencode/target.ts";
 import { createOpencodeSkillTarget as memory } from "../Memory/src/agent-source/integration/opencode/target.ts";
 import { readOpencodeDatabase } from "../Memory/src/agent-source/adapters/opencode/db-reader.ts";
-import { selectSourceTurn, buildSourceTurnRequest } from "../AgentSourceCore/src/source-turn.ts";
+import { selectSourceTurn, buildSourceTurnRequest } from "../Memory/AgentSourceCore/src/source-turn.ts";
 import { createMemoryServiceFixture } from "../Memory/tests/fixtures/memory-service-fixture.ts";
 import { createMemoryHttpServer } from "../Memory/src/index.ts";
 import { Repositories } from "../Memory/src/storage/repositories.ts";
