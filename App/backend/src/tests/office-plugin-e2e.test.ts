@@ -104,12 +104,17 @@ describe("Office MPP end to end", () => {
     expect(tools).toHaveLength(installed.manifest.capabilities.length);
     const toolName = (id: string) => tools.find(t => t.name.includes(`${id}_`))!.name;
     const results: Array<Record<string, any>> = [];
-    const call = async (id: string, args: Record<string, unknown>, expectedError?: string) => {
+    const call = async (id: string, args: Record<string, unknown>, expectedError?: string | readonly string[]) => {
       console.info(`Office E2E: ${id} started`);
       const result = await client.callTool({ name: toolName(id), arguments: args, _meta: { "memmy.dev/session-key": "office-e2e" } }, undefined, { timeout: 360000 });
       console.info(`Office E2E: ${id} completed`);
       const text = (result.content as Array<{ type: string; text?: string }>).find(c => c.type === "text")?.text ?? "";
-      if (expectedError) { expect(result.isError).toBe(true); expect(text).toContain(expectedError); return {}; }
+      if (expectedError) {
+        expect(result.isError).toBe(true);
+        if (typeof expectedError === "string") expect(text).toContain(expectedError);
+        else expect(expectedError.some(code => text.startsWith(`${code}:`)), text).toBe(true);
+        return {};
+      }
       expect(result.isError, `${id}: ${text}`).not.toBe(true);
       const output = JSON.parse(text); results.push(output);
       if (id === "office_review_page") expect((result.content as Array<{ type: string }>).some(c => c.type === "image")).toBe(true);
@@ -256,9 +261,17 @@ describe("Office MPP end to end", () => {
     const imported = await call("office_import", { path: uploaded });
     expect(imported.sourceUnchanged).toBe(true); expect(sha(readFileSync(uploaded))).toBe(uploadHash);
     await call("office_inspect", { taskId: imported.taskId, file: "../uploaded.docx" }, "invalid_path");
-    await call("office_import", { path: "/etc/passwd" }, "EPERM");
+    // The Unix system path does not exist on Windows, where ENOENT proves
+    // nothing about sandbox denial. The owned, existing fixture below covers
+    // denied imports on every platform without relying on OS-specific paths.
+    if (process.platform !== "win32") await call("office_import", { path: "/etc/passwd" }, "EPERM");
     const deniedPath = join(root, "outside.docx"); writeFileSync(deniedPath, readFileSync(uploaded));
-    await call("office_import", { path: deniedPath }, "EPERM");
+    expect(existsSync(deniedPath)).toBe(true);
+    const deniedHash = sha(readFileSync(deniedPath));
+    // Both OS-level access denial and the plugin's approved-root guard reject
+    // this file; missing-file and unrelated errors must not satisfy the test.
+    await call("office_import", { path: deniedPath }, ["EPERM", "EACCES", "unsafe_file"]);
+    expect(sha(readFileSync(deniedPath))).toBe(deniedHash);
 
     await service.disable("office");
     expect((await client.listTools()).tools).toEqual([]);
