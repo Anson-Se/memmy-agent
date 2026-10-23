@@ -179,6 +179,56 @@ describe("atomic resource admission before queue claims", () => {
     expect(release).toHaveBeenCalledTimes(2);
   });
 
+  it("persists unspent model turns while maintenance wraps the compatible legacy cursor", () => {
+    const h = harness();
+    for (let i = 0; i < 4; i++) { h.job(`import-${i}`, "import_summary"); h.job(`evolution-${i}`, "reflection"); }
+    function finish(work: FairClaimedWork[]) {
+      for (const item of work) {
+        if (item.queue === "main") h.runtime.completeJob(item.job.id, at, item.job);
+        item.admission?.release();
+      }
+    }
+    for (let i = 0; i < 2; i++) {
+      const work = h.claim(1, () => ({ release() {} }));
+      expect(work[0]?.queue === "main" && work[0].job.id).toBe(`import-${i}`);
+      finish(work);
+    }
+    for (let i = 0; i < 10; i++) {
+      h.job(`maintenance-${i}`, "episode_idle_close");
+      const work = h.claim(1, item => item.queue === "main" && item.job.jobType === "episode_idle_close" ? { release() {} } : undefined);
+      expect(work[0]?.queue === "main" && work[0].job.id).toBe(`maintenance-${i}`);
+      finish(work);
+    }
+    const saved = h.runtime.getKv("worker.scheduler.wrr_cursor.v1")?.value;
+    expect(saved).toMatchObject({ cursor: 0, turns: { version: 1 } });
+    const restored = new Repositories(h.db.db);
+    const work = claimFairWorkerBatch(restored, { at, limit: 1, includeRetries: true, owner: "restored", retryOwner: "retry",
+      leaseSeconds: 60, retryLeaseMs: 60_000, options: resolveWorkerSchedulingOptions({}, {}), admit: () => ({ release() {} }) });
+    expect(work[0]?.queue === "main" && work[0].job.id).toBe("evolution-0");
+    finish(work);
+  });
+
+  it.each([undefined, null, {}, { version: 9, lanes: [] }, { version: 1, lanes: [] }])(
+    "accepts old cursor state and ignores malformed optional lane turns: %j", turns => {
+      const h = harness(); h.job("import", "import_summary"); h.job("evolution", "reflection");
+      h.runtime.setKv("worker.scheduler.wrr_cursor.v1", { weightsKey: "4/3/2/2/1", cursor: 8, turns }, at);
+      const work = h.claim(1, () => ({ release() {} }));
+      expect(work[0]?.queue === "main" && work[0].job.id).toBe("import");
+      expect(h.runtime.getKv("worker.scheduler.wrr_cursor.v1")?.value).toMatchObject({ cursor: 9, turns: { version: 1 } });
+      work[0]!.admission!.release();
+    }
+  );
+
+  it("discards turns saved with a different weight configuration", () => {
+    const h = harness(); h.job("interactive"); h.job("import", "import_summary");
+    h.runtime.setKv("worker.scheduler.wrr_cursor.v1", { weightsKey: "1/1/1/1/1", cursor: 8,
+      turns: { version: 1, lanes: ["import", "evolution", "maintenance", "interactive", "repair_retry"]
+        .map(lane => ({ lane, remaining: 1 })) } }, at);
+    const work = h.claim(1, () => ({ release() {} }));
+    expect(work[0]?.queue === "main" && work[0].job.id).toBe("interactive");
+    work[0]!.admission!.release();
+  });
+
   it("does not claim, count an attempt or advance WRR when all permits are busy", () => {
     const h = harness(); const before = h.job("busy"); h.retry("retry-busy");
     const admit = vi.fn((_work: FairClaimedWork) => undefined);

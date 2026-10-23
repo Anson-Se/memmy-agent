@@ -3,6 +3,7 @@ import type { Repositories, EvolutionJobRecord, EmbeddingRetryRecord } from "../
 import type { QueueEligibilityOptions } from "../../storage/queue-eligibility.js";
 import type { SchedulingCandidate } from "../../storage/queue-scheduling-store.js";
 import { LaneQueueSelector } from "./lane-queue-selector.js";
+import { AdmissionLaneQueueSelector, type LaneQueueTurns } from "./admission-lane-queue-selector.js";
 import { QUEUE_LANES } from "./job-policy-registry.js";
 import type { ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 
@@ -33,6 +34,7 @@ type ScanContinuation = {
   mainDone: boolean;
   retryDone: boolean;
   cohort?: number;
+  turns?: LaneQueueTurns;
 };
 /** Owned by one drain/fill; discard after permits/configuration change or a completed scan. */
 export interface FairWorkerScan {
@@ -217,9 +219,10 @@ function claimAdmittedWorkerBatch(
       }
       const cursorKey = scopeCursorKey(request);
       const weightsKey = QUEUE_LANES.map(lane => input.options.laneWeights[lane]).join("/");
-      const saved = repos.runtime.getKv(cursorKey)?.value as { weightsKey?: unknown; cursor?: unknown } | undefined;
+      const saved = repos.runtime.getKv(cursorKey)?.value as { weightsKey?: unknown; cursor?: unknown; turns?: unknown } | undefined;
       const cursor = saved?.weightsKey === weightsKey && Number.isSafeInteger(saved.cursor) && Number(saved.cursor) >= 0 ? Number(saved.cursor) : 0;
-      const selector = new LaneQueueSelector(input.options.laneWeights, cursor);
+      const selector = new AdmissionLaneQueueSelector(input.options.laneWeights, cursor,
+        state.turns ?? (saved?.weightsKey === weightsKey ? saved.turns : undefined));
       const { buckets, candidates } = state;
       function refill() {
         for (const bucket of buckets) {
@@ -234,8 +237,12 @@ function claimAdmittedWorkerBatch(
       let exhausted = false;
       while (claimed.length < limit && inspected < inspectLimit) {
         refill();
-        const before = selector.getCursor();
-        const chosen = selector.select(candidates, 1).selected[0];
+        // A page that has never contained a row proves an empty lane. Exhausted
+        // pages after rejected candidates do not: their unspent turn survives.
+        selector.dropEmpty(new Set(QUEUE_LANES.filter(lane =>
+          buckets.filter(bucket => bucket.lane === lane).every(bucket => bucket.after === 0 && bucket.exhausted) &&
+          !candidates.some(candidate => candidate.lane === lane))));
+        const chosen = selector.choose(candidates);
         if (!chosen) { exhausted = true; break; }
         candidates.splice(candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id), 1);
         inspected++;
@@ -247,11 +254,11 @@ function claimAdmittedWorkerBatch(
           const retry = repos.runtime.getEmbeddingRetry(chosen.id);
           if (retry) result = tryClaim({ queue: "embedding_retry", retry });
         }
-        if (result) claimed.push(result);
-        else selector.setCursor(before);
+        if (result) { claimed.push(result); selector.commit(chosen.lane); }
       }
+      state.turns = selector.snapshot();
       saveScan(!exhausted && claimed.length < limit);
-      if (claimed.length) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor() }, input.at);
+      if (claimed.length) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor(), turns: selector.snapshot() }, input.at);
       return claimed;
     });
   } catch (error) {
