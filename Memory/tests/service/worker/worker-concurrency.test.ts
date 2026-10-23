@@ -148,7 +148,7 @@ describe("atomic worker admission and real model requests", () => {
     const c = new WorkerConcurrencyController({ resourceLimits: { summary: 1 } }, {});
     const p = c.tryAcquire(req())!;
     expect(c.tryAcquire(req())).toBeUndefined();
-    const other = c.tryAcquire(req({ resourceClass: "embedding" }), 3)!;
+    const other = c.tryAcquire(req({ resourceClass: "embedding", queueLane: "interactive" }), 3)!;
     expect(c.availableJobs()).toBe(0); expect(c.tryAcquire(req({ resourceClass: "database" }))).toBeUndefined();
     p.release(); other.release();
   });

@@ -35,9 +35,9 @@ async function runSharedProvider(options: {
   const providerLimit = options.cloud ? 2 : 1;
   const blockedProvider = [{ key: "independent-blocked-model", limit: 1 }];
   const held = options.blockedInteractiveScope
-    ? concurrency.tryAcquire({ resourceClass: "scan", providers: [], scopeKeys: [JSON.stringify(["target", "busy-scope"])] })!
+    ? concurrency.tryAcquire({ queueLane: "interactive", resourceClass: "summary", providers: [], scopeKeys: [JSON.stringify(["target", "busy-scope"])] })!
     : options.blockedInteractive
-      ? concurrency.tryAcquire({ resourceClass: "summary", providers: blockedProvider, scopeKeys: [] })! : undefined;
+      ? concurrency.tryAcquire({ queueLane: "interactive", resourceClass: "summary", providers: blockedProvider, scopeKeys: [] })! : undefined;
   const maintenanceWaiters = new Set<() => void>();
   const wakeMaintenance = () => { for (const wake of maintenanceWaiters) wake(); maintenanceWaiters.clear(); };
   abort.signal.addEventListener("abort", wakeMaintenance);
@@ -118,7 +118,7 @@ async function runSharedProvider(options: {
     expect(peakModelRequests).toBe(providerLimit);
     expect(activeModelRequests).toBe(0);
     held?.release();
-    expect(concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    expect(concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, backgroundActiveJobs: 0, maxBackgroundJobs: 3, interactiveReservedSlots: 1, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
     expect(db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='leased'").get()).toEqual({ n: 0 });
     const waiting = db.db.prepare("SELECT attempts,lease_token FROM evolution_jobs WHERE status='queued'").all() as Array<{ attempts: number; lease_token: string | null }>;
     expect(waiting.every(row => row.attempts === 0 && row.lease_token === null)).toBe(true);

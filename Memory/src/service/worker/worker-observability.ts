@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { QUEUE_LANES, RESOURCE_CLASSES, type ResourceClass } from "./job-policy-registry.js";
 
-export type AdmissionRejectReason = "global" | "resource" | "scope" | "provider" | "embedding_request" | "batch" | "closing" | "share_invalid";
+export type AdmissionRejectReason = "global" | "background" | "resource" | "scope" | "provider" | "embedding_request" | "batch" | "closing" | "share_invalid";
 export type WorkerSkipReason = AdmissionRejectReason | "budget" | "configuration" | "dependency" | "unknown";
 export type WorkerMetricOutcome = "succeeded" | "failed" | "released" | "fenced";
 export interface ObservedWorkerWork {
@@ -15,6 +15,7 @@ export interface ObservedWorkerWork {
 }
 export interface ObservedConcurrency {
   activeJobs: number; maxActiveJobs: number;
+  backgroundActiveJobs?: number; maxBackgroundJobs?: number; interactiveReservedSlots?: number;
   resources: Readonly<Record<string, number>>;
   resourceLimits: Readonly<Record<ResourceClass, number>>;
   providers: ReadonlyArray<{ key: string; active: number; limit: number }>;
@@ -147,12 +148,14 @@ export class WorkerObservability implements WorkerObserver {
         value.active += count(provider.active); value.limit += count(provider.limit); providerValues.set(id, value);
       }
       this.current = { activeJobs: count(event.state.activeJobs), maxActiveJobs: count(event.state.maxActiveJobs),
+        backgroundActiveJobs: count(event.state.backgroundActiveJobs), maxBackgroundJobs: count(event.state.maxBackgroundJobs),
+        interactiveReservedSlots: count(event.state.interactiveReservedSlots),
         resources: Object.fromEntries(RESOURCE_CLASSES.map(resource => [resource, count(event.state.resources[resource])])),
         resourceLimits: Object.fromEntries(RESOURCE_CLASSES.map(resource => [resource, count(event.state.resourceLimits[resource])])) as Record<ResourceClass, number>,
         embeddingRequests: count(event.state.embeddingRequests), embeddingRequestLimit: count(event.state.embeddingRequestLimit),
         providers: [...providerValues.values()] };
       const peak = (name: string, value: number) => bucket.peaks.set(name, Math.max(bucket.peaks.get(name) ?? 0, value));
-      peak("global", event.state.activeJobs); peak("embedding_request", event.state.embeddingRequests);
+      peak("background", count(event.state.backgroundActiveJobs)); peak("global", event.state.activeJobs); peak("embedding_request", event.state.embeddingRequests);
       for (const resource of RESOURCE_CLASSES) peak(`resource.${resource}`, event.state.resources[resource] ?? 0);
       for (const provider of this.current.providers) peak(`provider.${provider.key}`, provider.active);
     } else if (event.type === "tokens" || event.type === "model_request") {
@@ -183,7 +186,7 @@ export class WorkerObservability implements WorkerObserver {
     // event. Its current occupancy still belongs to that window's peak.
     if (this.current) {
       const peak = (name: string, value: number) => peaks.set(name, Math.max(peaks.get(name) ?? 0, value));
-      peak("global", this.current.activeJobs); peak("embedding_request", this.current.embeddingRequests);
+      peak("background", count(this.current.backgroundActiveJobs)); peak("global", this.current.activeJobs); peak("embedding_request", this.current.embeddingRequests);
       for (const resource of RESOURCE_CLASSES) peak(`resource.${resource}`, this.current.resources[resource] ?? 0);
       for (const provider of this.current.providers) peak(`provider.${provider.key}`, provider.active);
     }

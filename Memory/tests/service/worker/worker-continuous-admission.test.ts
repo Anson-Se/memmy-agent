@@ -102,7 +102,8 @@ function mainRows(h: ReturnType<typeof harness>) {
 
 function expectNoPermits(h: ReturnType<typeof harness>) {
   expect(h.concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: h.concurrency.limits.maxActiveJobs,
-    resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    backgroundActiveJobs: 0, maxBackgroundJobs: h.concurrency.limits.maxBackgroundJobs,
+    interactiveReservedSlots: h.concurrency.limits.interactiveReservedSlots, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
 }
 function prepareProviders(h: ReturnType<typeof harness>, prepare: (work: FairClaimedWork) => PreparedWorkerExecution) {
   h.deps.prepareExecution = prepare;

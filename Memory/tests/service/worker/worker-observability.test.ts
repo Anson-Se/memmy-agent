@@ -23,6 +23,24 @@ function routed(metrics: WorkerObserver, c: WorkerConcurrencyController) {
 }
 
 describe("bounded worker diagnostics", () => {
+  it("reports background occupancy, reservation and admission rejection without a full queue census", () => {
+    let now = at;
+    const metrics = new WorkerObservability({ now: () => now });
+    const c = new WorkerConcurrencyController({}, {}), detach = c.observe(metrics);
+    const background = c.tryAcquire(req({ queueLane: "import" }), 3)!;
+    expect(c.tryAcquire(req({ queueLane: "maintenance" }))).toBeUndefined();
+    const interactive = c.tryAcquire(req({ queueLane: "interactive" }))!;
+    expect(asSnapshot(metrics).concurrency).toMatchObject({ activeJobs: 4, backgroundActiveJobs: 3,
+      maxBackgroundJobs: 3, interactiveReservedSlots: 1, peaks: { global: 4, background: 3 } });
+    expect(asSnapshot(metrics).counters["admission_rejected.background"]).toBe(1);
+    // Unchanged occupancy must remain visible after the event's original window expires.
+    now += 310_001;
+    expect(asSnapshot(metrics).concurrency.peaks.background).toBe(3);
+    background.release(); background.release(); interactive.release();
+    expect(asSnapshot(metrics).concurrency).toMatchObject({ activeJobs: 0, backgroundActiveJobs: 0 });
+    detach(); metrics.stop();
+  });
+
   it("reports started wait percentiles, completion rate and time-due counts without claiming they are runnable", () => {
     let now = at;
     const metrics = new WorkerObservability({ now: () => now, queueSnapshot: () => [{ lane: "import", queued: 7, failed: 1,

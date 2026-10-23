@@ -50,7 +50,8 @@ function harness(maxActiveJobs = 4) {
     repos.transaction(() => { for (let i = 0; i < total; i++) job(`auto-${i}`, type); });
   }
   function expectClean() {
-    expect(concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: maxActiveJobs, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    expect(concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: maxActiveJobs, backgroundActiveJobs: 0,
+      maxBackgroundJobs: concurrency.limits.maxBackgroundJobs, interactiveReservedSlots: concurrency.limits.interactiveReservedSlots, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
     const queued = db.db.prepare("SELECT attempts,lease_token FROM evolution_jobs WHERE status='queued'").all();
     expect(queued.every(row => (row as { attempts: number; lease_token: string | null }).attempts === 0
       && (row as { lease_token: string | null }).lease_token === null)).toBe(true);

@@ -50,7 +50,8 @@ export function workerWorkRequirements(
         ?? text(internal?.projectId) ?? job?.scopeKey ?? null;
     scopeKeys.push(JSON.stringify(["user_project", job?.userId ?? memory?.userId, project]));
   }
-  return { resourceClass: policy.resourceClass, providers: execution?.providers ?? [], scopeKeys,
+  return { queueLane: work.queue === "main" ? work.job.queueLane ?? undefined : work.retry.queueLane ?? undefined,
+    resourceClass: policy.resourceClass, providers: execution?.providers ?? [], scopeKeys,
     embedding: execution?.embedding === true || policy.concurrency.providerRoles.includes("embedding") };
 }
 

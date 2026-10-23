@@ -98,7 +98,7 @@ describe("Skill cluster assignment/evolution admission", () => {
     const evolutions = h.repos.runtime.listJobs(undefined, 100).filter(job => job.jobType === "skill_batch_evolve" && job.payload.clusterId === cluster.id);
     expect(evolutions).toHaveLength(2);
     expect(evolutions.every(job => job.status === "succeeded")).toBe(true);
-    expect(h.controller.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    expect(h.controller.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, backgroundActiveJobs: 0, maxBackgroundJobs: 3, interactiveReservedSlots: 1, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
   });
 
   it("resolves Skill scopes from authoritative episode/cluster metadata without a target or current session", async () => {

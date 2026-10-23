@@ -80,7 +80,7 @@ describe("feedback experience worker model admission", () => {
     const savedVector = memoryVector(repos.memories.get(policies[0]!.id)!, "vec")!;
     expect(savedVector).toHaveLength(vector.length);
     vector.forEach((value, index) => expect(savedVector[index]).toBeCloseTo(value));
-    expect(controller.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    expect(controller.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, backgroundActiveJobs: 0, maxBackgroundJobs: 3, interactiveReservedSlots: 1, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
     await service.stop();
   });
 });

@@ -90,7 +90,9 @@ afterEach(() => {
 
 describe("production WRR and runnable FIFO", () => {
   it("keeps global lane opportunities when targeted maintenance drains interleave", async () => {
-    const h = harness();
+    // Keep all four selected jobs admissible: this case isolates cursor sharing,
+    // while the dedicated reservation tests exercise background saturation.
+    const h = harness({ concurrency: new WorkerConcurrencyController({ maxActiveJobs: 5 }, {}) });
     for (let i = 0; i < 30; i++) {
       h.job(`native-${i}`, "trace_summary"); h.job(`repair-${i}`, "decision_repair");
       h.job(`import-${i}`, "import_summary"); h.job(`evolution-${i}`);

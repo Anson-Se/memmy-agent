@@ -84,6 +84,6 @@ describe("reflection and reward episode admission", () => {
     expect(beforeRelease).toEqual(["reflection-A", "reward-B"]);
     expect(executed).toEqual(["reflection-A", "reward-B", "reward-A"]);
     expect(result).toMatchObject({ leased: 3, succeeded: 3, failed: 0 });
-    expect(h.concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
+    expect(h.concurrency.snapshot()).toEqual({ activeJobs: 0, availableJobs: 4, backgroundActiveJobs: 0, maxBackgroundJobs: 3, interactiveReservedSlots: 1, resources: {}, providers: {}, scopeKeys: [], embeddingRequests: 0 });
   });
 });

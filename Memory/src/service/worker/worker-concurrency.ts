@@ -13,6 +13,8 @@ export interface WorkerConcurrencyOptions {
 }
 export interface WorkerConcurrencyLimits {
   readonly maxActiveJobs: number;
+  readonly maxBackgroundJobs: number;
+  readonly interactiveReservedSlots: number;
   readonly resourceLimits: Readonly<Record<ResourceClass, number>>;
   readonly localModelConcurrency: number;
   readonly cloudModelConcurrency: number;
@@ -25,6 +27,8 @@ export interface WorkerRequirements {
   providers: readonly ProviderRequirement[];
   scopeKeys: readonly string[];
   embedding?: boolean;
+  /** Persisted scheduling lane; only interactive may use the reserved slot. */
+  queueLane?: string;
 }
 export interface WorkerPermit {
   release(): void;
@@ -57,7 +61,7 @@ interface PermitState {
   group: ReservationGroup;
 }
 const defaults: WorkerConcurrencyLimits = Object.freeze({
-  maxActiveJobs: 4,
+  maxActiveJobs: 4, maxBackgroundJobs: 3, interactiveReservedSlots: 1,
   resourceLimits: Object.freeze({ summary: 4, embedding: 4, evolution_llm: 4, database: 1, scan: 1 }),
   localModelConcurrency: 1, cloudModelConcurrency: 2, embeddingRequestConcurrency: 1, embeddingBatchSize: 16
 });
@@ -87,8 +91,11 @@ export function resolveWorkerConcurrencyOptions(
     if (!(RESOURCE_CLASSES as readonly string[]).includes(key)) throw new TypeError(`Unknown resource class: ${key}`);
     resourceLimits[key as ResourceClass] = positive(value, `resourceLimits.${key}`);
   }
+  const maxActiveJobs = number("maxActiveJobs", "MEMMY_WORKER_MAX_ACTIVE_JOBS");
+  // A single-slot configuration must still permit background progress.
+  const interactiveReservedSlots = maxActiveJobs > 1 ? 1 : 0;
   return Object.freeze({
-    maxActiveJobs: number("maxActiveJobs", "MEMMY_WORKER_MAX_ACTIVE_JOBS"),
+    maxActiveJobs, interactiveReservedSlots, maxBackgroundJobs: maxActiveJobs - interactiveReservedSlots,
     resourceLimits: Object.freeze(resourceLimits),
     localModelConcurrency: number("localModelConcurrency", "MEMMY_WORKER_LOCAL_MODEL_CONCURRENCY"),
     cloudModelConcurrency: number("cloudModelConcurrency", "MEMMY_WORKER_CLOUD_MODEL_CONCURRENCY"),
@@ -153,6 +160,7 @@ export function workerModelBatchKey(configs: readonly unknown[]): string {
 export class WorkerConcurrencyController {
   readonly limits: WorkerConcurrencyLimits;
   private activeJobs = 0;
+  private backgroundActiveJobs = 0;
   private readonly resources = new Map<ResourceClass, number>();
   private readonly providers = new Map<string, Map<ReservationGroup, number>>();
   private readonly scopes = new Set<string>();
@@ -207,6 +215,8 @@ export class WorkerConcurrencyController {
   snapshot() {
     return {
       activeJobs: this.activeJobs, availableJobs: this.availableJobs(),
+      backgroundActiveJobs: this.backgroundActiveJobs, maxBackgroundJobs: this.limits.maxBackgroundJobs,
+      interactiveReservedSlots: this.limits.interactiveReservedSlots,
       resources: Object.fromEntries(this.resources),
       providers: Object.fromEntries([...this.providers].map(([key, groups]) => [key, groups.size])),
       scopeKeys: [...this.scopes], embeddingRequests: this.embeddingRequests
@@ -232,13 +242,17 @@ export class WorkerConcurrencyController {
     const providers = [...providerMap].sort(([a], [b]) => a.localeCompare(b)).map(([key, limit]) => ({ key, limit }));
     const scopeKeys = [...new Set(input.scopeKeys)];
     if (scopeKeys.some(key => typeof key !== "string" || !key.trim())) throw new TypeError("Scope keys must be nonempty strings");
-    const requirements: WorkerRequirements = { resourceClass: input.resourceClass, providers, scopeKeys, embedding: input.embedding === true };
+    const requirements: WorkerRequirements = { resourceClass: input.resourceClass, providers, scopeKeys, embedding: input.embedding === true, queueLane: input.queueLane };
     const parent = shareWith ? this.states.get(shareWith) : undefined;
     if (shareWith && (!parent || parent.released || parent.group.resourceClass !== "embedding" || input.resourceClass !== "embedding"
       || !parent.group.embedding || !input.embedding || JSON.stringify(parent.group.providers) !== JSON.stringify(providers))) return reject("share_invalid");
     if (input.resourceClass === "embedding" && input.embedding &&
       logicalJobs + (parent?.group.logicalJobs ?? 0) > this.limits.embeddingBatchSize) return reject("batch");
     if (logicalJobs > this.availableJobs()) return reject("global");
+    // Charge every logical member independently, including shared embedding batches.
+    // Missing/unknown lanes do not gain interactive privilege; foreground calls charge zero.
+    const backgroundJobs = input.queueLane === "interactive" ? 0 : logicalJobs;
+    if (this.backgroundActiveJobs + backgroundJobs > this.limits.maxBackgroundJobs) return reject("background");
     if ((this.resources.get(input.resourceClass) ?? 0) + logicalJobs > this.limits.resourceLimits[input.resourceClass]) return reject("resource");
     if (scopeKeys.some(key => this.scopes.has(key))) return reject("scope");
     if (!parent) {
@@ -262,6 +276,7 @@ export class WorkerConcurrencyController {
     group.members++;
     group.logicalJobs += logicalJobs;
     this.activeJobs += logicalJobs;
+    this.backgroundActiveJobs += backgroundJobs;
     this.resources.set(input.resourceClass, (this.resources.get(input.resourceClass) ?? 0) + logicalJobs);
     for (const key of scopeKeys) this.scopes.add(key);
     const state: PermitState = { requirements, logicalJobs, released: false, group };
@@ -272,6 +287,7 @@ export class WorkerConcurrencyController {
         state.released = true;
         group.logicalJobs -= logicalJobs;
         this.activeJobs -= logicalJobs;
+        this.backgroundActiveJobs -= backgroundJobs;
         const count = (this.resources.get(input.resourceClass) ?? 0) - logicalJobs;
         if (count) this.resources.set(input.resourceClass, count); else this.resources.delete(input.resourceClass);
         for (const key of scopeKeys) this.scopes.delete(key);
@@ -289,6 +305,8 @@ export class WorkerConcurrencyController {
     if (this.observers.size === 0) return;
     const state = {
       activeJobs: this.activeJobs, maxActiveJobs: this.limits.maxActiveJobs,
+      backgroundActiveJobs: this.backgroundActiveJobs, maxBackgroundJobs: this.limits.maxBackgroundJobs,
+      interactiveReservedSlots: this.limits.interactiveReservedSlots,
       resources: Object.fromEntries(this.resources), resourceLimits: this.limits.resourceLimits,
       providers: [...this.providers].map(([key, groups]) => ({ key, active: groups.size, limit: Math.min(...groups.values()) })),
       embeddingRequests: this.embeddingRequests, embeddingRequestLimit: this.limits.embeddingRequestConcurrency

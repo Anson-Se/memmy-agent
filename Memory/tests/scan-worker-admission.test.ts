@@ -128,20 +128,60 @@ describe("Memory-owned scan admission after Desktop scanner consolidation", () =
     expect(h.concurrency.snapshot().scopeKeys).toEqual([]);
   });
 
-  it("counts a scan in the same global budget as worker tasks", async () => {
+  it("counts a scan in the shared background and global budgets while retaining the interactive slot", async () => {
     const entered = deferred(), finish = deferred();
     const h = await harness(async () => { entered.resolve(); await finish.promise; });
     expect((await h.post("local")).status).toBe(202); await entered.promise;
     expect(h.concurrency.snapshot()).toMatchObject({ activeJobs: 1, resources: { scan: 1 } });
-    const held = Array.from({ length: 3 }, (_, index) => h.concurrency.tryAcquire({
-      resourceClass: "summary", providers: [], scopeKeys: [`worker-${index}`]
+    const held = Array.from({ length: 2 }, (_, index) => h.concurrency.tryAcquire({
+      resourceClass: "summary", queueLane: "import", providers: [], scopeKeys: [`worker-${index}`]
     }));
-    expect(held.every(Boolean)).toBe(true);
-    expect(h.concurrency.snapshot().activeJobs).toBe(4);
-    expect(h.concurrency.tryAcquire({ resourceClass: "summary", providers: [], scopeKeys: [] })).toBeUndefined();
-    held.forEach(permit => permit?.release());
-    finish.resolve(); await h.done();
-    await vi.waitFor(() => expect(h.concurrency.snapshot().activeJobs).toBe(0));
+    let interactive: ReturnType<WorkerConcurrencyController["tryAcquire"]>;
+    try {
+      expect(held.every(Boolean)).toBe(true);
+      expect(h.concurrency.snapshot()).toMatchObject({ activeJobs: 3, backgroundActiveJobs: 3, availableJobs: 1 });
+      expect(h.concurrency.tryAcquire({ resourceClass: "summary", queueLane: "import", providers: [], scopeKeys: [] })).toBeUndefined();
+      interactive = h.concurrency.tryAcquire({ resourceClass: "summary", queueLane: "interactive", providers: [], scopeKeys: [] });
+      expect(interactive).toBeDefined();
+      expect(h.concurrency.snapshot()).toMatchObject({ activeJobs: 4, backgroundActiveJobs: 3, availableJobs: 0 });
+      expect(h.concurrency.tryAcquire({ resourceClass: "summary", queueLane: "interactive", providers: [], scopeKeys: [] })).toBeUndefined();
+    } finally {
+      interactive?.release(); held.forEach(permit => permit?.release());
+      finish.resolve(); await h.done();
+    }
+    await vi.waitFor(() => expect(h.concurrency.snapshot()).toMatchObject({ activeJobs: 0, backgroundActiveJobs: 0 }));
+  });
+
+  it("keeps a scan waiting behind three background jobs, admits interactive work, and starts the scan when a background slot opens", async () => {
+    const concurrency = new WorkerConcurrencyController({}, {}), entered = deferred(), finish = deferred();
+    const held = Array.from({ length: 3 }, (_, index) => concurrency.tryAcquire({
+      resourceClass: "summary", queueLane: "import", providers: [], scopeKeys: [`worker-${index}`]
+    })!);
+    const h = await harness(async () => { entered.resolve(); await finish.promise; }, concurrency);
+    let interactive: ReturnType<WorkerConcurrencyController["tryAcquire"]>;
+    try {
+      expect(held.every(Boolean)).toBe(true);
+      expect((await h.post("viewer")).status).toBe(202);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(h.calls).toEqual([]);
+      expect(h.active()).toBe(0);
+      expect(concurrency.snapshot()).toMatchObject({ activeJobs: 3, backgroundActiveJobs: 3, availableJobs: 1 });
+      expect(concurrency.snapshot().scopeKeys).not.toContain("agent-source-scan:fixture-one");
+      interactive = concurrency.tryAcquire({ resourceClass: "summary", queueLane: "interactive", providers: [], scopeKeys: ["fresh"] });
+      expect(interactive).toBeDefined();
+      expect(concurrency.snapshot()).toMatchObject({ activeJobs: 4, backgroundActiveJobs: 3 });
+      expect(h.calls).toEqual([]);
+      held[0]!.release();
+      await entered.promise;
+      expect(h.calls).toEqual(["fixture-one"]);
+      expect(concurrency.snapshot()).toMatchObject({ activeJobs: 4, backgroundActiveJobs: 3, resources: { summary: 3, scan: 1 } });
+      expect(concurrency.snapshot().scopeKeys).toContain("fresh");
+      expect(concurrency.snapshot().scopeKeys).toContain("agent-source-scan:fixture-one");
+    } finally {
+      interactive?.release(); held.forEach(permit => permit?.release());
+      finish.resolve(); await h.done();
+    }
+    await vi.waitFor(() => expect(concurrency.snapshot()).toMatchObject({ activeJobs: 0, backgroundActiveJobs: 0, scopeKeys: [] }));
   });
 
   it("cancels a scan waiting for global capacity without starting its adapter or releasing another task", async () => {
