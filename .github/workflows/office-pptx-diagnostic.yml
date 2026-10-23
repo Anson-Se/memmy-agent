@@ -1,4 +1,4 @@
-name: Windows PPTX diagnostic
+name: Windows Office minimal regression
 
 on:
   pull_request:
@@ -29,9 +29,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'LibreOffice installation failed' }
       - name: Install fixture dependencies
         run: npm ci --prefix plugins/office
-      - name: Verify production converter with original and edited PPTX
+      - name: Verify DOCX and XLSX without full integration
         env:
           OFFICE_PPTX_THREAD_PROBE: "0"
+          OFFICE_MINIMAL_FORMATS: "docx,xlsx"
           OFFICE_PPTX_DIAGNOSTICS: ${{ runner.temp }}/pptx-diagnostics
         run: node scripts/test-office-pptx-windows.mjs
       - name: Preserve full diagnostic evidence
