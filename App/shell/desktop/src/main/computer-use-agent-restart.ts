@@ -24,9 +24,40 @@ export async function stopComputerUseAgentForPermissionRestart(
     const child = spawn(binary, ['__memmy-history', '--stop-agent'], {
       stdio: 'ignore', windowsHide: true, env,
     });
-    const timer = setTimeout(() => child.kill('SIGTERM'), 4_000);
-    child.once('error', () => { clearTimeout(timer); resolve(); });
-    child.once('close', () => { clearTimeout(timer); resolve(); });
+    let settled = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (detached = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      child.removeListener('error', onError);
+      child.removeListener('close', onClose);
+      if (detached) {
+        // A failed kill may report an asynchronous error even after our deadline.
+        // Keep only a harmless error sink until close, never the waiting promise.
+        const ignoreError = () => {};
+        child.on('error', ignoreError);
+        child.once('close', () => child.removeListener('error', ignoreError));
+        child.unref();
+      }
+      resolve();
+    };
+    const onError = () => finish(true);
+    const onClose = () => finish();
+    const timer = setTimeout(() => {
+      try {
+        if (!child.kill('SIGTERM')) { finish(true); return; }
+      } catch { finish(true); return; }
+      if (settled) return;
+      graceTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); }
+        catch { /* Best effort: cleanup must still have a hard deadline. */ }
+        finally { finish(true); }
+      }, 250);
+    }, 4_000);
+    child.once('error', onError);
+    child.once('close', onClose);
   });
   // The previous release used the default socket from the desktop process;
   // stop it once during migration as well as the app-scoped socket used now.

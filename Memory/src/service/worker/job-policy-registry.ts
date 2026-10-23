@@ -1,4 +1,5 @@
 import type { JobType } from "../../types.js";
+import { resolveWorkerLeaseOptions, type ResolvedWorkerLeaseOptions } from "./worker-lease-options.js";
 
 export const JOB_POLICY_VERSION = 2;
 export const QUEUE_LANES = ["interactive", "repair_retry", "import", "evolution", "maintenance"] as const;
@@ -92,8 +93,6 @@ const DEFINITIONS: Readonly<Record<PolicyJobType, PolicyDefinition>> = Object.fr
 });
 
 export const REGISTERED_JOB_TYPES = Object.freeze(Object.keys(DEFINITIONS) as PolicyJobType[]);
-const MAIN_LEASE = Object.freeze({ durationSec: 60, heartbeatMs: 20_000 });
-const RETRY_LEASE = Object.freeze({ durationSec: 300, heartbeatMs: 20_000 });
 const FIRST_REPORT_JOB_TYPES = new Set(["trace_summary", "import_summary", "observation_extract", "embedding", "embedding_retry"]);
 const STARTUP_REPAIR_SOURCES = new Set([
   "startup.processing_repair", "startup.placeholder_summary_repair",
@@ -119,6 +118,8 @@ export function isImportedPolicyTarget(target: JobPolicyTarget | undefined): boo
 }
 
 export class JobPolicyRegistry {
+  constructor(private readonly leases: Readonly<ResolvedWorkerLeaseOptions> = resolveWorkerLeaseOptions()) {}
+
   resolve(input: JobPolicyInput): JobPolicy {
     if (!Object.hasOwn(DEFINITIONS, input.jobType)) throw new UnknownJobPolicyError(input.jobType);
     const base = DEFINITIONS[input.jobType as PolicyJobType];
@@ -161,7 +162,7 @@ export class JobPolicyRegistry {
 
     return Object.freeze({
       ...base, queueLane, basePriority, policyVersion: JOB_POLICY_VERSION,
-      lease: input.jobType === "embedding_retry" ? RETRY_LEASE : MAIN_LEASE
+      lease: input.jobType === "embedding_retry" ? this.leases.embeddingRetry : this.leases.resources[base.resourceClass]
     });
   }
 }

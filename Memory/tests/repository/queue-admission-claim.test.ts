@@ -115,7 +115,13 @@ describe("atomic resource admission before queue claims", () => {
       h.runtime.enqueueJob({ ...job, id: `deduped-${i}`, payload: { source: "memory.processing.manual_retry" } });
     }
     h.job("later-interactive");
-    h.runtime.setKv("worker.scheduler.wrr_cursor.v1", { weightsKey: "4/3/2/2/1", cursor: 4 }, at);
+    // This case isolates metadata rewinds in an already spent modern round;
+    // cursor-only legacy state intentionally gets one upgrade advance instead.
+    h.runtime.setKv("worker.scheduler.wrr_cursor.v1", { weightsKey: "4/3/2/2/1", cursor: 4,
+      turns: { version: 1, interactive: { spent: true }, lanes: [
+        { lane: "repair_retry", remaining: 3 }, { lane: "import", remaining: 2 }, { lane: "evolution", remaining: 2 },
+        { lane: "maintenance", remaining: 1 }, { lane: "interactive", remaining: 4 }
+      ] } }, at);
     const admit = (work: FairClaimedWork) => work.queue === "main" && Number(work.job.id.split("-")[1]) < 64
       ? undefined : { release() {} };
     expect(h.claim(1, admit, "wrr", false, scan)).toEqual([]);

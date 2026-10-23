@@ -54,9 +54,11 @@ import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worke
 import { WorkerScheduler } from "./worker-scheduler.js";
 import { claimFairWorkerBatch, createFairWorkerScan, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions, type WorkerSchedulingOptions, type ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
-import { UnknownJobPolicyError } from "./job-policy-registry.js";
+import { JobPolicyRegistry, UnknownJobPolicyError } from "./job-policy-registry.js";
+import { resolveWorkerLeaseOptions, type WorkerLeaseOptions } from "./worker-lease-options.js";
 import { WorkerConcurrencyController, type PreparedWorkerExecution, type WorkerPermit } from "./worker-concurrency.js";
 import { workerWorkRequirements, workerEmbeddingGroupKey } from "./worker-work-requirements.js";
+import { observeWorker, type WorkerObserver, type WorkerMetricOutcome } from "./worker-observability.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -103,6 +105,8 @@ export interface WorkerRunSummary {
 export interface WorkerRunExecution {
   continuous?: boolean;
   signal?: AbortSignal;
+  /** Internal handoff signal; a zero-claim yield does not mean the queue is idle. */
+  onYieldToPendingRequests?: () => void;
 }
 
 export interface WorkerStartupReconciliation {
@@ -149,7 +153,9 @@ export interface WorkerRunnerDeps {
   beforeRun?: () => Promise<void>;
   afterRun?: () => void;
   scheduling?: WorkerSchedulingOptions;
+  leases?: WorkerLeaseOptions;
   concurrency?: WorkerConcurrencyController;
+  observer?: WorkerObserver;
   prepareExecution?: (work: FairClaimedWork) => PreparedWorkerExecution;
   prepareExecutionBatch?: () => (work: FairClaimedWork) => PreparedWorkerExecution;
   schedulingShadow?: {
@@ -195,9 +201,12 @@ export interface WorkerRunnerDeps {
 }
 
 export class WorkerRunner {
+  private readonly jobPolicies: JobPolicyRegistry;
   private readonly scheduler = new WorkerScheduler();
   private readonly leaseOwner = newId("worker");
   private readonly executionConfiguration = new WeakMap<object, string>();
+  private readonly observedFinished = new WeakSet<object>();
+  private readonly observedStarted = new WeakSet<object>();
   private readonly schedulingShadow: WorkerSchedulingShadow;
   private readonly concurrency: WorkerConcurrencyController;
   private readonly wakeListeners = new Set<() => void>();
@@ -206,6 +215,7 @@ export class WorkerRunner {
   private readonly unsubscribeConcurrency: () => void;
 
   constructor(private readonly deps: WorkerRunnerDeps) {
+    this.jobPolicies = new JobPolicyRegistry(resolveWorkerLeaseOptions(deps.leases));
     // Environment settings are fixed at process launch. Reject invalid startup
     // configuration instead of repeatedly waking an un-runnable worker.
     resolveWorkerSchedulingOptions(deps.scheduling);
@@ -257,12 +267,14 @@ export class WorkerRunner {
     this.refreshConfigurationBlockedJobs();
     this.deps.enqueueObservationBackfill?.(Math.min(limit, 100), at);
     const interruptedJobs = this.deps.repos.runtime.requeueLeasedJobsAfterRestart(at);
+    observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "recovered", count: interruptedJobs.length });
     const failedJobs = this.deps.repos.runtime.requeueFailedJobs(limit, at);
     for (const { before, after } of [...interruptedJobs, ...failedJobs]) {
       this.deps.appendJobChange(after, "queued", before);
     }
 
     const embeddingRetries = this.deps.repos.runtime.requeueEmbeddingRetriesAfterRestart(Date.parse(at));
+    observeWorker(this.deps.observer, { type: "lease", queue: "embedding_retry", action: "recovered", count: embeddingRetries.length });
     for (const { before, after } of embeddingRetries) {
       this.deps.appendEmbeddingRetryChange(after, "queued", before);
     }
@@ -524,6 +536,7 @@ export class WorkerRunner {
       for (const { before, after } of expiredBudgeted) {
         this.deps.appendJobChange(after, "queued", before);
       }
+      observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "recovered", count: expiredBudgeted.length });
     }
     // Diagnostics compare both algorithms; they never control real claims. A preview failure cannot prevent
     // the existing worker from claiming or executing its normal selection.
@@ -553,7 +566,7 @@ export class WorkerRunner {
     retryOnly = false,
     execution: WorkerRunExecution = {}
   ): Promise<WorkerRunSummary> {
-    type Admission = { permit: WorkerPermit; execution: PreparedWorkerExecution; group: symbol; release(): void };
+    type Admission = { permit: WorkerPermit; execution: PreparedWorkerExecution; group: symbol; priorRecoveries: number; release(): void };
     // Automatic execution stays open across refill waves. Finite manual requests
     // retain their exact budget and target filters through the same scheduler.
     let remaining = execution.continuous ? Number.POSITIVE_INFINITY : limit;
@@ -638,13 +651,19 @@ export class WorkerRunner {
           excludedJobTypes: this.summaryJobsHeld(),
           includeRetries: !(paused && this.deps.memoryBudgetJobConsumes("embedding")),
           owner: this.leaseOwner, retryOwner: this.deps.embeddingRetryWorkerId,
-          leaseSeconds: WORKER_LEASE_SECONDS, retryLeaseMs: EMBEDDING_RETRY_LEASE_MS, options, scan,
+          leaseSeconds: WORKER_LEASE_SECONDS,
+          retryLeaseMs: this.leasePolicyFor("embedding_retry").durationSec * 1000,
+          leaseFor: work => this.leasePolicyFor(work.queue === "main" ? work.job.jobType : "embedding_retry"),
+          options, scan,
           admit: candidate => {
             const execution = prepareExecution?.(candidate) ?? { providers: [], run: <T>(operation: () => T) => operation() };
             const requirements = workerWorkRequirements(candidate, this.deps.repos, execution);
             // Reject held business state before loading any embedding body.
             const heldScopes = this.concurrency.snapshot().scopeKeys;
-            if (requirements.scopeKeys.some(scope => heldScopes.includes(scope))) { denied = true; return undefined; }
+            if (requirements.scopeKeys.some(scope => heldScopes.includes(scope))) {
+              observeWorker(this.deps.observer, { type: "skipped", lane: candidate.queue === "main" ? candidate.job.queueLane : candidate.retry.queueLane, reason: "scope" });
+              denied = true; return undefined;
+            }
             const canShare = previous && previous.count < this.concurrency.limits.embeddingBatchSize;
             let batchKey: string | undefined;
             if (canShare) {
@@ -663,7 +682,9 @@ export class WorkerRunner {
             const group = shared ? share!.group : Symbol("worker-execution");
             const beforeAdmission = previous;
             const acquiredPermit = permit;
-            const admission: Admission = { permit, execution, group, release: () => {
+            const admission: Admission = { permit, execution, group,
+              priorRecoveries: (candidate.queue === "main" ? candidate.job : candidate.retry).leaseRecoveryCount ?? 0,
+              release: () => {
               acquiredPermit.release();
               // A lost ID-CAS must not strand the surviving embedding group.
               if (previous?.permit === acquiredPermit) previous = beforeAdmission;
@@ -683,7 +704,14 @@ export class WorkerRunner {
         jobsThisTurn += work.length;
         const groups: Array<{ work: FairClaimedWork[]; admission: Admission }> = [];
         for (const item of work) {
+          this.observeWork(item, "claimed");
           const admission = admissions.get(keyOf(item))!;
+          const recoveries = (item.queue === "main" ? item.job : item.retry).leaseRecoveryCount ?? 0;
+          if (recoveries > admission.priorRecoveries) {
+            const count = recoveries - admission.priorRecoveries;
+            observeWorker(this.deps.observer, { type: "lease", queue: item.queue, action: "expired", count });
+            observeWorker(this.deps.observer, { type: "lease", queue: item.queue, action: "recovered", count });
+          }
           if (item.queue === "main") { leased++; selectedMain.push(claimKey(item.job)); }
           const last = groups.at(-1);
           if (last?.admission.group === admission.group) last.work.push(item);
@@ -753,6 +781,10 @@ export class WorkerRunner {
     // the shared entry boundary or allowing service shutdown to close storage.
     await Promise.all(active);
     if (failedDrain) throw fatal;
+    if (execution.continuous && !this.stopping && !execution.signal?.aborted &&
+      this.deps.memoryAddEnabled() && this.scheduler.hasPendingRequests()) {
+      execution.onYieldToPendingRequests?.();
+    }
     const ordered = selectedMain.flatMap(id => results.has(id) ? [results.get(id)!] : []);
     const succeeded = ordered.reduce((sum, item) => sum + item.succeeded, 0);
     const failed = ordered.reduce((sum, item) => sum + item.failed, 0);
@@ -831,6 +863,7 @@ export class WorkerRunner {
     this.deps.appendJobChange(job, "leased");
     this.markProcessingJobLeased(job);
     workerLogger.info("job.started", workerJobLogFields(job));
+    this.observeWork({ queue: "main", job }, "started");
     try {
       if (job.queueLane === "unregistered") throw new UnknownJobPolicyError(job.jobType);
       this.captureExecutionConfiguration(job);
@@ -857,6 +890,7 @@ export class WorkerRunner {
       this.deps.appendJobChange(job, "leased");
       this.markProcessingJobLeased(job);
       workerLogger.info("job.started", workerJobLogFields(job));
+      this.observeWork({ queue: "main", job }, "started");
       try {
         const item = this.withJobLease(job, () => this.deps.embeddingJobs.prepareEmbeddingJob(job));
         if (item) {
@@ -946,6 +980,7 @@ export class WorkerRunner {
     if (!completed) return this.lostLeaseResult(job);
     this.deps.appendJobChange(completed, "succeeded", job);
     workerLogger.info("job.succeeded", workerJobLogFields(completed));
+    this.observeWork({ queue: "main", job }, "finished", "succeeded");
     return {
       succeeded: 1,
       failed: 0,
@@ -967,6 +1002,8 @@ export class WorkerRunner {
           attemptCount: deferred.attempts, updatedAt: at }, ["summary_pending", "summarizing"]);
       }
       this.deps.appendJobChange(deferred, "queued", job);
+      observeWorker(this.deps.observer, { type: "skipped", lane: job.queueLane, reason: "dependency" });
+      this.observeWork({ queue: "main", job }, "finished", "released");
       return { succeeded: 0, failed: 0, ref: { ...jobToRef(deferred), status: "queued" } };
     }
     const errorMessage = processingStageForJob(job.jobType)
@@ -1004,6 +1041,8 @@ export class WorkerRunner {
       availableAt: failedJob.availableAt,
       blockedReason: failedJob.blockedReason
     });
+    if (configurationBlocked) observeWorker(this.deps.observer, { type: "skipped", lane: job.queueLane, reason: "configuration" });
+    this.observeWork({ queue: "main", job }, "finished", "failed");
     return {
       succeeded: 0,
       failed: 1,
@@ -1098,10 +1137,11 @@ export class WorkerRunner {
     for (const retry of retries) {
       const claim = prefetchedClaims?.get(retry.id) ?? {
         workerId: this.deps.embeddingRetryWorkerId,
-        leaseUntil: retry.leaseUntil ?? now + EMBEDDING_RETRY_LEASE_MS,
+        leaseUntil: retry.leaseUntil ?? now + this.leasePolicyFor("embedding_retry").durationSec * 1000,
         leaseToken: retry.leaseToken!
       };
       if (!this.deps.repos.runtime.isEmbeddingRetryClaimHeld(retry.id, claim)) {
+        this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
         results.push({ succeeded: 0, failed: 0, item: null });
         continue;
       }
@@ -1118,6 +1158,7 @@ export class WorkerRunner {
         }
 
         try {
+          for (const item of batch) this.observeWork({ queue: "embedding_retry", retry: item.retry }, "started");
           for (const item of batch) this.captureExecutionConfiguration(item.claim);
           const vectors = await this.deps.embedder.embed(
             batch.map((item) => item.retry.sourceText || "(empty)"),
@@ -1164,6 +1205,7 @@ export class WorkerRunner {
       return this.holdUnstartedEmbeddingRetry(retry);
     }
     try {
+      this.observeWork({ queue: "embedding_retry", retry }, "started");
       this.captureExecutionConfiguration(claim);
       const vector = await this.deps.embedder.embedOne(retry.sourceText || "(empty)", retry.embedRole);
       return this.applyEmbeddingRetryVector(retry, claim, vector);
@@ -1177,7 +1219,10 @@ export class WorkerRunner {
     claim: EmbeddingRetryClaim,
     vector: number[]
   ): EmbeddingRetryResult {
-    if (!this.isEmbeddingRetryLeaseHeld(retry, claim)) return { succeeded: 0, failed: 0, item: null };
+    if (!this.isEmbeddingRetryLeaseHeld(retry, claim)) {
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
+      return { succeeded: 0, failed: 0, item: null };
+    }
     const memory = this.deps.repos.memories.get(retry.targetId);
     if (!memory) {
       throw new Error(`embedding retry target not found: ${retry.targetKind}:${retry.targetId}`);
@@ -1187,7 +1232,11 @@ export class WorkerRunner {
         ...claim,
         now: this.nowMs()
       });
-      if (!completed) return { succeeded: 0, failed: 0, item: null };
+      if (!completed) {
+        this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
+        return { succeeded: 0, failed: 0, item: null };
+      }
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "released");
       if (completed) this.deps.appendEmbeddingRetryChange(completed, "succeeded", retry);
       const replacement = this.deps.enqueueEmbeddingRetry(
         memory,
@@ -1219,8 +1268,10 @@ export class WorkerRunner {
     if (completed) {
       this.deps.appendEmbeddingRetryChange(completed, "succeeded", retry);
       workerLogger.info("embedding_retry.succeeded", embeddingRetryLogFields(completed));
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "succeeded");
       return { succeeded: 1, failed: 0, item: embeddingRetryToRunItem(completed) };
     }
+    this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
     return { succeeded: 0, failed: 0, item: null };
   }
 
@@ -1231,6 +1282,7 @@ export class WorkerRunner {
     error: unknown
   ): EmbeddingRetryResult {
     if (error instanceof JobLeaseLostError || !this.isEmbeddingRetryLeaseHeld(retry, claim)) {
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
       return { succeeded: 0, failed: 0, item: null };
     }
     const message = sanitizeProcessingError(error);
@@ -1256,6 +1308,8 @@ export class WorkerRunner {
         now: this.nowMs()
       });
     if (updated) {
+      if (configurationBlocked) observeWorker(this.deps.observer, { type: "skipped", lane: retry.queueLane, reason: "configuration" });
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "failed");
       this.deps.appendEmbeddingRetryChange(updated, terminal ? "failed" : "retry", retry);
       const fields = {
         ...embeddingRetryLogFields(updated),
@@ -1274,6 +1328,7 @@ export class WorkerRunner {
       if (resumed) this.deps.appendEmbeddingRetryChange(resumed, "queued", updated);
       return { succeeded: 0, failed: 1, item: embeddingRetryToRunItem(resumed ?? updated) };
     }
+    this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
     return { succeeded: 0, failed: 0, item: null };
   }
 
@@ -1303,7 +1358,7 @@ export class WorkerRunner {
 
   private holdUnconfiguredSummaryJob(job: EvolutionJobRecord): WorkerJobRunResult {
     if (!this.deps.repos.runtime.isJobLeaseHeld(job, this.deps.nowIso())) return this.lostLeaseResult(job);
-    this.requeueUnstartedBudgetedJobs([job]);
+    this.requeueUnstartedBudgetedJobs([job], "configuration");
     if (job.targetMemoryId) {
       const memory = this.deps.repos.memories.get(job.targetMemoryId);
       this.deps.repos.processing.update(job.targetMemoryId, {
@@ -1324,13 +1379,15 @@ export class WorkerRunner {
     };
   }
 
-  private requeueUnstartedBudgetedJobs(jobs: readonly EvolutionJobRecord[]): void {
+  private requeueUnstartedBudgetedJobs(jobs: readonly EvolutionJobRecord[], reason: "budget" | "configuration" = "budget"): void {
     if (jobs.length === 0) {
       return;
     }
     const requeued = this.deps.repos.runtime.releaseClaimedJobs(jobs, this.deps.nowIso());
     for (const { before, after } of requeued) {
       this.deps.appendJobChange(after, "queued", before);
+      observeWorker(this.deps.observer, { type: "skipped", lane: before.queueLane, reason });
+      this.observeWork({ queue: "main", job: before }, "finished", "released");
     }
   }
 
@@ -1357,14 +1414,21 @@ export class WorkerRunner {
       const transition = releasedById.get(job.id);
       if (!transition) return this.lostLeaseResult(job);
       this.deps.appendJobChange(transition.after, "queued", transition.before);
+      observeWorker(this.deps.observer, { type: "skipped", lane: job.queueLane, reason: "budget" });
+      this.observeWork({ queue: "main", job }, "finished", "released");
       return { succeeded: 0, failed: 0, ref: jobToRef(transition.after) };
     });
   }
 
   private holdUnstartedEmbeddingRetry(retry: EmbeddingRetryRecord): EmbeddingRetryResult {
     const released = this.deps.repos.runtime.releaseClaimedEmbeddingRetries([retry], this.nowMs())[0];
-    if (!released) return { succeeded: 0, failed: 0, item: null };
+    if (!released) {
+      this.observeWork({ queue: "embedding_retry", retry }, "finished", "fenced");
+      return { succeeded: 0, failed: 0, item: null };
+    }
     this.deps.appendEmbeddingRetryChange(released.after, "queued", released.before);
+    observeWorker(this.deps.observer, { type: "skipped", lane: retry.queueLane, reason: "budget" });
+    this.observeWork({ queue: "embedding_retry", retry }, "finished", "released");
     return { succeeded: 0, failed: 0, item: embeddingRetryToRunItem(released.after) };
   }
 
@@ -1378,32 +1442,71 @@ export class WorkerRunner {
 
   private lostLeaseResult(job: EvolutionJobRecord): WorkerJobRunResult {
     workerLogger.warn("lease.fenced", { jobId: job.id, jobType: job.jobType });
+    this.observeWork({ queue: "main", job }, "finished", "fenced");
     // A rejected result is neither a business failure nor a success. Report the
     // durable current state without inventing a terminal outcome for the caller.
     const current = this.deps.repos.runtime.getJob(job.id) ?? job;
     return { succeeded: 0, failed: 0, ref: jobToRef(current) };
   }
 
+  private observeWork(item: FairClaimedWork, type: "claimed" | "started" | "finished", outcome?: WorkerMetricOutcome): void {
+    if (!this.deps.observer) return;
+    const row = item.queue === "main" ? item.job : item.retry;
+    if (type === "started") {
+      if (this.observedStarted.has(row)) return;
+      this.observedStarted.add(row);
+    }
+    if (type === "finished") {
+      if (this.observedFinished.has(row)) return;
+      this.observedFinished.add(row);
+      if (outcome === "fenced") observeWorker(this.deps.observer, { type: "lease", queue: item.queue, action: "fenced" });
+    }
+    const work = { queue: item.queue, lane: row.queueLane, firstQueuedAt: row.firstQueuedAt,
+      leaseCount: row.leaseCount, leaseRecoveryCount: row.leaseRecoveryCount,
+      ...(item.selectionReason ? { selectionReason: item.selectionReason } : {}) };
+    if (type === "finished") observeWorker(this.deps.observer, { type, work, outcome: outcome! });
+    else observeWorker(this.deps.observer, { type, work });
+  }
+
+  private leasePolicyFor(jobType: string) {
+    try { return this.jobPolicies.resolve({ jobType }).lease; }
+    catch (error) {
+      if (!(error instanceof UnknownJobPolicyError)) throw error;
+      // Lease an unregistered persisted row only so its existing terminal
+      // error path can quarantine it; do not let it block the entire drain.
+      return { durationSec: WORKER_LEASE_SECONDS, heartbeatMs: WORKER_HEARTBEAT_MS };
+    }
+  }
+
   private startLeaseHeartbeat(jobs: readonly EvolutionJobRecord[]): () => void {
     if (jobs.length === 0) return () => {};
-    const tracked = new Map(jobs.map((job) => [job.id, job]));
+    const tracked = new Map<string, { job: EvolutionJobRecord; policy: { durationSec: number; heartbeatMs: number }; nextRenewAt: number }>(jobs.map(job => {
+      const policy = this.leasePolicyFor(job.jobType);
+      return [job.id, { job, policy, nextRenewAt: this.nowMs() + policy.heartbeatMs }];
+    }));
     const timer = setInterval(() => {
-      for (const [id, job] of tracked) {
+      for (const [id, entry] of tracked) {
+        const { job, policy } = entry;
+        if (this.nowMs() < entry.nextRenewAt) continue;
         try {
-          const renewed = this.deps.repos.runtime.renewJobLease(job, WORKER_LEASE_SECONDS, this.deps.nowIso());
+          const renewed = this.deps.repos.runtime.renewJobLease(job, policy.durationSec, this.deps.nowIso());
           if (!renewed) {
+            observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "renew_failed" });
             tracked.delete(id);
             continue;
           }
           job.leasedUntil = renewed.leasedUntil;
+          entry.nextRenewAt = this.nowMs() + policy.heartbeatMs;
           workerLogger.debug("lease.renewed", { jobId: id, leasedUntil: renewed.leasedUntil });
+          observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "renewed" });
         } catch (error) {
           // A busy database may recover on a later heartbeat. If the deadline
           // passes first, all subsequent writes are rejected by the lease guard.
           workerLogger.warn("lease.renew_failed", { jobId: id, ...memoryErrorFields(error) });
+          observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "renew_failed" });
         }
       }
-    }, WORKER_HEARTBEAT_MS);
+    }, Math.min(...[...tracked.values()].map(entry => entry.policy.heartbeatMs)));
     timer.unref?.();
     return () => clearInterval(timer);
   }
@@ -1460,20 +1563,26 @@ export class WorkerRunner {
 
   private startEmbeddingRetryHeartbeat(items: Array<{ retry: EmbeddingRetryRecord; claim: EmbeddingRetryClaim }>): () => void {
     if (items.length === 0) return () => {};
+    const policy = this.leasePolicyFor("embedding_retry");
     const tracked = new Set(items);
     const timer = setInterval(() => {
       for (const item of tracked) {
         try {
           const now = this.nowMs();
-          const renewed = this.deps.repos.runtime.renewEmbeddingRetryClaim(item.retry.id, item.claim, now + EMBEDDING_RETRY_LEASE_MS, now);
-          if (!renewed?.leaseUntil) { tracked.delete(item); continue; }
+          const renewed = this.deps.repos.runtime.renewEmbeddingRetryClaim(item.retry.id, item.claim, now + policy.durationSec * 1000, now);
+          if (!renewed?.leaseUntil) {
+            observeWorker(this.deps.observer, { type: "lease", queue: "embedding_retry", action: "renew_failed" });
+            tracked.delete(item); continue;
+          }
           item.claim.leaseUntil = renewed.leaseUntil;
           item.retry.leaseUntil = renewed.leaseUntil;
+          observeWorker(this.deps.observer, { type: "lease", queue: "embedding_retry", action: "renewed" });
         } catch (error) {
           workerLogger.warn("embedding_retry.renew_failed", { retryId: item.retry.id, ...memoryErrorFields(error) });
+          observeWorker(this.deps.observer, { type: "lease", queue: "embedding_retry", action: "renew_failed" });
         }
       }
-    }, WORKER_HEARTBEAT_MS);
+    }, policy.heartbeatMs);
     timer.unref?.();
     return () => clearInterval(timer);
   }

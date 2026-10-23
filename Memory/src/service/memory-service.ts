@@ -41,7 +41,8 @@ import {
   HttpByokTokenUsageRecorder,
   type HttpByokTokenUsageRecorderOptions,
   type MemoryLlmModelRole,
-  type MemoryModelUsageEvent
+  type MemoryModelUsageEvent,
+  type MemoryTokenUsageSink
 } from "../model/token-usage.js";
 import { TokenUsageOutbox } from "../storage/token-usage-outbox.js";
 import { MemoryTokenBudgetLedger } from "./memory-token-budget-ledger.js";
@@ -199,6 +200,7 @@ import {
 } from "./worker/job-handlers.js";
 import { WorkerRunner, type WorkerRunExecution } from "./worker/worker-runner.js";
 import { WorkerConcurrencyController, providerDescriptor, workerModelBatchKey, type PreparedWorkerExecution } from "./worker/worker-concurrency.js";
+import { observeWorker, readWorkerQueueMetrics, WorkerObservability } from "./worker/worker-observability.js";
 import { jobPolicyRegistry, UnknownJobPolicyError } from "./worker/job-policy-registry.js";
 import type { FairClaimedWork } from "./worker/fair-worker-queue.js";
 
@@ -220,6 +222,8 @@ export type { FeedbackResponse } from "./feedback/feedback-experience.js";
 export interface MemoryServiceOptions {
   /** One controller is shared by worker admission and actual model requests. */
   concurrency?: WorkerConcurrencyController;
+  /** Optional process-local diagnostics sink, never a public status API. */
+  observability?: WorkerObservability;
   db?: MemoryDb;
   backend?: StorageBackend;
   mode?: "local" | "cloud" | "dev";
@@ -304,6 +308,8 @@ export class MemoryService {
   private config: MemmyConfig;
   private readonly modelTasks: MemoryModelTaskRouter;
   private readonly concurrency: WorkerConcurrencyController;
+  private readonly workerMetrics: WorkerObservability;
+  private readonly stopConcurrencyMetrics: () => void;
   private readonly workerExecutionSnapshots = new WeakMap<MemoryModelTaskContext, {
     batchKey: string;
     providers: Map<string, PreparedWorkerExecution["providers"]>;
@@ -314,6 +320,7 @@ export class MemoryService {
   private readonly embeddingRetryWorkerId = `embedding-retry-${newId("worker")}`;
   private readonly tokenBudgetLedger: MemoryTokenBudgetLedger;
   private readonly tokenUsageRecorder: HttpByokTokenUsageRecorder;
+  private readonly modelUsageSink: MemoryTokenUsageSink;
   private readonly fetchAppMemoryBudgetFn: (signal?: AbortSignal) => Promise<{ dailyUsed: number; lifetimeUsed: number } | null>;
   private readonly budgetAbort = new AbortController();
   private appBudgetReconcile: {
@@ -336,6 +343,10 @@ export class MemoryService {
     this.concurrency = options.concurrency ?? new WorkerConcurrencyController();
     this.viewerEndpoint = options.viewerEndpoint;
     this.repos = options.backend?.repositories() ?? new Repositories(requireMemoryDb(options).db);
+    this.workerMetrics = options.observability ?? new WorkerObservability({
+      queueSnapshot: (at) => readWorkerQueueMetrics(this.repos.db, at)
+    });
+    this.stopConcurrencyMetrics = this.concurrency.observe(this.workerMetrics);
     this.l3WorldModelContextReadModel = new L3WorldModelContextReadModel(this.repos);
     this.mode = options.mode ?? "local";
     this.config = cloneMemmyConfig(options.config ?? DEFAULT_MEMMY_CONFIG);
@@ -352,10 +363,17 @@ export class MemoryService {
       touchBudget: () => this.tokenBudgetLedger.touch(),
       onPersistRecovered: () => this.persistRecoveredListener?.()
     });
+    this.modelUsageSink = {
+      record: (event) => {
+        // Preserve the original sink's return/throw and budget/outbox semantics.
+        try { return this.tokenUsageRecorder.record(event); }
+        finally { this.observeModelTokens(event); }
+      }
+    };
     this.fetchAppMemoryBudgetFn = options.fetchAppMemoryBudget
       ?? ((signal) => fetchAppMemoryBudget({ signal }));
     this.startAppBudgetReconcile();
-    this.modelTasks = new MemoryModelTaskRouter(() => this.resolveModelTaskContext(), this.concurrency);
+    this.modelTasks = new MemoryModelTaskRouter(() => this.resolveModelTaskContext(), this.concurrency, this.workerMetrics);
     this.llm = this.modelTasks.client("summary");
     this.skillLlm = this.modelTasks.client("evolution");
     this.embedder = this.modelTasks.embedder();
@@ -560,6 +578,7 @@ export class MemoryService {
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
       concurrency: this.concurrency,
+      observer: this.workerMetrics,
       prepareExecution: this.prepareWorkerExecution.bind(this),
       prepareExecutionBatch: this.prepareWorkerExecutionBatch.bind(this),
       repos: this.repos,
@@ -750,6 +769,7 @@ export class MemoryService {
     });
     serviceLogger.info("initialized", memoryConfigLogFields(this.config));
     this.tokenUsageRecorder.start();
+    this.workerMetrics.start();
   }
 
   stopTokenUsageDelivery(): void {
@@ -767,7 +787,10 @@ export class MemoryService {
     // slots, then keep storage alive through complete foreground business work.
     const modelsStopped = this.modelTasks.stop();
     const requestsStopped = this.concurrency.close();
-    this.stopping = Promise.all([stopped, modelsStopped, requestsStopped]).then(() => {});
+    this.stopping = Promise.all([stopped, modelsStopped, requestsStopped]).then(() => {
+      this.stopConcurrencyMetrics();
+      this.workerMetrics.stop();
+    });
     return this.stopping;
   }
 
@@ -776,7 +799,7 @@ export class MemoryService {
       modelRole === "memory_summary" ? config.summary : resolveEvolutionConfig(config),
       {
         modelRole,
-        usageRecorder: this.tokenUsageRecorder
+        usageRecorder: this.modelUsageSink
       }
     );
   }
@@ -787,6 +810,17 @@ export class MemoryService {
       operation: event.operation,
       totalTokens: event.usage.totalTokens
     });
+  }
+
+  private observeModelTokens(event: MemoryModelUsageEvent): void {
+    try {
+      const descriptor = providerDescriptor({ provider: event.provider, endpoint: event.endpoint, model: event.model,
+        actualModelContext: event.actualModelContext }, this.concurrency.limits);
+      observeWorker(this.workerMetrics, { type: "tokens", kind: event.kind === "memory_summary" ? "summary"
+        : event.kind === "memory_evolution" ? "evolution" : "embedding",
+        providerKey: descriptor.providers[0]!.key, modelKey: descriptor.providers.at(-1)!.key,
+        inputTokens: event.usage.inputTokens, outputTokens: event.usage.outputTokens, totalTokens: event.usage.totalTokens });
+    } catch { /* Diagnostics must not change token persistence or budget accounting. */ }
   }
 
   private budgetModelSources(): MemoryBudgetModelSources {
@@ -926,7 +960,7 @@ export class MemoryService {
     const evolution = this.options.skillLlm
       ?? this.createConfiguredMemoryLlm(taskConfig, "memory_evolution");
     const embedding = this.options.embedder ?? createEmbedder(taskConfig.embedding, {
-      usageRecorder: this.tokenUsageRecorder
+      usageRecorder: this.modelUsageSink
     });
     freezeModelSelectionConfig(taskConfig);
     return {
@@ -975,6 +1009,30 @@ export class MemoryService {
 
   notifyWorkerWorkAvailable(): void {
     this.workerRunner.notifyWorkAvailable();
+  }
+
+  /** Source producers share the global background budget, without inheriting
+   * a model permit: any foreground request still admits its own providers. */
+  async withAgentSourceScanPermit<T>(sourceIds: string | readonly string[], signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    const scopeKeys = [...new Set(typeof sourceIds === "string" ? [sourceIds] : sourceIds)]
+      .map(sourceId => `agent-source-scan:${sourceId}`);
+    for (;;) {
+      signal.throwIfAborted();
+      if (this.stopping) throw new Error("Memory service is stopping");
+      const permit = this.concurrency.tryAcquire({ resourceClass: "scan", providers: [],
+        scopeKeys });
+      if (permit) {
+        try { signal.throwIfAborted(); return await operation(); }
+        finally { permit.release(); }
+      }
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => { unsubscribe(); signal.removeEventListener("abort", canceled); resolve(); };
+        const canceled = () => { unsubscribe(); signal.removeEventListener("abort", canceled); reject(signal.reason); };
+        const unsubscribe = this.concurrency.subscribe(finish);
+        signal.addEventListener("abort", canceled, { once: true });
+        if (signal.aborted) canceled();
+      });
+    }
   }
 
   private withModelTaskContext<T>(operation: () => T): T {

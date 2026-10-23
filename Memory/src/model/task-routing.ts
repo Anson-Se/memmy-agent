@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { MemmyConfig } from "../config/index.js";
 import { providerDescriptor, type WorkerConcurrencyController } from "../service/worker/worker-concurrency.js";
+import { observeWorker, type WorkerObserver } from "../service/worker/worker-observability.js";
 import type {
   Embedder,
   LlmClient,
@@ -28,7 +29,8 @@ export class MemoryModelTaskRouter {
 
   constructor(
     private readonly resolveContext: () => MemoryModelTaskContext,
-    private readonly concurrency?: WorkerConcurrencyController
+    private readonly concurrency?: WorkerConcurrencyController,
+    private readonly observer?: WorkerObserver
   ) {}
 
   client(role: MemoryModelRole): LlmClient {
@@ -54,10 +56,34 @@ export class MemoryModelTaskRouter {
     return this.track(() => this.storage.run(context, operation));
   }
 
-  request<T>(config: LlmClient["config"] | Embedder["config"], operation: () => Promise<T>, embedding = false): Promise<T> {
+  request<T>(config: LlmClient["config"] | Embedder["config"], operation: () => Promise<T>, embedding = false,
+    kind: "summary" | "evolution" | "embedding" = embedding ? "embedding" : "summary", batchSize?: number): Promise<T> {
+    if (!this.concurrency && !this.observer) return operation();
+    const descriptor = providerDescriptor(config, this.concurrency?.limits);
+    const measured = this.observer ? async () => {
+      // Called only after actual request admission, never while waiting for a
+      // provider permit. Delegate retries remain part of this logical request.
+      const started = performance.now();
+      let failure: "429" | "timeout" | "other" | undefined;
+      try { return await operation(); }
+      catch (error) {
+        const status = error && typeof error === "object" && "httpStatus" in error ? error.httpStatus : undefined;
+        const name = error instanceof Error ? error.name : "";
+        failure = status === 429 ? "429" : /^(?:AbortError|TimeoutError)$/.test(name) ? "timeout" : "other";
+        throw error;
+      } finally {
+        observeWorker(this.observer, { type: "model_request", kind,
+          providerKey: descriptor.providers[0]!.key, modelKey: descriptor.providers.at(-1)!.key,
+          durationMs: performance.now() - started, outcome: failure ? "failed" : "succeeded", failure, batchSize });
+      }
+    } : operation;
     return this.concurrency
-      ? this.concurrency.runRequest(providerDescriptor(config, this.concurrency.limits), operation, embedding)
-      : operation();
+      ? this.concurrency.runRequest(descriptor, measured, embedding)
+      : measured();
+  }
+
+  embeddingBatchSize(): number {
+    return this.concurrency?.limits.embeddingBatchSize ?? 16;
   }
 
   run<T>(operation: () => T): T {
@@ -118,16 +144,25 @@ class TaskRoutedEmbedder implements Embedder {
   }
 
   embed(texts: string[], role?: "query" | "document"): Promise<number[][]> {
-    return this.router.run(() => {
+    return this.router.run(async () => {
+      if (texts.length === 0) return [];
       const delegate = this.delegate();
-      return this.router.request(delegate.config, () => delegate.embed(texts, role), true);
+      const batchSize = this.router.embeddingBatchSize();
+      const vectors: number[][] = [];
+      // A business task may generate many texts internally (for example Work
+      // Memory retrieval). Limit actual requests without charging extra jobs.
+      for (let offset = 0; offset < texts.length; offset += batchSize) {
+        const batch = texts.slice(offset, offset + batchSize);
+        vectors.push(...await this.router.request(delegate.config, () => delegate.embed(batch, role), true, "embedding", batch.length));
+      }
+      return vectors;
     });
   }
 
   embedOne(text: string, role?: "query" | "document"): Promise<number[]> {
     return this.router.run(() => {
       const delegate = this.delegate();
-      return this.router.request(delegate.config, () => delegate.embedOne(text, role), true);
+      return this.router.request(delegate.config, () => delegate.embedOne(text, role), true, "embedding", 1);
     });
   }
 
@@ -160,7 +195,7 @@ class TaskRoutedLlmClient implements LlmClient {
   ): Promise<string> {
     return this.router.run(() => {
       const delegate = this.delegate();
-      return this.router.request(delegate.config, () => delegate.complete(messages, options));
+      return this.router.request(delegate.config, () => delegate.complete(messages, options), false, this.role);
     });
   }
 
@@ -170,7 +205,7 @@ class TaskRoutedLlmClient implements LlmClient {
   ): Promise<T> {
     return this.router.run(() => {
       const delegate = this.delegate();
-      return this.router.request(delegate.config, () => delegate.completeJson<T>(messages, options));
+      return this.router.request(delegate.config, () => delegate.completeJson<T>(messages, options), false, this.role);
     });
   }
 

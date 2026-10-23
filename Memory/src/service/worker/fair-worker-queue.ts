@@ -4,15 +4,17 @@ import type { QueueEligibilityOptions } from "../../storage/queue-eligibility.js
 import type { SchedulingCandidate } from "../../storage/queue-scheduling-store.js";
 import { LaneQueueSelector } from "./lane-queue-selector.js";
 import { AdmissionLaneQueueSelector, type LaneQueueTurns } from "./admission-lane-queue-selector.js";
-import { QUEUE_LANES } from "./job-policy-registry.js";
+import { QUEUE_LANES, type QueueLane } from "./job-policy-registry.js";
 import type { ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 
 export interface WorkAdmission { release(): void }
 export type FairClaimedWork = ({ queue: "main"; job: EvolutionJobRecord } |
-  { queue: "embedding_retry"; retry: EmbeddingRetryRecord }) & { admission?: WorkAdmission };
+  { queue: "embedding_retry"; retry: EmbeddingRetryRecord }) & { admission?: WorkAdmission;
+    selectionReason?: "wrr" | "aging" | "interactive" | "legacy" };
 export interface FairWorkerClaimInput extends QueueEligibilityOptions {
   at: string; limit: number; includeRetries: boolean; owner: string;
   retryOwner: string; leaseSeconds: number; retryLeaseMs: number;
+  leaseFor?: (work: FairClaimedWork) => { durationSec: number };
   options: ResolvedWorkerSchedulingOptions;
   priorityCohortOnly?: boolean;
   /** Optional resumable admission scan. Without it the synchronous API is unchanged. */
@@ -35,6 +37,8 @@ type ScanContinuation = {
   retryDone: boolean;
   cohort?: number;
   turns?: LaneQueueTurns;
+  agingSkippedLanes: QueueLane[];
+  interactiveDenied?: boolean;
 };
 /** Owned by one drain/fill; discard after permits/configuration change or a completed scan. */
 export interface FairWorkerScan {
@@ -90,7 +94,7 @@ export function claimFairWorkerBatch(
       candidates.splice(candidates.findIndex((item) => item.queue === chosen.queue && item.id === chosen.id), 1);
       if (chosen.queue === "main") {
         const job = repos.runtime.claimQueuedJob(chosen.id, request);
-        if (job) claimed.push({ queue: "main", job });
+        if (job) claimed.push({ queue: "main", job, selectionReason: "wrr" });
         else selector.setCursor(before);
       } else {
         const retry = repos.runtime.claimEmbeddingRetryById(chosen.id, {
@@ -98,7 +102,7 @@ export function claimFairWorkerBatch(
           leaseUntil: Date.parse(input.at) + input.retryLeaseMs,
           targetMemoryIds: request.targetMemoryIds
         });
-        if (retry) claimed.push({ queue: "embedding_retry", retry });
+        if (retry) claimed.push({ queue: "embedding_retry", retry, selectionReason: "wrr" });
         else selector.setCursor(before);
       }
     }
@@ -132,7 +136,8 @@ function claimAdmittedWorkerBatch(
     } };
     admissions.push(admission);
     if (work.queue === "main") {
-      const job = repos.runtime.claimQueuedJob(work.job.id, request);
+      const job = repos.runtime.claimQueuedJob(work.job.id, { ...request,
+        leaseSeconds: input.leaseFor?.(work).durationSec ?? input.leaseSeconds });
       if (job) return { queue: "main", job, admission };
     } else {
       const retry = repos.runtime.claimEmbeddingRetryById(work.retry.id, {
@@ -158,11 +163,11 @@ function claimAdmittedWorkerBatch(
       // continuation. The runner drops the scan on any admission-state change.
       const state: ScanContinuation = continuing ? { ...continuing, mainDone: false,
         buckets: continuing.buckets.map(bucket => ({ ...bucket, exhausted: false })),
-        candidates: [...continuing.candidates], mainSeen: [...continuing.mainSeen], retrySeen: [...continuing.retrySeen]
+        candidates: [...continuing.candidates], agingSkippedLanes: [...continuing.agingSkippedLanes], mainSeen: [...continuing.mainSeen], retrySeen: [...continuing.retrySeen]
       } : { fingerprint, buckets: QUEUE_LANES.flatMap(lane =>
         (input.includeRetries ? ["main", "embedding_retry"] as const : ["main"] as const)
           .map(queue => ({ lane, queue, after: 0, exhausted: false }))), candidates: [],
-        mainSeen: [], retrySeen: [], mainDone: false, retryDone: false };
+        mainSeen: [], retrySeen: [], mainDone: false, retryDone: false, agingSkippedLanes: [] };
       let inspected = 0;
       const inspectLimit = scan ? FAIR_SCAN_CANDIDATE_LIMIT : Number.POSITIVE_INFINITY;
       const saveScan = (more: boolean) => {
@@ -183,7 +188,7 @@ function claimAdmittedWorkerBatch(
             inspected++;
             state.mainSeen.push(job.id);
             const result = tryClaim({ queue: "main", job });
-            if (result) { claimed.push(result); state.cohort ??= priority; }
+            if (result) { claimed.push({ ...result, selectionReason: "legacy" }); state.cohort ??= priority; }
           }
           if (page.length < pageLimit) state.mainDone = true;
         }
@@ -196,7 +201,7 @@ function claimAdmittedWorkerBatch(
             inspected++;
             state.retrySeen.push(retry.id);
             const result = tryClaim({ queue: "embedding_retry", retry });
-            if (result) claimed.push(result);
+            if (result) claimed.push({ ...result, selectionReason: "legacy" });
           }
           if (page.length < pageLimit) state.retryDone = true;
         }
@@ -242,11 +247,15 @@ function claimAdmittedWorkerBatch(
         selector.dropEmpty(new Set(QUEUE_LANES.filter(lane =>
           buckets.filter(bucket => bucket.lane === lane).every(bucket => bucket.after === 0 && bucket.exhausted) &&
           !candidates.some(candidate => candidate.lane === lane))));
-        const chosen = selector.choose(candidates);
+        const interactive = state.interactiveDenied ? undefined : selector.chooseInteractive(candidates);
+        const aged = !interactive && input.options.aging?.enabled ? selector.chooseAged(candidates, Date.parse(input.at),
+          input.options.aging.thresholdMs, new Set(state.agingSkippedLanes)) : undefined;
+        const chosen = interactive ?? aged ?? selector.choose(candidates);
         if (!chosen) { exhausted = true; break; }
         candidates.splice(candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id), 1);
         inspected++;
         let result: FairClaimedWork | undefined;
+        const acquiredBefore = admissions.length;
         if (chosen.queue === "main") {
           const job = repos.runtime.getJob(chosen.id);
           if (job) result = tryClaim({ queue: "main", job });
@@ -254,7 +263,17 @@ function claimAdmittedWorkerBatch(
           const retry = repos.runtime.getEmbeddingRetry(chosen.id);
           if (retry) result = tryClaim({ queue: "embedding_retry", retry });
         }
-        if (result) { claimed.push(result); selector.commit(chosen.lane); }
+        if (result) {
+          claimed.push({ ...result, selectionReason: interactive ? "interactive" : aged ? "aging" : "wrr" });
+          selector.commit(chosen.lane, aged !== undefined);
+        }
+        else if (aged && admissions.length === acquiredBefore) {
+          // A busy aged lane must not make every later candidate in that lane
+          // jump ahead of other runnable work. Retry aging after admission state
+          // changes; ordinary FIFO scanning remains available in this fill.
+          state.agingSkippedLanes.push(chosen.lane);
+        }
+        if (interactive && !result && admissions.length === acquiredBefore) state.interactiveDenied = true;
       }
       state.turns = selector.snapshot();
       saveScan(!exhausted && claimed.length < limit);

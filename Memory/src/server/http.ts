@@ -404,7 +404,12 @@ function createAutoWorkerDrain(
         for (let cycle = 0; cycle < maxCycles && !disposed; cycle += 1) {
           const result = await service.runWorkerOnce(workerBatchSize, {
             priorityCohortOnly: true
-          }, { continuous: true, signal: admissionAbort.signal });
+          }, { continuous: true, signal: admissionAbort.signal, onYieldToPendingRequests: () => {
+            // Keep an automatic continuation behind the accepted manual work.
+            // Awaiting the shared scheduler provides the wake-up; polling zero
+            // results would either lose the tail or spin while manual work runs.
+            requested = true;
+          } });
           if (result.leased === 0 && result.embeddingRetries.leased === 0) {
             break;
           }

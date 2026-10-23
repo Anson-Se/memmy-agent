@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { RESOURCE_CLASSES, type ResourceClass } from "./job-policy-registry.js";
+import { observeWorker, type AdmissionRejectReason, type WorkerObserver } from "./worker-observability.js";
 
 export interface WorkerConcurrencyOptions {
   maxActiveJobs?: number;
@@ -161,6 +162,7 @@ export class WorkerConcurrencyController {
   private readonly waiters = new Set<() => void>();
   private readonly listeners = new Set<() => void>();
   private readonly groups = new Set<ReservationGroup>();
+  private readonly observers = new Set<WorkerObserver>();
   private closing = false;
   private closed?: Promise<void>;
   private resolveClosed?: () => void;
@@ -169,6 +171,11 @@ export class WorkerConcurrencyController {
     this.limits = resolveWorkerConcurrencyOptions(options, env);
   }
   availableJobs(): number { return Math.max(0, this.limits.maxActiveJobs - this.activeJobs); }
+  observe(observer: WorkerObserver): () => void {
+    this.observers.add(observer);
+    this.observeConcurrency();
+    return () => { this.observers.delete(observer); };
+  }
   hasActivePermit(): boolean {
     const state = this.context.getStore();
     return state !== undefined && !state.released;
@@ -210,7 +217,11 @@ export class WorkerConcurrencyController {
     return this.acquire(requirements, logicalJobs, shareWith);
   }
   private acquire(input: WorkerRequirements, logicalJobs: number, shareWith?: WorkerPermit): WorkerPermit | undefined {
-    if (this.closing) return undefined;
+    const reject = (reason: AdmissionRejectReason): undefined => {
+      for (const observer of this.observers) observeWorker(observer, { type: "admission_rejected", reason });
+      return undefined;
+    };
+    if (this.closing) return reject("closing");
     if (!(RESOURCE_CLASSES as readonly string[]).includes(input.resourceClass)) throw new TypeError("Unknown resource class");
     const providerMap = new Map<string, number>();
     for (const provider of input.providers) {
@@ -224,17 +235,18 @@ export class WorkerConcurrencyController {
     const requirements: WorkerRequirements = { resourceClass: input.resourceClass, providers, scopeKeys, embedding: input.embedding === true };
     const parent = shareWith ? this.states.get(shareWith) : undefined;
     if (shareWith && (!parent || parent.released || parent.group.resourceClass !== "embedding" || input.resourceClass !== "embedding"
-      || !parent.group.embedding || !input.embedding || JSON.stringify(parent.group.providers) !== JSON.stringify(providers))) return undefined;
+      || !parent.group.embedding || !input.embedding || JSON.stringify(parent.group.providers) !== JSON.stringify(providers))) return reject("share_invalid");
     if (input.resourceClass === "embedding" && input.embedding &&
-      logicalJobs + (parent?.group.logicalJobs ?? 0) > this.limits.embeddingBatchSize) return undefined;
-    if (logicalJobs > this.availableJobs() || (this.resources.get(input.resourceClass) ?? 0) + logicalJobs > this.limits.resourceLimits[input.resourceClass]
-      || scopeKeys.some(key => this.scopes.has(key))) return undefined;
+      logicalJobs + (parent?.group.logicalJobs ?? 0) > this.limits.embeddingBatchSize) return reject("batch");
+    if (logicalJobs > this.availableJobs()) return reject("global");
+    if ((this.resources.get(input.resourceClass) ?? 0) + logicalJobs > this.limits.resourceLimits[input.resourceClass]) return reject("resource");
+    if (scopeKeys.some(key => this.scopes.has(key))) return reject("scope");
     if (!parent) {
-      if (requirements.embedding && this.embeddingRequests >= this.limits.embeddingRequestConcurrency) return undefined;
+      if (requirements.embedding && this.embeddingRequests >= this.limits.embeddingRequestConcurrency) return reject("embedding_request");
       for (const provider of providers) {
         const active = this.providers.get(provider.key);
         const cap = Math.min(provider.limit, ...active?.values() ?? []);
-        if ((active?.size ?? 0) >= cap) return undefined;
+        if ((active?.size ?? 0) >= cap) return reject("provider");
       }
     }
     const group: ReservationGroup = parent?.group ?? { providers, embedding: requirements.embedding === true,
@@ -269,7 +281,19 @@ export class WorkerConcurrencyController {
       }
     };
     this.states.set(permit, state);
+    this.observeConcurrency();
     return permit;
+  }
+
+  private observeConcurrency(): void {
+    if (this.observers.size === 0) return;
+    const state = {
+      activeJobs: this.activeJobs, maxActiveJobs: this.limits.maxActiveJobs,
+      resources: Object.fromEntries(this.resources), resourceLimits: this.limits.resourceLimits,
+      providers: [...this.providers].map(([key, groups]) => ({ key, active: groups.size, limit: Math.min(...groups.values()) })),
+      embeddingRequests: this.embeddingRequests, embeddingRequestLimit: this.limits.embeddingRequestConcurrency
+    };
+    for (const observer of this.observers) observeWorker(observer, { type: "concurrency", state });
   }
 
   private releaseGroupIfIdle(group: ReservationGroup): void {
@@ -282,6 +306,7 @@ export class WorkerConcurrencyController {
   }
 
   private notifyReleased(): void {
+    this.observeConcurrency();
     for (const wake of this.waiters) wake();
     this.waiters.clear();
     for (const listener of this.listeners) {

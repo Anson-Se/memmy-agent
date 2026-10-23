@@ -11,7 +11,7 @@ import {
 import type { ActualModelContext } from "../../src/contracts/index.js";
 
 export function createMemoryServiceFixture(): {
-  cleanup: () => void;
+  cleanup: () => Promise<void>;
   createTestMemoryService: (
     options: ConstructorParameters<typeof MemoryService>[0]
   ) => MemoryService;
@@ -92,18 +92,23 @@ export function createMemoryServiceFixture(): {
     };
   }
 
-  function cleanup(): void {
-    for (const service of services.splice(0)) {
-      void service.stop();
-    }
-    for (const database of databases.splice(0)) {
+  async function cleanup(): Promise<void> {
+    // Snapshot before awaiting: even callers which forget to await cleanup
+    // must never close the databases belonging to the next test's services.
+    const stoppingServices = services.splice(0);
+    const closingDatabases = databases.splice(0);
+    const removingRoots = roots.splice(0);
+    const stopped = await Promise.allSettled(stoppingServices.map(async service => { await service.stop(); }));
+    for (const database of closingDatabases) {
       if (database.db.open) {
         database.close();
       }
     }
-    for (const root of roots.splice(0)) {
+    for (const root of removingRoots) {
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
+    const failed = stopped.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   return {

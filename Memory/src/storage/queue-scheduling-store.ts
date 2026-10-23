@@ -19,6 +19,7 @@ export interface SchedulingCandidate {
   lane: QueueLane;
   enqueueSeq: number;
   basePriority: number;
+  firstQueuedAt?: string | null;
   unregistered?: boolean;
 }
 export interface SchedulingMetadata {
@@ -226,24 +227,24 @@ export class QueueSchedulingStore {
     const laneFilter = includeUnknown ? "queue_lane IN (?, 'unregistered')" : "queue_lane = ?";
     const after = input.afterEnqueueSeq ?? 0;
     if (input.queue === "main") {
-      const rows = this.db.prepare(`SELECT id, job_type, queue_lane, enqueue_seq, base_priority FROM evolution_jobs
+      const rows = this.db.prepare(`SELECT id, job_type, queue_lane, enqueue_seq, base_priority, first_queued_at FROM evolution_jobs
         WHERE ${main.sql} AND ${laneFilter} AND policy_version = ? AND enqueue_seq > ?
         ORDER BY enqueue_seq LIMIT ?`).all(...main.params, input.lane, JOB_POLICY_VERSION, after, limit) as Array<{
-          id: string; job_type: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
+          id: string; job_type: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number; first_queued_at: string | null
         }>;
       return rows.map((row) => ({ queue: "main" as const, id: row.id, jobType: row.job_type,
         lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
-        enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
+        enqueueSeq: row.enqueue_seq, basePriority: row.base_priority, firstQueuedAt: row.first_queued_at,
         ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) }));
     }
-    const retries = this.db.prepare(`SELECT q.id, q.queue_lane, q.enqueue_seq, q.base_priority FROM embedding_retry_queue q
+    const retries = this.db.prepare(`SELECT q.id, q.queue_lane, q.enqueue_seq, q.base_priority, q.first_queued_at FROM embedding_retry_queue q
       WHERE ${retry.sql} AND q.${laneFilter} AND q.policy_version = ? AND q.enqueue_seq > ?
       ORDER BY q.enqueue_seq LIMIT ?`).all(...retry.params, input.lane, JOB_POLICY_VERSION, after, limit) as Array<{
-        id: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number
+        id: string; queue_lane: QueueLane | "unregistered"; enqueue_seq: number; base_priority: number; first_queued_at: string | null
       }>;
     return retries.map((row) => ({ queue: "embedding_retry" as const, id: row.id, jobType: "embedding_retry",
       lane: row.queue_lane === "unregistered" ? "maintenance" : row.queue_lane,
-      enqueueSeq: row.enqueue_seq, basePriority: row.base_priority,
+      enqueueSeq: row.enqueue_seq, basePriority: row.base_priority, firstQueuedAt: row.first_queued_at,
       ...(row.queue_lane === "unregistered" ? { unregistered: true } : {}) }));
   }
 }

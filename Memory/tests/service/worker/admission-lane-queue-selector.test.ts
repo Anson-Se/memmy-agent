@@ -6,11 +6,11 @@ import { QUEUE_LANES, type QueueLane } from "../../../src/service/worker/job-pol
 function candidate(lane: QueueLane, enqueueSeq = 1): LaneQueueCandidate {
   return { queue: "main", id: `${lane}-${enqueueSeq}`, lane, enqueueSeq, basePriority: 0 };
 }
-function claim(selector: AdmissionLaneQueueSelector, available: QueueLane[], blocked: QueueLane[] = []): QueueLane | undefined {
+function claim(selector: AdmissionLaneQueueSelector, available: QueueLane[], blocked: QueueLane[] = [], interactive = false): QueueLane | undefined {
   const pool = available.map((lane, i) => candidate(lane, i + 1));
   selector.dropEmpty(new Set(QUEUE_LANES.filter(lane => !available.includes(lane))));
   while (pool.length) {
-    const item = selector.choose(pool)!;
+    const item = (interactive ? selector.chooseInteractive(pool) : undefined) ?? selector.choose(pool)!;
     pool.splice(pool.indexOf(item), 1);
     if (blocked.includes(item.lane)) continue;
     selector.commit(item.lane);
@@ -96,5 +96,114 @@ describe("admission-aware weighted lane turns", () => {
     expect(selector.choose(input)).toBe(old);
     expect(input).toEqual([newer, old]);
     expect(() => selector.choose([old, old])).toThrow(/Duplicate/);
+  });
+
+  it("restores the bounded aging round and sanitizes malformed optional aging state", () => {
+    const selector = new AdmissionLaneQueueSelector();
+    selector.commit("evolution", true);
+    const saved = selector.snapshot();
+    const aged = { ...candidate("maintenance"), firstQueuedAt: "2026-10-22T00:00:00.000Z" };
+    const now = Date.parse("2026-10-23T00:00:00.000Z");
+    expect(new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, 0, saved).chooseAged([aged], now, 300_000)).toBeUndefined();
+    for (const aging of [undefined, null, [], {}, { servedMask: -1, used: true },
+      { servedMask: 32, used: true }, { servedMask: 0, used: "true" }]) {
+      const restored = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, 0, { ...saved, aging });
+      expect(restored.chooseAged([aged], now, 300_000)).toBe(aged);
+      expect(restored.snapshot().lanes).toEqual(saved.lanes);
+    }
+    saved.aging!.used = false;
+    expect(selector.snapshot().aging?.used).toBe(true);
+  });
+
+  it("does not advance a lane that already consumed its complete turn this round", () => {
+    const selector = new AdmissionLaneQueueSelector();
+    selector.commit("maintenance");
+    const aged = { ...candidate("maintenance"), firstQueuedAt: "2026-10-22T00:00:00.000Z" };
+    expect(selector.chooseAged([aged], Date.parse("2026-10-23T00:00:00.000Z"), 300_000)).toBeUndefined();
+    expect(() => selector.commit("maintenance", true)).toThrow(/unspent/);
+  });
+
+  it("applies the same metadata validation to aging and ordinary selection", () => {
+    const selector = new AdmissionLaneQueueSelector();
+    const old = { ...candidate("evolution"), firstQueuedAt: "2026-10-22T00:00:00.000Z" };
+    const now = Date.parse("2026-10-23T00:00:00.000Z");
+    expect(() => selector.chooseAged([old, old], now, 300_000)).toThrow(/Duplicate/);
+    expect(() => selector.chooseAged([{ ...old, enqueueSeq: 0 }], now, 300_000)).toThrow(/Invalid enqueue/);
+  });
+
+  it("prefers unspent interactive tickets after an empty skip while retaining complete weighted rounds", () => {
+    const selector = new AdmissionLaneQueueSelector();
+    expect(claim(selector, ["import", "evolution", "maintenance"], [], true)).toBe("import");
+    expect(selector.snapshot().aging!.servedMask & 1).toBe(1);
+    expect(claim(selector, [...QUEUE_LANES], [], true)).toBe("interactive");
+    const steady = new AdmissionLaneQueueSelector();
+    const sequence = Array.from({ length: 36 }, () => claim(steady, [...QUEUE_LANES], [], true));
+    const expected = QUEUE_LANES.flatMap(lane => Array<QueueLane>(DEFAULT_LANE_WEIGHTS[lane]).fill(lane));
+    expect(sequence).toEqual([...expected, ...expected, ...expected]);
+  });
+
+  it("does not refresh spent interactive tickets on restart, repeated previews or fast unrelated work", () => {
+    let selector = new AdmissionLaneQueueSelector();
+    for (let i = 0; i < 4; i++) expect(claim(selector, [...QUEUE_LANES], [], true)).toBe("interactive");
+    expect(selector.snapshot().interactive?.spent).toBe(true);
+    selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, selector.getCursor(), selector.snapshot());
+    const before = selector.snapshot();
+    for (let i = 0; i < 20; i++) expect(selector.chooseInteractive([candidate("interactive")])).toBeUndefined();
+    expect(selector.snapshot()).toEqual(before);
+    for (let i = 0; i < 100; i++) expect(claim(selector, [...QUEUE_LANES],
+      ["interactive", "repair_retry", "import", "evolution"], true)).toBe("maintenance");
+    expect(selector.chooseInteractive([candidate("interactive")])).toBeUndefined();
+    // Ordinary WRR must also honor the older unfulfilled model opportunities.
+    expect(claim(selector, [...QUEUE_LANES], [], true)).toBe("repair_retry");
+  });
+
+  it.each([4, 5, 6, 7, 8, 9, 10, 11])("advances exactly one existing ticket when upgrading old cursor %s", cursor => {
+    let selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, cursor);
+    const item = candidate("interactive");
+    expect(selector.chooseInteractive([item])).toBe(item);
+    const preview = selector.snapshot();
+    // A lost CAS or aborted transaction discards the selector without commit.
+    selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, cursor);
+    expect(selector.snapshot()).toEqual(preview);
+    selector.commit("interactive");
+    expect(selector.snapshot().lanes.find(turn => turn.lane === "interactive")?.remaining).toBe(3);
+    const restored = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, selector.getCursor(), selector.snapshot());
+    expect(restored.chooseInteractive([item])).toBeUndefined();
+    expect(restored.choose([...QUEUE_LANES].map(lane => candidate(lane)))?.lane).not.toBe("interactive");
+  });
+
+  it.each([0, 1, 2, 3])("uses only the current remaining quota in old interactive cursor segment %s", cursor => {
+    const selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, cursor), item = candidate("interactive");
+    expect(selector.snapshot().interactive?.upgradeAdvance).toBe(false);
+    for (let i = 0; i < 4 - cursor; i++) { expect(selector.chooseInteractive([item])).toBe(item); selector.commit("interactive"); }
+    expect(selector.chooseInteractive([item])).toBeUndefined();
+  });
+
+  it("distinguishes old turns from explicit new state and never regenerates a consumed upgrade advance", () => {
+    const lanes = ["import", "evolution", "maintenance", "interactive", "repair_retry"] as QueueLane[];
+    const old = { version: 1, lanes: lanes.map(lane => ({ lane, remaining: DEFAULT_LANE_WEIGHTS[lane] })),
+      aging: { servedMask: 3, used: false } };
+    const item = candidate("interactive");
+    const selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, 7, old);
+    expect(selector.chooseInteractive([item])).toBe(item);
+    selector.commit("interactive");
+    const spent = selector.snapshot();
+    for (let restart = 0; restart < 20; restart++) {
+      const restored = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, selector.getCursor(), spent);
+      expect(restored.chooseInteractive([item])).toBeUndefined();
+    }
+    expect(new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, 7,
+      { ...old, interactive: { spent: true } }).chooseInteractive([item])).toBeUndefined();
+    const empty = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, 7,
+      { ...old, interactive: { spent: false } });
+    for (let i = 0; i < 4; i++) { expect(empty.chooseInteractive([item])).toBe(item); empty.commit("interactive"); }
+    expect(empty.chooseInteractive([item])).toBeUndefined();
+  });
+
+  it.each([4, 7, 9, 11])("retains every lane's long-term weighted share after one upgrade advance at cursor %s", cursor => {
+    const selector = new AdmissionLaneQueueSelector(DEFAULT_LANE_WEIGHTS, cursor);
+    const sequence = Array.from({ length: 144 }, () => claim(selector, [...QUEUE_LANES], [], true));
+    const steady = sequence.slice(-120);
+    for (const lane of QUEUE_LANES) expect(steady.filter(value => value === lane)).toHaveLength(DEFAULT_LANE_WEIGHTS[lane] * 10);
   });
 });
