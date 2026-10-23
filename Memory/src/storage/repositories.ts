@@ -3681,22 +3681,28 @@ export class RuntimeRepository {
 
   /** Legacy ordering for resource admission, paged without acquiring a lease. */
   previewLegacyJobPage(input: QueueEligibilityOptions & {
-    at: string; limit: number; offset?: number;
+    at: string; limit: number; offset?: number; excludedIds?: readonly string[];
   }): Array<{ job: EvolutionJobRecord; priority: number }> {
     if (input.limit <= 0) return [];
     const eligibility = mainQueueEligibility(input.at, input);
     const rows = this.db.prepare(`SELECT *, ${evolutionJobPrioritySql()} AS queue_priority
-      FROM evolution_jobs WHERE ${eligibility.sql} ORDER BY ${evolutionJobOrderSql()} LIMIT ? OFFSET ?`)
-      .all(...eligibility.params, Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as Array<SqlJobRow & { queue_priority: number }>;
+      FROM evolution_jobs WHERE ${eligibility.sql}
+      ${input.excludedIds?.length ? "AND id NOT IN (SELECT value FROM json_each(?))" : ""}
+      ORDER BY ${evolutionJobOrderSql()} LIMIT ? OFFSET ?`)
+      .all(...eligibility.params, ...(input.excludedIds?.length ? [JSON.stringify(input.excludedIds)] : []),
+        Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as Array<SqlJobRow & { queue_priority: number }>;
     return rows.map(row => ({ job: jobFromSql(row), priority: row.queue_priority }));
   }
 
-  previewLegacyRetryPage(input: { now: number; limit: number; offset?: number; targetMemoryIds?: readonly string[] }): EmbeddingRetryRecord[] {
+  previewLegacyRetryPage(input: { now: number; limit: number; offset?: number; targetMemoryIds?: readonly string[]; excludedIds?: readonly string[] }): EmbeddingRetryRecord[] {
     if (input.limit <= 0) return [];
     const eligibility = retryQueueEligibility(input.now, input.targetMemoryIds);
     return (this.db.prepare(`SELECT q.* FROM embedding_retry_queue q LEFT JOIN memories m ON m.id = q.target_id
-      WHERE ${eligibility.sql} ORDER BY ${embeddingRetryOrderSql()} LIMIT ? OFFSET ?`)
-      .all(...eligibility.params, Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as SqlEmbeddingRetryRow[]).map(embeddingRetryFromSql);
+      WHERE ${eligibility.sql}
+      ${input.excludedIds?.length ? "AND q.id NOT IN (SELECT value FROM json_each(?))" : ""}
+      ORDER BY ${embeddingRetryOrderSql()} LIMIT ? OFFSET ?`)
+      .all(...eligibility.params, ...(input.excludedIds?.length ? [JSON.stringify(input.excludedIds)] : []),
+        Math.min(200, Math.floor(input.limit)), Math.max(0, Math.floor(input.offset ?? 0))) as SqlEmbeddingRetryRow[]).map(embeddingRetryFromSql);
   }
 
   leaseQueuedJobs(

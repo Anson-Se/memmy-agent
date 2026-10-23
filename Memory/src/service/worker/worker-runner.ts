@@ -52,7 +52,7 @@ import { isObservationMemory, observationJobPayload, observationMemoryState, OBS
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
 import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
 import { WorkerScheduler } from "./worker-scheduler.js";
-import { claimFairWorkerBatch, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
+import { claimFairWorkerBatch, createFairWorkerScan, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions, type WorkerSchedulingOptions, type ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 import { UnknownJobPolicyError } from "./job-policy-registry.js";
 import { WorkerConcurrencyController, type PreparedWorkerExecution, type WorkerPermit } from "./worker-concurrency.js";
@@ -563,6 +563,14 @@ export class WorkerRunner {
     let attemptedReconcileDeadline: number | undefined;
     let filled = false;
     let jobsThisTurn = 0;
+    let admissionVersion = 0;
+    const unsubscribeScanAdmission = this.concurrency.subscribe(() => { admissionVersion++; });
+    let scanVersion = admissionVersion;
+    let scan = createFairWorkerScan();
+    let scanFilters = "";
+    let scanDenied = false;
+    let scanDeadline: number | undefined;
+    let prepareExecution: WorkerRunnerDeps["prepareExecution"];
     const active = new Set<Promise<void>>();
     const selectedMain: string[] = [];
     const claimKey = (job: EvolutionJobRecord) => `${job.id}:${job.leaseToken}`;
@@ -603,7 +611,17 @@ export class WorkerRunner {
         let previous: { key: string; permit: WorkerPermit; group: symbol; count: number } | undefined;
         const keyOf = (work: FairClaimedWork) => `${work.queue}:${work.queue === "main" ? work.job.id : work.retry.id}`;
         const paused = this.deps.memoryBudgetPaused();
-        const prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
+        const filters = JSON.stringify([retryOnly, paused, this.deps.memoryBudgetModelSources(), this.summaryJobsHeld(),
+          this.deps.configurationFingerprint?.()]);
+        if (!scan.more || scanVersion !== admissionVersion || scanFilters !== filters ||
+          (scanDeadline !== undefined && scanDeadline <= this.nowMs())) {
+          scan = createFairWorkerScan();
+          scanFilters = filters;
+          scanDenied = false;
+          scanDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
+          prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
+        }
+        scanVersion = admissionVersion;
         const capacity = Math.min(remaining, this.concurrency.availableJobs(), FAIR_CLAIM_BATCH_LIMIT);
         if (filled && capacity > 0 && !retryOnly && options.algorithm === "legacy") {
           // Legacy selection requires an explicit failed -> queued transition.
@@ -620,7 +638,7 @@ export class WorkerRunner {
           excludedJobTypes: this.summaryJobsHeld(),
           includeRetries: !(paused && this.deps.memoryBudgetJobConsumes("embedding")),
           owner: this.leaseOwner, retryOwner: this.deps.embeddingRetryWorkerId,
-          leaseSeconds: WORKER_LEASE_SECONDS, retryLeaseMs: EMBEDDING_RETRY_LEASE_MS, options,
+          leaseSeconds: WORKER_LEASE_SECONDS, retryLeaseMs: EMBEDDING_RETRY_LEASE_MS, options, scan,
           admit: candidate => {
             const execution = prepareExecution?.(candidate) ?? { providers: [], run: <T>(operation: () => T) => operation() };
             const requirements = workerWorkRequirements(candidate, this.deps.repos, execution);
@@ -655,6 +673,12 @@ export class WorkerRunner {
             return admission;
           }
         }) : [];
+        // CAS-lost permits released inside this transaction did not make an
+        // earlier blocked resource available. Only later external/task releases
+        // invalidate the continuation before the next slice.
+        scanVersion = admissionVersion;
+        scanDenied ||= denied;
+        denied = scanDenied;
         remaining -= work.length;
         jobsThisTurn += work.length;
         const groups: Array<{ work: FairClaimedWork[]; admission: Admission }> = [];
@@ -700,6 +724,14 @@ export class WorkerRunner {
         }
         if (remaining <= 0 || !this.deps.memoryAddEnabled() || this.stopping || failedDrain || execution.signal?.aborted ||
           (execution.continuous && this.scheduler.hasPendingRequests())) break;
+        if (capacity > 0 && scan.more) {
+          // No await occurs inside the claim transaction. Start this slice's
+          // claimed work above, then let HTTP, timers and cancellation run even
+          // when thousands of inspected rows acquired no execution slot.
+          await yieldWorkerTurn();
+          jobsThisTurn = 0;
+          continue;
+        }
         if (active.size === 0) {
           const snapshot = this.concurrency.snapshot();
           if (!denied || (snapshot.activeJobs === 0 && snapshot.embeddingRequests === 0 && Object.keys(snapshot.providers).length === 0)) break;
@@ -716,6 +748,7 @@ export class WorkerRunner {
         finally { if (timer !== undefined) clearTimeout(timer); wake.dispose(); }
       }
     } catch (error) { failedDrain = true; fatal = error; }
+    finally { unsubscribeScanAdmission(); }
     // Stop admission first, then wait for every guarded execution before releasing
     // the shared entry boundary or allowing service shutdown to close storage.
     await Promise.all(active);

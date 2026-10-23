@@ -14,11 +14,33 @@ export interface FairWorkerClaimInput extends QueueEligibilityOptions {
   retryOwner: string; leaseSeconds: number; retryLeaseMs: number;
   options: ResolvedWorkerSchedulingOptions;
   priorityCohortOnly?: boolean;
+  /** Optional resumable admission scan. Without it the synchronous API is unchanged. */
+  scan?: FairWorkerScan;
   /** Must synchronously acquire all execution permits or return undefined. */
   admit?: (work: FairClaimedWork) => WorkAdmission | undefined;
 }
 const CURSOR_KEY = "worker.scheduler.wrr_cursor.v1";
 export const FAIR_CLAIM_BATCH_LIMIT = 200;
+
+export const FAIR_SCAN_CANDIDATE_LIMIT = 64;
+type ScanBucket = { lane: SchedulingCandidate["lane"]; queue: SchedulingCandidate["queue"]; after: number; exhausted: boolean };
+type ScanContinuation = {
+  fingerprint: string;
+  buckets: ScanBucket[];
+  candidates: SchedulingCandidate[];
+  mainSeen: string[];
+  retrySeen: string[];
+  mainDone: boolean;
+  retryDone: boolean;
+  cohort?: number;
+};
+/** Owned by one drain/fill; discard after permits/configuration change or a completed scan. */
+export interface FairWorkerScan {
+  inspected: number;
+  more: boolean;
+  continuation?: ScanContinuation;
+}
+export function createFairWorkerScan(): FairWorkerScan { return { inspected: 0, more: false }; }
 
 function normalizeFilter(values: readonly string[] | undefined): string[] | undefined {
   return values === undefined ? undefined : [...new Set(values)].sort();
@@ -125,48 +147,80 @@ function claimAdmittedWorkerBatch(
     return repos.transaction(() => {
       if (limit === 0) return [];
       const claimed: FairClaimedWork[] = [];
+      const fingerprint = JSON.stringify([scopeCursorKey(request), input.options, input.priorityCohortOnly ?? false,
+        repos.runtime.scheduling.getSelectionRevision()]);
+      const scan = input.scan;
+      if (scan) { scan.inspected = 0; scan.more = false; }
+      const continuing = scan?.continuation?.fingerprint === fingerprint ? scan.continuation : undefined;
+      // Buffers are copied so transaction rollback cannot leave a half-consumed
+      // continuation. The runner drops the scan on any admission-state change.
+      const state: ScanContinuation = continuing ? { ...continuing, mainDone: false,
+        buckets: continuing.buckets.map(bucket => ({ ...bucket, exhausted: false })),
+        candidates: [...continuing.candidates], mainSeen: [...continuing.mainSeen], retrySeen: [...continuing.retrySeen]
+      } : { fingerprint, buckets: QUEUE_LANES.flatMap(lane =>
+        (input.includeRetries ? ["main", "embedding_retry"] as const : ["main"] as const)
+          .map(queue => ({ lane, queue, after: 0, exhausted: false }))), candidates: [],
+        mainSeen: [], retrySeen: [], mainDone: false, retryDone: false };
+      let inspected = 0;
+      const inspectLimit = scan ? FAIR_SCAN_CANDIDATE_LIMIT : Number.POSITIVE_INFINITY;
+      const saveScan = (more: boolean) => {
+        if (scan) { scan.inspected = inspected; scan.more = more; scan.continuation = more ? state : undefined; }
+      };
       if (input.options.algorithm === "legacy") {
-        // Offset counts only examined rows still eligible after our own CAS.
-        // Permits may exclude a high-priority resource; the first admitted main
-        // row establishes the cohort, without consuming retry spare capacity.
-        let offset = 0, cohort: number | undefined;
-        mainPages: for (;;) {
-          const page = repos.runtime.previewLegacyJobPage({ ...request, limit: 200, offset });
-          if (page.length === 0) break;
-          let removed = 0;
+        // Offsets become invalid when another macro task removes or leases an
+        // examined row. Exclude examined IDs instead, keeping the original SQL
+        // priority/recency ordering for every remaining eligible candidate.
+        mainPages: while (!state.mainDone && claimed.length < limit && inspected < inspectLimit) {
+          const pageLimit = Math.min(200, inspectLimit - inspected);
+          const page = repos.runtime.previewLegacyJobPage({ ...request, limit: pageLimit, excludedIds: state.mainSeen });
           for (const { job, priority } of page) {
-            if (claimed.length >= limit || (input.priorityCohortOnly && cohort !== undefined && priority !== cohort)) break mainPages;
+            if (claimed.length >= limit) break mainPages;
+            if (input.priorityCohortOnly && state.cohort !== undefined && priority !== state.cohort) {
+              state.mainDone = true; break mainPages;
+            }
+            inspected++;
+            state.mainSeen.push(job.id);
             const result = tryClaim({ queue: "main", job });
-            if (result) { claimed.push(result); removed++; cohort ??= priority; }
+            if (result) { claimed.push(result); state.cohort ??= priority; }
           }
-          if (page.length < 200) break;
-          offset += page.length - removed;
+          if (page.length < pageLimit) state.mainDone = true;
         }
-        offset = 0;
-        while (input.includeRetries && claimed.length < limit) {
-          const page = repos.runtime.previewLegacyRetryPage({ now: Date.parse(input.at), targetMemoryIds: request.targetMemoryIds, limit: 200, offset });
-          if (page.length === 0) break;
-          let removed = 0;
+        retryPages: while (state.mainDone && input.includeRetries && !state.retryDone && claimed.length < limit && inspected < inspectLimit) {
+          const pageLimit = Math.min(200, inspectLimit - inspected);
+          const page = repos.runtime.previewLegacyRetryPage({ now: Date.parse(input.at),
+            targetMemoryIds: request.targetMemoryIds, limit: pageLimit, excludedIds: state.retrySeen });
           for (const retry of page) {
-            if (claimed.length >= limit) break;
+            if (claimed.length >= limit) break retryPages;
+            inspected++;
+            state.retrySeen.push(retry.id);
             const result = tryClaim({ queue: "embedding_retry", retry });
-            if (result) { claimed.push(result); removed++; }
+            if (result) claimed.push(result);
           }
-          if (page.length < 200) break;
-          offset += page.length - removed;
+          if (page.length < pageLimit) state.retryDone = true;
         }
+        saveScan(claimed.length < limit && (!state.mainDone || (input.includeRetries && !state.retryDone)));
         return claimed;
       }
 
-      repos.runtime.scheduling.refreshRunnablePolicies(request);
+      // An upgrade may leave thousands of older rows with stale policy. Finish
+      // their projection before FIFO selection, but never do all writes in one
+      // event-loop turn. Recheck each slice for metadata dirtied between turns.
+      const projection = repos.runtime.scheduling.refreshRunnablePolicies({ ...request,
+        ...(scan ? { maxRows: inspectLimit } : {}) });
+      if (scan) {
+        inspected += projection.refreshed;
+        if (projection.refreshed > 0) {
+          state.candidates = [];
+          for (const bucket of state.buckets) { bucket.after = 0; bucket.exhausted = false; }
+        }
+        if (projection.hasMore || inspected >= inspectLimit) { saveScan(true); return []; }
+      }
       const cursorKey = scopeCursorKey(request);
       const weightsKey = QUEUE_LANES.map(lane => input.options.laneWeights[lane]).join("/");
       const saved = repos.runtime.getKv(cursorKey)?.value as { weightsKey?: unknown; cursor?: unknown } | undefined;
       const cursor = saved?.weightsKey === weightsKey && Number.isSafeInteger(saved.cursor) && Number(saved.cursor) >= 0 ? Number(saved.cursor) : 0;
       const selector = new LaneQueueSelector(input.options.laneWeights, cursor);
-      const buckets = QUEUE_LANES.flatMap(lane => (input.includeRetries ? ["main", "embedding_retry"] as const : ["main"] as const)
-        .map(queue => ({ lane, queue, after: 0, exhausted: false })));
-      const candidates: SchedulingCandidate[] = [];
+      const { buckets, candidates } = state;
       function refill() {
         for (const bucket of buckets) {
           if (bucket.exhausted || candidates.some(candidate => candidate.queue === bucket.queue && candidate.lane === bucket.lane)) continue;
@@ -177,12 +231,14 @@ function claimAdmittedWorkerBatch(
           candidates.push(...page);
         }
       }
-      while (claimed.length < limit) {
+      let exhausted = false;
+      while (claimed.length < limit && inspected < inspectLimit) {
         refill();
         const before = selector.getCursor();
         const chosen = selector.select(candidates, 1).selected[0];
-        if (!chosen) break;
+        if (!chosen) { exhausted = true; break; }
         candidates.splice(candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id), 1);
+        inspected++;
         let result: FairClaimedWork | undefined;
         if (chosen.queue === "main") {
           const job = repos.runtime.getJob(chosen.id);
@@ -194,10 +250,12 @@ function claimAdmittedWorkerBatch(
         if (result) claimed.push(result);
         else selector.setCursor(before);
       }
+      saveScan(!exhausted && claimed.length < limit);
       if (claimed.length) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor() }, input.at);
       return claimed;
     });
   } catch (error) {
+    if (input.scan) { input.scan.more = false; input.scan.continuation = undefined; }
     // Rollback also covers successful earlier CAS operations. Returning all
     // permits here prevents a failed transaction from leaking execution slots.
     for (const admission of admissions) {

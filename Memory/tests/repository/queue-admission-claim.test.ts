@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../src/storage/repositories.js";
-import { claimFairWorkerBatch, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
+import { claimFairWorkerBatch, createFairWorkerScan, FAIR_SCAN_CANDIDATE_LIMIT, type FairWorkerScan, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions } from "../../src/service/worker/worker-scheduling-options.js";
 
 const at = "2026-10-22T00:00:00.000Z", now = Date.parse(at);
@@ -14,18 +14,18 @@ function harness() {
   const db = new MemoryDb({ path: join(root, "memory.sqlite") });
   resources.push({ db, root });
   const repos = new Repositories(db.db), runtime = repos.runtime;
-  function job(id: string, jobType: EvolutionJobRecord["jobType"] = "trace_summary", targetMemoryId = id) {
-    return runtime.enqueueJob({ id, jobType, targetMemoryId, userId: "user", status: "queued", payload: {},
+  function job(id: string, jobType: EvolutionJobRecord["jobType"] = "trace_summary", targetMemoryId = id, dedupeKey?: string) {
+    return runtime.enqueueJob({ id, jobType, targetMemoryId, dedupeKey, userId: "user", status: "queued", payload: {},
       attempts: 0, maxAttempts: 3, createdAt: at, updatedAt: at });
   }
   function retry(id: string) {
     return runtime.enqueueEmbeddingRetry({ id, targetKind: "trace", targetId: id, vectorField: "vec_summary", sourceText: id, now });
   }
   function claim(limit: number, admit: (work: FairClaimedWork) => { release(): void } | undefined,
-    algorithm: "wrr" | "legacy" = "wrr", priorityCohortOnly = false) {
+    algorithm: "wrr" | "legacy" = "wrr", priorityCohortOnly = false, scan?: FairWorkerScan) {
     return claimFairWorkerBatch(repos, { at, limit, includeRetries: true, owner: "main", retryOwner: "retry",
       leaseSeconds: 60, retryLeaseMs: 60_000, options: resolveWorkerSchedulingOptions({ algorithm }, {}),
-      admit, priorityCohortOnly });
+      admit, priorityCohortOnly, scan });
   }
   return { db, repos, runtime, job, retry, claim };
 }
@@ -38,6 +38,147 @@ afterEach(() => {
 });
 
 describe("atomic resource admission before queue claims", () => {
+  it.each(["wrr", "legacy"] as const)("resumes %s scans across bounded slices and still reaches the tail", algorithm => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 551; i++) h.job(`blocked-${i}`);
+    h.job("ready", "user_memory_embedding");
+    const seen: string[] = [];
+    const admit = (work: FairClaimedWork) => {
+      const id = work.queue === "main" ? work.job.id : work.retry.id;
+      seen.push(id);
+      return id === "ready" ? { release() {} } : undefined;
+    };
+    const work: FairClaimedWork[] = [];
+    do {
+      work.push(...h.claim(1, admit, algorithm, false, scan));
+      expect(scan.inspected).toBeLessThanOrEqual(FAIR_SCAN_CANDIDATE_LIMIT);
+    } while (scan.more);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["ready"]);
+    expect(new Set(seen).size).toBe(552);
+    expect(seen).toHaveLength(552);
+    work[0]!.admission!.release();
+  });
+
+  it.each(["delete", "ineligible"] as const)("keeps legacy tail reachable when examined rows become %s between slices", change => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 200; i++) h.job(`blocked-${i}`);
+    h.job("ready", "user_memory_embedding");
+    const seen: string[] = [];
+    const admit = (work: FairClaimedWork) => {
+      const id = work.queue === "main" ? work.job.id : work.retry.id;
+      seen.push(id);
+      return id === "ready" ? { release() {} } : undefined;
+    };
+    expect(h.claim(1, admit, "legacy", false, scan)).toEqual([]);
+    if (change === "delete") h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='blocked-0'").run();
+    else h.db.db.prepare("UPDATE evolution_jobs SET status='succeeded' WHERE id='blocked-0'").run();
+    const work: FairClaimedWork[] = [];
+    do { work.push(...h.claim(1, admit, "legacy", false, scan)); } while (scan.more);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["ready"]);
+    expect(seen).toHaveLength(201);
+    work[0]!.admission!.release();
+  });
+
+  it("rechecks new legacy main jobs while continuing a blocked retry scan", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 130; i++) h.retry(`blocked-${i}`);
+    h.retry("tail-retry");
+    const admit = (work: FairClaimedWork) => work.queue === "main" || work.retry.id === "tail-retry" ? { release() {} } : undefined;
+    expect(h.claim(1, admit, "legacy", false, scan)).toEqual([]);
+    expect(scan.more).toBe(true);
+    h.job("new-summary");
+    const work = h.claim(1, admit, "legacy", false, scan);
+    expect(work.map(item => item.queue === "main" ? item.job.id : item.retry.id)).toEqual(["new-summary"]);
+    work[0]!.admission!.release();
+  });
+
+  it("uses refreshed lane metadata when a deduped enqueue moves a buffered candidate", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 66; i++) h.job(`job-${i}`, "trace_summary", `job-${i}`, `dedupe-${i}`);
+    const admit = (work: FairClaimedWork) => work.queue === "main" && Number(work.job.id.split("-")[1]) < 64
+      ? undefined : { release() {} };
+    expect(h.claim(1, admit, "wrr", false, scan)).toEqual([]);
+    const previous = h.runtime.getJob("job-64")!;
+    const changed = h.runtime.enqueueJob({ ...previous, id: "new-id", payload: { source: "memory.processing.manual_retry" } });
+    expect(changed.queueLane).toBe("repair_retry");
+    const work: FairClaimedWork[] = [];
+    do { work.push(...h.claim(1, admit, "wrr", false, scan)); } while (!work.length && scan.more);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["job-65"]);
+    expect(h.runtime.getKv("worker.scheduler.wrr_cursor.v1")?.value).toMatchObject({ cursor: 1 });
+    work[0]!.admission!.release();
+  });
+
+  it("rewinds the lane heads when a buffered row moves before an already buffered new-lane head", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 66; i++) {
+      const job = h.job(`job-${i}`, "trace_summary", `job-${i}`, `dedupe-${i}`);
+      h.runtime.enqueueJob({ ...job, id: `deduped-${i}`, payload: { source: "memory.processing.manual_retry" } });
+    }
+    h.job("later-interactive");
+    h.runtime.setKv("worker.scheduler.wrr_cursor.v1", { weightsKey: "4/3/2/2/1", cursor: 4 }, at);
+    const admit = (work: FairClaimedWork) => work.queue === "main" && Number(work.job.id.split("-")[1]) < 64
+      ? undefined : { release() {} };
+    expect(h.claim(1, admit, "wrr", false, scan)).toEqual([]);
+    h.runtime.enqueueJob({ ...h.runtime.getJob("job-64")!, id: "new-id", payload: { source: "turn.complete.capture" } });
+    const work: FairClaimedWork[] = [];
+    do { work.push(...h.claim(1, admit, "wrr", false, scan)); } while (!work.length && scan.more);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["job-65"]);
+    expect(h.runtime.getKv("worker.scheduler.wrr_cursor.v1")?.value).toMatchObject({ cursor: 5 });
+    work[0]!.admission!.release();
+  });
+
+  it("reconsiders an already examined old sequence moved into another lane", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 64; i++) h.job(`interactive-${i}`, "trace_summary", `interactive-${i}`, `dedupe-${i}`);
+    for (let i = 0; i < 100; i++) h.job(`repair-${i}`, "decision_repair");
+    h.job("maintenance-ready", "episode_idle_close");
+    let changed = false;
+    const admit = (work: FairClaimedWork) => work.queue === "main" &&
+      (work.job.id === "maintenance-ready" || (changed && work.job.id === "interactive-0")) ? { release() {} } : undefined;
+    expect(h.claim(1, admit, "wrr", false, scan)).toEqual([]);
+    new Repositories(h.db.db).runtime.enqueueJob({ ...h.runtime.getJob("interactive-0")!, id: "deduped", payload: { source: "memory.processing.manual_retry" } });
+    changed = true;
+    const work: FairClaimedWork[] = [];
+    do { work.push(...h.claim(1, admit, "wrr", false, scan)); } while (!work.length && scan.more);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["interactive-0"]);
+    work[0]!.admission!.release();
+  });
+
+  it("keeps deep keyset progress while new enqueues receive their initial policy", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 551; i++) h.job(`blocked-${i}`);
+    h.job("ready", "user_memory_embedding");
+    const seen: string[] = [], work: FairClaimedWork[] = [];
+    const admit = (item: FairClaimedWork) => {
+      const id = item.queue === "main" ? item.job.id : item.retry.id;
+      seen.push(id);
+      return id === "ready" ? { release() {} } : undefined;
+    };
+    for (let slice = 0; slice < 12 && !work.length; slice++) {
+      work.push(...h.claim(1, admit, "wrr", false, scan));
+      h.job(`new-${slice}`);
+    }
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["ready"]);
+    expect(seen).toHaveLength(552);
+    expect(new Set(seen).size).toBe(552);
+    work[0]!.admission!.release();
+  });
+
+  it("revalidates buffered rows by ID-CAS and returns permits for stale candidates", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    for (let i = 0; i < 100; i++) h.job(`job-${i}`);
+    expect(h.claim(1, () => undefined, "wrr", false, scan)).toEqual([]);
+    expect(scan.more).toBe(true);
+    h.db.db.prepare("UPDATE evolution_jobs SET status='succeeded' WHERE id='job-64'").run();
+    const release = vi.fn();
+    const work = h.claim(1, () => ({ release }), "wrr", false, scan);
+    expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["job-65"]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(h.runtime.getJob("job-64")).toMatchObject({ status: "succeeded", attempts: 0 });
+    work[0]!.admission!.release();
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
   it("does not claim, count an attempt or advance WRR when all permits are busy", () => {
     const h = harness(); const before = h.job("busy"); h.retry("retry-busy");
     const admit = vi.fn((_work: FairClaimedWork) => undefined);

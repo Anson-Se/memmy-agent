@@ -310,6 +310,220 @@ describe("queue scheduling metadata and read-only candidates", () => {
 });
 
 describe("real-scheduler policy preparation", () => {
+  it("does not invalidate selection while initially classifying newly enqueued or raw jobs", () => {
+    const h = harness();
+    expect(h.store.getSelectionRevision()).toBe(0);
+    h.job("new-main"); h.retry("new-retry");
+    h.rawJob("raw-new");
+    expect(h.store.refreshRunnablePolicies({ at }).refreshed).toBe(1);
+    expect(h.store.getSelectionRevision()).toBe(0);
+  });
+
+  it("invalidates selection for an existing deduplicated task even after its metadata is current", () => {
+    const h = harness();
+    const original = h.job("original", "import_summary", undefined, {}, "same-job");
+    const revision = h.store.getSelectionRevision();
+    const updated = h.job("discarded-id", "import_summary", undefined,
+      { source: "startup.placeholder_summary_repair" }, "same-job");
+    expect(updated).toMatchObject({ id: original.id, queueLane: "maintenance", policyVersion: JOB_POLICY_VERSION });
+    expect(h.store.getSelectionRevision()).toBe(revision + 1);
+    h.store.refreshOne("main", original.id);
+    // Payload/resource/scope changes need invalidation even when lane is equal.
+    expect(h.store.getSelectionRevision()).toBe(revision + 2);
+  });
+
+  it.each(["full", "runnable"] as const)("shares %s refresh invalidations across both tables without counting first projections", mode => {
+    const h = harness(); h.job("old-main"); h.retry("old-retry"); h.rawJob("fresh-main");
+    h.db.db.prepare("UPDATE evolution_jobs SET policy_version=NULL WHERE id='old-main'").run();
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL WHERE id='old-retry'").run();
+    expect(h.store.getSelectionRevision()).toBe(0);
+    const result = mode === "full" ? h.store.refreshPolicies() : h.store.refreshRunnablePolicies({ at, maxRows: 64 });
+    expect(result.refreshed).toBe(3);
+    expect(h.store.getSelectionRevision()).toBe(2);
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 64 }).refreshed).toBe(0);
+    expect(h.store.getSelectionRevision()).toBe(2);
+  });
+
+  it("shares the revision between Repositories using the same SQLite connection", () => {
+    const h = harness(), second = new Repositories(h.db.db).runtime.scheduling;
+    h.job("shared-main"); h.retry("shared-retry");
+    expect(second.getSelectionRevision()).toBe(0);
+    second.refreshOne("main", "shared-main");
+    expect(h.store.getSelectionRevision()).toBe(1);
+    h.store.refreshOne("embedding_retry", "shared-retry");
+    expect(second.getSelectionRevision()).toBe(2);
+    expect(harness().store.getSelectionRevision()).toBe(0);
+  });
+
+  it("keeps invalidation monotonic when an outer transaction rolls a policy update back", () => {
+    const h = harness(); const original = h.job("rolled-back", "import_summary");
+    const before = h.store.getSelectionRevision();
+    expect(() => h.repos.transaction(() => {
+      h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id=?")
+        .run(JSON.stringify({ source: "startup.placeholder_summary_repair" }), original.id);
+      h.store.refreshOne("main", original.id);
+      expect(h.runtime.getJob(original.id)?.queueLane).toBe("maintenance");
+      throw new Error("fixture transaction rollback");
+    })).toThrow("fixture transaction rollback");
+    expect(h.runtime.getJob(original.id)?.queueLane).toBe("import");
+    expect(h.store.getSelectionRevision()).toBeGreaterThan(before);
+    const afterRollback = h.store.getSelectionRevision();
+    h.store.refreshOne("main", original.id);
+    expect(h.store.getSelectionRevision()).toBeGreaterThan(afterRollback);
+    h.store.refreshOne("main", "missing");
+    expect(h.store.getSelectionRevision()).toBe(afterRollback + 1);
+  });
+
+  it.each([0, 1, 64])("limits actual policy writes to maxRows=%i across both backing queues", maxRows => {
+    const h = harness();
+    h.db.db.transaction(() => {
+      for (let i = 0; i < 65; i++) h.rawJob(`main-${i}`, "import_summary");
+      for (let i = 0; i < 3; i++) h.retry(`retry-${i}`);
+      h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL").run();
+    })();
+    const input = { at, maxRows };
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: maxRows, unknown: [], hasMore: true });
+    const projected = h.db.db.prepare(`SELECT
+      (SELECT COUNT(*) FROM evolution_jobs WHERE policy_version=?) +
+      (SELECT COUNT(*) FROM embedding_retry_queue WHERE policy_version=?) AS n`)
+      .get(JOB_POLICY_VERSION, JOB_POLICY_VERSION) as { n: number };
+    expect(projected.n).toBe(maxRows);
+    if (maxRows === 0) {
+      expect(h.store.pendingPolicyCount()).toBe(68);
+      expect(h.store.refreshRunnablePolicies({ at })).toEqual({ refreshed: 68, unknown: [] });
+    } else {
+      let total = maxRows;
+      for (let round = 0; round < 70; round++) {
+        const result = h.store.refreshRunnablePolicies(input);
+        expect(result.refreshed).toBeLessThanOrEqual(maxRows);
+        total += result.refreshed;
+        if (result.hasMore === false) break;
+      }
+      expect(total).toBe(68);
+    }
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+  });
+
+  it("shares the remaining row budget with retries instead of giving each table a separate allowance", () => {
+    const h = harness();
+    h.rawJob("main");
+    h.retry("retry-first"); h.retry("retry-second");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL").run();
+    const result = h.store.refreshRunnablePolicies({ at, maxRows: 2 });
+    expect(result).toEqual({ refreshed: 2, unknown: [], hasMore: true });
+    expect(h.runtime.getJob("main")?.policyVersion).toBe(JOB_POLICY_VERSION);
+    expect(h.runtime.getEmbeddingRetry("retry-first")?.policyVersion).toBe(JOB_POLICY_VERSION);
+    expect(h.runtime.getEmbeddingRetry("retry-second")?.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 2 })).toEqual({ refreshed: 1, unknown: [], hasMore: false });
+  });
+
+  it("reports a precise exhausted boundary on the next empty slice and probes zero budget without writes", () => {
+    const h = harness();
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 0 })).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+    h.rawJob("one");
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 0 })).toEqual({ refreshed: 0, unknown: [], hasMore: true });
+    expect(h.runtime.getJob("one")?.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 1 })).toEqual({ refreshed: 1, unknown: [], hasMore: true });
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 1 })).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+  });
+
+  it("preserves due, dependency, scope, configuration, terminal and retry eligibility in bounded slices", () => {
+    const h = harness();
+    for (const id of ["ready", "due-failed", "future-failed", "configuration", "succeeded", "terminal", "leased-valid", "leased-expired"])
+      h.rawJob(id);
+    h.rawJob("future-run", "reflection", { payload: { runAfter: new Date(now + 1000).toISOString() } });
+    h.db.db.prepare("UPDATE evolution_jobs SET status='failed',available_at=? WHERE id='due-failed'").run(at);
+    h.db.db.prepare("UPDATE evolution_jobs SET status='failed',available_at=? WHERE id='future-failed'").run(new Date(now+1000).toISOString());
+    h.db.db.prepare("UPDATE evolution_jobs SET blocked_reason='configuration' WHERE id='configuration'").run();
+    h.db.db.prepare("UPDATE evolution_jobs SET status='succeeded' WHERE id='succeeded'").run();
+    h.db.db.prepare("UPDATE evolution_jobs SET status='dead_letter' WHERE id='terminal'").run();
+    h.db.db.prepare("UPDATE evolution_jobs SET status='leased',leased_until=? WHERE id='leased-valid'").run(new Date(now+1000).toISOString());
+    h.db.db.prepare("UPDATE evolution_jobs SET status='leased',leased_until=? WHERE id='leased-expired'").run(at);
+    h.memory("pending-target");
+    h.repos.processing.save({ memoryId: "pending-target", state: "embedding_pending", stage: "embedding", activeJobId: null,
+      attemptCount: 0, manualRetryCount: 0, retryAction: "retry", updatedAt: at });
+    h.rawJob("reward-blocked", "reward", { payload: { l1MemoryId: "pending-target" } });
+    h.rawJob("scope-first", "l3_world_model_update", { scopeKey: "project", scopeSeq: 1 });
+    h.rawJob("scope-blocked", "l3_world_model_update", { scopeKey: "project", scopeSeq: 2 });
+    h.retry("retry-due"); h.retry("retry-future"); h.retry("retry-terminal");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL").run();
+    h.db.db.prepare("UPDATE embedding_retry_queue SET next_attempt_at=? WHERE id='retry-future'").run(now+1000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='succeeded' WHERE id='retry-terminal'").run();
+    const input = { at, maxRows: 1, includeDueFailed: true };
+    let total = 0;
+    for (let i = 0; i < 10; i++) {
+      const result = h.store.refreshRunnablePolicies(input); total += result.refreshed;
+      expect(result.refreshed).toBeLessThanOrEqual(1);
+      if (result.hasMore === false) break;
+    }
+    expect(total).toBe(5);
+    for (const id of ["ready", "due-failed", "leased-expired", "scope-first"])
+      expect(h.runtime.getJob(id)?.policyVersion).toBe(JOB_POLICY_VERSION);
+    for (const id of ["future-failed", "configuration", "succeeded", "terminal", "leased-valid", "future-run", "reward-blocked", "scope-blocked"])
+      expect(h.runtime.getJob(id)?.policyVersion).toBeNull();
+    expect(h.runtime.getEmbeddingRetry("retry-due")?.policyVersion).toBe(JOB_POLICY_VERSION);
+    expect(h.runtime.getEmbeddingRetry("retry-future")?.policyVersion).toBeNull();
+    expect(h.runtime.getEmbeddingRetry("retry-terminal")?.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ ...input, maxRows: 0 })).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+  });
+
+  it("applies target/type/retry gates to the bounded zero-write probe as well as projection", () => {
+    const h = harness();
+    h.rawJob("outside", "reflection", { target: "outside" });
+    h.rawJob("wrong-type", "episode_title", { target: "selected" });
+    h.retry("inside-retry", "selected");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL").run();
+    const input = { at, targetMemoryIds: ["selected"], allowedJobTypes: ["reflection"], includeRetries: false, maxRows: 0 };
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+    expect(h.store.refreshRunnablePolicies({ ...input, includeRetries: true })).toEqual({ refreshed: 0, unknown: [], hasMore: true });
+    expect(h.store.refreshRunnablePolicies({ ...input, includeRetries: true, maxRows: 1 })).toEqual({ refreshed: 1, unknown: [], hasMore: true });
+    expect(h.runtime.getJob("outside")?.policyVersion).toBeNull();
+    expect(h.runtime.getJob("wrong-type")?.policyVersion).toBeNull();
+  });
+
+  it("counts unknown-type quarantine against the same row budget and does not warn/project it again", () => {
+    const h = harness(); h.rawJob("unknown", "future_new_job"); h.rawJob("next");
+    const input = { at, maxRows: 1 };
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 1, unknown: [{ id: "unknown", jobType: "future_new_job" }], hasMore: true });
+    expect(h.runtime.getJob("unknown")).toMatchObject({ queueLane: "unregistered", attempts: 0, status: "queued" });
+    expect(h.runtime.getJob("next")?.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 1, unknown: [], hasMore: true });
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+  });
+
+  it("does not charge already-classified rows, exhausted failures or valid retry leases against a slice", () => {
+    const h = harness();
+    h.job("already-classified");
+    h.rawJob("exhausted");
+    h.db.db.prepare("UPDATE evolution_jobs SET failure_count=max_attempts WHERE id='exhausted'").run();
+    h.retry("valid-lease"); h.retry("expired-lease");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',lease_until=? WHERE id='valid-lease'").run(now+1000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',lease_until=? WHERE id='expired-lease'").run(now);
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 1 })).toEqual({ refreshed: 1, unknown: [], hasMore: true });
+    expect(h.runtime.getEmbeddingRetry("expired-lease")?.policyVersion).toBe(JOB_POLICY_VERSION);
+    expect(h.runtime.getEmbeddingRetry("valid-lease")?.policyVersion).toBeNull();
+    expect(h.runtime.getJob("exhausted")?.policyVersion).toBeNull();
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 1 })).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+  });
+
+  it("retains type exclusion and the default failed-job gate during zero-write and nonzero slices", () => {
+    const h = harness();
+    h.rawJob("excluded", "trace_summary"); h.rawJob("failure", "reflection");
+    h.db.db.prepare("UPDATE evolution_jobs SET status='failed' WHERE id='failure'").run();
+    const input = { at, maxRows: 0, excludedJobTypes: ["trace_summary"] };
+    expect(h.store.refreshRunnablePolicies(input)).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+    expect(h.store.refreshRunnablePolicies({ ...input, maxRows: 1 })).toEqual({ refreshed: 0, unknown: [], hasMore: false });
+    expect(h.store.refreshRunnablePolicies({ ...input, maxRows: 1, includeDueFailed: true }))
+      .toEqual({ refreshed: 1, unknown: [], hasMore: true });
+    expect(h.runtime.getJob("excluded")?.policyVersion).toBeNull();
+  });
+
+  it.each([-1, 0.5, NaN, Infinity])("rejects invalid projection budget %s without writing rows", maxRows => {
+    const h = harness(); h.rawJob("untouched");
+    expect(() => h.store.refreshRunnablePolicies({ at, maxRows })).toThrow(RangeError);
+    expect(h.runtime.getJob("untouched")?.policyVersion).toBeNull();
+  });
+
   it("finishes more than one projection batch before FIFO selection without touching terminal history", () => {
     const h = harness();
     h.db.db.transaction(() => {
