@@ -823,6 +823,30 @@ export class MemoryRepository {
     return ids.map((id) => byId.get(id)).filter((row): row is MemoryRow => Boolean(row));
   }
 
+  /** Title scheduling needs provenance, never conversation bodies or vectors. */
+  areAllHistoricalCaptureMemories(ids: readonly string[]): boolean {
+    const distinctIds = [...new Set(ids)];
+    if (distinctIds.length === 0) return false;
+    const row = this.db.prepare(`SELECT COUNT(*) AS found,
+      COALESCE(SUM(CASE WHEN
+        json_extract(properties_json, '$.internal_info.capture_origin') = 'agent_source_scan'
+        AND lower(COALESCE(agent_id, '')) != 'memmy-onboarding'
+        AND NOT EXISTS (SELECT 1 FROM (
+          SELECT value FROM json_each(CASE WHEN json_type(tags_json) = 'array' THEN tags_json ELSE '[]' END)
+          UNION ALL
+          SELECT value FROM json_each(CASE WHEN json_type(info_json, '$.tags') = 'array'
+            THEN json_extract(info_json, '$.tags') ELSE '[]' END)
+          UNION ALL
+          SELECT value FROM json_each(CASE WHEN json_type(properties_json, '$.tags') = 'array'
+            THEN json_extract(properties_json, '$.tags') ELSE '[]' END)
+        ) WHERE lower(value) IN ('first-encounter-report', 'onboarding-report'))
+        THEN 1 ELSE 0 END), 0) AS historical
+      FROM memories
+      WHERE id IN (SELECT value FROM json_each(?)) AND deleted_at IS NULL`)
+      .get(toJson(distinctIds)) as { found: number; historical: number };
+    return row.found === distinctIds.length && row.historical === row.found;
+  }
+
   list(filter: MemoryFilter = {}, limit = 50, offset = 0): MemoryRow[] {
     const built = buildMemoryWhere(filter);
     const rows = this.db

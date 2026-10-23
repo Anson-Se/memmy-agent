@@ -21,7 +21,6 @@ import {
   embeddingRetryTargetKindForMemory,
   embeddingRetryVectorFieldForMemory
 } from "../embedding/embedding-pipeline.js";
-import { isOnboardingFirstReportTarget } from "./job-policy-registry.js";
 import { episodeTitleIsCurrent } from "../episode-title/episode-title-service.js";
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import { observationMemoryState } from "../observation-memory-state.js";
@@ -212,10 +211,7 @@ export function enqueueJob(
     // inherit the historical lane; mixed or incomplete episodes stay interactive.
     delete payload.captureOrigin;
     const episode = input.episodeId ? deps.repos.runtime.getEpisode(input.episodeId) : undefined;
-    const memories = episode ? deps.repos.memories.getMany(episode.l1MemoryIds) : [];
-    if (episode && memories.length > 0 && memories.length === episode.l1MemoryIds.length
-      && memories.every(memory => memory.properties.internal_info.capture_origin === "agent_source_scan"
-        && !isOnboardingFirstReportTarget({ agentId: memory.agentId, tags: memory.tags }))) {
+    if (episode && deps.repos.memories.areAllHistoricalCaptureMemories(episode.l1MemoryIds)) {
       payload.captureOrigin = "agent_source_scan";
     }
   }
