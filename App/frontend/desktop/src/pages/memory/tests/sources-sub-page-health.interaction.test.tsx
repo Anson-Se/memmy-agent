@@ -443,6 +443,134 @@ describe("SourcesSubPage memory service recovery", () => {
     await act(async () => { late.resolve({ active: true, progress: null, status: "idle", version: { generation: 2, sequence: 99 } }); });
     expect(stateApi.state.agentSources.scanStamp?.version).toEqual(fresh.version);
   });
+
+  it.each([false, true])("starts the first scan immediately after clearing a just-completed scan (leave page: %s)", async (leavePage) => {
+    const clients = createClients(async () => healthy);
+    const clearPending = deferred<Awaited<ReturnType<AppClients["localData"]["clear"]>>>();
+    const previousVersion = { generation: 3, sequence: 8 };
+    const clearedVersion = { generation: 3, sequence: 9 };
+    let cleared = false;
+    let scanStarted = false;
+    clients.localData.clear = vi.fn(() => clearPending.promise);
+    clients.config.updateOnboarding = vi.fn(async () => ({ scanPermission: "scan_only" } as never));
+    clients.agentSources.getScanStatus = vi.fn(async () => scanStarted
+      ? { active: true, progress: { jobId: "after-clear", attemptId: "attempt-after-clear", sourceId: "all", phase: "scan", current: 0, total: 0, version: { generation: 3, sequence: 10 } }, version: { generation: 3, sequence: 10 } }
+      : { active: false, progress: null, status: "idle", version: cleared ? clearedVersion : previousVersion });
+    clients.agentSources.startScan = vi.fn(async () => {
+      scanStarted = true;
+      return { jobId: "after-clear", attemptId: "attempt-after-clear", version: { generation: 3, sequence: 10 } };
+    });
+
+    await render(clients);
+    await act(async () => {
+      stateApi.dispatch(appActions.agentSourceScanCompleted({ jobId: "before-clear", attemptId: "old-attempt", sourceId: "all", succeeded: true, completedAt: new Date().toISOString(), version: previousVersion }));
+    });
+    const completedAt = Date.now();
+    expect(stateApi.state.agentSources.recentScanCompletions).toHaveLength(1);
+    expect([...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步完成")?.disabled).toBe(true);
+    const clearButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清除所有本地数据"));
+    expect(clearButton).toBeDefined();
+    await act(async () => { clearButton!.click(); });
+    const confirmButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清空记忆数据库"));
+    expect(confirmButton).toBeDefined();
+    await act(async () => { confirmButton!.click(); });
+    expect(clients.localData.clear).toHaveBeenCalledTimes(1);
+    expect(stateApi.state.agentSources.memoryDataClearing).toBe(true);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
+
+    if (leavePage) await render(clients, false);
+    cleared = true;
+    await act(async () => {
+      clearPending.resolve({} as Awaited<ReturnType<AppClients["localData"]["clear"]>>);
+      await clearPending.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(Date.now()).toBe(completedAt); // No completion-feedback timer has elapsed.
+    expect(stateApi.state.agentSources.recentScanCompletions).toEqual([]);
+    expect(clients.agentSources.getScanStatus).toHaveBeenCalled();
+    expect(clients.agentSources.listSources).toHaveBeenCalledTimes(2);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(clearedVersion);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(stateApi.state.agentSources.memoryDataClearing).toBe(false);
+
+    await render(clients);
+    const scanButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "同步新增");
+    expect(scanButton?.disabled).toBe(false);
+    await act(async () => { scanButton?.click(); });
+    expect(clients.agentSources.startScan).toHaveBeenCalledTimes(1);
+    expect(clients.agentSources.startScan).toHaveBeenCalledWith({ sourceId: "all", expectedVersion: clearedVersion });
+    expect(stateApi.state.agentSources.scanProgress?.jobId).toBe("after-clear");
+  });
+
+  it("keeps scans locked after clear until both status and source refresh succeed", async () => {
+    const clients = createClients(async () => healthy);
+    const previousVersion = { generation: 4, sequence: 2 };
+    const clearedVersion = { generation: 4, sequence: 3 };
+    let failStatusRefresh = false;
+    let failSourceRefresh = false;
+    clients.localData.clear = vi.fn(async () => ({} as never));
+    clients.agentSources.getScanStatus = vi.fn(async () => {
+      if (failStatusRefresh) {
+        failStatusRefresh = false;
+        throw new Error("scan status refresh failed");
+      }
+      return { active: false, progress: null, status: "idle", version: clearedVersion };
+    });
+    clients.agentSources.listSources = vi.fn(async () => {
+      if (failSourceRefresh) {
+        failSourceRefresh = false;
+        throw new Error("source list refresh failed");
+      }
+      return [];
+    });
+    await render(clients);
+    await act(async () => {
+      stateApi.dispatch(appActions.agentSourceScanStatusReceived({ active: false, progress: null, status: "idle", version: previousVersion }));
+    });
+    failStatusRefresh = true;
+    failSourceRefresh = true;
+    const clearButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清除所有本地数据"));
+    await act(async () => { clearButton?.click(); });
+    const confirmButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清空记忆数据库"));
+    await act(async () => { confirmButton?.click(); });
+
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(previousVersion);
+    await advance(1_000);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(true);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(previousVersion);
+    await advance(1_000);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(clearedVersion);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(clients.agentSources.getScanStatus).toHaveBeenCalledTimes(3);
+    expect(clients.agentSources.listSources).toHaveBeenCalledTimes(3);
+  });
+
+  it("reconciles after a rejected clear request so a no-op failure does not leave scanning locked", async () => {
+    const clients = createClients(async () => healthy);
+    const version = { generation: 5, sequence: 4 };
+    clients.localData.clear = vi.fn(async () => { throw new Error("clear rejected"); });
+    clients.agentSources.getScanStatus = vi.fn(async () => ({ active: false, progress: null, status: "idle", version }));
+    await render(clients);
+    await act(async () => {
+      stateApi.dispatch(appActions.agentSourceScanStatusReceived({ active: false, progress: null, status: "idle", version }));
+    });
+    const clearButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清除所有本地数据"));
+    await act(async () => { clearButton?.click(); });
+    const confirmButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("清空记忆数据库"));
+    await act(async () => {
+      confirmButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("clear rejected");
+    expect(stateApi.state.agentSources.memoryDataClearing).toBe(false);
+    expect(stateApi.state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(stateApi.state.agentSources.scanStamp?.version).toEqual(version);
+    expect(clients.agentSources.listSources).toHaveBeenCalledTimes(2);
+  });
 });
 
 function ClientsHarness(props: { clients: AppClients; showPage?: boolean }) {
@@ -459,8 +587,8 @@ function createClients(health: (signal?: AbortSignal) => Promise<unknown>): AppC
       localToken: "test-token",
       memory: { baseUrl: "http://127.0.0.1:18960" }
     },
-    localData: { getPath: async () => ({ ok: true, dataPath: "/test/memory" }) },
-    agentSources: { listSources: async () => [], getScanStatus: async () => ({ running: false, jobId: null, progress: null, unavailable: null }) },
+    localData: { getPath: async () => ({ ok: true, dataPath: "/test/memory" }), clear: async () => ({} as never) },
+    agentSources: { listSources: vi.fn(async () => []), getScanStatus: async () => ({ running: false, jobId: null, progress: null, unavailable: null }) },
     config: {
       getScanPreferences: async () => ({ autoScanKnownAgents: true, watchFileChanges: true, autoInjectSkill: false })
     },

@@ -162,7 +162,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const recentlyCompletedSourceIds = new Set(state.agentSources.recentScanCompletions.filter((item) => item.succeeded !== false).map((item) => item.sourceId));
   const scanStopped = scanProgress?.phase === "stopped";
   const scanCancelling = Boolean(state.agentSources.cancellingScanJobId || state.agentSources.scanControl?.control === "cancel");
-  const scanControlBusy = memoryServiceBusy || state.agentSources.memoryServiceRestarting || state.agentSources.scanStateSyncRequired || Boolean(state.agentSources.scanControl);
+  const scanControlBusy = memoryServiceBusy || state.agentSources.memoryServiceRestarting || state.agentSources.memoryDataClearing || state.agentSources.scanStateSyncRequired || Boolean(state.agentSources.scanControl);
   const showScanProgress = isScanning || scanStopped || scanCancelling;
   const hasDeterminateScanProgress = Boolean(scanProgress && scanProgress.phase !== "scan" && scanProgress.phase !== "stopped" && scanProgress.total > 0);
   const memoryUnavailable = memoryServiceStatus === "unavailable";
@@ -381,7 +381,8 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
 
   function restartMemoryService() {
     const monitor = memoryServiceMonitor.current;
-    if (!clients || !monitor?.active || monitor.clients !== clients || monitor.restarting || memoryServiceBusy || state.agentSources.memoryServiceRestarting) {
+    if (!clients || !monitor?.active || monitor.clients !== clients || monitor.restarting || memoryServiceBusy ||
+      state.agentSources.memoryServiceRestarting || state.agentSources.memoryDataClearing || state.agentSources.scanStateSyncReason === "clear") {
       return;
     }
 
@@ -753,26 +754,29 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
       .finally(() => setLocalDataBusy(null));
   }
 
-  /**
-   * Clears local memory data, import state, and sync progress records, then refreshes the memory management page cache.
-   */
+  /** Clears local Memory data and keeps scan actions locked until shared scan and source state are refreshed. */
   function clearLocalMemoryData() {
-    if (!clients || localDataBusy) {
+    if (!clients || localDataBusy || state.agentSources.memoryDataClearing || state.agentSources.memoryServiceRestarting || state.agentSources.scanStateSyncRequired) {
       return;
     }
 
     setLocalDataBusy("clear");
     setLocalDataError("");
     setLocalDataExportMessage("");
+    dispatch(appActions.agentSourceClearStarted(state.agentSources.scanStamp?.version ?? null));
+    let clearSucceeded = false;
     void clients.localData
       .clear({ confirm: true })
       .then(() => {
+        clearSucceeded = true;
         clearMemoryPanelCache();
         setShowWipeConfirm(false);
-        reloadSources();
       })
       .catch((error) => setLocalDataError(error instanceof Error ? error.message : String(error)))
-      .finally(() => setLocalDataBusy(null));
+      .finally(() => {
+        dispatch(appActions.agentSourceClearFinished(clearSucceeded));
+        setLocalDataBusy(null);
+      });
   }
 
   return (
@@ -840,7 +844,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
             actionLabel={t(memoryServiceBusy || state.agentSources.memoryServiceRestarting ? "memory.restartServiceBusy" : "memory.restartService")}
             actionTone="success"
             onAction={restartMemoryService}
-            actionDisabled={!clients || memoryServiceBusy || state.agentSources.memoryServiceRestarting}
+            actionDisabled={!clients || memoryServiceBusy || state.agentSources.memoryServiceRestarting || state.agentSources.memoryDataClearing || state.agentSources.scanStateSyncReason === "clear"}
             actionBusy={memoryServiceBusy || state.agentSources.memoryServiceRestarting}
             bordered
             feedback={
@@ -1174,6 +1178,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
           <button
             type="button"
             onClick={() => setShowWipeConfirm(true)}
+            disabled={state.agentSources.memoryDataClearing || state.agentSources.memoryServiceRestarting || state.agentSources.scanStateSyncRequired}
             className="flex items-center gap-1.5 px-4 py-2 text-xs text-status-error/85 border border-status-error/30 rounded-btn hover:bg-status-error-soft/60 transition-colors cursor-pointer"
           >
             <Trash2 size={12} />
@@ -1319,7 +1324,7 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
               <button
                 type="button"
                 onClick={clearLocalMemoryData}
-                disabled={localDataBusy === "clear"}
+                disabled={localDataBusy === "clear" || state.agentSources.memoryDataClearing || state.agentSources.memoryServiceRestarting || state.agentSources.scanStateSyncRequired}
                 className="px-4 py-2 text-sm text-white bg-status-error rounded-btn hover:bg-status-error/85 transition-all cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
               >
                 {localDataBusy === "clear" && <Loader2 size={14} className="animate-spin" />}

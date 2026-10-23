@@ -1,4 +1,4 @@
-import { acceptsScanUpdate, compareScanVersions, type ScanStamp, agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
+import { acceptsScanUpdate, compareScanVersions, type ScanStamp, type ScanVersion, agentSourceScanExecutionKey } from "@memmy/local-api-contracts";
 /** App reducer module. */
 import { ASR_DEFAULT_BASE_URL, QWEN_ASR_MODEL_ID, type AgentSourceView, type AgentSourceScanUnavailable, type AppBootstrapResponse, type ScanPreferences } from "@memmy/local-api-contracts";
 import type { AppRoutePath, PreferredMode } from "../app/routes.js";
@@ -28,9 +28,13 @@ export interface AgentSourcesState {
   scanStamp?: ScanStamp;
   scanRequestGeneration?: number;
   memoryServiceRestarting: boolean;
+  memoryDataClearing: boolean;
   scanStateSyncRequired: boolean;
   scanStateSyncGeneration: number;
   scanStateSyncBaseGeneration: number | null;
+  scanStateSyncBaseVersion: ScanVersion | null;
+  scanStateSyncReason: "restart" | "clear" | null;
+  scanStateSyncRequireVersionAdvance: boolean;
   scanControl?: { control: "start" | "pause" | "resume" | "cancel"; token: string } | null;
   scanUnavailable: AgentSourceScanUnavailable | null;
   items: AgentSourceView[];
@@ -133,9 +137,13 @@ export function createInitialAppState(windowVisible = true): AppState {
     },
     agentSources: {
       memoryServiceRestarting: false,
+      memoryDataClearing: false,
       scanStateSyncRequired: false,
       scanStateSyncGeneration: 0,
       scanStateSyncBaseGeneration: null,
+      scanStateSyncBaseVersion: null,
+      scanStateSyncReason: null,
+      scanStateSyncRequireVersionAdvance: false,
       scanUnavailable: null,
       items: [],
       isLoading: false,
@@ -294,19 +302,42 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "agentSources/restartStarted":
       return { ...state, agentSources: { ...state.agentSources, memoryServiceRestarting: true,
         scanStateSyncRequired: true, scanStateSyncGeneration: state.agentSources.scanStateSyncGeneration + 1,
-        scanStateSyncBaseGeneration: action.baseGeneration } };
+        scanStateSyncBaseGeneration: action.baseGeneration, scanStateSyncBaseVersion: null, scanStateSyncReason: "restart",
+        scanStateSyncRequireVersionAdvance: false } };
     case "agentSources/restartFinished":
       return { ...state, agentSources: { ...state.agentSources, memoryServiceRestarting: false } };
-    case "agentSources/restartStateSynchronized": {
-      if (action.generation !== state.agentSources.scanStateSyncGeneration || state.agentSources.memoryServiceRestarting || action.status.unavailable) return state;
+    case "agentSources/clearStarted":
+      return { ...state, agentSources: { ...state.agentSources, memoryDataClearing: true,
+        scanStateSyncRequired: true, scanStateSyncGeneration: state.agentSources.scanStateSyncGeneration + 1,
+        scanStateSyncBaseGeneration: action.baseVersion?.generation ?? null,
+        scanStateSyncBaseVersion: action.baseVersion, scanStateSyncReason: "clear", scanStateSyncRequireVersionAdvance: false } };
+    case "agentSources/clearFinished":
+      return { ...state, agentSources: { ...state.agentSources, memoryDataClearing: false,
+        scanStateSyncRequireVersionAdvance: action.succeeded } };
+    case "agentSources/scanStateSynchronized": {
+      if (!state.agentSources.scanStateSyncRequired || !state.agentSources.scanStateSyncReason ||
+        action.generation !== state.agentSources.scanStateSyncGeneration || state.agentSources.memoryServiceRestarting || action.status.unavailable) return state;
       const currentVersion = state.agentSources.scanStamp?.version;
       const incomingVersion = action.status.version;
       const baseGeneration = state.agentSources.scanStateSyncBaseGeneration;
-      if (baseGeneration !== null && (!incomingVersion || incomingVersion.generation <= baseGeneration)) return state;
-      if (currentVersion && (!incomingVersion || compareScanVersions(incomingVersion, currentVersion) < 0)) return state;
-      const reconciled = appReducer(state, { type: "agentSources/scanStatus", status: action.status });
-      return { ...reconciled, agentSources: { ...reconciled.agentSources, scanStateSyncRequired: false,
-        scanStateSyncBaseGeneration: null } };
+      const baseVersion = state.agentSources.scanStateSyncBaseVersion;
+      if (state.agentSources.scanStateSyncReason === "restart" && baseGeneration !== null && (!incomingVersion || incomingVersion.generation <= baseGeneration)) return state;
+      const minimumVersionComparison = state.agentSources.scanStateSyncRequireVersionAdvance ? 1 : 0;
+      if (state.agentSources.scanStateSyncReason === "clear" && baseVersion && (!incomingVersion || compareScanVersions(incomingVersion, baseVersion) < minimumVersionComparison)) return state;
+      if (state.agentSources.scanStateSyncReason === "clear" && (!incomingVersion || !action.sources)) return state;
+      const incomingIsStale = Boolean(currentVersion && (!incomingVersion || compareScanVersions(incomingVersion, currentVersion) < 0));
+      if (state.agentSources.scanStateSyncReason === "restart" && currentVersion && incomingIsStale) return state;
+      const reconciled = incomingIsStale ? state : appReducer(state, { type: "agentSources/scanStatus", status: action.status });
+      return { ...reconciled, agentSources: { ...reconciled.agentSources,
+        ...(action.sources ? { items: action.sources, isLoading: false } : {}),
+        // A successful clear invalidates earlier completion feedback. Keep feedback
+        // from scans completed at/after this snapshot (including newer SSE updates).
+        ...(state.agentSources.scanStateSyncReason === "clear" && state.agentSources.scanStateSyncRequireVersionAdvance && incomingVersion
+          ? { recentScanCompletions: reconciled.agentSources.recentScanCompletions.filter((completion) =>
+              completion.version && compareScanVersions(completion.version, incomingVersion) >= 0) }
+          : {}),
+        scanStateSyncRequired: false, scanStateSyncBaseGeneration: null, scanStateSyncBaseVersion: null, scanStateSyncReason: null,
+        scanStateSyncRequireVersionAdvance: false } };
     }
     case "agentSources/error":
       return {

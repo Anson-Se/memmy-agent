@@ -31,7 +31,7 @@ import type {
 } from "./agent-chat-slice.js";
 import type { ToolsAction } from "./tools-slice.js";
 
-import type { ScanStamp as importScanStamp, AgentSourceScanStatusResponse } from "@memmy/local-api-contracts";
+import type { ScanStamp as importScanStamp, ScanVersion, AgentSourceScanStatusResponse } from "@memmy/local-api-contracts";
 
 /** Type definition for event connection status. */
 export type EventConnectionStatus = "pending" | "connecting" | "connected" | "heartbeat" | "reconnecting";
@@ -109,7 +109,9 @@ export type AppAction =
   | { type: "agentSources/scanAvailability"; unavailable: AgentSourceScanUnavailable | null }
   | { type: "agentSources/restartStarted"; baseGeneration: number | null }
   | { type: "agentSources/restartFinished" }
-  | { type: "agentSources/restartStateSynchronized"; generation: number; status: AgentSourceScanStatusResponse }
+  | { type: "agentSources/clearStarted"; baseVersion: ScanVersion | null }
+  | { type: "agentSources/clearFinished"; succeeded: boolean }
+  | { type: "agentSources/scanStateSynchronized"; generation: number; status: AgentSourceScanStatusResponse; sources?: AgentSourceView[] }
   | { type: "agentSources/scanResumeAcknowledged"; token: string; jobId: string; attemptId?: string }
   | { type: "agentSources/scanStarted"; sourceId: string }
   | { type: "agentSources/scanStatus"; status: AgentSourceScanStatusResponse; requestGeneration?: number; cancelledExecution?: { token: string; jobId: string; attemptId?: string } }
@@ -212,8 +214,16 @@ export const appActions = {
     return { type: "agentSources/restartFinished" };
   },
 
-  agentSourceRestartStateSynchronized(generation: number, status: AgentSourceScanStatusResponse): AppAction {
-    return { type: "agentSources/restartStateSynchronized", generation, status };
+  agentSourceClearStarted(baseVersion: ScanVersion | null): AppAction {
+    return { type: "agentSources/clearStarted", baseVersion };
+  },
+
+  agentSourceClearFinished(succeeded: boolean): AppAction {
+    return { type: "agentSources/clearFinished", succeeded };
+  },
+
+  agentSourceScanStateSynchronized(generation: number, status: AgentSourceScanStatusResponse, sources?: AgentSourceView[]): AppAction {
+    return { type: "agentSources/scanStateSynchronized", generation, status, sources };
   },
 
   /** Handles agent sources failed. */

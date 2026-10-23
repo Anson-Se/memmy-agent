@@ -6,14 +6,14 @@ import { useApiClients } from "./providers.js";
 const RECONCILE_INTERVAL_MS = 1_000;
 const RECONCILE_TIMEOUT_MS = 5_000;
 
-/** Keeps restart scan-state reconciliation alive across route unmounts. */
+/** Keeps restart and post-clear scan-state reconciliation alive across route unmounts. */
 export function AgentSourceScanReconciler() {
   const { state, dispatch } = useAppState();
   const { clients } = useApiClients();
-  const { memoryServiceRestarting, scanStateSyncGeneration, scanStateSyncRequired } = state.agentSources;
+  const { memoryServiceRestarting, memoryDataClearing, scanStateSyncGeneration, scanStateSyncReason, scanStateSyncRequired } = state.agentSources;
 
   useEffect(() => {
-    if (!clients || !scanStateSyncRequired || memoryServiceRestarting) return undefined;
+    if (!clients || !scanStateSyncRequired || !scanStateSyncReason || memoryServiceRestarting || memoryDataClearing) return undefined;
 
     let active = true;
     let pending = false;
@@ -30,16 +30,23 @@ export function AgentSourceScanReconciler() {
         if (controller.signal.aborted) rejectAbort();
         else controller.signal.addEventListener("abort", rejectAbort, { once: true });
       });
+      const raceWithAbort = <T,>(promise: Promise<T>) => Promise.race([promise, aborted]);
       try {
-        const health = await Promise.race([clients.memoryRuntime.health(controller.signal), aborted]);
-        if (!active || controller.signal.aborted || !health.ok || !health.storage.ready) return;
-        const status = await Promise.race([clients.agentSources.getScanStatus({ signal: controller.signal }), aborted]);
+        if (scanStateSyncReason === "restart") {
+          const health = await raceWithAbort(clients.memoryRuntime.health(controller.signal));
+          if (!active || controller.signal.aborted || !health.ok || !health.storage.ready) return;
+        }
+        const status = await raceWithAbort(clients.agentSources.getScanStatus({ signal: controller.signal }));
         if (!active || controller.signal.aborted) return;
         dispatch(appActions.agentSourceScanAvailability(status.unavailable ?? null));
         if (status.unavailable) return;
-        dispatch(appActions.agentSourceRestartStateSynchronized(scanStateSyncGeneration, status));
+        const sources = scanStateSyncReason === "clear"
+          ? await raceWithAbort(clients.agentSources.listSources())
+          : undefined;
+        if (!active || controller.signal.aborted) return;
+        dispatch(appActions.agentSourceScanStateSynchronized(scanStateSyncGeneration, status, sources));
       } catch {
-        // Keep scan actions locked until a healthy service returns a full snapshot.
+        // Keep scan actions locked until the required post-operation snapshot succeeds.
       } finally {
         window.clearTimeout(timeout);
         if (rejectAbort) controller.signal.removeEventListener("abort", rejectAbort);
@@ -55,7 +62,7 @@ export function AgentSourceScanReconciler() {
       window.clearInterval(interval);
       inFlight?.abort();
     };
-  }, [clients, dispatch, memoryServiceRestarting, scanStateSyncGeneration, scanStateSyncRequired]);
+  }, [clients, dispatch, memoryDataClearing, memoryServiceRestarting, scanStateSyncGeneration, scanStateSyncReason, scanStateSyncRequired]);
 
   return null;
 }

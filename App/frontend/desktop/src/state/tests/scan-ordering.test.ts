@@ -144,3 +144,43 @@ for (const refresh of [a.agentSourcesLoading(), a.agentSourcesLoaded([]), a.agen
     expect(state.agentSources.error).toBeNull();
   });
 }
+
+
+describe("completion feedback after memory clear", () => {
+  const completed = () => reduce(createInitialAppState(), a.agentSourceScanCompleted(completion(2)));
+  const synchronize = (state: ReturnType<typeof createInitialAppState>, sequence = 3) => reduce(state,
+    a.agentSourceScanStateSynchronized(state.agentSources.scanStateSyncGeneration,
+      { active: false, progress: null, status: "idle", version: version(sequence) }, []));
+
+  it.each(["all", "codex"])("expires old %s feedback only after successful clear synchronization", (sourceId) => {
+    const oldCompletion = { ...completion(2), sourceId };
+    let state = reduce(createInitialAppState(), a.agentSourceScanCompleted(oldCompletion));
+    state = reduce(state, a.agentSourceClearStarted(version(2)));
+    expect(state.agentSources.recentScanCompletions).toEqual([oldCompletion]);
+    state = reduce(state, a.agentSourceClearFinished(true));
+    expect(synchronize(state, 2)).toBe(state); // A pre-clear snapshot must not unlock or expire feedback.
+    expect(state.agentSources.recentScanCompletions).toEqual([oldCompletion]);
+    state = synchronize(state);
+    expect(state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(state.agentSources.recentScanCompletions).toEqual([]);
+    expect(reduce(state, a.agentSourceScanCompleted(oldCompletion))).toBe(state);
+  });
+
+  it("preserves feedback after a failed clear", () => {
+    let state = reduce(completed(), a.agentSourceClearStarted(version(2)));
+    state = reduce(state, a.agentSourceClearFinished(false));
+    state = synchronize(state, 2);
+    expect(state.agentSources.scanStateSyncRequired).toBe(false);
+    expect(state.agentSources.recentScanCompletions).toEqual([completion(2)]);
+  });
+
+  it("keeps a newer completion that arrives before the clear snapshot is applied", () => {
+    let state = reduce(completed(), a.agentSourceClearStarted(version(2)));
+    state = reduce(state, a.agentSourceClearFinished(true));
+    const newer = { ...completion(4, "new"), jobId: "new-job", sourceId: "codex" };
+    state = reduce(state, a.agentSourceScanCompleted(newer));
+    state = synchronize(state);
+    expect(state.agentSources.recentScanCompletions).toEqual([newer]);
+    expect(state.agentSources.scanStamp?.version).toEqual(version(4));
+  });
+});
