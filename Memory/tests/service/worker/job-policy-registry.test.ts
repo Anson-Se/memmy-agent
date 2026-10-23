@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MEMORY_WORKER_JOB_TYPES } from "@memmy/agent-source-core";
 import {
-  JOB_POLICY_VERSION, JobPolicyRegistry, REGISTERED_JOB_TYPES, UnknownJobPolicyError
+  JOB_POLICY_VERSION, JobPolicyRegistry, REGISTERED_JOB_TYPES, UnknownJobPolicyError, isImportedPolicyTarget
 } from "../../../src/service/worker/job-policy-registry.js";
 
 const registry = new JobPolicyRegistry();
@@ -84,6 +84,38 @@ describe("job policy registry", () => {
     expect(registry.resolve({ jobType: "embedding", target: { memoryLayer: "L2" } }).queueLane).toBe("evolution");
     expect(registry.resolve({ jobType: "embedding_retry" }).queueLane).toBe("repair_retry");
     expect(registry.resolve({ jobType: "user_memory_embedding" }).queueLane).toBe("interactive");
+  });
+
+  it.each(["trace_summary", "import_summary", "observation_extract", "embedding"])(
+    "routes native historical %s by scheduling provenance without changing import-pipeline identity", jobType => {
+      const target = { memoryLayer: "L1", tags: ["database", "test"], pluginAlgorithm: "capture.v7", captureOrigin: "agent_source_scan" };
+      expect(isImportedPolicyTarget(target)).toBe(false);
+      expect(registry.resolve({ jobType, target })).toMatchObject({ queueLane: "import", basePriority: 2 });
+      expect(registry.resolve({ jobType, target }).resourceClass).toBe(registry.resolve({ jobType }).resourceClass);
+      expect(registry.resolve({ jobType, target }).concurrency).toEqual(registry.resolve({ jobType }).concurrency);
+    }
+  );
+
+  it("preserves first-report, manual retry, startup repair and retry-queue policy over historical provenance", () => {
+    const target = { memoryLayer: "L1", captureOrigin: "agent_source_scan" };
+    expect(registry.resolve({ jobType: "trace_summary", target: { ...target, agentId: "memmy-onboarding" } }))
+      .toMatchObject({ queueLane: "interactive", basePriority: -100 });
+    expect(registry.resolve({ jobType: "trace_summary", target, payload: { source: "memory.processing.manual_retry" } }).queueLane).toBe("repair_retry");
+    expect(registry.resolve({ jobType: "embedding", target, payload: { reason: "startup.processing_repair" } }).queueLane).toBe("maintenance");
+    expect(registry.resolve({ jobType: "embedding_retry", target }).queueLane).toBe("repair_retry");
+    expect(registry.resolve({ jobType: "reflection", target }).queueLane).toBe("evolution");
+    expect(registry.resolve({ jobType: "user_memory_embedding", target }).queueLane).toBe("interactive");
+  });
+
+  it("does not infer historical provenance from a native agent, payload hint, or an inexact origin", () => {
+    for (const target of [
+      { agentId: "claude_code", pluginAlgorithm: "capture.v7" },
+      { captureOrigin: "hook" }, { captureOrigin: "agent_source_scan " }, { captureOrigin: "AGENT_SOURCE_SCAN" }
+    ]) {
+      expect(registry.resolve({ jobType: "trace_summary", target }).queueLane).toBe("interactive");
+      expect(registry.resolve({ jobType: "embedding", target: { ...target, memoryLayer: "L1" } }).queueLane).toBe("interactive");
+    }
+    expect(registry.resolve({ jobType: "trace_summary", payload: { captureOrigin: "agent_source_scan" } }).queueLane).toBe("interactive");
   });
 
   it("accepts explicit operation modes without trusting arbitrary payload fields", () => {

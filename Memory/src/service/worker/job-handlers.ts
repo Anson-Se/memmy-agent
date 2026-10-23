@@ -21,6 +21,7 @@ import {
   embeddingRetryTargetKindForMemory,
   embeddingRetryVectorFieldForMemory
 } from "../embedding/embedding-pipeline.js";
+import { isOnboardingFirstReportTarget } from "./job-policy-registry.js";
 import { episodeTitleIsCurrent } from "../episode-title/episode-title-service.js";
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import { observationMemoryState } from "../observation-memory-state.js";
@@ -205,6 +206,19 @@ export function enqueueJob(
   input: EnqueueJobInput
 ): EvolutionJobRecord {
   const at = input.createdAt ?? deps.nowIso();
+  const payload = { ...input.payload };
+  if (input.jobType === "episode_title") {
+    // Title jobs have no target memory. Only a wholly historical episode can
+    // inherit the historical lane; mixed or incomplete episodes stay interactive.
+    delete payload.captureOrigin;
+    const episode = input.episodeId ? deps.repos.runtime.getEpisode(input.episodeId) : undefined;
+    const memories = episode ? deps.repos.memories.getMany(episode.l1MemoryIds) : [];
+    if (episode && memories.length > 0 && memories.length === episode.l1MemoryIds.length
+      && memories.every(memory => memory.properties.internal_info.capture_origin === "agent_source_scan"
+        && !isOnboardingFirstReportTarget({ agentId: memory.agentId, tags: memory.tags }))) {
+      payload.captureOrigin = "agent_source_scan";
+    }
+  }
   const job = deps.repos.runtime.enqueueJob({
     id: newId("job"),
     jobType: input.jobType,
@@ -214,7 +228,7 @@ export function enqueueJob(
     sessionId: input.sessionId,
     episodeId: input.episodeId,
     targetMemoryId: input.targetMemoryId,
-    payload: input.payload ?? {},
+    payload,
     attempts: 0,
     maxAttempts: input.maxAttempts ?? 3,
     createdAt: at,

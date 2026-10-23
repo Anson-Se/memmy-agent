@@ -184,6 +184,44 @@ describe("queue scheduling metadata and read-only candidates", () => {
     expect(h.store.refreshPolicies(1).refreshed).toBe(1);
   });
 
+  it("projects native historical capture metadata on enqueue for both summary and subsequent embedding", () => {
+    const h = harness(); h.memory("native-history", ["database", "test"]); h.memory("live-hook", ["database", "test"]);
+    h.db.db.prepare("UPDATE memories SET agent_id='claude_code',properties_json=? WHERE id='native-history'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7", capture_origin: "agent_source_scan" } }));
+    h.db.db.prepare("UPDATE memories SET agent_id='claude_code',properties_json=? WHERE id='live-hook'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7" } }));
+    const summary = h.job("native-summary", "trace_summary", "native-history", { source: "turn.complete.capture", decideCapture: true });
+    const embedding = h.job("native-embedding", "embedding", "native-history", { reason: "trace.summary.updated", sourceJobId: summary.id });
+    expect(summary).toMatchObject({ jobType: "trace_summary", queueLane: "import", resourceClass: "summary", payload: { source: "turn.complete.capture", decideCapture: true } });
+    expect(embedding).toMatchObject({ queueLane: "import", resourceClass: "embedding", payload: { reason: "trace.summary.updated" } });
+    expect(h.retry("history-retry", "native-history").queueLane).toBe("repair_retry");
+    expect(h.job("live-summary", "trace_summary", "live-hook").queueLane).toBe("interactive");
+    expect(h.job("live-embedding", "embedding", "live-hook").queueLane).toBe("interactive");
+    const memory = h.repos.memories.get("native-history")!;
+    expect(memory.tags).toEqual(["database", "test"]);
+    expect(memory.properties.internal_info.plugin_algorithm).toBe("capture.v7");
+  });
+
+  it("refreshes an older policy version with explicit native history metadata while preserving FIFO and lease state", () => {
+    const h = harness(); h.memory("native-history"); h.memory("unmarked-native");
+    h.db.db.prepare("UPDATE memories SET properties_json=? WHERE id='native-history'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7", capture_origin: "agent_source_scan" } }));
+    const summary = h.job("history-summary", "trace_summary", "native-history");
+    const unmarked = h.job("unmarked-summary", "trace_summary", "unmarked-native");
+    h.db.db.prepare("UPDATE evolution_jobs SET policy_version=?,queue_lane='interactive' WHERE id IN (?,?)")
+      .run(JOB_POLICY_VERSION - 1, summary.id, unmarked.id);
+    expect(JOB_POLICY_VERSION).toBeGreaterThan(1);
+    expect(h.store.refreshPolicies()).toEqual({ refreshed: 2, unknown: [] });
+    expect(h.runtime.getJob(summary.id)).toMatchObject({ queueLane: "import", policyVersion: JOB_POLICY_VERSION,
+      enqueueSeq: summary.enqueueSeq, firstQueuedAt: summary.firstQueuedAt, status: "queued", attempts: 0, leaseCount: 0, leaseToken: null });
+    expect(h.runtime.getJob(unmarked.id)).toMatchObject({ queueLane: "interactive", enqueueSeq: unmarked.enqueueSeq });
+    h.db.db.prepare("UPDATE memories SET properties_json=? WHERE id='native-history'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7" } }));
+    expect(h.runtime.getJob(summary.id)!.policyVersion).toBeNull();
+    h.store.refreshPolicies();
+    expect(h.runtime.getJob(summary.id)).toMatchObject({ queueLane: "interactive", enqueueSeq: summary.enqueueSeq });
+  });
+
   it("marks unknown raw job types as explicitly unregistered and excludes them from lane previews", () => {
     const h = harness(); h.rawJob("unknown", "future_job_type");
     expect(h.store.refreshPolicies()).toEqual({ refreshed: 1, unknown: [{ id: "unknown", jobType: "future_job_type" }] });
@@ -323,6 +361,19 @@ describe("real-scheduler policy preparation", () => {
     h.db.db.prepare("UPDATE memories SET tags_json='{}' WHERE id='bad-shapes'").run();
     expect(h.store.refreshRunnablePolicies({ at }).refreshed).toBe(1);
     expect(h.runtime.getJob("malformed-payload")!.queueLane).toBe("interactive");
+  });
+
+  it("projects historical origin during dirty runnable refresh and ignores malformed origins", () => {
+    const h = harness(); h.memory("native-history"); h.memory("malformed-history");
+    h.db.db.prepare("UPDATE memories SET properties_json=? WHERE id='native-history'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7", capture_origin: "agent_source_scan" } }));
+    h.db.db.prepare("UPDATE memories SET properties_json=? WHERE id='malformed-history'")
+      .run(JSON.stringify({ internal_info: { plugin_algorithm: "capture.v7", capture_origin: ["agent_source_scan"] } }));
+    h.rawJob("raw-native-embedding", "embedding", { target: "native-history" });
+    h.rawJob("raw-malformed-summary", "trace_summary", { target: "malformed-history" });
+    expect(h.store.refreshRunnablePolicies({ at, includeRetries: false })).toEqual({ refreshed: 2, unknown: [] });
+    expect(h.runtime.getJob("raw-native-embedding")).toMatchObject({ queueLane: "import", policyVersion: JOB_POLICY_VERSION });
+    expect(h.runtime.getJob("raw-malformed-summary")).toMatchObject({ queueLane: "interactive", policyVersion: JOB_POLICY_VERSION });
   });
 
   it("exposes unknown jobs only through explicit maintenance quarantine admission", () => {

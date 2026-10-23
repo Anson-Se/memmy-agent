@@ -28,7 +28,7 @@ export interface SchedulingMetadata {
 }
 interface PolicyRow {
   id: string; job_type: string; payload_json: string; agent_id: string | null;
-  memory_layer: string | null; tags_json: string | null; plugin_algorithm: string | null;
+  memory_layer: string | null; tags_json: string | null; plugin_algorithm: string | null; capture_origin: unknown;
 }
 export interface PolicyRefreshResult { refreshed: number; unknown: Array<{ id: string; jobType: string }> }
 
@@ -50,7 +50,8 @@ export class QueueSchedulingStore {
         const rows = this.db.prepare(`SELECT q.id,
           ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
           m.agent_id, m.memory_layer, m.tags_json,
-          json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm
+          json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
+          json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
           FROM ${table} q LEFT JOIN memories m ON m.id = ${target}
           WHERE q.policy_version IS NULL OR q.policy_version != ? ORDER BY q.enqueue_seq LIMIT ?`)
           .all(JOB_POLICY_VERSION, Math.max(0, limit - result.refreshed)) as PolicyRow[];
@@ -85,7 +86,8 @@ export class QueueSchedulingStore {
           const rows = this.db.prepare(`SELECT q.id,
             ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
             m.agent_id, m.memory_layer, m.tags_json,
-            json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm
+            json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
+            json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
             FROM ${table} q LEFT JOIN memories m ON m.id = ${target}
             WHERE (q.policy_version IS NULL OR q.policy_version != ?) AND (${ready})
             ORDER BY q.enqueue_seq LIMIT 200`).all(JOB_POLICY_VERSION, ...parameters) as PolicyRow[];
@@ -105,7 +107,8 @@ export class QueueSchedulingStore {
       const row = this.db.prepare(`SELECT q.id,
         ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
         m.agent_id, m.memory_layer, m.tags_json,
-        json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm
+        json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
+        json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
         FROM ${table} q LEFT JOIN memories m ON m.id = ${target} WHERE q.id = ?`).get(id) as PolicyRow | undefined;
       if (row) this.writePolicy(table, row, result);
     } catch (error) {
@@ -128,7 +131,8 @@ export class QueueSchedulingStore {
           agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
           memoryLayer: typeof row.memory_layer === "string" ? row.memory_layer : undefined,
           tags: Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === "string") : [],
-          pluginAlgorithm: typeof row.plugin_algorithm === "string" ? row.plugin_algorithm : undefined
+          pluginAlgorithm: typeof row.plugin_algorithm === "string" ? row.plugin_algorithm : undefined,
+          captureOrigin: typeof row.capture_origin === "string" ? row.capture_origin : undefined
         }
       });
     } catch (error) {

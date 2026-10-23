@@ -1,6 +1,6 @@
 import type { JobType } from "../../types.js";
 
-export const JOB_POLICY_VERSION = 1;
+export const JOB_POLICY_VERSION = 2;
 export const QUEUE_LANES = ["interactive", "repair_retry", "import", "evolution", "maintenance"] as const;
 export type QueueLane = typeof QUEUE_LANES[number];
 export const RESOURCE_CLASSES = ["summary", "embedding", "evolution_llm", "database", "scan"] as const;
@@ -16,6 +16,8 @@ export interface JobPolicyTarget {
   memoryKind?: string;
   tags?: readonly string[];
   pluginAlgorithm?: string;
+  /** Scheduling provenance only; never identifies an import processing pipeline. */
+  captureOrigin?: string;
 }
 
 export interface JobPolicyInput {
@@ -141,8 +143,10 @@ export class JobPolicyRegistry {
       queueLane = "maintenance";
       basePriority = 90;
     } else if (input.operationMode === "historical_import" ||
+      (input.jobType === "episode_title" && input.payload?.captureOrigin === "agent_source_scan") ||
       ((SUMMARY_JOB_TYPES.has(input.jobType) || input.jobType === "embedding") &&
-        (source === "agent_source.scan.summary_stage" || reason === "import.summary.updated" || isImportedPolicyTarget(input.target)))) {
+        (source === "agent_source.scan.summary_stage" || reason === "import.summary.updated" ||
+          input.target?.captureOrigin === "agent_source_scan" || isImportedPolicyTarget(input.target)))) {
       queueLane = "import";
       basePriority = 2;
     } else if (input.jobType === "embedding") {

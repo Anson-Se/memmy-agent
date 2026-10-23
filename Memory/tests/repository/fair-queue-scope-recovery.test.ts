@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../src/storage/repositories.js";
 import { claimFairWorkerBatch, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
+import { JOB_POLICY_VERSION } from "../../src/service/worker/job-policy-registry.js";
 import { resolveWorkerSchedulingOptions } from "../../src/service/worker/worker-scheduling-options.js";
 import type { QueueEligibilityOptions } from "../../src/storage/queue-eligibility.js";
 
@@ -98,7 +99,7 @@ describe("fair queue scope cursors and failed recovery", () => {
     expect(work[0]!.queue === "main" && work[0]!.job).toMatchObject({ id: "old-failed", status: "leased",
       attempts: previous.attempts + 1, failureCount: 1, leaseCount: 2 });
     expect(h.runtime.getJob("new-queued")?.status).toBe("queued");
-    expect(h.db.db.prepare("SELECT policy_version FROM evolution_jobs WHERE id='old-failed'").get()).toMatchObject({ policy_version: 1 });
+    expect(h.db.db.prepare("SELECT policy_version FROM evolution_jobs WHERE id='old-failed'").get()).toMatchObject({ policy_version: JOB_POLICY_VERSION });
   });
 
   it("rechecks all failed eligibility fences and keeps legacy claims opt-in", () => {

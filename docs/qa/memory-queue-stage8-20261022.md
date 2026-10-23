@@ -46,10 +46,39 @@
 4. Agent Session DAG 原有一项用例曾在全量中出现 30 秒 processed=false，相关源码及用例未改，也不经过本轮 Provider 路径。整文件 16/16、原用例连续 8 次以及补修后的全量均通过；最初失败原因未确认，保留原失败和复核日志，不把原因直接归于 CPU 或环境。
 5. 用系统 Node 加载 Electron ABI 的 SQLite 原生模块曾报不匹配，属于验证器运行时选错；包内验证改用该安装包自带 Electron Node。工作区与日常仓库的依赖已隔离，不修改日常安装的原生模块。
 
+## 安装包真实扫描补查：native 历史任务分类
+
+第一次候选包 `ca5ca477` 的自动检查全部通过，但实际 full scan 暴露新入口遗漏：当前历史扫描也走 `completeSourceTurn → completeTurn → trace_summary/capture.v7`，没有旧 `agent-source` 标签。现场导入 4,535 条时，4,405 个待处理历史摘要与 129 个待处理向量均进入 interactive，后者排在历史摘要后。该包不能作为最终队列验收通过的证据，扫描已通过正式接口取消并保留资料于 `/private/tmp/memmy-queue-stage8-profile-native-classification-repro`。
+
+修复只增加内部调度来源：合法 `agent_source_scan + captureLegacyHistory=true` 的 full/initial_subset 历史捕获，将 `internal_info.capture_origin` 保存为 `agent_source_scan`。保留 `trace_summary`、`capture.v7`、capture decision 和原标签，后续 embedding 从目标记忆继承 lane。普通 Hook 与无该历史许可的 incremental 扫描保留原分类。首次报告、人工重试和启动修复规则优先；embedding retry 保留 repair_retry。
+
+策略版本从 1 升到 2，存储的三条刷新路径都读取该来源。刷新不改变入队顺序、首次排队时间、尝试数或已有租约。无来源信息的旧 native 记录不猜测其生产渠道，也不把所有外部 Agent 的实时对话改成 import。
+
+正式真实服务回归修前 12 项中 7 项失败；扩展后新增 18 项全部通过，连原 source-turn-capture 共 68 项。覆盖时间早于/晚于 activation、detached history、实际摘要→embedding、48 条历史积压中新任务的实际完成、同 Lane FIFO、首次报告、人工重试、启动修复、双方向 Hook/scan 去重及重启；实际 executor 的 full/initial_subset/incremental 也覆盖。注册表和存储直接新增 9 项，连选择器与连续准入共 77 项通过。
+
+安装压力资料保持 12,000 个完整轮次和 1/8/32 KiB 三档原始消息。最终资料拆为 300 段对话，每段 40 轮，以覆盖多会话扫描；第一次 3 段各 4,000 轮的资料及失败现场另行保留。不能把换资料理解为旧超长会话性能问题已经修复。
+
+补修后的全量检查有一次时间敏感失败：扫描响应测试 1 项未在 waitFor 默认时间内到达检查点，10,000 条基线测试 2 项超过 5 秒；原失败留在 `/private/tmp/memmy-stage8-native-root-final.log`。两个文件独立重跑 23/23 通过（`/private/tmp/memmy-stage8-native-timeout-recheck.log`），没有放宽测试超时或改行为断言。最终全量结果以下方记录为准。
+
 ## 最终检查与安装包验收
 
-最终 `npm run lint`、`npm run typecheck`、Agent typecheck、`npm test`、显式 contracts 测试均通过。`npm test` 含 release 30 通过/5 跳过、packaging guards 122/1、Memory 1,695/1、Migrations 279/1、Backend 1,109、Frontend 2,452、Electron 1,259/126；跳过项沿用各套件原有条件，不能记为已覆盖平台能力。Agent 独立全量 7,142/80。
+模型兼容补修版本 `ca5ca477` 的 `npm run lint`、`npm run typecheck`、Agent typecheck、`npm test`、显式 contracts 测试均通过。`npm test` 含 release 30 通过/5 跳过、packaging guards 122/1、Memory 1,695/1、Migrations 279/1、Backend 1,109、Frontend 2,452、Electron 1,259/126；跳过项沿用各套件原有条件，不能记为已覆盖平台能力。Agent 独立全量 7,142/80。
 
 最终日志：`/private/tmp/memmy-stage8-{lint,typecheck,root,agent,contracts}-accepted.log`；Agent 单独类型日志为 `/private/tmp/memmy-stage8-agent-typecheck-final-compat.log`。接口和类型构建完成后再执行测试，未与全量 Agent 测试并行刷新 contracts。
 
-最终 DMG 验收待执行；本段将在安装、扫描及重启验证后补充。
+历史扫描分类补修的 lint/typecheck 已通过，全量复核与重新打包验收进行中；最终 DMG 结论将在安装、扫描及重启验证后补充。
+
+
+## 2026-10-23 续验记录
+
+夜间限定测试并行度的那轮在 2026-10-22 22:40:46 遭遇系统低电量休眠。`pmset` 明确记录 Low Power Sleep、电量 1%、持续 35,795 秒，与用例记录约 35,797 秒吻合。因此这轮不能作为持续运行耗时或死锁证据。`queue-admission-claim.test.ts` 续验独立重跑 11/11，通过时间 0.896 秒。更早的短时等待失败仍保留，未据此将全部超时统一归为休眠。
+
+本次全量采用 `VITEST_MAX_WORKERS=2` 限定测试文件并行度，`caffeinate -i` 仅在命令运行期间防止空闲休眠。没有修改产品并发、测试断言或超时阈值。低电量或合盖仍可触发系统休眠，不能认为该临时机制能覆盖所有系统中断。
+
+
+续验又补出多会话标题来源的遗漏：把真实服务公平性场景从同一历史会话扩为 48 段独立历史会话时，新任务仍在 24 轮窗口内无法完成，因历史 `episode_title` 留在 interactive。修前日志 `/private/tmp/memmy-stage8-20261023-multiconversation-before.log`。标题没有 target memory，因此统一入队处根据真实 episode 的完整 L1 集合生成内部来源：只有全部明确属于历史扫描、且不含首次报告时才标记历史；混合、当前、空集合或缺失记忆保持原分类。临时/最终标题均使用同一入队逻辑，传入的来源提示不能覆盖实际判定。没有改标题生成或 capture.v7 业务逻辑。
+
+多会话公平性与历史/当前/混合会话标题回归补齐后，新 source-turn 文件共 22 项；连 registry 共 40 项通过，Memory 类型检查通过。前一轮完整仓库在测试文件并行度 2 时全通过（Memory 1,722/1、其余组件计数同前），标题补修后重新执行 Memory 全量，最终结果另补。
+
+
+最终源码补修的 Memory 全量：1,726 通过、1 跳过，169 文件通过、1 文件跳过，55.65 秒，日志 `/private/tmp/memmy-stage8-20261023-memory-accepted.log`。标题补修前的本日仓库全量全部通过，日志 `/private/tmp/memmy-stage8-20261023-root-final.log`；没有以先前失败轮次当作通过。此次后续源码改动限于 Memory，追加了 Memory 全量与类型检查，未重复未受影响的 Agent 全量。
