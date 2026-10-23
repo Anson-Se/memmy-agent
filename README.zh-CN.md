@@ -86,7 +86,7 @@
 #### 2. 使用 memmy CLI /TUI
 ![tui.png](docs/assets/tui.png)
 
-Linux x64 或 arm64（需 Node.js 22 或更高版本，并且 systemd 用户会话可用）可一行安装：
+Linux x64 或 arm64 需有可用的 systemd 用户会话，并使用 Node.js 22.23.4+（22.x）、24.22.1+（24.x）或 26.12.1+（26.x）。安装器不接受其他主版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MemTensor/memmy-agent/main/scripts/install.sh | bash

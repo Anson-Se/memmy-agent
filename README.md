@@ -87,7 +87,7 @@ Download Memmy from the [official website](https://memmy.bot/) or [GitHub Releas
 
 ![Memmy TUI](docs/assets/tui.png)
 
-On Linux x64 or arm64 with Node.js 22 or newer and an available systemd user session:
+On Linux x64 or arm64 with an available systemd user session, use Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x). Other major versions are not accepted by the installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MemTensor/memmy-agent/main/scripts/install.sh | bash
