@@ -148,7 +148,61 @@ afterEach(() => {
 });
 
 describe("MCP connection helpers", () => {
-  it.runIf(process.platform === 'darwin')('asks before controlling an app and skips the prompt after always allow', async () => {
+  it("refreshes an already connected plugin catalog after install and disable without closing the transport", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const servers = { plugins: { command: "plugin-bridge" } };
+    saveConfig(new Config({ tools: { mcpServers: servers } }));
+    const names: string[] = [];
+    const session = fakeSession(names);
+    const closed: string[] = [];
+    setMcpRuntimeForTest(runtimeFor({ "plugin-bridge": session }, { closed }) as any);
+    const registry = new ToolRegistry();
+    const state = { mcpServers: servers, mcpStacks: await connectMcpServers(servers, registry) };
+    expect(registry.toolNames).toEqual([]);
+
+    names.push("plugin_session-start", "plugin_material-collect");
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: true, refreshed: ["plugins"] });
+    expect(registry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    expect(registry.has("mcp_plugins_plugin_material-collect")).toBe(true);
+    const stack = state.mcpStacks.plugins;
+    session.listTools = async () => { throw new Error("temporary discovery outage"); };
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: false, failed: ["plugins"] });
+    expect(registry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    session.listTools = fakeSession(names).listTools;
+    names.length = 0;
+    await expect(reloadServers(state, registry)).resolves.toMatchObject({ ok: true, refreshed: ["plugins"] });
+    expect(registry.toolNames).toEqual([]);
+    expect(state.mcpStacks.plugins).toBe(stack);
+    expect(closed).toEqual([]);
+    await stack!.aclose();
+  });
+  it("refreshes plugin tools into the replacement live registry", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const servers = { plugins: { command: "plugin-bridge" } };
+    saveConfig(new Config({ tools: { mcpServers: servers } }));
+    const names: string[] = [];
+    const session = fakeSession(names);
+    setMcpRuntimeForTest(runtimeFor({ "plugin-bridge": session }) as any);
+    const startupRegistry = new ToolRegistry();
+    const state = { mcpServers: servers, mcpStacks: await connectMcpServers(servers, startupRegistry) };
+    const liveRegistry = new ToolRegistry();
+
+    names.push("plugin_session-start", "plugin_material-collect");
+    await expect(reloadServers(state, liveRegistry)).resolves.toMatchObject({
+      ok: true,
+      refreshed: ["plugins"],
+      tool_counts: { plugins: 2 },
+    });
+    expect(liveRegistry.has("mcp_plugins_plugin_session-start")).toBe(true);
+    expect(liveRegistry.has("mcp_plugins_plugin_material-collect")).toBe(true);
+    expect(startupRegistry.toolNames).toEqual([]);
+
+    await state.mcpStacks.plugins!.aclose();
+  });
+  it.runIf(process.platform === 'darwin')('uses the private Desktop guide instead of doctor through the real MCP registration', async () => {
+    vi.stubEnv('MEMMY_DESKTOP_MANAGED_GATEWAY', '1');
     const prepare = vi.spyOn(desktopOnboardingClient, 'prepare').mockResolvedValue({ app: 'com.example.Memmy', pid: 42 });
     const guide = vi.spyOn(desktopOnboardingClient, 'guide').mockResolvedValue(false);
     const doctor = vi.spyOn(permissionChecks, 'nativePermissionDoctor');
@@ -522,6 +576,44 @@ describe("MCP connection helpers", () => {
     expect(loop.tools.has("mcp_browserbase_navigate")).toBe(false);
     expect((loop as any).mcpStacks.browserbase).toBeUndefined();
     expect(closed).toEqual(["browserbase-mcp"]);
+  });
+
+  it("rediscovers plugin tools with unchanged config while preserving other live connections", async () => {
+    const root = tempRoot();
+    setConfigPath(path.join(root, "config.yaml"));
+    const config = new Config({ tools: { mcpServers: {
+      plugins: { command: "plugin-bridge" },
+      other: { command: "other-mcp" },
+    } } });
+    saveConfig(config);
+    const closed: string[] = [];
+    const sessions = { "plugin-bridge": fakeSession([]), "other-mcp": fakeSession(["read"]) };
+    setMcpRuntimeForTest(runtimeFor(sessions, { closed }) as any);
+    const loop = makeLoop(root, {});
+    try {
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.toolNames.filter((name) => name.startsWith("mcp_plugins_"))).toEqual([]);
+      const otherStack = (loop as any).mcpStacks.other;
+      sessions["plugin-bridge"].listTools = fakeSession(["review_create_task", "review_get_status"]).listTools;
+      const installed = await reloadServers(loop as any, loop.tools);
+      expect(installed).toMatchObject({ ok: true, changed: [], refreshed: ["plugins"], tool_counts: { plugins: 2, other: 1 } });
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(true);
+      expect(loop.tools.has("mcp_plugins_review_get_status")).toBe(true);
+      expect((loop as any).mcpStacks.other).toBe(otherStack);
+      expect(closed).toEqual([]);
+
+      sessions["plugin-bridge"].listTools = fakeSession([]).listTools;
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(false);
+      expect(loop.tools.has("mcp_plugins_review_get_status")).toBe(false);
+      expect(loop.tools.has("mcp_other_read")).toBe(true);
+
+      sessions["plugin-bridge"].listTools = fakeSession(["review_create_task"]).listTools;
+      await reloadServers(loop as any, loop.tools);
+      expect(loop.tools.has("mcp_plugins_review_create_task")).toBe(true);
+    } finally {
+      await loop.closeMcp();
+    }
   });
 
   it("routes MCP reload requests through runtime control without restart", async () => {

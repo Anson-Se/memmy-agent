@@ -20,6 +20,7 @@ export type ThreadFileKind =
   | "file";
 
 export type ThreadPreviewKind =
+  | "document"
   | "pdf"
   | "image"
   | "video"
@@ -131,7 +132,7 @@ const EXTENSION_KINDS: Record<string, ThreadFileKind> = {
 const CODE_EXTENSIONS = new Set([
   "bash", "c", "cc", "cpp", "cs", "css", "dart", "go", "h", "hpp", "java", "js", "jsx", "kt", "less",
   "lua", "m", "mjs", "cjs", "php", "pl", "ps1", "py", "r", "rb", "rs", "sass", "scala", "scss", "sh",
-  "sql", "swift", "ts", "tsx", "vue", "zsh",
+  "tex", "bib", "sty", "cls", "bst", "dtx", "ltx", "typ", "sql", "swift", "ts", "tsx", "vue", "zsh",
 ]);
 
 const PREVIEW_BY_KIND: Partial<Record<ThreadFileKind, ThreadPreviewKind>> = {
@@ -158,6 +159,7 @@ export function threadFileKind(name: string): ThreadFileKind {
 
 export function threadPreviewKind(name: string): ThreadPreviewKind {
   const extension = threadFileExtension(name);
+  if (extension === "docx" || extension === "xlsx" || extension === "pptx") return "document";
   if (extension === "csv" || extension === "tsv") return "csv";
   return PREVIEW_BY_KIND[threadFileKind(name)] ?? "unsupported";
 }
@@ -311,7 +313,7 @@ export function threadTabForInAppPreview(file: { name: string; path?: string; ur
   const candidates = [file.name, file.path, file.url]
     .map((value) => (value ? threadFileName(value) : ""))
     .filter(Boolean);
-  const name = candidates.find((candidate) => threadPreviewKind(candidate) === "markdown");
+  const name = candidates.find((candidate) => threadPreviewKind(candidate) !== "unsupported");
   if (!name || (!file.path && !file.url)) return null;
   if (file.path) {
     return {

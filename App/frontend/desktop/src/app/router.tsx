@@ -64,6 +64,7 @@ import { LoginPage } from "../pages/login-page.js";
 import { writeMemorySubPage } from "../pages/memory-sub-page-storage.js";
 import { OnboardingPage } from "../pages/onboarding-page.js";
 import { PetPage } from "../pages/pet-page.js";
+import { PluginSurfacePage } from "../pages/plugin-surface-page.js";
 import { PetStartupScreen } from "../pages/pet-startup-screen.js";
 import { StartupScreen } from "../pages/startup-screen.js";
 import { TokenDetailPage } from "../pages/token-detail-page.js";
@@ -392,6 +393,8 @@ function renderRoute(path: AppRoutePath) {
       return <KnowledgePage />;
     case "/memory-sources":
       return <MemoryPage initialSubPage="sources" />;
+    case "/plugin":
+      return <PluginSurfacePage />;
     case "/settings":
       return <SettingsPage />;
     case "/pet":

@@ -20,6 +20,9 @@ import { canEditWorkspacePreview } from "./editable-code-editor-options.js";
 import { EditableCodePreview, type PreviewEditorControls } from "./editable-code-preview.js";
 import { isLineOrientedDiff, WorkspaceDiffView, workspaceDiffStats, workspaceFileLineCount, WorkspaceSourceView } from "./workspace-diff-view.js";
 
+import type { FilePreviewResource } from "./file-preview/file-preview-types.js";
+import { FilePreview } from "./file-preview/file-preview.js";
+
 export const THREAD_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 export const THREAD_CSV_PREVIEW_MAX_ROWS = 500;
 
@@ -29,6 +32,7 @@ type ThreadPreviewState =
   | { status: "unsupported" }
   | { status: "too-large" }
   | { status: "unavailable" }
+  | { status: "ready"; kind: "document"; resource: FilePreviewResource }
   | { status: "ready"; kind: "pdf" | "html"; objectUrl: string }
   | { status: "ready"; kind: "image" | "video"; url: string }
   | { status: "ready"; kind: "markdown" | "code" | "text" | "csv"; text: string }
@@ -216,6 +220,8 @@ function ThreadPreviewBody(props: {
     );
   }
   switch (state.kind) {
+    case "document":
+      return <FilePreview resource={state.resource} />;
     case "pdf":
       return <iframe className="thread-preview__frame" src={state.objectUrl} title={props.name} />;
     case "html":
@@ -361,6 +367,23 @@ async function loadFilePreview(
     path = resolved.path;
     mediaUrl = resolved.media_url ?? mediaUrl;
   }
+  if ((kind === "document" || kind === "pdf") && mediaUrl) {
+    const url = mediaUrl;
+    const resource: FilePreviewResource = {
+      id: path ?? url,
+      name: tab.name,
+      path: path ?? undefined,
+      load: async (signal) => {
+        const response = await (context.fetchFn ?? fetch)(url, { signal });
+        if (!response.ok) throw new Error("media_fetch_failed");
+        return response.blob();
+      },
+      open: path && context.artifactClient ? () => context.artifactClient!.openArtifact(path!) : undefined,
+      reveal: path && context.artifactClient ? () => context.artifactClient!.revealArtifact(path!) : undefined,
+    };
+    return { state: { status: "ready", kind: "document", resource }, path };
+  }
+  if (kind === "document") return { state: { status: "unavailable" }, path };
   if (kind === "unsupported") return { state: { status: "unsupported" }, path };
   if (!mediaUrl) return { state: { status: "unavailable" }, path };
   if (kind === "image" || kind === "video") return { state: { status: "ready", kind, url: mediaUrl }, path };
