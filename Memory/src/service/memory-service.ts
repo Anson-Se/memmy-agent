@@ -4,7 +4,9 @@ import {
   assertJsonValue,
   canonicalJson,
   isLocalWorkspaceUri,
-  sha256Hex
+  sha256Hex,
+  type L3UserProjectsReplaceRequest,
+  type L3UserProjectsReplaceResponse
 } from "../contracts/index.js";
 import {
   languageSteeringLine,
@@ -1474,6 +1476,17 @@ export class MemoryService {
     const session = this.requireSession(sessionId);
     this.assertL3WorldModelSessionScope(session, request.namespace);
     return this.repos.l3WorldModels.traceHead(sessionId);
+  }
+
+  /** Stores the desktop app's selected project folders; kept regardless of the L3 field cognition flag. */
+  replaceL3UserProjects(request: L3UserProjectsReplaceRequest): L3UserProjectsReplaceResponse {
+    const userId = normalizeNamespace(request.namespace).userId;
+    const at = nowIso();
+    this.repos.transaction(() => {
+      this.repos.l3Field.replaceUserProjects(userId, request.projects, at);
+      this.repos.l3Field.setStandaloneRoots(userId, request.standaloneRoots ?? [], at);
+    });
+    return { count: request.projects.length, serverTime: at };
   }
 
   l3WorldModelBoundary(

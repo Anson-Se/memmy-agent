@@ -269,6 +269,21 @@ export class L3FieldRepository {
     })();
   }
 
+  /** Throwaway task roots Memmy itself creates (they are never projects); stored with the project list. */
+  getStandaloneRoots(userId: string): string[] {
+    const row = this.db.prepare(`SELECT value_json FROM runtime_kv WHERE key = ?`)
+      .get(standaloneRootsKey(userId)) as { value_json: string } | undefined;
+    const value = row ? parseJson<unknown>(row.value_json, []) : [];
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  }
+
+  setStandaloneRoots(userId: string, roots: readonly string[], at = nowIso()): void {
+    this.db.prepare(
+      `INSERT INTO runtime_kv (key, value_json, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    ).run(standaloneRootsKey(userId), toJson([...roots]), at);
+  }
+
   private writeSnapshot(unit: L3UnitRecord, at: string): MemoryRow {
     const memoryValue = renderL3UnitSnapshot(unit, this.activeItems(unit.unitKey));
     const existing = unit.snapshotMemoryId ? this.memories.get(unit.snapshotMemoryId) : undefined;
@@ -336,6 +351,10 @@ export class L3FieldRepository {
     );
     return saved;
   }
+}
+
+function standaloneRootsKey(userId: string): string {
+  return `l3_field.standalone_roots:${userId}`;
 }
 
 function unitFromSql(row: SqlUnitRow): L3UnitRecord {

@@ -83,6 +83,26 @@ export const L3WorldModelBoundaryResponseSchema = z.object({
 }).strict();
 export type L3WorldModelBoundaryResponse = z.infer<typeof L3WorldModelBoundaryResponseSchema>;
 
+const AbsolutePathSchema = z.string().min(1).max(4096)
+  .refine((value) => value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value), "path must be absolute");
+
+/** Full list of folders the user picked in the desktop app; each push replaces the previous one. */
+export const L3UserProjectsReplaceRequestSchema = z.object({
+  ...L3WorldModelRequestEnvelopeShape,
+  projects: z.array(z.object({
+    rootPath: AbsolutePathSchema,
+    name: z.string().min(1).max(512)
+  }).strict()).max(500),
+  standaloneRoots: z.array(AbsolutePathSchema).max(20).default([])
+}).strict().superRefine(assertEnvelopeSourceConsistency);
+export type L3UserProjectsReplaceRequest = z.input<typeof L3UserProjectsReplaceRequestSchema>;
+
+export const L3UserProjectsReplaceResponseSchema = z.object({
+  count: z.number().int().nonnegative(),
+  serverTime: z.string().datetime()
+}).strict();
+export type L3UserProjectsReplaceResponse = z.infer<typeof L3UserProjectsReplaceResponseSchema>;
+
 export const SessionL3WorldModelContextResponseSchema = z.object({
   schemaVersion: z.literal(2),
   projectId: NonEmptyStringSchema.nullable(),

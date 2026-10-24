@@ -8,6 +8,7 @@ import {
 } from "../agent-source/runtime.js";
 import {
   EmbeddingInferenceInputSchema,
+  L3UserProjectsReplaceRequestSchema,
   L3WorldModelBoundaryRequestSchema,
   L3WorldModelRequestEnvelopeSchema,
   OpenSessionInputSchema
@@ -77,6 +78,7 @@ export const API_ROUTES = [
   "GET /api/v1/sessions/:sessionId/l3-world-model-trace-head",
   "POST /api/v1/sessions/:sessionId/l3-world-model-boundary",
   "GET /api/v1/l3-world-model/sessions/:sessionId/context",
+  "POST /api/v1/l3/user-projects",
   "POST /api/v1/turns/start",
   "POST /api/v1/turns/:turnId/complete",
   "POST /api/v1/source-turns/complete",
@@ -686,6 +688,20 @@ async function routeRequest(
     scheduleAutoWorkerForEvolution(result, autoWorker);
     if (request.trigger === "token_compaction") autoWorker.schedule();
     return result;
+  }
+
+  if (method === "POST" && path === "/api/v1/l3/user-projects") {
+    requireMemoryWrite(principal);
+    const parsed = L3UserProjectsReplaceRequestSchema.safeParse(
+      strictEnvelopeWithPrincipal(asObject(body, "l3.user-projects"), principal)
+    );
+    if (!parsed.success) {
+      throw new MemoryServiceError(
+        "invalid_argument",
+        parsed.error.issues.map((issue) => `${issue.path.join(".") || "request"}: ${issue.message}`).join("; ")
+      );
+    }
+    return service.replaceL3UserProjects(parsed.data);
   }
 
   const l3Context = match(path, /^\/api\/v1\/l3-world-model\/sessions\/([^/]+)\/context$/);
