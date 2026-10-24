@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 
-type PermissionScope = { url: string; token: string; active: boolean; signal: AbortSignal; onEvent?: (event: Record<string, unknown>) => void };
+type ManagedTool = { name: string; description: string; inputSchema: Record<string, unknown> };
+type PermissionScope = { tools: ManagedTool[]; url: string; token: string; active: boolean; signal: AbortSignal; onEvent?: (event: Record<string, unknown>) => void };
 const scopes = new AsyncLocalStorage<PermissionScope>();
 const fileCalls = new AsyncLocalStorage<string>();
 
@@ -68,7 +69,11 @@ export function authenticateMemmateRuntime(request: Request): boolean {
 
 export function createMemmatePermissionScope(value: unknown, signal: AbortSignal): PermissionScope {
   if (!value || typeof value !== "object") throw new Error("MemMate approval connection is required");
-  const input = value as { url?: unknown; token?: unknown };
+  const input = value as { protocol?: unknown; tools?: unknown; url?: unknown; token?: unknown };
+  if (input.protocol !== 2 || !Array.isArray(input.tools) || !input.tools.length || input.tools.some(tool =>
+    !tool || typeof tool.name !== "string" || typeof tool.description !== "string" || !tool.inputSchema || typeof tool.inputSchema !== "object")) {
+    throw new Error("MemMate managed execution protocol 2 and tool definitions are required");
+  }
   if (typeof input.url !== "string" || typeof input.token !== "string" || !/^[a-f0-9]{64}$/u.test(input.token)) {
     throw new Error("Invalid MemMate approval connection");
   }
@@ -77,7 +82,19 @@ export function createMemmatePermissionScope(value: unknown, signal: AbortSignal
     || url.pathname !== "/authorize" || url.username || url.password || url.search || url.hash) {
     throw new Error("MemMate approval connection must be local");
   }
-  return { url: url.href, token: input.token, active: true, signal };
+  return { url: url.href, token: input.token, tools: structuredClone(input.tools), active: true, signal };
+}
+
+export function memmateToolDefinitions(): Record<string, unknown>[] {
+  const scope = scopes.getStore();
+  if (!scope?.active || scope.signal.aborted) return [];
+  return scope.tools.map(tool => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.inputSchema } }));
+}
+
+export class MemmateExecutionError extends Error {
+  constructor(readonly detail: { kind: "permission" | "execution"; code: string }) {
+    super(`MemMate ${detail.kind === "permission" ? "did not authorize this operation" : "execution failed"}: ${detail.code}`);
+  }
 }
 
 export function withMemmatePermission<T>(scope: PermissionScope | undefined, run: () => T): T {
@@ -104,8 +121,12 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
     signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(125_000)])
   });
   if (!response.ok) throw new Error("MemMate approval service is unavailable");
-  const result = await response.json() as { decision?: string; reason?: string; result?: unknown };
+  const result = await response.json() as { decision?: string; reason?: string; result?: unknown; error?: { kind?: unknown; code?: unknown } };
   if (!scope.active || scope.signal.aborted || signal?.aborted) throw new Error("MemMate run has ended");
+  if (result.error && ["permission", "execution"].includes(String(result.error.kind))
+    && typeof result.error.code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,79}$/u.test(result.error.code)) {
+    throw new MemmateExecutionError({ kind: result.error.kind as "permission" | "execution", code: result.error.code });
+  }
   if (result.decision !== "allow") {
     const message = `MemMate denied this operation: ${result.reason ?? "denied"}`;
     if (result.decision === "deny" && ["operator_rejected", "denied_by_policy", "policy_denied", "unconfigured_deny"].includes(result.reason ?? "")) {
@@ -113,7 +134,7 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
     }
     throw new Error(message);
   }
-  if (name === "web_fetch" && typeof result.result !== "string") throw new Error("MemMate web execution result is missing");
+  if (typeof result.result !== "string") throw new Error("MemMate execution result is missing");
   return { args: approvedArgs, ...(typeof result.result === "string" ? { result: result.result } : {}) };
 }
 

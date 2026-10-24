@@ -1,5 +1,4 @@
-import { resolveWorkspacePath as resolveManagedFilePath } from "./tools/path-utils.js";
-import { authorizeMemmateTool, emitMemmateToolEvent, memmatePermissionRequired, withMemmateFileCall } from "./memmate-permission.js";
+import { authorizeMemmateTool, emitMemmateToolEvent, memmatePermissionRequired, MemmateExecutionError } from "./memmate-permission.js";
 import { requestTiming } from "../../utils/request-timing.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
@@ -1063,7 +1062,7 @@ export class AgentRunner {
       }
     }
     for (const item of out) emitMemmateToolEvent({ type: "tool_result", callId: item.call.id, name: item.call.name,
-      output: item.result, ok: item.event.status !== "error" });
+      output: item.result, ok: item.event.status !== "error", ...(item.event.executionError ? { error: item.event.executionError } : {}) });
     return out;
   }
 
@@ -1077,6 +1076,17 @@ export class AgentRunner {
     if (spec.abortSignal?.aborted) {
       const event = { name: call.name, status: "error", detail: "task cancelled" };
       return { call, result: "Error: task cancelled", event, error: spec.failOnToolError ? createAbortError() : null };
+    }
+    if (memmatePermissionRequired()) {
+      try {
+        const authorized = await authorizeMemmateTool(call.name, call.arguments, spec.abortSignal, call.id);
+        return { call, result: authorized.result, event: { name: call.name, status: "ok" } };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "MemMate execution failed";
+        return { call, result: `Error: ${message}`, event: { name: call.name, status: "error", detail: message,
+          ...(error instanceof MemmateExecutionError ? { executionError: error.detail } : {}) },
+          error: spec.failOnToolError ? error : null };
+      }
     }
     const repeatedLookup = repeatedExternalLookupError(call.name, call.arguments, externalLookupCounts);
     if (repeatedLookup) {
@@ -1101,27 +1111,6 @@ export class AgentRunner {
       const handled = this.classifyViolation(prepError, prepError + hint, event, call, workspaceViolationCounts);
       if (handled) return { call, ...handled };
       return { call, result: prepError + hint, event, error: spec.failOnToolError ? new Error(prepError) : null };
-    }
-
-    const managed = memmatePermissionRequired();
-    let managedResult: string | undefined;
-    if (managed) {
-      try {
-        const executionName = call.name;
-        await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
-        if (call.name !== executionName) throw new Error("Tool name changed before MemMate approval");
-        if (["read_file", "write_file", "edit_file", "list_dir", "find_files", "grep"].includes(executionName)
-          && (typeof params?.path === "string" || ["find_files", "grep"].includes(executionName))) {
-          params = { ...params, path: resolveManagedFilePath(tool?.workspace ?? spec.workspace ?? process.cwd(), params?.path ?? ".") };
-        }
-        const authorized = await authorizeMemmateTool(executionName, params, spec.abortSignal, call.id);
-        params = authorized.args;
-        managedResult = authorized.result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "MemMate approval failed";
-        return { call, result: `Error: ${message}`, event: { name: call.name, status: "error", detail: message },
-          error: spec.failOnToolError ? error : null };
-      }
     }
 
     const progressCallback = spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
@@ -1155,7 +1144,7 @@ export class AgentRunner {
     try {
       let raw: any;
       const fileMutationOutcomes = new Map<string, FileMutationOutcome>();
-      if (!managed) await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
+      await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
       const toolContext: ToolExecutionContext = {
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
@@ -1168,9 +1157,9 @@ export class AgentRunner {
           });
         },
       };
-      const run = withMemmateFileCall(call.id, () => managedResult !== undefined ? managedResult : tool && typeof tool.execute === "function"
+      const run = tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
-        : spec.tools.execute(call.name, params, toolContext));
+        : spec.tools.execute(call.name, params, toolContext);
       raw = await withAbort(Promise.resolve(run), spec.abortSignal);
       if (spec.abortSignal?.aborted) throw createAbortError();
       let event: Record<string, any>;

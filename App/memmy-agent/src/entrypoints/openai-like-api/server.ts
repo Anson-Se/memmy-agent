@@ -529,7 +529,7 @@ export async function handleModels(request?: Request, ctx?: Pick<ApiContext, "mo
 }
 
 export async function handleHealth(): Promise<Response> {
-  return Response.json({ status: "ok", ...(memmatePermissionRequired() ? { memmatePermissionProtocol: 1, memmatePermissionRequired: true, memmateMacosSandbox: process.env.MEMMATE_MACOS_SANDBOX === "1" } : {}) });
+  return Response.json({ status: "ok", ...(memmatePermissionRequired() ? { memmatePermissionProtocol: 1, memmateExecutionProtocol: 2, memmatePermissionRequired: true, memmateMacosSandbox: process.env.MEMMATE_MACOS_SANDBOX === "1" } : {}) });
 }
 
 export function createApp(

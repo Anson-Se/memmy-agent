@@ -1,11 +1,10 @@
-import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { authorizeMemmateTool, createMemmatePermissionScope, withMemmatePermission } from "../../../src/core/agent-runtime/memmate-permission.js";
 import { AgentRunner, AgentRunSpec } from "../../../src/core/agent-runtime/runner.js";
 import { ToolCallRequest } from "../../../src/providers/base.js";
 import { createApp } from "../../../src/entrypoints/openai-like-api/server.js";
 
-const credential = { url: "http://127.0.0.1:12345/authorize", token: "a".repeat(64) };
+const credential = { protocol: 2, tools: [{ name: "web_fetch", description: "managed fetch", inputSchema: { type: "object" } }], url: "http://127.0.0.1:12345/authorize", token: "a".repeat(64) };
 const scope = () => createMemmatePermissionScope(credential, new AbortController().signal);
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
@@ -33,7 +32,7 @@ describe("mandatory MemMate permission", () => {
       expect(() => createMemmatePermissionScope({ ...credential, url }, new AbortController().signal)).toThrow();
     }
   });
-  it.each([true, false])("waits before the %s direct-execute branch and runs only approved normalized arguments", async direct => {
+  it.each([true, false])("waits for the Host and never calls the %s native-execute branch", async direct => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
     let reply!: (value: Response) => void;
     const received: any[] = [];
@@ -44,9 +43,10 @@ describe("mandatory MemMate permission", () => {
     const pending = withMemmatePermission(scope(), () => new AgentRunner().executeTools(new AgentRunSpec({ tools: tools as any }), [new ToolCallRequest({ id: "one", name: "write_file", arguments: {} })]));
     await vi.waitFor(() => expect(received).toHaveLength(1));
     expect(execute).not.toHaveBeenCalled(); original.path = "after.txt";
-    reply(Response.json({ decision: "allow" }));
+    reply(Response.json({ decision: "allow", result: "Host result" }));
     await pending;
-    expect(execute).toHaveBeenCalledWith({ path: path.resolve("before.txt") }, ...(direct ? [expect.anything()] : []));
+    expect(execute).not.toHaveBeenCalled();
+    expect(received[0].args).toEqual({});
   });
   it.each(["deny", "allow_always", "unavailable"])("never executes on %s", async decision => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
@@ -65,7 +65,7 @@ describe("mandatory MemMate permission", () => {
   });
   it("carries the verified request scope to tool execution and ends it with the response", async () => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1"); vi.stubEnv("MEMMATE_RUNTIME_TOKEN", "b".repeat(64));
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow" })));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow", result: "Host result" })));
     let detached!: () => Promise<unknown>;
     const app = createApp(async () => {
       // AsyncResource preserves the request scope for deferred work, which must expire.
@@ -82,7 +82,7 @@ describe("mandatory MemMate permission", () => {
   it.each(["allow", "deny"])("streams tool outcomes with the approval call id for %s", async decision => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1"); vi.stubEnv("MEMMATE_RUNTIME_TOKEN", "b".repeat(64));
     const requests: any[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_url, init) => { requests.push(JSON.parse(init.body)); return Response.json({ decision }); }));
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => { requests.push(JSON.parse(init.body)); return Response.json({ decision, ...(decision === "allow" ? { result: "written" } : {}) }); }));
     const execute = vi.fn(async () => "written");
     const app = createApp(async (args: any) => {
       await args.onProgress("", { toolEvents: [{ phase: "start", call_id: "correlated", name: "write_file", arguments: { path: "a" } }] });
@@ -99,7 +99,7 @@ describe("mandatory MemMate permission", () => {
     expect(requests[0].callId).toBe("correlated");
     expect(events.map(event => [event.type, event.callId])).toEqual([["tool_call", "correlated"], ["tool_result", "correlated"]]);
     expect(events[1].ok).toBe(decision === "allow");
-    expect(execute).toHaveBeenCalledTimes(decision === "allow" ? 1 : 0);
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it.each([true, false])("keeps approval pending beyond the legacy deadline and authenticates explicit stop (stream=%s)", async stream => {
@@ -144,4 +144,43 @@ describe("mandatory MemMate permission", () => {
     expect(app.context.activeRequests.size).toBe(0);
   });
 
+});
+
+
+describe("managed execution outcomes", () => {
+  it.each(["read_file", "write_file", "list_dir", "run_command", "web_fetch", "web_search"])("delegates %s entirely to the Host", async name => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow", result: "Error is valid file content" })));
+    const native = vi.fn(() => { throw new Error("native execution must not run"); });
+    const runner = new AgentRunner();
+    const results = await withMemmatePermission(scope(), () => runner.executeTools(new AgentRunSpec({
+      tools: { prepareCall: native, execute: native, get: () => ({ readOnly: true }) } as any
+    }), [new ToolCallRequest({ id: name, name, arguments: { path: "file" } })]));
+    expect(native).not.toHaveBeenCalled();
+    expect(results[0].event.status).toBe("ok");
+    expect(results[0].result).toBe("Error is valid file content");
+  });
+  it("retains execution errors instead of relabelling them as denied approvals", async () => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    const error = { kind: "execution", code: "ENOTFOUND" };
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "deny", reason: "ENOTFOUND", error })));
+    const results = await withMemmatePermission(scope(), () => new AgentRunner().executeTools(new AgentRunSpec({
+      tools: { get: () => ({ readOnly: true }) } as any
+    }), [new ToolCallRequest({ id: "dns", name: "web_fetch", arguments: {} })]));
+    expect(results[0].event).toMatchObject({ status: "error", executionError: error });
+    expect(results[0].result).toContain("execution failed: ENOTFOUND");
+    expect(results[0].result).not.toContain("denied");
+  });
+  it("requires protocol 2 and a Host tool catalog", () => {
+    expect(() => createMemmatePermissionScope({ ...credential, protocol: 1 }, new AbortController().signal)).toThrow("protocol 2");
+    expect(() => createMemmatePermissionScope({ ...credential, tools: [] }, new AbortController().signal)).toThrow("tool definitions");
+  });
+  it("only exposes the request-scoped Host tools", async () => {
+    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    const { ToolRegistry } = await import("../../../src/core/agent-runtime/tools/registry.js");
+    const registry = new ToolRegistry();
+    expect(registry.getDefinitions()).toEqual([]);
+    withMemmatePermission(scope(), () => expect(registry.getDefinitions().map(tool => tool.function.name)).toEqual(["web_fetch"]));
+    expect(registry.getDefinitions()).toEqual([]);
+  });
 });
