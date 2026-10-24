@@ -68,6 +68,7 @@ export interface WorkerJobProcessors {
     abstractL3(job: EvolutionJobRecord): MaybePromise<void>;
     updateL3WorldModel(job: EvolutionJobRecord): MaybePromise<void>;
     updateProjectEnvironment(job: EvolutionJobRecord): MaybePromise<void>;
+    updateL3Unit(job: EvolutionJobRecord): MaybePromise<void>;
     crystallizeSkill(job: EvolutionJobRecord): MaybePromise<void>;
     assignSkillCluster(job: EvolutionJobRecord): MaybePromise<void>;
     evolveSkillCluster(job: EvolutionJobRecord): MaybePromise<void>;
@@ -96,7 +97,7 @@ export interface WorkerJobProcessors {
 }
 
 export interface WorkerJobHandlerDeps {
-  repos: Pick<Repositories, "transaction" | "memories" | "userMemories" | "processing" | "runtime">;
+  repos: Pick<Repositories, "transaction" | "memories" | "userMemories" | "processing" | "runtime" | "l3WorldModels">;
   capture: { synthReflection: boolean };
   reward: { feedbackWindowSec: number };
   nowIso(): string;
@@ -270,6 +271,10 @@ export async function processJob(
     case "project_environment_profile":
       await deps.processors.evolution.updateProjectEnvironment(job);
       return;
+    case "l3_unit_update":
+      // A terminal error goes straight to dead letter in failLeasedWorkerJob.
+      await deps.processors.evolution.updateL3Unit(job);
+      return;
     case "skill_crystallization":
       await deps.processors.evolution.crystallizeSkill(job);
       return;
@@ -381,7 +386,15 @@ export function finalizeClosedEpisode(
   trigger: ClosedEpisodeTrigger
 ): EvolutionJobRecord[] {
   const current = deps.repos.runtime.getEpisode(episode.id) ?? episode;
-  if (current.status !== "closed" || current.l1MemoryIds.length === 0) return [];
+  if (current.status !== "closed") return [];
+  // Every way a task closes ends up here, so this is where its turns go to the new L3.
+  deps.repos.l3WorldModels.freezeClosedTask({
+    sessionId: current.sessionId,
+    episodeId: current.id,
+    trigger: trigger === "idle_timeout" ? "episode_idle_close" : trigger === "session_closed" ? "session_close" : "new_task",
+    at
+  });
+  if (current.l1MemoryIds.length === 0) return [];
   if (episodeHasPendingCaptureDecision(deps, current) || deps.repos.runtime.hasUnassignedTurns(current.sessionId)) return [];
   // Titling is independent of reward and reflection, so it must be queued before
   // the mutually exclusive branches below can return.
@@ -568,6 +581,7 @@ export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
     job.jobType === "observation_extract" ||
     job.jobType === "embedding" ||
     job.jobType === "l3_world_model_update" ||
+    job.jobType === "l3_unit_update" ||
     job.jobType === "project_environment_profile";
 }
 

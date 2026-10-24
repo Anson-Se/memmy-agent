@@ -15,6 +15,9 @@ import { isL3FieldCognitionActive } from "./l3-field/flag.js";
 import { loadL3FieldContext } from "./l3-field/l3-field-context.js";
 import type { L3FieldEnvironment } from "./l3-field/session-units.js";
 import { l3FieldSnapshotUnitKey } from "./l3-field/snapshot-memory.js";
+import { resolveSessionUnits } from "./l3-field/session-units.js";
+import { machineProfileFingerprint, probeMachine, renderMachineProfile, type MachineProbe } from "./l3-field/machine-profile.js";
+import { L3UnitUpdatePipeline } from "./l3-field/unit-update-pipeline.js";
 import {
   languageSteeringLine,
   skillOutputLanguageFor,
@@ -243,6 +246,8 @@ export interface MemoryServiceOptions {
   mode?: "local" | "cloud" | "dev";
   /** Machine identity and home folder for the new L3; defaults to this installation. Tests override it. */
   l3FieldEnvironment?: () => L3FieldEnvironment;
+  /** Probes this computer for the new L3 machine profile; tests override it. */
+  l3MachineProbe?: () => Promise<MachineProbe>;
   configPath?: string;
   configLoader?: (configPath?: string) => {
     config: MemmyConfig;
@@ -310,6 +315,8 @@ export class MemoryService {
   private readonly importJobs: ImportJobProcessor;
   private readonly l3WorldModelContextReadModel: L3WorldModelContextReadModel;
   private readonly projectEnvironment: ProjectEnvironmentService;
+  private readonly l3UnitUpdate: L3UnitUpdatePipeline;
+  private readonly l3MachineProfileRefreshedAt = new Map<string, number>();
   private readonly panelReadModel: PanelReadModel;
   private readonly retrieval: RetrievalService;
   private readonly sessionTurns: SessionTurnService;
@@ -410,6 +417,15 @@ export class MemoryService {
       get llm() { return projectEnvironmentOwner.skillLlm; },
       get language() { return projectEnvironmentOwner.config.language; }
     });
+    this.l3UnitUpdate = new L3UnitUpdatePipeline({
+      repos: this.repos,
+      get llm() { return projectEnvironmentOwner.skillLlm; },
+      get language() { return projectEnvironmentOwner.config.language; },
+      environment: () => projectEnvironmentOwner.l3FieldEnvironment()
+    });
+    this.repos.l3WorldModels.routeBatchesToFieldCognition(
+      () => projectEnvironmentOwner.l3FieldActive() ? projectEnvironmentOwner.l3FieldEnvironment().machineId : null
+    );
     const episodeTitleOwner = this;
     this.episodeTitle = new EpisodeTitleService({
       repos: this.repos,
@@ -440,6 +456,7 @@ export class MemoryService {
           abstractL3: (job) => this.evolutionJobs.abstractL3(job),
           updateL3WorldModel: (job) => this.evolutionJobs.updateL3WorldModel(job),
           updateProjectEnvironment: (job) => this.projectEnvironment.processProfileJob(job),
+          updateL3Unit: (job) => this.l3UnitUpdate.process(job),
           crystallizeSkill: (job) => this.evolutionJobs.crystallizeSkill(job),
           assignSkillCluster: (job) => this.evolutionJobs.assignSkillCluster(job),
           evolveSkillCluster: (job) => this.evolutionJobs.evolveSkillCluster(job),
@@ -644,6 +661,7 @@ export class MemoryService {
       runWorkerNoWrite: this.runWorkerNoWrite.bind(this),
       restartFailedProcessing: this.restartFailedProcessing.bind(this),
       enqueueObservationBackfill: (limit, at) => this.observationMemory.backfill(limit, at),
+      l3FieldActive: () => this.l3FieldActive(),
       purgeL3InactiveItems: (at) => this.repos.l3Field.purgeInactive(
         new Date(Date.parse(at) - this.config.algorithm.l3FieldCognition.inactiveRetentionDays * 86_400_000).toISOString()
       ),
@@ -1123,6 +1141,44 @@ export class MemoryService {
 
   private l3FieldEnvironmentCache?: L3FieldEnvironment;
 
+  /** New L3 profiles at session start and compaction: rescan the session's project, re-probe the machine. */
+  private requestL3FieldProfiles(session: SessionRecord): void {
+    if (!this.memoryAddEnabled()) return;
+    const units = resolveSessionUnits(this.repos, this.l3FieldEnvironment(), session);
+    if (units.project?.unit.checkoutRoot) {
+      this.projectEnvironment.requestL3UnitProfile({
+        userId: session.userId,
+        unitKey: units.project.unit.unitKey,
+        checkoutRoot: units.project.unit.checkoutRoot
+      });
+    }
+    void this.refreshL3MachineProfile(units.machine.unitKey);
+  }
+
+  /** At most once per ten minutes per machine; the profile is rewritten only when the probe changed. */
+  private async refreshL3MachineProfile(unitKey: string): Promise<void> {
+    const now = Date.now();
+    if (now - (this.l3MachineProfileRefreshedAt.get(unitKey) ?? 0) < 10 * 60_000) return;
+    this.l3MachineProfileRefreshedAt.set(unitKey, now);
+    try {
+      // A reset (snapshot deleted) while probing makes this probe stale; it must not bring the profile back.
+      const resetBefore = this.repos.l3Field.getUnit(unitKey)?.deletedAt;
+      const probe = await (this.options.l3MachineProbe ?? probeMachine)();
+      // The service may have stopped, or memory writes been turned off, while the probe ran.
+      if (this.closing || !this.memoryAddEnabled()) return;
+      const fingerprint = machineProfileFingerprint(probe);
+      this.repos.transaction(() => {
+        const unit = this.repos.l3Field.getUnit(unitKey);
+        if (!unit || unit.deletedAt !== resetBefore || unit.profileFingerprint === fingerprint) return;
+        this.repos.l3Field.setProfile(unitKey, { text: renderMachineProfile(probe), fingerprint });
+        this.repos.l3Field.refreshSnapshot(unitKey);
+      });
+    } catch {
+      // A failed probe leaves the old profile; the next session start tries again.
+      this.l3MachineProfileRefreshedAt.delete(unitKey);
+    }
+  }
+
   private l3FieldEnvironment(): L3FieldEnvironment {
     this.l3FieldEnvironmentCache ??= this.options.l3FieldEnvironment?.() ?? {
       machineId: deriveWorkspaceHostId(getOrCreateInstallationId({ env: process.env })),
@@ -1461,7 +1517,10 @@ export class MemoryService {
     serverTime: string;
   } {
     const response = this.sessionTurns.openSession(this.withTimeZone(request));
-    if (this.projectEnvironmentScanEnabled() && response.projectId) {
+    if (this.l3FieldActive()) {
+      // With memory writes off the session is not stored, and profiles are writes anyway.
+      if (this.memoryAddEnabled()) this.requestL3FieldProfiles(this.requireSession(response.sessionId));
+    } else if (this.projectEnvironmentScanEnabled() && response.projectId) {
       const session = this.requireSession(response.sessionId);
       const scope = this.repos.l3WorldModels.getScope(session.userId, response.projectId);
       if (scope?.workspaceUri && isLocalWorkspaceUri(scope.workspaceUri)) {
@@ -1537,7 +1596,9 @@ export class MemoryService {
     if (!result.throughTraceSeq) {
       throw new MemoryServiceError("conflict", "through L1 memory was not registered");
     }
-    if (
+    if (request.trigger === "token_compaction" && this.l3FieldActive()) {
+      this.requestL3FieldProfiles(session);
+    } else if (
       request.trigger === "token_compaction" &&
       this.projectEnvironmentScanEnabled() &&
       session.projectId
@@ -2694,7 +2755,14 @@ export class MemoryService {
     this.assertMemoryInScope(memory, request.namespace);
     const kind = kindFromMemory(memory);
     const at = nowIso();
-    const archived = this.repos.memories.archive(memory.id, at);
+    const archived = this.repos.transaction(() => {
+      const row = this.repos.memories.archive(memory.id, at);
+      // A project's session context includes the machine, so archiving the machine's new-L3
+      // snapshot moves the project versions too, or clients keep using their cached context.
+      const l3Unit = row ? l3FieldSnapshotUnitKey(memory) : null;
+      if (l3Unit) this.repos.l3Field.refreshProjectContexts(l3Unit, at);
+      return row;
+    });
     if (!archived) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }

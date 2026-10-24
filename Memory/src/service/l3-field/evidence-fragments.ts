@@ -1,16 +1,24 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { sha256Hex } from "../../contracts/index.js";
 import type { RawTurnRecord } from "../../storage/repositories.js";
 import { matchToolResultIndices } from "../../utils/tool-call-pairing.js";
 import type { EvidenceFragment, ResolvedProject } from "./types.js";
 
-const PATH_KEYS = ["file_path", "filePath", "path", "notebook_path", "workdir", "cwd", "directory"];
+const TARGET_KEYS = ["file_path", "filePath", "path", "notebook_path"];
+const WORKDIR_KEYS = ["workdir", "cwd", "directory"];
+const PATCH_KEYS = ["input", "patch"];
+const PATCH_FILE_LINE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm;
 const COMMAND_KEYS = ["command", "cmd"];
 const USER_TEXT_LIMIT = 4_000;
-const CLIP_HEAD_CHARS = 600;
-const CLIP_TAIL_CHARS = 600;
+const CLIP_HEAD_CHARS = 300;
+const CLIP_TAIL_CHARS = 300;
+const ERROR_LINE_CHARS = 200;
 const ERROR_LINE = /error|fail|exception|denied|not found|traceback|refused|cannot|no such|fatal/i;
 const COMMAND_SEPARATORS = new Set(["&&", "||", ";", "|"]);
+/** A redirection token, with its target attached (`2>/dev/null`) or as the next token (`>`). */
+const REDIRECT = /^\d*(?:>>?|<)|^&>/;
+const REDIRECT_ONLY = /^(?:\d*(?:>>?|<)|&>)$/;
 
 /**
  * Cuts one raw turn into evidence fragments: the user's words, and each tool
@@ -32,17 +40,42 @@ export function buildEvidenceFragments(input: {
     const project = input.resolve(input.sessionCwd, "session_dir");
     return project ? [input.unitKeyOf(project)] : [];
   };
+  const rootOf = new Map<string, string | null>();
   const unitsForPaths = (paths: string[]): string[] => {
     if (paths.length === 0) return sessionUnits();
     const keys = new Set<string>();
     for (const target of paths) {
       const project = input.resolve(target, "tool_path");
-      if (project) keys.add(input.unitKeyOf(project));
+      if (!project) continue;
+      const key = input.unitKeyOf(project);
+      rootOf.set(key, project.checkoutRoot ?? null);
+      keys.add(key);
     }
-    return [...keys];
+    return mostSpecificUnits([...keys], rootOf);
   };
   const fragmentId = (kind: string, index: number) =>
     sha256Hex(`${rawTurn.id}:${kind}:${index}`).slice(0, 16);
+
+  const calls: EvidenceFragment[] = [];
+  rawTurn.toolCalls.forEach((call, index) => {
+    if (!isRecord(call)) return;
+    const paths = extractToolPaths(call, input.sessionCwd);
+    calls.push({
+      id: fragmentId("call", index),
+      rawTurnId: rawTurn.id,
+      l1MemoryId: input.l1MemoryId,
+      toolName: typeof call.name === "string" ? call.name : null,
+      input: clipToolInput(call.input),
+      output: toolOutputText(call),
+      isError: isErrorRecord(call),
+      paths,
+      candidateUnitKeys: unitsForPaths(paths),
+      at: typeof call.endedAt === "string" ? call.endedAt : rawTurn.createdAt
+    });
+  });
+  // The user's words belong to the projects this turn actually worked on; only a turn that touched
+  // no project falls back to the session folder (a session opened in a big parent folder).
+  const touched = mostSpecificUnits([...new Set(calls.flatMap((call) => call.candidateUnitKeys))], rootOf);
 
   const fragments: EvidenceFragment[] = [];
   const userText = rawTurn.userText?.trim();
@@ -56,27 +89,11 @@ export function buildEvidenceFragments(input: {
       output: userText.slice(0, USER_TEXT_LIMIT),
       isError: false,
       paths: [],
-      candidateUnitKeys: sessionUnits(),
+      candidateUnitKeys: touched.length > 0 ? touched : sessionUnits(),
       at: rawTurn.createdAt
     });
   }
-
-  rawTurn.toolCalls.forEach((call, index) => {
-    if (!isRecord(call)) return;
-    const paths = extractToolPaths(call, input.sessionCwd);
-    fragments.push({
-      id: fragmentId("call", index),
-      rawTurnId: rawTurn.id,
-      l1MemoryId: input.l1MemoryId,
-      toolName: typeof call.name === "string" ? call.name : null,
-      input: call.input ?? null,
-      output: toolOutputText(call),
-      isError: isErrorRecord(call),
-      paths,
-      candidateUnitKeys: unitsForPaths(paths),
-      at: typeof call.endedAt === "string" ? call.endedAt : rawTurn.createdAt
-    });
-  });
+  fragments.push(...calls);
 
   const matched = new Set(
     matchToolResultIndices(rawTurn.toolCalls, rawTurn.toolResults).filter((index): index is number => index !== undefined)
@@ -101,30 +118,50 @@ export function buildEvidenceFragments(input: {
 }
 
 /**
- * Paths a tool call actually touched: file/dir arguments, `cd` and `git -C`
- * targets, and absolute path arguments of commands. Relative paths resolve
- * against the call's own workdir/cwd, else the session folder.
+ * Paths a tool call actually touched: file arguments, files named in a patch, `cd`
+ * and `git -C` targets, and absolute path arguments of commands. Relative paths
+ * resolve against the call's own workdir/cwd, else the session folder. Each shell
+ * subcommand that names no target of its own counts as touching the directory it ran in.
  */
 export function extractToolPaths(call: Record<string, unknown>, sessionCwd: string | null): string[] {
   const rawArgs = call.input ?? call.arguments ?? call.args;
   const args = parseArguments(rawArgs);
   if (!args) {
-    return typeof rawArgs === "string" ? codeModePaths(rawArgs, sessionCwd) : [];
+    if (typeof rawArgs !== "string") return [];
+    // A code-mode snippet can hold a patch next to other calls; keep the paths of both.
+    return [...new Set([...patchPaths(rawArgs, sessionCwd), ...codeModePaths(rawArgs, sessionCwd)])];
   }
-  const workdir = stringValue(args.workdir) ?? stringValue(args.cwd) ?? stringValue(args.directory) ?? sessionCwd;
+  const explicitWorkdir = WORKDIR_KEYS.map((key) => stringValue(args[key])).find(Boolean);
+  const workdir = explicitWorkdir ? resolveAgainst(explicitWorkdir, sessionCwd) : sessionCwd;
   const found: string[] = [];
   const add = (value: string, base: string | null) => {
     const resolved = resolveAgainst(value, base);
     if (resolved && !found.includes(resolved)) found.push(resolved);
   };
-  for (const key of PATH_KEYS) {
+  for (const key of TARGET_KEYS) {
     const value = stringValue(args[key]);
-    if (value) add(value, key === "workdir" || key === "cwd" || key === "directory" ? sessionCwd : workdir);
+    if (value) add(value, workdir);
+  }
+  for (const key of PATCH_KEYS) {
+    const value = stringValue(args[key]);
+    if (value) for (const target of patchPaths(value, workdir)) add(target, null);
   }
   for (const key of COMMAND_KEYS) {
     const raw = args[key];
     const command = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.filter((part) => typeof part === "string").join(" ") : null;
     if (command) for (const target of commandPaths(command, workdir)) add(target, null);
+  }
+  if (found.length === 0 && explicitWorkdir && workdir) found.push(workdir);
+  return found;
+}
+
+/** Files an apply_patch style patch adds, updates, deletes or moves to. */
+function patchPaths(text: string, base: string | null): string[] {
+  if (!text.includes("*** Begin Patch")) return [];
+  const found: string[] = [];
+  for (const match of text.matchAll(PATCH_FILE_LINE)) {
+    const resolved = resolveAgainst((match[1] ?? match[2]!).trim(), base);
+    if (resolved && !found.includes(resolved)) found.push(resolved);
   }
   return found;
 }
@@ -145,6 +182,8 @@ function codeModePaths(code: string, sessionCwd: string | null): string[] {
   const add = (target: string | null) => {
     if (target && !found.includes(target)) found.push(target);
   };
+  // A snippet can hold several calls and literals are not tied to the call they belong to,
+  // so every workdir counts here (unlike a single call, where a named target wins).
   const workdirs = [...(values.workdir ?? []), ...(values.cwd ?? [])];
   for (const dir of workdirs) add(resolveAgainst(dir, sessionCwd));
   const base = workdirs[0] ? resolveAgainst(workdirs[0], sessionCwd) : sessionCwd;
@@ -175,10 +214,24 @@ export function clipToolOutput(text: string): string {
   const head = text.slice(0, CLIP_HEAD_CHARS);
   const tail = text.slice(-CLIP_TAIL_CHARS);
   const middle = text.slice(CLIP_HEAD_CHARS, text.length - CLIP_TAIL_CHARS);
-  const errorLines = middle.split(/\r?\n/).filter((line) => ERROR_LINE.test(line)).slice(0, 20);
+  const errorLines = middle.split(/\r?\n/).filter((line) => ERROR_LINE.test(line)).slice(0, 20)
+    .map((line) => (line.length > ERROR_LINE_CHARS ? `${line.slice(0, ERROR_LINE_CHARS)}…` : line));
   return [head, "[已截断]", ...errorLines, ...(errorLines.length ? ["[已截断]"] : []), tail].join("\n");
 }
 
+/** A long tool input (a patch, a written file) is clipped like output; its paths were read before clipping. */
+function clipToolInput(value: unknown): unknown {
+  if (value === undefined || value === null) return null;
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return text.length <= CLIP_HEAD_CHARS + CLIP_TAIL_CHARS ? value : clipToolOutput(text);
+}
+
+/**
+ * Paths each subcommand works on: `cd` and `git -C` targets, absolute path arguments, and relative
+ * ones (`api/AGENTS.md`, or a bare name that exists in the current directory).
+ * A subcommand naming none works in the current directory, so that counts instead. Where
+ * output is redirected to (`> /tmp/log`) is not what the command works on.
+ */
 function commandPaths(command: string, startDir: string | null): string[] {
   const found: string[] = [];
   let cwd = startDir;
@@ -193,16 +246,27 @@ function commandPaths(command: string, startDir: string | null): string[] {
         cwd = target;
       }
     } else {
+      const targets: string[] = [];
       for (let i = 0; i < rest.length; i += 1) {
         const token = rest[i]!;
+        if (REDIRECT.test(token)) {
+          if (REDIRECT_ONLY.test(token)) i += 1;
+          continue;
+        }
         if (executable === "git" && token === "-C" && rest[i + 1]) {
           const target = resolveAgainst(rest[i + 1]!, cwd);
-          if (target) found.push(target);
+          if (target) targets.push(target);
           i += 1;
           continue;
         }
-        if (isAbsoluteAny(token) && !token.includes("://")) found.push(token);
+        if (isAbsoluteAny(token) && !token.includes("://")) targets.push(token);
+        else {
+          const relative = relativePathArgument(token, cwd);
+          if (relative) targets.push(relative);
+        }
       }
+      if (targets.length === 0 && cwd) targets.push(cwd);
+      found.push(...targets);
     }
     segment = [];
   };
@@ -269,6 +333,33 @@ function parseArguments(value: unknown): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Work on a project inside a bigger folder belongs to that project: when a fragment touches both a
+ * folder and a project nested in it, only the nested one stays a candidate.
+ */
+function mostSpecificUnits(keys: string[], rootOf: ReadonlyMap<string, string | null>): string[] {
+  const inside = (child: string, parent: string) =>
+    child !== parent && [parent, parent + "/", parent + "\\"].some((prefix) => prefix !== parent && child.startsWith(prefix));
+  return keys.filter((key) => {
+    const root = rootOf.get(key);
+    return !root || !keys.some((other) => {
+      const otherRoot = rootOf.get(other);
+      return Boolean(otherRoot) && inside(otherRoot!, root);
+    });
+  });
+}
+
+/** Wildcards, patterns and expressions are not paths even when they contain a slash. */
+const NOT_A_PATH = /[*?[\]{}|()<>$`'"=!\s]/;
+
+/** A relative argument is a path when it has a slash, or when it names something in the current directory. */
+function relativePathArgument(token: string, cwd: string | null): string | null {
+  if (!cwd || token.startsWith("-") || token.includes("://") || NOT_A_PATH.test(token)) return null;
+  const target = resolveAgainst(token, cwd);
+  if (!target) return null;
+  return token.includes("/") || existsSync(target) ? target : null;
 }
 
 function resolveAgainst(value: string, base: string | null): string | null {

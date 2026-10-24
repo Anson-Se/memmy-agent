@@ -607,6 +607,9 @@ const statements = [
     ON evolution_jobs (dedupe_key)
     WHERE dedupe_key IS NOT NULL
       AND job_type IN ('l3_world_model_update', 'project_environment_profile')`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_jobs_l3_unit_dedupe
+    ON evolution_jobs (dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND job_type = 'l3_unit_update'`,
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_jobs_scope_seq
     ON evolution_jobs (scope_key, scope_seq)
     WHERE scope_key IS NOT NULL`,

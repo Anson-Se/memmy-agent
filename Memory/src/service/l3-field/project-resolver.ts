@@ -52,8 +52,12 @@ export function resolveProject(input: ResolveProjectInput, ctx: ResolverContext)
 
   const startDir = existingDirectory(target);
   const selected = nearestUserProject(target, ctx.userProjects);
-  const gitRaw = startDir ? readGitIdentity(startDir) : null;
-  const git = gitRaw && isUsableRoot(gitRaw.repoRoot, home, ctx) ? gitRaw : null;
+  // A folder the user chose is a project wherever it is; otherwise tool install folders never are.
+  if (!selected && isToolLocation(target, home)) return null;
+  // A dependency that is its own git clone belongs to the project that contains it.
+  const gitStart = startDir ? outsidePackageDirectory(startDir) : null;
+  const gitRaw = gitStart ? readGitIdentity(gitStart) : null;
+  const git = gitRaw && isUsableRoot(gitRaw.repoRoot, home, ctx) && !isToolLocation(gitRaw.repoRoot, home) ? gitRaw : null;
 
   if (selected && isUsableRoot(selected.root, home, ctx)) {
     const gitIsNearer = git && git.repoRoot.length > selected.root.length;
@@ -81,7 +85,7 @@ export function resolveProject(input: ResolveProjectInput, ctx: ResolverContext)
 
   if (input.role === "session_dir") {
     const root = startDir ?? path.dirname(target);
-    if (!isUsableRoot(root, home, ctx)) return null;
+    if (!isUsableRoot(root, home, ctx) || hasPackageDirectory(root)) return null;
     return { identity: `dir:${root}`, checkoutRoot: root, source: "folder", displayName: path.basename(root) };
   }
   const sessionFolder = input.sessionProjectRoot ?? input.sessionCwd;
@@ -119,6 +123,40 @@ function isThrowawayLocation(target: string, home: string, ctx: ResolverContext)
     return true;
   }
   return false;
+}
+
+// Temp folders (/var/folders, /tmp) are handled as throwaway locations; /etc resolves to /private/etc on macOS.
+const SYSTEM_ROOTS = [
+  "/usr", "/bin", "/sbin", "/etc", "/private/etc", "/System", "/Library", "/Applications",
+  "/opt/homebrew", "/opt/local", "/nix"
+];
+const WINDOWS_TOOL_DIRS = /\\(program files( \(x86\))?|programdata|appdata)(\\|$)/i;
+const PACKAGE_DIRS = new Set(["node_modules", "site-packages", "dist-packages", "vendor", "bower_components"]);
+
+/**
+ * Where tools and the system live, not projects: system and package-manager folders, Windows
+ * program folders, ~/Library, and hidden folders right under home (~/.nvm, ~/.oh-my-zsh, ~/.pyenv, ...).
+ * Many of these are git clones, so the git check alone would turn them into projects.
+ */
+function isToolLocation(target: string, home: string): boolean {
+  if (WINDOWS_TOOL_DIRS.test(target)) return true;
+  if (isPathWithin(home, target)) {
+    const first = path.relative(home, target).split(path.sep)[0] ?? "";
+    return first.startsWith(".") || first === "Library";
+  }
+  return SYSTEM_ROOTS.some((root) => isPathWithin(root, target, path.posix));
+}
+
+/** A root inside a dependency folder is a downloaded package, not the user's project. */
+function hasPackageDirectory(root: string): boolean {
+  return root.split(/[\\/]/).some((part) => PACKAGE_DIRS.has(part));
+}
+
+/** The directory just above the first dependency folder on the path, or the path itself. */
+function outsidePackageDirectory(target: string): string {
+  const parts = target.split(path.sep);
+  const index = parts.findIndex((part) => PACKAGE_DIRS.has(part));
+  return index > 0 ? parts.slice(0, index).join(path.sep) || path.sep : target;
 }
 
 /** A project root may not be the home folder, a top-level container folder, a filesystem root or a throwaway location. */

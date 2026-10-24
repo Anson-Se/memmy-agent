@@ -23,7 +23,8 @@ function setup(enabled = true, l3MachineProbe: () => Promise<never> | Promise<un
     db,
     mode: "dev",
     config,
-    l3FieldEnvironment: () => ({ machineId: MACHINE_ID, homeDir: home, tempRoots: [] })
+    l3FieldEnvironment: () => ({ machineId: MACHINE_ID, homeDir: home, tempRoots: [] }),
+    l3MachineProbe: l3MachineProbe as never
   });
   const repos = new Repositories(db.db);
   return { db, service, repos, home, project };
@@ -51,6 +52,40 @@ function evidence() {
 }
 
 describe("new L3 session context", () => {
+  it("reads without writing while memory writes are off, showing only what already exists", () => {
+    const { db, service, repos, home, project } = setup();
+    const { opened, request } = open(service, "read-only", project);
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "pnpm -> 未安装", evidence: evidence(), evidenceAt: new Date().toISOString() });
+    repos.db.prepare(`DELETE FROM l3_units WHERE kind = 'project'`).run();
+    const config = structuredClone(DEFAULT_MEMMY_CONFIG);
+    config.algorithm.enableMemoryAdd = false;
+    const readOnly = fixture.createTestMemoryService({
+      db, mode: "dev", config,
+      l3FieldEnvironment: () => ({ machineId: MACHINE_ID, homeDir: home, tempRoots: [] }),
+      l3MachineProbe: () => new Promise(() => undefined)
+    });
+    const counts = () => repos.db.prepare(
+      `SELECT (SELECT COUNT(*) FROM l3_units) AS units, (SELECT COUNT(*) FROM memories) AS memories,
+              (SELECT COUNT(*) FROM evolution_jobs) AS jobs`
+    ).get();
+    const before = counts();
+    const context = readOnly.l3WorldModelContext(opened.sessionId, request);
+    expect(context.renderedContext).toContain("pnpm -> 未安装");
+    expect(counts()).toEqual(before);
+  });
+
+  it("does not store a machine probe that finishes after the service stopped", async () => {
+    let finish!: (probe: unknown) => void;
+    const { service, repos } = setup(true, () => new Promise((resolve) => { finish = resolve; }));
+    open(service, "stopping");
+    await service.stop();
+    finish({ os: "darwin", osVersion: "15", arch: "arm64", shell: "/bin/zsh", tools: {} });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const machine = repos.l3Field.getUnit(repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID }).unitKey)!;
+    expect(machine.profileFingerprint ?? null).toBeNull();
+  });
+
   it("is empty for a session without a folder until the machine knows something", () => {
     const { service, repos } = setup();
     const { opened, request } = open(service, "machine-only");
@@ -114,6 +149,96 @@ describe("new L3 session context", () => {
     const context = service.l3WorldModelContext(opened.sessionId, request);
     expect(context.renderedContext).toContain("本机用 bun");
     expect(context.memoryId).not.toBe(snapshot.id);
+  });
+
+  it("does not inject a unit whose snapshot the user archived, and keeps it archived when it is rewritten", () => {
+    const { service, repos } = setup();
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 pnpm 9", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    const snapshot = repos.l3Field.refreshSnapshot(machine.unitKey);
+    const { opened, request } = open(service, "archive");
+    service.archiveMemory(snapshot.id, { namespace: request.namespace, reason: "user" });
+    expect(service.l3WorldModelContext(opened.sessionId, request).renderedContext).toBe("");
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 bun", evidence: evidence(), evidenceAt: "2026-10-02T00:00:00.000Z" });
+    repos.l3Field.refreshSnapshot(machine.unitKey);
+    expect(repos.memories.get(snapshot.id)!.status).toBe("archived");
+    expect(service.l3WorldModelContext(opened.sessionId, request).renderedContext).toBe("");
+  });
+
+  it("moves a project's context version when the machine snapshot is archived, so clients drop the cached machine part", () => {
+    const { service, repos, project } = setup();
+    const { opened, request } = open(service, "archive-machine", project);
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 pnpm 9", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    service.l3WorldModelContext(opened.sessionId, request);
+    const unit = repos.db.prepare(`SELECT unit_key FROM l3_units WHERE kind = 'project'`).get() as { unit_key: string };
+    repos.l3Field.insertItem({ unitKey: unit.unit_key, kind: "project_constraint", content: "改完跑 npm test", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    const machineSnapshot = repos.l3Field.refreshSnapshot(machine.unitKey);
+    repos.l3Field.refreshSnapshot(unit.unit_key);
+    const before = service.l3WorldModelContext(opened.sessionId, request);
+    expect(before.renderedContext).toContain("本机用 pnpm 9");
+
+    service.archiveMemory(machineSnapshot.id, { namespace: request.namespace, reason: "user" });
+    const after = service.l3WorldModelContext(opened.sessionId, request);
+    expect(after.renderedContext).not.toContain("本机用 pnpm 9");
+    expect(after.renderedContext).toContain("改完跑 npm test");
+    expect(after.memoryVersion).not.toBe(before.memoryVersion);
+  });
+
+  it("deletes a snapshot and resets its unit together, or neither", () => {
+    const { service, repos } = setup();
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    const item = repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 pnpm 9", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    const snapshot = repos.l3Field.refreshSnapshot(machine.unitKey);
+    const { request } = open(service, "atomic-delete");
+    const internal = (service as unknown as { repos: Repositories }).repos;
+    const reset = vi.spyOn(internal.l3Field, "markUnitDeleted").mockImplementation(() => { throw new Error("disk full"); });
+    expect(() => service.deleteMemory(snapshot.id, { namespace: request.namespace, reason: "user" })).toThrow("disk full");
+    reset.mockRestore();
+    expect(repos.memories.get(snapshot.id)!.deletedAt).toBeFalsy();
+    expect(repos.l3Field.getItem(item.id)!.status).toBe("active");
+  });
+
+  it("drops a machine probe that was running when the user deleted the machine snapshot", async () => {
+    let finishProbe: (probe: unknown) => void = () => undefined;
+    const probe = () => new Promise((resolve) => { finishProbe = resolve; });
+    const { service, repos } = setup(true, probe);
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 pnpm 9", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    const snapshot = repos.l3Field.refreshSnapshot(machine.unitKey);
+    const { request } = open(service, "probe-race");
+    service.deleteMemory(snapshot.id, { namespace: request.namespace, reason: "user" });
+    finishProbe({ os: { name: "macOS", version: "26.0" }, arch: "arm64", shell: "zsh", tools: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(repos.l3Field.getUnit(machine.unitKey)!.profileText).toBeFalsy();
+    expect(repos.l3Field.getUnit(machine.unitKey)!.snapshotMemoryId).toBeUndefined();
+  });
+
+  it("moves the project version when the machine is reset, and keeps refreshing a project rebuilt after a reset", () => {
+    const { service, repos, project } = setup();
+    const { opened, request } = open(service, "versions", project);
+    const machine = repos.l3Field.ensureMachineUnit({ userId: "u1", machineId: MACHINE_ID });
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 pnpm 9", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    service.l3WorldModelContext(opened.sessionId, request);
+    const unitKey = (repos.db.prepare(`SELECT unit_key FROM l3_units WHERE kind = 'project'`).get() as { unit_key: string }).unit_key;
+    repos.l3Field.insertItem({ unitKey, kind: "project_constraint", content: "改完跑测试", evidence: evidence(), evidenceAt: "2026-10-01T00:00:00.000Z" });
+    repos.l3Field.refreshSnapshot(machine.unitKey);
+    const before = service.l3WorldModelContext(opened.sessionId, request);
+
+    repos.l3Field.markUnitDeleted(machine.unitKey);
+    const afterMachineReset = service.l3WorldModelContext(opened.sessionId, request);
+    expect(afterMachineReset.memoryVersion).not.toBe(before.memoryVersion);
+    expect(afterMachineReset.renderedContext).not.toContain("pnpm");
+
+    repos.l3Field.markUnitDeleted(unitKey);
+    repos.l3Field.insertItem({ unitKey, kind: "project_constraint", content: "新规则", evidence: evidence(), evidenceAt: "2026-10-02T00:00:00.000Z" });
+    repos.l3Field.refreshSnapshot(unitKey);
+    const rebuilt = service.l3WorldModelContext(opened.sessionId, request);
+    repos.l3Field.insertItem({ unitKey: machine.unitKey, kind: "env_fact", content: "本机用 bun", evidence: evidence(), evidenceAt: "2026-10-03T00:00:00.000Z" });
+    repos.l3Field.refreshSnapshot(machine.unitKey);
+    const afterMachineChange = service.l3WorldModelContext(opened.sessionId, request);
+    expect(afterMachineChange.memoryVersion).not.toBe(rebuilt.memoryVersion);
+    expect(afterMachineChange.renderedContext).toContain("本机用 bun");
   });
 
   it("on startup drops items inactive for over 15 days and never queues embeddings for snapshots", () => {

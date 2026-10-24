@@ -73,3 +73,19 @@ export interface L3UserProject {
   rootPath: string;
   name: string;
 }
+
+export interface L3UnitBatchRecord {
+  id: string;
+  machineUnitKey: string;
+  scopeSeq: number;
+  userId: string;
+  sessionId: string;
+  trigger: string;
+  startTraceSeq: number;
+  endTraceSeq: number;
+  l1MemoryIds: string[];
+  rawTurnIds: string[];
+  status: L3UnitBatchStatus;
+  createdAt: string;
+  updatedAt: string;
+}

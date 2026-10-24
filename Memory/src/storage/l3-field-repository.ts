@@ -4,6 +4,8 @@ import type {
   L3ItemEvidence,
   L3ItemKind,
   L3ItemRecord,
+  L3UnitBatchRecord,
+  L3UnitBatchStatus,
   L3UnitKind,
   L3UnitRecord,
   L3UserProject,
@@ -154,6 +156,22 @@ export class L3FieldRepository {
     ).all(unitKey) as SqlItemRow[]).map(itemFromSql);
   }
 
+  /**
+   * Items of these units that a delete or replace removed on evidence newer than `evidenceAt`,
+   * newest last. Empty when all of a batch's evidence is newer (the usual case); a batch rerun late,
+   * history scanned late, or a batch spanning a removal sees what was removed.
+   */
+  itemsRemovedAfter(unitKeys: readonly string[], evidenceAt: string, limit = 20): L3ItemRecord[] {
+    if (unitKeys.length === 0) return [];
+    return (this.db.prepare(
+      `SELECT * FROM l3_items
+       WHERE unit_key IN (${unitKeys.map(() => "?").join(", ")})
+         AND status = 'inactive' AND removed_evidence_at > ?
+       ORDER BY removed_evidence_at DESC, id DESC
+       LIMIT ?`
+    ).all(...unitKeys, evidenceAt, limit) as SqlItemRow[]).map(itemFromSql).reverse();
+  }
+
   getItem(id: string): L3ItemRecord | undefined {
     const row = this.db.prepare(`SELECT * FROM l3_items WHERE id = ?`).get(id) as SqlItemRow | undefined;
     return row ? itemFromSql(row) : undefined;
@@ -220,16 +238,29 @@ export class L3FieldRepository {
   refreshSnapshot(unitKey: string, at = nowIso()): MemoryRow {
     const unit = this.getUnit(unitKey);
     if (!unit) throw new Error(`L3 unit not found: ${unitKey}`);
+    const before = unit.snapshotMemoryId ? this.memories.get(unit.snapshotMemoryId) : undefined;
     const saved = this.writeSnapshot(unit, at);
-    if (unit.kind === "machine") {
-      const projects = (this.db.prepare(
-        `SELECT * FROM l3_units
-         WHERE user_id = ? AND machine_id = ? AND kind = 'project'
-           AND snapshot_memory_id IS NOT NULL AND deleted_at IS NULL`
-      ).all(unit.userId, unit.machineId) as SqlUnitRow[]).map(unitFromSql);
-      for (const project of projects) this.writeSnapshot(project, at);
-    }
+    const changed = saved.id !== before?.id || saved.version !== before?.version;
+    if (unit.kind === "machine" && changed) this.bumpProjectSnapshots(unit, at);
     return saved;
+  }
+
+  /** After a machine unit's snapshot changed outside a refresh (archived), its projects get new versions. */
+  refreshProjectContexts(unitKey: string, at = nowIso()): void {
+    const unit = this.getUnit(unitKey);
+    if (unit?.kind === "machine") this.bumpProjectSnapshots(unit, at);
+  }
+
+  /**
+   * Every project on the machine with a current snapshot gets a new version. A project reset
+   * earlier keeps its `deleted_at` (it guards old batches) but counts again once rebuilt.
+   */
+  private bumpProjectSnapshots(machine: L3UnitRecord, at: string): void {
+    const projects = (this.db.prepare(
+      `SELECT * FROM l3_units
+       WHERE user_id = ? AND machine_id = ? AND kind = 'project' AND snapshot_memory_id IS NOT NULL`
+    ).all(machine.userId, machine.machineId) as SqlUnitRow[]).map(unitFromSql);
+    for (const project of projects) this.writeSnapshot(project, at, true);
   }
 
   /**
@@ -250,6 +281,9 @@ export class L3FieldRepository {
          SET status = 'inactive', inactive_at = ?, updated_at = ?
          WHERE unit_key = ? AND status = 'active'`
       ).run(at, at, unitKey);
+      // Project context includes the machine, so its cached versions must move when the machine resets.
+      const unit = this.getUnit(unitKey);
+      if (unit?.kind === "machine") this.bumpProjectSnapshots(unit, at);
     })();
   }
 
@@ -286,6 +320,59 @@ export class L3FieldRepository {
     ).run(profile.text, profile.fingerprint, at, unitKey);
   }
 
+  /**
+   * Freezes one chunk of a session's input traces as a batch of the machine unit, claiming the
+   * unit's next sequence number. The caller queues the matching l3_unit_update job.
+   */
+  freezeUnitBatch(input: {
+    userId: string;
+    machineId: string;
+    sessionId: string;
+    trigger: string;
+    startTraceSeq: number;
+    endTraceSeq: number;
+    l1MemoryIds: readonly string[];
+    rawTurnIds: readonly string[];
+    at?: string;
+  }): L3UnitBatchRecord {
+    const at = input.at ?? nowIso();
+    const machine = this.ensureMachineUnit({ userId: input.userId, machineId: input.machineId, at });
+    const claimed = this.db.prepare(
+      `UPDATE l3_units SET next_seq = next_seq + 1, updated_at = ? WHERE unit_key = ?
+       RETURNING next_seq - 1 AS scope_seq`
+    ).get(at, machine.unitKey) as { scope_seq: number };
+    const id = newId("l3batch");
+    this.db.prepare(
+      `INSERT INTO l3_unit_batches (
+         id, machine_unit_key, scope_seq, user_id, session_id, trigger, start_trace_seq, end_trace_seq,
+         l1_memory_ids_json, raw_turn_ids_json, status, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`
+    ).run(
+      id,
+      machine.unitKey,
+      claimed.scope_seq,
+      input.userId,
+      input.sessionId,
+      input.trigger,
+      input.startTraceSeq,
+      input.endTraceSeq,
+      toJson([...input.l1MemoryIds]),
+      toJson([...input.rawTurnIds]),
+      at,
+      at
+    );
+    return this.getBatch(id)!;
+  }
+
+  getBatch(id: string): L3UnitBatchRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM l3_unit_batches WHERE id = ?`).get(id) as SqlBatchRow | undefined;
+    return row ? batchFromSql(row) : undefined;
+  }
+
+  setBatchStatus(id: string, status: L3UnitBatchStatus, at = nowIso()): void {
+    this.db.prepare(`UPDATE l3_unit_batches SET status = ?, updated_at = ? WHERE id = ?`).run(status, at, id);
+  }
+
   /** Throwaway task roots Memmy itself creates (they are never projects); stored with the project list. */
   getStandaloneRoots(userId: string): string[] {
     const row = this.db.prepare(`SELECT value_json FROM runtime_kv WHERE key = ?`)
@@ -301,7 +388,8 @@ export class L3FieldRepository {
     ).run(standaloneRootsKey(userId), toJson([...roots]), at);
   }
 
-  private writeSnapshot(unit: L3UnitRecord, at: string): MemoryRow {
+  /** `force` writes a new version even when nothing shown changed (a project carrying a machine change). */
+  private writeSnapshot(unit: L3UnitRecord, at: string, force = false): MemoryRow {
     const items = this.activeItems(unit.unitKey);
     const memoryValue = renderL3UnitSnapshot(unit, items);
     const existing = unit.snapshotMemoryId ? this.memories.get(unit.snapshotMemoryId) : undefined;
@@ -361,6 +449,13 @@ export class L3FieldRepository {
       updatedAt: at,
       deletedAt: null
     };
+    // Nothing shown changed (a confirm only moves times): keep the version, so clients do not refetch
+    // and the change log does not fill with empty updates.
+    if (
+      existing && !force && !existing.deletedAt && existing.status === status &&
+      existing.contentHash === memory.contentHash &&
+      toJson(existing.properties.internal_info) === toJson(memory.properties.internal_info)
+    ) return existing;
     const saved = existing ? this.memories.update(memory) : this.memories.insert(memory);
     if (!existing) {
       this.db.prepare(
@@ -391,6 +486,40 @@ export class L3FieldRepository {
 
 function standaloneRootsKey(userId: string): string {
   return `l3_field.standalone_roots:${userId}`;
+}
+
+interface SqlBatchRow {
+  id: string;
+  machine_unit_key: string;
+  scope_seq: number;
+  user_id: string;
+  session_id: string;
+  trigger: string;
+  start_trace_seq: number;
+  end_trace_seq: number;
+  l1_memory_ids_json: string;
+  raw_turn_ids_json: string;
+  status: L3UnitBatchStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+function batchFromSql(row: SqlBatchRow): L3UnitBatchRecord {
+  return {
+    id: row.id,
+    machineUnitKey: row.machine_unit_key,
+    scopeSeq: Number(row.scope_seq),
+    userId: row.user_id,
+    sessionId: row.session_id,
+    trigger: row.trigger,
+    startTraceSeq: Number(row.start_trace_seq),
+    endTraceSeq: Number(row.end_trace_seq),
+    l1MemoryIds: parseJson<string[]>(row.l1_memory_ids_json, []),
+    rawTurnIds: parseJson<string[]>(row.raw_turn_ids_json, []),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
 }
 
 function unitFromSql(row: SqlUnitRow): L3UnitRecord {

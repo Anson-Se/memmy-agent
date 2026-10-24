@@ -79,7 +79,7 @@ describe("L3 field cognition storage", () => {
       .toBe(project.unitKey);
   });
 
-  it("refreshes a unit snapshot and bumps project snapshots when the machine unit changes", () => {
+  it("refreshes a unit snapshot only when it changed, and bumps project snapshots when the machine unit changes", () => {
     const { repos } = openRepos();
     const machine = repos.l3Field.ensureMachineUnit({ userId: USER, machineId: MACHINE });
     const project = repos.l3Field.ensureProjectUnit({ userId: USER, machineId: MACHINE, project: PROJECT });
@@ -96,7 +96,13 @@ describe("L3 field cognition storage", () => {
     expect(first.memoryValue).toContain("报告以 GitHub 上的 main 为准");
     const again = repos.l3Field.refreshSnapshot(project.unitKey);
     expect(again.id).toBe(first.id);
-    expect(again.version).toBe(first.version + 1);
+    expect(again.version).toBe(first.version);
+    repos.l3Field.refreshSnapshot(machine.unitKey);
+    const machineVersion = repos.memories.get(repos.l3Field.getUnit(machine.unitKey)!.snapshotMemoryId!)!.version;
+    // A machine that did not change leaves the project snapshots alone.
+    repos.l3Field.refreshSnapshot(machine.unitKey);
+    expect(repos.memories.get(repos.l3Field.getUnit(machine.unitKey)!.snapshotMemoryId!)!.version).toBe(machineVersion);
+    expect(repos.memories.get(first.id)!.version).toBe(again.version + 1);
 
     repos.l3Field.insertItem({
       unitKey: machine.unitKey,
@@ -106,7 +112,7 @@ describe("L3 field cognition storage", () => {
       evidenceAt: "2026-10-21T00:00:00.000Z"
     });
     repos.l3Field.refreshSnapshot(machine.unitKey);
-    expect(repos.memories.get(first.id)!.version).toBe(again.version + 1);
+    expect(repos.memories.get(first.id)!.version).toBe(again.version + 2);
   });
 
   it("replaces items by marking the old one inactive and pointing at its successor", () => {

@@ -123,6 +123,29 @@ describe("resolveProject", () => {
     expect(resolveProject(asSession(dir("Memmy", "20261022-101010")), ctx)).toBeNull();
   });
 
+  it("does not treat tool installs as projects even when they are git clones", () => {
+    const nvm = dir(".nvm");
+    gitRepo(nvm, "https://github.com/nvm-sh/nvm.git");
+    const toolPath = (p: string) => ({ path: p, role: "tool_path" as const, sessionCwd: null, sessionProjectRoot: null });
+    expect(resolveProject(toolPath(join(nvm, "nvm.sh")), ctx)).toBeNull();
+    expect(resolveProject(asSession(nvm), ctx)).toBeNull();
+    expect(resolveProject(toolPath("/opt/homebrew/bin/git"), ctx)).toBeNull();
+    expect(resolveProject(toolPath("/usr/local/Homebrew/Library/Homebrew/brew.sh"), ctx)).toBeNull();
+    expect(resolveProject(toolPath("C:\\Program Files\\Git\\bin\\git.exe"), ctx)).toBeNull();
+
+    const app = dir("code", "app");
+    gitRepo(app, "git@github.com:me/app.git");
+    const pkg = dir("code", "app", "node_modules", "left-pad");
+    gitRepo(pkg, "https://github.com/x/left-pad.git");
+    expect(resolveProject(toolPath(join(pkg, "index.js")), ctx)).toMatchObject({ identity: "github.com/me/app" });
+  });
+
+  it("still takes a folder the user selected inside a hidden folder", () => {
+    const notes = dir(".config", "notes");
+    ctx.userProjects = [{ rootPath: notes, name: "notes" }];
+    expect(resolveProject(asSession(notes), ctx)).toMatchObject({ source: "user_selected", checkoutRoot: notes });
+  });
+
   it("does not treat the home directory, Desktop, Documents or Downloads themselves as projects", () => {
     for (const container of [home, dir("Desktop"), dir("Documents"), dir("Downloads")]) {
       expect(resolveProject(asSession(container), ctx)).toBeNull();
