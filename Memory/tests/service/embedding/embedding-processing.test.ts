@@ -16,7 +16,9 @@ import {
   updateMemoryVectorField
 } from "../../../src/service/embedding/embedding-pipeline.js";
 import { ModelHttpError } from "../../../src/model/http.js";
+import { createEmbedder } from "../../../src/model/embedder.js";
 import { Repositories } from "../../../src/storage/repositories.js";
+import { WorkerConcurrencyController } from "../../../src/service/worker/worker-concurrency.js";
 import {
   addAgentSourceImport,
   createBatchReflectionLlm,
@@ -32,9 +34,121 @@ const {
   createTestService
 } = createMemoryServiceFixture();
 
-afterEach(() => { cleanup(); vi.useRealTimers(); });
+afterEach(async () => {
+  await cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("MemoryService / embedding / processing", () => {
+  for (const queue of ["fresh", "retry"] as const) {
+    for (const format of ["code", "message"] as const) {
+      it.each([
+        ["OperationNotSupported", "The embeddings operation does not work with the specified model.", false],
+        ["insufficient_quota", "Insufficient balance.", false],
+        ["rate_limit_exceeded", "Rate limit exceeded.", true]
+      ] as const)(`${queue} queue does not fan out shared HTTP 400 %s (${format})`, async (code, message, transient) => {
+        const inputs: string[][] = [];
+        const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+          inputs.push((JSON.parse(String(init?.body)) as { input: string[] }).input);
+          return new Response(JSON.stringify({ error: {
+            code: format === "code" ? code : undefined,
+            message: format === "message" ? message : "Request rejected"
+          } }), { status: 400 });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        const { db, service } = createTestService({
+          // Four background members fit one request while the realtime slot remains reserved.
+          concurrency: new WorkerConcurrencyController({ maxActiveJobs: 5 }),
+          embedder: createHttpTestEmbedder(),
+          llm: createBatchReflectionLlm([], "Synthetic summary.")
+        });
+        const repos = new Repositories(db.db);
+        if (queue === "fresh") {
+          const session = service.openSession({ namespace: { source: "codex", profileId: "shared-error", userId: "test" } });
+          const ids = ["GOOD_A", "GOOD_B", "GOOD_C"].map((answer, i) => service.completeTurn(`turn-${i}`, {
+            sessionId: session.sessionId, query: "Remember this.", answer
+          }).l1MemoryId);
+          await prepareFreshEmbeddingBatch(service, ids);
+          expect(fetchMock).not.toHaveBeenCalled();
+          await service.runWorkerOnce(ids.length, { targetMemoryIds: ids });
+          for (const id of ids) expect(repos.processing.get(id)).toMatchObject({
+            state: transient ? "embedding_pending" : "failed",
+            errorCode: transient ? "transient_provider_error" : "model_configuration",
+            retryAction: transient ? "retry" : "open_settings"
+          });
+        } else {
+          const retries = ["GOOD_A", "GOOD_B", "GOOD_C"].map((content, i) => {
+            const memory = skillMemory(undefined, { id: `shared-${i}`, content });
+            repos.memories.insert(memory);
+            return repos.runtime.enqueueEmbeddingRetry({ targetKind: "skill", targetId: memory.id,
+              vectorField: "vec", sourceText: embeddingTextForMemory(memory), embedRole: "query", now: Date.now() - 1 });
+          });
+          await service.runWorkerOnce(10);
+          for (const retry of retries) {
+            const stored = repos.runtime.getEmbeddingRetry(retry.id)!;
+            expect(stored).toMatchObject({ status: transient ? "pending" : "failed", attempts: transient ? 1 : 0 });
+            if (transient) expect(stored.nextAttemptAt).toBeGreaterThan(Date.now());
+            else expect(stored.blockedReason).toBe("configuration");
+          }
+        }
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(inputs.map(input => input.length)).toEqual([3]);
+        expect(db.db.prepare("SELECT count(*) AS n FROM memory_vector_entries").get()).toEqual({ n: 0 });
+      });
+    }
+
+    it.each([
+      ["context_length_exceeded", "maximum context length exceeded"],
+      ["20015", "The parameter is invalid."]
+    ])(`${queue} queue preserves valid siblings through the HTTP adapter (%s)`, async (code, message) => {
+      const inputs: string[][] = [];
+      const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        const { input } = JSON.parse(String(init?.body)) as { input: string[] };
+        inputs.push(input);
+        const bad = input.some(text => text.includes("BAD_EMBEDDING_ITEM"));
+        return new Response(JSON.stringify(bad ? { code, message } : {
+          data: input.map(() => ({ embedding: [1, 0, 0] }))
+        }), { status: bad ? 400 : 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const { db, service } = createTestService({ embedder: createHttpTestEmbedder(),
+        concurrency: new WorkerConcurrencyController({ maxActiveJobs: 5 }),
+        llm: createBatchReflectionLlm([], "Synthetic summary.") });
+      const repos = new Repositories(db.db);
+      const texts = ["GOOD_A", "GOOD_B", "GOOD_C", "BAD_EMBEDDING_ITEM"];
+      if (queue === "fresh") {
+        const session = service.openSession({ namespace: { source: "codex", profileId: "isolation", userId: "test" } });
+        const ids = texts.map((answer, i) => service.completeTurn(`turn-${i}`, {
+          sessionId: session.sessionId, query: "Remember this.", answer
+        }).l1MemoryId);
+        await prepareFreshEmbeddingBatch(service, ids);
+        expect(fetchMock).not.toHaveBeenCalled();
+        await service.runWorkerOnce(ids.length, { targetMemoryIds: ids });
+        expect(ids.map(id => repos.processing.get(id)?.state)).toEqual([
+          "ready", "ready", "ready", code === "context_length_exceeded" ? "ready_text_only" : "failed"
+        ]);
+      } else {
+        const retries = texts.map((content, i) => {
+          const memory = skillMemory(undefined, { id: `isolated-${i}`, content });
+          repos.memories.insert(memory);
+          return repos.runtime.enqueueEmbeddingRetry({ targetKind: "skill", targetId: memory.id,
+            vectorField: "vec", sourceText: embeddingTextForMemory(memory), embedRole: "query", now: Date.now() - 1 });
+        });
+        await service.runWorkerOnce(10);
+        expect(retries.map(retry => repos.runtime.getEmbeddingRetry(retry.id)?.status)).toEqual([
+          "succeeded", "succeeded", "succeeded", "failed"
+        ]);
+      }
+      expect(db.db.prepare("SELECT count(*) AS n FROM memory_vector_entries").get()).toEqual({ n: 3 });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      expect(inputs.map(input => input.length)).toEqual([4, 1, 1, 1, 1]);
+      for (const marker of texts) expect(inputs[0]!.filter(text => text.includes(marker))).toHaveLength(1);
+      await service.runWorkerOnce(20, { priorityCohortOnly: true });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    });
+  }
+
   it("embeds Skill retrieval metadata instead of the full SKILL.md when short metadata exists", () => {
     const text = embeddingTextForMemory(skillMemory({
       retrievalBlurb: "Use for safe SQLite schema migrations.",
@@ -212,12 +326,17 @@ describe("MemoryService / embedding / processing", () => {
     db.close();
   });
 
-  it("isolates a deterministic embedding failure and keeps the valid sibling", async () => {
+  it.each([
+    [400, "context_length_exceeded", "maximum context length exceeded"],
+    [400, "20015", "The parameter is invalid."],
+    [413, "payload_too_large", "Request too large"],
+    [422, "invalid_input", "Invalid input"]
+  ])("isolates a deterministic embedding failure and keeps the valid sibling (%s / %s)", async (status, code, message) => {
     const llmCalls: Array<{
       messages: Array<{ role: string; content: string }>;
       options: { operation: string };
     }> = [];
-    const embedder = createSelectiveFailureEmbedder();
+    const embedder = createSelectiveFailureEmbedder(undefined, new ModelHttpError(message, "openai_compatible", status as number, code as string, message as string));
     const { db, service } = createTestService({
       llm: createBatchReflectionLlm(llmCalls, "Imported memory summary."),
       embedder
@@ -247,10 +366,10 @@ describe("MemoryService / embedding / processing", () => {
     ]));
     expect(repositories.processing.get(good.l1MemoryId)?.state).toBe("ready");
     expect(repositories.processing.get(bad.l1MemoryId)).toMatchObject({
-      state: "ready_text_only",
-      stage: null,
+      state: code === "context_length_exceeded" ? "ready_text_only" : "failed",
+      stage: code === "context_length_exceeded" ? null : "embedding",
       retryAction: "none",
-      errorCode: "model_input_too_long"
+      errorCode: code === "context_length_exceeded" ? "model_input_too_long" : "invalid_model_request"
     });
     db.close();
   });
@@ -349,8 +468,13 @@ describe("MemoryService / embedding / processing", () => {
     db.close();
   });
 
-  it("isolates a deterministic legacy retry failure and keeps the valid sibling", async () => {
-    const { db, service } = createTestService({ embedder: createSelectiveFailureEmbedder() });
+  it.each([
+    [400, "context_length_exceeded", "maximum context length exceeded"],
+    [400, "20015", "The parameter is invalid."],
+    [413, "payload_too_large", "Request too large"],
+    [422, "invalid_input", "Invalid input"]
+  ])("isolates a deterministic legacy retry failure and keeps the valid sibling (%s / %s)", async (status, code, message) => {
+    const { db, service } = createTestService({ embedder: createSelectiveFailureEmbedder(undefined, new ModelHttpError(message, "openai_compatible", status as number, code as string, message as string)) });
     const repositories = new Repositories(db.db);
     const good = skillMemory(undefined, {
       id: "skill_legacy_retry_good",
@@ -388,6 +512,22 @@ describe("MemoryService / embedding / processing", () => {
     expect(repositories.runtime.getEmbeddingRetry(goodRetry.id)?.status).toBe("succeeded");
     expect(repositories.runtime.getEmbeddingRetry(badRetry.id)?.status).toBe("failed");
     expect(retrievalDocumentIsCurrent(repositories.memories.get(good.id)!)).toBe(true);
+    db.close();
+  });
+
+  it.each([401, 403, 429, 500])("does not fan out a shared HTTP %s failure", async (status) => {
+    const calls = { batch: 0, single: 0 };
+    const failure = new ModelHttpError("Provider unavailable", "openai_compatible", status, undefined, "Provider unavailable");
+    const { db, service } = createTestService({ embedder: createSelectiveFailureEmbedder(calls, failure) });
+    const repositories = new Repositories(db.db);
+    for (let index = 0; index < 2; index += 1) {
+      const memory = skillMemory(undefined, { id: `shared-failure-${index}`, content: "VALID_EMBEDDING_ITEM" });
+      repositories.memories.insert(memory);
+      repositories.runtime.enqueueEmbeddingRetry({ targetKind: "skill", targetId: memory.id, vectorField: "vec",
+        sourceText: embeddingTextForMemory(memory), embedRole: "query", now: Date.now() - 1 });
+    }
+    await service.runWorkerOnce(10);
+    expect(calls).toEqual({ batch: 1, single: 0 });
     db.close();
   });
 
@@ -734,6 +874,24 @@ function worldModelMemory(): MemoryRow {
   };
 }
 
+/** Prepare all compatible embedding jobs before draining, without relying on old priority cohorts. */
+async function prepareFreshEmbeddingBatch(
+  service: ReturnType<typeof createTestService>["service"], ids: readonly string[]
+): Promise<void> {
+  for (const id of ids) {
+    const run = await service.runWorkerOnce(1, { targetMemoryIds: [id] });
+    expect(run.jobs).toEqual([expect.objectContaining({
+      jobType: "trace_summary", targetMemoryId: id, status: "succeeded"
+    })]);
+  }
+}
+
+function createHttpTestEmbedder(): Embedder {
+  return createEmbedder({ ...DEFAULT_MEMMY_CONFIG.embedding, provider: "openai_compatible",
+    model: "custom-alias", endpoint: "https://embedding.test/v1", cache: false, maxRetries: 0 },
+    { usageRecorder: { record() { return "skipped"; } } });
+}
+
 function createFlakyEmbedder(): Embedder {
   let batchCalls = 0;
   return {
@@ -766,8 +924,8 @@ function createFlakyEmbedder(): Embedder {
   };
 }
 
-function createSelectiveFailureEmbedder(calls?: { batch: number; single: number }): Embedder {
-  const inputTooLong = () => new ModelHttpError(
+function createSelectiveFailureEmbedder(calls?: { batch: number; single: number }, failure?: ModelHttpError): Embedder {
+  const inputTooLong = () => failure ?? new ModelHttpError(
     "openai_compatible HTTP 400: maximum context length exceeded",
     "openai_compatible",
     400,

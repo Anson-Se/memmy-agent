@@ -111,7 +111,7 @@ export function providerDescriptor(config: {
 }, limits: Pick<WorkerConcurrencyLimits, "localModelConcurrency" | "cloudModelConcurrency"> = defaults): WorkerProviderDescriptor {
   const source = (config.sourceProvider || config.provider || "unknown").trim().toLowerCase();
   const defaultEndpoints: Readonly<Record<string, string>> = {
-    openai_compatible: "https://api.openai.com/v1", gemini: "https://generativelanguage.googleapis.com/v1beta",
+    openai_compatible: "https://api.openai.com/v1", openai_responses: "https://api.openai.com/v1", gemini: "https://generativelanguage.googleapis.com/v1beta",
     anthropic: "https://api.anthropic.com/v1/messages", cohere: "https://api.cohere.com/v2/embed",
     voyage: "https://api.voyageai.com/v1/embeddings", mistral: "https://api.mistral.ai/v1/embeddings"
   };
@@ -128,6 +128,7 @@ export function providerDescriptor(config: {
       if (hostname === "localhost" || hostname === "[::1]" || /^127\./.test(hostname)) url.hostname = "localhost";
       url.username = ""; url.password = ""; url.search = ""; url.hash = "";
       if (config.provider === "openai_compatible") url.pathname = url.pathname.replace(/\/(?:chat\/completions|embeddings)\/?$/, "");
+      if (config.provider === "openai_responses") url.pathname = url.pathname.replace(/\/responses\/?$/, "");
       // Native Mistral embeddings share the API service with compatible chat.
       // Keep the host and preceding base path so independent proxies stay separate.
       if (config.provider === "mistral") url.pathname = url.pathname.replace(/\/embeddings\/?$/, "");

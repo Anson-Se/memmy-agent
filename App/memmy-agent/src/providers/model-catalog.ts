@@ -169,6 +169,7 @@ export function persistedModelSelection(
     ownerAccountId: selection.ownerAccountId ?? null,
     capability: selection.capability,
     capabilities: Object.freeze([...selection.capabilities]),
+    ...(selection.inputModalities ? { inputModalities: Object.freeze([...selection.inputModalities]) } : {}),
   });
 }
 
@@ -249,6 +250,7 @@ function runtimeCatalog(config: Config): RuntimeModelCatalog {
             apiKey: endpoint.apiKey,
             extraHeaders: endpoint.extraHeaders,
             extraBody: endpoint.extraBody,
+            region: endpoint.region,
           }),
         ])),
       })];
@@ -262,6 +264,7 @@ function runtimeCatalog(config: Config): RuntimeModelCatalog {
         source: preset.source,
         ownerAccountId: preset.ownerAccountId,
         capabilities: [...preset.capabilities],
+        inputModalities: preset.inputModalities ?? undefined,
       }),
     ])),
     modelAssignments: {

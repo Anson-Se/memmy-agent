@@ -5,7 +5,7 @@ import { captureMemmyScreen, computerUseApp, memmyPermissionSnapshot, resolveCom
 import { desktopSaveFileName } from './save-file-name.js';
 import { createComputerUseOnboarding } from './computer-use-onboarding.js';
 import { createComputerUsePIPScreenPermissionGuide } from './computer-use-pip-screen-permission.js';
-import { stopComputerUseAgentForPermissionRestart } from './computer-use-agent-restart.js';
+import { stopComputerUseAgentForPermissionRestart, stopComputerUseAgentsOnExitSync } from './computer-use-agent-restart.js';
 import { createComputerUseSurfaceWindows } from './computer-use-surface-window.js';
 import { captureComputerUseWindow } from './computer-use-window-capture.js';
 import { createBrowserSidebarBridge } from './browser-sidebar-bridge.js';
@@ -1652,7 +1652,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle("memmy:restart-for-computer-history-permissions", async () => {
     if (process.platform !== "darwin") throw new Error("Computer History permissions require macOS");
     await stopComputerUseAgentForPermissionRestart(app.isPackaged, process.resourcesPath,
-      process.env.MEMMY_DEV_COMPUTER_USE_BINARY);
+      process.env.MEMMY_DEV_COMPUTER_USE_BINARY).catch(error => {
+        // The normal quit path retries native cleanup and has a synchronous exit fallback.
+        console.warn("Failed to stop the native Computer Use agent before permission restart:", error);
+      });
     shouldRelaunchAfterQuitCleanup = true;
     // Let IPC finish, then reuse the normal recording/service shutdown path.
     setImmediate(() => app.quit());
@@ -6004,6 +6007,10 @@ app.on("before-quit", (event) => {
       clearQuitCleanupForceExitTimer();
       isQuitCleanupComplete = true;
       isQuitCleanupInProgress = false;
+      if (process.platform === 'darwin') {
+        stopComputerUseAgentsOnExitSync(app.isPackaged, process.resourcesPath,
+          process.env.MEMMY_DEV_COMPUTER_USE_BINARY);
+      }
       relaunchAfterQuitCleanupIfRequested();
       app.quit();
     });
@@ -6033,10 +6040,20 @@ function relaunchAfterQuitCleanupIfRequested(): void {
 
 function armQuitCleanupForceExitTimer(): void {
   clearQuitCleanupForceExitTimer();
+  // cleanupBeforeQuit clears the global while its asynchronous service close is pending.
+  const services = runtimeServices;
   quitCleanupForceExitTimer = setTimeout(() => {
     console.warn("quit cleanup timed out; forcing app exit");
     // Apply the same service-lifecycle choice when graceful cleanup times out.
-    runtimeServices?.terminateSync({ stopMemory: stopMemoryServiceForCurrentQuit });
+    try {
+      services?.terminateSync({ stopMemory: stopMemoryServiceForCurrentQuit });
+    } catch (error) {
+      console.warn("Failed to terminate runtime services during forced quit:", error);
+    }
+    if (process.platform === 'darwin') {
+      stopComputerUseAgentsOnExitSync(app.isPackaged, process.resourcesPath,
+        process.env.MEMMY_DEV_COMPUTER_USE_BINARY);
+    }
     relaunchAfterQuitCleanupIfRequested();
     app.exit(0);
   }, APP_QUIT_CLEANUP_FORCE_EXIT_DELAY_MS);
@@ -6159,17 +6176,21 @@ async function cleanupBeforeQuit(): Promise<void> {
   browserWebviewDownloads = null;
   disposeBrowserWebviewPermissions?.();
   disposeBrowserWebviewPermissions = null;
-  await traceQuitCleanup("runtime-services", async () => {
-    await services?.close({ stopMemory: stopMemoryServiceForCurrentQuit });
-  });
-  // History permission checks run through the separate signed native app
-  // agent. It can outlive Electron when macOS performs “Quit & Reopen”, and
-  // then keeps the old TCC preflight result on the next launch. Stop any
-  // leftover agent so the next process observes the current grant.
-  await traceQuitCleanup("native-history-agent", () => stopComputerUseAgentForPermissionRestart(app.isPackaged, process.resourcesPath,
-    process.env.MEMMY_DEV_COMPUTER_USE_BINARY)).catch(error => {
-      console.warn("Failed to stop the native Computer Use agent during quit cleanup:", error);
+  // Native app agents belong to LaunchServices, outside the gateway process tree.
+  // Start their bounded shutdown before awaiting services, which may fail or hit the quit deadline.
+  const nativeAgentShutdown = process.platform === 'darwin'
+    ? traceQuitCleanup("native-history-agent", () => stopComputerUseAgentForPermissionRestart(app.isPackaged, process.resourcesPath,
+      process.env.MEMMY_DEV_COMPUTER_USE_BINARY)).catch(error => {
+        console.warn("Failed to stop the native Computer Use agent during quit cleanup:", error);
+      })
+    : Promise.resolve();
+  try {
+    await traceQuitCleanup("runtime-services", async () => {
+      await services?.close({ stopMemory: stopMemoryServiceForCurrentQuit });
     });
+  } finally {
+    await nativeAgentShutdown;
+  }
   browserSidebarBridge?.dispose();
   browserSidebarBridge = null;
   embeddedBrowserDriver.dispose();

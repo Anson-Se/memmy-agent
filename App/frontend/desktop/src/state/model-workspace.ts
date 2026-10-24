@@ -1,6 +1,7 @@
 /** Pure view-model helpers for the canonical model catalog returned by the local API. */
 import {
   BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID,
+  getModelThinkingConfig,
   type CatalogEndpointInput,
   type CatalogProviderId,
   type ModelAssignment,
@@ -8,6 +9,9 @@ import {
   type ModelConfigInput,
   type ModelConfigView,
   type ModelEndpointProtocol,
+  type ModelInputModality,
+  type ModelThinkingConfig,
+  type ModelThinkingConfigDto,
   type TextModelItemView
 } from "@memmy/local-api-contracts";
 import { CLIENT_PRESET_ID_PREFIX, type ModelProviderConfig } from "../api/config-client.js";
@@ -31,6 +35,7 @@ export interface ModelConnection {
   endpointId: string;
   endpoint: string;
   protocol: ModelEndpointProtocol;
+  region: string;
   apiKeyMasked: string;
   inheritProviderDefaults?: boolean;
   models: string[];
@@ -46,6 +51,9 @@ export interface ModelConnectionModel {
   model: string;
   capability: ModelCapability;
   capabilities: CatalogCapability[];
+  thinking?: ModelThinkingConfigDto;
+  custom?: boolean;
+  inputModalities?: ModelInputModality[];
 }
 
 export interface ModelWorkspaceSpace {
@@ -80,6 +88,7 @@ export interface ModelConnectionInput {
   endpoint: string;
   protocol?: ModelEndpointProtocol;
   inheritProviderDefaults?: boolean;
+  region?: string;
   apiKey?: string;
   apiKeyMasked?: string;
   models: string[];
@@ -88,6 +97,9 @@ export interface ModelConnectionInput {
     model: string;
     capability: ModelCapability;
     capabilities?: ModelCapability[];
+    thinking?: ModelThinkingConfigDto | null;
+    custom?: boolean;
+    inputModalities?: ModelInputModality[];
   }>;
   modelCapabilities?: Record<string, ModelCapability>;
 }
@@ -186,7 +198,10 @@ export function modelConfigInputFromView(view: ModelConfigView): ModelConfigInpu
         model: model.model,
         source: model.source,
         ...(model.ownerAccountId ? { ownerAccountId: model.ownerAccountId } : {}),
-        capabilities: [...model.capabilities]
+        capabilities: [...model.capabilities],
+        ...(model.thinking ? { thinking: model.thinking } : {}),
+        ...(model.custom ? { custom: true } : {}),
+        ...(model.inputModalities ? { inputModalities: [...model.inputModalities] } : {})
       }))
     })),
     modelAssignments: cloneAssignments(view.modelAssignments)
@@ -384,12 +399,23 @@ export function upsertModelConnection(
 ): ModelWorkspaceMutationResult {
   const providerId = normalizeProvider(input.provider);
   const endpoint = input.endpoint.trim().replace(/\/+$/, "");
-  const entries: Array<{ presetId?: string; model: string; capabilities: ModelCapability[]; capabilitiesExplicit: boolean }> = input.modelEntries?.length
+  const entries: Array<{
+    presetId?: string;
+    model: string;
+    capabilities: ModelCapability[];
+    capabilitiesExplicit: boolean;
+    thinking?: ModelThinkingConfigDto | null;
+    custom?: boolean;
+    inputModalities?: ModelInputModality[];
+  }> = input.modelEntries?.length
     ? input.modelEntries.map((entry) => ({
         ...(entry.presetId ? { presetId: entry.presetId } : {}),
         model: entry.model.trim(),
         capabilities: unique(entry.capabilities?.length ? entry.capabilities : [entry.capability]),
         capabilitiesExplicit: Boolean(entry.capabilities?.length),
+        ...(entry.thinking !== undefined ? { thinking: entry.thinking } : {}),
+        ...(entry.custom ? { custom: true } : {}),
+        ...(entry.inputModalities ? { inputModalities: entry.inputModalities } : {})
       })).filter((entry) => Boolean(entry.model))
     : input.models.map((model) => ({
         model: model.trim(),
@@ -461,7 +487,8 @@ export function upsertModelConnection(
     ...(inheritProviderDefaults !== undefined ? { inheritProviderDefaults } : {}),
     hasApiKey: Boolean(input.apiKey || input.apiKeyMasked),
     apiKeyMasked: input.apiKey ? maskApiKey(input.apiKey) : input.apiKeyMasked ?? "",
-    apiKey: input.apiKey ?? ""
+    apiKey: input.apiKey ?? "",
+    ...(input.region ? { region: input.region } : {})
   });
   provider.models.push(...entries.map((entry, index) => {
     const model = entry.model;
@@ -484,7 +511,10 @@ export function upsertModelConnection(
       model,
       source: "byok" as const,
       capabilities,
-      available: true
+      available: true,
+      ...(entry.thinking ? { thinking: entry.thinking } : {}),
+      ...(entry.custom ? { custom: true } : {}),
+      ...(entry.inputModalities ? { inputModalities: [...entry.inputModalities] } : {})
     };
   }));
 
@@ -666,6 +696,7 @@ function createSpace(catalog: ModelConfigView, mode: ModelWorkspaceMode): ModelW
       endpointId: endpoint.endpointId,
       endpoint: endpoint.apiBase,
       protocol: endpoint.protocol,
+      region: endpoint.region ?? "",
       apiKeyMasked: endpoint.apiKeyMasked || (endpoint.inheritProviderDefaults === false ? "" : provider.apiKeyMasked),
       ...(endpoint.inheritProviderDefaults !== undefined ? { inheritProviderDefaults: endpoint.inheritProviderDefaults } : {}),
       models: models.map((model) => model.model),
@@ -673,7 +704,10 @@ function createSpace(catalog: ModelConfigView, mode: ModelWorkspaceMode): ModelW
         presetId: model.presetId,
         model: model.model,
         capability: fromCapabilities(model.capabilities),
-        capabilities: [...model.capabilities]
+        capabilities: [...model.capabilities],
+        ...(model.thinking ? { thinking: model.thinking } : {}),
+        ...(model.custom ? { custom: true } : {}),
+        ...(model.inputModalities ? { inputModalities: [...model.inputModalities] } : {})
       })),
       modelCapabilities: Object.fromEntries(models.map((model) => [model.model, fromCapabilities(model.capabilities)])),
       presetIds: Object.fromEntries(models.map((model) => [model.model, model.presetId])),
@@ -718,7 +752,8 @@ function endpointInput(endpoint: ModelConfigView["providers"][number]["endpoints
     apiBase: endpoint.apiBase,
     protocol: endpoint.protocol,
     ...(endpoint.inheritProviderDefaults !== undefined ? { inheritProviderDefaults: endpoint.inheritProviderDefaults } : {}),
-    ...(endpoint.apiKey ? { apiKey: endpoint.apiKey } : {})
+    ...(endpoint.apiKey ? { apiKey: endpoint.apiKey } : {}),
+    ...(endpoint.region ? { region: endpoint.region } : {})
   };
 }
 
@@ -751,9 +786,16 @@ function cloneAssignment<T extends Omit<ModelAssignment, "ownerAccountId"> | Mod
 
 function normalizeProvider(provider: string): CatalogProviderId | null {
   const normalized = provider.trim().toLowerCase();
-  const aliases: Record<string, CatalogProviderId> = { qwen: "dashscope", kimi: "moonshot", baidu: "qianfan", doubao: "volcengine", xiaomi: "xiaomi_mimo" };
+  const aliases: Record<string, CatalogProviderId> = {
+    qwen: "dashscope",
+    kimi: "moonshot",
+    baidu: "qianfan",
+    doubao: "volcengine",
+    xiaomi: "xiaomi_mimo",
+    openai_responses: "openai"
+  };
   const candidate = aliases[normalized] ?? normalized;
-  return ["openai", "anthropic", "gemini", "deepseek", "zhipu", "dashscope", "moonshot", "minimax", "qianfan", "volcengine", "stepfun", "xiaomi_mimo", "memmy_account"].includes(candidate)
+  return ["openai", "anthropic", "gemini", "deepseek", "zhipu", "dashscope", "moonshot", "minimax", "qianfan", "volcengine", "stepfun", "xiaomi_mimo", "memmy_account", "bedrock", "custom"].includes(candidate)
     ? candidate as CatalogProviderId
     : null;
 }
@@ -765,6 +807,7 @@ function protocolFor(provider: CatalogProviderId, capability: ModelCapability): 
   if (provider === "anthropic") return "anthropic-messages";
   if (provider === "gemini") return "gemini-generate-content";
   if (provider === "memmy_account") return "memmy-account";
+  if (provider === "bedrock") return "bedrock-converse";
   return "openai-chat-completions";
 }
 
@@ -915,4 +958,64 @@ function endpointAuthMatches(
 function newClientPresetId(): string {
   const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${CLIENT_PRESET_ID_PREFIX}${suffix}`;
+}
+
+function modelEntryFor(
+  workspace: ModelWorkspace,
+  candidate: ModelCandidate | null | undefined
+) {
+  if (!candidate || candidate.source !== "byok") return undefined;
+  const connection = workspace.spaces.byok.connections
+    .find((item) => item.id === candidate.connectionId);
+  return connection?.modelEntries.find((item) => item.model === candidate.model);
+}
+
+export function isCustomModelEntry(
+  workspace: ModelWorkspace,
+  candidate: ModelCandidate | null | undefined
+): boolean {
+  return modelEntryFor(workspace, candidate)?.custom === true;
+}
+
+export function customThinkingConfigFor(
+  workspace: ModelWorkspace,
+  candidate: ModelCandidate | null | undefined
+): ModelThinkingConfig | null {
+  return modelEntryFor(workspace, candidate)?.thinking ?? null;
+}
+
+const CHAT_COMPLETIONS_O_SERIES_MARKERS = ["o1", "o3", "o4"] as const;
+
+function endpointProtocolFor(
+  workspace: ModelWorkspace,
+  candidate: ModelCandidate
+): ModelEndpointProtocol | undefined {
+  for (const space of Object.values(workspace.spaces)) {
+    const connection = space.connections.find((item) => item.id === candidate.connectionId);
+    if (connection) return connection.protocol;
+  }
+  return undefined;
+}
+
+function chatCompletionsHidesCatalogThinking(modelName: string): boolean {
+  const name = modelName.toLowerCase();
+  return name.includes("gpt-")
+    || CHAT_COMPLETIONS_O_SERIES_MARKERS.some((marker) => name.includes(marker));
+}
+
+export function resolveThinkingConfigForModel(
+  workspace: ModelWorkspace,
+  candidate: ModelCandidate | null | undefined
+): ModelThinkingConfig | null {
+  if (isCustomModelEntry(workspace, candidate)) {
+    return customThinkingConfigFor(workspace, candidate);
+  }
+  if (
+    candidate
+    && endpointProtocolFor(workspace, candidate) === "openai-chat-completions"
+    && chatCompletionsHidesCatalogThinking(candidate.model)
+  ) {
+    return null;
+  }
+  return getModelThinkingConfig(candidate?.model);
 }
