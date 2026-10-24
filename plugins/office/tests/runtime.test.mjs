@@ -133,6 +133,34 @@ test("execution copies inherit calculation state only from byte-identical clean 
   assert.deepEqual(changedState.dirtyFormulaFiles,["budget.xlsx"]);
 });
 
+test("normalization cannot report successful recalculation when the renderer only copies stale caches", { skip: process.platform === "win32" }, async t => {
+  const { data, root } = await environment(t);
+  const created = (await call(data,"office_execute", {code:`
+    const book = new ExcelJS.Workbook(); const sheet = book.addWorksheet("Budget");
+    sheet.addRows([[20, {formula:"A1+30",result:0}], ["KEEP"]]);
+    await fs.writeFile(path.join(workspace,"stale.xlsx"),await book.xlsx.writeBuffer());
+    return {files:["stale.xlsx"]};
+  `})).output;
+  const source = join(data,"tasks",created.taskId,"stale.xlsx");
+  const original = await readFile(source);
+  const tools = join(root,"LibreOffice.app/Contents");
+  await mkdir(join(tools,"MacOS"),{recursive:true});
+  await mkdir(join(tools,"Resources/services"),{recursive:true});
+  await writeFile(join(tools,"Resources/services/services.rdb"),'<components xmlns="http://openoffice.org/2010/uno-components"/>');
+  const executable = join(tools,"MacOS/soffice");
+  const captured = join(root,"captured.xlsx");
+  await writeFile(executable,`#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path');const src=process.argv.at(-1);fs.copyFileSync(src,${JSON.stringify(captured)});fs.copyFileSync(src,path.join(process.argv[process.argv.indexOf('--outdir')+1],path.basename(src)));`,{mode:0o755});
+  const result = await call(data,"office_convert",{taskId:created.taskId,file:"stale.xlsx",format:"xlsx",allowLossy:true},{MEMMY_OFFICE_TOOLS:JSON.stringify({soffice:executable})});
+  assert.equal(result.code,"recalculation_failed",JSON.stringify(result));
+  assert.deepEqual(await readFile(source),original);
+  const zip = await JSZip.loadAsync(await readFile(captured));
+  const sheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
+  assert.match(sheet,/<f>A1\+30<\/f>/);
+  assert.doesNotMatch(sheet.match(/<c[^>]*r="B1"[^>]*>([\s\S]*?)<\/c>/)[1],/<v\b/);
+  assert.match(await zip.file("xl/sharedStrings.xml").async("string"),/KEEP/);
+  assert.match(await zip.file("xl/workbook.xml").async("string"),/fullCalcOnLoad="1"/);
+});
+
 test("CSV policy rejects malformed data and preserves quoted/newline/text fields", async t => {
   const policy = { encoding: "UTF-8", bom: "absent", delimiter: ",", quote: '"', newline: "lf", malformedRows: "reject" };
   assert.deepEqual(parseDelimited(Buffer.from('Name,Value\n"line\nbreak","a""b"\n'), policy), [["Name", "Value"], ["line\nbreak", 'a"b']]);

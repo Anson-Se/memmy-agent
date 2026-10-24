@@ -151,10 +151,24 @@ describe("Office MPP end to end", () => {
       }
       if (format === "xlsx") {
         document = await call("office_edit", { taskId: document.taskId, file: document.file, name: "calculation.xlsx", cells: [{ sheet: "Budget", address: "B4", formula: "SUM(B2:B3)" }] });
+        const stale = await call("office_execute", { sourceTaskId: document.taskId, inputFiles: [document.file], code: `
+          const book = new ExcelJS.Workbook(); await book.xlsx.readFile(path.join(workspace, ${JSON.stringify(document.file)}));
+          book.getWorksheet("Budget").getCell("B4").value = {formula:"SUM(B2:B3)",result:0};
+          const checks = book.addWorksheet("Checks");
+          checks.addRows([[{formula:"Budget!B4*2",result:999}], [{formula:'IF(A1=100,"OK","BAD")',result:"STALE"}], [{formula:"A1=100",result:false}], ["KEEP"]]);
+          await fs.writeFile(path.join(workspace,"stale-cache.xlsx"),await book.xlsx.writeBuffer());
+          return {files:["stale-cache.xlsx"]};
+        ` });
+        document = { taskId: stale.taskId, file: stale.files[0] };
+        const stalePath = join(dataRoot, "office/tasks", document.taskId, document.file);
+        const staleBytes = readFileSync(stalePath);
+        expect((await call("office_inspect", document)).formulas.map((f: { cachedValue: string }) => f.cachedValue)).toEqual(["0", "999", "STALE", "0"]);
         await call("office_convert", { taskId: document.taskId, file: document.file, format: "xlsx" }, "preservation_consent_required");
         document = await call("office_convert", { taskId: document.taskId, file: document.file, format: "xlsx", allowLossy: true });
+        expect(readFileSync(stalePath)).toEqual(staleBytes);
         const calculated = await call("office_inspect", { taskId: document.taskId, file: document.file });
-        expect(calculated.formulas[0].cachedValue).toBe("50");
+        expect(calculated.formulas.map((f: { cachedValue: string }) => f.cachedValue)).toEqual(["50", "100", "OK", "1"]);
+        expect(calculated.sheets.find((s: { name: string }) => s.name === "Checks").rows[3][0]).toBe("KEEP");
         const calculatedBytes = readFileSync(join(dataRoot, "office/tasks", document.taskId, document.file));
         const copied = await call("office_execute", { sourceTaskId: document.taskId, inputFiles: [document.file], code: `
           await fs.copyFile(path.join(workspace, ${JSON.stringify(document.file)}), path.join(workspace, "renamed-budget.xlsx"));

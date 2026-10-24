@@ -170,6 +170,37 @@ async function command(name, args, directory) {
   if (result.code !== 0) throw fail("office_conversion_failed", `${name} failed (${result.code ?? result.signal}): ${result.stderr || result.stdout.slice(0, 8192) || "no diagnostic output"}`);
   return result.stdout;
 }
+async function workbookWithoutFormulaCaches(input) {
+  const zip = await loadZip(input);
+  let formulaCount = 0;
+  for (const part of Object.values(zip.files)) {
+    if (part.dir || !/^xl\/worksheets\/sheet\d+\.xml$/.test(part.name)) continue;
+    const document = parseXml(await part.async("string"));
+    let changed = false;
+    for (const cell of nodes(document, NS.s, "c")) {
+      if (!nodes(cell, NS.s, "f").length) continue;
+      // Keep formulas (including shared/array metadata), styles and constants.
+      // A cached result and its type are not evidence of a fresh calculation.
+      for (const cached of nodes(cell, NS.s, "v")) cached.parentNode.removeChild(cached);
+      cell.removeAttribute("t");
+      formulaCount++; changed = true;
+    }
+    if (changed) zip.file(part.name, xml(document));
+  }
+  if (!formulaCount) return fs.readFile(input);
+  const workbook = parseXml(await zip.file("xl/workbook.xml").async("string"));
+  let calculation = nodes(workbook, NS.s, "calcPr")[0];
+  if (!calculation) {
+    calculation = workbook.createElementNS(NS.s, "calcPr");
+    const following = new Set(["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "smartTagTypes", "webPublishing", "fileRecoveryPr", "webPublishObjects", "extLst"]);
+    workbook.documentElement.insertBefore(calculation, Array.from(workbook.documentElement.childNodes).find(node => following.has(node.localName)) ?? null);
+  }
+  calculation.setAttribute("calcMode", "auto");
+  calculation.setAttribute("fullCalcOnLoad", "1");
+  calculation.setAttribute("forceFullCalc", "1");
+  zip.file("xl/workbook.xml", xml(workbook));
+  return zip.generateAsync({ type: "nodebuffer" });
+}
 async function convertFile(input, outputDir, format, csv) {
   // Windows extension registries append long names below UserInstallation.
   // Deep task/QA paths can exceed native limits despite longPathAware. Keep
@@ -179,9 +210,11 @@ async function convertFile(input, outputDir, format, csv) {
   const profile = pathToFileURL(path.join(work, "profile")).href;
   try {
     let source = input, convertedDirectory = work;
-    if (windows) {
+    if (windows || ext(input) === "xlsx") {
       source = path.join(work, `source.${ext(input)}`);
-      await writeNew(source, await fs.readFile(input));
+      // Recalculate a private copy, never the user's source workbook. Missing
+      // caches force LibreOffice to evaluate formulas instead of reusing them.
+      await writeNew(source, ext(input) === "xlsx" ? await workbookWithoutFormulaCaches(input) : await fs.readFile(input));
       convertedDirectory = path.join(work, "out");
       await fs.mkdir(convertedDirectory);
     }
@@ -565,7 +598,10 @@ async function handle(call) {
         await writeNew(intermediate, Buffer.from(await workbook.xlsx.writeBuffer()));
         output = input.format === "xlsx" ? intermediate : await convertFile(intermediate, directory, "pdf");
       } else output = await convertFile(file, directory, input.format, input.csv);
-      await inspect(output);
+      const summary = await inspect(output);
+      if (input.format === "xlsx" && summary.formulas.some(formula => formula.cachedValue === null)) {
+        throw fail("recalculation_failed", "LibreOffice did not produce calculated formula results");
+      }
       if (sourceHash !== digest(await fs.readFile(file))) throw fail("source_modified", "Conversion altered source");
       return { taskId: input.taskId, file: path.basename(output), sourceUnchanged: true, needsRender: true, ...(input.allowLossy ? { warning: "LibreOffice normalized this workbook; review object and formatting preservation." } : {}) };
     }
