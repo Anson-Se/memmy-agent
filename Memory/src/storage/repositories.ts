@@ -61,6 +61,7 @@ import {
 import { QueueSchedulingStore, type SchedulingMetadata } from "./queue-scheduling-store.js";
 import { mainQueueEligibility, retryQueueEligibility, type QueueEligibilityOptions } from "./queue-eligibility.js";
 import { compactHistoryChangePayload, compactHistoryChangeRow } from "./history-change-snapshot.js";
+import { L3FieldRepository } from "./l3-field-repository.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -86,6 +87,10 @@ const BUNDLE_TABLES = [
   "api_logs",
   "memory_change_log",
   "l3_world_model_project_environment_state",
+  "l3_units",
+  "l3_unit_batches",
+  "l3_items",
+  "l3_user_projects",
   "evolution_jobs",
   "embedding_retry_queue",
   "memory_processing_state",
@@ -5369,6 +5374,10 @@ export class RuntimeRepository {
       }>
     };
     this.db.transaction(() => {
+      const keptL3Units = this.existingL3Units(tables, conflictStrategy);
+      // Unfinished work of a kept unit that this database does not have: its Sessions' traces must be
+      // frozen again here, so their cursors are moved back below the first trace no batch here covers.
+      const droppedL3Work: Array<{ sessionId: string; startTraceSeq: number }> = [];
       const hadRuntimeData = Boolean(this.db.prepare(`SELECT EXISTS(
         SELECT 1 FROM memories UNION ALL SELECT 1 FROM sessions UNION ALL
         SELECT 1 FROM raw_turns UNION ALL SELECT 1 FROM source_turn_captures
@@ -5378,6 +5387,21 @@ export class RuntimeRepository {
         for (const row of rows) {
           const defaults = applyBundleDefaults(table, deserializeBundleRow(row));
           const normalized = table === "memory_change_log" ? compactHistoryChangeRow(defaults) : defaults;
+          const l3UnitKey = keptL3Units.size > 0 ? bundleRowL3UnitKey(table, normalized) : null;
+          if (l3UnitKey && keptL3Units.has(l3UnitKey)) {
+            if (table === "l3_unit_batches" && normalized.status !== "applied" && typeof normalized.id === "string" &&
+                !this.rowExists("l3_unit_batches", ["id"], [normalized.id]) &&
+                typeof normalized.session_id === "string" && typeof normalized.start_trace_seq === "number" &&
+                typeof normalized.end_trace_seq === "number") {
+              const unfrozen = this.firstUnfrozenL3Trace(normalized.session_id, normalized.start_trace_seq, normalized.end_trace_seq);
+              if (unfrozen !== null) droppedL3Work.push({ sessionId: normalized.session_id, startTraceSeq: unfrozen });
+            }
+            if (table === "l3_units") {
+              result.conflicts.push({ table, primaryKey: "unit_key", sourceId: l3UnitKey, targetId: l3UnitKey, action: "skipped" });
+            }
+            result.skipped[table] = (result.skipped[table] ?? 0) + 1;
+            continue;
+          }
           const identity = bundleIdentity(table, normalized);
           if (identity) {
             recordMigrationMap(result.migrationMap, table, identity.sourceId, identity.sourceId);
@@ -5435,10 +5459,33 @@ export class RuntimeRepository {
           }
         }
       }
+      const rewind = this.db.prepare(
+        `UPDATE l3_world_model_session_cursors SET last_scheduled_seq = MIN(last_scheduled_seq, ?) WHERE session_id = ?`
+      );
+      for (const work of droppedL3Work) rewind.run(work.startTraceSeq - 1, work.sessionId);
     })();
     this.scheduleLogTablesPrune();
     this.scheduleHistoryLogCompaction(true);
     return result;
+  }
+
+  /**
+   * Row-by-row conflict handling cannot keep an L3 unit consistent (an old item could stay active
+   * next to its imported successor), so a unit that already exists here is kept whole: the bundle's
+   * rows for it (unit, items, batches, jobs, snapshot) are all skipped, as re-importing one's own
+   * backup skips every other existing row. With conflictStrategy "error" the import fails instead.
+   */
+  private existingL3Units(tables: Record<string, unknown>, conflictStrategy: "skip" | "replace" | "error"): Set<string> {
+    const rows = Array.isArray(tables.l3_units) ? tables.l3_units as Array<Record<string, unknown>> : [];
+    const exists = this.db.prepare(`SELECT 1 FROM l3_units WHERE unit_key = ?`).pluck();
+    const kept = new Set<string>();
+    for (const row of rows) {
+      const unitKey = deserializeBundleRow(row).unit_key;
+      if (typeof unitKey !== "string" || !exists.get(unitKey)) continue;
+      if (conflictStrategy === "error") throw new Error(`import conflict: l3 unit already exists: ${unitKey}`);
+      kept.add(unitKey);
+    }
+    return kept;
   }
 
   private mergeSourceTurnActivation(
@@ -5465,6 +5512,28 @@ export class RuntimeRepository {
     return existing ? "replaced" : "inserted";
   }
 
+
+  /**
+   * The first trace in [start, end] that no batch of this database froze, or null when all were
+   * (an earlier import of the same bundle refroze them). A batch counts only if it froze the turn now
+   * at that position: a replace import can put another turn there, which a batch reading its frozen
+   * ids would leave out.
+   */
+  private firstUnfrozenL3Trace(sessionId: string, start: number, end: number): number | null {
+    const covered = this.db.prepare(
+      `SELECT EXISTS(
+         SELECT 1 FROM l3_world_model_input_traces t JOIN l3_unit_batches b
+           ON b.session_id = t.session_id AND b.start_trace_seq <= t.trace_seq AND b.end_trace_seq >= t.trace_seq
+         WHERE t.session_id = ? AND t.trace_seq = ?
+           AND EXISTS(SELECT 1 FROM json_each(b.l1_memory_ids_json) WHERE value = t.l1_memory_id)
+           AND EXISTS(SELECT 1 FROM json_each(b.raw_turn_ids_json) WHERE value = t.raw_turn_id)
+       )`
+    ).pluck();
+    for (let seq = start; seq <= end; seq += 1) {
+      if (!covered.get(sessionId, seq)) return seq;
+    }
+    return null;
+  }
   private rowExists(table: BundleTableName, columns: string[], values: Array<string | number>): boolean {
     const tableColumns = this.tableColumns(table);
     if (columns.length === 0 || columns.some((column) => !tableColumns.includes(column))) {
@@ -6531,6 +6600,7 @@ export class Repositories {
   readonly processing: MemoryProcessingRepository;
   readonly runtime: RuntimeRepository;
   readonly l3WorldModels: L3WorldModelRepository;
+  readonly l3Field: L3FieldRepository;
   readonly projectEnvironments: ProjectEnvironmentRepository;
   readonly vectors: SqliteVecStore;
 
@@ -6542,6 +6612,7 @@ export class Repositories {
     this.processing = new MemoryProcessingRepository(db);
     this.runtime = new RuntimeRepository(db);
     this.l3WorldModels = new L3WorldModelRepository(db, this.memories);
+    this.l3Field = new L3FieldRepository(db, this.memories);
     this.projectEnvironments = new ProjectEnvironmentRepository(db, this.l3WorldModels, this.runtime);
   }
 
@@ -8442,6 +8513,31 @@ interface BundleIdentity {
   values: Array<string | number>;
 }
 
+/** The new-L3 unit a bundle row belongs to, for the tables that hold one unit's state. */
+function bundleRowL3UnitKey(table: string, row: Record<string, unknown>): string | null {
+  const record = (value: unknown): Record<string, unknown> => {
+    const parsed = typeof value === "string" ? parseJson<unknown>(value, {}) : value;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  };
+  const text = (value: unknown) => (typeof value === "string" && value ? value : null);
+  switch (table) {
+    case "l3_units":
+    case "l3_items":
+      return text(row.unit_key);
+    case "l3_unit_batches":
+      return text(row.machine_unit_key);
+    case "evolution_jobs": {
+      if (row.job_type === "l3_unit_update") return text(row.scope_key);
+      const payload = record(row.payload_json);
+      return row.job_type === "project_environment_profile" && payload.mode === "l3_field" ? text(payload.unitKey) : null;
+    }
+    case "memories":
+      return text(record(record(record(row.properties_json).internal_info).l3_field).unit_key);
+    default:
+      return null;
+  }
+}
+
 function bundleIdentity(
   table: BundleTableName,
   row: Record<string, unknown>
@@ -8455,7 +8551,9 @@ function bundleIdentity(
     l3_world_model_input_traces: ["session_id", "trace_seq"],
     l3_world_model_evidence_batches: ["id"],
     l3_world_model_batch_targets: ["batch_id", "target_field"],
-    l3_world_model_project_environment_state: ["user_id", "project_id"]
+    l3_world_model_project_environment_state: ["user_id", "project_id"],
+    l3_units: ["unit_key"],
+    l3_user_projects: ["user_id", "root_path"]
   };
   const newColumns = newTableIdentityColumns[table];
   if (newColumns) {
@@ -8548,9 +8646,15 @@ function normalizeRedactedL3WorldModelBundle(
     .filter((row) => terminalBatchIds.has(String(row.batch_id)));
   tables.evolution_jobs = (tables.evolution_jobs ?? []).filter((row) => {
     const jobType = row.job_type;
-    if (jobType !== "l3_world_model_update" && jobType !== "project_environment_profile") return true;
+    if (
+      jobType !== "l3_world_model_update" &&
+      jobType !== "project_environment_profile" &&
+      jobType !== "l3_unit_update"
+    ) return true;
     return row.status === "succeeded" || row.status === "dead_letter";
   });
+  // Unfinished unit batches depend on raw text that a redacted bundle no longer carries.
+  tables.l3_unit_batches = (tables.l3_unit_batches ?? []).filter((row) => row.status === "applied");
   tables.l3_world_model_project_environment_state = (
     tables.l3_world_model_project_environment_state ?? []
   ).map((row) => ({
