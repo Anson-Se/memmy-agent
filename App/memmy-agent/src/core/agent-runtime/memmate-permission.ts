@@ -112,13 +112,14 @@ export async function authorizeMemmateTool(name: string, args: unknown, signal?:
   // A detached copy prevents a hook or parallel caller from changing approved parameters.
   const approvedArgs = JSON.parse(JSON.stringify(args));
   if (!parentCallId) emitMemmateToolEvent({ type: "tool_call", callId, name, input: approvedArgs });
+  // Six Host hops may each wait 120s for approval and 15s for IO, plus transport grace.
   const response = await fetch(scope.url, {
     method: "POST", redirect: "error",
     headers: { "content-type": "application/json", authorization: `Bearer ${scope.token}` },
     body: JSON.stringify({ callId, toolName: name, args: approvedArgs,
       ...(["read_file", "list_dir", "find_files", "grep", "memmate_read_path"].includes(name) ? { fileAccessProtocol: 1 } : {}),
       ...(parentCallId ? { parentCallId } : {}) }),
-    signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(125_000)])
+    signal: AbortSignal.any([scope.signal, ...(signal ? [signal] : []), AbortSignal.timeout(["web_fetch", "web_search"].includes(name) ? 815_000 : 125_000)])
   });
   if (!response.ok) throw new Error("MemMate approval service is unavailable");
   const result = await response.json() as { decision?: string; reason?: string; result?: unknown; error?: { kind?: unknown; code?: unknown } };

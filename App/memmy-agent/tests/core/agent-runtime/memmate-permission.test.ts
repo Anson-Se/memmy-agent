@@ -18,6 +18,29 @@ describe("mandatory MemMate permission", () => {
     }), [new ToolCallRequest({ id: "web", name: "web_fetch", arguments: { url: "https://example.com" } })]));
     expect(execute).not.toHaveBeenCalled(); expect(results[0].result).toContain("approved page");
   });
+  it.each([false, true])("waits across redirect approvals but keeps a bounded lifetime: timeout=%s", async expires => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController(); setTimeout(() => controller.abort(new Error("timeout")), ms); return controller.signal;
+    });
+    let reply!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn((_url, init) => new Promise((resolve, reject) => {
+      reply = resolve;
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    })));
+    try {
+      const pending = withMemmatePermission(scope(), () => authorizeMemmateTool("web_fetch", { url: "https://example.com" }));
+      if (expires) {
+        const rejected = expect(pending).rejects.toThrow("timeout");
+        await vi.advanceTimersByTimeAsync(900_000); await rejected;
+      } else {
+        await vi.advanceTimersByTimeAsync(150_000);
+        reply(Response.json({ decision: "allow", result: "after several approvals" }));
+        expect((await pending).result).toBe("after several approvals");
+      }
+    } finally { timeout.mockRestore(); vi.useRealTimers(); }
+  });
+
   it("does not fall back to direct networking when the Host omits its web result", async () => {
     vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow" })));
