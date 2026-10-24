@@ -44,6 +44,10 @@ import { memoryNeedsImportSummary, summaryProcessingJobType } from "../import/im
 import {
   classifyProcessingError,
   type EnqueueJobInput,
+  L3_RETRY_JOB_TYPES,
+  L3_SUSPEND_MINUTES,
+  l3FailureHandling,
+  type L3FailureHandling,
   processingJobMatchesMemory,
   processingStageForJob,
   sanitizeProcessingError,
@@ -178,8 +182,12 @@ export interface WorkerRunnerDeps {
   enqueueObservationBackfill?: (limit: number, at: string) => number;
   /** Drops new-L3 items that have been inactive longer than the retention window. */
   purgeL3InactiveItems?: (at: string) => number;
+  /** Gives each dead-lettered new-L3 batch one automatic rerun. */
+  requeueL3DeadLettersOnce?: (at: string) => number;
   /** Whether the new L3 is on; while off its jobs stay queued and are not leased. */
   l3FieldActive?: () => boolean;
+  /** Without an evolution model, L3 jobs stay queued (not leased, no attempt used) until one is configured. */
+  evolutionModelConfigured?: () => boolean;
   previewPolicyEvidenceReconciliation: (limit: number) => PolicyEvidencePreflightReport;
   reconcileOrphanedPolicies: (at: string, limit: number) => number;
   enqueueJob: (input: EnqueueJobInput) => EvolutionJobRecord;
@@ -460,6 +468,7 @@ export class WorkerRunner {
     }
 
     this.deps.purgeL3InactiveItems?.(at);
+    this.deps.requeueL3DeadLettersOnce?.(at);
     this.refreshObservationModelConfiguration();
     return {
       requeuedJobs: interruptedJobs.length + failedJobs.length,
@@ -1080,12 +1089,14 @@ export class WorkerRunner {
       this.observeWork({ queue: "main", job }, "finished", "released");
       return { succeeded: 0, failed: 0, ref: { ...jobToRef(deferred), status: "queued" } };
     }
+    const l3Handling = l3FailureHandling(job, error);
+    if (l3Handling.kind === "retry_later" || l3Handling.kind === "suspend") return this.rescheduleFailedL3Job(job, error, l3Handling);
     const errorMessage = processingStageForJob(job.jobType)
       ? sanitizeProcessingError(error)
       : error instanceof Error ? error.message : String(error);
     const classification = classifyProcessingError(error);
     const configurationBlocked = classification.retryAction === "open_settings" && classification.code !== "40309";
-    const forceDeadLetter = classification.code === "40309"
+    const forceDeadLetter = l3Handling.kind === "dead_letter" || classification.code === "40309"
       || classification.retryAction === "none"
       || error instanceof UnknownJobPolicyError
       || isTerminalL3WorldModelError(error)
@@ -1127,6 +1138,36 @@ export class WorkerRunner {
         ...jobToRef(job),
         status: resumed?.status ?? (failedJob.status === "dead_letter" ? "dead_letter" : "failed")
       }
+    };
+  }
+
+  /** Temporary trouble waits and retries; a configuration problem waits for a fix without using an attempt. */
+  private rescheduleFailedL3Job(
+    job: EvolutionJobRecord,
+    error: unknown,
+    handling: Extract<L3FailureHandling, { kind: "retry_later" | "suspend" }>
+  ): WorkerJobRunResult {
+    const at = this.deps.nowIso();
+    const minutes = handling.kind === "retry_later" ? handling.delayMinutes : L3_SUSPEND_MINUTES;
+    const rescheduled = this.deps.repos.runtime.rescheduleFailedJob(job.id, {
+      runAfter: new Date(Date.parse(at) + minutes * 60_000).toISOString(),
+      error: sanitizeProcessingError(error),
+      refundAttempt: handling.kind === "suspend",
+      minMaxAttempts: handling.kind === "retry_later" ? handling.maxAttempts : undefined,
+      at
+    }, job);
+    if (!rescheduled) return this.lostLeaseResult(job);
+    this.deps.appendJobChange(rescheduled, "queued", job);
+    workerLogger.warn(handling.kind === "suspend" ? "job.suspended" : "job.retry_scheduled", {
+      ...workerJobLogFields(rescheduled),
+      retryInMinutes: minutes,
+      ...memoryErrorFields(error)
+    });
+    this.observeWork({ queue: "main", job }, "finished", handling.kind === "suspend" ? "released" : "failed");
+    return {
+      succeeded: 0,
+      failed: handling.kind === "suspend" ? 0 : 1,
+      ref: { ...jobToRef(rescheduled), status: "queued" }
     };
   }
 
@@ -1412,7 +1453,10 @@ export class WorkerRunner {
   }
 
   private excludedLeaseJobTypes(): readonly string[] | undefined {
-    const held = this.summaryJobsHeld() ?? [];
+    const held = [
+      ...(this.summaryJobsHeld() ?? []),
+      ...(this.deps.evolutionModelConfigured?.() === false ? L3_RETRY_JOB_TYPES : [])
+    ];
     // One L3 runs at a time; the other's jobs wait in the queue for the switch to turn back.
     // Excluding l3_unit_update also holds new-L3 profile jobs, and excluding l3_world_model_update
     // holds the old project profile jobs (see mainQueueEligibility).

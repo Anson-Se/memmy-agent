@@ -9,6 +9,7 @@ import {
 import {
   EmbeddingInferenceInputSchema,
   L3UserProjectsReplaceRequestSchema,
+  L3FailedBatchesRetryRequestSchema,
   L3WorldModelBoundaryRequestSchema,
   L3WorldModelRequestEnvelopeSchema,
   OpenSessionInputSchema
@@ -79,6 +80,7 @@ export const API_ROUTES = [
   "POST /api/v1/sessions/:sessionId/l3-world-model-boundary",
   "GET /api/v1/l3-world-model/sessions/:sessionId/context",
   "POST /api/v1/l3/user-projects",
+  "POST /api/v1/l3/failed-batches/retry",
   "POST /api/v1/turns/start",
   "POST /api/v1/turns/:turnId/complete",
   "POST /api/v1/source-turns/complete",
@@ -702,6 +704,22 @@ async function routeRequest(
       );
     }
     return service.replaceL3UserProjects(parsed.data);
+  }
+
+  if (method === "POST" && path === "/api/v1/l3/failed-batches/retry") {
+    requireMemoryWrite(principal);
+    const parsed = L3FailedBatchesRetryRequestSchema.safeParse(
+      strictEnvelopeWithPrincipal(asObject(body, "l3.failed-batches.retry"), principal)
+    );
+    if (!parsed.success) {
+      throw new MemoryServiceError(
+        "invalid_argument",
+        parsed.error.issues.map((issue) => `${issue.path.join(".") || "request"}: ${issue.message}`).join("; ")
+      );
+    }
+    const retried = service.retryFailedL3Batches(parsed.data);
+    if (retried.requeued > 0) autoWorker.schedule();
+    return retried;
   }
 
   const l3Context = match(path, /^\/api\/v1\/l3-world-model\/sessions\/([^/]+)\/context$/);

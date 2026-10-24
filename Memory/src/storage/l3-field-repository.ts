@@ -369,6 +369,45 @@ export class L3FieldRepository {
     return row ? batchFromSql(row) : undefined;
   }
 
+  /**
+   * Rerun entry: the user's batches whose job ended in dead letter go back in the queue. The original
+   * job is reset in place (a copy would hit the dedupe and sequence indexes); applied batches are left alone.
+   * Returns the ids of the jobs put back.
+   */
+  requeueDeadLetterBatches(userId: string, at = nowIso()): string[] {
+    return this.requeueDeadLetters(`AND j.user_id = ?`, [userId], at, false);
+  }
+
+  /**
+   * Worker startup: every user's dead-lettered batches get one automatic rerun each, so a batch that
+   * failed through a long outage is not lost; a batch that dead-letters again stays for the manual rerun.
+   */
+  requeueDeadLetterBatchesOnce(at = nowIso()): string[] {
+    return this.requeueDeadLetters(`AND json_extract(j.payload_json, '$.autoRequeued') IS NULL`, [], at, true);
+  }
+
+  private requeueDeadLetters(filter: string, params: string[], at: string, markAuto: boolean): string[] {
+    return this.db.transaction(() => {
+      const jobs = this.db.prepare(
+        `SELECT j.id, b.id AS batch_id FROM evolution_jobs j
+         JOIN l3_unit_batches b ON b.id = CAST(json_extract(j.payload_json, '$.batchId') AS TEXT)
+         WHERE j.job_type = 'l3_unit_update' AND j.status = 'dead_letter' AND b.status != 'applied' ${filter}
+         ORDER BY j.scope_key, j.scope_seq`
+      ).all(...params) as Array<{ id: string; batch_id: string }>;
+      for (const job of jobs) {
+        this.db.prepare(`UPDATE l3_unit_batches SET status = 'queued', updated_at = ? WHERE id = ?`).run(at, job.batch_id);
+        this.db.prepare(
+          `UPDATE evolution_jobs SET status = 'queued', attempts = 0, failure_count = 0, leased_until = NULL,
+             lease_owner = NULL, lease_token = NULL, available_at = NULL, blocked_reason = NULL, last_error = NULL,
+             payload_json = ${markAuto ? "json_set(json_remove(payload_json, '$.runAfter'), '$.autoRequeued', 1)" : "json_remove(payload_json, '$.runAfter')"},
+             updated_at = ?
+           WHERE id = ?`
+        ).run(at, job.id);
+      }
+      return jobs.map((job) => job.id);
+    })();
+  }
+
   setBatchStatus(id: string, status: L3UnitBatchStatus, at = nowIso()): void {
     this.db.prepare(`UPDATE l3_unit_batches SET status = ?, updated_at = ? WHERE id = ?`).run(status, at, id);
   }

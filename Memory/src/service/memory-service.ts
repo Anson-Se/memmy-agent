@@ -7,6 +7,8 @@ import {
   deriveWorkspaceHostId,
   isLocalWorkspaceUri,
   sha256Hex,
+  type L3FailedBatchesRetryRequest,
+  type L3FailedBatchesRetryResponse,
   type L3UserProjectsReplaceRequest,
   type L3UserProjectsReplaceResponse
 } from "../contracts/index.js";
@@ -662,6 +664,8 @@ export class MemoryService {
       restartFailedProcessing: this.restartFailedProcessing.bind(this),
       enqueueObservationBackfill: (limit, at) => this.observationMemory.backfill(limit, at),
       l3FieldActive: () => this.l3FieldActive(),
+      requeueL3DeadLettersOnce: (at) => this.requeueL3DeadLettersOnce(at),
+      evolutionModelConfigured: () => workerRunnerOwner.skillLlm.isConfigured(),
       purgeL3InactiveItems: (at) => this.repos.l3Field.purgeInactive(
         new Date(Date.parse(at) - this.config.algorithm.l3FieldCognition.inactiveRetentionDays * 86_400_000).toISOString()
       ),
@@ -1572,6 +1576,32 @@ export class MemoryService {
       this.repos.l3Field.setStandaloneRoots(userId, request.standaloneRoots ?? [], at);
     });
     return { count: request.projects.length, serverTime: at };
+  }
+
+  /** Rerun entry for the new L3 only; dead letters of the old pipeline are not rerun. */
+  retryFailedL3Batches(request: L3FailedBatchesRetryRequest): L3FailedBatchesRetryResponse {
+    this.assertMemoryAddEnabled();
+    const userId = normalizeNamespace(request.namespace).userId;
+    const at = nowIso();
+    const before = new Map(this.repos.runtime.listJobs("dead_letter", 10_000, userId).map((job) => [job.id, job]));
+    const requeued = this.repos.l3Field.requeueDeadLetterBatches(userId, at);
+    for (const id of requeued) {
+      const after = this.repos.runtime.getJob(id);
+      if (after) this.workerHandlers.appendJobChange(after, "queued", before.get(id));
+    }
+    return { requeued: requeued.length, serverTime: at };
+  }
+
+  /** Worker startup: one automatic rerun for each dead-lettered new-L3 batch; nothing while the new L3 is off. */
+  private requeueL3DeadLettersOnce(at: string): number {
+    if (!this.l3FieldActive()) return 0;
+    const before = new Map(this.repos.runtime.listJobs("dead_letter", 10_000).map((job) => [job.id, job]));
+    const requeued = this.repos.l3Field.requeueDeadLetterBatchesOnce(at);
+    for (const id of requeued) {
+      const after = this.repos.runtime.getJob(id);
+      if (after) this.workerHandlers.appendJobChange(after, "queued", before.get(id));
+    }
+    return requeued.length;
   }
 
   l3WorldModelBoundary(

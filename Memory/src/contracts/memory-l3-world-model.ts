@@ -103,6 +103,18 @@ export const L3UserProjectsReplaceResponseSchema = z.object({
 }).strict();
 export type L3UserProjectsReplaceResponse = z.infer<typeof L3UserProjectsReplaceResponseSchema>;
 
+/** Puts the user's new-L3 batches that ended in dead letter back in the queue. */
+export const L3FailedBatchesRetryRequestSchema = z.object({
+  ...L3WorldModelRequestEnvelopeShape
+}).strict().superRefine(assertEnvelopeSourceConsistency);
+export type L3FailedBatchesRetryRequest = z.input<typeof L3FailedBatchesRetryRequestSchema>;
+
+export const L3FailedBatchesRetryResponseSchema = z.object({
+  requeued: z.number().int().nonnegative(),
+  serverTime: z.string().datetime()
+}).strict();
+export type L3FailedBatchesRetryResponse = z.infer<typeof L3FailedBatchesRetryResponseSchema>;
+
 export const SessionL3WorldModelContextResponseSchema = z.object({
   schemaVersion: z.literal(2),
   projectId: NonEmptyStringSchema.nullable(),

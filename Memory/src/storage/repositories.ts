@@ -4058,6 +4058,33 @@ export class RuntimeRepository {
     return result.changes > 0 ? this.getJob(id) : undefined;
   }
 
+  /**
+   * Puts a failed job this run still holds back in the queue to run after `runAfter`. A refunded
+   * attempt means the run did not count as a failure (waiting for a configuration fix);
+   * `minMaxAttempts` raises the failure limit. Returns undefined when the run lost its lease.
+   */
+  rescheduleFailedJob(id: string, input: {
+    runAfter: string;
+    error: string;
+    refundAttempt?: boolean;
+    minMaxAttempts?: number;
+    at?: string;
+  }, claim?: EvolutionJobRecord): EvolutionJobRecord | undefined {
+    const at = input.at ?? nowIso();
+    const where = this.jobClaimWhere(claim, at);
+    const result = this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', leased_until = NULL,
+      lease_owner = NULL, lease_token = NULL, available_at = ?, blocked_reason = NULL, last_error = ?,
+      failure_count = failure_count + CASE WHEN ? THEN 0 ELSE 1 END,
+      attempts = CASE WHEN ? THEN MAX(0, attempts - 1) ELSE attempts END,
+      max_attempts = MAX(max_attempts, ?), updated_at = ?,
+      payload_json = json_set(payload_json, '$.runAfter', ?)
+      WHERE id = ? AND ${where.sql}`).run(
+      input.runAfter, input.error, input.refundAttempt ? 1 : 0, input.refundAttempt ? 1 : 0,
+      input.minMaxAttempts ?? 0, at, input.runAfter, id, ...where.params
+    );
+    return result.changes > 0 ? this.getJob(id) : undefined;
+  }
+
   /** Waiting for a dependency is not a model failure and does not consume an attempt. */
   deferProcessingJob(id: string, runAfter: string, at = nowIso(), claim?: EvolutionJobRecord): EvolutionJobRecord | undefined {
     const where = this.jobClaimWhere(claim, at);
