@@ -33,10 +33,16 @@ function setup(reply = '{"op":"create","profile":"Node 项目，测试用 vitest
   });
   const pendingJob = (): EvolutionJobRecord => {
     const row = db.db.prepare(
-      `SELECT id, user_id, payload_json FROM evolution_jobs
+      `SELECT id, user_id, payload_json, created_at FROM evolution_jobs
        WHERE job_type = 'project_environment_profile' AND status = 'queued' ORDER BY created_at DESC LIMIT 1`
-    ).get() as { id: string; user_id: string; payload_json: string };
-    return { id: row.id, jobType: "project_environment_profile", userId: row.user_id, payload: JSON.parse(row.payload_json) } as EvolutionJobRecord;
+    ).get() as { id: string; user_id: string; payload_json: string; created_at: string };
+    return {
+      id: row.id,
+      jobType: "project_environment_profile",
+      userId: row.user_id,
+      payload: JSON.parse(row.payload_json),
+      createdAt: row.created_at
+    } as EvolutionJobRecord;
   };
   return { db, repos, service, complete, unit, project, pendingJob };
 }
@@ -81,13 +87,31 @@ describe("L3 field cognition project profile", () => {
     expect(complete).toHaveBeenCalledTimes(1);
   });
 
-  it("drops the result when the unit was deleted", async () => {
-    const { service, repos, complete, unit, project, pendingJob } = setup();
+  it("does not ask the model again for an unchanged project that had nothing worth a profile (an empty folder)", async () => {
+    const { service, complete, unit, project, pendingJob, db } = setup('{"op":"noop","profile":""}');
+    rmSync(join(project, "package.json"));
+    rmSync(join(project, "index.ts"));
     service.requestL3UnitProfile({ userId: "u1", unitKey: unit.unitKey, checkoutRoot: project });
-    repos.l3Field.markUnitDeleted(unit.unitKey);
+    await service.processProfileJob(pendingJob());
+    db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded', updated_at = ? WHERE job_type = 'project_environment_profile'`)
+      .run(new Date(Date.now() - 11 * 60_000).toISOString());
+    service.requestL3UnitProfile({ userId: "u1", unitKey: unit.unitKey, checkoutRoot: project });
+    await service.processProfileJob(pendingJob());
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a job queued before the unit was deleted, but serves jobs queued after it", async () => {
+    const { service, repos, complete, unit, project, pendingJob, db } = setup();
+    service.requestL3UnitProfile({ userId: "u1", unitKey: unit.unitKey, checkoutRoot: project, at: "2026-10-01T00:00:00.000Z" });
+    repos.l3Field.markUnitDeleted(unit.unitKey, "2026-10-02T00:00:00.000Z");
     await service.processProfileJob(pendingJob());
     expect(complete).not.toHaveBeenCalled();
     expect(repos.l3Field.getUnit(unit.unitKey)!.profileText).toBeUndefined();
+
+    db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded' WHERE job_type = 'project_environment_profile'`).run();
+    service.requestL3UnitProfile({ userId: "u1", unitKey: unit.unitKey, checkoutRoot: project, at: "2026-10-03T00:00:00.000Z" });
+    await service.processProfileJob(pendingJob());
+    expect(repos.l3Field.getUnit(unit.unitKey)!.profileText).toBe("Node 项目，测试用 vitest");
   });
 });
 

@@ -175,17 +175,22 @@ export class ProjectEnvironmentService {
       throw new Error("invalid l3 field profile job payload");
     }
     const unit = this.deps.repos.l3Field.getUnit(unitKey);
-    if (!unit || unit.deletedAt || unit.userId !== userId || unit.kind !== "project") return;
-    const scanned = await deriveScanEvidence(pathToFileURL(checkoutRoot).href);
-    const derived: ProjectEnvironmentDerivedEvidence = {
-      ...scanned,
-      deterministicFacts: { ...scanned.deterministicFacts, runtimeProbes: [] }
-    };
-    if (unit.profileFingerprint === derived.fingerprint && unit.profileText) return;
+    if (!unit || unit.userId !== userId || unit.kind !== "project") return;
+    // A job queued before the unit was reset (deleted) must not bring old results back.
+    if (unit.deletedAt && job.createdAt <= unit.deletedAt) return;
+    // Runtime versions probed on this machine belong to the machine profile, so they are neither
+    // shown to the model nor part of the fingerprint: upgrading node does not re-profile every project.
+    const derived = await deriveScanEvidence(pathToFileURL(checkoutRoot).href, { withRuntimeProbes: false });
+    // Unchanged since the last summary, including one that found nothing worth a profile.
+    if (unit.profileFingerprint === derived.fingerprint) return;
     const currentProfile = unit.profileText ?? null;
     const output = await summarizeProjectProfile(this.deps, derived, currentProfile);
     const latest = this.deps.repos.l3Field.getUnit(unitKey);
-    if (!latest || latest.deletedAt || (latest.profileText ?? null) !== currentProfile) return;
+    if (
+      !latest ||
+      (latest.deletedAt && job.createdAt <= latest.deletedAt) ||
+      (latest.profileText ?? null) !== currentProfile
+    ) return;
     const nextProfile = output.op === "noop" ? currentProfile : (output.profile || null);
     this.deps.repos.transaction(() => {
       this.deps.repos.l3Field.setProfile(unitKey, { text: nextProfile, fingerprint: derived.fingerprint });
@@ -194,8 +199,11 @@ export class ProjectEnvironmentService {
   }
 }
 
-async function deriveScanEvidence(workspaceUri: string): Promise<ProjectEnvironmentDerivedEvidence> {
-  const scan = await scanLocalProject(workspaceUri);
+async function deriveScanEvidence(
+  workspaceUri: string,
+  options: { withRuntimeProbes?: boolean } = {}
+): Promise<ProjectEnvironmentDerivedEvidence> {
+  const scan = await scanLocalProject(workspaceUri, options);
   const classification = classifyProjectInventory(scan.entries);
   const facts = parseDeterministicProjectFacts({
     entries: scan.entries,

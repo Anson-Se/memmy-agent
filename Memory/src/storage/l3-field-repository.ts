@@ -71,6 +71,8 @@ export function l3UnitSnapshotMemoryKey(unitKey: string): string {
   return `world_model:l3_field:${unitKey}`;
 }
 
+export { isL3FieldSnapshotMemory, l3FieldSnapshotUnitKey } from "../service/l3-field/snapshot-memory.js";
+
 /** Renders one unit (profile plus active items) as the text stored in its snapshot memory. */
 export function renderL3UnitSnapshot(unit: L3UnitRecord, items: readonly L3ItemRecord[]): string {
   const facts = items.filter((item) => item.kind === "env_fact");
@@ -230,10 +232,18 @@ export class L3FieldRepository {
     return saved;
   }
 
+  /**
+   * Deleting a unit's L3 resets it rather than disabling it: items become
+   * inactive, the profile and snapshot link are cleared, and `deleted_at`
+   * records when, so work queued before the reset is discarded while later
+   * conversations build the unit up again.
+   */
   markUnitDeleted(unitKey: string, at = nowIso()): void {
     this.db.transaction(() => {
       this.db.prepare(
-        `UPDATE l3_units SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE unit_key = ?`
+        `UPDATE l3_units
+         SET deleted_at = ?, snapshot_memory_id = NULL, profile_text = NULL, profile_fingerprint = NULL, updated_at = ?
+         WHERE unit_key = ?`
       ).run(at, at, unitKey);
       this.db.prepare(
         `UPDATE l3_items
@@ -292,12 +302,25 @@ export class L3FieldRepository {
   }
 
   private writeSnapshot(unit: L3UnitRecord, at: string): MemoryRow {
-    const memoryValue = renderL3UnitSnapshot(unit, this.activeItems(unit.unitKey));
+    const items = this.activeItems(unit.unitKey);
+    const memoryValue = renderL3UnitSnapshot(unit, items);
     const existing = unit.snapshotMemoryId ? this.memories.get(unit.snapshotMemoryId) : undefined;
     const title = unit.kind === "machine" ? "本机场域认知" : `项目场域认知：${unit.displayName ?? unit.projectIdentity}`;
     const tags = ["world_model", "l3_field", `scope:${unit.kind}`];
     const info: Record<string, unknown> = { l3_field_unit_key: unit.unitKey };
-    const status = unit.deletedAt ? "deleted" as const : "activated" as const;
+    // Rewriting a snapshot keeps the user's archive; only the user unarchives it.
+    const status = existing?.status === "archived" ? "archived" as const : "activated" as const;
+    const bullets = (kind: L3ItemKind) => {
+      const lines = items.filter((item) => item.kind === kind).map((item) => `- ${item.content}`);
+      return lines.length ? lines.join("\n") : null;
+    };
+    // Shape the desktop "world model" page already understands (it only reads schema-2 fields).
+    const legacyFields = {
+      general_rules_and_safety_constraints: null,
+      project_environment_profile: unit.profileText?.trim() ? unit.profileText.trim() : null,
+      project_contract: bullets("project_constraint"),
+      domain_knowledge: bullets("env_fact")
+    };
     const memory: MemoryRow = {
       id: existing?.id ?? newId("memory"),
       timeline: existing?.timeline ?? at,
@@ -322,7 +345,13 @@ export class L3FieldRepository {
           title,
           summary: [...memoryValue.replace(/\s+/gu, " ").trim()].slice(0, 240).join(""),
           body: memoryValue,
-          l3_field: { unit_key: unit.unitKey, kind: unit.kind }
+          l3_field: {
+            unit_key: unit.unitKey,
+            kind: unit.kind,
+            display_name: unit.displayName ?? null,
+            identity_source: unit.identitySource ?? null,
+            legacy_fields: legacyFields
+          }
         }
       },
       memoryLayer: "L3",
@@ -330,7 +359,7 @@ export class L3FieldRepository {
       version: existing?.version ?? 1,
       createdAt: existing?.createdAt ?? at,
       updatedAt: at,
-      deletedAt: unit.deletedAt ?? null
+      deletedAt: null
     };
     const saved = existing ? this.memories.update(memory) : this.memories.insert(memory);
     if (!existing) {

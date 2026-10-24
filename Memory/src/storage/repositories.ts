@@ -62,6 +62,7 @@ import { QueueSchedulingStore, type SchedulingMetadata } from "./queue-schedulin
 import { mainQueueEligibility, retryQueueEligibility, type QueueEligibilityOptions } from "./queue-eligibility.js";
 import { compactHistoryChangePayload, compactHistoryChangeRow } from "./history-change-snapshot.js";
 import { L3FieldRepository } from "./l3-field-repository.js";
+import { isL3FieldSnapshotMemory } from "../service/l3-field/snapshot-memory.js";
 
 type SqlValue = string | number | Buffer | null;
 const BUNDLE_TABLES = [
@@ -1379,7 +1380,7 @@ export class MemoryRepository {
   reindexFts(memory: MemoryRow): void {
     try {
       this.db.prepare(`DELETE FROM memories_fts WHERE id = ?`).run(memory.id);
-      if (!memory.deletedAt && memory.status !== "deleted") {
+      if (!memory.deletedAt && memory.status !== "deleted" && !isL3FieldSnapshotMemory(memory)) {
         this.db
           .prepare(`INSERT INTO memories_fts (id, identifier, memory_value, tags) VALUES (?, ?, ?, ?)`)
           .run(memory.id, memory.id, retrievalDocumentForMemory(memory), memory.tags.join(" "));

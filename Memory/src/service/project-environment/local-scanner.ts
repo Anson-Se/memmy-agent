@@ -54,7 +54,11 @@ interface InventorySnapshot {
   omittedCount: number;
 }
 
-export async function scanLocalProject(workspaceUri: WorkspaceUri): Promise<ProjectEnvironmentScanResult> {
+/** `withRuntimeProbes: false` skips running the declared runtimes (the new L3 keeps them in the machine profile). */
+export async function scanLocalProject(
+  workspaceUri: WorkspaceUri,
+  options: { withRuntimeProbes?: boolean } = {}
+): Promise<ProjectEnvironmentScanResult> {
   const root = await resolveLocalWorkspaceRoot(workspaceUri);
   let stable = await scanInventory(root);
   let next = await scanInventory(root);
@@ -70,7 +74,7 @@ export async function scanLocalProject(workspaceUri: WorkspaceUri): Promise<Proj
     if (textFile) textFiles.push(textFile);
   }
   const runtimeProbes: RuntimeProbeResult[] = [];
-  for (const probe of requiredRuntimeProbes(stable.entries)) {
+  for (const probe of options.withRuntimeProbes === false ? [] : requiredRuntimeProbes(stable.entries)) {
     runtimeProbes.push(await runProbe(root, probe));
   }
   return { ...stable, textFiles, runtimeProbes };

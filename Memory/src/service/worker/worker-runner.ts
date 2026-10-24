@@ -62,6 +62,7 @@ import { resolveWorkerLeaseOptions, type WorkerLeaseOptions } from "./worker-lea
 import { WorkerConcurrencyController, workerCapacityKey, type PreparedWorkerExecution, type WorkerPermit } from "./worker-concurrency.js";
 import { workerWorkRequirements, workerEmbeddingGroupKey } from "./worker-work-requirements.js";
 import { observeWorker, type WorkerObserver, type WorkerMetricOutcome } from "./worker-observability.js";
+import { isL3FieldSnapshotMemory } from "../l3-field/snapshot-memory.js";
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
@@ -175,6 +176,8 @@ export interface WorkerRunnerDeps {
   runWorkerNoWrite: (request: RequestEnvelope) => Promise<WorkerRunSummary>;
   restartFailedProcessing: (at: string, limit: number) => number;
   enqueueObservationBackfill?: (limit: number, at: string) => number;
+  /** Drops new-L3 items that have been inactive longer than the retention window. */
+  purgeL3InactiveItems?: (at: string) => number;
   previewPolicyEvidenceReconciliation: (limit: number) => PolicyEvidencePreflightReport;
   reconcileOrphanedPolicies: (at: string, limit: number) => number;
   enqueueJob: (input: EnqueueJobInput) => EvolutionJobRecord;
@@ -432,6 +435,7 @@ export class WorkerRunner {
     }, limit);
     for (const memory of retrievalMemories) {
       this.deps.repos.memories.reindexFts(memory);
+      if (isL3FieldSnapshotMemory(memory)) continue;
       if (!this.deps.capture.embedAfterCapture || retrievalDocumentIsCurrent(memory)) continue;
       if (this.deps.repos.runtime.hasPendingJob(memory.id, "embedding")) continue;
       const sourceHash = retrievalDocumentSourceHash(memory);
@@ -451,6 +455,7 @@ export class WorkerRunner {
       enqueuedRetrievalReindexes += 1;
     }
 
+    this.deps.purgeL3InactiveItems?.(at);
     this.refreshObservationModelConfiguration();
     return {
       requeuedJobs: interruptedJobs.length + failedJobs.length,

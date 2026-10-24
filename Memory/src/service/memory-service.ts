@@ -1,13 +1,20 @@
 import { EmbeddingMaintenance } from "./embedding/embedding-maintenance.js";
 import { embeddingRetryTargetKindForMemory, embeddingRetryVectorFieldForMemory } from "./embedding/embedding-pipeline.js";
+import { homedir } from "node:os";
 import {
   assertJsonValue,
   canonicalJson,
+  deriveWorkspaceHostId,
   isLocalWorkspaceUri,
   sha256Hex,
   type L3UserProjectsReplaceRequest,
   type L3UserProjectsReplaceResponse
 } from "../contracts/index.js";
+import { getOrCreateInstallationId } from "../cli/analytics.js";
+import { isL3FieldCognitionActive } from "./l3-field/flag.js";
+import { loadL3FieldContext } from "./l3-field/l3-field-context.js";
+import type { L3FieldEnvironment } from "./l3-field/session-units.js";
+import { l3FieldSnapshotUnitKey } from "./l3-field/snapshot-memory.js";
 import {
   languageSteeringLine,
   skillOutputLanguageFor,
@@ -234,6 +241,8 @@ export interface MemoryServiceOptions {
   db?: MemoryDb;
   backend?: StorageBackend;
   mode?: "local" | "cloud" | "dev";
+  /** Machine identity and home folder for the new L3; defaults to this installation. Tests override it. */
+  l3FieldEnvironment?: () => L3FieldEnvironment;
   configPath?: string;
   configLoader?: (configPath?: string) => {
     config: MemmyConfig;
@@ -635,6 +644,9 @@ export class MemoryService {
       runWorkerNoWrite: this.runWorkerNoWrite.bind(this),
       restartFailedProcessing: this.restartFailedProcessing.bind(this),
       enqueueObservationBackfill: (limit, at) => this.observationMemory.backfill(limit, at),
+      purgeL3InactiveItems: (at) => this.repos.l3Field.purgeInactive(
+        new Date(Date.parse(at) - this.config.algorithm.l3FieldCognition.inactiveRetentionDays * 86_400_000).toISOString()
+      ),
       previewPolicyEvidenceReconciliation: this.evolutionJobs.previewPolicyEvidenceReconciliation.bind(this.evolutionJobs),
       reconcileOrphanedPolicies: this.evolutionJobs.reconcileOrphanedPolicies.bind(this.evolutionJobs),
       enqueueJob: this.workerHandlers.enqueueJob,
@@ -1105,6 +1117,20 @@ export class MemoryService {
       this.storageCapabilities().backendId === "sqlite-local";
   }
 
+  private l3FieldActive(): boolean {
+    return isL3FieldCognitionActive(this.config, this.storageCapabilities(), this.mode);
+  }
+
+  private l3FieldEnvironmentCache?: L3FieldEnvironment;
+
+  private l3FieldEnvironment(): L3FieldEnvironment {
+    this.l3FieldEnvironmentCache ??= this.options.l3FieldEnvironment?.() ?? {
+      machineId: deriveWorkspaceHostId(getOrCreateInstallationId({ env: process.env })),
+      homeDir: homedir()
+    };
+    return this.l3FieldEnvironmentCache;
+  }
+
   private memorySearchEnabled(): boolean {
     return this.config.algorithm.enableMemorySearch;
   }
@@ -1540,6 +1566,9 @@ export class MemoryService {
     this.assertL3WorldModelSessionScope(session, request.namespace);
     if (session.status !== "open") {
       throw new MemoryServiceError("conflict", "l3_world_model_session_not_open");
+    }
+    if (this.l3FieldActive()) {
+      return loadL3FieldContext(this.repos, this.l3FieldEnvironment(), session, { readOnly: !this.memoryAddEnabled() });
     }
     return this.l3WorldModelContextReadModel.load(session);
   }
@@ -2790,9 +2819,16 @@ export class MemoryService {
     }
     const kind = kindFromMemory(memory);
     const at = nowIso();
-    const deleted = strictV2WorldModel
-      ? this.repos.l3WorldModels.deleteScopeMemory(memory.id, at)?.deleted
-      : this.repos.memories.softDelete(memory.id, at);
+    const deletedL3Unit = l3FieldSnapshotUnitKey(memory);
+    const deleted = this.repos.transaction(() => {
+      const removed = strictV2WorldModel
+        ? this.repos.l3WorldModels.deleteScopeMemory(memory.id, at)?.deleted
+        : this.repos.memories.softDelete(memory.id, at);
+      // Deleting a new-L3 snapshot resets its unit: what it knew goes, later sessions start it afresh.
+      // Same transaction, so a failure never leaves the unit's items behind a deleted snapshot.
+      if (removed && deletedL3Unit) this.repos.l3Field.markUnitDeleted(deletedL3Unit, at);
+      return removed;
+    });
     if (!deleted) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
