@@ -155,6 +155,14 @@ describe("Office MPP end to end", () => {
         document = await call("office_convert", { taskId: document.taskId, file: document.file, format: "xlsx", allowLossy: true });
         const calculated = await call("office_inspect", { taskId: document.taskId, file: document.file });
         expect(calculated.formulas[0].cachedValue).toBe("50");
+        const calculatedBytes = readFileSync(join(dataRoot, "office/tasks", document.taskId, document.file));
+        const copied = await call("office_execute", { sourceTaskId: document.taskId, inputFiles: [document.file], code: `
+          await fs.copyFile(path.join(workspace, ${JSON.stringify(document.file)}), path.join(workspace, "renamed-budget.xlsx"));
+          return {files:["renamed-budget.xlsx"]};
+        ` });
+        document = { taskId: copied.taskId, file: copied.files[0] };
+        expect(readFileSync(join(dataRoot, "office/tasks", document.taskId, document.file))).toEqual(calculatedBytes);
+        await call("office_deliver", { taskId: document.taskId, file: document.file, revision: sha(calculatedBytes), reviewedPages: [1], reviewNotes: "not yet reviewed" }, "stale_review");
       }
       const rendered = await call("office_render", { taskId: document.taskId, file: document.file });
       expect(rendered.pages.length).toBeGreaterThan(0);

@@ -495,9 +495,16 @@ async function handle(call) {
       const task = await newTask();
       const executionDirectory = path.join(task.directory, "execution");
       await fs.mkdir(executionDirectory);
+      // Snapshot clean input bytes before untrusted code runs. A byte-identical
+      // copy keeps calculation state, but never inherits visual review state.
+      const cleanWorkbookHashes = new Set();
       for (const name of input.inputFiles ?? []) {
         const source = await taskFile({ taskId: input.sourceTaskId, file: name });
-        await writeNew(path.join(executionDirectory, safeName(name)), await fs.readFile(source.file));
+        const bytes = await fs.readFile(source.file);
+        if (ext(name) === "xlsx" && !(await state(source.directory)).dirtyFormulaFiles.includes(name)) {
+          cleanWorkbookHashes.add(digest(bytes));
+        }
+        await writeNew(path.join(executionDirectory, safeName(name)), bytes);
       }
       // __filename survives the CommonJS bundle; it is never derived from input.
       const executable = path.join(path.dirname(__filename), "execute.cjs");
@@ -518,9 +525,12 @@ async function handle(call) {
         if (!["docx", "pdf", "pptx", "xlsx"].includes(ext(name))) throw fail("unsupported_format", "Execution outputs must be Office/PDF files");
         const source = await regular(path.join(executionDirectory, name));
         const file = path.join(task.directory, name);
-        await writeNew(file, await fs.readFile(source));
+        const bytes = await fs.readFile(source);
+        await writeNew(file, bytes);
         const checked = await inspect(file);
-        if (ext(file) === "xlsx" && checked.formulas.length) await state(task.directory, s => { s.dirtyFormulaFiles.push(name); });
+        if (ext(file) === "xlsx" && checked.formulas.length && !cleanWorkbookHashes.has(digest(bytes))) {
+          await state(task.directory, s => { s.dirtyFormulaFiles.push(name); });
+        }
       }
       return { taskId: task.taskId, files: response.files, needsRender: true, codeExecutedInPermissionSandbox: true };
     }

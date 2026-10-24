@@ -100,6 +100,39 @@ test("parallel edits retain all formula invalidations in shared task state", asy
   for (let index = 1; index <= 4; index++) assert.ok(s.dirtyFormulaFiles.includes(`edit-${index}.xlsx`));
 });
 
+test("execution copies inherit calculation state only from byte-identical clean inputs", async t => {
+  const { data } = await environment(t);
+  const generated = await call(data, "office_execute", { code: `
+    const book = new ExcelJS.Workbook(); const sheet = book.addWorksheet("Budget");
+    sheet.addRows([["Amount", "Total"], [20, {formula:"SUM(A2:A3)", result:50}], [30]]);
+    await fs.writeFile(path.join(workspace,"budget.xlsx"), await book.xlsx.writeBuffer());
+    return {files:["budget.xlsx"]};
+  ` });
+  assert.equal(generated.type, "result", JSON.stringify(generated));
+  const copy = async sourceTaskId => call(data, "office_execute", { sourceTaskId, inputFiles:["budget.xlsx"], code: `
+    await fs.copyFile(path.join(workspace,"budget.xlsx"),path.join(workspace,"renamed.xlsx"));
+    return {files:["renamed.xlsx"]};
+  ` });
+  const dirtyCopy = (await copy(generated.output.taskId)).output;
+  const dirtyState = JSON.parse(await readFile(join(data,"tasks",dirtyCopy.taskId,"state.json"),"utf8"));
+  assert.deepEqual(dirtyState.dirtyFormulaFiles,["renamed.xlsx"]);
+  // Imported cached workbooks are clean under the existing import/delivery policy.
+  const imported = (await call(data,"office_import", {path:join(data,"tasks",generated.output.taskId,"budget.xlsx")})).output;
+  const cleanCopy = (await copy(imported.taskId)).output;
+  const cleanState = JSON.parse(await readFile(join(data,"tasks",cleanCopy.taskId,"state.json"),"utf8"));
+  assert.deepEqual(cleanState.dirtyFormulaFiles,[]);
+  assert.deepEqual(cleanState.reviews,{});
+  const changed = await call(data,"office_execute", {sourceTaskId:imported.taskId,inputFiles:["budget.xlsx"],code:`
+    const book = new ExcelJS.Workbook(); await book.xlsx.readFile(path.join(workspace,"budget.xlsx"));
+    book.worksheets[0].getCell("A2").value = 99;
+    await fs.writeFile(path.join(workspace,"budget.xlsx"),await book.xlsx.writeBuffer());
+    return {files:["budget.xlsx"]};
+  `});
+  assert.equal(changed.type,"result",JSON.stringify(changed));
+  const changedState = JSON.parse(await readFile(join(data,"tasks",changed.output.taskId,"state.json"),"utf8"));
+  assert.deepEqual(changedState.dirtyFormulaFiles,["budget.xlsx"]);
+});
+
 test("CSV policy rejects malformed data and preserves quoted/newline/text fields", async t => {
   const policy = { encoding: "UTF-8", bom: "absent", delimiter: ",", quote: '"', newline: "lf", malformedRows: "reject" };
   assert.deepEqual(parseDelimited(Buffer.from('Name,Value\n"line\nbreak","a""b"\n'), policy), [["Name", "Value"], ["line\nbreak", 'a"b']]);
