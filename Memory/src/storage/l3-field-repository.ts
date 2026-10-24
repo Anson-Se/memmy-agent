@@ -269,6 +269,13 @@ export class L3FieldRepository {
     })();
   }
 
+  /** Profile text comes only from code probes (machine) or scan summaries (project). */
+  setProfile(unitKey: string, profile: { text: string | null; fingerprint: string }, at = nowIso()): void {
+    this.db.prepare(
+      `UPDATE l3_units SET profile_text = ?, profile_fingerprint = ?, updated_at = ? WHERE unit_key = ?`
+    ).run(profile.text, profile.fingerprint, at, unitKey);
+  }
+
   /** Throwaway task roots Memmy itself creates (they are never projects); stored with the project list. */
   getStandaloneRoots(userId: string): string[] {
     const row = this.db.prepare(`SELECT value_json FROM runtime_kv WHERE key = ?`)
