@@ -324,7 +324,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
           footer={<div className="plugin-marketplace-detail-footer">
             <span className="plugin-marketplace-detail-status">
               {status(detail)}{detail.installed ? ` · v${detail.installed.version}` : ""}
-              {detail.version ? ` · ${t("plugins.ui.latestVersion", { version: detail.version })}` : ""}
+              {detail.version ? `${detail.installed ? " ｜ " : " · "}${t("plugins.ui.latestVersion", { version: detail.version })}` : ""}
             </span>
             <div className="plugin-marketplace-detail-actions">
               {detail.installed ? <button type="button" className="w-full rounded-xl border border-stone-200 bg-white text-stone-700 text-sm font-normal py-2.5 hover:bg-stone-50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed" disabled={actionsDisabled} onClick={() => requestUninstall(detail)}>{t("settings.plugins.uninstall")}</button> : null}

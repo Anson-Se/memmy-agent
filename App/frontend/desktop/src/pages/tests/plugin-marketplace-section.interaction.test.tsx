@@ -106,7 +106,7 @@ describe("PluginMarketplaceSection", () => {
     expect(props.onUpdate).toHaveBeenCalledExactlyOnceWith(plugin);
     await click("查看Office详情");
     const dialog = document.querySelector("[role=dialog]")!;
-    expect(dialog.querySelector(".plugin-marketplace-detail-status")?.textContent).toBe("已安装 · v1.0.0 · 最新版本 · v1.1.0");
+    expect(dialog.querySelector(".plugin-marketplace-detail-status")?.textContent).toBe("已安装 · v1.0.0 ｜ 最新版本 · v1.1.0");
     await click("更新Office", dialog);
     expect(props.onUpdate).toHaveBeenCalledTimes(2);
     expect(dialog.isConnected).toBe(true);
