@@ -58,7 +58,7 @@ function harness() {
       vectorField: "vec_summary", sourceText: "synthetic", now: epoch });
   }
   function state() {
-    const metadata = new Set(["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version"]);
+    const metadata = new Set(["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version", "policy_promotion"]);
     const rows = (table: string) => (db.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all() as Record<string, unknown>[])
       .map((row) => Object.fromEntries(Object.entries(row).filter(([key]) => !metadata.has(key))));
     return { main: rows("evolution_jobs"), retry: rows("embedding_retry_queue"),

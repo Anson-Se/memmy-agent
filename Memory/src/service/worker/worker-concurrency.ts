@@ -22,6 +22,10 @@ export interface WorkerConcurrencyLimits {
   readonly embeddingBatchSize: number;
 }
 export interface ProviderRequirement { key: string; limit: number }
+/** Opaque, process-local keys used only to wake the waiters of a changed capacity. */
+export function workerCapacityKey(kind: "global" | "background" | "resource" | "scope" | "embedding_request" | "provider", key?: string): string {
+  return JSON.stringify([kind, key ?? null]);
+}
 export interface WorkerRequirements {
   resourceClass: ResourceClass;
   providers: readonly ProviderRequirement[];
@@ -169,7 +173,7 @@ export class WorkerConcurrencyController {
   private readonly states = new WeakMap<WorkerPermit, PermitState>();
   private readonly context = new AsyncLocalStorage<PermitState | undefined>();
   private readonly waiters = new Set<() => void>();
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = new Set<(resources: readonly string[]) => void>();
   private readonly groups = new Set<ReservationGroup>();
   private readonly observers = new Set<WorkerObserver>();
   private closing = false;
@@ -209,7 +213,7 @@ export class WorkerConcurrencyController {
     this.notifyReleased();
     return this.closed;
   }
-  subscribe(listener: () => void): () => void {
+  subscribe(listener: (resources: readonly string[]) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   }
@@ -223,12 +227,15 @@ export class WorkerConcurrencyController {
       scopeKeys: [...this.scopes], embeddingRequests: this.embeddingRequests
     };
   }
-  tryAcquire(requirements: WorkerRequirements, logicalJobs = 1, shareWith?: WorkerPermit): WorkerPermit | undefined {
+  tryAcquire(requirements: WorkerRequirements, logicalJobs = 1, shareWith?: WorkerPermit,
+    onBlocked?: (resource: string) => void): WorkerPermit | undefined {
     positive(logicalJobs, "logicalJobs");
-    return this.acquire(requirements, logicalJobs, shareWith);
+    return this.acquire(requirements, logicalJobs, shareWith, onBlocked);
   }
-  private acquire(input: WorkerRequirements, logicalJobs: number, shareWith?: WorkerPermit): WorkerPermit | undefined {
-    const reject = (reason: AdmissionRejectReason): undefined => {
+  private acquire(input: WorkerRequirements, logicalJobs: number, shareWith?: WorkerPermit,
+    onBlocked?: (resource: string) => void): WorkerPermit | undefined {
+    const reject = (reason: AdmissionRejectReason, resource?: string): undefined => {
+      if (resource) onBlocked?.(resource);
       for (const observer of this.observers) observeWorker(observer, { type: "admission_rejected", reason });
       return undefined;
     };
@@ -249,19 +256,20 @@ export class WorkerConcurrencyController {
       || !parent.group.embedding || !input.embedding || JSON.stringify(parent.group.providers) !== JSON.stringify(providers))) return reject("share_invalid");
     if (input.resourceClass === "embedding" && input.embedding &&
       logicalJobs + (parent?.group.logicalJobs ?? 0) > this.limits.embeddingBatchSize) return reject("batch");
-    if (logicalJobs > this.availableJobs()) return reject("global");
+    if (logicalJobs > this.availableJobs()) return reject("global", workerCapacityKey("global"));
     // Charge every logical member independently, including shared embedding batches.
     // Missing/unknown lanes do not gain interactive privilege; foreground calls charge zero.
     const backgroundJobs = input.queueLane === "interactive" ? 0 : logicalJobs;
-    if (this.backgroundActiveJobs + backgroundJobs > this.limits.maxBackgroundJobs) return reject("background");
-    if ((this.resources.get(input.resourceClass) ?? 0) + logicalJobs > this.limits.resourceLimits[input.resourceClass]) return reject("resource");
-    if (scopeKeys.some(key => this.scopes.has(key))) return reject("scope");
+    if (this.backgroundActiveJobs + backgroundJobs > this.limits.maxBackgroundJobs) return reject("background", workerCapacityKey("background"));
+    if ((this.resources.get(input.resourceClass) ?? 0) + logicalJobs > this.limits.resourceLimits[input.resourceClass]) return reject("resource", workerCapacityKey("resource", input.resourceClass));
+    const heldScope = scopeKeys.find(key => this.scopes.has(key));
+    if (heldScope) return reject("scope", workerCapacityKey("scope", heldScope));
     if (!parent) {
-      if (requirements.embedding && this.embeddingRequests >= this.limits.embeddingRequestConcurrency) return reject("embedding_request");
+      if (requirements.embedding && this.embeddingRequests >= this.limits.embeddingRequestConcurrency) return reject("embedding_request", workerCapacityKey("embedding_request"));
       for (const provider of providers) {
         const active = this.providers.get(provider.key);
         const cap = Math.min(provider.limit, ...active?.values() ?? []);
-        if ((active?.size ?? 0) >= cap) return reject("provider");
+        if ((active?.size ?? 0) >= cap) return reject("provider", workerCapacityKey("provider", provider.key));
       }
     }
     const group: ReservationGroup = parent?.group ?? { providers, embedding: requirements.embedding === true,
@@ -293,8 +301,10 @@ export class WorkerConcurrencyController {
         if (count) this.resources.set(input.resourceClass, count); else this.resources.delete(input.resourceClass);
         for (const key of scopeKeys) this.scopes.delete(key);
         group.members--;
-        this.releaseGroupIfIdle(group);
-        this.notifyReleased();
+        const freed = scopeKeys.map(key => workerCapacityKey("scope", key));
+        if (logicalJobs > 0) freed.push(workerCapacityKey("global"), workerCapacityKey("resource", input.resourceClass));
+        if (backgroundJobs > 0) freed.push(workerCapacityKey("background"));
+        this.notifyReleased([...freed, ...this.releaseGroupIfIdle(group)]);
       }
     };
     this.states.set(permit, state);
@@ -315,21 +325,23 @@ export class WorkerConcurrencyController {
     for (const observer of this.observers) observeWorker(observer, { type: "concurrency", state });
   }
 
-  private releaseGroupIfIdle(group: ReservationGroup): void {
-    if (group.members || group.activeRequests || !this.groups.delete(group)) return;
+  private releaseGroupIfIdle(group: ReservationGroup): string[] {
+    if (group.members || group.activeRequests || !this.groups.delete(group)) return [];
     for (const provider of group.providers) {
       const active = this.providers.get(provider.key)!;
       active.delete(group); if (active.size === 0) this.providers.delete(provider.key);
     }
     if (group.embedding) this.embeddingRequests--;
+    return [...group.providers.map(provider => workerCapacityKey("provider", provider.key)),
+      ...(group.embedding ? [workerCapacityKey("embedding_request")] : [])];
   }
 
-  private notifyReleased(): void {
+  private notifyReleased(resources: readonly string[] = []): void {
     this.observeConcurrency();
     for (const wake of this.waiters) wake();
     this.waiters.clear();
     for (const listener of this.listeners) {
-      try { listener(); } catch { /* Observers cannot prevent resource release. */ }
+      try { listener(resources); } catch { /* Observers cannot prevent resource release. */ }
     }
     if (this.closing && this.activeJobs === 0 && this.groups.size === 0) this.resolveClosed?.();
   }
@@ -352,8 +364,7 @@ export class WorkerConcurrencyController {
         finally {
           state.group.activeRequests--;
           if (state.group.members === 0) {
-            this.releaseGroupIfIdle(state.group);
-            this.notifyReleased();
+            this.notifyReleased(this.releaseGroupIfIdle(state.group));
           }
         }
       });

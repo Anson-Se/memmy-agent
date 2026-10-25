@@ -3292,6 +3292,9 @@ export class RuntimeRepository {
   enqueueJobInTransaction(job: EvolutionJobRecord): EvolutionJobRecord {
     const existing = job.dedupeKey ? this.getActiveJobByDedupeKey(job.dedupeKey) : undefined;
     if (existing) {
+      // Capture an older/raw producer's explicit promotion before merging a new
+      // delivery's payload. Current projections are a cheap indexed no-op.
+      this.scheduling.refreshOne("main", existing.id);
       const updatedAt = job.updatedAt ?? nowIso();
       const payload = mergeJobPayload(existing.payload, job.payload);
       const manualRetry = existing.status === "failed" && job.payload.source === "memory.processing.manual_retry";

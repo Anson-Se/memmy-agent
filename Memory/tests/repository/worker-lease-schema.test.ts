@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
+import { pendingPolicyIndex } from "../../src/storage/queue-scheduling-schema.js";
 import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories } from "../../src/storage/repositories.js";
 import { SCHEMA_VERSION } from "../../src/storage/schema.js";
@@ -227,11 +228,13 @@ function usingDatabase(run: (runtime: Repositories["runtime"]) => void): void {
 function removeSchedulingSchema(db: MemoryDb): void {
   for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
     for (const suffix of ["enqueue_sequence", "policy_dirty"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
+    db.db.exec(`DROP INDEX ${pendingPolicyIndex(table)}`);
+    db.db.exec(`DROP INDEX ${pendingPolicyIndex(table, true)}`);
     for (const suffix of ["enqueue_seq", "lane_due", "lane_fifo", "policy_dirty"]) db.db.exec(`DROP INDEX ${table}_${suffix}`);
   }
   for (const suffix of ["dirty", "insert", "delete"]) db.db.exec(`DROP TRIGGER memories_worker_policy_${suffix}`);
   for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
-    for (const column of ["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version"]) {
+    for (const column of ["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version", "policy_promotion"]) {
       db.db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
     }
   }

@@ -125,7 +125,10 @@ describe("atomic resource admission before queue claims", () => {
     const admit = (work: FairClaimedWork) => work.queue === "main" && Number(work.job.id.split("-")[1]) < 64
       ? undefined : { release() {} };
     expect(h.claim(1, admit, "wrr", false, scan)).toEqual([]);
-    h.runtime.enqueueJob({ ...h.runtime.getJob("job-64")!, id: "new-id", payload: { source: "turn.complete.capture" } });
+    // A first-report promotion can move an explicitly retried task to interactive.
+    // Ordinary background redelivery must now retain that task's earned urgency.
+    h.db.db.prepare(`INSERT INTO memories(id,timeline,user_id,memory_value,memory_layer,agent_id,created_at,updated_at)
+      VALUES ('job-64',?,'user','synthetic','L1','memmy-onboarding',?,?)`).run(at, at, at);
     const work: FairClaimedWork[] = [];
     do { work.push(...h.claim(1, admit, "wrr", false, scan)); } while (!work.length && scan.more);
     expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["job-65"]);

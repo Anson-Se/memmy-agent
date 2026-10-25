@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCommand } from "../../Memory/src/cli/commands.js";
 import { PROJECT_VERSION } from "../../Memory/src/cli/project-version.js";
 import {
@@ -10,12 +10,16 @@ import {
   MemoryDb,
   MemoryService,
   type Embedder,
-  type LlmClient
+  type JobRef,
+  type LlmClient,
+  type LlmMessage
 } from "../../Memory/src/index.js";
+import { Repositories } from "../../Memory/src/storage/repositories.js";
 
 const tempRoots: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -38,16 +42,25 @@ describe("memory layer smoke plan", () => {
       .toContain("tsx tests/smoke/memory-layer-smoke.ts");
   });
 
-  it("stores, processes, reads, and recalls a verified turn through the real Memory service", async () => {
+  it.each([1, 20])("stores, processes, reads, and recalls a verified turn with worker budget %i", async (workerBudget) => {
     const root = mkdtempSync(join(tmpdir(), "memmy-memory-smoke-"));
     tempRoots.push(root);
     const db = new MemoryDb({ path: join(root, "memory.sqlite") });
+    const repos = new Repositories(db.db);
+    const llm = createSmokeSummaryLlm();
+    const embedder = createSmokeEmbedder();
+    const modelCalls = [
+      vi.spyOn(llm, "complete"),
+      vi.spyOn(llm, "completeJson"),
+      vi.spyOn(embedder, "embed"),
+      vi.spyOn(embedder, "embedOne")
+    ];
     const service = new MemoryService({
       db,
       mode: "dev",
       config: DEFAULT_MEMMY_CONFIG,
-      llm: createSmokeSummaryLlm(),
-      embedder: createSmokeEmbedder(),
+      llm,
+      embedder,
       fetchAppMemoryBudget: async () => null
     });
     const namespace = {
@@ -95,13 +108,42 @@ describe("memory layer smoke plan", () => {
       });
       expect(completed.jobs.map((job) => job.jobType)).toContain("trace_summary");
 
-      const summaryWorker = await service.runWorkerOnce(20, { namespace });
-      expect(summaryWorker.failed).toBe(0);
-      expect(summaryWorker.jobs.map((job) => job.jobType)).toContain("trace_summary");
+      // Continuous refill may process the summary and its embedding in one call.
+      // Collect bounded rounds so this smoke contract also holds with a small budget.
+      const processedJobs: JobRef[] = [];
+      let drained = false;
+      for (let round = 0; round < 20; round += 1) {
+        const worker = await service.runWorkerOnce(workerBudget, { namespace });
+        expect(worker.failed).toBe(0);
+        expect(worker.embeddingRetries.failed).toBe(0);
+        expect(worker.succeeded).toBe(worker.leased);
+        processedJobs.push(...worker.jobs);
+        if (worker.leased === 0 && worker.embeddingRetries.leased === 0) {
+          drained = true;
+          break;
+        }
+      }
+      expect(drained, "Smoke jobs must finish within the bounded worker rounds").toBe(true);
+      for (const jobType of ["trace_summary", "embedding"] as const) {
+        const jobs = processedJobs.filter((job) =>
+          job.jobType === jobType && job.targetMemoryId === completed.l1MemoryId
+        );
+        expect(jobs).toHaveLength(1);
+        expect(jobs[0]?.status).toBe("succeeded");
+      }
+      expect(new Set(processedJobs.map((job) => job.jobId)).size).toBe(processedJobs.length);
+      expect(repos.memories.hasVector(completed.l1MemoryId, "vec_summary")).toBe(true);
+      expect(repos.processing.get(completed.l1MemoryId)).toMatchObject({ state: "ready" });
 
-      const embeddingWorker = await service.runWorkerOnce(20, { namespace });
-      expect(embeddingWorker.failed).toBe(0);
-      expect(embeddingWorker.jobs.map((job) => job.jobType)).toContain("embedding");
+      const callsAfterProcessing = modelCalls.map((spy) => spy.mock.calls.length);
+      for (let round = 0; round < 2; round += 1) {
+        const idleWorker = await service.runWorkerOnce(workerBudget, { namespace });
+        expect(idleWorker).toMatchObject({
+          leased: 0, succeeded: 0, failed: 0, jobs: [],
+          embeddingRetries: { leased: 0, succeeded: 0, failed: 0, items: [] }
+        });
+      }
+      expect(modelCalls.map((spy) => spy.mock.calls.length)).toEqual(callsAfterProcessing);
 
       const detail = service.getMemory(completed.l1MemoryId, { namespace });
       expect(detail).toMatchObject({
@@ -214,7 +256,7 @@ function createSmokeSummaryLlm(): LlmClient {
     async complete() {
       return JSON.stringify({ title: "Smoke turn", summary: "Verified smoke summary" });
     },
-    async completeJson<T extends Record<string, unknown>>(messages) {
+    async completeJson<T extends Record<string, unknown>>(messages: LlmMessage[]) {
       const system = messages
         .filter((message) => message.role === "system")
         .map((message) => message.content)

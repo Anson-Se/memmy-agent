@@ -5,6 +5,7 @@ import {
 } from "../service/worker/job-policy-registry.js";
 import { mainQueueEligibility, retryQueueEligibility, type QueueEligibilityOptions } from "./queue-eligibility.js";
 import { createMemoryLogger, memoryErrorFields } from "../logging/logger.js";
+import { activePolicyPredicate, pendingPolicyIndex, pendingPolicyPredicate } from "./queue-scheduling-schema.js";
 import { JobLeaseLostError } from "./job-lease-context.js";
 
 const logger = createMemoryLogger("worker");
@@ -34,11 +35,13 @@ interface PolicyRow {
   id: string; job_type: string; payload_json: string; agent_id: string | null;
   memory_layer: string | null; tags_json: string | null; plugin_algorithm: string | null; capture_origin: unknown;
   previous_queue_lane: string | null;
+  policy_promotion: string | null;
+  status: string;
 }
 export interface PolicyRefreshResult {
   refreshed: number;
   unknown: Array<{ id: string; jobType: string }>;
-  /** Present only for bounded runnable refreshes; true can conservatively mean the budget was exhausted. */
+  /** Present for active/runnable maintenance; runnable probes may conservatively report an exhausted budget. */
   hasMore?: boolean;
 }
 
@@ -55,22 +58,44 @@ export class QueueSchedulingStore {
   }
 
   refreshPolicies(limit = 500): PolicyRefreshResult {
-    const result: PolicyRefreshResult = { refreshed: 0, unknown: [] };
+    return this.refreshPendingPolicies(Math.max(0, limit), false, true);
+  }
+
+  /** Admission maintenance is independent of eligibility. Even delayed/blocked
+   * dirty tasks leave the worklist after one bounded visit; they cannot be scanned
+   * again on every refill. Terminal history is absent from the active index. */
+  refreshActivePolicies(input: { maxRows?: number; includeRetries?: boolean } = {}): PolicyRefreshResult {
+    if (input.maxRows !== undefined && (!Number.isSafeInteger(input.maxRows) || input.maxRows < 0)) {
+      throw new RangeError("maxRows must be a non-negative safe integer");
+    }
+    return this.refreshPendingPolicies(input.maxRows, true, input.includeRetries !== false);
+  }
+
+  private refreshPendingPolicies(limit: number | undefined, active: boolean, includeRetries: boolean): PolicyRefreshResult {
+    const result: PolicyRefreshResult = { refreshed: 0, unknown: [], ...(active ? { hasMore: false } : {}) };
     if (this.db.readonly) return result;
     return this.db.transaction(() => {
       for (const queue of ["main", "embedding_retry"] as const) {
+        if (queue === "embedding_retry" && !includeRetries) continue;
         const table = queue === "main" ? "evolution_jobs" : "embedding_retry_queue";
         const target = queue === "main" ? "q.target_memory_id" : "q.target_id";
-        const rows = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane,
-          ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
-          m.agent_id, m.memory_layer, m.tags_json,
-          json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
-          json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
-          FROM ${table} q LEFT JOIN memories m ON m.id = ${target}
-          WHERE q.policy_version IS NULL OR q.policy_version != ? ORDER BY q.enqueue_seq LIMIT ?`)
-          .all(JOB_POLICY_VERSION, Math.max(0, limit - result.refreshed)) as PolicyRow[];
-        for (const row of rows) {
-          this.writePolicy(table, row, result);
+        const predicate = `${pendingPolicyPredicate}${active ? ` AND ${activePolicyPredicate(table, "q.")}` : ""}`;
+        for (;;) {
+          const remaining = limit === undefined ? 200 : Math.min(200, limit - result.refreshed);
+          if (remaining === 0) {
+            if (active && this.db.prepare(`SELECT 1 FROM ${table} q INDEXED BY ${pendingPolicyIndex(table, active)}
+              WHERE ${predicate} LIMIT 1`).get()) result.hasMore = true;
+            break;
+          }
+          const rows = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane, q.policy_promotion, q.status,
+            ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
+            m.agent_id, m.memory_layer, m.tags_json,
+            json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
+            json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
+            FROM ${table} q INDEXED BY ${pendingPolicyIndex(table, active)} LEFT JOIN memories m ON m.id = ${target}
+            WHERE ${predicate} ORDER BY q.enqueue_seq LIMIT ?`).all(remaining) as PolicyRow[];
+          for (const row of rows) this.writePolicy(table, row, result);
+          if (rows.length < remaining) break;
         }
       }
       return result;
@@ -95,33 +120,36 @@ export class QueueSchedulingStore {
     if (this.db.readonly) return result;
     const main = mainQueueEligibility(input.at, input);
     const retry = retryQueueEligibility(Date.parse(input.at), input.targetMemoryIds);
+    // Start from the event-maintained pending index, then check each dirty ID.
+    // Never materialize the whole eligible queue to discover missing metadata.
     return this.db.transaction(() => {
       for (const queue of ["main", "embedding_retry"] as const) {
         if (queue === "embedding_retry" && input.includeRetries === false) continue;
+        if ((queue === "main" ? main.sql : retry.sql) === "0") continue;
         const table = queue === "main" ? "evolution_jobs" : "embedding_retry_queue";
         const target = queue === "main" ? "q.target_memory_id" : "q.target_id";
         const ready = queue === "main"
-          ? `q.id IN (SELECT id FROM evolution_jobs WHERE ${main.sql})`
+          ? `EXISTS (SELECT 1 FROM evolution_jobs WHERE id = q.id AND (${main.sql}))`
           : retry.sql;
         const parameters = queue === "main" ? main.params : retry.params;
         if (input.maxRows === 0) {
-          const found = this.db.prepare(`SELECT 1 FROM ${table} q
-            WHERE (q.policy_version IS NULL OR q.policy_version != ?) AND (${ready}) LIMIT 1`)
-            .get(JOB_POLICY_VERSION, ...parameters);
+          const found = this.db.prepare(`SELECT 1 FROM ${table} q INDEXED BY ${pendingPolicyIndex(table)}
+            WHERE ${pendingPolicyPredicate} AND (${ready}) LIMIT 1`)
+            .get(...parameters);
           if (found) { result.hasMore = true; return result; }
           continue;
         }
         for (;;) {
           const remaining = input.maxRows === undefined ? 200 : Math.min(200, input.maxRows - result.refreshed);
           if (remaining === 0) { result.hasMore = true; return result; }
-          const rows = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane,
+          const rows = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane, q.policy_promotion, q.status,
             ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
             m.agent_id, m.memory_layer, m.tags_json,
             json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
             json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
-            FROM ${table} q LEFT JOIN memories m ON m.id = ${target}
-            WHERE (q.policy_version IS NULL OR q.policy_version != ?) AND (${ready})
-            ORDER BY q.enqueue_seq LIMIT ?`).all(JOB_POLICY_VERSION, ...parameters, remaining) as PolicyRow[];
+            FROM ${table} q INDEXED BY ${pendingPolicyIndex(table)} LEFT JOIN memories m ON m.id = ${target}
+            WHERE ${pendingPolicyPredicate} AND (${ready})
+            ORDER BY q.enqueue_seq LIMIT ?`).all(...parameters, remaining) as PolicyRow[];
           if (rows.length === 0) break;
           for (const row of rows) this.writePolicy(table, row, result);
         }
@@ -135,12 +163,12 @@ export class QueueSchedulingStore {
     try {
       const table = queue === "main" ? "evolution_jobs" : "embedding_retry_queue";
       const target = queue === "main" ? "q.target_memory_id" : "q.target_id";
-      const row = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane,
+      const row = this.db.prepare(`SELECT q.id, q.queue_lane AS previous_queue_lane, q.policy_promotion, q.status,
         ${queue === "main" ? "q.job_type, q.payload_json" : "'embedding_retry' AS job_type, '{}' AS payload_json"},
         m.agent_id, m.memory_layer, m.tags_json,
         json_extract(m.properties_json, '$.internal_info.plugin_algorithm') AS plugin_algorithm,
         json_extract(m.properties_json, '$.internal_info.capture_origin') AS capture_origin
-        FROM ${table} q LEFT JOIN memories m ON m.id = ${target} WHERE q.id = ?`).get(id) as PolicyRow | undefined;
+        FROM ${table} q LEFT JOIN memories m ON m.id = ${target} WHERE q.id = ? AND ${pendingPolicyPredicate}`).get(id) as PolicyRow | undefined;
       if (row) this.writePolicy(table, row, result);
     } catch (error) {
       if (error instanceof JobLeaseLostError) throw error;
@@ -153,10 +181,11 @@ export class QueueSchedulingStore {
 
   private writePolicy(table: string, row: PolicyRow, result: PolicyRefreshResult): void {
     let policy: { queueLane: string; resourceClass: string; basePriority: number; policyVersion: number };
+    let promotion: "onboarding_first_report" | "manual_retry" | null = null;
     try {
       const payload: unknown = JSON.parse(row.payload_json);
       const tags: unknown = row.tags_json ? JSON.parse(row.tags_json) : [];
-      policy = jobPolicyRegistry.resolve({ jobType: row.job_type,
+      const input = { jobType: row.job_type,
         payload: payload && typeof payload === "object" && !Array.isArray(payload)
           ? payload as Record<string, unknown> : {}, target: {
           agentId: typeof row.agent_id === "string" ? row.agent_id : undefined,
@@ -165,7 +194,19 @@ export class QueueSchedulingStore {
           pluginAlgorithm: typeof row.plugin_algorithm === "string" ? row.plugin_algorithm : undefined,
           captureOrigin: typeof row.capture_origin === "string" ? row.capture_origin : undefined
         }
-      });
+      };
+      policy = jobPolicyRegistry.resolve(input);
+      // Business urgency, never lane weights: first report > explicit retry >
+      // ordinary classification. Keep earned urgency only for this unfinished task.
+      const unfinished = table === "evolution_jobs"
+        ? ["queued", "leased", "failed"].includes(row.status)
+        : ["pending", "in_progress"].includes(row.status);
+      if (unfinished) {
+        if (row.policy_promotion === "onboarding_first_report" ||
+          (policy.queueLane === "interactive" && policy.basePriority === -100)) promotion = "onboarding_first_report";
+        else if (row.policy_promotion === "manual_retry" || input.payload.source === "memory.processing.manual_retry") promotion = "manual_retry";
+      }
+      if (promotion) policy = jobPolicyRegistry.resolve({ ...input, operationMode: promotion });
     } catch (error) {
       if (!(error instanceof UnknownJobPolicyError)) throw error;
       // Keep quarantine explicit. WRR admits these only for terminal cleanup;
@@ -175,8 +216,8 @@ export class QueueSchedulingStore {
       policy = { queueLane: "unregistered", resourceClass: "unregistered",
         basePriority: 0, policyVersion: JOB_POLICY_VERSION };
     }
-    const updated = this.db.prepare(`UPDATE ${table} SET queue_lane = ?, resource_class = ?, base_priority = ?, policy_version = ? WHERE id = ?`)
-      .run(policy.queueLane, policy.resourceClass, policy.basePriority, policy.policyVersion, row.id);
+    const updated = this.db.prepare(`UPDATE ${table} SET queue_lane = ?, resource_class = ?, base_priority = ?, policy_version = ?, policy_promotion = ? WHERE id = ?`)
+      .run(policy.queueLane, policy.resourceClass, policy.basePriority, policy.policyVersion, promotion, row.id);
     if (updated.changes > 0 && row.previous_queue_lane !== null) {
       // Do not invalidate deep scans for ordinary new imports. An existing row
       // can change lane/resource/scope even while ending at the same policy version.
@@ -188,9 +229,9 @@ export class QueueSchedulingStore {
 
   pendingPolicyCount(): number {
     return Number((this.db.prepare(`SELECT
-      (SELECT COUNT(*) FROM evolution_jobs WHERE policy_version IS NULL OR policy_version != ?) +
-      (SELECT COUNT(*) FROM embedding_retry_queue WHERE policy_version IS NULL OR policy_version != ?) AS n`)
-      .get(JOB_POLICY_VERSION, JOB_POLICY_VERSION) as { n: number }).n);
+      (SELECT COUNT(*) FROM evolution_jobs INDEXED BY ${pendingPolicyIndex("evolution_jobs")} WHERE ${pendingPolicyPredicate}) +
+      (SELECT COUNT(*) FROM embedding_retry_queue INDEXED BY ${pendingPolicyIndex("embedding_retry_queue")} WHERE ${pendingPolicyPredicate}) AS n`)
+      .get() as { n: number }).n);
   }
 
   unregisteredPolicyCount(): number {

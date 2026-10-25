@@ -89,6 +89,121 @@ function blockedBacklog(h: ReturnType<typeof harness>, count = 1000) {
 }
 
 describe("continuous worker event-loop fairness", () => {
+  it("reaches an independent evolution Provider behind 20,000 blocked jobs during ongoing interference", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 20_000), abort = new AbortController();
+    h.deps.scheduling = { algorithm: "wrr", aging: { enabled: true, thresholdMs: 1 } };
+    h.db.db.prepare("UPDATE evolution_jobs SET job_type='reflection' WHERE id='late-database'").run();
+    h.repos.runtime.scheduling.refreshOne("main", "late-database");
+    h.db.db.prepare("UPDATE evolution_jobs SET queue_lane='import', first_queued_at='2000-01-01T00:00:00.000Z'").run();
+    const prepare = h.deps.prepareExecution!;
+    h.deps.prepareExecution = work => {
+      const execution = prepare(work);
+      return work.queue === "main" && work.job.id === "late-database"
+        ? { ...execution, providers: [{ key: "independent-evolution", limit: 1 }] } : execution;
+    };
+    let releases = 0;
+    const interference = (async () => {
+      for (let turn = 0; turn < 400 && !abort.signal.aborted; turn++) {
+        await nextTurn();
+        await h.concurrency.runRequest({ local: false, providers: [{ key: "noise", limit: 1 }] }, async () => {});
+        releases++;
+      }
+      abort.abort();
+    })();
+    try {
+      const result = await h.runner.runWorkerOnce(1, {}, { signal: abort.signal });
+      expect(result.jobs.map(job => job.jobId)).toEqual(["late-database"]);
+      expect(releases).toBeGreaterThan(0);
+      expect(releases).toBeLessThan(400);
+      expect(backlog.prepared()).toBe(20_001);
+      expect(h.db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE status='queued' AND attempts=0 AND lease_token IS NULL").get()).toEqual({ n: 20_000 });
+    } finally { abort.abort(); await interference; backlog.held.release(); }
+    h.expectClean();
+  }, 30_000);
+
+  it("does not re-prepare already blocked rows after a full scan on unrelated wakeups", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 100), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const run = h.runner.runWorkerOnce(2, {}, { signal: abort.signal });
+    try {
+      for (let i = 0; i < 8; i++) await nextTurn();
+      expect(backlog.prepared()).toBe(100);
+      for (let i = 0; i < 8; i++) {
+        await h.concurrency.runRequest({ local: false, providers: [{ key: "noise", limit: 1 }] }, async () => {});
+        await nextTurn();
+      }
+      expect(backlog.prepared()).toBe(100);
+      backlog.held.release();
+      expect((await run).jobs.map(job => job.jobId)).toEqual(["blocked-0", "blocked-1"]);
+    } finally { abort.abort(); backlog.held.release(); await run; }
+    h.expectClean();
+  });
+
+  it("rechecks a parked row after its stored execution metadata changes", async () => {
+    const h = harness(), backlog = blockedBacklog(h), abort = new AbortController();
+    const prepare = h.deps.prepareExecution!;
+    h.deps.prepareExecution = work => {
+      const execution = prepare(work);
+      return work.queue === "main" && work.job.payload.independent === true
+        ? { ...execution, providers: [] } : execution;
+    };
+    const changed = (async () => {
+      await nextTurn();
+      h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='blocked-0'")
+        .run(JSON.stringify({ independent: true }));
+      h.repos.runtime.scheduling.refreshOne("main", "blocked-0");
+      h.db.db.prepare("UPDATE evolution_jobs SET queue_lane='import' WHERE id='blocked-0'").run();
+      h.runner.notifyWorkAvailable();
+    })();
+    try {
+      const result = await h.runner.runWorkerOnce(1, {}, { signal: abort.signal });
+      expect(result.jobs.map(job => job.jobId)).toEqual(["blocked-0"]);
+      expect(h.repos.runtime.getJob("late-database")).toMatchObject({ status: "queued", attempts: 0 });
+    } finally { abort.abort(); await changed; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("does not keep a finite drain waiting on parked records that were deleted", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 8), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    let finished = false;
+    const run = h.runner.runWorkerOnce(1, {}, { signal: abort.signal }).then(result => { finished = true; return result; });
+    try {
+      for (let i = 0; i < 4; i++) await nextTurn();
+      expect(backlog.prepared()).toBe(8);
+      h.db.db.prepare("DELETE FROM evolution_jobs").run();
+      h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 4; i++) await nextTurn();
+      expect(finished).toBe(true);
+      expect((await run).leased).toBe(0);
+    } finally { abort.abort(); backlog.held.release(); await run; }
+    h.expectClean();
+  });
+
+  it.each([false, true])("makes progress through unrelated Provider releases (aging=%s)", async aging => {
+    const h = harness(), backlog = blockedBacklog(h, 2_000), abort = new AbortController();
+    h.deps.scheduling = { algorithm: "wrr", aging: { enabled: aging, thresholdMs: 1 } };
+    h.db.db.prepare("UPDATE evolution_jobs SET first_queued_at='2000-01-01T00:00:00.000Z'").run();
+    const noise = { local: false, providers: [{ key: "unrelated-foreground", limit: 1 }] };
+    let releases = 0;
+    const interference = (async () => {
+      for (let turn = 0; turn < 80 && !abort.signal.aborted; turn++) {
+        await nextTurn();
+        await h.concurrency.runRequest(noise, async () => {});
+        releases++;
+      }
+      abort.abort();
+    })();
+    try {
+      const result = await h.runner.runWorkerOnce(1, {}, { signal: abort.signal });
+      expect(releases).toBeGreaterThan(0);
+      expect(result.jobs.map(job => job.jobId)).toEqual(["late-database"]);
+      expect(backlog.prepared()).toBe(backlog.count + 1);
+      expect(h.repos.runtime.getJob("blocked-0")).toMatchObject({ status: "queued", attempts: 0, leaseToken: null });
+    } finally { abort.abort(); await interference; backlog.held.release(); }
+    h.expectClean();
+  });
+
   it("yields while projecting an upgraded dirty queue and admits no row before projection completes", async () => {
     const h = harness(), backlog = blockedBacklog(h), abort = new AbortController();
     h.db.db.prepare("UPDATE evolution_jobs SET policy_version=0").run();

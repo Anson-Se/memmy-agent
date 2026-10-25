@@ -110,6 +110,66 @@ function prepareProviders(h: ReturnType<typeof harness>, prepare: (work: FairCla
 }
 
 describe("continuous worker admission with real SQLite", () => {
+  it("rechecks multiple required Providers in turn without losing FIFO or reserving partial capacity", async () => {
+    const h = harness();
+    const holds = ["A", "B"].map(key => h.concurrency.tryAcquire({ resourceClass: "summary",
+      queueLane: "interactive", providers: [{ key, limit: 1 }], scopeKeys: [] })!);
+    prepareProviders(h, () => ({ providers: [{ key: "A", limit: 1 }, { key: "B", limit: 1 }], run: operation => operation() }));
+    h.job("oldest", "trace_summary"); h.job("next", "trace_summary");
+    const positions = mainRows(h).map(row => row.id);
+    const run = h.runner.runWorkerOnce(100);
+    try {
+      await flushPump();
+      expect(h.executed).toEqual([]);
+      holds[0]!.release(); await flushPump();
+      expect(h.executed).toEqual([]);
+      expect(h.concurrency.snapshot().providers).toEqual({ B: 1 });
+      expect(mainRows(h).every(row => row.status === "queued" && row.attempts === 0 && row.lease_token === null)).toBe(true);
+      holds[1]!.release();
+      expect((await run).jobs.map(job => job.jobId)).toEqual(positions);
+      expect(h.executed).toEqual(["oldest", "next"]);
+    } finally { holds.forEach(permit => permit.release()); await run; }
+    expectNoPermits(h);
+  });
+
+  it("finishes a drained request while an unrelated foreground Provider is still held", async () => {
+    const h = harness(), gate = deferred(), entered = deferred(), abort = new AbortController();
+    const foreground = h.concurrency.runRequest({ local: false, providers: [{ key: "unrelated", limit: 1 }] }, async () => {
+      entered.resolve(); await gate.promise;
+    });
+    await entered.promise;
+    prepareProviders(h, () => ({ providers: [{ key: "shared-worker", limit: 1 }], run: operation => operation() }));
+    h.job("first", "trace_summary"); h.job("second", "trace_summary");
+    let finished = false;
+    const run = h.runner.runWorkerOnce(100, {}, { signal: abort.signal }).then(result => { finished = true; return result; });
+    try {
+      await flushPump();
+      expect(finished).toBe(true);
+      expect(h.executed).toEqual(["first", "second"]);
+      expect(h.concurrency.snapshot().providers).toEqual({ unrelated: 1 });
+    } finally { abort.abort(); gate.resolve(); await foreground; await run; }
+    expectNoPermits(h);
+  });
+
+  it("reawakens parked embedding retries without changing their FIFO positions or attempts before admission", async () => {
+    const h = harness();
+    const held = h.concurrency.tryAcquire({ resourceClass: "embedding", embedding: true,
+      providers: [{ key: "embedding-provider", limit: 1 }], scopeKeys: [] })!;
+    prepareProviders(h, () => ({ providers: [{ key: "embedding-provider", limit: 1 }], embedding: true, run: operation => operation() }));
+    h.retry("retry-oldest"); h.retry("retry-next");
+    const run = h.runner.runEmbeddingRetryOnce(2);
+    try {
+      await flushPump();
+      expect(h.executed).toEqual([]);
+      expect(h.repos.runtime.getEmbeddingRetry("retry-oldest")).toMatchObject({ status: "pending", attempts: 0 });
+      held.release();
+      const result = await run;
+      expect(result.items.map(item => item.id)).toEqual(["retry-oldest", "retry-next"]);
+      expect(result).toMatchObject({ leased: 2, succeeded: 2, failed: 0 });
+    } finally { held.release(); await run; }
+    expectNoPermits(h);
+  });
+
   it("keeps limit=100 as a drain budget rather than leasing waiting tasks ahead of capacity", async () => {
     const gate = deferred();
     const started: string[] = [];

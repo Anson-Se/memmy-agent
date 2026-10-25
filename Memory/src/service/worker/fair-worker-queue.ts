@@ -6,8 +6,10 @@ import { LaneQueueSelector } from "./lane-queue-selector.js";
 import { AdmissionLaneQueueSelector, type LaneQueueTurns } from "./admission-lane-queue-selector.js";
 import { QUEUE_LANES, type QueueLane } from "./job-policy-registry.js";
 import type { ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
+import { WorkerAdmissionWaitSet } from "./worker-admission-wait-set.js";
 
 export interface WorkAdmission { release(): void }
+export interface WorkAdmissionBlocked { blockedOn: string }
 export type FairClaimedWork = ({ queue: "main"; job: EvolutionJobRecord } |
   { queue: "embedding_retry"; retry: EmbeddingRetryRecord }) & { admission?: WorkAdmission;
     selectionReason?: "wrr" | "aging" | "interactive" | "legacy" };
@@ -19,8 +21,8 @@ export interface FairWorkerClaimInput extends QueueEligibilityOptions {
   priorityCohortOnly?: boolean;
   /** Optional resumable admission scan. Without it the synchronous API is unchanged. */
   scan?: FairWorkerScan;
-  /** Must synchronously acquire all execution permits or return undefined. */
-  admit?: (work: FairClaimedWork) => WorkAdmission | undefined;
+  /** Acquire all permits synchronously, or report the capacity to wait for. */
+  admit?: (work: FairClaimedWork) => WorkAdmission | WorkAdmissionBlocked | undefined;
 }
 const CURSOR_KEY = "worker.scheduler.wrr_cursor.v1";
 export const FAIR_CLAIM_BATCH_LIMIT = 200;
@@ -40,13 +42,25 @@ type ScanContinuation = {
   agingSkippedLanes: QueueLane[];
   interactiveDenied?: boolean;
 };
-/** Owned by one drain/fill; discard after permits/configuration change or a completed scan. */
+/** Owned by one drain. Capacity releases only wake the matching parked rows;
+ * configuration, classification and due-time changes still invalidate the scan. */
 export interface FairWorkerScan {
   inspected: number;
+  blocked: boolean;
   more: boolean;
   continuation?: ScanContinuation;
+  fingerprint?: string;
+  waiting: WorkerAdmissionWaitSet;
 }
-export function createFairWorkerScan(): FairWorkerScan { return { inspected: 0, more: false }; }
+export function createFairWorkerScan(): FairWorkerScan {
+  return { inspected: 0, blocked: false, more: false, waiting: new WorkerAdmissionWaitSet() };
+}
+export function releaseFairWorkerResources(scan: FairWorkerScan, resources: readonly string[]): void {
+  const lanes = scan.waiting.release(resources);
+  if (!scan.continuation) return;
+  scan.continuation.agingSkippedLanes = scan.continuation.agingSkippedLanes.filter(lane => !lanes.has(lane));
+  if (lanes.has("interactive")) scan.continuation.interactiveDenied = false;
+}
 
 function normalizeFilter(values: readonly string[] | undefined): string[] | undefined {
   return values === undefined ? undefined : [...new Set(values)].sort();
@@ -78,7 +92,7 @@ export function claimFairWorkerBatch(
   };
   const cursorKey = scopeCursorKey(request);
   return repos.transaction(() => {
-    repos.runtime.scheduling.refreshRunnablePolicies(request);
+    repos.runtime.scheduling.refreshActivePolicies({ includeRetries: input.includeRetries });
     const weightsKey = QUEUE_LANES.map((lane) => input.options.laneWeights[lane]).join("/");
     const saved = repos.runtime.getKv(cursorKey)?.value as { weightsKey?: unknown; cursor?: unknown } | undefined;
     const cursor = saved?.weightsKey === weightsKey && Number.isSafeInteger(saved.cursor) && Number(saved.cursor) >= 0
@@ -125,9 +139,13 @@ function claimAdmittedWorkerBatch(
   };
   const admissions: WorkAdmission[] = [];
   const limit = Math.max(0, Math.min(FAIR_CLAIM_BATCH_LIMIT, Math.floor(input.limit)));
-  function tryClaim(work: FairClaimedWork): FairClaimedWork | undefined {
+  function tryClaim(work: FairClaimedWork, candidate?: SchedulingCandidate): FairClaimedWork | undefined {
     const acquired = input.admit!(work);
     if (!acquired) return undefined;
+    if ("blockedOn" in acquired) {
+      if (candidate) input.scan?.waiting.park(candidate, acquired.blockedOn);
+      return undefined;
+    }
     let released = false;
     const admission = { release() {
       if (released) return;
@@ -157,10 +175,14 @@ function claimAdmittedWorkerBatch(
       const fingerprint = JSON.stringify([scopeCursorKey(request), input.options, input.priorityCohortOnly ?? false,
         repos.runtime.scheduling.getSelectionRevision()]);
       const scan = input.scan;
-      if (scan) { scan.inspected = 0; scan.more = false; }
+      if (scan) {
+        scan.inspected = 0; scan.blocked = false; scan.more = false;
+        if (scan.fingerprint !== fingerprint) scan.waiting.clear();
+        scan.fingerprint = fingerprint;
+      }
       const continuing = scan?.continuation?.fingerprint === fingerprint ? scan.continuation : undefined;
       // Buffers are copied so transaction rollback cannot leave a half-consumed
-      // continuation. The runner drops the scan on any admission-state change.
+      // continuation. On rollback all drain-local wait references are discarded.
       const state: ScanContinuation = continuing ? { ...continuing, mainDone: false,
         buckets: continuing.buckets.map(bucket => ({ ...bucket, exhausted: false })),
         candidates: [...continuing.candidates], agingSkippedLanes: [...continuing.agingSkippedLanes], mainSeen: [...continuing.mainSeen], retrySeen: [...continuing.retrySeen]
@@ -210,13 +232,14 @@ function claimAdmittedWorkerBatch(
       }
 
       // An upgrade may leave thousands of older rows with stale policy. Finish
-      // their projection before FIFO selection, but never do all writes in one
+      // their active-task projection before FIFO selection, but never do all writes in one
       // event-loop turn. Recheck each slice for metadata dirtied between turns.
-      const projection = repos.runtime.scheduling.refreshRunnablePolicies({ ...request,
+      const projection = repos.runtime.scheduling.refreshActivePolicies({ includeRetries: input.includeRetries,
         ...(scan ? { maxRows: inspectLimit } : {}) });
       if (scan) {
         inspected += projection.refreshed;
         if (projection.refreshed > 0) {
+          scan.waiting.clear();
           state.candidates = [];
           for (const bucket of state.buckets) { bucket.after = 0; bucket.exhausted = false; }
         }
@@ -242,26 +265,33 @@ function claimAdmittedWorkerBatch(
       let exhausted = false;
       while (claimed.length < limit && inspected < inspectLimit) {
         refill();
+        const ready = scan?.waiting.heads() ?? [];
+        const readyKeys = new Set(ready.map(candidate => `${candidate.queue}:${candidate.id}`));
+        const selectable = [...candidates.filter(candidate => !readyKeys.has(`${candidate.queue}:${candidate.id}`)), ...ready];
         // A page that has never contained a row proves an empty lane. Exhausted
         // pages after rejected candidates do not: their unspent turn survives.
         selector.dropEmpty(new Set(QUEUE_LANES.filter(lane =>
           buckets.filter(bucket => bucket.lane === lane).every(bucket => bucket.after === 0 && bucket.exhausted) &&
-          !candidates.some(candidate => candidate.lane === lane))));
-        const interactive = state.interactiveDenied ? undefined : selector.chooseInteractive(candidates);
-        const aged = !interactive && input.options.aging?.enabled ? selector.chooseAged(candidates, Date.parse(input.at),
+          !selectable.some(candidate => candidate.lane === lane))));
+        const interactive = state.interactiveDenied ? undefined : selector.chooseInteractive(selectable);
+        const aged = !interactive && input.options.aging?.enabled ? selector.chooseAged(selectable, Date.parse(input.at),
           input.options.aging.thresholdMs, new Set(state.agingSkippedLanes)) : undefined;
-        const chosen = interactive ?? aged ?? selector.choose(candidates);
+        const chosen = interactive ?? aged ?? selector.choose(selectable);
         if (!chosen) { exhausted = true; break; }
-        candidates.splice(candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id), 1);
+        const index = candidates.findIndex(candidate => candidate.queue === chosen.queue && candidate.id === chosen.id);
+        if (index >= 0) candidates.splice(index, 1);
         inspected++;
         let result: FairClaimedWork | undefined;
         const acquiredBefore = admissions.length;
-        if (chosen.queue === "main") {
+        const blocked = scan?.waiting.isBlocked(chosen);
+        if (blocked && scan) scan.blocked = true;
+        if (!blocked) scan?.waiting.take(chosen);
+        if (!blocked && chosen.queue === "main") {
           const job = repos.runtime.getJob(chosen.id);
-          if (job) result = tryClaim({ queue: "main", job });
-        } else {
+          if (job) result = tryClaim({ queue: "main", job }, chosen);
+        } else if (!blocked && chosen.queue === "embedding_retry") {
           const retry = repos.runtime.getEmbeddingRetry(chosen.id);
-          if (retry) result = tryClaim({ queue: "embedding_retry", retry });
+          if (retry) result = tryClaim({ queue: "embedding_retry", retry }, chosen);
         }
         if (result) {
           claimed.push({ ...result, selectionReason: interactive ? "interactive" : aged ? "aging" : "wrr" });
@@ -281,7 +311,7 @@ function claimAdmittedWorkerBatch(
       return claimed;
     });
   } catch (error) {
-    if (input.scan) { input.scan.more = false; input.scan.continuation = undefined; }
+    if (input.scan) { input.scan.more = false; input.scan.continuation = undefined; input.scan.waiting.clear(); }
     // Rollback also covers successful earlier CAS operations. Returning all
     // permits here prevents a failed transaction from leaking execution slots.
     for (const admission of admissions) {

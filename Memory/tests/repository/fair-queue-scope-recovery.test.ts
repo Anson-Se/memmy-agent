@@ -112,11 +112,16 @@ describe("fair queue scope cursors and failed recovery", () => {
     h.db.db.prepare("UPDATE evolution_jobs SET job_type='reflection' WHERE id='wrong-type'").run();
     expect(h.runtime.claimQueuedJob("ready", { at })).toBeUndefined();
     expect(h.runtime.leaseQueuedJobs(20)).toEqual([]);
+    const before = new Map(["future", "config", "exhausted", "runAfter", "wrong-target", "wrong-type"].map(id => [id, h.runtime.getJob(id)!]));
     const work = h.claim(20, { targetMemoryIds: ["ready", "future", "config", "exhausted", "runAfter", "wrong-type"], allowedJobTypes: ["import_summary"] });
     expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["ready"]);
     for (const id of ["future", "config", "exhausted", "runAfter", "wrong-target", "wrong-type"]) {
-      expect(h.runtime.getJob(id)?.status).toBe("failed");
-      expect(h.db.db.prepare("SELECT policy_version FROM evolution_jobs WHERE id=?").get(id)).toMatchObject({ policy_version: null });
+      const prior = before.get(id)!;
+      // Metadata backfill includes delayed work, but never bypasses claim eligibility.
+      expect(h.runtime.getJob(id)).toMatchObject({ status: "failed", attempts: prior.attempts,
+        failureCount: prior.failureCount, leaseToken: prior.leaseToken, availableAt: prior.availableAt,
+        blockedReason: prior.blockedReason, payload: prior.payload });
+      expect(h.db.db.prepare("SELECT policy_version FROM evolution_jobs WHERE id=?").get(id)).toMatchObject({ policy_version: JOB_POLICY_VERSION });
     }
     expect(h.runtime.claimQueuedJob("wrong-target", { at, includeDueFailed: true, excludedJobTypes: ["import_summary"] })).toBeUndefined();
   });

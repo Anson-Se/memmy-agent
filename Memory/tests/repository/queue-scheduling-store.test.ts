@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories } from "../../src/storage/repositories.js";
 import { JOB_POLICY_VERSION, jobPolicyRegistry } from "../../src/service/worker/job-policy-registry.js";
+import { pendingPolicyIndex } from "../../src/storage/queue-scheduling-schema.js";
 import { SCHEMA_VERSION } from "../../src/storage/schema.js";
 import type { JobType } from "../../src/types.js";
 
@@ -51,11 +52,13 @@ afterEach(() => {
 function removeSchedulingSchema(db: MemoryDb): void {
   for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
     for (const suffix of ["enqueue_sequence", "policy_dirty"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
+    db.db.exec(`DROP INDEX ${pendingPolicyIndex(table)}`);
+    db.db.exec(`DROP INDEX ${pendingPolicyIndex(table, true)}`);
     for (const suffix of ["enqueue_seq", "lane_due", "lane_fifo", "policy_dirty"]) db.db.exec(`DROP INDEX ${table}_${suffix}`);
   }
   for (const suffix of ["dirty", "insert", "delete"]) db.db.exec(`DROP TRIGGER memories_worker_policy_${suffix}`);
   for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
-    for (const column of ["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version"]) {
+    for (const column of ["queue_lane", "resource_class", "enqueue_seq", "first_queued_at", "base_priority", "policy_version", "policy_promotion"]) {
       db.db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
     }
   }
@@ -63,6 +66,25 @@ function removeSchedulingSchema(db: MemoryDb): void {
 }
 
 describe("queue scheduling metadata and read-only candidates", () => {
+  it("retains a manual promotion when an unfinished task is redelivered by startup repair", () => {
+    const h = harness();
+    const first = h.job("first", "import_summary", undefined, { source: "startup.placeholder_summary_repair" }, "same");
+    h.job("manual", "import_summary", undefined, { source: "memory.processing.manual_retry" }, "same");
+    const reused = h.job("background", "import_summary", undefined, { source: "startup.placeholder_summary_repair" }, "same");
+    expect(reused).toMatchObject({ id: first.id, queueLane: "repair_retry", basePriority: 0,
+      enqueueSeq: first.enqueueSeq, firstQueuedAt: first.firstQueuedAt,
+      payload: { source: "startup.placeholder_summary_repair" } });
+  });
+
+  it("does not dirty policies for changes to memory content unrelated to scheduling", () => {
+    const h = harness(); h.memory("target");
+    h.job("summary", "trace_summary", "target"); h.retry("retry", "target");
+    h.db.db.prepare("UPDATE memories SET properties_json=? WHERE id='target'")
+      .run(JSON.stringify({ internal_info: { processing_state: "ready" }, arbitrary: "updated" }));
+    expect(h.store.pendingPolicyCount()).toBe(0);
+    expect(h.store.refreshRunnablePolicies({ at, maxRows: 64 }).refreshed).toBe(0);
+  });
+
   it("migrates v11 with chronological order across both queues and remains stable after reopening", () => {
     const h = harness();
     h.rawJob("late-main", "reflection", { at: "2026-10-22T00:00:03.000Z" });
@@ -178,7 +200,7 @@ describe("queue scheduling metadata and read-only candidates", () => {
     h.db.db.prepare("UPDATE memories SET tags_json='[]' WHERE id='target'").run();
     h.db.db.prepare("UPDATE evolution_jobs SET payload_json = ? WHERE id='summary'").run('{"source":"startup.placeholder_summary_repair"}');
     h.store.refreshPolicies();
-    expect(h.runtime.getJob(original.id)).toMatchObject({ queueLane: "maintenance", enqueueSeq: original.enqueueSeq });
+    expect(h.runtime.getJob(original.id)).toMatchObject({ queueLane: "interactive", basePriority: -100, enqueueSeq: original.enqueueSeq });
     h.db.db.prepare("UPDATE evolution_jobs SET policy_version = ? WHERE id='summary'").run(JOB_POLICY_VERSION - 1);
     expect(h.store.pendingPolicyCount()).toBe(1);
     expect(h.store.refreshPolicies(1).refreshed).toBe(1);
@@ -328,7 +350,9 @@ describe("real-scheduler policy preparation", () => {
     expect(updated).toMatchObject({ id: original.id, queueLane: "maintenance", policyVersion: JOB_POLICY_VERSION });
     expect(h.store.getSelectionRevision()).toBe(revision + 1);
     h.store.refreshOne("main", original.id);
-    // Payload/resource/scope changes need invalidation even when lane is equal.
+    // Refreshing unchanged, current metadata must not reset a deep candidate scan.
+    expect(h.store.getSelectionRevision()).toBe(revision + 1);
+    h.job("another-id", "import_summary", undefined, { scope: "changed" }, "same-job");
     expect(h.store.getSelectionRevision()).toBe(revision + 2);
   });
 
@@ -348,8 +372,10 @@ describe("real-scheduler policy preparation", () => {
     const h = harness(), second = new Repositories(h.db.db).runtime.scheduling;
     h.job("shared-main"); h.retry("shared-retry");
     expect(second.getSelectionRevision()).toBe(0);
+    h.db.db.prepare("UPDATE evolution_jobs SET payload_json='{\"scope\":\"changed\"}' WHERE id='shared-main'").run();
     second.refreshOne("main", "shared-main");
     expect(h.store.getSelectionRevision()).toBe(1);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET source_text='changed' WHERE id='shared-retry'").run();
     h.store.refreshOne("embedding_retry", "shared-retry");
     expect(second.getSelectionRevision()).toBe(2);
     expect(harness().store.getSelectionRevision()).toBe(0);
@@ -368,6 +394,9 @@ describe("real-scheduler policy preparation", () => {
     expect(h.runtime.getJob(original.id)?.queueLane).toBe("import");
     expect(h.store.getSelectionRevision()).toBeGreaterThan(before);
     const afterRollback = h.store.getSelectionRevision();
+    h.store.refreshOne("main", original.id);
+    expect(h.store.getSelectionRevision()).toBe(afterRollback);
+    h.db.db.prepare("UPDATE evolution_jobs SET payload_json='{\"scope\":\"changed\"}' WHERE id=?").run(original.id);
     h.store.refreshOne("main", original.id);
     expect(h.store.getSelectionRevision()).toBeGreaterThan(afterRollback);
     h.store.refreshOne("main", "missing");

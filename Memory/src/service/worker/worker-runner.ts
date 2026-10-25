@@ -53,11 +53,11 @@ import { isObservationMemory, observationJobPayload, observationMemoryState, OBS
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
 import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
 import { WorkerScheduler } from "./worker-scheduler.js";
-import { claimFairWorkerBatch, createFairWorkerScan, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
+import { claimFairWorkerBatch, createFairWorkerScan, releaseFairWorkerResources, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions, type WorkerSchedulingOptions, type ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 import { JobPolicyRegistry, UnknownJobPolicyError } from "./job-policy-registry.js";
 import { resolveWorkerLeaseOptions, type WorkerLeaseOptions } from "./worker-lease-options.js";
-import { WorkerConcurrencyController, type PreparedWorkerExecution, type WorkerPermit } from "./worker-concurrency.js";
+import { WorkerConcurrencyController, workerCapacityKey, type PreparedWorkerExecution, type WorkerPermit } from "./worker-concurrency.js";
 import { workerWorkRequirements, workerEmbeddingGroupKey } from "./worker-work-requirements.js";
 import { observeWorker, type WorkerObserver, type WorkerMetricOutcome } from "./worker-observability.js";
 
@@ -577,10 +577,15 @@ export class WorkerRunner {
     let attemptedReconcileDeadline: number | undefined;
     let filled = false;
     let jobsThisTurn = 0;
-    let admissionVersion = 0;
-    const unsubscribeScanAdmission = this.concurrency.subscribe(() => { admissionVersion++; });
-    let scanVersion = admissionVersion;
     let scan = createFairWorkerScan();
+    let claiming = false;
+    const unsubscribeScanAdmission = this.concurrency.subscribe(resources => {
+      // A CAS-lost reservation is returned synchronously inside the claim. It
+      // does not free capacity that was unavailable before that reservation.
+      if (claiming) return;
+      if (options.algorithm === "legacy") scan = createFairWorkerScan();
+      else releaseFairWorkerResources(scan, resources);
+    });
     let scanFilters = "";
     let scanDenied = false;
     let scanDeadline: number | undefined;
@@ -627,7 +632,8 @@ export class WorkerRunner {
         const paused = this.deps.memoryBudgetPaused();
         const filters = JSON.stringify([retryOnly, paused, this.deps.memoryBudgetModelSources(), this.summaryJobsHeld(),
           this.deps.configurationFingerprint?.()]);
-        if (!scan.more || scanVersion !== admissionVersion || scanFilters !== filters ||
+        if (!scan.more) scanDenied = false;
+        if (scanFilters !== filters ||
           (scanDeadline !== undefined && scanDeadline <= this.nowMs())) {
           scan = createFairWorkerScan();
           scanFilters = filters;
@@ -635,7 +641,6 @@ export class WorkerRunner {
           scanDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
           prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
         }
-        scanVersion = admissionVersion;
         const capacity = Math.min(remaining, this.concurrency.availableJobs(), FAIR_CLAIM_BATCH_LIMIT);
         if (filled && capacity > 0 && !retryOnly && options.algorithm === "legacy") {
           // Legacy selection requires an explicit failed -> queued transition.
@@ -645,6 +650,7 @@ export class WorkerRunner {
           )) this.deps.appendJobChange(after, "queued", before);
         }
         filled = true;
+        claiming = true;
         const work = capacity > 0 ? claimFairWorkerBatch(this.deps.repos, {
           at: this.deps.nowIso(), limit: capacity, targetMemoryIds: request.targetMemoryIds,
           priorityCohortOnly: request.priorityCohortOnly,
@@ -661,9 +667,10 @@ export class WorkerRunner {
             const requirements = workerWorkRequirements(candidate, this.deps.repos, execution);
             // Reject held business state before loading any embedding body.
             const heldScopes = this.concurrency.snapshot().scopeKeys;
-            if (requirements.scopeKeys.some(scope => heldScopes.includes(scope))) {
+            const heldScope = requirements.scopeKeys.find(scope => heldScopes.includes(scope));
+            if (heldScope) {
               observeWorker(this.deps.observer, { type: "skipped", lane: candidate.queue === "main" ? candidate.job.queueLane : candidate.retry.queueLane, reason: "scope" });
-              denied = true; return undefined;
+              denied = true; return { blockedOn: workerCapacityKey("scope", heldScope) };
             }
             const canShare = previous && previous.count < this.concurrency.limits.embeddingBatchSize;
             let batchKey: string | undefined;
@@ -672,10 +679,15 @@ export class WorkerRunner {
               batchKey = key ? JSON.stringify([key, execution.batchKey ?? null]) : undefined;
             }
             const share = batchKey && previous?.key === batchKey ? previous : undefined;
-            let permit = this.concurrency.tryAcquire(requirements, 1, share?.permit);
+            let blockedOn: string | undefined;
+            const onBlocked = (resource: string) => { blockedOn = resource; };
+            let permit = this.concurrency.tryAcquire(requirements, 1, share?.permit, onBlocked);
             const shared = permit !== undefined && share !== undefined;
-            if (!permit && share) permit = this.concurrency.tryAcquire(requirements);
-            if (!permit) { denied = true; return undefined; }
+            if (!permit && share) {
+              blockedOn = undefined;
+              permit = this.concurrency.tryAcquire(requirements, 1, undefined, onBlocked);
+            }
+            if (!permit) { denied = true; return blockedOn ? { blockedOn } : undefined; }
             if (!canShare) {
               const key = workerEmbeddingGroupKey(candidate, this.deps.repos);
               batchKey = key ? JSON.stringify([key, execution.batchKey ?? null]) : undefined;
@@ -695,11 +707,8 @@ export class WorkerRunner {
             return admission;
           }
         }) : [];
-        // CAS-lost permits released inside this transaction did not make an
-        // earlier blocked resource available. Only later external/task releases
-        // invalidate the continuation before the next slice.
-        scanVersion = admissionVersion;
-        scanDenied ||= denied;
+        claiming = false;
+        scanDenied ||= denied || scan.blocked;
         denied = scanDenied;
         remaining -= work.length;
         jobsThisTurn += work.length;

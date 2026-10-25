@@ -1,7 +1,7 @@
 import type { JobType } from "../../types.js";
 import { resolveWorkerLeaseOptions, type ResolvedWorkerLeaseOptions } from "./worker-lease-options.js";
 
-export const JOB_POLICY_VERSION = 2;
+export const JOB_POLICY_VERSION = 3;
 export const QUEUE_LANES = ["interactive", "repair_retry", "import", "evolution", "maintenance"] as const;
 export type QueueLane = typeof QUEUE_LANES[number];
 export const RESOURCE_CLASSES = ["summary", "embedding", "evolution_llm", "database", "scan"] as const;
