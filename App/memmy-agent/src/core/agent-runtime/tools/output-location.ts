@@ -22,7 +22,7 @@ type DeliveryState = {
   directory?: string;
   /** The user picked the directory, so it outlives one delivery. */
   chosen?: boolean;
-  /** Relative to `directory`, so a directory change retargets every declared file. */
+  /** Declared paths (symlinks unresolved) relative to `directory`, so a directory change retargets every declared file. */
   files?: string[];
   producers?: string[];
 };
@@ -156,10 +156,18 @@ export class OutputDelivery {
   }
 
   async declare(values: unknown): Promise<string | null> {
+    const outputs = await this.resolveOutputs(values);
+    if (typeof outputs === "string") return outputs;
+    this.record(outputs);
+    return null;
+  }
+
+  /** Checks output_paths without recording them; the caller records them once its tool call succeeded. */
+  async resolveOutputs(values: unknown): Promise<string | string[]> {
     if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value.trim())) {
       return "Error: output_paths must be an array of file paths.";
     }
-    if (!values.length) return null;
+    if (!values.length) return [];
     const directory = this.directory;
     const relative: string[] = [];
     try {
@@ -170,16 +178,26 @@ export class OutputDelivery {
         if (real === root || !isPathInside(real, root)) {
           return `Error: output path ${target} is outside the output directory ${directory}. Save final files there; call set_output_directory only if the user explicitly asked for another directory.`;
         }
-        relative.push(path.relative(root, real));
+        // Keep the declared path, not its symlink target: verify() resolves it again every time.
+        const base = isPathInside(target, directory) ? directory : isPathInside(target, root) ? root : null;
+        if (!base) {
+          return `Error: output path ${target} reaches the output directory ${directory} only through another link. Declare it by its path inside that directory.`;
+        }
+        relative.push(path.relative(base, target));
       }
     } catch (error) {
       return `Error: output path could not be resolved: ${(error as Error).message}`;
     }
     // The directory may have changed while paths were resolved; never record against the new one.
     if (this.directory !== directory) return `Error: the output directory changed to ${this.directory}; declare the files again there.`;
-    for (const file of relative) this.own?.add(`file:${file}`);
-    this.update({ directory, files: [...new Set([...(this.state.files ?? []), ...relative])] });
-    return null;
+    return relative;
+  }
+
+  /** Adds resolved files; after a directory change they are expected in the new directory, like every declared file. */
+  record(files: string[]): void {
+    if (!files.length) return;
+    for (const file of files) this.own?.add(`file:${file}`);
+    this.update({ directory: this.directory, files: [...new Set([...(this.state.files ?? []), ...files])] });
   }
 
   /** Register a background command or subagent that may still be writing deliverables. */
@@ -194,7 +212,12 @@ export class OutputDelivery {
   async verify(): Promise<string | null> {
     const state = this.state;
     const mine = (key: string) => !this.own || this.own.has(key);
-    const running = (state.producers ?? []).filter((id) => mine(`producer:${id}`) && producerRunning(id));
+    const producers = (state.producers ?? []).filter((id) => mine(`producer:${id}`));
+    const running = producers.filter((id) => producerRunning(id));
+    // Forget finished producers so the persisted state no longer reports an obligation for them.
+    if (running.length < producers.length) {
+      this.update({ producers: (state.producers ?? []).filter((id) => !producers.includes(id) || running.includes(id)) });
+    }
     if (running.length) {
       return `${DELIVERY_NOT_CONFIRMED}：还有 ${running.length} 个后台命令或子任务在运行。请等待其结束或查询状态，再核验交付。`;
     }

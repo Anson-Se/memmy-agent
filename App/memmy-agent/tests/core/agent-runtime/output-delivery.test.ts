@@ -24,6 +24,8 @@ import { MessageTool } from "../../../src/core/agent-runtime/tools/message.js";
 import { SessionManager } from "../../../src/core/session/manager.js";
 import { GoalRuntime } from "../../../src/core/agent-runtime/goal-runtime.js";
 import { cmdNew, cmdStop } from "../../../src/command/builtin.js";
+import { AgentHook, type AgentHookContext } from "../../../src/core/agent-runtime/hook.js";
+import { withProgressCapabilities } from "../../../src/utils/progress-events.js";
 
 vi.mock("../../../src/tools/computer-use/desktop-screen-capture.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/tools/computer-use/desktop-screen-capture.js")>(),
@@ -116,6 +118,155 @@ describe("OutputDelivery", () => {
     expect(await delivery.declare([path.join(outside, "x.pdf")])).toMatch(/outside the output directory/);
     expect(await delivery.declare(["link/x.pdf"])).toMatch(/outside the output directory/);
     expect(hasOutputObligations(metadata)).toBe(false);
+  });
+
+  it("re-checks the declared symlink, not the file it pointed to when declared", async () => {
+    const outside = path.join(root, "outside");
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(workspace, "canonical.md"), "report");
+    await fs.writeFile(path.join(outside, "elsewhere.md"), "report");
+    const link = path.join(workspace, "report.md");
+    await fs.symlink(path.join(workspace, "canonical.md"), link);
+    const metadata: Record<string, any> = {};
+    const delivery = new OutputDelivery(metadata, workspace);
+    expect(await delivery.declare(["report.md"])).toBeNull();
+    expect(metadata.outputDelivery.files).toEqual(["report.md"]);
+    expect(await delivery.verify()).toBeNull();
+
+    await fs.rm(link);
+    await fs.symlink(path.join(outside, "elsewhere.md"), link);
+    expect(await delivery.verify()).toContain(link);
+
+    await fs.rm(link);
+    expect(await delivery.verify()).toContain(link);
+
+    const target = path.join(root, "chosen");
+    await fs.mkdir(target);
+    delivery.addUserText(`save it to ${target}`);
+    expect(await delivery.selectDirectory(target, `save it to ${target}`)).toContain(target);
+    await fs.writeFile(path.join(target, "canonical.md"), "report");
+    await fs.symlink(path.join(target, "canonical.md"), path.join(target, "report.md"));
+    expect(await delivery.verify()).toBeNull();
+    await fs.rm(path.join(target, "report.md"));
+    expect(await delivery.verify()).toContain(path.join(target, "report.md"));
+  });
+
+  it("rejects a declaration that reaches the output directory only through an outside link", async () => {
+    await fs.writeFile(path.join(workspace, "report.md"), "report");
+    const alias = path.join(root, "alias");
+    await fs.symlink(workspace, alias);
+    const metadata: Record<string, any> = {};
+    expect(await new OutputDelivery(metadata, workspace).declare([path.join(alias, "report.md")])).toMatch(/only through another link/);
+    expect(hasOutputObligations(metadata)).toBe(false);
+  });
+
+  it("records output_paths only after the tool call succeeded, keeping earlier ones", async () => {
+    const metadata: Record<string, any> = {};
+    const delivery = new OutputDelivery(metadata, workspace);
+    await delivery.declare(["kept.md"]);
+    await fs.writeFile(path.join(workspace, "blocker"), "a file, not a directory");
+    const { result } = await run([
+      call("write_file", { path: "blocker/failed.md", content: "x", output_paths: ["kept.md", "failed.md"] }),
+      reply("Sorry, the file could not be written."),
+      reply("Sorry, the file could not be written."),
+      reply("Sorry, the file could not be written."),
+    ], delivery);
+    expect(metadata.outputDelivery.files).toEqual(["kept.md"]);
+    expect(result.finalContent).toContain("kept.md");
+    expect(result.finalContent).not.toContain("failed.md");
+  });
+
+  it("keeps a child's declaration of the same file when the parent's call fails", async () => {
+    const parent = new OutputDelivery({}, workspace);
+    const child = parent.forChild();
+    let started!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    class FailedWrite extends WriteFileTool {
+      override async execute(): Promise<string> {
+        started();
+        await gate;
+        return "Error: write rejected";
+      }
+    }
+    const tools = new ToolRegistry();
+    tools.register(new FailedWrite({ workspace, postWriteValidation: false }));
+    const provider = new ScriptedProvider([]);
+    const pending = new AgentRunner(provider).executeTools(new AgentRunSpec({ provider, tools, workspace, outputLocation: parent }), [
+      new ToolCallRequest({ id: "failed-parent", name: "write_file", arguments: { path: "shared.md", content: "x", output_paths: ["shared.md"] } }),
+    ]);
+    await ready;
+    expect(await child.declare(["shared.md"])).toBeNull();
+    release();
+    expect((await pending)[0].event.status).toBe("error");
+    expect(await child.verify()).toContain("shared.md");
+    expect(await parent.verify()).toContain("shared.md");
+  });
+
+  it("keeps output_paths when the tool succeeded but a later progress notification failed", async () => {
+    const delivery = new OutputDelivery({}, workspace);
+    const progressCallback = withProgressCapabilities(async (_text: string, options: any = {}) => {
+      if (options.fileEditEvents?.some((event: any) => event.phase === "end")) throw new Error("notification failed");
+    }, { fileEditEvents: true });
+    const provider = new ScriptedProvider([
+      call("write_file", { path: "report.md", content: "report", output_paths: ["report.md", "summary.csv"] }),
+      reply("Both files are ready."),
+      reply("Both files are ready."),
+      reply("Both files are ready."),
+    ]);
+    const result = await new AgentRunner(provider).run(new AgentRunSpec({
+      provider, tools: registry(), workspace, outputLocation: delivery, progressCallback, maxIterations: 5,
+      messages: [{ role: "user", content: "make report and summary" }],
+    }));
+    expect(result.stopReason).toBe("toolError");
+    expect(result.finalContent).toContain("summary.csv");
+  });
+
+  it("checks delivery before ending the stream when no retry is left", async () => {
+    const delivery = new OutputDelivery({}, workspace);
+    await delivery.declare(["missing.md"]);
+    const order: string[] = [];
+    const verify = delivery.verify.bind(delivery);
+    delivery.verify = async () => { order.push("verify"); return verify(); };
+    class TrackingHook extends AgentHook {
+      override wantsStreaming() { return true; }
+      override async onStreamEnd(_ctx: AgentHookContext, options: { resuming?: boolean } = {}) {
+        if (!options.resuming) order.push("end");
+      }
+    }
+    const provider = new ScriptedProvider([reply("All files delivered.")]);
+    const result = await new AgentRunner(provider).run(new AgentRunSpec({
+      provider, tools: registry(), workspace, outputLocation: delivery, hook: new TrackingHook(), maxIterations: 1,
+      messages: [{ role: "user", content: "make missing.md" }],
+    }));
+    expect(result.stopReason).toBe("toolError");
+    expect(order.indexOf("verify")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("verify")).toBeLessThan(order.indexOf("end"));
+  });
+
+  it("checks delivery before ending the stream when beforeFinalize rejects the last reply", async () => {
+    const delivery = new OutputDelivery({}, workspace);
+    await delivery.declare(["missing.md"]);
+    const order: string[] = [];
+    const verify = delivery.verify.bind(delivery);
+    delivery.verify = async () => { order.push("verify"); return verify(); };
+    class RejectingHook extends AgentHook {
+      override wantsStreaming() { return true; }
+      override async beforeFinalize() { return [{ role: "user" as const, content: "Create missing.md first." }]; }
+      override async onStreamEnd(_ctx: AgentHookContext, options: { resuming?: boolean } = {}) {
+        if (!options.resuming) order.push("end");
+      }
+    }
+    const provider = new ScriptedProvider([reply("All files delivered.")]);
+    const result = await new AgentRunner(provider).run(new AgentRunSpec({
+      provider, tools: registry(), workspace, outputLocation: delivery, hook: new RejectingHook(), maxIterations: 1,
+      messages: [{ role: "user", content: "make missing.md" }],
+    }));
+    expect(result.stopReason).toBe("toolError");
+    expect(result.finalContent).toContain("missing.md");
+    expect(order.indexOf("verify")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("verify")).toBeLessThan(order.indexOf("end"));
   });
 
   it("keeps the list and its directory for a later turn that runs in another workspace", async () => {

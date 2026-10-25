@@ -1113,12 +1113,16 @@ export class AgentRunner {
     }
     const { args: toolArgs, outputPaths } = takeOutputPaths(call.name, call.arguments);
     const declaresOutputs = Boolean(spec.outputLocation && Array.isArray(outputPaths) && outputPaths.length);
+    // Checked now, recorded only once the tool succeeded: a failed call leaves nothing to deliver.
+    let outputFiles: string[] = [];
     if (spec.outputLocation && outputPaths !== undefined) {
-      const declarationError = await spec.outputLocation.declare(outputPaths);
-      if (declarationError) {
+      const resolved = await spec.outputLocation.resolveOutputs(outputPaths);
+      if (typeof resolved === "string") {
+        const declarationError = resolved;
         const event = { name: call.name, status: "error", detail: eventDetail("", declarationError, 120) };
         return { call, result: declarationError + hint, event, error: spec.failOnToolError ? new Error(declarationError) : null };
       }
+      outputFiles = resolved;
     }
 
     const prepare = spec.tools?.prepareCall;
@@ -1207,7 +1211,7 @@ export class AgentRunner {
       let event: Record<string, any>;
       let error: any = null;
       if (typeof raw === "string" && raw.startsWith("Error")) {
-        if (progressCallback && fileEditTrackers.length) {
+          if (progressCallback && fileEditTrackers.length) {
           await invokeFileEditProgress(
             progressCallback,
             fileEditTrackers.map((tracker) => buildFileEditErrorEvent(tracker, raw)),
@@ -1222,6 +1226,7 @@ export class AgentRunner {
         error = spec.failOnToolError ? new Error(raw) : null;
         raw = raw + hint;
       } else {
+        spec.outputLocation?.record(outputFiles);
         const detail = toolEventDetail(raw);
         event = { name: call.name, status: "ok", detail };
       }
@@ -1990,6 +1995,8 @@ export class AgentRunner {
       if (finalizeInjections?.length) {
         const canContinue = iteration + 1 < spec.maxIterations;
         if (streamsHookContent) {
+          // A terminal stream end follows the delivery check; its result is applied after the loop.
+          if (!canContinue) await spec.outputLocation?.verify();
           await hook.onStreamEnd(context, { resuming: canContinue });
         }
         await hook.afterIteration(context);
@@ -2002,10 +2009,9 @@ export class AgentRunner {
       }
 
       // A reply claiming delivery must be verified before it becomes the final answer.
-      const deliveryProblem = spec.outputLocation && deliveryRetries < 2 && iteration + 1 < spec.maxIterations
-        ? await spec.outputLocation.verify()
-        : null;
-      if (deliveryProblem) {
+      // Checked before the stream ends; retries and remaining iterations only decide whether the model may fix it.
+      const deliveryProblem = spec.outputLocation ? await spec.outputLocation.verify() : null;
+      if (deliveryProblem && deliveryRetries < 2 && iteration + 1 < spec.maxIterations) {
         // Let the model fix it; neither the unverified reply nor this feedback is persisted.
         deliveryRetries += 1;
         if (streamsHookContent) {

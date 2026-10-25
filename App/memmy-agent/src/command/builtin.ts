@@ -184,7 +184,7 @@ export async function cmdStop(ctx: CommandContext): Promise<OutboundMessage> {
     }
   }
   // cancelActiveTasks also ends an unfinished file delivery; say so when nothing else was running.
-  const pendingDelivery = hasOutputObligations(ctx.loop?.sessions?.get?.(ctx.key)?.metadata);
+  const pendingDelivery = Boolean(ctx.loop?.cancelActiveTasks) && hasOutputObligations(ctx.loop?.sessions?.get?.(ctx.key)?.metadata);
   const total = ctx.loop?.cancelActiveTasks ? await ctx.loop.cancelActiveTasks(ctx.key) : 0;
   if (total) return reply(ctx, `Stopped ${total} task(s).`);
   return reply(ctx, pendingDelivery ? "Ended the unfinished file delivery." : "No active task to stop.");

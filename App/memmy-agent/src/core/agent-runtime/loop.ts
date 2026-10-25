@@ -2702,9 +2702,9 @@ export class AgentLoop {
     if (waits.length) await Promise.allSettled(waits);
     const subagents = this.subagents as any;
     const subCancelled = subagents?.cancelBySession ? await subagents.cancelBySession(key) : subagents?.cancel_by_session ? await subagents.cancel_by_session(key) : 0;
-    // Stopping also ends an unfinished file task when nothing is running any more.
+    // Stopping also ends an unfinished file task, unless a retained task is still running it.
     const session = this.sessions.get(key);
-    if (hasOutputObligations(session?.metadata)) {
+    if (!retained.length && hasOutputObligations(session?.metadata)) {
       clearOutputDelivery(session!.metadata);
       this.sessions.save(session!);
     }
