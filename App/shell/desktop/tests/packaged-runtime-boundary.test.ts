@@ -1150,8 +1150,8 @@ describe("desktop packaged runtime boundaries", () => {
     expect(packageSource).not.toContain(['create_cli_launcher "$CLI_BIN_DIR/', 'memmy-agent', '"'].join(""));
     expect(packageSource).not.toContain(['ln -sf "$SCRIPT_DIR/', 'memmy-agent', '"'].join(""));
     expect(windowsPackageSource).toContain('create_windows_cli_launcher "$CLI_BIN_DIR/memmy.cmd"');
-    expect(windowsPackageSource).toContain('require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy-memory.cmd"');
-    expect(windowsPackageSource).toContain('require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy.cmd"');
+    expect(windowsPackageSource).toContain('require_packaged_runtime_file "$UNPACKED_DIR/resources/cli/memmy-memory.cmd"');
+    expect(windowsPackageSource).toContain('require_packaged_runtime_file "$UNPACKED_DIR/resources/cli/memmy.cmd"');
     expect(windowsPackageSource).toContain('for %%I in ("%RESOURCES_DIR%\\..") do set "APP_DIR=%%~fI"');
     expect(windowsPackageSource).toContain('set "APP_EXEC=%APP_DIR%\\Memmy.exe"');
     expect(windowsPackageSource).not.toContain('set "APP_EXEC=%RESOURCES_DIR%\\Memmy.exe"');
@@ -1798,7 +1798,7 @@ describe("desktop packaged runtime boundaries", () => {
     expect(winSource).toContain('onnxruntime_dir="$(dirname "$onnxruntime_node")"');
     expect(winSource).toContain("onnxruntime.dll");
     expect(winSource).toContain("sharp-win32-x64/lib");
-    expect(winSource).toContain("win-unpacked/resources/app.asar.unpacked/dist/runtime");
+    expect(winSource).toContain("$UNPACKED_DIR/resources/app.asar.unpacked/dist/runtime");
     expect(winSource).toContain("conpty/OpenConsole.exe");
     expect(winSource).toContain("sqlite-vec-windows-x64/vec0.*");
   });
@@ -2003,6 +2003,8 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('"$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe"');
     expect(source).toContain('build-memmy-computer-history.sh');
     expect(source).toContain('verify-computer-history-runtime.mjs');
+    expect(source).toContain('if [ "$PACKAGE_SIGNING" = "unsigned" ]; then');
+    expect(source).toContain('Signed package: skipping byte-for-byte comparison');
     expect(source).toContain('"Windows 11 native History recorder"');
   });
 
@@ -2013,12 +2015,31 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain("desktop-edition.json");
     expect(source).toContain("write-desktop-edition-manifest.mjs");
     expect(source).toContain('--signing "$PACKAGE_SIGNING"');
-    expect(source).toContain('FINAL_EXE="$DESKTOP_DIR/release/Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.exe"');
+    expect(source).toContain('RELEASE_DIR="$DESKTOP_DIR/release"');
+    expect(source).toContain('FINAL_EXE="$RELEASE_DIR/Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.exe"');
     expect(source).toContain('ARTIFACT_NAME="Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.\\${ext}"');
     expect(source).toContain('BUILDER_ARGS+=(--config.extraMetadata.version="$DESKTOP_VERSION")');
     expect(source).toContain('npx electron-builder "${BUILDER_ARGS[@]}" --win nsis --x64 "$@" --config.artifactName="$ARTIFACT_NAME"');
     expect(source).not.toContain("use_final_artifact_name");
     expect(source).not.toContain("mv -f");
+  });
+
+  it("does not ask SimplySign to sign the unused per-user NSIS elevate helper", () => {
+    const config = parseYaml(readFileSync(winElectronBuilderPath, "utf8"));
+
+    expect(config.win.signExecutable).toBe(true);
+    expect(config.win.forceCodeSigning).toBe(true);
+    expect(config.win.signExts).toContain("!elevate.exe");
+    expect(config.nsis.perMachine).toBe(false);
+    expect(config.nsis.allowElevation).toBe(false);
+  });
+
+  it("extracts the NSIS uninstaller without executing an unsigned intermediate installer on Windows", () => {
+    const source = readFileSync(packageWinX64Path, "utf8");
+
+    expect(source).toContain("patch_electron_builder_nsis_uninstaller_extraction");
+    expect(source).toContain("UninstallerReader.exec(installerPath, uninstallerPath)");
+    expect(source).toContain("Memmy: extract the NSIS uninstaller before executing the unsigned installer");
   });
 
   it("fails closed when requested, source, builder, or staged runtime versions diverge", () => {

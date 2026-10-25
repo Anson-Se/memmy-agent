@@ -660,7 +660,7 @@ await import(pathToFileURL(process.argv[1]).href);
       buildScript.indexOf('RUNTIME_AGENT_SOURCE_CORE_DIR="$RUNTIME_DIR/memory/node_modules/@memmy/agent-source-core"'),
     );
     expect(buildScript).toContain(
-      'local packaged_memory_runtime="$DESKTOP_DIR/release/win-unpacked/resources/memory-runtime"',
+      'local packaged_memory_runtime="$UNPACKED_DIR/resources/memory-runtime"',
     );
     expect(buildScript).toContain(
       'require_packaged_runtime_file "$packaged_agent_source_core/package.json"',
