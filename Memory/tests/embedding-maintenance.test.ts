@@ -75,10 +75,10 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     expect(repos.memories.searchVectorIds(query, "vec")).toHaveLength(5);
   });
 
-  it("requires the retrieval field, not a stray L1 action vector", () => {
+  it("counts an existing L1 action independently from its missing summary vector", () => {
     const { repos, service } = setup();
     repos.memories.insert(memory("action-only", { dimension: 3, field: "vec_action", layer: "L1" }));
-    expect(service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 1, missing: 1, ready: 0 });
+    expect(service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 2, missing: 1, ready: 1 });
   });
 
   it("does not use foreign model dimensions as the current dimension", () => {

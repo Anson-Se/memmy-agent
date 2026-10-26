@@ -288,9 +288,10 @@ export class EmbeddingJobProcessor {
         sourceHash: input.sourceHash
       });
       saved = this.deps.repos.memories.updateMaintenance(
-        current.memoryLayer === "L1" ? updateImportPipelineStatus(vectorized, "indexed", at) : vectorized
+        current.memoryLayer === "L1" && input.vectorField !== "vec_action"
+          ? updateImportPipelineStatus(vectorized, "indexed", at) : vectorized
       );
-      const hadProcessing = Boolean(this.deps.repos.processing.get(saved.id));
+      const hadProcessing = input.vectorField !== "vec_action" && Boolean(this.deps.repos.processing.get(saved.id));
       if (hadProcessing) {
         this.deps.repos.processing.update(saved.id, {
           state: "ready", stage: null, activeJobId: null, attemptCount: input.attemptCount,

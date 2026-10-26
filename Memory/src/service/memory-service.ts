@@ -303,6 +303,7 @@ export class MemoryService {
   private llm: LlmClient;
   private skillLlm: LlmClient;
   private embedder: Embedder;
+  private embeddingUpgradeInFlight?: Promise<void>;
   private readonly embeddingRetryWorkerId = `embedding-retry-${newId("worker")}`;
   private readonly tokenBudgetLedger: MemoryTokenBudgetLedger;
   private readonly tokenUsageRecorder: HttpByokTokenUsageRecorder;
@@ -3020,13 +3021,13 @@ export class MemoryService {
       repos: this.repos,
       embedder: this.embedder,
       userId: this.config.userId?.trim() || "local-user",
-      enqueueMemory: (memory, text, at) => {
+      enqueueMemory: (memory, text, at, vectorField = embeddingRetryVectorFieldForMemory(memory)) => {
         const existing = this.repos.runtime.getEmbeddingRetryByTarget(
-          embeddingRetryTargetKindForMemory(memory), memory.id, embeddingRetryVectorFieldForMemory(memory)
+          embeddingRetryTargetKindForMemory(memory), memory.id, vectorField
         );
         // Join an already running job without clearing its worker lease.
         if (existing?.status === "pending" || existing?.status === "in_progress") return existing.id;
-        return this.workerHandlers.enqueueEmbeddingRetry(memory, text, at).id;
+        return this.workerHandlers.enqueueEmbeddingRetry(memory, text, at, vectorField).id;
       },
       enqueueUserMemory: (memory, at) => this.workerHandlers.enqueueJob({
         jobType: "user_memory_embedding", userId: memory.userId, targetMemoryId: memory.id,
@@ -3061,7 +3062,11 @@ export class MemoryService {
   }
 
   nextWorkerRunAt(): number | undefined {
-    return this.workerRunner.nextWorkerRunAt();
+    const workerAt = this.workerRunner.nextWorkerRunAt();
+    const upgradeAt = this.config.algorithm.enableMemoryAdd && !this.isMemoryBudgetPaused()
+      ? this.embeddingMaintenance().nextUpgradeAttemptAt() : undefined;
+    const times = [workerAt, upgradeAt].filter((time): time is number => Number.isFinite(time));
+    return times.length ? Math.min(...times) : undefined;
   }
 
   memoryTokenBudgetSnapshot() {
@@ -3090,7 +3095,15 @@ export class MemoryService {
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
     await this.ensureAppBudgetReconciled();
+    // Run the bounded one-time provenance repair through the normal durable worker.
+    // Respect explicit write/budget gates and scoped worker requests.
+    if (this.config.algorithm.enableMemoryAdd && !this.isMemoryBudgetPaused() && !request.targetMemoryIds) {
+      this.embeddingUpgradeInFlight ??= this.withModelTaskContext(() => this.embeddingMaintenance().resumeUpgrade())
+        .finally(() => { this.embeddingUpgradeInFlight = undefined; });
+      await this.embeddingUpgradeInFlight;
+    }
     const result = await this.workerRunner.runWorkerOnce(limit, request);
+    if (this.config.algorithm.enableMemoryAdd) this.embeddingMaintenance().upgradeProgress();
     this.reconcileAutomaticHistorySkills(nowIso());
     return result;
   }

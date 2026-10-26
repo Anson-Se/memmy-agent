@@ -38,6 +38,7 @@ export interface EmbeddingMaintenanceEntry {
   id: string;
   kind: "memory" | "user_memory";
   dimension: number;
+  vectorField?: MemoryVectorField;
   embeddingModel: string | null;
   embeddingProvider: string | null;
 }
@@ -53,13 +54,20 @@ export class SqliteVecStore {
 
   maintenanceEntries(): EmbeddingMaintenanceEntry[] {
     return this.db.prepare(`
-      SELECT m.id, 'memory' AS kind, COALESCE(v.embedding_dim, 0) AS dimension,
+      SELECT m.id AS id, 'memory' AS kind,
+             CASE WHEN m.memory_layer = 'L1' THEN 'vec_summary' ELSE 'vec' END AS vectorField,
+             COALESCE(v.embedding_dim, 0) AS dimension,
              v.embedding_model AS embeddingModel, v.embedding_provider AS embeddingProvider
       FROM memories m LEFT JOIN memory_vector_entries v
         ON v.memory_id = m.id
         AND v.vector_field = CASE WHEN m.memory_layer = 'L1' THEN 'vec_summary' ELSE 'vec' END
       WHERE m.deleted_at IS NULL AND m.status != 'deleted'
-      ORDER BY m.id
+      UNION ALL
+      SELECT m.id AS id, 'memory' AS kind, 'vec_action' AS vectorField, v.embedding_dim AS dimension,
+             v.embedding_model AS embeddingModel, v.embedding_provider AS embeddingProvider
+      FROM memories m JOIN memory_vector_entries v ON v.memory_id = m.id AND v.vector_field = 'vec_action'
+      WHERE m.memory_layer = 'L1' AND m.deleted_at IS NULL AND m.status != 'deleted'
+      ORDER BY id, vectorField
     `).all() as EmbeddingMaintenanceEntry[];
   }
 
