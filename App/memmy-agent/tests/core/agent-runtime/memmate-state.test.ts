@@ -30,7 +30,7 @@ it("managed templates, session and memory state never create the unapproved proj
   expect(loop.workspace).toBe(workspace);
   expect(loop.sessions.root).toBe(path.join(home, "workspace", "sessions"));
   expect(loop.context.memory.workspace).toBe(path.join(home, "workspace"));
-  expect(loop.tools.get("read_file")?.workspace).toBe(workspace);
+  expect(loop.tools.get("read_file")).toHaveProperty("workspace", workspace);
   expect(fs.readdirSync(workspace)).toEqual([]);
 });
 it("managed bootstrap context and plugin discovery cannot read project-controlled files", () => {

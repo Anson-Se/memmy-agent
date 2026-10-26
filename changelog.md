@@ -5,6 +5,7 @@
 ### Fixed
 
 - Accept valid macOS update packages during CPU architecture checks.
+- Preserve the Developer ID requirement when staging macOS updates and compare update version characters consistently.
 - Hide empty User Memories pagination and count seven-day activated-skill recalls and invocations correctly.
 - Include `ignore` in packaged Memory.
 - Verify SQLite 13 N-API prebuilds in Memory runtime packages.
@@ -13,6 +14,7 @@
 
 ### Changed
 
+- Route MemMate-managed file access through host approvals, including directory traversal, search, edits, and PDF/DOCX text reads; keep runtime state and plugin discovery isolated from unapproved projects.
 - Require Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) for the Linux CLI installer.
 
 - Upgrade Electron to `43.8.1` and `better-sqlite3` to `^13.0.3`; align native runtime packaging with the bundled N-API binaries.
