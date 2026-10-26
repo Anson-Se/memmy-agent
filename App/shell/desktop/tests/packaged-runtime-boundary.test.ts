@@ -251,7 +251,7 @@ describe("desktop packaged runtime boundaries", () => {
       );
       const materializeIndex = source.indexOf('rm -rf "$RUNTIME_MIGRATIONS_DIR"');
       const cleanupIndex = source.indexOf('rm -rf "$MIGRATIONS_STAGING_DIR"', stageIndex + 1);
-      const builderIndex = source.indexOf("npx electron-builder");
+      const builderIndex = packagingInvocationIndex(source);
       expect(stageIndex).toBeGreaterThanOrEqual(0);
       expect(runtimeInstallIndex).toBeGreaterThan(stageIndex);
       expect(materializeIndex).toBeGreaterThan(runtimeInstallIndex);
@@ -274,7 +274,7 @@ describe("desktop packaged runtime boundaries", () => {
     expect(winSource).toContain("stateStore.validateMigrationState");
     expect(winSource).toContain("Migrations runtime state behavior mismatch");
     expect(winSource.lastIndexOf("verify_packaged_windows_unpacked_artifacts")).toBeGreaterThan(
-      winSource.lastIndexOf("npx electron-builder"),
+      packagingInvocationIndex(winSource),
     );
   });
 
@@ -331,7 +331,7 @@ describe("desktop packaged runtime boundaries", () => {
       'verify_windows_better_sqlite3_runtime "$RUNTIME_DIR/memmy-agent"',
       agentVerifyIndex,
     );
-    const builderIndex = source.lastIndexOf("npx electron-builder");
+    const builderIndex = packagingInvocationIndex(source);
     const finalVerifyIndex = source.lastIndexOf("verify_packaged_windows_unpacked_artifacts");
     expect(agentDependenciesIndex).toBeGreaterThanOrEqual(0);
     expect(pruneIndex).toBeGreaterThan(agentDependenciesIndex);
@@ -1727,7 +1727,7 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('require_packaged_runtime_file "$packaged_memory_runtime/node_modules/better-sqlite3/prebuilds/darwin-$target_cpu.node"');
     const pruneIndex = source.lastIndexOf('prune_mac_runtime_artifacts "$TARGET_CPU"');
     const nativeVerifyIndex = source.lastIndexOf('verify_mac_memory_native_artifacts "$TARGET_CPU"');
-    const builderIndex = source.lastIndexOf("npx electron-builder");
+    const builderIndex = packagingInvocationIndex(source);
     const finalVerifyIndex = source.lastIndexOf('verify_packaged_mac_unpacked_artifacts "$TARGET_CPU"');
     expect(pruneIndex).toBeGreaterThanOrEqual(0);
     expect(nativeVerifyIndex).toBeGreaterThan(pruneIndex);
@@ -1817,7 +1817,7 @@ describe("desktop packaged runtime boundaries", () => {
       expect(source).toContain('$packaged_embedding_model/tokenizer.json');
       expect(source).toContain('$packaged_embedding_model/onnx/model_quantized.onnx');
       expect(source.indexOf("prepare-embedding-model.mjs")).toBeLessThan(
-        source.indexOf("npx electron-builder")
+        packagingInvocationIndex(source)
       );
     }
     expect(prepareEmbeddingModelSource).toContain('const fallbackRemoteHost = "https://hf-mirror.com/";');
@@ -1846,7 +1846,7 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('rm -f "$RUNTIME_DIR/memmy-agent/dist/skills/README.md"');
 
     expect(source.indexOf('prune_node_modules_non_runtime_files "$RUNTIME_DIR"')).toBeLessThan(
-      source.indexOf("npx electron-builder"),
+      packagingInvocationIndex(source),
     );
   });
 
@@ -1927,9 +1927,9 @@ describe("desktop packaged runtime boundaries", () => {
     expect(source).toContain('source.includes(marker)');
     expect(source).toContain('source.replace(original, replacement)');
     expect(source).toContain('patch_electron_builder_nsis_refresh');
-    expect(source.indexOf("patch_electron_builder_nsis_refresh")).toBeLessThan(
-      source.indexOf('npx electron-builder "${BUILDER_ARGS[@]}" --win nsis --x64')
-    );
+    const patchIndex = source.lastIndexOf("\npatch_electron_builder_nsis_refresh\n");
+    expect(patchIndex).toBeGreaterThanOrEqual(0);
+    expect(patchIndex).toBeLessThan(packagingInvocationIndex(source));
   });
 
   it("reuses the installed Electron dist during Windows packaging", () => {
@@ -2116,7 +2116,7 @@ describe("desktop packaged runtime boundaries", () => {
       expect(source).toContain("verify-packaged-asar.mjs");
       expect(source).toContain("verify_packaged_runtime_config_boundary");
       expect(source.indexOf("prune-runtime-env-files.mjs")).toBeLessThan(
-        source.indexOf("npx electron-builder"),
+        packagingInvocationIndex(source),
       );
     }
     expect(writerSource).toContain("cloudService");
@@ -2164,7 +2164,7 @@ describe("desktop packaged runtime boundaries", () => {
       source.lastIndexOf("verify_windows_agent_html_lint_runtime"),
     );
     expect(source.lastIndexOf("verify_pruned_windows_runtime")).toBeLessThan(
-      source.indexOf("npx electron-builder"),
+      packagingInvocationIndex(source),
     );
   });
 });
@@ -2175,6 +2175,17 @@ function readJson<T>(path: string): T {
 
 function normalizeLineEndings(source: string): string {
   return source.replace(/\r\n/g, "\n");
+}
+
+function packagingInvocationIndex(source: string): number {
+  // Windows declares electron-builder inside a signing wrapper before the main flow.
+  // Match its top-level invocation; macOS still invokes electron-builder directly.
+  const invocation = source.includes("run_electron_builder_with_signing_recovery()")
+    ? /^run_electron_builder_with_signing_recovery "\$@"\r?$/gm
+    : /^npx electron-builder [^\r\n]+\r?$/gm;
+  const matches = [...source.matchAll(invocation)];
+  expect(matches).toHaveLength(1);
+  return matches[0]!.index;
 }
 
 function extractFunctionSource(source: string, declaration: string): string {

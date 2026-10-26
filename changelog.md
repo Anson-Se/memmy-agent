@@ -9,6 +9,7 @@
 - Include `ignore` in packaged Memory.
 - Verify SQLite 13 N-API prebuilds in Memory runtime packages.
 - Retry temporary Linux Gateway bootstrap HTTP 503 responses.
+- Improve Windows installer builds by avoiding redundant native rebuilds, isolating edition outputs, and retrying transient signing and file-lock errors.
 
 ### Changed
 
