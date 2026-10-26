@@ -48,8 +48,46 @@ describe("AgentMessageContent math rendering", () => {
     expect(html).not.toContain("katex");
   });
 
+  it("does not let an unmatched code tick hide later math", () => {
+    const markdown = "未闭合 `code 后仍渲染 \\(x\\)\n \t\r\n下一段 \\[y\\]";
+    const normalized = normalizeLatexMathDelimiters(markdown);
+    expect(normalized).toContain("未闭合 `code 后仍渲染 $x$");
+    expect(normalized).toContain("$$\ny\n$$");
+  });
+
+  it("recognizes a code-span closer after a literal backslash", () => {
+    const markdown = "`code\\` 后仍渲染 \\(x\\)";
+    expect(normalizeLatexMathDelimiters(markdown)).toBe("`code\\` 后仍渲染 $x$");
+  });
+
+  it("keeps multiline code spans and Markdown code blocks literal", () => {
+    const markdown = [
+      "`跨行 \\(x\\)",
+      "code`",
+      "",
+      "> ```text",
+      "> \\[y\\]",
+      "> ```",
+      "",
+      "    \\(z\\)",
+    ].join("\n");
+    expect(normalizeLatexMathDelimiters(markdown)).toBe(markdown);
+    const html = renderToString(createElement(AgentMessageContent, { content: markdown }));
+    expect(html).not.toContain("katex");
+  });
+
+  it("still converts an indented continuation of an ordinary paragraph", () => {
+    const markdown = "普通段落\n    续行 \\(x\\)";
+    expect(normalizeLatexMathDelimiters(markdown)).toBe("普通段落\n    续行 $x$");
+  });
+
   it("keeps unmatched and escaped delimiters unchanged", () => {
     const markdown = "未闭合 \\(x 与转义 \\\\(y\\\\)";
+    expect(normalizeLatexMathDelimiters(markdown)).toBe(markdown);
+  });
+
+  it("keeps nested delimiters unchanged instead of partially rewriting them", () => {
+    const markdown = "非法嵌套 \\(a \\(b\\) c\\)";
     expect(normalizeLatexMathDelimiters(markdown)).toBe(markdown);
   });
 

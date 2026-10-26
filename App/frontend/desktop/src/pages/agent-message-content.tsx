@@ -285,10 +285,13 @@ export function normalizeLatexMathDelimiters(content: string): string {
   let lineStart = true;
   let fenceCharacter: "`" | "~" | null = null;
   let fenceLength = 0;
+  let fenceQuoteDepth = 0;
+  let indentedCodeQuoteDepth: number | null = null;
   let inlineCodeTicks = 0;
   let mathCloser: ")" | "]" | null = null;
   let mathOpenerIndex = -1;
   let mathOpeningDelimiter = "";
+  let mathCanConvert = true;
   let precedingBackslashes = 0;
 
   while (index < content.length) {
@@ -296,25 +299,57 @@ export function normalizeLatexMathDelimiters(content: string): string {
       const newlineIndex = content.indexOf("\n", index);
       const lineEnd = newlineIndex === -1 ? content.length : newlineIndex;
       const line = content.slice(index, lineEnd);
-      const fenceMatch = /^(?: {0,3})(`{3,}|~{3,})/.exec(line);
+      const { quoteDepth, body } = splitBlockquotePrefix(line);
+      const fenceMatch = /^(?: {0,3})(`{3,}|~{3,})/.exec(body);
 
       if (fenceCharacter !== null) {
-        output.push(content.slice(index, newlineIndex === -1 ? lineEnd : lineEnd + 1));
-        if (fenceMatch?.[1]?.[0] === fenceCharacter
-          && fenceMatch[1].length >= fenceLength
-          && line.slice(fenceMatch[0].length).trim() === "") {
+        if (quoteDepth < fenceQuoteDepth) {
           fenceCharacter = null;
           fenceLength = 0;
+          fenceQuoteDepth = 0;
+        } else {
+          output.push(content.slice(index, newlineIndex === -1 ? lineEnd : lineEnd + 1));
+          if (quoteDepth === fenceQuoteDepth
+            && fenceMatch?.[1]?.[0] === fenceCharacter
+            && fenceMatch[1].length >= fenceLength
+            && body.slice(fenceMatch[0].length).trim() === "") {
+            fenceCharacter = null;
+            fenceLength = 0;
+            fenceQuoteDepth = 0;
+          }
+          index = newlineIndex === -1 ? lineEnd : lineEnd + 1;
+          lineStart = true;
+          precedingBackslashes = 0;
+          continue;
         }
+      }
+
+      if (fenceMatch?.[1]) {
+        fenceCharacter = fenceMatch[1][0] as "`" | "~";
+        fenceLength = fenceMatch[1].length;
+        fenceQuoteDepth = quoteDepth;
+        indentedCodeQuoteDepth = null;
+        output.push(content.slice(index, newlineIndex === -1 ? lineEnd : lineEnd + 1));
         index = newlineIndex === -1 ? lineEnd : lineEnd + 1;
         lineStart = true;
         precedingBackslashes = 0;
         continue;
       }
 
-      if (fenceMatch?.[1]) {
-        fenceCharacter = fenceMatch[1][0] as "`" | "~";
-        fenceLength = fenceMatch[1].length;
+      const isIndentedCodeLine = /^(?: {4}|\t)/.test(body);
+      if (indentedCodeQuoteDepth !== null) {
+        if (quoteDepth === indentedCodeQuoteDepth && (isIndentedCodeLine || body.trim() === "")) {
+          output.push(content.slice(index, newlineIndex === -1 ? lineEnd : lineEnd + 1));
+          index = newlineIndex === -1 ? lineEnd : lineEnd + 1;
+          lineStart = true;
+          precedingBackslashes = 0;
+          continue;
+        }
+        indentedCodeQuoteDepth = null;
+      }
+
+      if (isIndentedCodeLine && canStartIndentedCode(content, index, quoteDepth)) {
+        indentedCodeQuoteDepth = quoteDepth;
         output.push(content.slice(index, newlineIndex === -1 ? lineEnd : lineEnd + 1));
         index = newlineIndex === -1 ? lineEnd : lineEnd + 1;
         lineStart = true;
@@ -327,18 +362,26 @@ export function normalizeLatexMathDelimiters(content: string): string {
     const isEscaped = precedingBackslashes % 2 === 1;
     if (mathCloser !== null) {
       if (character === "\\" && content[index + 1] === mathCloser && !isEscaped) {
-        const isDisplayMath = mathCloser === "]";
-        output[mathOpenerIndex] = mathOpeningDelimiter;
-        output.push(isDisplayMath
-          ? `${content[index - 1] === "\n" ? "" : "\n"}$$${content[index + 2] === "\n" || index + 2 === content.length ? "" : "\n"}`
-          : "$");
+        if (mathCanConvert) {
+          const isDisplayMath = mathCloser === "]";
+          output[mathOpenerIndex] = mathOpeningDelimiter;
+          output.push(isDisplayMath
+            ? `${content[index - 1] === "\n" ? "" : "\n"}$$${content[index + 2] === "\n" || index + 2 === content.length ? "" : "\n"}`
+            : "$");
+        } else {
+          output.push(character, mathCloser);
+        }
         mathCloser = null;
         mathOpenerIndex = -1;
         mathOpeningDelimiter = "";
+        mathCanConvert = true;
         index += 2;
         lineStart = false;
         precedingBackslashes = 0;
         continue;
+      }
+      if (character === "\\" && (content[index + 1] === "(" || content[index + 1] === "[") && !isEscaped) {
+        mathCanConvert = false;
       }
       output.push(character);
       lineStart = character === "\n";
@@ -347,10 +390,10 @@ export function normalizeLatexMathDelimiters(content: string): string {
       continue;
     }
 
-    if (character === "`" && !isEscaped) {
+    if (character === "`" && (inlineCodeTicks !== 0 || !isEscaped)) {
       let runLength = 1;
       while (content[index + runLength] === "`") runLength += 1;
-      if (inlineCodeTicks === 0) inlineCodeTicks = runLength;
+      if (inlineCodeTicks === 0 && hasInlineCodeCloser(content, index + runLength, runLength)) inlineCodeTicks = runLength;
       else if (inlineCodeTicks === runLength) inlineCodeTicks = 0;
       output.push(content.slice(index, index + runLength));
       index += runLength;
@@ -365,6 +408,7 @@ export function normalizeLatexMathDelimiters(content: string): string {
         output.push(content.slice(index, index + 2));
         mathOpenerIndex = output.length - 1;
         mathCloser = opener === "[" ? "]" : ")";
+        mathCanConvert = true;
         mathOpeningDelimiter = opener === "["
           ? `${index === 0 || content[index - 1] === "\n" ? "" : "\n"}$$${content[index + 2] === "\n" ? "" : "\n"}`
           : "$";
@@ -382,6 +426,48 @@ export function normalizeLatexMathDelimiters(content: string): string {
   }
 
   return output.join("");
+}
+
+function splitBlockquotePrefix(line: string): { quoteDepth: number; body: string } {
+  let offset = 0;
+  let quoteDepth = 0;
+  while (true) {
+    const match = /^(?: {0,3})>[ \t]?/.exec(line.slice(offset));
+    if (!match) break;
+    offset += match[0].length;
+    quoteDepth += 1;
+  }
+  return { quoteDepth, body: line.slice(offset) };
+}
+
+function canStartIndentedCode(content: string, lineStart: number, quoteDepth: number): boolean {
+  if (lineStart === 0) return true;
+  const previousLineEnd = lineStart - 1;
+  const previousLineStart = content.lastIndexOf("\n", previousLineEnd - 1) + 1;
+  const previousLine = splitBlockquotePrefix(content.slice(previousLineStart, previousLineEnd));
+  return previousLine.quoteDepth !== quoteDepth || previousLine.body.trim() === "";
+}
+
+function hasInlineCodeCloser(content: string, startIndex: number, runLength: number): boolean {
+  let index = startIndex;
+  while (index < content.length) {
+    if (content[index] === "\n") {
+      const nextLineEnd = content.indexOf("\n", index + 1);
+      const nextLine = content.slice(index + 1, nextLineEnd === -1 ? content.length : nextLineEnd);
+      if (nextLine.trim() === "") return false;
+      const { body } = splitBlockquotePrefix(nextLine);
+      if (/^(?: {0,3})(?:`{3,}|~{3,})/.test(body)) return false;
+    }
+    if (content[index] === "`") {
+      let candidateLength = 1;
+      while (content[index + candidateLength] === "`") candidateLength += 1;
+      if (candidateLength === runLength) return true;
+      index += candidateLength;
+      continue;
+    }
+    index += 1;
+  }
+  return false;
 }
 
 function areAgentMessageContentPropsEqual(previous: AgentMessageContentProps, next: AgentMessageContentProps): boolean {
