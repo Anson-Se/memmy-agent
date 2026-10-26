@@ -24,6 +24,7 @@ const DISPLAY_NAME = "DeepSeek Harness";
 const PATCH_START = "# memmy-memory plugin:start";
 const PATCH_END = "# memmy-memory plugin:end";
 const PLUGIN_PACKAGE_NAME = "@memmy/memmy-memory";
+const PROCESS_PROBE_TIMEOUT_MS = 5_000;
 
 export interface CreateDeepseekHarnessSkillTargetDeps {
   rootDirectory?: string;
@@ -92,7 +93,8 @@ export function createDeepseekHarnessSkillTarget(
       const currentPatch = await readTextFile(patchPath);
       const nextPatch = renderPatchedContent(currentPatch, renderPluginPatch(memmyConfigPath));
       const generatedFileContents = await Promise.all(generatedFiles.map(([filePath]) => readTextFile(filePath)));
-      const pluginNeedsUpdate = nextPatch !== currentPatch || generatedFiles.some(([, content], index) => (
+      const patchNeedsUpdate = normalizeLineEndings(nextPatch) !== normalizeLineEndings(currentPatch);
+      const pluginNeedsUpdate = patchNeedsUpdate || generatedFiles.some(([, content], index) => (
         content !== generatedFileContents[index]
       ));
       if (pluginNeedsUpdate && await isDeepseekHarnessRunning()) {
@@ -101,7 +103,7 @@ export function createDeepseekHarnessSkillTarget(
       for (const [filePath, content] of generatedFiles) {
         await writeFileIfChanged(filePath, content);
       }
-      await writeFileIfChanged(patchPath, nextPatch);
+      if (patchNeedsUpdate) await writeFileAtomically(patchPath, nextPatch);
       await replaceMemmySkillDirectory(rootDirectory, renderMemmyPluginSkillManifest(TARGET_ID));
       await replaceMemmyResumeSkillDirectory(rootDirectory, TARGET_ID);
     },
@@ -207,20 +209,51 @@ async function writeFileIfChanged(filePath: string, content: string): Promise<vo
   await writeFileAtomically(filePath, content);
 }
 
+function normalizeLineEndings(value: string): string {
+  return value.replaceAll("\r\n", "\n");
+}
+
 async function detectDeepseekHarnessProcess(): Promise<boolean> {
   if (process.platform === "win32") {
     return commandOutputMatches("tasklist", ["/FO", "CSV", "/NH"], /DeepSeek Harness(?: Helper)?\.exe/iu);
   }
-  const pattern = process.platform === "darwin"
-    ? "DeepSeek Harness\\.app/Contents|DeepSeek Harness Helper"
-    : "DeepSeek Harness|deepseek-harness|dsh-desktop";
-  return commandOutputMatches("pgrep", ["-f", pattern], /\S/u);
+  return commandOutputMatches("pgrep", ["-f", deepseekHarnessProcessPattern(process.platform)], /\S/u, 1);
 }
 
-function commandOutputMatches(command: string, args: string[], pattern: RegExp): Promise<boolean> {
-  return new Promise((resolve) => {
-    execFile(command, args, { encoding: "utf8", windowsHide: true }, (error, stdout) => {
-      resolve(!error && pattern.test(stdout));
+export function deepseekHarnessProcessPattern(platform: NodeJS.Platform): string {
+  const hostEntry = "/dsh-desktop-host/(?:lib/)?(?:cli|index|main)\\.js(?:\\s|$)";
+  if (platform === "darwin") {
+    const appExecutable = "(^|/)DeepSeek Harness(?: Helper)?(?:\\.app/Contents/MacOS/DeepSeek Harness(?: Helper)?)?(?:\\s|$)";
+    return appExecutable + "|(^|/)dsh-desktop(?:\\s|$)|" + hostEntry;
+  }
+  return "(^|/)(?:deepseek-harness|dsh-desktop)(?:\\s|$)|" + hostEntry;
+}
+
+function commandOutputMatches(
+  command: string,
+  args: string[],
+  pattern: RegExp,
+  noMatchExitCode?: number
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: PROCESS_PROBE_TIMEOUT_MS
+    }, (error, stdout) => {
+      if (!error) {
+        resolve(pattern.test(stdout));
+        return;
+      }
+      if (noMatchExitCode !== undefined && isNodeError(error) && Number(error.code) === noMatchExitCode) {
+        resolve(false);
+        return;
+      }
+      const probeError = new Error(
+        "Could not determine whether DeepSeek Harness is running. Quit DeepSeek Harness and retry the plugin installation."
+      );
+      (probeError as Error & { cause?: unknown }).cause = error;
+      reject(probeError);
     });
   });
 }

@@ -7,6 +7,7 @@ import { runInNewContext } from "node:vm";
 import YAML from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeepseekHarnessSkillTarget as createDeepseekHarnessSkillTargetImpl } from "../index.js";
+import { deepseekHarnessProcessPattern } from "../target.js";
 
 let tempDir: string | undefined;
 
@@ -143,6 +144,22 @@ describe("DeepSeek Harness skill target", () => {
     expect(isDeepseekHarnessRunning).not.toHaveBeenCalled();
   });
 
+  it("does not treat patch line endings as a plugin update", async () => {
+    const rootDirectory = createRoot();
+    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
+    await target.installPlugin?.("deepseek_harness");
+    const patchPath = join(rootDirectory, "cordis.patch.yml");
+    const crlfPatch = readFileSync(patchPath, "utf8").replaceAll("\n", "\r\n");
+    writeFileSync(patchPath, crlfPatch, "utf8");
+    const isDeepseekHarnessRunning = vi.fn(async () => true);
+    const runningTarget = createDeepseekHarnessSkillTarget({ rootDirectory, isDeepseekHarnessRunning });
+
+    await runningTarget.installPlugin?.("deepseek_harness");
+
+    expect(readFileSync(patchPath, "utf8")).toBe(crlfPatch);
+    expect(isDeepseekHarnessRunning).not.toHaveBeenCalled();
+  });
+
   it("requires DSH to stop before replacing stale plugin files", async () => {
     const rootDirectory = createRoot();
     const target = createDeepseekHarnessSkillTarget({ rootDirectory });
@@ -270,6 +287,34 @@ describe("DeepSeek Harness skill target", () => {
     });
 
     expect(requested).toEqual(["uiConversation"]);
+    expect(registered).toBe(1);
+  });
+
+  it("falls back to a legacy registry when optional injection throws", async () => {
+    const rootDirectory = createRoot();
+    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
+    await target.installPlugin?.("deepseek_harness");
+    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
+    let handoff: { id: string; factory(): Record<string, any> } | undefined;
+    runInNewContext(readFileSync(clientPath, "utf8"), {
+      window: { __ModuleLoader__: { load: (value: typeof handoff) => { handoff = value; } } }
+    });
+
+    let injectionFailed = false;
+    let registered = 0;
+    const client = handoff?.factory();
+    expect(() => client?.apply({
+      inject() {
+        injectionFailed = true;
+        throw new Error("optional injection unavailable");
+      },
+      get(name: string) {
+        return injectionFailed && name === "conversationEvents"
+          ? { register: () => { registered += 1; } }
+          : undefined;
+      }
+    })).not.toThrow();
+
     expect(registered).toBe(1);
   });
 
@@ -690,6 +735,19 @@ describe("DeepSeek Harness skill target", () => {
       if (previousDshHome === undefined) delete process.env.DSH_HOME;
       else process.env.DSH_HOME = previousDshHome;
     }
+  });
+});
+
+describe("DeepSeek Harness process matching", () => {
+  it("matches packaged and development entrypoints without matching checkout paths", () => {
+    const darwinPattern = new RegExp(deepseekHarnessProcessPattern("darwin"), "u");
+    const linuxPattern = new RegExp(deepseekHarnessProcessPattern("linux"), "u");
+
+    expect(darwinPattern.test("/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --expose-internals")).toBe(true);
+    expect(darwinPattern.test("/Applications/DeepSeek Harness.app/Contents/Frameworks/DeepSeek Harness Helper.app/Contents/MacOS/DeepSeek Harness Helper --type=renderer")).toBe(true);
+    expect(darwinPattern.test("node /workspace/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js")).toBe(true);
+    expect(linuxPattern.test("/opt/deepseek/bin/dsh-desktop --profile default")).toBe(true);
+    expect(linuxPattern.test("node /workspace/deepseek-harness/tests/process.test.js")).toBe(false);
   });
 });
 

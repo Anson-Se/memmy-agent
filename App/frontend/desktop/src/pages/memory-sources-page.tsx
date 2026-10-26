@@ -20,7 +20,6 @@ import { openExternalUrl } from "../utils/open-url.js";
 import { Button } from "../components/button.js";
 import { Banner } from "../components/banner.js";
 import { Modal } from "../components/modal.js";
-import { useNotificationCenter } from "../components/notification-center.js";
 import {
   AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS,
   agentActions,
@@ -127,7 +126,6 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
   const { state, dispatch } = useAppState();
   const { clients } = useApiClients();
   const { t } = useTranslation();
-  const { notify } = useNotificationCenter();
   const [manualName, setManualName] = useState("");
   const [manualHistoryPath, setManualHistoryPath] = useState("");
   const [manualValidating, setManualValidating] = useState(false);
@@ -672,12 +670,8 @@ export function MemorySourcesContent(props: MemorySourcesContentProps = {}) {
    *
    * @param action The source client operation.
    */
-  function runSourceAction(action: Promise<void>, source: AgentSourceView) {
-    void action.then(reloadSources).catch((error) => {
-      const message = formatAgentSourceActionError(error, source, t);
-      dispatch(appActions.agentSourcesFailed(message));
-      notify({ variant: "warning", title: source.displayName, body: message });
-    });
+  function runSourceAction(action: Promise<void>, source?: AgentSourceView) {
+    void action.then(reloadSources).catch((error) => dispatch(appActions.agentSourcesFailed(formatAgentSourceActionError(error, source, t))));
   }
 
   function runAgentSourceConnectionAction(action: AgentSourceConnectionAction, source: AgentSourceView) {

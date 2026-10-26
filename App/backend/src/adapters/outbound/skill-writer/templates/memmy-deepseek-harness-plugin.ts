@@ -573,9 +573,9 @@ export const DEEPSEEK_HARNESS_PLUGIN_CLIENT = String.raw`window.__ModuleLoader__
     const name = "memmy-memory-client";
     const inject = [];
 
-    function resolveConversationEventRegistry(ctx) {
+    function resolveConversationEventRegistry(ctx, includeUiLookup = true) {
       const uiConversation = ctx.uiConversation
-        || (typeof ctx.get === "function" ? ctx.get("uiConversation") : undefined);
+        || (includeUiLookup && typeof ctx.get === "function" ? ctx.get("uiConversation") : undefined);
       if (uiConversation && uiConversation.events) return uiConversation.events;
       const conversation = ctx.conversation
         || (typeof ctx.get === "function" ? ctx.get("conversation") : undefined);
@@ -586,21 +586,31 @@ export const DEEPSEEK_HARNESS_PLUGIN_CLIENT = String.raw`window.__ModuleLoader__
     }
 
     function apply(ctx) {
+      if (typeof ctx.inject !== "function") {
+        registerOptimisticUi(ctx);
+        return;
+      }
       try {
-        if (typeof ctx.inject === "function") {
-          ctx.inject(["uiConversation"], registerOptimisticUi);
+        const availableRegistry = resolveConversationEventRegistry(ctx, false);
+        if (availableRegistry) {
+          registerOptimisticUi(ctx, availableRegistry);
           return;
         }
       } catch (error) {
         warnOptionalUi(error);
+      }
+      try {
+        ctx.inject(["uiConversation"], registerOptimisticUi);
         return;
+      } catch (error) {
+        warnOptionalUi(error);
       }
       registerOptimisticUi(ctx);
     }
 
-    function registerOptimisticUi(ctx) {
+    function registerOptimisticUi(ctx, availableRegistry) {
       try {
-        const registry = resolveConversationEventRegistry(ctx);
+        const registry = availableRegistry || resolveConversationEventRegistry(ctx);
         if (!registry || typeof registry.register !== "function") return;
         registry.register({
           kind: "memmy-optimistic-user",
