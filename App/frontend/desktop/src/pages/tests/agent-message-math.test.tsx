@@ -76,6 +76,29 @@ describe("AgentMessageContent math rendering", () => {
     expect(html).not.toContain("katex");
   });
 
+  it("keeps fenced code nested in Markdown lists literal", () => {
+    const markdown = [
+      "- ```text",
+      "  \\[x\\]",
+      "  - ```",
+      "  ```",
+      "",
+      "1. ~~~text",
+      "   \\(y\\)",
+      "   ~~~",
+    ].join("\n");
+    expect(normalizeLatexMathDelimiters(markdown)).toBe(markdown);
+    const html = renderToString(createElement(AgentMessageContent, { content: markdown }));
+    expect(html).not.toContain("katex");
+  });
+
+  it("does not search for code-span closers across Markdown block boundaries", () => {
+    const heading = "未闭合 `code\n# 标题\n后续 \\(x\\)\n`";
+    const list = "未闭合 `code\n- 列表\n后续 \\(y\\)\n`";
+    expect(normalizeLatexMathDelimiters(heading)).toContain("后续 $x$");
+    expect(normalizeLatexMathDelimiters(list)).toContain("后续 $y$");
+  });
+
   it("still converts an indented continuation of an ordinary paragraph", () => {
     const markdown = "普通段落\n    续行 \\(x\\)";
     expect(normalizeLatexMathDelimiters(markdown)).toBe("普通段落\n    续行 $x$");

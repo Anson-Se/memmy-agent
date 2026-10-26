@@ -300,7 +300,11 @@ export function normalizeLatexMathDelimiters(content: string): string {
       const lineEnd = newlineIndex === -1 ? content.length : newlineIndex;
       const line = content.slice(index, lineEnd);
       const { quoteDepth, body } = splitBlockquotePrefix(line);
-      const fenceMatch = /^(?: {0,3})(`{3,}|~{3,})/.exec(body);
+      const fencePattern = /^(?: {0,3})(`{3,}|~{3,})/;
+      const fenceBody = fenceCharacter === null
+        ? body.replace(/^(?: {0,3})(?:[-+*]|\d{1,9}[.)])[ \t]+/, "")
+        : body;
+      const fenceMatch = fencePattern.exec(fenceBody);
 
       if (fenceCharacter !== null) {
         if (quoteDepth < fenceQuoteDepth) {
@@ -312,7 +316,7 @@ export function normalizeLatexMathDelimiters(content: string): string {
           if (quoteDepth === fenceQuoteDepth
             && fenceMatch?.[1]?.[0] === fenceCharacter
             && fenceMatch[1].length >= fenceLength
-            && body.slice(fenceMatch[0].length).trim() === "") {
+            && fenceBody.slice(fenceMatch[0].length).trim() === "") {
             fenceCharacter = null;
             fenceLength = 0;
             fenceQuoteDepth = 0;
@@ -449,14 +453,18 @@ function canStartIndentedCode(content: string, lineStart: number, quoteDepth: nu
 }
 
 function hasInlineCodeCloser(content: string, startIndex: number, runLength: number): boolean {
+  const openerLineStart = content.lastIndexOf("\n", startIndex - runLength - 1) + 1;
+  const openerQuoteDepth = splitBlockquotePrefix(content.slice(openerLineStart, startIndex)).quoteDepth;
   let index = startIndex;
   while (index < content.length) {
     if (content[index] === "\n") {
       const nextLineEnd = content.indexOf("\n", index + 1);
       const nextLine = content.slice(index + 1, nextLineEnd === -1 ? content.length : nextLineEnd);
       if (nextLine.trim() === "") return false;
-      const { body } = splitBlockquotePrefix(nextLine);
-      if (/^(?: {0,3})(?:`{3,}|~{3,})/.test(body)) return false;
+      const { quoteDepth, body } = splitBlockquotePrefix(nextLine);
+      if (quoteDepth !== openerQuoteDepth
+        || /^(?: {0,3})(?:`{3,}|~{3,}|#{1,6}(?:[ \t]+|$)|(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$))/.test(body)
+        || /^(?: {0,3})(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/.test(body)) return false;
     }
     if (content[index] === "`") {
       let candidateLength = 1;
