@@ -51,6 +51,17 @@ const bootstrap = AppBootstrapResponseSchema.parse({
 });
 
 describe("app reducer", () => {
+  it("routes sidebar recording requests to the main page and tracks capture status", () => {
+    const fromTools = appReducer(createInitialAppState(), appActions.navigate("/tools"));
+    const requested = appReducer(fromTools, appActions.requestRecordingControl());
+    expect(requested.navigation.currentPath).toBe("/main");
+    expect(requested.navigation.recordingRequestId).toBe(1);
+    expect(requested.navigation.recordingRequestAction).toBe("control");
+    const handled = appReducer(requested, appActions.recordingRequestHandled(1));
+    expect(handled.navigation.recordingHandledId).toBe(1);
+    expect(appReducer(handled, appActions.recordingRequestHandled(1))).toBe(handled);
+    expect(appReducer(handled, appActions.recordingStatusChanged("recording")).navigation.recordingStatus).toBe("recording");
+  });
   it("does not redraw the app when connection polling returns unchanged data", () => {
     const connection = { id: "github-1", toolkit: "github", status: "ACTIVE" };
     const ready = appReducer(createInitialAppState(), { type: "tools/loadSuccess", connections: [connection] });

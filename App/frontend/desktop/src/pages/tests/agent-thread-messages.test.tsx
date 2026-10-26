@@ -45,6 +45,16 @@ describe("delivered file save names", () => {
 });
 
 describe("AgentThreadMessages", () => {
+  it("keeps a task plan visible in the thread even without a matching creation trace", () => {
+    const html = renderToString(<I18nProvider language="zh-CN"><AgentThreadMessages
+      chatScopeKey="chat-plan" messages={[]}
+      taskPlan={{ plan_id: "plan-1", title: "写综述", status: "active",
+        items: [{ id: "draft", content: "整理文献", status: "in_progress" }],
+        created_at: null, updated_at: null }} />
+    </I18nProvider>);
+    expect(html).toContain("任务清单");
+    expect(html).toContain("整理文献");
+  });
   it("updates a question card in place without rendering its response as a user bubble", () => {
     const card: AgentQuestionCardPayload = {
       version: 1,

@@ -79,7 +79,7 @@ export class MessageTool extends Tool {
     return (
       "Proactively send a message to a user/channel, optionally with file attachments. " +
       "Use this for reminders, cross-channel delivery, or explicit proactive sends. " +
-      "Do not use this for the normal reply in the current chat: answer naturally instead. " +
+      "Do not use this for a text-only normal reply in the current chat: answer naturally instead. " +
       "When a file is the task's final deliverable, attach it to the current conversation " +
       "through the message tool's media parameter by default. " +
       "When generate_image creates images in the current chat, use the message tool " +

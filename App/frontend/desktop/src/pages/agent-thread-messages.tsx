@@ -2400,6 +2400,7 @@ function AgentActivityCluster(props: {
           <span className="min-w-0 truncate">{headerLabel}</span>
           <Chevron data-icon={props.open ? "chevron-down" : "chevron-right"} size={12} className="shrink-0" />
         </button>
+        {!props.open && props.taskPlan?.plan_id ? <AgentTaskPlanBar plan={props.taskPlan} embeddedInProcess runActive={props.isRunning} /> : null}
         {!props.open ? segments.flatMap((segment) => {
           if (segment.type !== "question") return [];
           const card = readAgentQuestionCard(segment.message.agentUi);

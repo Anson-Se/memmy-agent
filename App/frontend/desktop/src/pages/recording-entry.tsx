@@ -20,6 +20,7 @@ import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { I18nContextValue } from "../i18n/i18n-provider.js";
 import { useTranslation } from "../i18n/use-translation.js";
+import { enUSMessages, zhCNMessages } from "../i18n/messages.js";
 import { mergeLiveLines, type AsrLiveLine } from "../lib/asr-live-transcription.js";
 import type { RecordingPanelTranscript } from "./interview-recording-panel.js";
 import { formatClock, RecordingPlayer, TranscriptTurns } from "./interview-recording-panel.js";
@@ -1102,7 +1103,8 @@ export function transcriptFile(entry: RecordingArchiveEntry, t: Translate): File
 
 /** Give recordings saved before dated defaults a distinct label at read time. */
 function recordingDisplayTitle(entry: Pick<RecordingArchiveEntry, "title" | "recordedAt">): string {
-  if (entry.title !== "录音记录" && entry.title !== "Recording") return entry.title;
+  if (entry.title !== zhCNMessages["recording.page.defaultTitle"]
+    && entry.title !== enUSMessages["recording.page.defaultTitle"]) return entry.title;
   const stamp = formatRecordingTitleTimestamp(entry.recordedAt);
   return stamp ? `${entry.title} ${stamp}` : entry.title;
 }

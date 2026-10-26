@@ -55,13 +55,6 @@ function nonemptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function questionWaitingLabel(title: string | null | undefined, english = false): string {
-  const value = title?.trim();
-  if (!value) return english ? "Waiting for your answer" : "等待用户回答";
-  if (english) return /^Wait(?:ing)?\b/iu.test(value) ? value : `Waiting for ${value}`;
-  return /^(?:等待|待)/u.test(value) ? value : `等待${value}`;
-}
-
 export function readAgentQuestionCard(value: unknown): AgentQuestionCardPayload | null {
   if (!isRecord(value)) return null;
   const raw = isRecord(value.questionCard) ? value.questionCard : null;
@@ -247,7 +240,7 @@ function AgentNativeQuestionCard(props: {
   interrupted?: boolean;
   onSubmit?: (response: AgentQuestionResponse) => Promise<boolean> | boolean;
 }) {
-  const { t, language } = useTranslation();
+  const { t } = useTranslation();
   const dock = useContext(AgentQuestionDockContext);
   const activeRequestId = useContext(AgentQuestionActiveRequestContext);
   const [draft, setDraft] = useState(() => initialDraft(props.card));
@@ -377,7 +370,10 @@ function AgentNativeQuestionCard(props: {
   if (!answered && props.processView && activeRequestId === props.card.requestId) {
     return <div className="agent-question-answer agent-question-answer--review" data-waiting-input-anchor={props.card.requestId}>
       <MessageCircleQuestionMark size={14} aria-hidden="true" />
-      <span>{questionWaitingLabel(props.card.title, language === "en-US")}</span>
+      <span>{props.card.title?.trim()
+        ? props.card.title.trim().startsWith(t("home.question.waitPrefix"))
+          ? props.card.title.trim() : t("home.question.waitingNamed", { title: props.card.title.trim() })
+        : t("home.question.waitingForAnswer")}</span>
     </div>;
   }
   const card = (

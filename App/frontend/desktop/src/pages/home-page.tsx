@@ -92,7 +92,7 @@ import {
 } from "./agent-question-card.js";
 import { PluginCapabilityHost, RecordingBarPortalContext, isLegalFlowInteraction, pinnedCapabilityKey, selectRegionPluginCalls, selectVisiblePluginCalls } from "./plugin-capability-host.js";
 import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
-import { RecordingEntryCard, RecordingEntryPage, useRecordingEntry, type RecordingDeliverFn, type RecordingArchiveEntry } from "./recording-entry.js";
+import { RecordingEntryCard, RecordingEntryPage, applySidebarRecordingAction, sidebarRecordingStatus, useRecordingEntry, type RecordingDeliverFn, type RecordingArchiveEntry } from "./recording-entry.js";
 import { PluginArtifactPreviewPanel } from "./plugin-artifact-preview-panel.js";
 import { AgentThreadPanel, useAgentThreadPanel } from "./agent-thread-panel.js";
 import { hasPendingBrowserOpen, MEMMY_BROWSER_OPEN_EVENT } from "./browser-panel.js";
@@ -1540,6 +1540,23 @@ export function HomePage() {
       }
     }
   );
+  const recordingSidebarStatus = sidebarRecordingStatus(recordingEntry.session);
+  useEffect(() => {
+    dispatch(appActions.recordingStatusChanged(recordingSidebarStatus));
+  }, [dispatch, recordingSidebarStatus]);
+  useEffect(() => {
+    const requestId = state.navigation.recordingRequestId;
+    if (state.navigation.currentPath !== "/main" || requestId <= state.navigation.recordingHandledId) return;
+    dispatch(appActions.recordingRequestHandled(requestId));
+    if (state.navigation.recordingRequestAction !== "finish" && !recordingEntry.open) {
+      setPluginArtifactPreview(null);
+      setPreviewPanelOpen(false);
+      setEnvironmentPanelOpen(false);
+      recordingEntry.toggle();
+    }
+    applySidebarRecordingAction(recordingEntry.session, state.navigation.recordingRequestAction);
+  }, [dispatch, state.navigation.currentPath, state.navigation.recordingRequestId,
+    state.navigation.recordingHandledId, state.navigation.recordingRequestAction]);
   const archivePluginRecording = useCallback((entry: RecordingArchiveEntry) => {
     recordingEntry.archive(entry);
     stageRecordingMaterials(entry);
@@ -1849,7 +1866,8 @@ export function HomePage() {
   );
   // The same condition the sidebar spinner uses, so the thread and the
   // spinner never disagree about whether Memmy is working.
-  const pendingQuestion = isCurrentAgentRunning ? pendingAgentQuestion(state.agent.messages, currentActiveTurnId) : null;
+  const pendingQuestion = state.agent.currentChatId && state.agent.stopInFlightByChatId[state.agent.currentChatId]
+    ? null : pendingAgentQuestion(state.agent.messages, currentActiveTurnId);
   const pendingNativeQuestion = pendingQuestion && !pendingQuestion.context ? pendingQuestion : null;
   useQuestionDockLayout({
     panelRef: conversationPanelRef,
@@ -4251,6 +4269,13 @@ export function HomePage() {
       emptyLabel={t("workspaceArtifact.noFiles")}
       emptyDetail={previewRootLabel}
     />
+  ) : recordingEntry.open ? (
+    <aside className="workspace-artifact-preview-pane workspace-artifact-preview-pane--recording workspace-artifact-preview-pane--lifted recording-blank-preview"
+      style={{ width: previewPanelWidth }}>
+      <button type="button" className="recording-blank-preview__close" aria-label={t("common.close")}
+        onClick={recordingEntry.close}><X size={16} aria-hidden="true" /></button>
+      <RecordingEntryPage session={recordingEntry.session} />
+    </aside>
   ) : null;
   const pluginPreviewPanel = pluginArtifactPreview && clients && (!recordingSession || !recorderPaneOpen) ? (
     <PluginArtifactPreviewPanel
@@ -4305,6 +4330,7 @@ export function HomePage() {
   return (
     <AppFrame
       title={t("home.title")}
+      recordingActive={recordingEntry.open}
       topBar={hasActiveConversation ? (
         <AgentThreadToolbar
           key={chatScopeKey}

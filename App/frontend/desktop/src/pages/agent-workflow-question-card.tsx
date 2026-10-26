@@ -1,4 +1,4 @@
-import "./agent-question-card.css";
+import "./agent-workflow-question-card.css";
 import { useMemo, useState } from "react";
 import { Check, Loader2, PenLine, ChevronRight, X } from "lucide-react";
 import { useTranslation } from "../i18n/use-translation.js";
