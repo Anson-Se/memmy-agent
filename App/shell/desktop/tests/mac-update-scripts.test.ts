@@ -56,9 +56,22 @@ describe.runIf(process.platform === "darwin")("macOS automatic update validation
       "/usr/bin/lipo": mockTool("lipo", 'if [ "$1" = "-verify_arch" ]; then exit 2; fi; case " $(cat "$(dirname "$1")/architecture") " in *" $3 "*) exit 0;; *) exit 1;; esac'),
       "/usr/bin/sw_vers": mockTool("sw_vers", "echo 14.0"),
       "/usr/bin/xattr": mockTool("xattr", "exit 0"),
-      "/usr/bin/codesign": mockTool("codesign", `for arg in "$@"; do app="$arg"; done
-if [ "$1" = -dv ]; then echo "TeamIdentifier=$(cat "$app/team")" >&2; exit 0; fi
-for arg in "$@"; do if [ "$arg" = -R ] && [ -f "$app/untrusted-chain" ]; then exit 1; fi; done
+      "/usr/bin/codesign": mockTool("codesign", `app=""
+prev=""
+requirement=""
+for arg in "$@"; do
+  if [ "$prev" = "-R" ]; then requirement="$arg"; fi
+  prev="$arg"
+  app="$arg"
+done
+if [ "$1" = "-dv" ]; then echo "TeamIdentifier=$(cat "$app/team")" >&2; exit 0; fi
+if [ -n "$requirement" ]; then
+  case "$requirement" in
+    "=anchor apple generic "*"field.1.2.840.113635.100.6.1.13"*) ;;
+    *) exit 2 ;;
+  esac
+  if [ -f "$app/untrusted-chain" ]; then exit 1; fi
+fi
 if [ -f "$app/fail-after-replace" ] && [ "$app" = '${destination}' ]; then exit 1; fi
 [ "$(cat "$app/signature")" = valid ]`),
     };
@@ -170,6 +183,8 @@ describe("macOS update architecture command", () => {
     const options = { architecture: "arm64" as const, teamIdentifier: "MEMMYTEAM1", expectedVersion: "1.2.4", currentVersion: "1.2.3" };
     for (const script of [createMacDmgUpdateStageScript(options), createMacDmgUpdateInstallScript(options)]) {
       expect(script).toContain('/usr/bin/lipo "$app_path/Contents/MacOS/$bundle_executable" -verify_arch "$EXPECTED_ARCH"');
+      expect(script).toContain(`local signing_requirement='=anchor apple generic and identifier "cn.memtensor.memmy" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "MEMMYTEAM1"'`);
+      expect(script).toContain('codesign --verify --deep --strict -R "$signing_requirement" "$app_path"');
     }
   });
 });
