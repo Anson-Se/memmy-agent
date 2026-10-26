@@ -1,4 +1,4 @@
-import { MemmateReadBatch, memmatePermissionRequired } from "../memmate-permission.js";
+import { AuthorizedReadBatch, managedExecutionRequired } from "../managed-execution.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -159,7 +159,7 @@ export class SearchTool extends Tool {
     return path.relative(root, target).replaceAll(path.sep, "/") || ".";
   }
 
-  async *iterFiles(root: string, batch = new MemmateReadBatch(root)): AsyncIterable<string> {
+  async *iterFiles(root: string, batch = new AuthorizedReadBatch(root)): AsyncIterable<string> {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
@@ -219,7 +219,7 @@ export class FindFilesTool extends SearchTool {
     };
   }
 
-  async *iterPaths(root: string, { includeDirs = false }: { includeDirs?: boolean } = {}, batch = new MemmateReadBatch(root)): AsyncIterable<string> {
+  async *iterPaths(root: string, { includeDirs = false }: { includeDirs?: boolean } = {}, batch = new AuthorizedReadBatch(root)): AsyncIterable<string> {
     const stat = await safeStat(root);
     if (!stat) return;
     if (stat.isFile()) {
@@ -271,7 +271,7 @@ export class FindFilesTool extends SearchTool {
       const root = stat.isDirectory() ? target : path.dirname(target);
       const matches: Array<{ display: string; mtime: number }> = [];
 
-      const batch = new MemmateReadBatch(target);
+      const batch = new AuthorizedReadBatch(target);
       for await (const candidate of this.iterPaths(target, { includeDirs }, batch)) {
         const candidateStat = await safeStat(candidate);
         if (!candidateStat) continue;
@@ -322,7 +322,7 @@ export class GrepTool extends SearchTool {
     return (
       "Search file contents with a regex pattern. " +
       "Default output_mode is files_with_matches (file paths only); use content mode for matching lines with context. " +
-      "Prefer this over shell grep for ordinary workspace searches. In MemMate managed runs, also searches PDF and DOCX text. Skips other binary files and files >2 MB. Supports glob/type filtering."
+      "Prefer this over shell grep for ordinary workspace searches. In managed runs, also searches PDF and DOCX text. Skips other binary files and files >2 MB. Supports glob/type filtering."
     );
   }
 
@@ -424,7 +424,7 @@ export class GrepTool extends SearchTool {
       const counts = new Map<string, number>();
       const fileMtimes = new Map<string, number>();
 
-      const batch = new MemmateReadBatch(target);
+      const batch = new AuthorizedReadBatch(target);
       for await (const filePath of this.iterFiles(target, batch)) {
         const fileStat = await safeStat(filePath);
         if (!fileStat?.isFile()) continue;
@@ -436,7 +436,7 @@ export class GrepTool extends SearchTool {
           continue;
         }
         let content: string;
-        if (memmatePermissionRequired() && [".pdf", ".docx"].includes(path.extname(filePath).toLowerCase())) {
+        if (managedExecutionRequired() && [".pdf", ".docx"].includes(path.extname(filePath).toLowerCase())) {
           const extracted = await batch.read(filePath, () => extractText(filePath, { maxChars: null }));
           if (extracted === undefined) continue;
           if (extracted == null || extracted.startsWith("[error:")) {

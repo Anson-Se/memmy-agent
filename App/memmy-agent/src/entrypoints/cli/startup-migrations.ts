@@ -56,8 +56,8 @@ export function resolveStartupMigrationTarget(
     env,
   );
   if (input.config) setConfigPath(runtimeConfigFile);
-  const managed = env.MEMMATE_PERMISSION_REQUIRED === "1";
-  if (managed && !path.isAbsolute(env.MEMMY_AGENT_DATA_DIR ?? "")) throw new Error("MemMate runtime data directory is required");
+  const managed = env.AGENT_MANAGED_EXECUTION_REQUIRED === "1";
+  if (managed && !path.isAbsolute(env.MEMMY_AGENT_DATA_DIR ?? "")) throw new Error("Managed runtime data directory is required");
   return resolveMigrationTargets({
     runtimeConfigFile,
     agentWorkspaceOverride: managed ? path.join(env.MEMMY_AGENT_DATA_DIR!, "workspace") : input.workspace ?? env.MEMMY_AGENT_WORKSPACE,

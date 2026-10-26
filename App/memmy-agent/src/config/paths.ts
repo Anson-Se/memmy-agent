@@ -46,7 +46,7 @@ export function getWebuiDir(): string {
 
 export function getWorkspacePath(workspace?: string | null): string {
   const target = expandHome(workspace || process.env.MEMMY_AGENT_WORKSPACE || "~/.memmy/workspace");
-  return process.env.MEMMATE_PERMISSION_REQUIRED === "1" ? target : ensureDir(target);
+  return process.env.AGENT_MANAGED_EXECUTION_REQUIRED === "1" ? target : ensureDir(target);
 }
 
 export function getStandaloneTaskWorkspacesDir(): string {
@@ -68,7 +68,7 @@ export function getBridgeInstallDir(): string {
 
 /** Host-owned state must never be created or loaded from an unapproved project directory. */
 export function getWorkspaceStatePath(workspace: string): string {
-  if (process.env.MEMMATE_PERMISSION_REQUIRED !== "1") return workspace;
-  if (!path.isAbsolute(process.env.MEMMY_AGENT_DATA_DIR ?? "")) throw new Error("MemMate runtime data directory is required");
+  if (process.env.AGENT_MANAGED_EXECUTION_REQUIRED !== "1") return workspace;
+  if (!path.isAbsolute(process.env.MEMMY_AGENT_DATA_DIR ?? "")) throw new Error("Managed runtime data directory is required");
   return getRuntimeSubdir("workspace");
 }

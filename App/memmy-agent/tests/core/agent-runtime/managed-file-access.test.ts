@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { createMemmatePermissionScope, withMemmatePermission } from "../../../src/core/agent-runtime/memmate-permission.js";
+import { createManagedExecutionScope, withManagedExecution } from "../../../src/core/agent-runtime/managed-execution.js";
 import { AgentRunner, AgentRunSpec } from "../../../src/core/agent-runtime/runner.js";
 import { ToolCallRequest } from "../../../src/providers/base.js";
 import { ListDirTool, ReadFileTool, WriteFileTool } from "../../../src/core/agent-runtime/tools/filesystem.js";
@@ -14,23 +14,23 @@ afterEach(async () => {
 });
 
 it.each(["read_file", "write_file", "list_dir"])("%s never accesses native files after a Host grant", async name => {
-  const workspace = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "memmate-files-")));
+  const workspace = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "managed-files-")));
   roots.push(workspace);
   const target = path.join(workspace, "file.txt");
   await fs.writeFile(target, "unchanged");
   const tool = name === "read_file" ? new ReadFileTool({ workspace })
     : name === "list_dir" ? new ListDirTool({ workspace }) : new WriteFileTool({ workspace });
   const native = vi.spyOn(tool, "execute");
-  vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+  vi.stubEnv("AGENT_MANAGED_EXECUTION_REQUIRED", "1");
   let reply!: (value: Response) => void;
   const requests: any[] = [];
   vi.stubGlobal("fetch", vi.fn((_url, init) => {
     requests.push(JSON.parse(init.body)); return new Promise(resolve => { reply = resolve; });
   }));
-  const scope = createMemmatePermissionScope({ protocol: 2,
+  const scope = createManagedExecutionScope({ protocol: 2,
     tools: [{ name, description: "Host file operation", inputSchema: { type: "object" } }],
     url: "http://127.0.0.1:12345/authorize", token: "a".repeat(64) }, new AbortController().signal);
-  const pending = withMemmatePermission(scope, () => new AgentRunner().executeTools(new AgentRunSpec({
+  const pending = withManagedExecution(scope, () => new AgentRunner().executeTools(new AgentRunSpec({
     workspace, tools: { get: () => tool, prepareCall: () => { throw new Error("native preparation must not run"); } } as any
   }), [new ToolCallRequest({ id: "file-call", name, arguments: { path: target, content: "changed" } })]));
   await vi.waitFor(() => expect(requests).toHaveLength(1));
@@ -46,13 +46,13 @@ it.each(["read_file", "write_file", "list_dir"])("%s never accesses native files
 });
 
 it("cannot fall back to native write when the Host approves without an execution result", async () => {
-  vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+  vi.stubEnv("AGENT_MANAGED_EXECUTION_REQUIRED", "1");
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ decision: "allow" })));
   const execute = vi.fn();
-  const scope = createMemmatePermissionScope({ protocol: 2,
+  const scope = createManagedExecutionScope({ protocol: 2,
     tools: [{ name: "write_file", description: "write", inputSchema: {} }],
     url: "http://127.0.0.1:12345/authorize", token: "a".repeat(64) }, new AbortController().signal);
-  const [result] = await withMemmatePermission(scope, () => new AgentRunner().executeTools(new AgentRunSpec({
+  const [result] = await withManagedExecution(scope, () => new AgentRunner().executeTools(new AgentRunSpec({
     tools: { execute, get: () => ({ readOnly: false }) } as any
   }), [new ToolCallRequest({ id: "missing", name: "write_file", arguments: { path: "file", content: "wrong" } })]));
   expect(result.event.status).toBe("error");

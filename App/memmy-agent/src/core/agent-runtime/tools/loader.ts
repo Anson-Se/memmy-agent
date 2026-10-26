@@ -1,4 +1,4 @@
-import { memmatePermissionRequired } from "../memmate-permission.js";
+import { managedExecutionRequired } from "../managed-execution.js";
 import { DesktopScreenCaptureTool } from '../../../tools/computer-use/desktop-screen-capture.js';
 import fs from "node:fs";
 import path from "node:path";
@@ -224,7 +224,7 @@ export class ToolLoader {
 
   discoverPlugins(): ToolClass[] {
     // Workspace code cannot run before its file/process permissions have been checked.
-    if (memmatePermissionRequired()) return [];
+    if (managedExecutionRequired()) return [];
     const out: ToolClass[] = [];
     const seenPackages = new Set<string>();
     for (const nodeModules of nearestNodeModulesRoots(this.workspace)) {

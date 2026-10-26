@@ -1,4 +1,4 @@
-import { MemmateReadBatch, memmatePermissionRequired } from "../memmate-permission.js";
+import { AuthorizedReadBatch, managedExecutionRequired } from "../managed-execution.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -786,7 +786,7 @@ export class WriteFileTool extends Tool {
       await fs.writeFile(target, params.content, { encoding: "utf8", signal: signal ?? undefined });
       this.fileStates().recordWrite(target);
       // Managed writes must not launch unapproved validators as hidden subprocesses.
-      if (!this.postWriteValidation || memmatePermissionRequired()) return `Successfully wrote ${target}`;
+      if (!this.postWriteValidation || managedExecutionRequired()) return `Successfully wrote ${target}`;
       const content = await readBackWrittenFile(target, params.content, signal);
       const lint = await lintFile({ path: target, content }, { abortSignal: signal });
       return appendFileLintResults(`Successfully wrote ${target}`, [lint]);
@@ -967,7 +967,7 @@ export class EditFileTool extends Tool {
         await fs.writeFile(target, newText, { encoding: "utf8", signal: signal ?? undefined });
         this.fileStates().recordWrite(target);
         const success = exists ? "Successfully edited file" : `Successfully created ${target}`;
-        if (!this.postWriteValidation || memmatePermissionRequired()) return success;
+        if (!this.postWriteValidation || managedExecutionRequired()) return success;
         const content = await readBackWrittenFile(target, newText, signal);
         const lint = await lintFile({ path: target, content }, { abortSignal: signal });
         return appendFileLintResults(success, [lint]);
@@ -1035,7 +1035,7 @@ export class EditFileTool extends Tool {
       await fs.writeFile(target, updated, { encoding: "utf8", signal: signal ?? undefined });
       this.fileStates().recordWrite(target);
       const success = warning ? `${warning}\nSuccessfully edited file` : "Successfully edited file";
-      if (!this.postWriteValidation || memmatePermissionRequired()) return success;
+      if (!this.postWriteValidation || managedExecutionRequired()) return success;
       const content = await readBackWrittenFile(target, updated, signal);
       const lint = await lintFile({
         path: target,
@@ -1105,7 +1105,7 @@ export class ListDirTool extends Tool {
     if (!isToolPathAllowed(target, this.allowedDir, this.extraAllowedDirs)) return `Error: path outside workspace: ${params.path}`;
     const maxEntries = params.max_entries ?? params.maxEntries ?? 200;
     const rows: string[] = [];
-    const batch = new MemmateReadBatch(target);
+    const batch = new AuthorizedReadBatch(target);
     const walk = async (dir: string) => {
       const authorizedEntries = await batch.read(dir, () => fs.readdir(dir, { withFileTypes: true }));
       if (!authorizedEntries) return;
