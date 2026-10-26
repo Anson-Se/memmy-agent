@@ -14,7 +14,8 @@
 
 ### Changed
 
-- Route MemMate-managed file access through host approvals, including directory traversal, search, edits, and PDF/DOCX text reads; keep runtime state and plugin discovery isolated from unapproved projects.
+- Route host-managed file access through approvals, including directory traversal, search, edits, and PDF/DOCX text reads; keep runtime state and plugin discovery isolated from unapproved projects.
+- Rename the managed Agent integration to product-neutral environment variables, request fields, authentication headers, and health fields. Applications embedding the managed Agent must update their integration together with the Agent.
 - Require Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) for the Linux CLI installer.
 
 - Upgrade Electron to `43.8.1` and `better-sqlite3` to `^13.0.3`; align native runtime packaging with the bundled N-API binaries.
