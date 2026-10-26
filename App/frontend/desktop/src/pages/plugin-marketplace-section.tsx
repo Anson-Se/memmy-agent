@@ -318,9 +318,13 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
           <div className="plugin-marketplace-detail-content">
             <PluginDetailPreview category={detail.category} name={detail.name} />
             <p className="plugin-marketplace-detail-description">
-              {capabilityDescription(detail.category, t)}{detail.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : ""}
+              {capabilityDescription(detail.category, t)}{detail.id !== "literature-review" && detail.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : ""}
             </p>
-            {detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.signInRequired")}{detail.requiresOfficialModel ? t("plugins.ui.memmyOfficialModelsRecommended") : ""}</p> : null}
+            {detail.id === "literature-review" ? (
+              <p className="plugin-marketplace-detail-note">{t("plugins.ui.literatureReviewModelNote")}</p>
+            ) : detail.requiresLogin ? (
+              <p className="plugin-marketplace-detail-note">{t("plugins.ui.signInRequired")}{detail.requiresOfficialModel ? t("plugins.ui.memmyOfficialModelsRecommended") : ""}</p>
+            ) : null}
             {!detail.installed && !detail.installable && !detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.anInstallableReleaseIsNotAvailableYet")}</p> : null}
             {detail.installed?.state === "failed" ? <p className="plugin-marketplace-detail-error">{t("plugins.ui.installationCouldNotCompleteRetryInstallationOrContact")}</p> : null}
           </div>
