@@ -499,6 +499,7 @@ const ResolvedArtifactSchema = z.object({
   media_url: z.string().optional(),
   relative_path: z.string().optional()
 });
+const ResolvedRecordingSchema = z.object({ media_url: z.string() });
 
 const RevealArtifactResponseSchema = z.object({
   ok: z.literal(true),
@@ -931,9 +932,11 @@ export interface MemmyAgentClient {
   renameSession(sessionKey: string, title: string): Promise<MemmyAgentSessionSummary>;
   deleteSession(sessionKey: string): Promise<boolean>;
   resolveArtifact(path: string, sessionKey: string): Promise<ResolvedAgentArtifact>;
+  resolveRecording(path: string): Promise<string>;
   revealArtifact(path: string, sessionKey: string): Promise<void>;
   openArtifact(path: string, sessionKey: string): Promise<void>;
   uploadAgentMedia(attachments: UploadAgentMediaInput[]): Promise<UploadedAgentMedia[]>;
+  deleteRecordingFiles(paths: string[]): Promise<void>;
   uploadAgentImages(images: UploadAgentImageInput[]): Promise<UploadedAgentImage[]>;
   connectWebSocket(onEvent?: (event: MemmyAgentWsEvent) => void): Promise<MemmyAgentWebSocketConnection>;
   sessionKeyToChatId(sessionKey: string): string;
@@ -1593,6 +1596,13 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
     });
   }
 
+  async resolveRecording(path: string): Promise<string> {
+    const result = await this.request("/api/webui/recordings/resolve", ResolvedRecordingSchema, {
+      method: "POST", body: { path }
+    });
+    return new URL(result.media_url, this.baseUrl).toString();
+  }
+
   async revealArtifact(path: string, sessionKey: string): Promise<void> {
     await this.request("/api/webui/artifacts/reveal", RevealArtifactResponseSchema, {
       method: "POST",
@@ -1649,6 +1659,12 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
   async uploadAgentImages(images: UploadAgentImageInput[]): Promise<UploadedAgentImage[]> {
     const media = await this.uploadAgentMedia(images.map((image) => ({ ...image, kind: "image" })));
     return media.filter((item): item is UploadedAgentImage => item.kind === "image");
+  }
+
+  async deleteRecordingFiles(paths: string[]): Promise<void> {
+    await this.request("/api/webui/recordings/delete", z.object({ ok: z.literal(true) }), {
+      method: "POST", body: { paths }
+    });
   }
 
   async connectWebSocket(onEvent?: (event: MemmyAgentWsEvent) => void): Promise<MemmyAgentWebSocketConnection> {

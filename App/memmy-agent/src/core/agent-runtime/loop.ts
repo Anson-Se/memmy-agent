@@ -105,6 +105,7 @@ import {
 } from "./goal-runtime.js";
 import { TaskPlanRuntime } from "./task-plan-runtime.js";
 import { createTaskPlanContinuation } from "./task-plan-continuation.js";
+import { createArtifactDeliveryContinuation } from "./artifact-delivery-continuation.js";
 import { resolveToolResultMaxChars, SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME } from "./tool-result-budget.js";
 import { AgentProgressHook } from "./progress-hook.js";
 import { createTurnCancellationBoundary, type TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
@@ -3788,10 +3789,34 @@ export class AgentLoop {
     const activeContextWindowTokens = modelSelection?.snapshot.contextWindowTokens
       ?? this.contextWindowTokens;
     const activeTools = tools ?? this.tools;
+    const deliveryMessageTool = activeTools.get("message");
+    let heldDeliveryStream = "";
+    const deliveryAwareStream = onStream ? async (delta: string) => {
+      if (deliveryMessageTool instanceof MessageTool && deliveryMessageTool.hasPendingPluginFiles()) {
+        heldDeliveryStream += delta;
+      } else {
+        if (heldDeliveryStream) {
+          await onStream(heldDeliveryStream);
+          heldDeliveryStream = "";
+        }
+        await onStream(delta);
+      }
+    } : null;
+    const deliveryAwareStreamEnd = onStream || onStreamEnd ? async (options: { resuming?: boolean } = {}) => {
+      if (heldDeliveryStream) {
+        if (!options.resuming) await onStream?.(heldDeliveryStream);
+        heldDeliveryStream = "";
+      }
+      await onStreamEnd?.(options);
+    } : null;
+    const deliveryContinuation = createArtifactDeliveryContinuation(() => {
+      const messageTool = activeTools.get("message");
+      return messageTool instanceof MessageTool ? messageTool.turnDeliveredMediaPaths() : [];
+    });
     const checkpointSession = session;
     const checkpoint = checkpointSession ? (payload: Record<string, any>) => this.setRuntimeCheckpoint(checkpointSession, payload) : null;
     const activeSessionKey = session?.key ?? sessionKey ?? null;
-    const loopHook = new AgentProgressHook(onProgress, onStream, onStreamEnd, {
+    const loopHook = new AgentProgressHook(onProgress, deliveryAwareStream, deliveryAwareStreamEnd, {
       channel: channel ?? "cli",
       chatId: chatId ?? "direct",
       messageId: messageId ?? null,
@@ -3812,9 +3837,12 @@ export class AgentLoop {
       },
     });
     const hook = this.extraHooks.length ? new CompositeAgentHook([loopHook, ...this.extraHooks]) : loopHook;
+    const taskPlanContinuation = createTaskPlanContinuation(() => activeSessionKey
+      ? this.taskPlanRuntime.get(activeSessionKey) : null);
     const result = await this.runner.run(
       new AgentRunSpec({
         messages: initialMessages,
+        finalResponseContinuation: (response) => taskPlanContinuation(response) ?? deliveryContinuation(response),
         privateSkillRefs: session?.metadata?.privatePluginSkillRefs,
         onPrivateSkillRefsChanged: session ? (refs) => {
           session.metadata.privatePluginSkillRefs = refs;
@@ -3825,8 +3853,6 @@ export class AgentLoop {
         model: activeModel,
         maxIterations: this.maxIterations,
         maxIterationsFinalPrompt: renderTemplate("agent/max-iterations-final-response.md", { strip: true }),
-        finalResponseContinuation: createTaskPlanContinuation(() => activeSessionKey
-          ? this.taskPlanRuntime.get(activeSessionKey) : null),
         maxTokens: activeProvider?.generation?.maxTokens ?? this.config.agents.defaults.maxTokens,
         temperature: activeProvider?.generation?.temperature ?? this.config.agents.defaults.temperature,
         reasoningEffort: reasoningEffortFromTurnMetadata(metadata, activeModel)
@@ -3841,7 +3867,7 @@ export class AgentLoop {
         contextBlockLimit: this.contextBlockLimit,
         providerRetryMode: this.providerRetryMode,
         progressCallback: onProgress,
-        streamProgressDeltas: Boolean(onStream),
+        streamProgressDeltas: Boolean(deliveryAwareStream),
         retryWaitCallback: onRetryWait,
         checkpointCallback: checkpoint,
         llmTimeoutS: runnerWallLlmTimeoutS(this.sessions, activeSessionKey, {
