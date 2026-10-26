@@ -51,6 +51,7 @@ export interface AgentSourceScanCompletion {
 export interface AgentSourceScanFinished extends AgentSourceScanCompletion {
   succeeded: boolean;
 }
+export type RecordingSidebarStatus = "idle" | "starting" | "recording" | "paused" | "transcribing" | "ready" | "failed";
 
 export const AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS = 5_000;
 
@@ -84,6 +85,11 @@ export type AppAction =
   | { type: "bootstrap/loaded"; bootstrap: AppBootstrapResponse; initialPath: AppRoutePath }
   | { type: "events/statusChanged"; status: EventConnectionStatus }
   | { type: "navigation/changed"; path: AppRoutePath }
+  | { type: "recording/openRequested" }
+  | { type: "recording/controlRequested" }
+  | { type: "recording/finishRequested" }
+  | { type: "recording/requestHandled"; requestId: number }
+  | { type: "recording/statusChanged"; status: RecordingSidebarStatus }
   | { type: "window/visibilityChanged"; visible: boolean }
   | { type: "invitationToast/shown"; id: number; kind: InvitationToastKind }
   | { type: "invitationToast/cleared"; id: number }
@@ -134,6 +140,11 @@ export const appActions = {
   navigate(path: AppRoutePath): AppAction {
     return { type: "navigation/changed", path };
   },
+  requestRecordingOpen(): AppAction { return { type: "recording/openRequested" }; },
+  requestRecordingControl(): AppAction { return { type: "recording/controlRequested" }; },
+  requestRecordingFinish(): AppAction { return { type: "recording/finishRequested" }; },
+  recordingRequestHandled(requestId: number): AppAction { return { type: "recording/requestHandled", requestId }; },
+  recordingStatusChanged(status: RecordingSidebarStatus): AppAction { return { type: "recording/statusChanged", status }; },
 
   windowVisibilityChanged(visible: boolean): AppAction {
     return { type: "window/visibilityChanged", visible };
@@ -277,6 +288,14 @@ export const agentActions = {
 
   pendingModelPresetCleared(scopeKey: string): AppAction {
     return { type: "agent/pendingModelPresetCleared", scopeKey };
+  },
+
+  thinkingToggled(scopeKey: string, enabled: boolean): AppAction {
+    return { type: "agent/thinkingToggled", scopeKey, enabled };
+  },
+
+  thinkingLevelChanged(scopeKey: string, level: string): AppAction {
+    return { type: "agent/thinkingLevelChanged", scopeKey, level };
   },
 
   modelSelectionRequestStarted(

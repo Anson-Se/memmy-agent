@@ -48,13 +48,13 @@ describe("AgentTaskPlanBar", () => {
     ));
   }
 
-  it("renders ordered progress and supports collapsing the fixed panel", () => {
+  it("renders ordered progress and supports collapsing the plan", () => {
     render(plan());
     const header = container.querySelector<HTMLButtonElement>(
       ".agent-task-plan-bar__header",
     )!;
     expect(header.getAttribute("aria-expanded")).toBe("true");
-    expect(container.textContent).toContain("Generate literature review");
+    expect(container.textContent).toContain("Task plan");
     expect(container.textContent).toContain("1/3");
     expect([...container.querySelectorAll(".agent-task-plan-bar__item")]
       .map((item) => item.textContent)).toEqual([

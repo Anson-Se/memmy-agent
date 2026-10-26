@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "npm run build -w @memmy/knowledge && npm run build -w @memmy/desktop-interface && tsc -p tsconfig.json --noEmit && vite build",
     "typecheck": "npm run build -w @memmy/knowledge && npm run build -w @memmy/desktop-interface && tsc -p tsconfig.json --noEmit",
-    "test": "npm run build -w @memmy/knowledge && npm run build -w @memmy/desktop-interface && vitest run"
+    "test": "npm run build -w @memmy/knowledge && npm run build -w @memmy/desktop-interface && npm run utilities:check && vitest run",
+    "utilities:sync": "node scripts/sync-prototype-utilities.mjs",
+    "utilities:check": "node scripts/sync-prototype-utilities.mjs --check"
   },
   "dependencies": {
     "@aiden0z/pptx-renderer": "1.3.0",
@@ -37,6 +39,7 @@
   "devDependencies": {
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
-    "happy-dom": "^20.10.6"
+    "happy-dom": "^20.10.6",
+    "postcss": "8.5.15"
   }
 }

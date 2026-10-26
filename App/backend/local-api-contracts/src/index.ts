@@ -1,11 +1,13 @@
 /** Memmy local API contract. */
 import { z } from "zod";
+import { ModelThinkingConfigSchema } from "./model-thinking-levels.js";
 import { PluginCapabilityEventPayloadSchema } from "./plugin.js";
 import { normalizeOutputLanguage } from "./output-language.js";
 
 export { normalizeOutputLanguage } from "./output-language.js";
 
 export * from "./model-catalog-resolver.js";
+export * from "./model-thinking-levels.js";
 
 export * from "./memory-runtime.js";
 export * from "./memory-canonical-json.js";
@@ -747,6 +749,13 @@ export const ModelProviderSchema = z.enum([
 ]);
 export type ModelProvider = z.infer<typeof ModelProviderSchema>;
 
+/** Connection tests accept the catalog provider custom. Role model config stays on ModelProviderSchema. */
+export const ModelConfigTestProviderSchema = z.union([
+    ModelProviderSchema,
+    z.literal("custom")
+]);
+export type ModelConfigTestProvider = z.infer<typeof ModelConfigTestProviderSchema>;
+
 export const CatalogProviderIdSchema = z.enum([
     "openai",
     "anthropic",
@@ -760,7 +769,9 @@ export const CatalogProviderIdSchema = z.enum([
     "volcengine",
     "stepfun",
     "xiaomi_mimo",
-    "memmy_account"
+    "memmy_account",
+    "bedrock",
+    "custom"
 ]);
 export type CatalogProviderId = z.infer<typeof CatalogProviderIdSchema>;
 
@@ -802,7 +813,8 @@ export const ModelEndpointProtocolSchema = z.enum([
     "dashscope-input-audio-chat",
     "openai-images",
     "dashscope-multimodal-generation",
-    "memmy-account"
+    "memmy-account",
+    "bedrock-converse"
 ]);
 export type ModelEndpointProtocol = z.infer<typeof ModelEndpointProtocolSchema>;
 
@@ -923,11 +935,15 @@ export const CatalogEndpointInputSchema = z.object({
     protocol: ModelEndpointProtocolSchema,
     apiKey: z.string().optional(),
     extraHeaders: z.record(z.string(), z.string()).optional(),
-    extraBody: z.record(z.string(), z.unknown()).optional()
+    extraBody: z.record(z.string(), z.unknown()).optional(),
+    region: z.string().trim().min(1).optional()
 });
 export type CatalogEndpointInput = z.infer<typeof CatalogEndpointInputSchema>;
 
 export const MODEL_NAME_MAX_LENGTH = 128;
+
+export const ModelInputModalitySchema = z.enum(["text", "image", "video"]);
+export type ModelInputModality = z.infer<typeof ModelInputModalitySchema>;
 
 export const TextModelItemInputSchema = z.object({
     presetId: z.string().trim().min(1).optional(),
@@ -935,7 +951,10 @@ export const TextModelItemInputSchema = z.object({
     model: z.string().trim().min(1).max(MODEL_NAME_MAX_LENGTH),
     source: ModelSourceSchema,
     ownerAccountId: z.string().trim().min(1).optional(),
-    capabilities: z.array(ModelCapabilitySchema).min(1)
+    capabilities: z.array(ModelCapabilitySchema).min(1),
+    thinking: ModelThinkingConfigSchema.optional(),
+    custom: z.boolean().optional(),
+    inputModalities: z.array(ModelInputModalitySchema).optional()
 });
 export type TextModelItemInput = z.infer<typeof TextModelItemInputSchema>;
 
@@ -983,14 +1002,15 @@ export type ModelConfigInput = z.infer<typeof ModelConfigInputSchema>;
 
 /** Definition for model config test input. */
 export const ModelConfigTestInputSchema = z.object({
-    provider: ModelProviderSchema,
+    provider: ModelConfigTestProviderSchema,
     endpointId: z.string().trim().min(1),
     protocol: ModelEndpointProtocolSchema,
     apiBase: z.string().url(),
     modelId: z.string().min(1),
     apiKey: z.string().min(1).optional(),
     capability: ModelConfigTestCapabilitySchema.optional(),
-    secretTarget: ModelConfigTestSecretTargetSchema.optional()
+    secretTarget: ModelConfigTestSecretTargetSchema.optional(),
+    region: z.string().trim().min(1).optional()
 });
 export type ModelConfigTestInput = z.infer<typeof ModelConfigTestInputSchema>;
 
@@ -1096,7 +1116,8 @@ export const CatalogEndpointViewSchema = z.object({
     protocol: ModelEndpointProtocolSchema,
     hasApiKey: z.boolean(),
     apiKeyMasked: z.string(),
-    apiKey: z.string().default("")
+    apiKey: z.string().default(""),
+    region: z.string().min(1).optional()
 });
 export type CatalogEndpointView = z.infer<typeof CatalogEndpointViewSchema>;
 
@@ -1109,7 +1130,10 @@ export const TextModelItemViewSchema = z.object({
     source: ModelSourceSchema,
     ownerAccountId: z.string().min(1).optional(),
     capabilities: z.array(ModelCapabilitySchema).min(1),
-    available: z.boolean()
+    available: z.boolean(),
+    thinking: ModelThinkingConfigSchema.optional(),
+    custom: z.boolean().optional(),
+    inputModalities: z.array(ModelInputModalitySchema).optional()
 });
 export type TextModelItemView = z.infer<typeof TextModelItemViewSchema>;
 
@@ -1145,6 +1169,8 @@ export type MemoryRuntimeModelSettings = z.infer<typeof MemoryRuntimeModelSettin
 
 /** Schema for model config view. */
 export const ModelConfigViewSchema = z.object({
+    /** Write-response-only aliases, resolved by the server using real credentials. */
+    endpointAliases: z.record(z.string(), z.record(z.string(), z.string())).optional(),
     configRevision: z.string().min(1),
     providers: z.array(TextModelProviderViewSchema),
     modelAssignments: ModelAssignmentsSchema,

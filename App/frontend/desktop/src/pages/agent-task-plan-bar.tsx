@@ -1,3 +1,4 @@
+import "./agent-task-plan-bar.css";
 import {
   AlertCircle,
   CheckCircle2,
@@ -15,15 +16,20 @@ import { useTranslation } from "../i18n/use-translation.js";
 
 export interface AgentTaskPlanBarProps {
   plan: AgentTaskPlanState;
+  /** The enclosing turn process supplies the disclosure and status. */
+  embeddedInProcess?: boolean;
+  /** Keep the checklist open while its owning turn is running. */
+  runActive?: boolean;
 }
 
-export function AgentTaskPlanBar({ plan }: AgentTaskPlanBarProps) {
+export function AgentTaskPlanBar({ plan, embeddedInProcess = false, runActive = false }: AgentTaskPlanBarProps) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState(plan.status === "completed");
+  const autoCollapsed = plan.status !== "active" || (embeddedInProcess && !runActive);
+  const [collapsed, setCollapsed] = useState(autoCollapsed);
 
   useEffect(() => {
-    setCollapsed(plan.status === "completed");
-  }, [plan.plan_id]);
+    setCollapsed(autoCollapsed);
+  }, [autoCollapsed, plan.plan_id]);
 
   if (!plan.plan_id || !plan.status || plan.items.length === 0) return null;
 
@@ -32,10 +38,23 @@ export function AgentTaskPlanBar({ plan }: AgentTaskPlanBarProps) {
     completed,
     total: plan.items.length,
   });
+  const header = <>
+    <span className="agent-task-plan-bar__heading">
+      <ListChecks aria-hidden="true" />
+      <span className="agent-task-plan-bar__title">{t("home.taskPlan.title")}</span>
+    </span>
+    <span className="agent-task-plan-bar__summary">
+      {!embeddedInProcess ? <span className={`agent-task-plan-bar__status agent-task-plan-bar__status--${plan.status}`}>
+        {t(`home.taskPlan.status.${plan.status}`)}
+      </span> : null}
+      <span className="agent-task-plan-bar__progress">{progressLabel}</span>
+      <ChevronDown className="agent-task-plan-bar__chevron" aria-hidden="true" />
+    </span>
+  </>;
 
   return (
     <section
-      className={`agent-task-plan-bar agent-task-plan-bar--${plan.status}`}
+      className={`agent-task-plan-bar agent-task-plan-bar--${plan.status}${embeddedInProcess ? " agent-task-plan-bar--embedded" : ""}`}
       aria-label={t("home.taskPlan.title")}
     >
       <button
@@ -43,34 +62,22 @@ export function AgentTaskPlanBar({ plan }: AgentTaskPlanBarProps) {
         className="agent-task-plan-bar__header"
         aria-expanded={!collapsed}
         onClick={() => setCollapsed((value) => !value)}
-      >
-        <span className="agent-task-plan-bar__heading">
-          <ListChecks aria-hidden="true" />
-          <span className="agent-task-plan-bar__title">{plan.title}</span>
-        </span>
-        <span className="agent-task-plan-bar__summary">
-          <span className={`agent-task-plan-bar__status agent-task-plan-bar__status--${plan.status}`}>
-            {t(`home.taskPlan.status.${plan.status}`)}
-          </span>
-          <span className="agent-task-plan-bar__progress">{progressLabel}</span>
-          <ChevronDown
-            className="agent-task-plan-bar__chevron"
-            aria-hidden="true"
-          />
-        </span>
-      </button>
+      >{header}</button>
 
       {!collapsed ? (
         <ol className="agent-task-plan-bar__items">
-          {plan.items.map((item) => (
+          {plan.items.map((item) => {
+            const status = embeddedInProcess && !runActive && item.status === "in_progress" ? "pending" : item.status;
+            return (
             <li
               key={item.id}
-              className={`agent-task-plan-bar__item agent-task-plan-bar__item--${item.status}`}
+              className={`agent-task-plan-bar__item agent-task-plan-bar__item--${status}`}
             >
-              <TaskPlanItemIcon status={item.status} />
+              <TaskPlanItemIcon status={status} />
               <span>{item.content}</span>
             </li>
-          ))}
+            );
+          })}
         </ol>
       ) : null}
     </section>

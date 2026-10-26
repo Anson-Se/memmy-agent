@@ -26,6 +26,7 @@ describe("AppFrame", () => {
 
     expect(html).toContain("新任务");
     expect(html).toContain("连接与工具");
+    expect(html).toContain("app-frame-recording-nav");
     expect(html).toContain("项目");
     expect(html).toContain("任务");
     expect(html).toContain("暂无任务");
@@ -535,7 +536,7 @@ describe("AppFrame", () => {
   it("does not keep New Agent highlighted while a session is current", () => {
     const source = readFileSync(resolve(__dirname, "..", "app-frame.tsx"), "utf8");
 
-    expect(source).toContain('&& (item.path !== "/main" || !state.agent.currentSessionKey)');
+    expect(source).toContain('item.path !== "/main" || (!state.agent.currentSessionKey && !props.recordingActive)');
   });
 
   it("makes the whole sidebar account footer open settings", () => {

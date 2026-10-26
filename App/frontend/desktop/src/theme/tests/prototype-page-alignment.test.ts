@@ -4,6 +4,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
+import { AppProviders } from "../../app/providers.js";
+import { PRODUCT_TOUR_CHAT_CONTENT_ANCHOR } from "../../app/product-tour-layout.js";
+import { ToolsPage } from "../../pages/tools-page.js";
 
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -38,7 +43,10 @@ describe("prototype page structure alignment", () => {
     expect(source("pages/app-frame.tsx")).not.toContain('icon: "M"');
     expect(source("pages/home-page.tsx")).toContain("app-frame-page-content home-empty-screen flex flex-col items-center justify-center h-full");
     expect(source("styles.css")).toContain(".home-empty-screen");
-    expect(source("styles.css")).toContain("padding-bottom: 8%;");
+    const emptyHome = source("styles.css").match(/\.home-empty-screen\s*\{([^}]+)\}/)?.[1] ?? "";
+    expect(emptyHome).toContain("padding-block: 24px;");
+    expect(emptyHome).toContain("overflow-y: auto;");
+    expect(emptyHome).toContain("justify-content: safe center;");
     expect(source("pages/home-page.tsx")).toContain("text-center mb-8");
     expect(source("pages/home-page.tsx")).toContain("home-empty-brand-mascot flex justify-center");
     expect(source("pages/home-page.tsx")).toContain("text-2xl font-bold text-text-ink");
@@ -48,7 +56,8 @@ describe("prototype page structure alignment", () => {
     expect(source("pages/home-page.tsx")).toContain("relative home-empty-composer agent-composer-shell rounded-card-lg");
     expect(source("pages/home-page.tsx")).toContain("w-full px-5 pt-4 pb-12 text-sm resize-none focus:outline-none rounded-card-lg bg-background-paper placeholder:text-text-ink/40");
     expect(source("pages/home-page.tsx")).toContain("composer-actions absolute bottom-3 right-4 z-50");
-    expect(source("pages/home-page.tsx")).not.toContain("home.suggestion.");
+    expect(source("pages/home-page.tsx")).toContain("pluginScenarios.map");
+    expect(source("pages/home-page.tsx")).toContain("home-prompt-suggestions");
     expect(source("pages/home-page.tsx")).toContain("agent-conversation-panel flex flex-col h-full");
     expect(source("pages/home-page.tsx")).toContain("app-frame-page-content agent-conversation-scroll flex-1 overflow-y-auto");
     expect(source("pages/home-page.tsx")).toContain("agent-conversation-column space-y-3");
@@ -63,8 +72,11 @@ describe("prototype page structure alignment", () => {
 
   it("aligns utility pages with their prototype counterparts", () => {
     expect(source("pages/api-key-page.tsx")).toContain("min-h-screen bg-canvas-oat px-4 pt-4 pb-8 relative overflow-hidden");
-    expect(source("pages/tools-page.tsx")).toContain("app-frame-page-content h-full overflow-y-auto py-6");
-    expect(source("pages/tools-page.tsx")).toContain("tools-icon-grid");
+    expect(source("pages/tools-page.tsx")).toContain("app-frame-page-content h-full overflow-y-auto tools-page-content");
+    expect(source("pages/tools-page.tsx")).toContain('topBarInset={true}');
+    expect(source("pages/tools-page.tsx")).toContain('role="tablist"');
+    expect(source("pages/tools-page.tsx")).toContain("<ConnectionCatalogSection");
+    expect(source("pages/tools-page.tsx")).toContain("<PluginMarketplace");
     expect(source("styles.css")).toContain("grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));");
     expect(source("styles.css")).toContain("gap: 8px;");
     expect(source("styles.css")).toContain("gap: 12px;");
@@ -118,6 +130,14 @@ describe("prototype page structure alignment", () => {
     expect(source("pages/settings-page.tsx")).toContain("Brain, Palette, Rocket, Settings2, Shield, User, Zap");
     expect(source("pages/settings-page.tsx")).not.toContain('from "./memory/memory-prototype-icons.js"');
     expect(source("pages/pet-page.tsx")).toContain("fixed inset-0 bg-transparent pointer-events-none");
+  });
+
+  it("reserves the shared toolbar above the full-bleed tools content", () => {
+    const html = renderToString(createElement(AppProviders, null, createElement(ToolsPage)));
+    const body = html.match(new RegExp(`<div[^>]*data-tour-anchor="${PRODUCT_TOUR_CHAT_CONTENT_ANCHOR}"[^>]*>`))?.[0] ?? "";
+    expect(body).toContain('padding-top:calc(var(--codex-toolbar-height) + var(--app-frame-topbar-offset, 0px))');
+    expect(html).toContain('class="app-frame-page-content h-full overflow-y-auto tools-page-content" style="padding-top:0;padding-bottom:24px"');
+    expect(html).toContain('role="tablist"');
   });
 
   it("does not override prototype typography utilities on native controls", () => {

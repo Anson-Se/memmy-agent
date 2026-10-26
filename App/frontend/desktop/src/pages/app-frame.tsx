@@ -1,5 +1,6 @@
+import "./recording-sidebar-migration.css";
 import { BookOpen } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   productTourIncludesLogs,
@@ -68,7 +69,7 @@ import {
 } from "./memory/memory-prototype-icons.js";
 import { AppContentTopbar } from "./app-content-topbar.js";
 import { SETTINGS_BROWSER_EXTENSION_EVENT, SETTINGS_EXCEL_CONNECTION_EVENT, SETTINGS_NAV_ITEMS, writeSettingsMemoryBudgetFocus, type SettingsTabId } from "./settings-nav.js";
-import { ArrowDown, Check, CheckCheck, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, FolderPlus, ListFilter, MoreHorizontal, MousePointer2, Plus, RotateCcw } from "lucide-react";
+import { ArrowDown, AudioLines, Check, CheckCheck, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, FolderPlus, ListFilter, Mic, MoreHorizontal, MousePointer2, Pause, Plus, RotateCcw, Square } from "lucide-react";
 
 export interface SettingsSidebarNav {
   activeTab: SettingsTabId;
@@ -87,6 +88,7 @@ export interface AppFrameProps {
   /** Full-height panel docked to the right edge of the main area, stacked above the top bar. */
   sidePanel?: ReactNode;
   windowsTitlebarSafe?: boolean;
+  recordingActive?: boolean;
   /** When set, replaces the main app sidebar with settings section navigation. */
   settingsNav?: SettingsSidebarNav;
   children: ReactNode;
@@ -95,7 +97,7 @@ export interface AppFrameProps {
 interface NavItem {
   path?: AppRoutePath;
   icon: ReactNode;
-  action?: "search";
+  action?: "search" | "record";
   labelKey?: string;
 }
 
@@ -206,6 +208,7 @@ interface SidebarUpdateActionView {
 const navItems: NavItem[] = [
   { path: "/main", icon: <MessageSquarePlus size={16} /> },
   { action: "search", icon: <Search size={16} />, labelKey: "appFrame.search" },
+  { action: "record", icon: <Mic size={16} />, labelKey: "recording.page.title" },
   { path: "/tools", icon: <Link2 size={16} /> },
   { path: "/memory", icon: <BrainCircuit size={16} /> },
   { path: "/knowledge", icon: <BookOpen size={16} /> }
@@ -240,7 +243,8 @@ const projectCreateMenuSize: SidebarMenuSize = {
   margin: 8,
   gap: 2
 };
-const sidebarMenuOverlayZIndex = 9999;
+const COMPACT_APP_FRAME_QUERY = "(max-width: 720px)";
+const sidebarMenuOverlayZIndex = 10010;
 const SIDEBAR_PROFILE_NAME_MAX_VISUAL_WIDTH = 10;
 const SIDEBAR_PROFILE_META_MAX_VISUAL_WIDTH = 12;
 const ACCOUNT_DISPLAY_ELLIPSIS = "…";
@@ -314,7 +318,45 @@ export function AppFrame(props: AppFrameProps) {
     byokConfigured: Boolean(state.modelConfig?.catalog?.modelAssignments.byok.agent.candidates.length),
     guidanceDone: true,
   });
-  const [sidebarHidden, setSidebarHidden] = useState(false);
+  const [desktopSidebarHidden, setDesktopSidebarHidden] = useState(false);
+  const [compactViewport, setCompactViewport] = useState(() => (
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(COMPACT_APP_FRAME_QUERY).matches
+      : false
+  ));
+  const [compactSidebarOpen, setCompactSidebarOpen] = useState(false);
+  const sidebarHidden = compactViewport ? !compactSidebarOpen : desktopSidebarHidden;
+  const closeCompactSidebar = useCallback(() => setCompactSidebarOpen(false), []);
+  const toggleSidebar = () => {
+    if (compactViewport) setCompactSidebarOpen((open) => !open);
+    else setDesktopSidebarHidden((hidden) => !hidden);
+  };
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia(COMPACT_APP_FRAME_QUERY);
+    const update = ({ matches }: Pick<MediaQueryListEvent, "matches">) => {
+      setCompactViewport(matches);
+      if (matches) setCompactSidebarOpen(false);
+    };
+    update(query);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    closeCompactSidebar();
+  }, [closeCompactSidebar, state.navigation.currentPath, state.agent.currentSessionKey,
+    state.agent.currentChatId, state.agent.newChatRequestId]);
+
+  useEffect(() => {
+    if (!compactViewport || !compactSidebarOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeCompactSidebar();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [closeCompactSidebar, compactSidebarOpen, compactViewport]);
   const windowsChrome = isWindowsDesktopPlatform();
   const taskScrollRef = useRef<HTMLDivElement | null>(null);
   const [taskScrollFade, setTaskScrollFade] = useState(false);
@@ -513,6 +555,7 @@ export function AppFrame(props: AppFrameProps) {
   }
 
   function openNewAgent(target?: WebuiSessionTarget) {
+    closeCompactSidebar();
     const nextDraftRequestId = shouldCreateNewAgentDraft(state.agent)
       ? state.agent.newChatRequestId + 1
       : state.agent.newChatRequestId;
@@ -617,6 +660,7 @@ export function AppFrame(props: AppFrameProps) {
   }
 
   async function openAgentTask(task: AgentTaskView) {
+    closeCompactSidebar();
     handleFirstSidebarInteraction();
     if (!clients?.memmyAgent) {
       dispatch(appActions.navigate("/main"));
@@ -1041,7 +1085,7 @@ export function AppFrame(props: AppFrameProps) {
     }
   }
 
-  const sidebarStyle = sidebarHidden
+  const sidebarStyle = compactViewport ? undefined : sidebarHidden
     ? { ...sidebarResize.sidebarStyle, width: 0, minWidth: 0, maxWidth: 0, flexBasis: 0 }
     : sidebarResize.sidebarStyle;
 
@@ -1052,7 +1096,7 @@ export function AppFrame(props: AppFrameProps) {
       {windowsChrome ? (
         <WindowsTitlebar
           sidebarHidden={sidebarHidden}
-          onToggleSidebar={() => setSidebarHidden((hidden) => !hidden)}
+          onToggleSidebar={toggleSidebar}
         />
       ) : null}
       <div className={windowsChrome ? "sidebar-shell__body" : "sidebar-shell__passthrough"}>
@@ -1060,6 +1104,9 @@ export function AppFrame(props: AppFrameProps) {
         aria-hidden={sidebarHidden ? true : undefined}
         inert={sidebarHidden ? true : undefined}
         className="app-frame-sidebar flex flex-col"
+        onClickCapture={(event) => {
+          if (event.target instanceof Element && event.target.closest(".app-frame-nav-button")) closeCompactSidebar();
+        }}
         style={sidebarStyle}
       >
         {!windowsChrome && (
@@ -1069,7 +1116,7 @@ export function AppFrame(props: AppFrameProps) {
             className="sidebar-toolbar-button"
             aria-label={t("appFrame.hideSidebar")}
             title={t("appFrame.hideSidebar")}
-            onClick={() => setSidebarHidden(true)}
+            onClick={() => compactViewport ? closeCompactSidebar() : setDesktopSidebarHidden(true)}
           >
             <PanelLeft size={20} />
           </button>
@@ -1131,8 +1178,8 @@ export function AppFrame(props: AppFrameProps) {
         <nav className="space-y-0.5">
           {navItems.map((item) => {
             const key = item.path ?? item.action ?? "unknown";
-            const active = item.path
-              ? state.navigation.currentPath === item.path && (item.path !== "/main" || !state.agent.currentSessionKey)
+            const active = item.action === "record" ? props.recordingActive === true : item.path
+              ? state.navigation.currentPath === item.path && (item.path !== "/main" || (!state.agent.currentSessionKey && !props.recordingActive))
               : false;
 
             const label = item.path
@@ -1143,6 +1190,8 @@ export function AppFrame(props: AppFrameProps) {
               handleFirstSidebarInteraction();
               if (item.action === "search") {
                 setSearchPaletteOpen(true);
+              } else if (item.action === "record") {
+                dispatch(appActions.requestRecordingOpen());
               } else if (item.path) {
                 openSidebarRoute(item.path);
               }
@@ -1164,11 +1213,27 @@ export function AppFrame(props: AppFrameProps) {
               </button>
             );
 
-            return (
-              <div key={key}>
+            if (item.action === "record") {
+              const status = state.navigation.recordingStatus;
+              return <div key={key} className="app-frame-recording-nav">
                 {navButton}
-              </div>
-            );
+                {status === "transcribing" ? <span className="app-frame-recording-nav__status" role="status">{t("plugin.ui.audio.transcribing")}</span> : null}
+                {status === "ready" || status === "failed" ? <button type="button" className="app-frame-recording-nav__control"
+                  onClick={() => dispatch(appActions.requestRecordingOpen())}>{t("recording.page.view")}</button> : null}
+                {status !== "transcribing" && status !== "ready" && status !== "failed" ? <span className="app-frame-recording-nav__controls">
+                  {status === "recording" ? <span className="app-frame-recording-nav__signal" role="status" aria-label={t("plugin.ui.audio.recording")}><AudioLines size={16} aria-hidden="true" /></span> : null}
+                  <Tooltip content={status === "recording" ? t("plugin.ui.audio.pause") : status === "paused" ? t("plugin.ui.audio.resume") : t("plugin.ui.audio.start")}><button type="button" className="app-frame-recording-nav__control"
+                    disabled={status === "starting"} onClick={() => dispatch(appActions.requestRecordingControl())}>
+                    {status === "recording" ? <Pause size={15} aria-hidden="true" /> : <AudioLines size={16} aria-hidden="true" />}
+                  </button></Tooltip>
+                  {status === "recording" || status === "paused" ? <Tooltip content={t("plugin.ui.audio.stop")}><button type="button"
+                    className="app-frame-recording-nav__control" onClick={() => dispatch(appActions.requestRecordingFinish())}>
+                    <Square size={13} aria-hidden="true" />
+                  </button></Tooltip> : null}
+                </span> : null}
+              </div>;
+            }
+            return <div key={key}>{navButton}</div>;
           })}
         </nav>
         )}
@@ -1525,11 +1590,20 @@ export function AppFrame(props: AppFrameProps) {
           className="sidebar-restore-button"
           aria-label={t("appFrame.showSidebar")}
           title={t("appFrame.showSidebar")}
-          onClick={() => setSidebarHidden(false)}
+          onClick={() => compactViewport ? setCompactSidebarOpen(true) : setDesktopSidebarHidden(false)}
         >
           <PanelLeftCollapsed size={20} />
         </button>
       )}
+
+      {compactViewport && compactSidebarOpen ? (
+        <button
+          type="button"
+          className="app-frame-sidebar-backdrop"
+          aria-label={t("appFrame.hideSidebar")}
+          onClick={closeCompactSidebar}
+        />
+      ) : null}
 
       <SidebarResizeHandle
         label={t("appFrame.resizeSidebar")}
@@ -1537,7 +1611,7 @@ export function AppFrame(props: AppFrameProps) {
         minWidth={sidebarResize.minWidth}
         maxWidth={sidebarResize.maxWidth}
         isResizing={sidebarResize.isResizing}
-        isDisabled={sidebarHidden}
+        isDisabled={sidebarHidden || compactViewport}
         onResizeStart={sidebarResize.beginResize}
         onResizeBy={sidebarResize.resizeBy}
       />

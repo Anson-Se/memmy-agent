@@ -76,6 +76,37 @@ afterEach(() => {
 });
 
 describe("WebUI media upload route", () => {
+  it("deletes confirmed recording files but rejects paths outside recordings", async () => {
+    const root = tmpRoot();
+    const workspace = path.join(root, "workspace");
+    const recordingDir = path.join(workspace, "recordings");
+    fs.mkdirSync(recordingDir, { recursive: true });
+    const audio = path.join(recordingDir, "interview.wav");
+    const transcript = path.join(recordingDir, "interview.txt");
+    const unrelated = path.join(workspace, "notes.txt");
+    fs.writeFileSync(audio, tinyWavBytes());
+    fs.writeFileSync(transcript, "transcript");
+    fs.writeFileSync(unrelated, "keep");
+    const channel = new WebSocketChannel({}, new MessageBus(), { workspacePath: workspace });
+    const token = await bootstrapToken(channel);
+    const call = (paths: string[], authorized = true) => channel.dispatchHttp({ remoteAddress: ["127.0.0.1"] }, {
+      path: "/api/webui/recordings/delete", method: "POST",
+      headers: authorized ? { authorization: `Bearer ${token}` } : {},
+      body: JSON.stringify({ paths })
+    });
+    expect((await call([audio], false))?.status).toBe(401);
+    expect((await call([audio, unrelated]))?.status).toBe(403);
+    expect(fs.existsSync(audio)).toBe(true);
+    const linked = path.join(recordingDir, "linked.wav");
+    fs.symlinkSync(unrelated, linked);
+    expect((await call([linked]))?.status).toBe(403);
+    const deleted = await call([audio, transcript]);
+    expect(deleted?.status).toBe(200);
+    expect(jsonBody(deleted).deleted).toBe(2);
+    expect(fs.existsSync(audio)).toBe(false);
+    expect(fs.existsSync(transcript)).toBe(false);
+    expect(fs.readFileSync(unrelated, "utf8")).toBe("keep");
+  });
   it("requires bearer token", async () => {
     tmpRoot();
     const channel = new WebSocketChannel({}, new MessageBus());

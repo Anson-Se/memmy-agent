@@ -1,6 +1,7 @@
+import { NATIVE_APP_ACCESS_REQUEST, NATIVE_APP_ACCESS_RESULT } from "@memmy/local-api-contracts";
 import { macPermissionSettingsGuide } from "../../../src/tools/computer-use/mac-permission-settings.js";
 import fs from "node:fs";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -231,9 +232,30 @@ describe("MCP connection helpers", () => {
     vi.stubEnv('MEMMY_DESKTOP_MANAGED_GATEWAY', '1');
     const prepare = vi.spyOn(desktopOnboardingClient, 'prepare').mockResolvedValue({ app: 'com.example.Memmy', pid: 42 });
     const guide = vi.spyOn(desktopOnboardingClient, 'guide').mockResolvedValue(false);
-    const doctor = vi.spyOn(permissionChecks, 'nativePermissionDoctor');
+    const doctorProbe = vi.fn(async () => ({ state: 'unknown' as const }));
+    const doctor = vi.spyOn(permissionChecks, 'nativePermissionDoctor').mockReturnValue(doctorProbe);
     const pause = vi.spyOn(nativeLifecycle, 'stopOwnedNativeAgent').mockResolvedValue(undefined);
     const allowed = vi.spyOn(nativeAppApprovalStore, 'isAllowed').mockReturnValue(false);
+    // Vitest's fork has an IPC parent too. Model the Desktop approval reply
+    // explicitly instead of sending the request to the test runner and waiting.
+    const desktopMessages = new EventEmitter();
+    const accessRequests: Array<Record<string, unknown>> = [];
+    const desktopProcess = Object.create(process) as NodeJS.Process;
+    Object.defineProperties(desktopProcess, {
+      connected: { value: true },
+      on: { value: desktopMessages.on.bind(desktopMessages) },
+      removeListener: { value: desktopMessages.removeListener.bind(desktopMessages) },
+      send: { value: vi.fn((message: Record<string, unknown>, callback?: (error: Error | null) => void) => {
+        if (message.type !== NATIVE_APP_ACCESS_REQUEST) throw new Error('Unexpected Desktop IPC fixture request');
+        accessRequests.push(message);
+        queueMicrotask(() => desktopMessages.emit('message', {
+          type: NATIVE_APP_ACCESS_RESULT, requestId: message.requestId, decision: 'deny',
+        }));
+        callback?.(null);
+        return true;
+      }) },
+    });
+    vi.stubGlobal('process', desktopProcess);
     const binary = bundledComputerUseBinary();
     const session = { ...fakeSession([...OCU_TOOLS]), ping: async () => {}, callTool: vi.fn().mockImplementation(async (name: string) =>
       name === 'list_apps'
@@ -250,6 +272,9 @@ describe("MCP connection helpers", () => {
       const denied = await tool.execute({ app: 'Notes' }, { stopTurn: stop });
       expect(denied).toContain('was not allowed to use this app');
       expect(stop).toHaveBeenCalledOnce();
+      expect(accessRequests).toEqual([expect.objectContaining({
+        type: NATIVE_APP_ACCESS_REQUEST, platform: 'darwin', appId: 'com.apple.Notes',
+      })]);
       expect(session.callTool).toHaveBeenCalledWith('list_apps', {}, 30);
       expect(session.callTool).not.toHaveBeenCalledWith('get_app_state', expect.anything(), 30);
       allowed.mockReturnValue(true);
@@ -258,9 +283,13 @@ describe("MCP connection helpers", () => {
       (tool as any).setContext(new RequestContext({ messageId: 'desktop-allowed', sessionKey: 'approval-test', channel: 'webui', chatId: 'chat' }));
       const result = await tool.execute({ app: 'Notes' }, { stopTurn: stop });
       expect(result).toContain('Accessibility permission is required.');
+      expect(accessRequests).toHaveLength(1);
+      expect(desktopMessages.listenerCount('message')).toBe(0);
+      expect(guide).toHaveBeenCalledOnce();
+      expect(doctorProbe).not.toHaveBeenCalled();
       expect(session.callTool).toHaveBeenCalledWith('get_app_state', { app: 'com.apple.Notes' }, 30);
     } finally {
-      await stacks.memmy_computer_use?.aclose(); prepare.mockRestore(); guide.mockRestore(); doctor.mockRestore(); pause.mockRestore(); allowed.mockRestore(); vi.unstubAllEnvs();
+      await stacks.memmy_computer_use?.aclose(); prepare.mockRestore(); guide.mockRestore(); doctor.mockRestore(); pause.mockRestore(); allowed.mockRestore(); vi.unstubAllEnvs(); vi.unstubAllGlobals();
     }
   });
   it.runIf(process.platform === "darwin")("preserves explicit custom OCU launchers without inventing a doctor contract", async () => {

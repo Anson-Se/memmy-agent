@@ -278,7 +278,9 @@ const SessionSummarySchema = z.object({
   projectId: z.string().nullable(),
   cwd: z.string(),
   model_preset: z.string().nullable().optional(),
-  model_selection: ModelSelectionSchema.nullable().optional()
+  model_selection: ModelSelectionSchema.nullable().optional(),
+  thinking_enabled: z.boolean().nullable().optional(),
+  thinking_level: z.string().nullable().optional()
 }).passthrough();
 
 const ProjectSchema = z.object({
@@ -425,18 +427,6 @@ const SlashCommandsResponseSchema = z.object({
   commands: z.array(SlashCommandSchema)
 });
 
-const WEBUI_HIDDEN_SLASH_COMMANDS = new Set([
-  "/stop",
-  "/restart",
-  "/dream",
-  "/dream-log",
-  "/dream-restore",
-  "/history",
-  "/pairing",
-  "/help",
-  "/model"
-]);
-
 const SidebarStateSchema = z.object({
   schema_version: z.literal(1),
   pinned_keys: z.array(z.string()),
@@ -509,6 +499,7 @@ const ResolvedArtifactSchema = z.object({
   media_url: z.string().optional(),
   relative_path: z.string().optional()
 });
+const ResolvedRecordingSchema = z.object({ media_url: z.string() });
 
 const RevealArtifactResponseSchema = z.object({
   ok: z.literal(true),
@@ -738,6 +729,8 @@ export type MemmyAgentSendMessageInput = {
   language?: MemmyAgentUiLanguage;
   media?: MemmyAgentMediaInput[];
   modelPreset?: string | null;
+  thinkingEnabled?: boolean;
+  thinkingLevel?: string | null;
 };
 
 export type MemmyAgentQuestionResponseInput = {
@@ -939,9 +932,11 @@ export interface MemmyAgentClient {
   renameSession(sessionKey: string, title: string): Promise<MemmyAgentSessionSummary>;
   deleteSession(sessionKey: string): Promise<boolean>;
   resolveArtifact(path: string, sessionKey: string): Promise<ResolvedAgentArtifact>;
+  resolveRecording(path: string): Promise<string>;
   revealArtifact(path: string, sessionKey: string): Promise<void>;
   openArtifact(path: string, sessionKey: string): Promise<void>;
   uploadAgentMedia(attachments: UploadAgentMediaInput[]): Promise<UploadedAgentMedia[]>;
+  deleteRecordingFiles(paths: string[]): Promise<void>;
   uploadAgentImages(images: UploadAgentImageInput[]): Promise<UploadedAgentImage[]>;
   connectWebSocket(onEvent?: (event: MemmyAgentWsEvent) => void): Promise<MemmyAgentWebSocketConnection>;
   sessionKeyToChatId(sessionKey: string): string;
@@ -1489,7 +1484,6 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
   async listSlashCommands(): Promise<MemmyAgentSlashCommand[]> {
     const response = await this.request("/api/commands", SlashCommandsResponseSchema);
     return response.commands
-      .filter((command) => !WEBUI_HIDDEN_SLASH_COMMANDS.has(command.command))
       .map((command) => ({
         command: command.command,
         title: command.title,
@@ -1602,6 +1596,13 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
     });
   }
 
+  async resolveRecording(path: string): Promise<string> {
+    const result = await this.request("/api/webui/recordings/resolve", ResolvedRecordingSchema, {
+      method: "POST", body: { path }
+    });
+    return new URL(result.media_url, this.baseUrl).toString();
+  }
+
   async revealArtifact(path: string, sessionKey: string): Promise<void> {
     await this.request("/api/webui/artifacts/reveal", RevealArtifactResponseSchema, {
       method: "POST",
@@ -1658,6 +1659,12 @@ class HttpMemmyAgentClient implements MemmyAgentClient {
   async uploadAgentImages(images: UploadAgentImageInput[]): Promise<UploadedAgentImage[]> {
     const media = await this.uploadAgentMedia(images.map((image) => ({ ...image, kind: "image" })));
     return media.filter((item): item is UploadedAgentImage => item.kind === "image");
+  }
+
+  async deleteRecordingFiles(paths: string[]): Promise<void> {
+    await this.request("/api/webui/recordings/delete", z.object({ ok: z.literal(true) }), {
+      method: "POST", body: { paths }
+    });
   }
 
   async connectWebSocket(onEvent?: (event: MemmyAgentWsEvent) => void): Promise<MemmyAgentWebSocketConnection> {
@@ -2754,6 +2761,8 @@ class MemmyAgentWebSocketSession implements MemmyAgentWebSocketConnection {
       ...(input.target ? { target: input.target } : {}),
       ...(input.language ? { language: input.language } : {}),
       ...(input.modelPreset !== undefined ? { model_preset: input.modelPreset } : {}),
+      ...(input.thinkingEnabled !== undefined ? { thinking_enabled: input.thinkingEnabled } : {}),
+      ...(input.thinkingLevel ? { thinking_level: input.thinkingLevel } : {}),
       ...(input.media?.length ? { media_paths: input.media.map((item) => item.path) } : {})
     }, expectedGeneration);
     this.knownChats.add(input.chatId);
