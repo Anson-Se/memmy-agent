@@ -1,10 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  MemoryDb,
-  type LlmClient
-} from "../../../src/index.js";
+import { MemoryDb, type LlmClient } from "../../../src/index.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture
@@ -25,7 +22,7 @@ function createFeedbackRefinerLlm(calls: Array<{
 }>): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.evolution,
+      ...LEGACY_TEST_CONFIG.evolution,
       provider: "host",
       endpoint: "http://127.0.0.1/feedback-refiner",
       model: "feedback-refiner"
@@ -229,19 +226,19 @@ describe("MemoryService / feedback / experience", () => {
       skillLlm: createFeedbackRefinerLlm(calls),
       embedder: createCapturingEmbedder([]),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }

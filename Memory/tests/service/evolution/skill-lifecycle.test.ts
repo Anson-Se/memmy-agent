@@ -1,6 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_MEMMY_CONFIG, MemoryDb, type LlmClient } from "../../../src/index.js";
+import { MemoryDb, type LlmClient } from "../../../src/index.js";
 import {
   insertActivePolicyMemory,
   insertActiveSkillMemoryForTest,
@@ -519,20 +520,20 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       mode: "dev",
       skillLlm: createNoToolSkillLlm(),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: true,
             cooldownMs: 60_000
           }
@@ -1087,27 +1088,27 @@ describe("MemoryService / evolution / skill lifecycle", () => {
         }]
       }),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: true,
             minPolicies: 1,
             minPolicySupport: 1,
             minPolicyGain: 0.01
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: true,
             minSupport: 1,
             minGain: 0.01,
@@ -1281,27 +1282,27 @@ describe("MemoryService / evolution / skill lifecycle", () => {
         steps: ["Run the focused pytest workflow and inspect migration output before retrying."]
       }),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: true,
             minPolicies: 1,
             minPolicySupport: 1,
             minPolicyGain: 0.01
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: true,
             minSupport: 1,
             minGain: 0.01,
@@ -1425,27 +1426,27 @@ describe("MemoryService / evolution / skill lifecycle", () => {
         }]
       }),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             traceCharCap: 700
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: true,
             minPolicies: 1,
             minPolicySupport: 1,
             minPolicyGain: 0.01
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: true,
             minSupport: 1,
             minGain: 0.01,

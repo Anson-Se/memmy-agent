@@ -1,18 +1,11 @@
+import { LEGACY_TEST_CONFIG } from "./fixtures/memory-service-fixture.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  createMemoryHttpServer,
-  DEFAULT_MEMMY_CONFIG,
-  loadMemmyConfig,
-  MemoryDb,
-  MemoryService,
-  type Embedder,
-  type LlmClient
-} from "../src/index.js";
+import { createMemoryHttpServer, loadMemmyConfig, MemoryDb, MemoryService, type Embedder, type LlmClient } from "../src/index.js";
 import type { AgentSourceExecutor } from "../src/agent-source/runtime.js";
 import type { ViewerCliOptions } from "../src/server/viewer-cli.js";
 import { prepareViewerRequest, adaptViewerResponse } from "../viewer/src/api/memmy-adapter.js";
@@ -616,9 +609,9 @@ async function startFixture(options: {
   const root = mkdtempSync(join(tmpdir(), "memmy-viewer-api-"));
   const configPath = join(root, "config.yaml");
   const config = {
-    ...DEFAULT_MEMMY_CONFIG,
+    ...LEGACY_TEST_CONFIG,
     hub: { enabled: false, teamToken: "hub-secret" }
-  } as typeof DEFAULT_MEMMY_CONFIG;
+  } as typeof LEGACY_TEST_CONFIG;
   writeFileSync(configPath, YAML.stringify({ memmyMemory: config }));
   const db = new MemoryDb({ path: join(root, "memory.sqlite") });
   const service = new MemoryService({
@@ -693,7 +686,7 @@ function closeServer(server: Server): Promise<void> {
 
 function testEmbedder(): Embedder {
   return {
-    config: { ...DEFAULT_MEMMY_CONFIG.embedding, model: "viewer-test" },
+    config: { ...LEGACY_TEST_CONFIG.embedding, model: "viewer-test" },
     isRemote: () => false,
     embed: async (texts) => texts.map(() => [1, 0, 0]),
     embedOne: async () => [1, 0, 0],
@@ -703,7 +696,7 @@ function testEmbedder(): Embedder {
 
 function testLlm(model: string, calls: string[]): LlmClient {
   return {
-    config: { ...DEFAULT_MEMMY_CONFIG.summary, provider: "openai_compatible", model, endpoint: "http://127.0.0.1" },
+    config: { ...LEGACY_TEST_CONFIG.summary, provider: "openai_compatible", model, endpoint: "http://127.0.0.1" },
     isConfigured: () => true,
     complete: async (_messages, options) => {
       calls.push(options.operation);

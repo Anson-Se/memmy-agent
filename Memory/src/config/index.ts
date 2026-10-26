@@ -505,7 +505,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     session: {
       followUpMode: "merge_follow_ups",
       mergeMaxGapMs: 2 * 60 * 60 * 1000,
-      turnJudge: false,
+      turnJudge: true,
       turnJudgeKeepInput: false
     },
     retrieval: {

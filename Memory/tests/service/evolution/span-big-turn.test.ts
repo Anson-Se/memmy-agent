@@ -1,10 +1,6 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  type LlmClient,
-  type LlmCompletionOptions,
-  type LlmMessage
-} from "../../../src/index.js";
+import { type LlmClient, type LlmCompletionOptions, type LlmMessage } from "../../../src/index.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture,
@@ -48,7 +44,7 @@ function createSpanBigTurnLlm(
   let spanCallIndex = 0;
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/span-big-turn",
       model: "span-big-turn"
@@ -124,11 +120,11 @@ describe("MemoryService / evolution / span big turn", () => {
     const embeddedRoles: Array<"query" | "document" | undefined> = [];
     const llm = createSpanBigTurnLlm(calls);
     const config = {
-      ...DEFAULT_MEMMY_CONFIG,
+      ...LEGACY_TEST_CONFIG,
       algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        ...LEGACY_TEST_CONFIG.algorithm,
         retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          ...LEGACY_TEST_CONFIG.algorithm.retrieval,
           relativeThresholdFloor: 0,
           smartSeed: false,
           llmFilterEnabled: false
@@ -355,11 +351,11 @@ describe("MemoryService / evolution / span big turn", () => {
     };
     const llm = createSpanBigTurnLlm(calls, [firstSplit, secondSplit, firstSplit]);
     const config = {
-      ...DEFAULT_MEMMY_CONFIG,
+      ...LEGACY_TEST_CONFIG,
       algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        ...LEGACY_TEST_CONFIG.algorithm,
         retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          ...LEGACY_TEST_CONFIG.algorithm.retrieval,
           relativeThresholdFloor: 0,
           smartSeed: false,
           llmFilterEnabled: false
@@ -586,11 +582,11 @@ describe("MemoryService / evolution / span big turn", () => {
       const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
       const llm = createSpanBigTurnLlm(calls);
       const config = {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           reward: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.reward,
+            ...LEGACY_TEST_CONFIG.algorithm.reward,
             llmScoring: false
           }
         }

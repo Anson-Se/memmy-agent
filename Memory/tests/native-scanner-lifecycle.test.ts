@@ -1,3 +1,4 @@
+import { LEGACY_TEST_CONFIG } from "./fixtures/memory-service-fixture.js";
 import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -5,7 +6,7 @@ import { readCodexRollout, sourceTurnFromMessages, buildSourceTurnRequest, type 
 import { createAgentSourceExecutor } from "../src/agent-source/runtime.js";
 import { createSourceRegistry } from "../src/agent-source/adapters/source-registry.js";
 import { createMemoryServiceFixture } from "./fixtures/memory-service-fixture.js";
-import { DEFAULT_MEMMY_CONFIG } from "../src/index.js";
+
 import { Repositories } from "../src/storage/repositories.js";
 
 const fixture = createMemoryServiceFixture();
@@ -26,7 +27,7 @@ async function wait(executor: ReturnType<typeof createAgentSourceExecutor>) {
 
 describe("Codex scan and Hook share the actual Memory lifecycle", () => {
   it.each(["hook", "scan"])("keeps one RawTurn, L1 and capture job when %s arrives first", async first => {
-    const { service, db, root } = fixture.createTestService({ config: { ...DEFAULT_MEMMY_CONFIG, userId: "scan-owner" } });
+    const { service, db, root } = fixture.createTestService({ config: { ...LEGACY_TEST_CONFIG, userId: "scan-owner" } });
     const path = join(root, "rollout.jsonl");
     writeFileSync(path, records(true).map(record => JSON.stringify(record)).join("\n") + "\n");
     const messages: RawCodexMessage[] = []; for await (const value of readCodexRollout(path)) messages.push(value);

@@ -480,6 +480,9 @@ function createAutoWorkerDrain(
     scheduleNextDueJob();
   });
 
+  // Capture failures still leave durable work, even when the HTTP response fails.
+  service.setCapturePendingListener(schedule);
+
   service.setPersistRecoveredListener(() => {
     if (disposed || !workerStarted) {
       return;
@@ -515,6 +518,7 @@ function createAutoWorkerDrain(
       disposed = true;
       service.setAppBudgetReconcileListener(undefined);
       service.setPersistRecoveredListener(undefined);
+      service.setCapturePendingListener(undefined);
       requested = false;
       if (startupTimer) {
         clearTimeout(startupTimer);

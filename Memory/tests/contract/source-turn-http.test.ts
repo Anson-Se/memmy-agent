@@ -1,6 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildSourceTurnRequest } from "@memmy/agent-source-core";
-import { DEFAULT_MEMMY_CONFIG, createMemoryHttpServer } from "../../src/index.js";
+import { createMemoryHttpServer } from "../../src/index.js";
 import { Repositories } from "../../src/storage/repositories.js";
 import { createMemoryServiceFixture } from "../fixtures/memory-service-fixture.js";
 
@@ -9,7 +10,7 @@ afterEach(cleanup);
 
 describe("source turn HTTP contract", () => {
   it("accepts the real shared builder and principal namespace for both channels", async () => {
-    const { service, db } = createTestService({ config: { ...DEFAULT_MEMMY_CONFIG, userId: "configured-owner" } });
+    const { service, db } = createTestService({ config: { ...LEGACY_TEST_CONFIG, userId: "configured-owner" } });
     const server = createMemoryHttpServer({ service, startAgentSourceAutomation: false,
       auth: { mode: "dev", scopedApiKeys: { "scope-test-token": {
         namespace: { source: "codex", profileId: "default", userId: "http-user" }, scopes: ["memory:read", "memory:write"]
@@ -41,7 +42,7 @@ describe("source turn HTTP contract", () => {
   });
 
   it.each(["hook", "agent_source_scan", "concurrent"] as const)("reuses the installed Hook owner after account switch when %s arrives first", async (channel) => {
-    const { service, db } = createTestService({ config: { ...DEFAULT_MEMMY_CONFIG, userId: "configured-owner" } });
+    const { service, db } = createTestService({ config: { ...LEGACY_TEST_CONFIG, userId: "configured-owner" } });
     const opened = service.openSession({
       source: "codex", namespace: { source: "codex", profileId: "default", userId: "installed-owner", sessionKey: "codex-memory-local-conversation" },
       l3WorldModelProtocolVersion: 2, l3WorldModelTransition: "allow_legacy_rollover",

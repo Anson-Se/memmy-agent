@@ -1,8 +1,6 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  type LlmClient
-} from "../../../src/index.js";
+import { type LlmClient } from "../../../src/index.js";
 import {
   createCapturingEmbedder,
   createMemoryServiceFixture
@@ -26,7 +24,7 @@ function createCountingLlm(
 ): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/negative-experience-test",
       model: "negative-experience-test"
@@ -103,29 +101,29 @@ describe("MemoryService / evolution / negative experience", () => {
       skillLlm: llm,
       embedder: createCapturingEmbedder(embeddedTexts, embeddingRoles),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: true,
             synthReflection: false
           },
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             useLlm: false,
             attachToPolicy: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }
@@ -252,29 +250,29 @@ describe("MemoryService / evolution / negative experience", () => {
       llm,
       skillLlm: llm,
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false,
             synthReflection: false
           },
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             useLlm: false,
             attachToPolicy: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }
@@ -329,29 +327,29 @@ describe("MemoryService / evolution / negative experience", () => {
       llm: createCountingLlm([]),
       skillLlm: createCountingLlm([]),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false,
             synthReflection: false
           },
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             useLlm: false,
             attachToPolicy: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }
@@ -463,16 +461,16 @@ describe("MemoryService / evolution / negative experience", () => {
   it("skips generic negative feedback without a reusable safer behavior", async () => {
     const { db, service } = createTestService({
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false,
             synthReflection: false
           },
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             useLlm: false,
             attachToPolicy: false
           }
@@ -515,22 +513,22 @@ describe("MemoryService / evolution / negative experience", () => {
       llm: createCountingLlm([]),
       skillLlm: createCountingLlm([]),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           enableQueryRewrite: false,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false,
             synthReflection: false
           },
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             useLlm: false,
             attachToPolicy: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           }
         }

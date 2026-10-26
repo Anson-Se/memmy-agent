@@ -392,6 +392,7 @@ describe("MemoryService / session / turn capture", () => {
         ...DEFAULT_MEMMY_CONFIG,
         algorithm: {
           ...DEFAULT_MEMMY_CONFIG.algorithm,
+        session: { ...DEFAULT_MEMMY_CONFIG.algorithm.session, turnJudge: false },
           capture: {
             ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
             maxTextChars: 220,

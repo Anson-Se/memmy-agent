@@ -1114,6 +1114,7 @@ describe("MemoryService / session / episode relation", () => {
       ...DEFAULT_MEMMY_CONFIG,
       algorithm: {
         ...DEFAULT_MEMMY_CONFIG.algorithm,
+        session: { ...DEFAULT_MEMMY_CONFIG.algorithm.session, turnJudge: false },
         retrieval: {
           ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
           llmFilterEnabled: false
@@ -1176,7 +1177,7 @@ describe("MemoryService / session / episode relation", () => {
     const service = createTestMemoryService({
       db,
       mode: "dev",
-      config: accountRuntimeConfig(),
+      config: { ...accountRuntimeConfig(), algorithm: { ...accountRuntimeConfig().algorithm, session: { ...accountRuntimeConfig().algorithm.session, turnJudge: false } } },
       llm: createRelationClassifierLlm(summaryCalls, summaryOptions),
       skillLlm: createRelationClassifierLlm(evolutionCalls),
       embedder: createCapturingEmbedder([])

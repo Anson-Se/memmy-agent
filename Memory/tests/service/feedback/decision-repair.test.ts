@@ -1,12 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  MemoryDb,
-  type LlmClient,
-  type LlmCompletionOptions,
-  type LlmMessage
-} from "../../../src/index.js";
+import { MemoryDb, type LlmClient, type LlmCompletionOptions, type LlmMessage } from "../../../src/index.js";
 import { makeTraceEligibleForL2 } from "../../fixtures/evolution-fixture.js";
 import {
   createCapturingEmbedder,
@@ -30,7 +25,7 @@ function createDecisionRepairLlm(
 ): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.evolution,
+      ...LEGACY_TEST_CONFIG.evolution,
       provider: "host",
       endpoint: "http://127.0.0.1/decision-repair",
       model: "decision-repair"
@@ -402,7 +397,7 @@ describe("MemoryService / feedback / decision repair", () => {
     expect(repairCall!.options).toMatchObject({
       operation: "decision.repair.v1",
       thinkingMode: "enabled",
-      temperature: DEFAULT_MEMMY_CONFIG.evolution.temperature,
+      temperature: LEGACY_TEST_CONFIG.evolution.temperature,
       maxTokens: 800
     });
     expect(repairCall!.messages[0]!.content).toContain("just-in-time guidance");
@@ -693,7 +688,7 @@ describe("MemoryService / feedback / decision repair", () => {
     expect(repairCall!.options).toMatchObject({
       operation: "decision.repair.v1",
       thinkingMode: "enabled",
-      temperature: DEFAULT_MEMMY_CONFIG.evolution.temperature,
+      temperature: LEGACY_TEST_CONFIG.evolution.temperature,
       maxTokens: 800
     });
     expect(repairCall!.messages[1]!.content).toContain("failure-burst");
@@ -728,11 +723,11 @@ describe("MemoryService / feedback / decision repair", () => {
       llm: createBatchReflectionLlm([], "Inspect migration output before retrying"),
       skillLlm: createDecisionRepairLlm(calls),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           feedback: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.feedback,
+            ...LEGACY_TEST_CONFIG.algorithm.feedback,
             valueDistributionRepairEnabled: true
           }
         }
@@ -824,7 +819,7 @@ describe("MemoryService / feedback / decision repair", () => {
     expect(repairCall!.options).toMatchObject({
       operation: "decision.repair.v1",
       thinkingMode: "enabled",
-      temperature: DEFAULT_MEMMY_CONFIG.evolution.temperature,
+      temperature: LEGACY_TEST_CONFIG.evolution.temperature,
       maxTokens: 800
     });
     expect(repairCall!.messages[1]!.content).toContain("TRIGGER: value-distribution");
@@ -865,7 +860,7 @@ describe("MemoryService / feedback / decision repair", () => {
 
   it("uses decision_repair retrieval for repair suggestions without creating repairs", async () => {
     const { db, service } = createTestService({
-      config: DEFAULT_MEMMY_CONFIG,
+      config: LEGACY_TEST_CONFIG,
       embedder: createCapturingEmbedder([])
     });
     const session = service.openSession({
@@ -907,7 +902,7 @@ describe("MemoryService / feedback / decision repair", () => {
   });
 
   it("uses plugin-style failure metadata for repair suggestion retrieval", async () => {
-    const { db, service } = createTestService({ config: DEFAULT_MEMMY_CONFIG });
+    const { db, service } = createTestService({ config: LEGACY_TEST_CONFIG });
     const session = service.openSession({
       namespace: {
         source: "codex",

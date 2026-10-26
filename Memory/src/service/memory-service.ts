@@ -1,3 +1,4 @@
+import { CaptureRecovery, type CaptureCommand } from "./session/capture-recovery.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -287,6 +288,7 @@ export class MemoryService {
   private readonly projectEnvironment: ProjectEnvironmentService;
   private readonly panelReadModel: PanelReadModel;
   private readonly retrieval: RetrievalService;
+  private readonly captureRecovery: CaptureRecovery;
   private readonly sessionTurns: SessionTurnService;
   private readonly skillReadModel: SkillReadModel;
   private readonly workerHandlers: ReturnType<typeof createWorkerJobHandlers>;
@@ -318,12 +320,14 @@ export class MemoryService {
     backoffMs: 1_000
   };
   private persistRecoveredListener?: () => void;
+  private capturePendingListener?: () => void;
   private closing = false;
   private viewerEndpoint?: string;
 
   constructor(private readonly options: MemoryServiceOptions) {
     this.viewerEndpoint = options.viewerEndpoint;
     this.repos = options.backend?.repositories() ?? new Repositories(requireMemoryDb(options).db);
+    this.captureRecovery = new CaptureRecovery(this.repos, () => this.capturePendingListener?.());
     this.l3WorldModelContextReadModel = new L3WorldModelContextReadModel(this.repos);
     this.mode = options.mode ?? "local";
     this.config = cloneMemmyConfig(options.config ?? DEFAULT_MEMMY_CONFIG);
@@ -552,6 +556,7 @@ export class MemoryService {
     });
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
+      activeCaptureJobs: () => [...this.captureRecovery.activeForegroundJobs],
       onTurnJudgeDeadLetter: (job) => this.embeddingJobs.markTurnJudgeFailed(job),
       repos: this.repos,
       get embedder() { return workerRunnerOwner.embedder; },
@@ -578,7 +583,9 @@ export class MemoryService {
       appendEmbeddingRetryChange: this.workerHandlers.appendEmbeddingRetryChange,
       jobHandlers: {
         processJob: (job) => this.withModelTaskContext(
-          () => this.workerHandlers.processJob(job)
+          () => job.jobType === "capture_replay"
+            ? this.captureRecovery.replay(job, (command) => this.replayCapture(command))
+            : this.workerHandlers.processJob(job)
         )
       },
       embeddingJobs: this.embeddingJobs
@@ -676,6 +683,7 @@ export class MemoryService {
     });
     const sessionTurnOwner = this;
     this.sessionTurns = new SessionTurnService({
+      captureRecovery: this.captureRecovery,
       repos: this.repos,
       get config() { return sessionTurnOwner.config; },
       get llm() { return sessionTurnOwner.llm; },
@@ -859,6 +867,10 @@ export class MemoryService {
 
   setAppBudgetReconcileListener(listener?: () => void): void {
     this.appBudgetReconcile.settledListener = listener;
+  }
+
+  setCapturePendingListener(listener?: () => void): void {
+    this.capturePendingListener = listener;
   }
 
   setPersistRecoveredListener(listener?: () => void): void {
@@ -1337,10 +1349,10 @@ export class MemoryService {
     jobs: JobRef[];
     serverTime: string;
   }> {
-    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.withCaptureRecovery("compactSession", [sessionId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.summary ?? "" },
       () => this.sessionTurns.compactSession(sessionId, this.withTimeZone(request))
-    ));
+    )));
   }
 
   async startTurn(request: TurnStartRequest & Record<string, unknown>): Promise<{
@@ -1364,10 +1376,36 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
+  private withCaptureRecovery<T>(operation: CaptureCommand["operation"], args: unknown[], execute: () => Promise<T>): Promise<T> {
+    const saved = JSON.parse(JSON.stringify(args)) as unknown[];
+    const request = saved.find(isRecord) ?? {};
+    // Preserve the effective owner across configuration/account changes before retry.
+    const namespace = isRecord(request.namespace) ? request.namespace : {};
+    if (operation === "completeSourceTurn") request.namespace = { ...namespace, userId: namespace.userId ?? this.config.userId };
+    const sessionId = typeof request.sessionId === "string" ? request.sessionId
+      : operation === "compactSession" ? String(saved[0]) : undefined;
+    return this.captureRecovery.run({ operation, args: saved, sessionId,
+      userId: String(namespace.userId ?? (sessionId ? this.repos.runtime.getSession(sessionId)?.userId : undefined) ?? this.config.userId ?? "local-user") }, execute);
+  }
+
+  private async replayCapture(command: CaptureCommand): Promise<unknown> {
+    const [first, second] = command.args;
+    switch (command.operation) {
+      case "completeTurn": return this.completeTurn(String(first), second as TurnCompleteRequest & Record<string, unknown>);
+      case "completeSourceTurn": return this.completeSourceTurn(first as SourceTurnCompleteRequest);
+      case "observeTool": return this.observeTool(first as ToolObserveRequest);
+      case "compactSession": return this.compactSession(String(first), second as SessionCompactRequest);
+      case "subagentStart": return this.subagentStart(first as SubagentStartRequest);
+      case "subagentComplete": return this.subagentComplete(first as SubagentCompleteRequest);
+      case "useSkill": return this.useSkill(String(first), second as SkillUseRequest);
+      default: throw new Error("unsupported capture recovery operation");
+    }
+  }
+
   async completeSourceTurn(request: SourceTurnCompleteRequest): Promise<SourceTurnCompleteResponse> {
     // Native scans have no Hook envelope. Use the configured owner only when
     // the request (including authenticated scope) did not provide one.
-    const response = await this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    const response = await this.withCaptureRecovery("completeSourceTurn", [request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.query, turnId: request.sourceTurn?.turnId },
       () => this.sessionTurns.completeSourceTurn(this.withTimeZone({
         ...request,
@@ -1379,7 +1417,7 @@ export class MemoryService {
           userId: request.namespace?.userId ?? this.config.userId
         }
       }))
-    ));
+    )));
     serviceLogger.info("source_turn.complete", {
       source: request.sourceTurn?.source,
       profileId: request.sourceTurn?.profileId,
@@ -1397,10 +1435,10 @@ export class MemoryService {
   }
 
   async completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): Promise<CompleteTurnResponse> {
-    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.withCaptureRecovery("completeTurn", [turnId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.query, turnId },
       () => this.sessionTurns.completeTurn(turnId, this.withTimeZone(request))
-    ));
+    )));
   }
 
   async observeTool(input: ToolObserveRequest): Promise<{
@@ -1412,7 +1450,7 @@ export class MemoryService {
     syncCursor?: string;
     serverTime: string;
   }> {
-    return this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input)));
+    return this.withCaptureRecovery("observeTool", [input], () => this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input))));
   }
 
 
@@ -1425,17 +1463,17 @@ export class MemoryService {
     syncCursor: string;
     serverTime: string;
   }> {
-    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.withCaptureRecovery("subagentStart", [input], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: input.task ?? "" },
       () => this.sessionTurns.subagentStart(this.withTimeZone(input))
-    ));
+    )));
   }
 
   async subagentComplete(input: SubagentCompleteRequest): Promise<CompleteTurnResponse> {
-    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.withCaptureRecovery("subagentComplete", [input], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: input.summary ?? "Subagent completed" },
       () => this.sessionTurns.subagentComplete(this.withTimeZone(input))
-    ));
+    )));
   }
 
   async repairSuggestion(input: RepairSuggestionRequest): Promise<{
@@ -2245,10 +2283,10 @@ export class MemoryService {
     serverTime: string;
     duplicate?: boolean;
   }> {
-    return this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.withCaptureRecovery("useSkill", [skillId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: `Use skill ${skillId}` },
       () => this.skillReadModel.useSkill(skillId, this.withTimeZone(request))
-    ));
+    )));
   }
 
   async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {

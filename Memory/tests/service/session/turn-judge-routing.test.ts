@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_MEMMY_CONFIG } from "../../../src/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Repositories } from "../../../src/storage/repositories.js";
 import { heuristicHumanScore } from "../../../src/algorithm/plugin-algorithms.js";
 import { representativeEpisodeFeedback } from "../../../src/service/evolution/turn-judge.js";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
@@ -16,12 +16,25 @@ import {
 
 const { cleanup, createTestService } = createMemoryServiceFixture();
 
-afterEach(cleanup);
+afterEach(() => { vi.useRealTimers(); cleanup(); });
 
 type Db = ReturnType<typeof createTestService>["db"];
 
 function judged(relation: string | null, feedback: string | null, l1: Record<string, unknown> | null = null): JudgeAnswer {
   return { relation, feedback, reason: `${relation}/${feedback}`, l1, user: null };
+}
+
+function captureL3Evidence(llm: ReturnType<typeof createTurnJudgeLlm>["llm"]) {
+  const inputs: Array<{ raw_turns: Array<{ raw_turn_id: string; feedback: Array<{ polarity: string }> }> }> = [];
+  const complete = llm.complete;
+  llm.complete = async (messages, options) => {
+    if (options.operation.startsWith("l3_world_model.")) {
+      inputs.push(JSON.parse(messages.at(-1)!.content));
+      return JSON.stringify({ op: "noop", value: "" });
+    }
+    return complete(messages, options);
+  };
+  return inputs;
 }
 
 function episodeOf(db: Db, rawTurnId: string): string {
@@ -98,8 +111,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(relation).toEqual({ relation: "follow_up", reason: "follow_up/neutral", signals: ["llm", "turn.judge.v1"] });
   });
 
-  it("closes the task on new_task, moves the turn with its L1 and leaves the reaction on the old task", async () => {
-    const { llm } = createTurnJudgeLlm({ "第二轮": [judged("new_task", "negative", l1For("第二轮：换个事，写求职信"))] });
+  it.each(["positive", "negative"])("closes new_task and freezes its %s feedback in L3 evidence", async (polarity) => {
+    const { llm } = createTurnJudgeLlm({ "第二轮": [judged("new_task", polarity, l1For("第二轮：换个事，写求职信"))] });
+    const l3Evidence = captureL3Evidence(llm);
     const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
     const session = service.openSession({
       l3WorldModelProtocolVersion: 2,
@@ -146,11 +160,58 @@ describe("turn.judge.v1 routing (switch on)", () => {
     }
 
     const [feedback] = feedbackRows(db, session.sessionId);
-    expect(feedback).toMatchObject({ episode_id: first.episodeId, raw_turn_id: first.rawTurnId, polarity: "negative", magnitude: 1 });
+    expect(feedback).toMatchObject({ episode_id: first.episodeId, raw_turn_id: first.rawTurnId, polarity, magnitude: 1 });
     expect(oldTask.feedbackIds).toEqual([feedback!.id]);
-    expect(jobsOf(db, "decision_repair", first.episodeId)).toHaveLength(1);
+    const evidence = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id = ?")
+      .all(session.sessionId) as Array<{ feedback_ids_json: string }>;
+    expect(evidence.flatMap(row => JSON.parse(row.feedback_ids_json))).toEqual([feedback!.id]);
+    expect(l3Evidence.flatMap(input => input.raw_turns).find(turn => turn.raw_turn_id === first.rawTurnId)?.feedback)
+      .toEqual([expect.objectContaining({ polarity })]);
+    await settle(service);
+    const after = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id = ?")
+      .all(session.sessionId) as Array<{ feedback_ids_json: string }>;
+    expect(after.flatMap(row => JSON.parse(row.feedback_ids_json)).filter(id => id === feedback!.id)).toHaveLength(1);
+    expect(jobsOf(db, "decision_repair", first.episodeId)).toHaveLength(polarity === "negative" ? 1 : 0);
     // The old task's closing work runs once its turns are settled.
     expect(jobsOf(db, "reward", first.episodeId).length + jobsOf(db, "reflection", first.episodeId).length).toBeGreaterThan(0);
+  });
+
+  it.each(["positive", "negative"])("preserves %s feedback with backlog and a reopened historical Episode", async polarity => {
+    const { llm } = createTurnJudgeLlm({
+      "B task": [judged("new_task", polarity, l1For("B task"))],
+      "C task": [judged("follow_up", "positive", l1For("C task"))]
+    });
+    const l3Evidence = captureL3Evidence(llm);
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
+    const session = service.openSession({ l3WorldModelProtocolVersion: 2, l3WorldModelTransition: "resume_only",
+      namespace: { source: "codex", profileId: "default", userId: "reopen-backlog", sessionKey: "reopen-backlog" } });
+    const historical = await service.completeTurn("historical", { sessionId: session.sessionId, query: "Historical task", answer: "Historical output" });
+    await settle(service);
+    const repos = new Repositories(db.db);
+    repos.runtime.closeEpisode(historical.episodeId, { closeReason: "idle_timeout" });
+    const first = await service.completeTurn("a", { sessionId: session.sessionId, query: "A task", answer: "A done" });
+    await settle(service);
+    // Selection reopens a historical task during B's routing. C was already
+    // captured provisionally in A and must subsequently follow B.
+    const completeJson = llm.completeJson;
+    llm.completeJson = async (messages, options) => {
+      if (options.operation === "episode.select.v1") return { episodeId: historical.episodeId, title: "A reopened", summary: "Historical task" } as any;
+      return completeJson(messages, options);
+    };
+    const second = await service.completeTurn("b", { sessionId: session.sessionId, query: "B task", answer: "B done" });
+    const third = await service.completeTurn("c", { sessionId: session.sessionId, query: "C task", answer: "C done" });
+    await settle(service, 10);
+    expect(repos.runtime.getEpisode(historical.episodeId)?.meta.reopenReason).toBe("episode_selection");
+    const feedback = feedbackRows(db, session.sessionId).find(row => row.raw_turn_id === first.rawTurnId)!;
+    expect(feedback.polarity).toBe(polarity);
+    const batches = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id=?").all(session.sessionId) as Array<{ feedback_ids_json: string }>;
+    expect(batches.flatMap(row => JSON.parse(row.feedback_ids_json)).filter(id => id === feedback.id)).toHaveLength(1);
+    expect(l3Evidence.flatMap(input => input.raw_turns).find(turn => turn.raw_turn_id === first.rawTurnId)?.feedback)
+      .toEqual([expect.objectContaining({ polarity })]);
+    expect(episodeOf(db, second.rawTurnId)).toBe(historical.episodeId);
+    expect(episodeOf(db, third.rawTurnId)).toBe(historical.episodeId);
+    expect(rawTurnPayload(db, second.rawTurnId).turn_judge.status).toBe("judged");
+    expect(rawTurnPayload(db, third.rawTurnId).turn_judge.status).toBe("judged");
   });
 
   it("judges turns of one session in order and files a later turn by the earlier turn's result", async () => {
@@ -362,7 +423,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
 
   it("keeps the old routing while the switch is off", async () => {
     const { llm, judgeCalls } = createTurnJudgeLlm();
-    const { service, db } = createTestService({ llm, config: DEFAULT_MEMMY_CONFIG });
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig(false) });
     const session = openSession(service, "route-off");
     const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写周报", answer: "好。" }));
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "结束会话", answer: "好的。" }));
@@ -398,4 +459,35 @@ describe("representative feedback for the reward fallback", () => {
     ]);
     expect(picked?.polarity).toBe("negative");
   });
+  it.each([false, true])("serializes equal-time turns through leases and recovery (legacy job payload=%s)", async legacyPayload => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2099-01-01T10:00:00Z"));
+    const { llm, judgeCalls } = createTurnJudgeLlm({
+      B: [judged("new_task", "negative", l1For("B task"))],
+      C: [judged("new_task", "positive", l1For("C task"))]
+    });
+    const { service, db } = createTestService({ llm, config: turnJudgeConfig() });
+    const session = openSession(service, "equal-time");
+    const first = await service.completeTurn("a", { sessionId: session.sessionId, query: "A task", answer: "A done" });
+    await settle(service);
+    const second = await service.completeTurn("b", { sessionId: session.sessionId, query: "B task", answer: "B done" });
+    const third = await service.completeTurn("c", { sessionId: session.sessionId, query: "C task", answer: "C done" });
+    const repo = new Repositories(db.db);
+    expect(repo.runtime.getRawTurn(second.rawTurnId)?.createdAt).toBe(repo.runtime.getRawTurn(third.rawTurnId)?.createdAt);
+    if (legacyPayload) {
+      db.db.prepare("UPDATE evolution_jobs SET payload_json=json_remove(payload_json, '$.rawTurnId') WHERE job_type='trace_summary'").run();
+    }
+    // Even a second worker explicitly requesting C cannot overtake leased B.
+    const jobs = repo.runtime.leaseQueuedJobs(10, 60, undefined, false, ["trace_summary"]);
+    expect(jobs.map(job => job.targetMemoryId)).toEqual([second.l1MemoryId]);
+    expect(repo.runtime.leaseQueuedJobs(10, 60, [third.l1MemoryId], false, ["trace_summary"])).toEqual([]);
+    repo.runtime.failJob(jobs[0]!.id, "transient model failure");
+    expect(repo.runtime.leaseQueuedJobs(10, 60, [third.l1MemoryId], false, ["trace_summary"])).toEqual([]);
+    repo.runtime.requeueFailedJobs();
+    await settle(service, 8);
+    expect(judgeCalls.map(call => call.user)).toEqual(["A task", "B task", "C task"]);
+    expect(new Set([first, second, third].map(turn => episodeOf(db, turn.rawTurnId))).size).toBe(3);
+    expect(feedbackRows(db, session.sessionId).map(row => row.raw_turn_id)).toEqual([first.rawTurnId, second.rawTurnId]);
+  });
+
 });

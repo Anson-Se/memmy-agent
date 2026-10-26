@@ -66,6 +66,7 @@ export interface MemoryProcessingRecord {
   updatedAt: IsoTime;
 }
 export type JobType =
+  | "capture_replay"
   | "episode_idle_close"
   | "episode_title"
   | "trace_summary"

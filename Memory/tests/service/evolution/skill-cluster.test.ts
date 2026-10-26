@@ -1,5 +1,6 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_MEMMY_CONFIG, type LlmClient } from "../../../src/index.js";
+import { type LlmClient } from "../../../src/index.js";
 import { DIRECT_SKILL_SOURCE } from "../../../src/algorithm/trace-direct-skill.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import { createMemoryServiceFixture, runWorkerRounds } from "../../fixtures/memory-service-fixture.js";
@@ -44,7 +45,7 @@ interface DirectSkillCall {
 function createDirectSkillLlm(calls: DirectSkillCall[]): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.evolution,
+      ...LEGACY_TEST_CONFIG.evolution,
       provider: "host",
       endpoint: "http://127.0.0.1/direct-skill",
       model: "direct-skill"
@@ -101,7 +102,7 @@ async function runDirectSkillEpisode(input: {
   rTask: number;
   query?: string;
   answer?: string;
-  config?: typeof DEFAULT_MEMMY_CONFIG;
+  config?: typeof LEGACY_TEST_CONFIG;
 }) {
   const calls: DirectSkillCall[] = [];
   const { db, service } = createTestService({ skillLlm: createDirectSkillLlm(calls), config: input.config });
@@ -160,11 +161,11 @@ describe("MemoryService / evolution / skill cluster", () => {
       userId: `skill-language-${language}-${outputLanguageMode}`,
       rTask: 1,
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         language,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
-          skill: { ...DEFAULT_MEMMY_CONFIG.algorithm.skill, outputLanguageMode }
+          ...LEGACY_TEST_CONFIG.algorithm,
+          skill: { ...LEGACY_TEST_CONFIG.algorithm.skill, outputLanguageMode }
         }
       }
     });
@@ -211,25 +212,25 @@ describe("MemoryService / evolution / skill cluster", () => {
     const { db, service } = createTestService({
       llm: createDirectSkillLlm(calls),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false,
             alphaScoring: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: true,
             directFromTrace: true
           }
@@ -319,7 +320,7 @@ describe("MemoryService / evolution / skill cluster", () => {
       skillLlm: createDirectSkillLlm(calls),
       embedder: {
         config: {
-          ...DEFAULT_MEMMY_CONFIG.embedding,
+          ...LEGACY_TEST_CONFIG.embedding,
           provider: "local",
           model: "scene-split"
         },

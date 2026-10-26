@@ -51,7 +51,7 @@ import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/hi
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
-const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "observation_extract", "episode_title"];
+const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["capture_replay", "trace_summary", "import_summary", "observation_extract", "episode_title"];
 
 const workerLogger = createMemoryLogger("worker");
 
@@ -116,6 +116,8 @@ type EmbeddingRetryResult = {
  */
 export interface WorkerRunnerDeps {
   repos: Pick<Repositories, "transaction" | "memories" | "processing" | "runtime">;
+  // Startup recovery must not steal requests already running in this process.
+  activeCaptureJobs?: () => readonly string[];
   // A per-turn judgment that used up its attempts: mark it failed so the task can close.
   onTurnJudgeDeadLetter?: (job: EvolutionJobRecord) => void;
   embedder: Embedder;
@@ -209,7 +211,7 @@ export class WorkerRunner {
 
     const at = this.deps.nowIso();
     this.deps.enqueueObservationBackfill?.(Math.min(limit, 100), at);
-    const interruptedJobs = this.deps.repos.runtime.requeueLeasedJobsAfterRestart(at);
+    const interruptedJobs = this.deps.repos.runtime.requeueLeasedJobsAfterRestart(at, this.deps.activeCaptureJobs?.());
     const failedJobs = this.deps.repos.runtime.requeueFailedJobs(limit, at);
     for (const { before, after } of [...interruptedJobs, ...failedJobs]) {
       this.deps.appendJobChange(after, "queued", before);
@@ -526,6 +528,15 @@ export class WorkerRunner {
       await this.deps.jobHandlers.processJob(job);
       return this.completeLeasedWorkerJob(job);
     } catch (error) {
+      if (job.jobType === "capture_replay") {
+        const current = this.deps.repos.runtime.getJob(job.id);
+        // The capture may have committed before optional tool-repair work failed,
+        // or another lease may now own it. Never overwrite that newer state.
+        if (current?.status === "succeeded") return this.completeLeasedWorkerJob(current);
+        if (!current || current.status !== "leased" || current.leasedUntil !== job.leasedUntil) {
+          return { succeeded: 0, failed: 0, ref: jobToRef(current ?? job) };
+        }
+      }
       if (error instanceof SummaryModelUnconfiguredError) {
         return this.holdUnconfiguredSummaryJob(job);
       }

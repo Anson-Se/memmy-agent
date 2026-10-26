@@ -3370,6 +3370,20 @@ export class RuntimeRepository {
     };
   }
 
+  /** Reserve a durable capture before waiting for its Episode selection. */
+  reserveCaptureReplay(job: EvolutionJobRecord): EvolutionJobRecord | undefined {
+    return this.db.transaction(() => {
+      const existing = this.getActiveJobByDedupeKey(job.dedupeKey!);
+      if (existing?.status === "leased" && existing.leasedUntil && existing.leasedUntil > job.createdAt) return undefined;
+      if (existing) {
+        this.db.prepare(`UPDATE evolution_jobs SET status = 'leased', leased_until = ?, updated_at = ? WHERE id = ?`)
+          .run(job.leasedUntil!, job.updatedAt, existing.id);
+        return this.getJob(existing.id);
+      }
+      return this.enqueueJobInTransaction(job);
+    })();
+  }
+
   enqueueJob(job: EvolutionJobRecord): EvolutionJobRecord {
     return this.db.transaction(() => this.enqueueJobInTransaction(job))();
   }
@@ -3835,8 +3849,19 @@ export class RuntimeRepository {
                    AND json_extract(earlier_turn_job.payload_json, '$.turnJudge') = 1
                    AND earlier_turn_job.status IN ('queued', 'leased', 'failed')
                    AND earlier_turn_job.id <> evolution_jobs.id
-                   AND CAST(json_extract(earlier_turn_job.payload_json, '$.turnAt') AS TEXT)
-                     < CAST(json_extract(evolution_jobs.payload_json, '$.turnAt') AS TEXT)
+                   AND (
+                     CAST(json_extract(earlier_turn_job.payload_json, '$.turnAt') AS TEXT)
+                       < CAST(json_extract(evolution_jobs.payload_json, '$.turnAt') AS TEXT)
+                     OR (json_extract(earlier_turn_job.payload_json, '$.turnAt') = json_extract(evolution_jobs.payload_json, '$.turnAt')
+                       AND COALESCE((SELECT rowid FROM raw_turns WHERE id = COALESCE(
+                         json_extract(earlier_turn_job.payload_json, '$.rawTurnId'),
+                         (SELECT json_extract(properties_json, '$.internal_info.trace.raw_turn_id') FROM memories WHERE id = earlier_turn_job.target_memory_id)
+                       )), earlier_turn_job.rowid)
+                       < COALESCE((SELECT rowid FROM raw_turns WHERE id = COALESCE(
+                         json_extract(evolution_jobs.payload_json, '$.rawTurnId'),
+                         (SELECT json_extract(properties_json, '$.internal_info.trace.raw_turn_id') FROM memories WHERE id = evolution_jobs.target_memory_id)
+                       )), evolution_jobs.rowid))
+                   )
                )
              )
              ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
@@ -3891,12 +3916,20 @@ export class RuntimeRepository {
     return this.getJob(id);
   }
 
+  completeCaptureReplay(id: string, at = nowIso()): void {
+    // The raw content now lives in the normal capture tables. Do not retain a
+    // second copy in completed jobs that would escape later raw-turn redaction.
+    this.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded', leased_until = NULL,
+      payload_json = json_object('operation', json_extract(payload_json, '$.command.operation'), 'captured', json('true')),
+      updated_at = ? WHERE id = ? AND job_type = 'capture_replay'`).run(at, id);
+  }
+
   /** Waiting for a dependency is not a model failure and does not consume an attempt. */
-  deferProcessingJob(id: string, runAfter: string, at = nowIso()): EvolutionJobRecord | undefined {
+  deferProcessingJob(id: string, runAfter: string, at = nowIso(), restoreAttempt = true): EvolutionJobRecord | undefined {
     this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', leased_until = NULL,
-      attempts = MAX(0, attempts - 1), updated_at = ?,
+      attempts = MAX(0, attempts - ?), updated_at = ?,
       payload_json = json_set(payload_json, '$.runAfter', ?)
-      WHERE id = ? AND status = 'leased'`).run(at, runAfter, id);
+      WHERE id = ? AND status = 'leased'`).run(restoreAttempt ? 1 : 0, at, runAfter, id);
     return this.getJob(id);
   }
 
@@ -3950,7 +3983,8 @@ export class RuntimeRepository {
   }
 
   requeueLeasedJobsAfterRestart(
-    at = nowIso()
+    at = nowIso(),
+    activeCaptureIds: readonly string[] = []
   ): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
     const transaction = this.db.transaction(() => {
       const rows = this.db
@@ -3958,9 +3992,10 @@ export class RuntimeRepository {
           `SELECT *
            FROM evolution_jobs
            WHERE status = 'leased'
+             ${activeCaptureIds.length ? `AND id NOT IN (${activeCaptureIds.map(() => '?').join(', ')})` : ''}
            ORDER BY ${evolutionJobOrderSql()}`
         )
-        .all() as SqlJobRow[];
+        .all(...activeCaptureIds) as SqlJobRow[];
 
       for (const row of rows) {
         this.db
@@ -8329,7 +8364,7 @@ function evolutionJobPrioritySql(): string {
                  'startup.processing_repair',
                  'startup.placeholder_summary_repair'
                ) THEN 90
-             WHEN job_type IN ('trace_summary', 'observation_extract')
+             WHEN job_type IN ('capture_replay', 'trace_summary', 'observation_extract')
                OR (job_type = 'embedding' AND ${interactiveL1Target}) THEN 1
              WHEN job_type = 'import_summary'
                OR (job_type = 'embedding' AND ${importedTarget}) THEN 2

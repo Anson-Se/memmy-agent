@@ -8,6 +8,7 @@ export const MEMORY_WORKER_JOB_TYPES = [
   "episode_idle_close",
   "episode_title",
   "trace_summary",
+  "capture_replay",
   "observation_extract",
   "user_memory_embedding",
   "import_summary",
@@ -86,6 +87,7 @@ export function jobTypeBudgetRoles(jobType: string): MemoryBudgetModelRole[] {
       return [];
     case "episode_title":
     case "trace_summary":
+    case "capture_replay":
     case "observation_extract":
     case "import_summary":
     case "span_big_turn":

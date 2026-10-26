@@ -1,10 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  MemoryDb,
-  type LlmClient
-} from "../../../src/index.js";
+import { MemoryDb, type LlmClient } from "../../../src/index.js";
 import {
   createBatchReflectionLlm,
   createMemoryServiceFixture,
@@ -26,7 +23,7 @@ function createEmptyRewardSummaryLlm(calls: Array<{
 }>): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/empty-reward-summary",
       model: "empty-reward-summary"
@@ -78,7 +75,7 @@ function createCapturingRewardSummaryLlm(calls: Array<{
 }>): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/reward-summary-capturing",
       model: "reward-summary-capturing"
@@ -141,7 +138,7 @@ function createCapturingRewardSummaryLlm(calls: Array<{
 function createRejectingCaptureLlm(calls: string[]): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/rejecting-capture",
       model: "rejecting-capture"
@@ -183,7 +180,7 @@ function createRejectingCaptureLlm(calls: string[]): LlmClient {
 function createMixedCaptureLlm(calls: Array<{ operation: string; stepCount?: number }>): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/mixed-capture",
       model: "mixed-capture"
@@ -341,24 +338,24 @@ describe("MemoryService / evolution / reward", () => {
     const { db, service } = createTestService({
       llm: createBatchReflectionLlm(calls),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false,
             synthReflection: true
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }
@@ -537,11 +534,11 @@ describe("MemoryService / evolution / reward", () => {
     const { db, service } = createTestService({
       llm: createMixedCaptureLlm(calls),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             embedAfterCapture: false
           }
         }
@@ -713,25 +710,25 @@ describe("MemoryService / evolution / reward", () => {
       mode: "dev",
       llm: createEmptyRewardSummaryLlm(rewardCalls),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false,
             alphaScoring: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }
@@ -806,24 +803,24 @@ describe("MemoryService / evolution / reward", () => {
       llm: createCapturingRewardSummaryLlm(rewardCalls),
       skillLlm: createBatchReflectionLlm([], "reflected reward summary"),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           capture: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.capture,
+            ...LEGACY_TEST_CONFIG.algorithm.capture,
             synthReflection: false,
             embedAfterCapture: false
           },
           l2Induction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l2Induction,
+            ...LEGACY_TEST_CONFIG.algorithm.l2Induction,
             useLlm: false
           },
           l3Abstraction: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction,
+            ...LEGACY_TEST_CONFIG.algorithm.l3Abstraction,
             useLlm: false
           },
           skill: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.skill,
+            ...LEGACY_TEST_CONFIG.algorithm.skill,
             useLlm: false
           }
         }

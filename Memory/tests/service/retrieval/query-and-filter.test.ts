@@ -1,14 +1,7 @@
+import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_MEMMY_CONFIG,
-  MemoryDb,
-  type LlmClient,
-  type LlmCompletionOptions,
-  type LlmMessage,
-  type MemoryRow,
-  type RecallHit
-} from "../../../src/index.js";
+import { MemoryDb, type LlmClient, type LlmCompletionOptions, type LlmMessage, type MemoryRow, type RecallHit } from "../../../src/index.js";
 import { Repositories, type RawTurnRecord } from "../../../src/storage/repositories.js";
 import {
   policyIsEligibleForDownstream,
@@ -324,11 +317,11 @@ describe("MemoryService / retrieval / query and filtering", () => {
 
   it("uses the summed tier topK as the explicit search default limit", async () => {
     const config = {
-      ...DEFAULT_MEMMY_CONFIG,
+      ...LEGACY_TEST_CONFIG,
       algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        ...LEGACY_TEST_CONFIG.algorithm,
         retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          ...LEGACY_TEST_CONFIG.algorithm.retrieval,
           tier1TopK: 1,
           tier2TopK: 2,
           tier3TopK: 4,
@@ -465,11 +458,11 @@ describe("MemoryService / retrieval / query and filtering", () => {
 
   it("limits turn-start recall to tier1 + tier2 topK", async () => {
     const config = {
-      ...DEFAULT_MEMMY_CONFIG,
+      ...LEGACY_TEST_CONFIG,
       algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        ...LEGACY_TEST_CONFIG.algorithm,
         retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          ...LEGACY_TEST_CONFIG.algorithm.retrieval,
           tier1TopK: 1,
           tier2TopK: 2,
           tier3TopK: 4,
@@ -608,12 +601,12 @@ describe("MemoryService / retrieval / query and filtering", () => {
     }> = [];
     const seenEmbeddings: string[] = [];
     const config = {
-      ...DEFAULT_MEMMY_CONFIG,
+      ...LEGACY_TEST_CONFIG,
       algorithm: {
-        ...DEFAULT_MEMMY_CONFIG.algorithm,
+        ...LEGACY_TEST_CONFIG.algorithm,
         enableQueryRewrite: true,
         retrieval: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+          ...LEGACY_TEST_CONFIG.algorithm.retrieval,
           relativeThresholdFloor: 0,
           smartSeed: false,
           llmFilterEnabled: false
@@ -736,7 +729,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
     });
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const failingFilterLlm = createFailingLlm();
     const service = createTestMemoryService({
       db,
@@ -811,7 +804,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
       messages: Array<{ role: string; content: string }>;
       options: { operation: string };
     }> = [];
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const { db, service } = createTestService({
       llm: createRankedRetrievalFilterLlm(calls, [0]),
       embedder: createCapturingEmbedder([]),
@@ -872,7 +865,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
       messages: Array<{ role: string; content: string }>;
       options: { operation: string };
     }> = [];
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const service = createTestMemoryService({
       db,
       mode: "dev",
@@ -940,7 +933,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     }> = [];
     const llm: LlmClient = {
       config: {
-        ...DEFAULT_MEMMY_CONFIG.summary,
+        ...LEGACY_TEST_CONFIG.summary,
         provider: "host",
         endpoint: "http://127.0.0.1/retrieval-filter",
         model: "retrieval-filter"
@@ -974,7 +967,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
         };
       }
     };
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const service = createTestMemoryService({
       db,
       mode: "dev",
@@ -1056,7 +1049,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     let summaryFails = false;
     const summaryLlm: LlmClient = {
       config: {
-        ...DEFAULT_MEMMY_CONFIG.summary,
+        ...LEGACY_TEST_CONFIG.summary,
         provider: "host",
         endpoint: "http://127.0.0.1/summary",
         model: "summary"
@@ -1101,7 +1094,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     };
     const evolutionLlm: LlmClient = {
       config: {
-        ...DEFAULT_MEMMY_CONFIG.evolution,
+        ...LEGACY_TEST_CONFIG.evolution,
         provider: "host",
         endpoint: "http://127.0.0.1/evolution",
         model: "evolution"
@@ -1132,7 +1125,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
         };
       }
     };
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const service = createTestMemoryService({
       db,
       mode: "dev",
@@ -1283,7 +1276,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
     });
-    const config = DEFAULT_MEMMY_CONFIG;
+    const config = LEGACY_TEST_CONFIG;
     const calls: Array<{
       messages: Array<{ role: string; content: string }>;
       options: { operation: string };
@@ -1611,11 +1604,11 @@ describe("MemoryService / retrieval / query and filtering", () => {
     const { db, service } = createTestService({
       llm: createQueryExtractCapturingLlm(extractInputs),
       config: {
-        ...DEFAULT_MEMMY_CONFIG,
+        ...LEGACY_TEST_CONFIG,
         algorithm: {
-          ...DEFAULT_MEMMY_CONFIG.algorithm,
+          ...LEGACY_TEST_CONFIG.algorithm,
           retrieval: {
-            ...DEFAULT_MEMMY_CONFIG.algorithm.retrieval,
+            ...LEGACY_TEST_CONFIG.algorithm.retrieval,
             queryExtractHistoryTurns: 0
           }
         }
@@ -1750,7 +1743,7 @@ async function seedQueryExtractHistory(
 function createQueryExtractCapturingLlm(extractInputs: string[]): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/query-extract-history",
       model: "query-extract-history"
@@ -1895,7 +1888,7 @@ function createTimeFilterLlm(
 ): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.evolution,
+      ...LEGACY_TEST_CONFIG.evolution,
       provider: "host",
       endpoint: "http://127.0.0.1/time-filter",
       model: "time-filter"
@@ -1938,7 +1931,7 @@ function createRankedRetrievalFilterLlm(
 ): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/retrieval-filter",
       model: "retrieval-filter"
@@ -2002,7 +1995,7 @@ function createQueryRewriteLlm(
 ): LlmClient {
   return {
     config: {
-      ...DEFAULT_MEMMY_CONFIG.summary,
+      ...LEGACY_TEST_CONFIG.summary,
       provider: "host",
       endpoint: "http://127.0.0.1/query-rewrite",
       model: "query-rewrite"

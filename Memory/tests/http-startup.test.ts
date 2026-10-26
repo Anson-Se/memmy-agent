@@ -299,6 +299,7 @@ function stubService(reconcile: () => void): StartupServiceStub {
     setAppBudgetReconcileListener(next?: () => void) {
       listener = next;
     },
+    setCapturePendingListener: () => undefined,
     setPersistRecoveredListener(next?: () => void) {
       persistListener = next;
     },

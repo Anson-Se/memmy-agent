@@ -10,6 +10,11 @@ import {
 } from "../../src/index.js";
 import type { ActualModelContext } from "../../src/contracts/index.js";
 
+// Suites for legacy capture/retrieval behavior keep that mode explicit as the
+// production default changes. Enabled/default-on suites use production config.
+export const LEGACY_TEST_CONFIG = { ...DEFAULT_MEMMY_CONFIG, algorithm: { ...DEFAULT_MEMMY_CONFIG.algorithm,
+  session: { ...DEFAULT_MEMMY_CONFIG.algorithm.session, turnJudge: false } } };
+
 export function createMemoryServiceFixture(): {
   cleanup: () => void;
   createTestMemoryService: (
@@ -48,6 +53,9 @@ export function createMemoryServiceFixture(): {
     }
     const service = new MemoryService({
       ...options,
+      // Legacy fixture suites opt out explicitly; turn-judge suites pass their
+      // enabled configuration, and default-on coverage passes DEFAULT_MEMMY_CONFIG.
+      config: options.config ?? LEGACY_TEST_CONFIG,
       fetchAppMemoryBudget: options.fetchAppMemoryBudget ?? (async () => null),
       skillLlm: options.skillLlm ?? options.llm,
       embedder: options.embedder ?? createCapturingEmbedder([])
@@ -151,9 +159,9 @@ export function configWithMemoryGates(gates: {
   enableQueryRewrite?: boolean;
 }): typeof DEFAULT_MEMMY_CONFIG {
   return {
-    ...DEFAULT_MEMMY_CONFIG,
+    ...LEGACY_TEST_CONFIG,
     algorithm: {
-      ...DEFAULT_MEMMY_CONFIG.algorithm,
+      ...LEGACY_TEST_CONFIG.algorithm,
       ...gates
     }
   };
@@ -180,7 +188,7 @@ export function accountRuntimeConfig(): typeof DEFAULT_MEMMY_CONFIG {
   const endpoint = "https://apigw-pre.memtensor.cn/api/agentExternal/v1";
   const apiKey = "cloud-uuid";
   return {
-    ...DEFAULT_MEMMY_CONFIG,
+    ...LEGACY_TEST_CONFIG,
     roleRouting: {
       summary: "follow",
       evolution: "follow"

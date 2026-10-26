@@ -1,3 +1,4 @@
+import type { CaptureRecovery } from "./capture-recovery.js";
 import { EpisodeSelectionRequired, selectionInput, selectionKey, selectEpisode, type EpisodeSelectionContext, type EpisodeSelectionResult } from "./episode-selection.js";
 import {
   captureTurnSteps,
@@ -107,6 +108,7 @@ interface ToolFailureBurst extends ToolFailureState { contextHash: string; failu
 interface DecisionRepairSummary { repairId?: string; contextHash?: string; skipped?: boolean; reason?: string; attachedPolicyIds?: string[]; }
 type SessionTurnDependencies = {
   repos: Repositories;
+  captureRecovery?: CaptureRecovery;
   readonly config: MemmyConfig;
   readonly llm: LlmClient;
   readonly skillLlm: LlmClient;
@@ -515,10 +517,14 @@ export class SessionTurnService {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         this.selectionScope = { context, results };
-        return this.deps.repos.transaction(operation);
+        return this.deps.captureRecovery
+          ? this.deps.captureRecovery.commit(operation)
+          : this.deps.repos.transaction(operation);
       } catch (error) {
         if (!(error instanceof EpisodeSelectionRequired)) throw error;
         this.selectionScope = undefined;
+        this.deps.captureRecovery?.beforeModel();
+        if (!this.deps.llm.isConfigured()) throw new MemoryServiceError("conflict", "episode selection requires a configured summary model");
         if (this.deps.shouldDeferEpisodeSelection?.()) {
           throw new MemoryServiceError("conflict", "episode selection is waiting for the summary model token budget");
         }
@@ -2256,6 +2262,7 @@ export class SessionTurnService {
                 promptVersion: TURN_JUDGE_PROMPT_VERSION,
                 // Judgments of one session run in turn order (see leaseQueuedJobs).
                 turnAt: sourceRawTurn.createdAt,
+                rawTurnId: sourceRawTurn.id,
                 ...(stepRawTurnId !== rawTurn.id ? { turnJudgeCatchUp: true } : {}),
                 ...(turnJudgeNoiseKind(sourceRawTurn.userText) ? { turnJudgeNoise: turnJudgeNoiseKind(sourceRawTurn.userText) } : {})
               } : {}),
@@ -3366,6 +3373,14 @@ export class SessionTurnService {
     if (input.feedback && input.previousRawTurnId) {
       this.recordTurnJudgeFeedback(session, rawTurn, input.feedback, input.reason, input.previousRawTurnId, input.previousL1MemoryId, input.at, jobs);
     }
+    // Freeze only after routing and feedback persistence. A batch is an immutable
+    // evidence snapshot: feedback saved afterwards cannot be picked up by it.
+    if (decision?.relation === "new_task" && input.baseEpisodeId &&
+        session.meta.l3_world_model_protocol_version === 2 &&
+        route.reason !== "later_turn_already_judged") {
+      this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "new_task",
+        episodeId: input.baseEpisodeId, at: input.at });
+    }
     const current = this.deps.repos.runtime.getRawTurn(rawTurn.id) ?? rawTurn;
     const turnStart = isRecord(current.messagePayload?.turn_start) ? current.messagePayload.turn_start : {};
     const routeProposal = isRecord(turnStart.routeProposal) ? turnStart.routeProposal : undefined;
@@ -3458,10 +3473,6 @@ export class SessionTurnService {
         relationDecision: decision,
         relationRouting: { action }
       }, at);
-    }
-    if (decision.relation === "new_task" && session.meta.l3_world_model_protocol_version === 2) {
-      // Only through the old task's last trace: later turns may already be stored.
-      this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "new_task", episodeId: base.id, at });
     }
     if (decision.relation === "end_topic") {
       const ending: EpisodeRecord = this.deps.requireEpisode(target.id);
@@ -4216,11 +4227,8 @@ export class SessionTurnService {
     }
 
     let selection: EpisodeSelectionResult | undefined;
-    if (this.deps.config.algorithm.session.turnJudge && !this.deps.llm.isConfigured()) {
-      throw new MemoryServiceError("conflict", "episode selection requires a configured summary model");
-    }
     // Keep the legacy, explicitly non-model routing mode usable offline.
-    if (this.deps.llm.isConfigured()) {
+    if (this.deps.config.algorithm.session.turnJudge || this.deps.llm.isConfigured()) {
       const scope = this.selectionScope;
       if (!scope) throw new Error("episode creation requires withEpisodeSelection");
       const input = selectionInput(this.deps.repos, session, scope.context);
