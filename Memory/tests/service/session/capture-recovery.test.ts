@@ -118,18 +118,60 @@ describe("durable capture before Episode selection", () => {
     expect(reopened.db.prepare("SELECT status FROM evolution_jobs WHERE job_type='capture_replay'").get()).toEqual({ status: "succeeded" });
   });
 
-  it("holds an unconfigured model's saved capture without exhausting retries", async () => {
-    const { llm } = createTurnJudgeLlm();
+  it("stores captures offline under the default config without a summary model", async () => {
+    const { llm, judgeCalls } = createTurnJudgeLlm();
     llm.isConfigured = () => false;
+    const { service, db } = fixture.createTestService({ llm, config: DEFAULT_MEMMY_CONFIG });
+    const { sessionId } = service.openSession({ namespace: { source: "codex", profileId: "default", userId: "offline" } });
+    await service.completeTurn("offline", { sessionId, query: "Retain the original", answer: "Retain the answer" });
+    const source = await service.completeSourceTurn({ source: "codex", channel: "hook", sourceTurn: { source: "codex", profileId: "default",
+      conversationId: "offline-native", turnId: "native-turn", startedAt: "2099-01-01T00:00:00Z", completedAt: "2099-01-01T00:01:00Z",
+      completionEvidence: "task_complete" }, query: "Retain source input", answer: "Retain source output" });
+    expect(source.status).toBe("stored");
+    expect(db.db.prepare("SELECT count(*) AS n FROM raw_turns").get()).toEqual({ n: 2 });
+    expect(db.db.prepare("SELECT count(*) AS n FROM evolution_jobs WHERE job_type='capture_replay'").get()).toEqual({ n: 0 });
+    for (let i = 0; i < 4; i++) await service.runWorkerOnce(30);
+    expect(judgeCalls).toHaveLength(0);
+  });
+
+  it("holds a saved capture while the model is unconfigured without exhausting retries", async () => {
+    const { llm } = createTurnJudgeLlm();
+    const complete = llm.completeJson;
+    llm.completeJson = async () => { throw new Error("model removed"); };
     const { service, db } = fixture.createTestService({ llm, config: turnJudgeConfig() });
     const { sessionId } = service.openSession({});
     await expect(service.completeTurn("unconfigured", { sessionId, query: "Retain the original", answer: "Retain the answer" }))
-      .rejects.toThrow("configured summary model");
+      .rejects.toThrow("model removed");
+    llm.isConfigured = () => false;
+    llm.completeJson = complete;
     for (let i = 0; i < 4; i++) await service.runWorkerOnce(30);
     expect(db.db.prepare("SELECT status,attempts FROM evolution_jobs WHERE job_type='capture_replay'").get()).toEqual({ status: "queued", attempts: 0 });
     llm.isConfigured = () => true;
     for (let i = 0; i < 4; i++) await service.runWorkerOnce(30);
     expect(db.db.prepare("SELECT count(*) AS n FROM raw_turns").get()).toEqual({ n: 1 });
+  });
+
+  it("keeps a replayed source turn as detached history when a later turn was stored first", async () => {
+    const { llm } = createTurnJudgeLlm();
+    const complete = llm.completeJson;
+    let fail = true;
+    llm.completeJson = async (messages, options) => {
+      if (fail) throw new Error("quota exhausted");
+      return complete(messages, options);
+    };
+    const { service, db } = fixture.createTestService({ llm, config: turnJudgeConfig() });
+    const turn = (turnId: string, minute: number) => ({ source: "codex", channel: "hook" as const,
+      sourceTurn: { source: "codex", profileId: "default", conversationId: "native", turnId, sequence: minute,
+        startedAt: `2099-01-01T00:0${minute}:00Z`, completedAt: `2099-01-01T00:0${minute}:30Z`, completionEvidence: "task_complete" },
+      query: `Original input ${turnId}`, answer: `Original output ${turnId}` });
+    await expect(service.completeSourceTurn(turn("turn-1", 1))).rejects.toThrow("quota");
+    fail = false;
+    expect((await service.completeSourceTurn(turn("turn-2", 2))).status).toBe("stored");
+    for (let i = 0; i < 6; i++) await service.runWorkerOnce(30);
+    expect(db.db.prepare("SELECT user_text FROM raw_turns WHERE turn_id = 'turn-1'").get())
+      .toEqual({ user_text: "Original input turn-1" });
+    expect(db.db.prepare("SELECT count(*) AS n FROM source_turn_captures").get()).toEqual({ n: 2 });
+    expect((await service.completeSourceTurn(turn("turn-1", 1))).status).toBe("existing");
   });
 
   it("automatically retries after an HTTP capture fails, without another client request", async () => {

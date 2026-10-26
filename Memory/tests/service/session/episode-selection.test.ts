@@ -156,13 +156,12 @@ describe("episode selection before creation", () => {
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toEqual([]);
   });
 
-  it("does not bypass selection when the summary model is unconfigured in turn-judge mode", async () => {
+  it("creates the episode offline when the summary model is unconfigured in turn-judge mode", async () => {
     const { service, repos, llm } = setup();
     llm.isConfigured = () => false;
     const session = openSession(service, "unconfigured");
-    await expect(service.completeTurn("x", { sessionId: session.sessionId, query: "A task", answer: "done" }))
-      .rejects.toThrow("requires a configured summary model");
-    expect(repos.runtime.listEpisodesForSession(session.sessionId)).toEqual([]);
+    await service.completeTurn("x", { sessionId: session.sessionId, query: "A task", answer: "done" });
+    expect(repos.runtime.listEpisodesForSession(session.sessionId)).toHaveLength(1);
   });
 
   it("model failure leaves no empty episode and a retry succeeds once", async () => {

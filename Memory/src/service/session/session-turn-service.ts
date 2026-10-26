@@ -1392,7 +1392,9 @@ export class SessionTurnService {
       request = { ...request, namespace };
       let gapEpisode: EpisodeRecord | undefined;
       let targetSessionId = previous?.sessionId;
-      const legacyBackfill = allowsLegacyHistoryCapture(request);
+      // A replayed capture was accepted before later turns were stored. Keep it as
+      // detached history instead of dropping it as out of order.
+      const legacyBackfill = allowsLegacyHistoryCapture(request) || this.deps.captureRecovery?.replaying() === true;
       const detachLegacyHistory = (reason: string): SourceTurnCompleteResponse => {
         if (!legacyBackfill) return { status: "pending", reason };
         return this.captureDetachedLegacyHistory(request, normalized, sourceTurn, scope, contentHash);
@@ -4227,8 +4229,9 @@ export class SessionTurnService {
     }
 
     let selection: EpisodeSelectionResult | undefined;
-    // Keep the legacy, explicitly non-model routing mode usable offline.
-    if (this.deps.config.algorithm.session.turnJudge || this.deps.llm.isConfigured()) {
+    // Without a summary model, capture stays in the offline mode (see
+    // modelDecidesCapture) instead of refusing the turn.
+    if (this.deps.llm.isConfigured()) {
       const scope = this.selectionScope;
       if (!scope) throw new Error("episode creation requires withEpisodeSelection");
       const input = selectionInput(this.deps.repos, session, scope.context);
