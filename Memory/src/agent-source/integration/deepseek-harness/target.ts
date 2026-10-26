@@ -221,12 +221,12 @@ async function detectDeepseekHarnessProcess(): Promise<boolean> {
 }
 
 export function deepseekHarnessProcessPattern(platform: NodeJS.Platform): string {
-  const hostEntry = "/dsh-desktop-host/(?:lib/)?(?:cli|index|main)\\.js(?:\\s|$)";
+  const hostEntry = "/dsh-desktop-host/(lib/)?(cli|index|main)\\.js([[:space:]]|$)";
   if (platform === "darwin") {
-    const appExecutable = "(^|/)DeepSeek Harness(?: Helper)?(?:\\.app/Contents/MacOS/DeepSeek Harness(?: Helper)?)?(?:\\s|$)";
-    return appExecutable + "|(^|/)dsh-desktop(?:\\s|$)|" + hostEntry;
+    const appExecutable = "(^|/)DeepSeek Harness( Helper)?(\\.app/Contents/MacOS/DeepSeek Harness( Helper)?)?([[:space:]]|$)";
+    return appExecutable + "|(^|/)dsh-desktop([[:space:]]|$)|" + hostEntry;
   }
-  return "(^|/)(?:deepseek-harness|dsh-desktop)(?:\\s|$)|" + hostEntry;
+  return "(^|/)(deepseek-harness|dsh-desktop)([[:space:]]|$)|" + hostEntry;
 }
 
 function commandOutputMatches(

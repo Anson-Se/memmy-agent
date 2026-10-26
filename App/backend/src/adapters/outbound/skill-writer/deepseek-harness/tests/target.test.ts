@@ -740,14 +740,20 @@ describe("DeepSeek Harness skill target", () => {
 
 describe("DeepSeek Harness process matching", () => {
   it("matches packaged and development entrypoints without matching checkout paths", () => {
-    const darwinPattern = new RegExp(deepseekHarnessProcessPattern("darwin"), "u");
-    const linuxPattern = new RegExp(deepseekHarnessProcessPattern("linux"), "u");
+    if (process.platform === "win32") return;
+    const darwinPattern = deepseekHarnessProcessPattern("darwin");
+    const linuxPattern = deepseekHarnessProcessPattern("linux");
+    const matches = (pattern: string, command: string) => spawnSync(
+      "grep",
+      ["-E", "--", pattern],
+      { input: command + "\n", encoding: "utf8" }
+    ).status === 0;
 
-    expect(darwinPattern.test("/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --expose-internals")).toBe(true);
-    expect(darwinPattern.test("/Applications/DeepSeek Harness.app/Contents/Frameworks/DeepSeek Harness Helper.app/Contents/MacOS/DeepSeek Harness Helper --type=renderer")).toBe(true);
-    expect(darwinPattern.test("node /workspace/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js")).toBe(true);
-    expect(linuxPattern.test("/opt/deepseek/bin/dsh-desktop --profile default")).toBe(true);
-    expect(linuxPattern.test("node /workspace/deepseek-harness/tests/process.test.js")).toBe(false);
+    expect(matches(darwinPattern, "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --expose-internals")).toBe(true);
+    expect(matches(darwinPattern, "/Applications/DeepSeek Harness.app/Contents/Frameworks/DeepSeek Harness Helper.app/Contents/MacOS/DeepSeek Harness Helper --type=renderer")).toBe(true);
+    expect(matches(darwinPattern, "node /workspace/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js")).toBe(true);
+    expect(matches(linuxPattern, "/opt/deepseek/bin/dsh-desktop --profile default")).toBe(true);
+    expect(matches(linuxPattern, "node /workspace/deepseek-harness/tests/process.test.js")).toBe(false);
   });
 });
 
