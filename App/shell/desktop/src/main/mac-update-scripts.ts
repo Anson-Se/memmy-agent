@@ -67,7 +67,7 @@ validate_app_bundle() {
     exit 1
   fi
   if [[ -n "$EXPECTED_TEAM" ]]; then
-    local signing_requirement=${quotedShellValue(`anchor apple generic and identifier "cn.memtensor.memmy" and certificate leaf[1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "${options.teamIdentifier ?? ""}"`)}
+    local signing_requirement=${quotedShellValue(`=anchor apple generic and identifier "cn.memtensor.memmy" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "${options.teamIdentifier ?? ""}"`)}
     if ! /usr/bin/codesign --verify --deep --strict -R "$signing_requirement" "$app_path"; then
       echo "Memmy update does not have the installed Apple Developer ID identity"
       exit 1

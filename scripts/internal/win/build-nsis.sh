@@ -76,13 +76,42 @@ npm_with_configured_script_shell() {
 resolve_electron_dist() {
   local electron_dist="${MEMMY_ELECTRON_DIST:-}"
 
-  if [ -z "$electron_dist" ] && [ -f "$DESKTOP_DIR/node_modules/electron/dist/electron.exe" ]; then
-    electron_dist="$DESKTOP_DIR/node_modules/electron/dist"
+  if [ -z "$electron_dist" ]; then
+    for candidate in \
+      "$DESKTOP_DIR/node_modules/electron/dist" \
+      "$ROOT_DIR/node_modules/electron/dist"; do
+      if [ -f "$candidate/electron.exe" ]; then
+        electron_dist="$candidate"
+        break
+      fi
+    done
   fi
 
   if [ -n "$electron_dist" ]; then
     to_node_readable_path "$electron_dist"
   fi
+}
+
+restore_electron_dist() {
+  if [ -f "$DESKTOP_DIR/node_modules/electron/dist/electron.exe" ] || \
+     [ -f "$ROOT_DIR/node_modules/electron/dist/electron.exe" ]; then
+    return
+  fi
+
+  local install_script=""
+  for candidate in \
+    "$ROOT_DIR/node_modules/electron/install.js" \
+    "$DESKTOP_DIR/node_modules/electron/install.js"; do
+    if [ -f "$candidate" ]; then
+      install_script="$candidate"
+      break
+    fi
+  done
+  if [ -z "$install_script" ]; then
+    echo "Electron install.js is missing; cannot materialize the Windows Electron runtime." >&2
+    exit 1
+  fi
+  node "$install_script"
 }
 
 if [ -n "${MEMMY_DESKTOP_VERSION:-}" ]; then
@@ -130,9 +159,13 @@ case "${MEMMY_ACCOUNT_CHANNEL:-phone}" in
     ;;
 esac
 
-FINAL_EXE="$DESKTOP_DIR/release/Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.exe"
+RELEASE_DIR="$DESKTOP_DIR/release"
+BUILD_OUTPUT_DIR="$(dirname "$ROOT_DIR")/.memmy-win-build-$PACKAGE_EDITION-$PACKAGE_SIGNING-$$"
+UNPACKED_DIR="$BUILD_OUTPUT_DIR/win-unpacked"
+FINAL_EXE="$RELEASE_DIR/Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.exe"
+BUILDER_FINAL_EXE="$BUILD_OUTPUT_DIR/Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.exe"
 ARTIFACT_NAME="Memmy-$DESKTOP_VERSION-win32-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING.\${ext}"
-package_log_init "win-$DESKTOP_VERSION-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING" "$DESKTOP_DIR/release/logs"
+package_log_init "win-$DESKTOP_VERSION-$PACKAGE_ARCH-$PACKAGE_EDITION-$PACKAGE_SIGNING" "$RELEASE_DIR/logs"
 package_install_error_trap
 package_log "Windows package context: version=$DESKTOP_VERSION arch=$PACKAGE_ARCH edition=$PACKAGE_EDITION signing=$PACKAGE_SIGNING installer=$FINAL_EXE"
 
@@ -249,6 +282,54 @@ if (!source.includes(original)) {
 }
 
 writeFileSync(templatePath, source.replace(original, replacement));
+NODE
+}
+
+patch_electron_builder_nsis_uninstaller_extraction() {
+  local target_path="$ROOT_DIR/node_modules/app-builder-lib/out/targets/nsis/NsisTarget.js"
+  local windows_target_path
+  windows_target_path="$(to_node_readable_path "$target_path")"
+
+  node - "$windows_target_path" <<'NODE'
+const { readFileSync, writeFileSync } = require("node:fs");
+
+const [targetPath] = process.argv.slice(2);
+const source = readFileSync(targetPath, "utf8");
+const eol = source.includes("\r\n") ? "\r\n" : "\n";
+const marker = "Memmy: extract the NSIS uninstaller before executing the unsigned installer";
+
+if (source.includes(marker)) {
+  process.exit(0);
+}
+
+const original = [
+  "        else {",
+  "            const wineVm = new WineVm_1.WineVmManager((_a = packager.config.toolsets) === null || _a === void 0 ? void 0 : _a.wine);",
+  "            await wineVm.exec(installerPath, [], { env: { __COMPAT_LAYER: \"RunAsInvoker\" } });",
+  "        }",
+].join(eol);
+const replacement = [
+  "        else if (isWin) {",
+  `            // ${marker}.`,
+  "            try {",
+  "                await nsisUtil_1.UninstallerReader.exec(installerPath, uninstallerPath);",
+  "            } catch (error) {",
+  "                builder_util_1.log.warn(`Unable to extract NSIS uninstaller without execution: ${error.message}`);",
+  "                const wineVm = new WineVm_1.WineVmManager((_a = packager.config.toolsets) === null || _a === void 0 ? void 0 : _a.wine);",
+  "                await wineVm.exec(installerPath, [], { env: { __COMPAT_LAYER: \"RunAsInvoker\" } });",
+  "            }",
+  "        }",
+  "        else {",
+  "            const wineVm = new WineVm_1.WineVmManager((_a = packager.config.toolsets) === null || _a === void 0 ? void 0 : _a.wine);",
+  "            await wineVm.exec(installerPath, [], { env: { __COMPAT_LAYER: \"RunAsInvoker\" } });",
+  "        }",
+].join(eol);
+
+if (!source.includes(original)) {
+  throw new Error(`Unable to find electron-builder NSIS uninstaller execution block in ${targetPath}`);
+}
+
+writeFileSync(targetPath, source.replace(original, replacement));
 NODE
 }
 
@@ -399,6 +480,95 @@ EOF
   exit 1
 }
 
+resolve_windows_signtool() {
+  local local_app_data="${LOCALAPPDATA:-}"
+  if [ -z "$local_app_data" ]; then
+    return 1
+  fi
+  if command -v cygpath >/dev/null 2>&1; then
+    local_app_data="$(cygpath -u "$local_app_data")"
+  fi
+  find "$local_app_data/electron-builder/Cache" \
+    -type f \
+    -path '*/windows-10/x64/signtool.exe' \
+    -print -quit 2>/dev/null
+}
+
+sign_builder_final_installer() {
+  local signtool_path
+  local csc_link="${WIN_CSC_LINK:-${CSC_LINK:-}}"
+  local csc_password="${WIN_CSC_KEY_PASSWORD:-${CSC_KEY_PASSWORD:-}}"
+  local csc_sha1="${WIN_CSC_SHA1:-${CSC_SHA1:-}}"
+  local csc_subject="${WIN_CSC_SUBJECT_NAME:-${CSC_SUBJECT_NAME:-}}"
+  local timestamp_server="${WIN_CSC_TIMESTAMP_SERVER:-${CSC_TIMESTAMP_SERVER:-http://timestamp.digicert.com}}"
+
+  signtool_path="$(resolve_windows_signtool || true)"
+  if [ -z "$signtool_path" ] || [ ! -f "$BUILDER_FINAL_EXE" ]; then
+    return 1
+  fi
+
+  if [ -n "$csc_link" ] && [ -n "$csc_password" ]; then
+    "$signtool_path" sign \
+      /tr "$timestamp_server" \
+      /f "$csc_link" \
+      /p "$csc_password" \
+      /fd sha256 \
+      /td sha256 \
+      /d Memmy \
+      "$BUILDER_FINAL_EXE"
+    return
+  fi
+
+  if [ -n "$csc_sha1" ]; then
+    "$signtool_path" sign \
+      /tr "$timestamp_server" \
+      /sha1 "$csc_sha1" \
+      /s My \
+      /fd sha256 \
+      /td sha256 \
+      /d Memmy \
+      "$BUILDER_FINAL_EXE"
+    return
+  fi
+
+  if [ -n "$csc_subject" ]; then
+    "$signtool_path" sign \
+      /tr "$timestamp_server" \
+      /n "$csc_subject" \
+      /s My \
+      /fd sha256 \
+      /td sha256 \
+      /d Memmy \
+      "$BUILDER_FINAL_EXE"
+    return
+  fi
+
+  return 1
+}
+
+run_electron_builder_with_signing_recovery() {
+  local attempt_log="$BUILD_OUTPUT_DIR/.electron-builder-attempt.log"
+  local builder_exit_code
+
+  if npx electron-builder "${BUILDER_ARGS[@]}" --win nsis --x64 "$@" --config.artifactName="$ARTIFACT_NAME" 2>&1 | tee "$attempt_log"; then
+    return 0
+  fi
+  builder_exit_code="${PIPESTATUS[0]}"
+
+  if [ "$PACKAGE_SIGNING" != "signed" ] ||
+    [ ! -f "$BUILDER_FINAL_EXE" ] ||
+    ! grep -Eiq '0x80090020|SignerSign\(\) failed|SignTool Error:.*unexpected internal|No certificates were found' "$attempt_log"; then
+    return "$builder_exit_code"
+  fi
+
+  log "electron-builder 在最终安装器签名阶段返回临时错误，准备直接重试最终安装器签名。"
+  if run_with_retries 3 sign_builder_final_installer; then
+    log "最终安装器已通过 signtool 重试签名，继续执行安装包验证。"
+    return 0
+  fi
+  return "$builder_exit_code"
+}
+
 verify_windows_x64_native_module() {
   local native_file="$1"
   local description="$2"
@@ -448,7 +618,9 @@ verify_windows_computer_use_surface() {
 
 verify_windows_better_sqlite3_runtime() {
   local runtime_dir="$1"
-  local electron_executable="$DESKTOP_DIR/node_modules/electron/dist/electron.exe"
+  local electron_dist
+  electron_dist="$(resolve_electron_dist)"
+  local electron_executable="$electron_dist/electron.exe"
   local node_runtime_dir
   node_runtime_dir="$(to_node_readable_path "$runtime_dir")"
 
@@ -613,24 +785,24 @@ verify_pruned_windows_runtime() {
 }
 
 verify_packaged_windows_unpacked_artifacts() {
-  local unpacked_runtime="$DESKTOP_DIR/release/win-unpacked/resources/app.asar.unpacked/dist/runtime"
-  local packaged_memory_runtime="$DESKTOP_DIR/release/win-unpacked/resources/memory-runtime"
+  local unpacked_runtime="$UNPACKED_DIR/resources/app.asar.unpacked/dist/runtime"
+  local packaged_memory_runtime="$UNPACKED_DIR/resources/memory-runtime"
   local packaged_agent_source_core="$packaged_memory_runtime/node_modules/@memmy/agent-source-core"
-  local packaged_embedding_model="$DESKTOP_DIR/release/win-unpacked/resources/embedding-models/$EMBEDDING_MODEL_ID"
+  local packaged_embedding_model="$UNPACKED_DIR/resources/embedding-models/$EMBEDDING_MODEL_ID"
 
-  require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/app.asar"
+  require_packaged_runtime_file "$UNPACKED_DIR/resources/app.asar"
   node "$ROOT_DIR/scripts/internal/shared/verify-browser-extension.mjs" \
     "$(to_node_readable_path "$DESKTOP_DIR/extensions/memmy-browser")" \
-    "$(to_node_readable_path "$DESKTOP_DIR/release/win-unpacked/resources/browser-extension")"
-  require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy-memory.cmd"
-  require_packaged_runtime_file "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy.cmd"
+    "$(to_node_readable_path "$UNPACKED_DIR/resources/browser-extension")"
+  require_packaged_runtime_file "$UNPACKED_DIR/resources/cli/memmy-memory.cmd"
+  require_packaged_runtime_file "$UNPACKED_DIR/resources/cli/memmy.cmd"
   require_packaged_runtime_file "$packaged_memory_runtime/dist/src/cli/index.js"
   if ! grep -Fq 'set "ENTRY=%RESOURCES_DIR%\memory-runtime\dist\src\cli\index.js"' \
-    "$DESKTOP_DIR/release/win-unpacked/resources/cli/memmy-memory.cmd"; then
+    "$UNPACKED_DIR/resources/cli/memmy-memory.cmd"; then
     echo "Packaged Memory CLI launcher points outside the external Memory runtime." >&2
     exit 1
   fi
-  verify_packaged_runtime_config_boundary "$DESKTOP_DIR/release/win-unpacked/resources"
+  verify_packaged_runtime_config_boundary "$UNPACKED_DIR/resources"
   require_packaged_runtime_file "$packaged_agent_source_core/package.json"
   require_packaged_runtime_file "$packaged_agent_source_core/dist/src/index.js"
   for manifest in package.json package-lock.json memory-runtime.json; do
@@ -674,10 +846,14 @@ verify_packaged_windows_unpacked_artifacts() {
   node "$ROOT_DIR/scripts/internal/win/verify-computer-history-runtime.mjs" \
     "$(to_node_readable_path "$unpacked_runtime/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe")" x64 \
     "$(to_node_readable_path "$ROOT_DIR/App/native-computer-history/apps/OpenComputerHistoryWindows/worker.ps1")"
-  verify_packaged_file_matches_runtime \
-    "$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe" \
-    "$unpacked_runtime/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe" \
-    "Windows 11 native History recorder"
+  if [ "$PACKAGE_SIGNING" = "unsigned" ]; then
+    verify_packaged_file_matches_runtime \
+      "$RUNTIME_DIR/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe" \
+      "$unpacked_runtime/memmy-agent/dist/native-computer-history/windows/amd64/memmy-computer-history.exe" \
+      "Windows 11 native History recorder"
+  else
+    log "Signed package: skipping byte-for-byte comparison for the Authenticode-signed Windows 11 History recorder."
+  fi
   require_packaged_runtime_file "$unpacked_runtime/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1"
   verify_packaged_file_matches_runtime \
     "$RUNTIME_DIR/memmy-agent/dist/tools/computer-history/win/win11-observer.ps1" \
@@ -769,12 +945,13 @@ fi
 package_step_start "Install root workspace dependencies if needed"
 if [ ! -d "$ROOT_DIR/node_modules" ]; then
   log "Installing root workspace dependencies"
-  npm_with_configured_script_shell install
+  npm_with_configured_script_shell install --ignore-scripts --package-lock=false --no-audit --no-fund
 else
   log "Root workspace dependencies already available"
 fi
+restore_electron_dist
 package_step_start "Install migrations workspace dev dependencies"
-npm_with_configured_script_shell install --workspace @memmy/migrations --include=dev
+npm_with_configured_script_shell install --workspace @memmy/migrations --include=dev --ignore-scripts --package-lock=false --no-audit --no-fund
 
 package_step_start "Build migrations package"
 npm_with_configured_script_shell run build --prefix "$MIGRATIONS_DIR"
@@ -783,7 +960,7 @@ package_step_start "Build local API contracts package"
 npm_with_configured_script_shell run build -w @memmy/local-api-contracts
 
 package_step_start "Install memmy-agent workspace dependencies"
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_with_configured_script_shell ci --prefix "$AGENT_DIR"
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_with_configured_script_shell ci --prefix "$AGENT_DIR" --ignore-scripts --no-audit --no-fund --os=win32 --cpu=x64
 
 package_step_start "Build Memory workspace"
 npm_with_configured_script_shell run build -w @memmy/memory
@@ -967,12 +1144,16 @@ cp -R "$EMBEDDING_MODELS_DIR" "$RUNTIME_DIR/memory/embedding-models"
 
 package_step_start "Patch electron-builder NSIS template"
 patch_electron_builder_nsis_refresh
+patch_electron_builder_nsis_uninstaller_extraction
 
 package_step_start "Run electron-builder Windows NSIS packaging"
 cd "$DESKTOP_DIR"
+mkdir -p "$BUILD_OUTPUT_DIR"
+log "Using isolated electron-builder output: $BUILD_OUTPUT_DIR"
 
 BUILDER_ARGS=(--config "$BUILDER_CONFIG")
 BUILDER_ARGS+=(--config.extraMetadata.version="$DESKTOP_VERSION")
+BUILDER_ARGS+=(--config.directories.output="$(to_node_readable_path "$BUILD_OUTPUT_DIR")")
 ELECTRON_DIST="$(resolve_electron_dist)"
 if [ -n "$ELECTRON_DIST" ]; then
   log "Using Electron dist: $ELECTRON_DIST"
@@ -982,13 +1163,20 @@ if [ "${#WINDOWS_SIGNING_BUILDER_ARGS[@]}" -gt 0 ]; then
   BUILDER_ARGS+=("${WINDOWS_SIGNING_BUILDER_ARGS[@]}")
 fi
 
-npx electron-builder "${BUILDER_ARGS[@]}" --win nsis --x64 "$@" --config.artifactName="$ARTIFACT_NAME"
+run_electron_builder_with_signing_recovery "$@"
 package_step_start "Verify packaged Windows app artifacts"
 verify_packaged_windows_unpacked_artifacts
 node "$ROOT_DIR/scripts/internal/win/verify-desktop-sqlite-vec.mjs" packaged \
   "$(to_node_readable_path "$ROOT_DIR/App/backend/package.json")" \
-  "$(to_node_readable_path "$DESKTOP_DIR/release/win-unpacked/resources/app.asar")" \
-  "$(to_node_readable_path "$DESKTOP_DIR/release/win-unpacked/resources")"
+  "$(to_node_readable_path "$UNPACKED_DIR/resources/app.asar")" \
+  "$(to_node_readable_path "$UNPACKED_DIR/resources")"
+
+package_step_start "Copy verified Windows installer to release output"
+if [ ! -f "$BUILDER_FINAL_EXE" ]; then
+  echo "Packaging completed without the isolated installer: $BUILDER_FINAL_EXE" >&2
+  exit 1
+fi
+run_with_retries 5 cp -f "$BUILDER_FINAL_EXE" "$FINAL_EXE"
 
 if [ ! -f "$FINAL_EXE" ]; then
   echo "Packaging completed without the expected installer: $FINAL_EXE" >&2
