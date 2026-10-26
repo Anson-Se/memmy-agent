@@ -93,15 +93,13 @@ describe("RecordingEntryPage", () => {
     const value = session();
     await render(value);
 
-    // 总结 starts a new task; 添加到会话 stays where the user is. Both send the
-    // same transcript, so the two must be distinguishable by more than a click.
-    const actions = [...container.querySelectorAll<HTMLButtonElement>(".recording-page__list-action")];
-    expect(actions.map((button) => button.textContent)).toEqual(["总结", "添加到会话"]);
-    await act(async () => actions[0]!.click());
-    await act(async () => actions[1]!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__list-action")!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__more-trigger")!.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>(".recording-page__more-menu button")]
+      .find((button) => button.textContent?.includes("总结"))!.click());
 
-    expect(value.deliver).toHaveBeenNthCalledWith(1, entry, "summarize");
-    expect(value.deliver).toHaveBeenNthCalledWith(2, entry, "attach");
+    expect(value.deliver).toHaveBeenNthCalledWith(1, entry, "attach");
+    expect(value.deliver).toHaveBeenNthCalledWith(2, entry, "summarize");
   });
 
   it("opens a row's transcript without leaving the page", async () => {

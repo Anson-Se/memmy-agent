@@ -50,6 +50,32 @@ function artifactChannel(data: string, workspace: string): {
 }
 
 describe("WebSocket media route", () => {
+  it("renews only default-workspace recordings without a chat session", async () => {
+    const data = tmpDataDir("ws-recording-resolve");
+    const workspace = path.join(data, "workspace");
+    const recordings = path.join(workspace, "recordings");
+    fs.mkdirSync(recordings, { recursive: true });
+    const audio = path.join(recordings, "interview.webm");
+    const outside = path.join(workspace, "private.webm");
+    fs.writeFileSync(audio, "audio");
+    fs.writeFileSync(outside, "private");
+    const channel = new WebSocketChannel({}, new MessageBus(), { workspacePath: workspace });
+    (channel as any).apiTokens.set("api-token", Date.now() / 1000 + 60);
+    const request = (pathValue: string, authenticated = true) => channel.handleWebuiRecordingResolve({
+      path: "/api/webui/recordings/resolve", method: "POST",
+      headers: authenticated ? { authorization: "Bearer api-token" } : {},
+      body: JSON.stringify({ path: pathValue })
+    });
+    expect(request(audio, false).status).toBe(401);
+    const resolved = request(audio);
+    expect(resolved.status).toBe(200);
+    const mediaUrl = JSON.parse(String(resolved.body)).media_url as string;
+    expect(mediaUrl).toMatch(/^\/api\/media\/ws\//);
+    const [sig, payload] = mediaUrl.slice("/api/media/ws/".length).split("/");
+    expect(channel.handleWorkspaceMediaFetch(sig!, payload!).status).toBe(200);
+    expect(request(outside).status).toBe(404);
+    expect(request(path.join(recordings, "missing.webm")).status).toBe(404);
+  });
   it("keeps media route root stable when users configure trailing slashes", () => {
     expect(normalizeConfigPath("/media/")).toBe("/media");
     expect(normalizeConfigPath("")).toBe("/");

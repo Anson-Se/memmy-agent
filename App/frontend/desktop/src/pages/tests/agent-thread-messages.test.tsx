@@ -82,7 +82,7 @@ describe("AgentThreadMessages", () => {
 
     expect(html).toContain("还有其他文件需要上传吗？");
     expect(html).toContain("已全部上传");
-    expect(html).toContain("已回答");
+    expect(html).toContain("向用户提问");
     expect(html).not.toContain("agent-chat-bubble--user");
     expect(html).not.toContain("memmy-question-response");
   });

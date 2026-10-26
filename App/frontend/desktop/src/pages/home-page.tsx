@@ -82,11 +82,11 @@ import {
 import { AgentAttachmentCard, splitAgentAttachmentName } from "./agent-file-attachment-chip.js";
 import { AgentGoalBar, type AgentGoalControlRequest } from "./agent-goal-bar.js";
 import { AgentQueuedMessageList, queuedComposerEditDecision } from "./agent-queued-message-list.js";
-import { AgentTaskPlanBar } from "./agent-task-plan-bar.js";
+import { useQuestionDockLayout } from "./use-question-dock-layout.js";
 import { agentOutputSignature, useStalledOutputShimmer } from "./agent-stall-shimmer.js";
 import { AgentThreadMessages, ChatImageLightbox } from "./agent-thread-messages.js";
 import {
-  pendingAgentQuestion, composerQuestionAnswer,
+  AgentQuestionActiveRequestContext, AgentQuestionCard, pendingAgentQuestion,
   type AgentQuestionCardPayload,
   type AgentQuestionResponse,
 } from "./agent-question-card.js";
@@ -1448,6 +1448,7 @@ export function HomePage() {
   const conversationPanelRef = useRef<HTMLElement | null>(null);
   const conversationContentRef = useRef<HTMLDivElement | null>(null);
   const composerOverlayRef = useRef<HTMLDivElement | null>(null);
+  const [questionDockTarget, setQuestionDockTarget] = useState<HTMLDivElement | null>(null);
   // The row the chat and the side preview share, so the preview can cap itself
   // to leave the chat visible instead of covering it.
   const [workspaceLayoutRef, workspaceLayoutWidth] = useSharedRowWidth<HTMLDivElement>();
@@ -1532,11 +1533,10 @@ export function HomePage() {
         }]);
       },
       ...((state.agent.currentSessionKey ?? state.agent.currentChatId) ? { sessionKey: state.agent.currentSessionKey ?? `websocket:${state.agent.currentChatId}` } : {}),
+      ...(clients ? { deleteFiles: (paths: string[]) => clients.memmyAgent.deleteRecordingFiles(paths) } : {}),
       resolveAudio: async (entry) => {
         if (!clients || !entry.audioPath) return entry.audioUrl;
-        const result = await clients.memmyAgent.resolveArtifact(entry.audioPath, entry.sessionKey
-          ?? state.agent.currentSessionKey ?? "");
-        return result.media_url ?? null;
+        return clients.memmyAgent.resolveRecording(entry.audioPath);
       }
     }
   );
@@ -1850,6 +1850,16 @@ export function HomePage() {
   // The same condition the sidebar spinner uses, so the thread and the
   // spinner never disagree about whether Memmy is working.
   const pendingQuestion = isCurrentAgentRunning ? pendingAgentQuestion(state.agent.messages, currentActiveTurnId) : null;
+  const pendingNativeQuestion = pendingQuestion && !pendingQuestion.context ? pendingQuestion : null;
+  useQuestionDockLayout({
+    panelRef: conversationPanelRef,
+    composerRef: composerOverlayRef,
+    questionDock: questionDockTarget,
+    pendingKey: pendingNativeQuestion ? `${chatScopeKey}:question:${pendingNativeQuestion.requestId}` : null,
+    scopeKey: chatScopeKey,
+    followingRef: shouldAutoScrollAgentConversationRef,
+    scrollToLatest: scrollAgentConversationToBottom,
+  });
   const isAgentWorking = isCurrentAgentRunning || isCurrentGoalActive;
   useStalledOutputShimmer(
     conversationContentRef,
@@ -2833,29 +2843,11 @@ export function HomePage() {
       })));
       return;
     }
-    if (pendingQuestion && input.trim() && !input.trimStart().startsWith("/")) {
-      const response = pendingAttachments.length ? null : composerQuestionAnswer(pendingQuestion, input);
-      if (!response) {
-        dispatch(agentActions.operationFailed("chat", createAgentOperationError({ source: "send", message: "home.question.useCard", chatId: state.agent.currentChatId ?? undefined })));
-        return;
-      }
-      if (messageSendLocksRef.current.has(chatScopeKey)) return;
-      const submitted = input;
-      messageSendLocksRef.current.add(chatScopeKey);
-      stageComposerForSend(chatScopeKey);
-      try {
-        const answered = await submitAgentQuestionResponse(pendingQuestion, response);
-        if (!answered) {
-          restoreComposerAfterFailedSend(chatScopeKey, submitted, [], null);
-          dispatch(agentActions.operationFailed("chat", createAgentOperationError({ source: "send", message: "home.question.submitFailed", chatId: state.agent.currentChatId ?? undefined })));
-        } else settleComposerAfterSend(chatScopeKey, []);
-      } finally { messageSendLocksRef.current.delete(chatScopeKey); }
-      return;
-    }
     const clientRequestId = crypto.randomUUID();
     const currentChatId = state.agent.currentChatId;
     if (
       currentChatId
+      && !pendingQuestion
       && Boolean(input.trim())
       && pendingAttachments.length === 0
       && !input.trimStart().startsWith("/")
@@ -4581,6 +4573,7 @@ export function HomePage() {
                   </span>
                 </div>
               )}
+              <AgentQuestionActiveRequestContext.Provider value={pendingNativeQuestion?.requestId ?? null}>
               <AgentThreadMessages
                 key={chatScopeKey}
                 chatScopeKey={chatScopeKey}
@@ -4598,7 +4591,9 @@ export function HomePage() {
                 onOpenActivityFile={openActivityFileInPanel}
                 memoryRuntimeClient={clients?.memoryRuntime ?? null}
                 onAnswerQuestion={answerAgentQuestion}
+                taskPlan={currentTaskPlan}
               />
+              </AgentQuestionActiveRequestContext.Provider>
               <PluginCapabilityHost
                 region="flow"
                 calls={visiblePluginCalls}
@@ -4720,6 +4715,11 @@ export function HomePage() {
                   onPress={invokePinnedPluginCommand}
                 />
                 <div className="agent-composer-stack">
+                  <div ref={setQuestionDockTarget} className="agent-question-dock">
+                    {pendingNativeQuestion ? <AgentQuestionCard key={pendingNativeQuestion.requestId}
+                      card={pendingNativeQuestion}
+                      onSubmit={(response) => answerAgentQuestion(pendingNativeQuestion, response)} /> : null}
+                  </div>
                   <AgentQueuedMessageList
                     items={currentQueuedMessages}
                     label={t("home.queue.label")}
@@ -4738,9 +4738,6 @@ export function HomePage() {
                     onEdit={(clientRequestId) => void editQueuedMessage(clientRequestId)}
                     onSteer={(clientRequestId) => void steerQueuedMessage(clientRequestId)}
                   />
-                  {currentTaskPlan ? (
-                    <AgentTaskPlanBar plan={currentTaskPlan} />
-                  ) : null}
                   {state.agent.currentChatId && currentGoal ? (
                     <AgentGoalBar
                       chatId={state.agent.currentChatId}

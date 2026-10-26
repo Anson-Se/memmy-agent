@@ -1,7 +1,15 @@
-import "./agent-question-card.css";
-import { useMemo, useState } from "react";
-import { Check, Loader2, PenLine, ChevronRight, X } from "lucide-react";
+import { createContext, useContext, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
+import { ArrowRight, Check, ChevronLeft, ChevronRight, Loader2, MessageCircleQuestionMark, PenLine, X } from "lucide-react";
 import { useTranslation } from "../i18n/use-translation.js";
+import "./agent-confirmation-dock.css";
+import "./agent-question-card.css";
+import { AgentWorkflowQuestionCard } from "./agent-workflow-question-card.js";
+
+/** Undefined keeps standalone cards interactive; chat history only owns the answer record. */
+export const AgentQuestionActiveRequestContext = createContext<string | null | undefined>(undefined);
+/** Undefined keeps standalone cards inline; null waits for the chat dock to mount. */
+export const AgentQuestionDockContext = createContext<HTMLElement | null | undefined>(undefined);
 
 export type AgentQuestionOption = {
   id: string;
@@ -47,6 +55,13 @@ function nonemptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function questionWaitingLabel(title: string | null | undefined, english = false): string {
+  const value = title?.trim();
+  if (!value) return english ? "Waiting for your answer" : "等待用户回答";
+  if (english) return /^Wait(?:ing)?\b/iu.test(value) ? value : `Waiting for ${value}`;
+  return /^(?:等待|待)/u.test(value) ? value : `等待${value}`;
+}
+
 export function readAgentQuestionCard(value: unknown): AgentQuestionCardPayload | null {
   if (!isRecord(value)) return null;
   const raw = isRecord(value.questionCard) ? value.questionCard : null;
@@ -88,23 +103,6 @@ export function readAgentQuestionCard(value: unknown): AgentQuestionCardPayload 
   };
 }
 
-/** Only an unanswered card belonging to the active turn can receive composer text. */
-export function pendingAgentQuestion(messages: Array<{ agentUi?: unknown; questionResponse?: unknown; turnId?: string }>, activeTurnId: string | null): AgentQuestionCardPayload | null {
-  if (!activeTurnId) return null;
-  for (const message of [...messages].reverse()) {
-    if (message.turnId !== activeTurnId || message.questionResponse) continue;
-    const card = readAgentQuestionCard(message.agentUi);
-    if (card) return card;
-  }
-  return null;
-}
-
-export function composerQuestionAnswer(card: AgentQuestionCardPayload, content: string): AgentQuestionResponse | null {
-  const question = card.questions[0];
-  if (card.questions.length !== 1 || !question?.allowOther || !content.trim() || content.trimStart().startsWith("/")) return null;
-  return { requestId: card.requestId, answers: [{ questionId: question.id, selectedOptionIds: [], otherText: content.trim() }] };
-}
-
 export function serializeAgentQuestionResponse(
   card: AgentQuestionCardPayload,
   response: AgentQuestionResponse,
@@ -115,7 +113,7 @@ export function serializeAgentQuestionResponse(
       .map((id) => question.options.find((option) => option.id === id)?.label)
       .filter((label): label is string => Boolean(label));
     if (answer?.otherText?.trim()) selectedLabels.push(answer.otherText.trim());
-    return `${question.prompt}：${selectedLabels.join("、")}`;
+    return `${question.prompt}：${selectedLabels.join("、") || "(skipped)"}`;
   });
   const displayContent = lines.join("\n");
   const encoded = encodeURIComponent(JSON.stringify(response));
@@ -157,105 +155,129 @@ export function visibleAgentQuestionResponseContent(content: string): string {
   return content.replace(QUESTION_RESPONSE_RE, "").trimEnd();
 }
 
+type AgentQuestionMessage = { agentUi?: unknown; questionResponse?: unknown; questionInterrupted?: boolean; turnId?: string; role: string; content: string };
+
+export function pendingAgentQuestion(messages: ReadonlyArray<AgentQuestionMessage>, activeTurnId: string | null): AgentQuestionCardPayload | null {
+  if (!activeTurnId) return null;
+  const answered = new Set(messages.flatMap((message) => {
+    const response = normalizeAgentQuestionResponse(message.questionResponse)
+      ?? (message.role === "user" ? readAgentQuestionResponse(message.content) : null);
+    return response ? [response.requestId] : [];
+  }));
+  for (const message of [...messages].reverse()) {
+    if (message.turnId !== activeTurnId) continue;
+    const card = readAgentQuestionCard(message.agentUi);
+    if (card && !message.questionInterrupted && !answered.has(card.requestId)) return card;
+  }
+  return null;
+}
+
+export function hasPendingAgentQuestion(messages: ReadonlyArray<AgentQuestionMessage>, activeTurnId: string | null): boolean {
+  return pendingAgentQuestion(messages, activeTurnId) !== null;
+}
+
+export function composerQuestionAnswer(card: AgentQuestionCardPayload, content: string): AgentQuestionResponse | null {
+  const question = card.questions[0];
+  if (card.questions.length !== 1 || !question?.allowOther || !content.trim() || content.trimStart().startsWith("/")) return null;
+  return { requestId: card.requestId, answers: [{ questionId: question.id, selectedOptionIds: [], otherText: content.trim() }] };
+}
+
 type DraftAnswer = {
   selectedOptionIds: string[];
   otherSelected: boolean;
   otherText: string;
+  skipped: boolean;
 };
 
 function initialDraft(card: AgentQuestionCardPayload): Record<string, DraftAnswer> {
   return Object.fromEntries(card.questions.map((question) => [
     question.id,
-    { selectedOptionIds: [], otherSelected: false, otherText: "" },
+    { selectedOptionIds: [], otherSelected: false, otherText: "", skipped: false },
   ]));
 }
 
-function responseLabel(question: AgentQuestion, answer: AgentQuestionAnswer | undefined): string {
+function hasAnswer(answer: DraftAnswer | undefined): boolean {
+  return Boolean(
+    answer?.skipped
+    || answer?.selectedOptionIds.length
+    || (answer?.otherSelected && answer.otherText.trim()),
+  );
+}
+
+function responseFromDraft(card: AgentQuestionCardPayload, draft: Record<string, DraftAnswer>): AgentQuestionResponse {
+  return {
+    requestId: card.requestId,
+    answers: card.questions.map((question) => {
+      const answer = draft[question.id];
+      return {
+        questionId: question.id,
+        selectedOptionIds: answer?.skipped ? [] : (answer?.selectedOptionIds ?? []),
+        ...(!answer?.skipped && answer?.otherSelected && answer.otherText.trim()
+          ? { otherText: answer.otherText.trim() } : {}),
+      };
+    }),
+  };
+}
+
+function responseLabel(question: AgentQuestion, answer: AgentQuestionAnswer | undefined, unansweredLabel: string): string {
   const labels = (answer?.selectedOptionIds ?? [])
     .map((id) => question.options.find((option) => option.id === id)?.label)
     .filter((label): label is string => Boolean(label));
   if (answer?.otherText) labels.push(answer.otherText);
-  return labels.join("、");
+  return labels.join("、") || unansweredLabel;
 }
 
 export function AgentQuestionCard(props: {
   card: AgentQuestionCardPayload;
   response?: AgentQuestionResponse | null;
+  processView?: boolean;
+  interrupted?: boolean;
   onSubmit?: (response: AgentQuestionResponse) => Promise<boolean> | boolean;
 }) {
-  const { t } = useTranslation();
+  if (props.card.context?.workflow && !props.processView) {
+    return <AgentWorkflowQuestionCard card={props.card} response={props.response} onSubmit={props.onSubmit} />;
+  }
+  return <AgentNativeQuestionCard {...props} />;
+}
+
+function AgentNativeQuestionCard(props: {
+  card: AgentQuestionCardPayload;
+  response?: AgentQuestionResponse | null;
+  processView?: boolean;
+  interrupted?: boolean;
+  onSubmit?: (response: AgentQuestionResponse) => Promise<boolean> | boolean;
+}) {
+  const { t, language } = useTranslation();
+  const dock = useContext(AgentQuestionDockContext);
+  const activeRequestId = useContext(AgentQuestionActiveRequestContext);
   const [draft, setDraft] = useState(() => initialDraft(props.card));
   const [submitting, setSubmitting] = useState(false);
   const [submitFailed, setSubmitFailed] = useState(false);
   const [submittedResponse, setSubmittedResponse] = useState<AgentQuestionResponse | null>(null);
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+  const [answerExpanded, setAnswerExpanded] = useState(() => props.processView === true);
   const persistedResponse = props.response?.requestId === props.card.requestId ? props.response : null;
   const completedResponse = persistedResponse ?? submittedResponse;
   const answered = completedResponse != null;
+  const processRecordLabel = props.card.title ?? t("home.question.asked");
   const canSubmit = useMemo(
-    () => props.card.questions.every((question) => {
-      const answer = draft[question.id];
-      return Boolean(
-        answer?.selectedOptionIds.length
-        || (answer?.otherSelected && answer.otherText.trim()),
-      );
-    }),
+    () => props.card.questions.every((question) => hasAnswer(draft[question.id])),
     [draft, props.card.questions],
   );
+  const questionIndex = Math.min(activeQuestionIndex, props.card.questions.length - 1);
+  const activeQuestion = props.card.questions[questionIndex]!;
+  const activeDraft = draft[activeQuestion.id]!;
+  const isLastQuestion = questionIndex === props.card.questions.length - 1;
+  const selectedCount = activeDraft.selectedOptionIds.length
+    + (activeDraft.otherSelected && activeDraft.otherText.trim() ? 1 : 0);
+  const currentAnswered = hasAnswer(activeDraft);
 
-  const toggleOption = (question: AgentQuestion, optionId: string) => {
-    if (answered || submitting) return;
-    setSubmitFailed(false);
-    setDraft((current) => {
-      const previous = current[question.id] ?? { selectedOptionIds: [], otherSelected: false, otherText: "" };
-      const selectedOptionIds = question.allowMultiple
-        ? previous.selectedOptionIds.includes(optionId)
-          ? previous.selectedOptionIds.filter((id) => id !== optionId)
-          : [...previous.selectedOptionIds, optionId]
-        : [optionId];
-      return {
-        ...current,
-        [question.id]: {
-          ...previous,
-          selectedOptionIds,
-          ...(!question.allowMultiple ? { otherSelected: false, otherText: "" } : {}),
-        },
-      };
-    });
-  };
-
-  const toggleOther = (question: AgentQuestion) => {
-    if (answered || submitting) return;
-    setSubmitFailed(false);
-    setDraft((current) => {
-      const previous = current[question.id] ?? { selectedOptionIds: [], otherSelected: false, otherText: "" };
-      const otherSelected = !previous.otherSelected;
-      return {
-        ...current,
-        [question.id]: {
-          ...previous,
-          otherSelected,
-          ...(!question.allowMultiple && otherSelected ? { selectedOptionIds: [] } : {}),
-        },
-      };
-    });
-  };
-
-  const submit = async () => {
-    if (!canSubmit || !props.onSubmit || answered || submitting) return;
+  const submitDraft = async (nextDraft: Record<string, DraftAnswer>) => {
+    if (!props.onSubmit || answered || submitting) return;
     setSubmitting(true);
     setSubmitFailed(false);
-    const response: AgentQuestionResponse = {
-      requestId: props.card.requestId,
-      answers: props.card.questions.map((question) => {
-        const answer = draft[question.id]!;
-        return {
-          questionId: question.id,
-          selectedOptionIds: answer.selectedOptionIds,
-          ...(answer.otherSelected && answer.otherText.trim() ? { otherText: answer.otherText.trim() } : {}),
-        };
-      }),
-    };
     try {
+      const response = responseFromDraft(props.card, nextDraft);
       if (await props.onSubmit(response)) setSubmittedResponse(response);
       else setSubmitFailed(true);
     } catch {
@@ -265,149 +287,194 @@ export function AgentQuestionCard(props: {
     }
   };
 
-  if (Boolean(completedResponse)) return (
-    <details className="agent-question-summary" data-workflow={props.card.context?.workflow}>
-      <summary>{props.card.title ?? t("home.question.title")} · {t(completedResponse?.cancelled ? "home.question.cancelled" : "home.question.answered")}</summary>
-      <div className="agent-question-summary__body">{completedResponse?.cancelled ? <p>{t("home.question.cancelled")}</p> : props.card.questions.map((question) => (
-        <div key={question.id}><p>{question.prompt}</p><p>{responseLabel(question, completedResponse!.answers.find((answer) => answer.questionId === question.id))}</p></div>
-      ))}</div>
-    </details>
-  );
+  const advanceOrSubmit = (nextDraft: Record<string, DraftAnswer>) => {
+    if (!isLastQuestion) {
+      setActiveQuestionIndex(questionIndex + 1);
+      return;
+    }
+    const firstUnanswered = props.card.questions.findIndex((question) => !hasAnswer(nextDraft[question.id]));
+    if (firstUnanswered >= 0) setActiveQuestionIndex(firstUnanswered);
+    else void submitDraft(nextDraft);
+  };
 
-  return (
-    <section data-workflow={props.card.context?.workflow} className="agent-question-card overflow-hidden rounded-card border border-border-stone/50 bg-background-paper shadow-sm" aria-label={props.card.title ?? t("home.question.title")}>
-      <div className="flex items-center justify-between gap-3 border-b border-border-stone/40 px-4 py-2.5">
-        <span className="text-sm font-semibold text-text-ink">{props.card.title ?? t("home.question.title")}</span>
-        <span className="shrink-0 text-xs text-text-ink/40">
-          {t("home.question.count", { count: props.card.questions.length })}
+  const toggleOption = (question: AgentQuestion, optionId: string) => {
+    if (answered || submitting) return;
+    setSubmitFailed(false);
+    const previous = draft[question.id] ?? { selectedOptionIds: [], otherSelected: false, otherText: "", skipped: false };
+    const selectedOptionIds = question.allowMultiple
+      ? previous.selectedOptionIds.includes(optionId)
+        ? previous.selectedOptionIds.filter((id) => id !== optionId)
+        : [...previous.selectedOptionIds, optionId]
+      : [optionId];
+    const nextDraft = {
+      ...draft,
+      [question.id]: {
+        ...previous,
+        skipped: false,
+        selectedOptionIds,
+        ...(!question.allowMultiple ? { otherSelected: false, otherText: "" } : {}),
+      },
+    };
+    setDraft(nextDraft);
+    if (!question.allowMultiple) advanceOrSubmit(nextDraft);
+  };
+
+  const activateOther = (question: AgentQuestion) => {
+    if (answered || submitting) return;
+    setSubmitFailed(false);
+    setDraft((current) => {
+      const previous = current[question.id] ?? { selectedOptionIds: [], otherSelected: false, otherText: "", skipped: false };
+      return {
+        ...current,
+        [question.id]: {
+          ...previous,
+          skipped: false,
+          otherSelected: true,
+          ...(!question.allowMultiple ? { selectedOptionIds: [] } : {}),
+        },
+      };
+    });
+  };
+
+  const skipQuestion = (questionId: string) => {
+    if (answered || submitting) return;
+    setSubmitFailed(false);
+    const nextDraft = {
+      ...draft,
+      [questionId]: { selectedOptionIds: [], otherSelected: false, otherText: "", skipped: true },
+    };
+    setDraft(nextDraft);
+    advanceOrSubmit(nextDraft);
+  };
+
+  const closeQuestionCard = () => {
+    if (answered || submitting) return;
+    const skippedDraft = Object.fromEntries(props.card.questions.map((question) => [
+      question.id,
+      { selectedOptionIds: [], otherSelected: false, otherText: "", skipped: true },
+    ]));
+    void submitDraft(skippedDraft);
+  };
+
+  if (props.interrupted || completedResponse?.cancelled || (!answered && props.processView && activeRequestId !== undefined && activeRequestId !== props.card.requestId)) {
+    return <div className="agent-question-answer agent-question-answer--interrupted">
+      <MessageCircleQuestionMark size={14} aria-hidden="true" />
+      <span>{props.processView ? processRecordLabel : t("home.question.asked")}</span>
+    </div>;
+  }
+
+  if (answered) {
+    const hasRecordedAnswer = completedResponse.answers.some((answer) => answer.selectedOptionIds.length > 0 || Boolean(answer.otherText?.trim()));
+    return <details className={`agent-question-answer${props.processView ? " agent-question-answer--process" : ""}`}
+      open={answerExpanded} onToggle={(event) => setAnswerExpanded(event.currentTarget.open)}>
+      <summary>{props.processView ? <MessageCircleQuestionMark size={14} aria-hidden="true" /> : <Check size={14} aria-hidden="true" />}<span>{props.processView
+        ? processRecordLabel
+        : t(hasRecordedAnswer ? "home.question.responseReceived" : "home.question.unanswered")}</span><ChevronRight size={13} aria-hidden="true" /></summary>
+      <dl className="agent-question-answer__details">{props.card.questions.map((question) => <div key={question.id}><dt>{question.prompt}</dt><dd>{responseLabel(question, completedResponse.answers.find((answer) => answer.questionId === question.id), t("home.question.unanswered"))}</dd></div>)}</dl>
+    </details>;
+  }
+
+  if (!answered && props.processView && activeRequestId === props.card.requestId) {
+    return <div className="agent-question-answer agent-question-answer--review" data-waiting-input-anchor={props.card.requestId}>
+      <MessageCircleQuestionMark size={14} aria-hidden="true" />
+      <span>{questionWaitingLabel(props.card.title, language === "en-US")}</span>
+    </div>;
+  }
+  const card = (
+    <section
+      className="agent-confirmation-card agent-question-card"
+      aria-label={props.card.title ?? t("home.question.title")}
+    >
+      <div className="agent-confirmation-card__header agent-question-card__header">
+        <span className="agent-question-card__prompt">
+          {activeQuestion.prompt}
         </span>
-        <button type="button" aria-label={t("plugin.ui.dismissCard")} disabled={submitting || !props.onSubmit} onClick={() => {
-          if (!props.onSubmit || submitting) return;
-          const response: AgentQuestionResponse = { requestId: props.card.requestId, answers: [], cancelled: true };
-          setSubmitting(true); setSubmitFailed(false);
-          Promise.resolve().then(() => props.onSubmit!(response)).then((ok) => { if (ok) setSubmittedResponse(response); else setSubmitFailed(true); }, () => setSubmitFailed(true)).finally(() => setSubmitting(false));
-        }}><X size={16} aria-hidden="true" /></button>
-      </div>
-      <div className="flex flex-col">
-        {props.card.questions.map((question, questionIndex) => {
-          const draftAnswer = draft[question.id]!;
-          const savedAnswer = completedResponse?.answers.find((answer) => answer.questionId === question.id);
-          // The rule between questions is drawn by index rather than with
-          // `last:border-b-0`: the precompiled utility bundle carries no such
-          // variant, so a class that reads as valid would do nothing and leave
-          // a stray line above the footer.
-          const separators = questionIndex > 0 ? " border-t border-border-stone/40" : "";
-          return (
-            <div
-              key={question.id}
-              role="group"
-              aria-label={question.prompt}
-              className={`pb-3 pt-3${separators}`}
-            >
-              {/*
-                Plain elements rather than a `fieldset`/`legend`: a legend is
-                lifted into the fieldset's border box, which notches the rule
-                above the question where the two meet.
-              */}
-              <div className="px-4 text-sm font-medium leading-relaxed text-text-ink">{question.prompt}</div>
-              {answered ? (
-                <div className="flex items-center gap-2 px-4 py-3 text-sm text-text-ink">
-                  <Check size={15} className="shrink-0 text-action-sky" aria-hidden="true" />
-                  <span>{responseLabel(question, savedAnswer)}</span>
-                </div>
-              ) : (
-                // The list is inset past the prompt, so the option hairlines
-                // stop short of the card edge the way the design draws them.
-                <div className="mt-2 flex flex-col px-3">
-                  {/*
-                    Every option is a full-width row rather than a chip: the
-                    design reads as a list the user scans top to bottom, and a
-                    long label keeps its own line instead of wrapping a chip
-                    into a ragged block.
-                  */}
-                  {question.options.map((option, index) => {
-                    const selected = draftAnswer.selectedOptionIds.includes(option.id);
-                    return (
-                      <button
-                        key={option.id}
-                        type="button"
-                        disabled={submitting}
-                        aria-pressed={selected}
-                        title={option.description}
-                        onClick={() => toggleOption(question, option.id)}
-                        className={`flex w-full items-center gap-2.5 border-b border-border-stone/30 px-2 py-2.5 text-left transition-colors disabled:cursor-not-allowed ${
-                          selected ? "bg-action-sky/15 text-text-ink" : "text-text-ink/80 hover:bg-canvas-oat/50"
-                        }`}
-                      >
-                        <span
-                          aria-hidden="true"
-                          className={`agent-question-card__index ${
-                            selected ? "bg-action-sky text-white" : "bg-canvas-oat text-text-ink/60"
-                          }`}
-                        >
-                          {index + 1}
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-sm">{option.label}</span>
-                          {option.description ? <span className="mt-0.5 block text-xs text-text-ink/50">{option.description}</span> : null}
-                        </span>
-                        {selected ? <Check size={15} className="shrink-0 text-action-sky" aria-hidden="true" /> : <ChevronRight size={15} className="shrink-0 text-text-ink/40" aria-hidden="true" />}
-                      </button>
-                    );
-                  })}
-                  {question.allowOther ? (
-                    <button
-                      type="button"
-                      disabled={submitting}
-                      aria-pressed={draftAnswer.otherSelected}
-                      onClick={() => toggleOther(question)}
-                      className={`flex w-full items-center gap-2.5 px-2 py-2.5 text-left text-sm transition-colors disabled:cursor-not-allowed ${
-                        draftAnswer.otherSelected ? "bg-action-sky/8 text-text-ink" : "text-text-ink/40 hover:bg-canvas-oat/50"
-                      }`}
-                    >
-                      <PenLine size={15} className="shrink-0" aria-hidden="true" />
-                      <span className="min-w-0 flex-1">{t("home.question.other")}</span>
-                    </button>
-                  ) : null}
-                  {draftAnswer.otherSelected ? (
-                    <div className="px-2 pb-1">
-                      <textarea
-                        value={draftAnswer.otherText}
-                        disabled={submitting}
-                        onChange={(event) => setDraft((current) => ({
-                          ...current,
-                          [question.id]: { ...current[question.id]!, otherText: event.target.value },
-                        }))}
-                        placeholder={t("home.question.otherPlaceholder")}
-                        rows={2}
-                        className="w-full resize-none rounded-input border border-border-stone/50 bg-background-paper px-3 py-2 text-sm text-text-ink outline-none transition focus:border-action-sky focus:ring-2 focus:ring-action-sky/20"
-                      />
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-      {!answered ? (
-        <div className="flex items-center justify-end gap-3 border-t border-border-stone/40 px-4 py-2.5">
-          {submitFailed ? <span className="text-xs text-status-error">{t("home.question.submitFailed")}</span> : null}
-          <button
-            type="button"
-            disabled={!canSubmit || !props.onSubmit || submitting}
-            onClick={() => void submit()}
-            className="inline-flex h-8 items-center justify-center gap-2 rounded-btn bg-action-sky px-4 text-sm font-semibold text-white transition-colors hover:bg-action-sky-hover disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {submitting ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : null}
-            {submitting ? t("home.question.submitting") : props.card.context?.workflow === "literature-review" ? t("common.confirm") : t("home.question.submit")}
+        <div className="agent-question-card__header-actions">
+          <nav className="agent-question-card__pagination" aria-label={t("home.question.count", { count: props.card.questions.length })}>
+            <button type="button" disabled={questionIndex === 0 || submitting}
+              aria-label={t("home.question.previous")}
+              onClick={() => setActiveQuestionIndex((index) => Math.max(0, index - 1))}>
+              <ChevronLeft size={16} aria-hidden="true" />
+            </button>
+            <span aria-live="polite">{questionIndex + 1}/{props.card.questions.length}</span>
+            <button type="button" disabled={isLastQuestion || submitting}
+              aria-label={t("home.question.next")}
+              onClick={() => setActiveQuestionIndex((index) => Math.min(props.card.questions.length - 1, index + 1))}>
+              <ChevronRight size={16} aria-hidden="true" />
+            </button>
+          </nav>
+          <button type="button" className="agent-question-card__close" disabled={submitting}
+            aria-label={t("home.question.close")}
+            title={t("home.question.close")}
+            onClick={closeQuestionCard}>
+            <X size={18} aria-hidden="true" />
           </button>
         </div>
-      ) : (
-        <div className="border-t border-border-stone/40 px-4 py-3 text-xs text-text-ink/45">
-          {persistedResponse ? t("home.question.answered") : t("home.question.submitted")}
-        </div>
-      )}
+      </div>
+      <div className="agent-confirmation-card__body agent-question-card__body"
+          role="group" aria-label={activeQuestion.prompt} key={activeQuestion.id}>
+          <div className="agent-question-card__options">
+            {activeQuestion.options.map((option, index) => {
+              const selected = activeDraft.selectedOptionIds.includes(option.id);
+              return (
+                <button key={option.id} type="button" disabled={submitting}
+                  aria-pressed={selected} title={option.description}
+                  data-multiple={activeQuestion.allowMultiple}
+                  onClick={() => toggleOption(activeQuestion, option.id)}
+                  className={"agent-question-card__option" + (selected ? " agent-question-card__option--selected" : "")}>
+                  <span className={"agent-question-card__choice" + (activeQuestion.allowMultiple ? " agent-question-card__choice--multiple" : "")} aria-hidden="true">
+                    {activeQuestion.allowMultiple ? (selected ? <Check size={12} /> : null) : index + 1}
+                  </span>
+                  <span className="agent-question-card__option-copy">
+                    <span>{option.label}</span>
+                  </span>
+                  {!activeQuestion.allowMultiple ? <ArrowRight size={17} className="agent-question-card__option-arrow" aria-hidden="true" /> : null}
+                </button>
+              );
+            })}
+            {activeQuestion.allowOther ? (
+              <div className="agent-question-card__other">
+                <span className="agent-question-card__other-icon" aria-hidden="true">
+                  <PenLine size={14} aria-hidden="true" />
+                </span>
+                <input type="text" disabled={submitting}
+                  value={activeDraft.otherText}
+                  onFocus={() => activateOther(activeQuestion)}
+                  onChange={(event) => setDraft((current) => ({
+                    ...current,
+                    [activeQuestion.id]: {
+                      ...current[activeQuestion.id]!,
+                      otherText: event.target.value,
+                      otherSelected: true,
+                      skipped: false,
+                    },
+                  }))}
+                  placeholder={t("home.question.other")}
+                  aria-label={t("home.question.otherPlaceholder")}
+                />
+              </div>
+            ) : null}
+          </div>
+      </div>
+      <div className="agent-confirmation-card__footer agent-question-card__footer">
+          {activeQuestion.allowMultiple && selectedCount > 0 ? (
+            <span className="agent-question-card__selection">{t("home.question.selectedCount", { count: selectedCount })}</span>
+          ) : <span className="agent-question-card__selection" />}
+          {submitFailed ? <span className="agent-question-card__error">{t("home.question.submitFailed")}</span> : null}
+          <button type="button" className="agent-question-card__skip" disabled={submitting}
+            onClick={() => skipQuestion(activeQuestion.id)}>
+            {t("home.question.skip")}
+          </button>
+          {currentAnswered && (activeQuestion.allowMultiple || activeDraft.otherSelected) ? (
+            <button type="button" className="agent-question-card__continue"
+              disabled={submitting || !props.onSubmit || !currentAnswered}
+              onClick={() => advanceOrSubmit(draft)}>
+              {submitting ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : null}
+              {t(isLastQuestion && canSubmit ? "home.question.confirm" : "home.question.next")}
+            </button>
+          ) : null}
+      </div>
     </section>
   );
+  return dock === undefined ? card : dock ? createPortal(card, dock, props.card.requestId) : null;
 }

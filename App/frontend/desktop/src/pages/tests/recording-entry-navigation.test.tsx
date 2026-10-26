@@ -183,7 +183,8 @@ describe("independent interview recording entries", () => {
     await click('.recording-entry-card .recording-bar__button--primary');
     await click('.recording-entry-card .recording-bar__button--primary');
     await act(async () => current.session.back());
-    await click('.recording-page__rename-trigger');
+    await click('.recording-page__more-trigger');
+    await click('.recording-page__more-menu button:has(.lucide-pencil)');
     const field = container.querySelector<HTMLInputElement>('.recording-page__rename input')!;
     await act(async () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(field, "企业现场访谈");
