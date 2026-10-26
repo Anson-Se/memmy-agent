@@ -45,6 +45,10 @@ interface AgentMessageContentProps {
 }
 
 const TRAILING_PUNCTUATION_RE = /[.,;:!?，。；：！？)）\]]+$/;
+// Match through adjacent punctuation, then split it back out before rendering the file chip.
+// Bare prose stays absolute-only because relative paths are ambiguous outside inline code.
+const BARE_LOCAL_PATH_RE = /(^|[\s([{（【:：])((?:~\/|\/|[A-Za-z]:[\\/])[^\s<>"'`]+)/gu;
+const APP_RELATIVE_URL_PATH_RE = /^\/(?:api|assets|static)(?:\/|$)/i;
 const LONG_TEXT_WRAP_CLASS = "break-words [overflow-wrap:anywhere]";
 const LIST_ITEM_BLOCK_TAGS = new Set(["p", "pre", "blockquote", "table", "ul", "ol", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "div"]);
 
@@ -201,15 +205,19 @@ export const AgentMessageContent = memo(function AgentMessageContent(props: Agen
       const language = /language-([A-Za-z0-9_+-]+)/.exec(className ?? "")?.[1] ?? null;
       const isInline = !language && !raw.includes("\n");
       if (isInline) {
+        const localPath = cleanPathToken(code);
+        if (isLikelyLocalFilePath(localPath)) {
+          return <FileReferenceChip path={localPath} label={localPath} isStreaming={props.isStreaming} artifactClient={props.artifactClient} onPreviewFile={props.onPreviewFile} />;
+        }
         return <code className={`agent-message-content__inline-code ${INLINE_CODE_WRAP_CLASS}`}>{code}</code>;
       }
       return <CodeBlock code={code} language={language} highlight={!props.isStreaming} />;
     },
     p({ children }) {
-      return <p className={`agent-message-content__p ${LONG_TEXT_WRAP_CLASS}`}>{children}</p>;
+      return <p className={`agent-message-content__p ${LONG_TEXT_WRAP_CLASS}`}>{withBareLocalFileReferences(children, props)}</p>;
     },
     li({ children, className }) {
-      return <li className={className}>{withListItemLead(children)}</li>;
+      return <li className={className}>{withListItemLead(withBareLocalFileReferences(children, props))}</li>;
     },
     ul({ children }) {
       return <ul className={`agent-message-content__list agent-message-content__list--unordered ${LONG_TEXT_WRAP_CLASS}`}>{children}</ul>;
@@ -233,10 +241,10 @@ export const AgentMessageContent = memo(function AgentMessageContent(props: Agen
       );
     },
     th({ children, style }) {
-      return <th className={`agent-message-content__th ${LONG_TEXT_WRAP_CLASS}`} style={style}>{children}</th>;
+      return <th className={`agent-message-content__th ${LONG_TEXT_WRAP_CLASS}`} style={style}>{withBareLocalFileReferences(children, props)}</th>;
     },
     td({ children, style }) {
-      return <td className={`agent-message-content__td ${LONG_TEXT_WRAP_CLASS}`} style={style}>{children}</td>;
+      return <td className={`agent-message-content__td ${LONG_TEXT_WRAP_CLASS}`} style={style}>{withBareLocalFileReferences(children, props)}</td>;
     }
   }), [props.artifactClient, props.isStreaming, props.onPreviewFile]);
 
@@ -965,10 +973,55 @@ export function localArtifactPathFromHref(href: string | undefined): string | nu
 }
 
 function isLikelyLocalPath(value: string): boolean {
-  if (!value || isDirectMediaUrl(value) || /^[a-z][a-z0-9+.-]*:/i.test(value)) {
-    return false;
-  }
+  if (!value || isDirectMediaUrl(value) || APP_RELATIVE_URL_PATH_RE.test(value)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return false;
   return value.includes("/") && (value.startsWith("/") || value.startsWith("~/") || /^[A-Za-z0-9_.@+-]+\//.test(value));
+}
+
+function parseLocalFileToken(rawPath: string): { path: string; suffix: string } | null {
+  const path = cleanPathToken(rawPath);
+  if (!isLikelyLocalFilePath(path)) return null;
+  return { path, suffix: rawPath.slice(path.length) };
+}
+
+function withBareLocalFileReferences(children: ReactNode, props: AgentMessageContentProps): ReactNode {
+  return Children.map(children, (child, childIndex) => {
+    if (typeof child !== "string") return child;
+    const nodes: ReactNode[] = [];
+    let cursor = 0;
+    let pathIndex = 0;
+    for (const match of child.matchAll(BARE_LOCAL_PATH_RE)) {
+      const rawPath = match[2] ?? "";
+      const parsed = parseLocalFileToken(rawPath);
+      if (!parsed) continue;
+      const start = (match.index ?? 0) + (match[1]?.length ?? 0);
+      if (start > cursor) nodes.push(child.slice(cursor, start));
+      nodes.push(
+        <FileReferenceChip
+          key={`bare-local-file-${childIndex}-${pathIndex}`}
+          path={parsed.path}
+          label={parsed.path}
+          isStreaming={props.isStreaming}
+          artifactClient={props.artifactClient}
+          onPreviewFile={props.onPreviewFile}
+        />
+      );
+      pathIndex += 1;
+      const matchEnd = start + rawPath.length;
+      if (parsed.suffix) nodes.push(parsed.suffix);
+      cursor = matchEnd;
+    }
+    if (cursor === 0) return child;
+    if (cursor < child.length) nodes.push(child.slice(cursor));
+    return nodes;
+  });
+}
+
+function isLikelyLocalFilePath(value: string): boolean {
+  // Requiring an extension avoids turning directories and shell commands into file chips.
+  const name = basename(value);
+  return isLikelyLocalPath(value) && name.includes(".") && !name.endsWith(".");
 }
 
 function basename(value: string): string {
