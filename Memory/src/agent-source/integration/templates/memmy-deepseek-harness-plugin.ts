@@ -571,7 +571,7 @@ export const DEEPSEEK_HARNESS_PLUGIN_CLIENT = String.raw`window.__ModuleLoader__
     const exports = module.exports;
 
     const name = "memmy-memory-client";
-    const inject = ["uiConversation"];
+    const inject = [];
 
     function resolveConversationEventRegistry(ctx) {
       const uiConversation = ctx.uiConversation
@@ -582,59 +582,84 @@ export const DEEPSEEK_HARNESS_PLUGIN_CLIENT = String.raw`window.__ModuleLoader__
       if (conversation && conversation.events) return conversation.events;
       const conversationEvents = typeof ctx.get === "function" ? ctx.get("conversationEvents") : undefined;
       if (conversationEvents) return conversationEvents;
-      throw new Error("memmy-memory requires uiConversation.events or conversationEvents");
+      return null;
     }
 
     function apply(ctx) {
-      resolveConversationEventRegistry(ctx).register({
-        kind: "memmy-optimistic-user",
-        target: "chat",
-        match(event) {
-          const inserted = optimisticMessage(event);
-          if (inserted) return { id: String(inserted.id), role: "start" };
-          return event.type === "user/message" && event.data.source && event.data.source.kind === "user"
-            ? { id: String(event.data.id), role: "update" }
-            : null;
-        },
-        start(_context, match) {
-          const message = optimisticMessage(match.event);
-          if (!message) throw new Error("memmy optimistic user start requires one next-turn insertion");
-          return {
-            pending: true,
-            seq: match.event.seq,
-            time: match.event.time,
-            content: message.content,
-            source: message.source
-          };
-        },
-        update(context) {
-          return { ...context.state, pending: false };
-        },
-        publication: () => "immediate",
-        buildViewNode(context) {
-          const state = context.state;
-          if (!state) return null;
-          const location = context.start && context.start.location
-            || context.matches[0] && context.matches[0].location
-            || { kind: "unresolved" };
-          return {
-            key: context.key,
-            kind: "user",
-            id: context.id,
-            target: "chat",
-            anchorSeq: state.seq,
-            location,
-            visibility: state.pending ? "visible" : "hidden",
-            data: {
-              kind: "user",
-              seq: state.seq,
-              time: state.time,
-              content: state.content,
-              source: state.source
-            }
-          };
+      try {
+        if (typeof ctx.inject === "function") {
+          ctx.inject(["uiConversation"], registerOptimisticUi);
+          return;
         }
-      });
+      } catch (error) {
+        warnOptionalUi(error);
+        return;
+      }
+      registerOptimisticUi(ctx);
+    }
+
+    function registerOptimisticUi(ctx) {
+      try {
+        const registry = resolveConversationEventRegistry(ctx);
+        if (!registry || typeof registry.register !== "function") return;
+        registry.register({
+          kind: "memmy-optimistic-user",
+          target: "chat",
+          match(event) {
+            const inserted = optimisticMessage(event);
+            if (inserted) return { id: String(inserted.id), role: "start" };
+            return event.type === "user/message" && event.data.source && event.data.source.kind === "user"
+              ? { id: String(event.data.id), role: "update" }
+              : null;
+          },
+          start(_context, match) {
+            const message = optimisticMessage(match.event);
+            if (!message) throw new Error("memmy optimistic user start requires one next-turn insertion");
+            return {
+              pending: true,
+              seq: match.event.seq,
+              time: match.event.time,
+              content: message.content,
+              source: message.source
+            };
+          },
+          update(context) {
+            return { ...context.state, pending: false };
+          },
+          publication: () => "immediate",
+          buildViewNode(context) {
+            const state = context.state;
+            if (!state) return null;
+            const location = context.start && context.start.location
+              || context.matches[0] && context.matches[0].location
+              || { kind: "unresolved" };
+            return {
+              key: context.key,
+              kind: "user",
+              id: context.id,
+              target: "chat",
+              anchorSeq: state.seq,
+              location,
+              visibility: state.pending ? "visible" : "hidden",
+              data: {
+                kind: "user",
+                seq: state.seq,
+                time: state.time,
+                content: state.content,
+                source: state.source
+              }
+            };
+          }
+        });
+      } catch (error) {
+        warnOptionalUi(error);
+      }
+    }
+
+    function warnOptionalUi(error) {
+      if (globalThis.console && typeof globalThis.console.warn === "function") {
+        globalThis.console.warn("memmy-memory optimistic message UI disabled", error);
+      }
     }
 
     function optimisticMessage(event) {
@@ -666,8 +691,7 @@ export function createDeepseekHarnessPluginPackageManifest(): Record<string, unk
     },
     dsh: {
       client: {
-        platform: "web",
-        inject: ["@deepseek-ai/dsh-client-ui-conversation"]
+        platform: "web"
       }
     },
     peerDependencies: {

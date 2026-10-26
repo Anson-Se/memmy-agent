@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -27,6 +28,7 @@ const PLUGIN_PACKAGE_NAME = "@memmy/memmy-memory";
 export interface CreateDeepseekHarnessSkillTargetDeps {
   rootDirectory?: string;
   memmyConfigPath?: string;
+  isDeepseekHarnessRunning?: () => Promise<boolean>;
 }
 
 export function createDeepseekHarnessSkillTarget(
@@ -34,6 +36,7 @@ export function createDeepseekHarnessSkillTarget(
 ): SkillTarget {
   const rootDirectory = deps.rootDirectory ?? resolveDeepseekHarnessHomeDirectory();
   const memmyConfigPath = deps.memmyConfigPath ?? join(homedir(), ".memmy", "config.yaml");
+  const isDeepseekHarnessRunning = deps.isDeepseekHarnessRunning ?? detectDeepseekHarnessProcess;
   const pluginDirectory = join(rootDirectory, "profiles", "node_modules", "@memmy", "memmy-memory");
   const patchPath = join(rootDirectory, "cordis.patch.yml");
 
@@ -76,22 +79,29 @@ export function createDeepseekHarnessSkillTarget(
       if (!(await this.resolveRootDirectory())) {
         throw new Error("DeepSeek Harness is not installed or its directory is unavailable");
       }
-      await mkdir(pluginDirectory, { recursive: true });
-      await writeFileAtomically(
-        join(pluginDirectory, "package.json"),
-        JSON.stringify(createDeepseekHarnessPluginPackageManifest(), null, 2) + "\n"
-      );
-      await writeFileAtomically(join(pluginDirectory, "index.mjs"), DEEPSEEK_HARNESS_PLUGIN_INDEX);
-      await writeFileAtomically(join(pluginDirectory, "client.js"), DEEPSEEK_HARNESS_PLUGIN_CLIENT);
-      await writeFileAtomically(
-        join(pluginDirectory, "memmy-workspace-bridge.mjs"),
-        await loadMemmyWorkspaceBridgeRuntimeAsset()
-      );
-      await writeFileAtomically(
-        join(pluginDirectory, "memmy-memory-config.json"),
-        JSON.stringify({ memmy_config_path: memmyConfigPath, ...(await readMemmyMemoryServiceConfig(memmyConfigPath)) }, null, 2) + "\n"
-      );
-      await upsertPatch(patchPath, renderPluginPatch(memmyConfigPath));
+      const generatedFiles: Array<readonly [string, string]> = [
+        [join(pluginDirectory, "package.json"), JSON.stringify(createDeepseekHarnessPluginPackageManifest(), null, 2) + "\n"],
+        [join(pluginDirectory, "index.mjs"), DEEPSEEK_HARNESS_PLUGIN_INDEX],
+        [join(pluginDirectory, "client.js"), DEEPSEEK_HARNESS_PLUGIN_CLIENT],
+        [join(pluginDirectory, "memmy-workspace-bridge.mjs"), await loadMemmyWorkspaceBridgeRuntimeAsset()],
+        [
+          join(pluginDirectory, "memmy-memory-config.json"),
+          JSON.stringify({ memmy_config_path: memmyConfigPath, ...(await readMemmyMemoryServiceConfig(memmyConfigPath)) }, null, 2) + "\n"
+        ]
+      ];
+      const currentPatch = await readTextFile(patchPath);
+      const nextPatch = renderPatchedContent(currentPatch, renderPluginPatch(memmyConfigPath));
+      const generatedFileContents = await Promise.all(generatedFiles.map(([filePath]) => readTextFile(filePath)));
+      const pluginNeedsUpdate = nextPatch !== currentPatch || generatedFiles.some(([, content], index) => (
+        content !== generatedFileContents[index]
+      ));
+      if (pluginNeedsUpdate && await isDeepseekHarnessRunning()) {
+        throw new Error("DeepSeek Harness is running. Quit it, retry the plugin installation, then restart DeepSeek Harness.");
+      }
+      for (const [filePath, content] of generatedFiles) {
+        await writeFileIfChanged(filePath, content);
+      }
+      await writeFileIfChanged(patchPath, nextPatch);
       await replaceMemmySkillDirectory(rootDirectory, renderMemmyPluginSkillManifest(TARGET_ID));
       await replaceMemmyResumeSkillDirectory(rootDirectory, TARGET_ID);
     },
@@ -118,8 +128,8 @@ function renderPluginPatch(memmyConfigPath: string): string {
   ].join("\n");
 }
 
-async function upsertPatch(filePath: string, block: string): Promise<void> {
-  const existing = removePatchBlock(await readTextFile(filePath));
+function renderPatchedContent(current: string, block: string): string {
+  const existing = removePatchBlock(current);
   const lines = existing.split(/\r?\n/u);
   const contentLines = lines.filter((line) => {
     const trimmed = line.trim();
@@ -128,7 +138,7 @@ async function upsertPatch(filePath: string, block: string): Promise<void> {
   const base = contentLines.length === 1 && contentLines[0] === "[]"
     ? lines.filter((line) => line.trim() !== "[]").join("\n").trimEnd()
     : existing.trimEnd();
-  await writeFileAtomically(filePath, [base, block, ""].filter((part, index) => part || index === 2).join("\n"));
+  return [base, block, ""].filter((part, index) => part || index === 2).join("\n");
 }
 
 async function removePatch(filePath: string): Promise<void> {
@@ -139,7 +149,7 @@ async function removePatch(filePath: string): Promise<void> {
     const trimmed = line.trim();
     return trimmed && !trimmed.startsWith("#");
   });
-  await writeFileAtomically(filePath, without + (without ? "\n" : "") + (hasEntries ? "" : "[]\n"));
+  await writeFileIfChanged(filePath, without + (without ? "\n" : "") + (hasEntries ? "" : "[]\n"));
 }
 
 function removePatchBlock(value: string): string {
@@ -190,6 +200,29 @@ async function writeFileAtomically(filePath: string, content: string): Promise<v
     await rm(tempPath, { force: true });
     throw error;
   }
+}
+
+async function writeFileIfChanged(filePath: string, content: string): Promise<void> {
+  if (await readTextFile(filePath) === content) return;
+  await writeFileAtomically(filePath, content);
+}
+
+async function detectDeepseekHarnessProcess(): Promise<boolean> {
+  if (process.platform === "win32") {
+    return commandOutputMatches("tasklist", ["/FO", "CSV", "/NH"], /DeepSeek Harness(?: Helper)?\.exe/iu);
+  }
+  const pattern = process.platform === "darwin"
+    ? "DeepSeek Harness\\.app/Contents|DeepSeek Harness Helper"
+    : "DeepSeek Harness|deepseek-harness|dsh-desktop";
+  return commandOutputMatches("pgrep", ["-f", pattern], /\S/u);
+}
+
+function commandOutputMatches(command: string, args: string[], pattern: RegExp): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(command, args, { encoding: "utf8", windowsHide: true }, (error, stdout) => {
+      resolve(!error && pattern.test(stdout));
+    });
+  });
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ApiRequestError } from "../../../api/http.js";
 import { AppProviders } from "../../../app/providers.js";
+import { NotificationCenterProvider } from "../../../components/notification-center.js";
 import { enUSMessages, zhCNMessages } from "../../../i18n/messages.js";
 import { AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS } from "../../../state/app-actions.js";
 import { agentSourceLogoUrl } from "../../agent-source-logos.js";
@@ -100,7 +101,9 @@ describe("SourcesSubPage", () => {
   it("复用跨 Agent 接入源主体内容", () => {
     const html = renderToString(
       <AppProviders>
-        <SourcesSubPage />
+        <NotificationCenterProvider>
+          <SourcesSubPage />
+        </NotificationCenterProvider>
       </AppProviders>
     );
 
