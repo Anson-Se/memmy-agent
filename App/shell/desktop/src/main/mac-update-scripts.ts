@@ -20,24 +20,8 @@ EXPECTED_VERSION=${quotedShellValue(options.expectedVersion ?? "")}
 CURRENT_VERSION=${quotedShellValue(options.currentVersion ?? "")}
 
 version_is_newer() {
-  /usr/bin/awk -v candidate="$1" -v installed="$2" 'BEGIN {
-    sub(/\\+.*/, "", candidate); sub(/\\+.*/, "", installed);
-    at=index(candidate, "-"); bt=index(installed, "-");
-    ac=at ? substr(candidate, 1, at-1) : candidate;
-    bc=bt ? substr(installed, 1, bt-1) : installed;
-    an=split(ac, a, "."); bn=split(bc, b, ".");
-    for (i=1; i<=an || i<=bn; i++) { if (a[i]+0>b[i]+0) exit 0; if (a[i]+0<b[i]+0) exit 1 }
-    if (!at && bt) exit 0; if (at && !bt) exit 1; if (!at && !bt) exit 1;
-    an=split(substr(candidate, at+1), a, "."); bn=split(substr(installed, bt+1), b, ".");
-    for (i=1; i<=an || i<=bn; i++) {
-      if (i>an) exit 1; if (i>bn) exit 0;
-      if ("x" a[i]=="x" b[i]) continue;
-      av=a[i] ~ /^[0-9]+$/; bv=b[i] ~ /^[0-9]+$/;
-      if (av && bv) { if (a[i]+0>b[i]+0) exit 0; exit 1 }
-      if (av) exit 1; if (bv) exit 0;
-      if ("x" a[i]>"x" b[i]) exit 0; exit 1
-    }
-    exit 1
+  LC_ALL=C /usr/bin/awk -v candidate="$1" -v installed="$2" 'BEGIN {
+    exit !("x" candidate > "x" installed)
   }'
 }
 

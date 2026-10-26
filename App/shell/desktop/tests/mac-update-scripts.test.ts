@@ -108,13 +108,35 @@ if [ -f "$app/fail-after-replace" ] && [ "$app" = '${destination}' ]; then exit 
   it.each([
     ["1.2.1", "1.2.2-rc.1", false],
     ["1.2.2-rc.1", "1.2.2-rc.1", false],
-    ["1.2.2-rc.1", "1.2.2", false],
-    ["1.2.2", "1.2.2-rc.1", true],
-    ["1.2.2-rc.10", "1.2.2-rc.2", true],
-  ])("compares package %s against current %s with prerelease precedence", (version, currentVersion, allowed) => {
+    ["1.2.2-rc.1", "1.2.2", true],
+    ["1.2.2", "1.2.2-rc.1", false],
+    ["1.2.2-rc.10", "1.2.2-rc.2", false],
+    ["1.2.401", "1.2.4", true],
+    ["1.2.402", "1.2.401", true],
+    ["1.2.5", "1.2.402", true],
+    ["1.2.6", "1.2.5", true],
+    ["1.3.0", "1.2.6", true],
+    ["1.2.401", "1.2.5", false],
+    ["1.2.10", "1.2.9", false],
+    ["1.2.5+build.2", "1.2.5+build.1", true],
+  ])("compares package %s against current %s by character", (version, currentVersion, allowed) => {
     fixture(staged, "replacement", { CFBundleShortVersionString: version });
     expect(install({ expectedVersion: version, currentVersion }).status === 0).toBe(allowed);
     expect(fs.readFileSync(path.join(destination, "tag"), "utf8")).toBe(allowed ? "replacement" : "original");
+  });
+
+  it("stages a 1.2.5 update over 1.2.401", () => {
+    const dmg = path.join(root, "dmg");
+    fixture(path.join(dmg, "Memmy.app"), "replacement", { CFBundleShortVersionString: "1.2.5" });
+    tools["/usr/bin/hdiutil"] = mockTool("hdiutil", 'if [ "$1" = attach ]; then cp -R "$2"/. "$6"; fi');
+    fs.rmSync(staged, { recursive: true });
+    fs.rmSync(`${staged}.ready`);
+    const helper = path.join(root, "stage.zsh");
+    fs.writeFileSync(helper, instrument(createMacDmgUpdateStageScript({ architecture: "arm64", teamIdentifier: "MEMMYTEAM1", expectedVersion: "1.2.5", currentVersion: "1.2.401" })));
+    const result = spawnSync("/bin/zsh", [helper, dmg, staged, `${staged}.ready`, log], { encoding: "utf8", timeout: 10_000 });
+    expect(result.status, fs.readFileSync(log, "utf8")).toBe(0);
+    expect(fs.existsSync(`${staged}.ready`)).toBe(true);
+    expect(fs.readFileSync(path.join(staged, "tag"), "utf8")).toBe("replacement");
   });
 
   it("rejects a symlink at the destination without changing its target", () => {
