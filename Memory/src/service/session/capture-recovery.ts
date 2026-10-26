@@ -9,7 +9,7 @@ export interface CaptureCommand {
   userId: string;
   sessionId?: string;
 }
-interface CaptureContext { command: CaptureCommand; job?: EvolutionJobRecord; committed?: boolean; }
+interface CaptureContext { command: CaptureCommand; job?: EvolutionJobRecord; committed?: boolean; replay?: boolean; }
 
 /** The request is journaled before the first external selection call. Normal
  * writes and completion of that journal entry commit in the same transaction. */
@@ -40,7 +40,12 @@ export class CaptureRecovery {
   async replay(job: EvolutionJobRecord, execute: (command: CaptureCommand) => Promise<unknown>): Promise<void> {
     const command = job.payload.command as CaptureCommand;
     if (!command?.operation || !Array.isArray(command.args)) throw new Error("invalid capture recovery command");
-    await this.context.run({ command, job }, () => execute(command));
+    await this.context.run({ command, job, replay: true }, () => execute(command));
+  }
+
+  /** True while the worker re-runs a journaled request. */
+  replaying(): boolean {
+    return this.context.getStore()?.replay === true;
   }
 
   beforeModel(): void {
