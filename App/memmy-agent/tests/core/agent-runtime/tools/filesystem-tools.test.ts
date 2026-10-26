@@ -301,7 +301,7 @@ describe("EditFileTool", () => {
 
 describe("filesystem post-write validation", () => {
   it("does not run implicit validators for managed writes or edits", async () => {
-    vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1");
+    vi.stubEnv("AGENT_MANAGED_EXECUTION_REQUIRED", "1");
     const root = workspace();
     const target = path.join(root, "managed.json");
     const written = await new WriteFileTool({ workspace: root }).execute({ path: target, content: "invalid json" });

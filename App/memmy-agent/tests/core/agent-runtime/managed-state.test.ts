@@ -13,10 +13,10 @@ import { resolveStartupMigrationTarget } from "../../../src/entrypoints/cli/star
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function fixture() {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "memmate-state-"))); roots.push(root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "managed-state-"))); roots.push(root);
   const home = path.join(root, "runtime"); fs.mkdirSync(home);
   const workspace = path.join(root, "unapproved-project");
-  vi.stubEnv("MEMMATE_PERMISSION_REQUIRED", "1"); vi.stubEnv("MEMMY_AGENT_DATA_DIR", home);
+  vi.stubEnv("AGENT_MANAGED_EXECUTION_REQUIRED", "1"); vi.stubEnv("MEMMY_AGENT_DATA_DIR", home);
   return { root, home, workspace };
 }
 it("managed templates, session and memory state never create the unapproved project directory", () => {
@@ -30,7 +30,7 @@ it("managed templates, session and memory state never create the unapproved proj
   expect(loop.workspace).toBe(workspace);
   expect(loop.sessions.root).toBe(path.join(home, "workspace", "sessions"));
   expect(loop.context.memory.workspace).toBe(path.join(home, "workspace"));
-  expect(loop.tools.get("read_file")?.workspace).toBe(workspace);
+  expect(loop.tools.get("read_file")).toMatchObject({ workspace });
   expect(fs.readdirSync(workspace)).toEqual([]);
 });
 it("managed bootstrap context and plugin discovery cannot read project-controlled files", () => {
@@ -47,7 +47,7 @@ it("managed migrations target private state and require an explicit Host data di
   const { workspace, home } = fixture();
   const config = path.join(home, "config.json");
   fs.writeFileSync(config, JSON.stringify({ agents: { defaults: { workspace } } }));
-  const env = { MEMMATE_PERMISSION_REQUIRED: "1", MEMMY_AGENT_DATA_DIR: home, HOME: home };
+  const env = { AGENT_MANAGED_EXECUTION_REQUIRED: "1", MEMMY_AGENT_DATA_DIR: home, HOME: home };
   const target = resolveStartupMigrationTarget({ config, workspace }, env);
   expect(target.agentWorkspace).toBe(path.join(home, "workspace"));
   expect(fs.existsSync(workspace)).toBe(false);

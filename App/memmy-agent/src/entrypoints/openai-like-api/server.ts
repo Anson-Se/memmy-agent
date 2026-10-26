@@ -1,4 +1,4 @@
-import { authenticateMemmateRuntime, createMemmatePermissionScope, memmatePermissionRequired, withMemmatePermission } from "../../core/agent-runtime/memmate-permission.js";
+import { authenticateAgentRuntime, createManagedExecutionScope, managedExecutionRequired, withManagedExecution } from "../../core/agent-runtime/managed-execution.js";
 import { requestTiming, withRequestTiming } from "../../utils/request-timing.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -253,12 +253,12 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
     sessionLocks: new Map<string, Promise<void>>(),
     activeRequests: new Map(),
   };
-  const managed = memmatePermissionRequired();
-  if (managed && !authenticateMemmateRuntime(request)) return errorJson(401, "MemMate runtime authentication required");
+  const managed = managedExecutionRequired();
+  if (managed && !authenticateAgentRuntime(request)) return errorJson(401, "Managed runtime authentication required");
   const controller = new AbortController();
   const permissionAbort = new AbortController();
   const permissionSignal = AbortSignal.any([request.signal, permissionAbort.signal, controller.signal]);
-  let permission: ReturnType<typeof createMemmatePermissionScope> | undefined;
+  let permission: ReturnType<typeof createManagedExecutionScope> | undefined;
   const contentType = request.headers.get("content-type") ?? "";
   let text = "";
   let mediaPaths: string[] = [];
@@ -278,7 +278,7 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
       } catch {
         return errorJson(400, "Invalid JSON body");
       }
-      if (managed) permission = createMemmatePermissionScope(body.memmate_permission, permissionSignal);
+      if (managed) permission = createManagedExecutionScope(body.managed_execution, permissionSignal);
       stream = Boolean(body.stream);
       requestedModel = body.model;
       [text, mediaPaths] = parseJsonContent(body);
@@ -323,7 +323,7 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
       ? { metadata: { model_preset: context.agentLoop.modelPreset } } : {}),
   };
 
-  const invoke = (args: Record<string, any>) => withMemmatePermission(permission, () => callAgent(context, args));
+  const invoke = (args: Record<string, any>) => withManagedExecution(permission, () => callAgent(context, args));
   const endPermission = () => { if (permission) permission.active = false; permissionAbort.abort(); };
 
   if (stream) {
@@ -465,7 +465,7 @@ async function handleTimedChatCompletions(request: Request, ctx?: ApiContext): P
 }
 
 async function handleCancel(request: Request, ctx: ApiContext): Promise<Response> {
-  if (memmatePermissionRequired() && !authenticateMemmateRuntime(request)) return errorJson(401, "MemMate runtime authentication required");
+  if (managedExecutionRequired() && !authenticateAgentRuntime(request)) return errorJson(401, "Managed runtime authentication required");
   let body: any;
   try {
     body = await request.json();
@@ -529,7 +529,7 @@ export async function handleModels(request?: Request, ctx?: Pick<ApiContext, "mo
 }
 
 export async function handleHealth(): Promise<Response> {
-  return Response.json({ status: "ok", ...(memmatePermissionRequired() ? { memmatePermissionProtocol: 1, memmateExecutionProtocol: 2, memmatePermissionRequired: true, memmateMacosSandbox: process.env.MEMMATE_MACOS_SANDBOX === "1" } : {}) });
+  return Response.json({ status: "ok", ...(managedExecutionRequired() ? { permissionProtocol: 1, managedExecutionProtocol: 2, managedExecutionRequired: true, macosSandbox: process.env.AGENT_MACOS_SANDBOX === "1" } : {}) });
 }
 
 export function createApp(
