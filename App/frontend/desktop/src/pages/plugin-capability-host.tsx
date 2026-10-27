@@ -1233,10 +1233,8 @@ function recordingDeliverableField(files: UploadedAgentMedia[]): { recordingDeli
 /**
  * How a staged recording's transcription is doing, under its file name.
  *
- * Failure only shows once the automatic retries are spent, and then it asks:
- * the user decides between another attempt and going on without the text.
- * Those two buttons stay live while the card is submitting, because a
- * submission waiting on this recording can only move once they are pressed.
+ * Failure only shows once the automatic retries are spent. The retry action
+ * stays available while a submission waits for the recording's text.
  */
 function StagedTranscriptionStatus(props: { state?: PluginTranscriptionState; job?: PluginTranscriptionJob }) {
   const { t } = useTranslation();
@@ -1251,7 +1249,6 @@ function StagedTranscriptionStatus(props: { state?: PluginTranscriptionState; jo
   return <div className="diagnostic-upload-card__transcription diagnostic-upload-card__transcription--failed" role="alert">
     <span>{t("plugin.ui.audio.transcriptionFailedRow", { attempts: PLUGIN_TRANSCRIPTION_ATTEMPTS })}</span>
     <button type="button" onClick={() => props.job?.retry()}>{t("plugin.ui.audio.retryTranscription")}</button>
-    <button type="button" onClick={() => props.job?.skip()}>{t("plugin.ui.audio.skipTranscription")}</button>
   </div>;
 }
 
@@ -1314,6 +1311,19 @@ export function FileInputCard(props: {
   const [dragging, setDragging] = useState(false);
   const transcriptionJobs = usePluginTranscriptions();
   const [waitingForTranscripts, setWaitingForTranscripts] = useState(false);
+  useEffect(() => {
+    // Older sessions may already contain both the pending audio-path row and
+    // the completed transcript-path row. The pending row owns the handover;
+    // once ready it displays the transcript file's metadata itself.
+    const redundant = new Set(stagedFiles.flatMap((file) => {
+      if (!file.pending) return [];
+      const state = transcriptionJobs?.transcriptions.get(file.path);
+      return state?.status === "ready" && state.transcript.transcriptFile?.path
+        ? [state.transcript.transcriptFile.path] : [];
+    }));
+    if (!redundant.size || !stagedFiles.some((file) => !file.pending && redundant.has(file.path))) return;
+    recordingMaterials.update(stagedFiles.filter((file) => file.pending || !redundant.has(file.path)));
+  }, [stagedFiles, transcriptionJobs?.transcriptions, recordingMaterials.update]);
   /**
    * Resolves the staged recordings into what the plugin receives.
    *
@@ -1493,15 +1503,21 @@ export function FileInputCard(props: {
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
       onDrop={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)); }}>
       {fileStates.length || stagedFiles.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
-        {stagedFiles.map((file) => <li key={file.path} className="diagnostic-upload-card__file">
-          <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={file.name} mime={file.mime} surface="row" /></span>
-          <div className="diagnostic-upload-card__file-info"><button type="button" disabled={!props.onOpenArtifact} title={file.name} onClick={() => props.onOpenArtifact?.({ id: file.path, path: file.path, uri: file.path, name: file.name, mediaType: file.mime })}>{file.name}</button>
-            <StagedTranscriptionStatus state={transcriptionJobs?.transcriptions.get(file.path)} job={transcriptionJobs?.transcriptionJob(file.path)} /></div>
-          <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(file.bytes)}</span>
-          <button type="button" className="diagnostic-upload-card__remove" disabled={props.disabled}
-            aria-label={t("plugin.ui.removeFile", { name: file.name })}
-            onClick={() => recordingMaterials.update(stagedFiles.filter((item) => item.path !== file.path))}><X size={17} /></button>
-        </li>)}
+        {stagedFiles.map((file) => {
+          const transcriptionState = transcriptionJobs?.transcriptions.get(file.path);
+          const transcriptFile = transcriptionState?.status === "ready" ? transcriptionState.transcript.transcriptFile : undefined;
+          const displayFile = transcriptFile ?? file;
+          const canOpen = Boolean(props.onOpenArtifact) && (!file.pending || Boolean(transcriptFile));
+          return <li key={file.path} className="diagnostic-upload-card__file">
+            <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={displayFile.name} mime={displayFile.mime} surface="row" /></span>
+            <div className="diagnostic-upload-card__file-info"><button type="button" disabled={!canOpen} title={displayFile.name} onClick={() => props.onOpenArtifact?.({ id: displayFile.path, path: displayFile.path, uri: displayFile.path, name: displayFile.name, mediaType: displayFile.mime })}>{displayFile.name}</button>
+              <StagedTranscriptionStatus state={transcriptionState} job={transcriptionJobs?.transcriptionJob(file.path)} /></div>
+            <span className="diagnostic-upload-card__file-size">{formatUploadFileSize(displayFile.bytes)}</span>
+            <button type="button" className="diagnostic-upload-card__remove" disabled={props.disabled}
+              aria-label={t("plugin.ui.removeFile", { name: displayFile.name })}
+              onClick={() => recordingMaterials.update(stagedFiles.filter((item) => item.path !== file.path))}><X size={17} /></button>
+          </li>;
+        })}
         {fileStates.map((item, index) => {
           return <li key={`${item.file.name}:${item.file.size}:${index}`} className="diagnostic-upload-card__file">
             <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={item.file.name} mime={item.file.type} surface="row" /></span>

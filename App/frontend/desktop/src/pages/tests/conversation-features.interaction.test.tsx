@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginUiProvider, usePluginUi } from "../../app/plugin-ui-context.js";
-import { useConversationFeatures } from "../conversation-features.js";
+import { conversationFeaturePanelOverlays, recordingArchiveMaterials, useConversationFeatures } from "../conversation-features.js";
 import type { AgentChatMessage } from "../../state/agent-chat-slice.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   chatId: null as string | null,
   invoke: vi.fn(async () => ({ callId: "guide-call" })),
   list: vi.fn(), dispatch: vi.fn(), openRecording: vi.fn(),
+  openArtifact: vi.fn(() => true),
   send: vi.fn(async () => true), sending: false,
   messages: [] as AgentChatMessage[],
 }));
@@ -34,7 +35,9 @@ vi.mock("../recording-entry.js", async (original) => {
 
 const clients = { plugins: { list: mocks.list, invoke: mocks.invoke, getUi: vi.fn(), respond: vi.fn(), cancel: vi.fn() },
   asr: { transcribe: vi.fn() }, memmyAgent: { uploadAgentMedia: vi.fn(), resolveArtifact: vi.fn() } };
-const plugin = { id: "legal-labor", state: "active", manifest: { capabilities: [], commands: [
+const plugin = { id: "legal-labor", state: "active", manifest: { capabilities: [
+  { id: "guide-open", name: "诊断指引", description: "查看诊断模板", inputSchema: {}, outputSchema: {}, execution: "job" }
+], commands: [
   { command: "/legal-guide", name: "诊断指引", capabilityId: "guide-open", pinned: true, icon: "file-text" },
   { command: "/legal-record", name: "访谈录音", capabilityId: "material-collect", pinned: true, topbar: true, icon: "audio-lines" }
 ] } };
@@ -47,7 +50,8 @@ describe("conversation feature integration", () => {
   function Harness() {
     ui = usePluginUi();
     features = useConversationFeatures({ scopeKey: mocks.chatId ?? "draft-1", agentMessages: mocks.messages, onDraft: vi.fn(),
-      onStageFiles: async () => {}, onSend: mocks.send, onOpenRecording: mocks.openRecording });
+      onStageFiles: async () => {}, onOpenArtifact: mocks.openArtifact,
+      onSend: mocks.send, onOpenRecording: mocks.openRecording });
     return <>{features.recorders}<nav>{features.shortcuts}</nav><section>{features.cards}</section></>;
   }
   const render = () => root.render(<I18nProvider language="zh-CN"><PluginUiProvider><Harness /></PluginUiProvider></I18nProvider>);
@@ -72,6 +76,55 @@ describe("conversation feature integration", () => {
     await act(async () => render());
     expect(container.querySelector("nav")?.textContent).toBe("");
     expect(mocks.invoke).not.toHaveBeenCalled();
+  });
+
+  it("publishes an idle interview for the shared right task panel", async () => {
+    mocks.chatId = "legal-chat";
+    await act(async () => render());
+    await act(async () => ui.receive({ pluginId: "legal-labor", capabilityId: "material-collect",
+      callId: "interview", conversationId: "legal-chat", origin: "agent",
+      event: { type: "interaction", request: { interactionId: "record", type: "audio-record", payload: {} } } }));
+
+    expect(container.textContent).toContain("开始录音");
+    expect(features.sidePanel).toBeNull();
+    expect(features.sidePanelWidth).toBeNull();
+    expect(features.pluginRecordingSession?.status).toBe("idle");
+  });
+
+  it("overlays a standalone artifact preview when both columns cannot fit", () => {
+    expect(conversationFeaturePanelOverlays(659)).toBe(true);
+    expect(conversationFeaturePanelOverlays(660)).toBe(false);
+    expect(conversationFeaturePanelOverlays(null)).toBe(false);
+  });
+
+  it("does not stage a handed-over interview transcript as a second material", () => {
+    const transcriptFile = { kind: "file" as const, path: "/media/interview.txt", name: "访谈转写.txt",
+      mime: "text/plain" as const, bytes: 34, url: "/text" };
+    const entry = { id: "plugin:/media/interview.webm", title: "访谈录音", recordedAt: "2026-10-27T00:00:00Z",
+      durationMs: 18_000, speakerCount: 1, transcript: { text: "访谈内容", segments: [] }, audioUrl: "/audio",
+      audioPath: "/media/interview.webm", sessionKey: "websocket:legal-chat", files: [transcriptFile],
+      collected: true, handedOver: true };
+    expect(recordingArchiveMaterials(entry)).toEqual([]);
+    expect(recordingArchiveMaterials({ ...entry, id: "archive:other", handedOver: false }))
+      .toEqual([{ ...transcriptFile, collected: true }]);
+  });
+
+  it("opens a staged transcript in the shared task file preview", async () => {
+    mocks.chatId = "legal-chat";
+    await act(async () => render());
+    await act(async () => {
+      ui.receive({ pluginId: "legal-labor", capabilityId: "material-collect", callId: "upload-call",
+        conversationId: "legal-chat", origin: "agent",
+        event: { type: "interaction", request: { interactionId: "files", type: "file-input",
+          payload: { title: "补充诊断材料", multiple: true } } } });
+      ui.addRecordingMaterials("legal-labor", "legal-chat", [{ kind: "file", path: "/workspace/recording.txt",
+        name: "录音转写.txt", mime: "text/plain", bytes: 34, url: "/text", collected: true }]);
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__file-info button")!.click());
+    expect(mocks.openArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      name: "录音转写.txt", path: "/workspace/recording.txt"
+    }));
+    expect(features.sidePanel).toBeNull();
   });
 
   it("opens one Host recorder without invoking material collection or starting a diagnosis", async () => {
@@ -101,6 +154,14 @@ describe("conversation feature integration", () => {
     expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith("legal-labor", "guide-open", expect.objectContaining({
       conversationId: "legal-chat", origin: "user", input: { command: "/legal-guide", arguments: "" }
     }));
+  });
+
+  it("does not offer a guide shortcut that the installed plugin cannot run", async () => {
+    mocks.list.mockResolvedValue([{ ...plugin, manifest: { ...plugin.manifest, capabilities: [] } }]);
+    await enterLegalConversation();
+    expect(button("诊断指引")).toBeUndefined();
+    expect(features.commandItems.some((item) => item.command === "/legal-guide")).toBe(false);
+    expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
   it("never routes the guide shortcut into session-start even with an outdated command manifest", async () => {

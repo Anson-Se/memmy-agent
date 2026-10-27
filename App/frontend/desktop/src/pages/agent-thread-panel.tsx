@@ -1,4 +1,5 @@
 import { RecordingEntryPage, type RecordingEntrySession } from "./recording-entry.js";
+import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
 import {
   useCallback,
   useEffect,
@@ -51,6 +52,7 @@ import {
 export const THREAD_PANEL_WIDTH_STORAGE_KEY = "memmy.threadPanel.width.v1";
 export const THREAD_PANEL_CLOSE_MS = 150;
 export const THREAD_PANEL_FULLSCREEN_BODY_CLASS = "memmy-thread-panel-fullscreen";
+export const PLUGIN_RECORDING_TAB_ID = "recording:plugin";
 const POPOVER_CLOSE_DELAY_MS = 160;
 const POPOVER_WIDTH = 320;
 const POPOVER_HEIGHT = 560;
@@ -306,10 +308,12 @@ export function AgentThreadPanel(props: {
   workspaceRoot: string | null;
   previewContext: ThreadPreviewContext;
   recordingSession?: RecordingEntrySession;
+  pluginRecordingSession?: RecordingPanelSession | null;
   recordingAuthenticated?: boolean;
   onRecordingSignIn?: () => void;
   onOpenRecording?: () => void;
   onCloseRecording?: () => void;
+  onClosePluginRecording?: () => void;
   recordingRevealRequestId?: number;
   onRecordingVisibleChange?: (visible: boolean) => void;
 }) {
@@ -341,7 +345,7 @@ export function AgentThreadPanel(props: {
   const browserSession = browserSessions.get(ownerKey) ?? EMPTY_BROWSER_SESSION;
   const { open: browserOpen, mounted: browserMounted, tabs: browserTabs,
     activeId: activeBrowserTabId, copiedId: copiedBrowserTabId } = browserSession;
-  const recordingVisible = panel.visible && panel.phase === "open" && !browserOpen && activeTab?.type === "recording";
+  const recordingVisible = panel.visible && panel.phase === "open" && !browserOpen && activeTab?.id === "recording:main";
   useEffect(() => props.onRecordingVisibleChange?.(recordingVisible), [props.onRecordingVisibleChange, recordingVisible]);
   // The overview list is hidden behind either a file preview or a browser tab.
   // A pinned list is also hidden while the browser surface is selected.
@@ -670,7 +674,8 @@ export function AgentThreadPanel(props: {
                 panel.activateTab(id);
               }}
               onClose={(id) => {
-                if (panel.tabState.tabs.find((tab) => tab.id === id)?.type === "recording") props.onCloseRecording?.();
+                if (id === PLUGIN_RECORDING_TAB_ID) props.onClosePluginRecording?.();
+                else if (panel.tabState.tabs.find((tab) => tab.id === id)?.type === "recording") props.onCloseRecording?.();
                 panel.closeTab(id);
               }}
               browserTabs={browserMounted ? browserTabs : []}
@@ -783,10 +788,13 @@ export function AgentThreadPanel(props: {
         {!browserOpen && activeTab ? (
           <div className="thread-panel__main">
             {activeTab.type === "recording"
-              ? props.recordingAuthenticated || (props.recordingSession && props.recordingSession.status !== "idle")
-                ? props.recordingSession ? <RecordingEntryPage session={props.recordingSession} /> : null
-                : <div className="recording-sign-in"><LockKeyhole size={24} /><p>{t("recording.page.signInTitle")}</p>
-                  <button type="button" onClick={props.onRecordingSignIn}>{t("recording.page.signIn")}</button></div>
+              ? activeTab.id === PLUGIN_RECORDING_TAB_ID
+                ? props.pluginRecordingSession
+                  ? <InterviewRecordingPanel embedded session={props.pluginRecordingSession} onClose={props.onClosePluginRecording} /> : null
+                : props.recordingAuthenticated || (props.recordingSession && props.recordingSession.status !== "idle")
+                  ? props.recordingSession ? <RecordingEntryPage session={props.recordingSession} /> : null
+                  : <div className="recording-sign-in"><LockKeyhole size={24} /><p>{t("recording.page.signInTitle")}</p>
+                    <button type="button" onClick={props.onRecordingSignIn}>{t("recording.page.signIn")}</button></div>
               : <ThreadTabPreview key={activeTab.id} tab={activeTab} context={props.previewContext} />}
           </div>
         ) : null}

@@ -4031,9 +4031,10 @@ function fileEditsShareActivity(left: AgentFileEdit, right: AgentFileEdit): bool
 
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"]);
 const VIDEO_ATTACHMENT_EXTENSIONS = new Set([".mp4", ".webm", ".mov", ".m4v"]);
+const AUDIO_ATTACHMENT_EXTENSIONS = new Set([".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"]);
 
 function isAgentChatMediaKind(value: unknown): value is AgentChatMediaKind {
-  return value === "image" || value === "video" || value === "file";
+  return value === "image" || value === "video" || value === "audio" || value === "file";
 }
 
 function extensionOf(value: string | undefined): string {
@@ -4044,12 +4045,18 @@ function extensionOf(value: string | undefined): string {
 }
 
 function inferMediaKind(media: { url?: string; name?: string; kind?: AgentChatMediaKind; path?: string }): AgentChatMediaKind {
+  // Older threads stored Memmy's audio-only recording as video because .webm
+  // was classified by extension. Correct those saved messages on hydration.
+  const displayName = (media.name || media.path?.split(/[\\/]/).pop() || "").toLowerCase();
+  if (/^录音-\d{4}-\d{2}-\d{2}t[\d-]+z\.webm$/u.test(displayName)) return "audio";
   if (isAgentChatMediaKind(media.kind)) return media.kind;
   if (media.url?.startsWith("data:image/")) return "image";
   if (media.url?.startsWith("data:video/")) return "video";
+  if (media.url?.startsWith("data:audio/")) return "audio";
   const ext = extensionOf(media.name) || extensionOf(media.path) || extensionOf(media.url);
   if (IMAGE_ATTACHMENT_EXTENSIONS.has(ext)) return "image";
   if (VIDEO_ATTACHMENT_EXTENSIONS.has(ext)) return "video";
+  if (AUDIO_ATTACHMENT_EXTENSIONS.has(ext)) return "audio";
   return "file";
 }
 

@@ -8,12 +8,14 @@ import { I18nProvider } from "../../i18n/i18n-provider.js";
 import type { AgentChatMessage } from "../../state/agent-chat-slice.js";
 import {
   AgentThreadPanel,
+  PLUGIN_RECORDING_TAB_ID,
   THREAD_PANEL_FULLSCREEN_BODY_CLASS,
   THREAD_PANEL_WIDTH_STORAGE_KEY,
   useAgentThreadPanel,
   type AgentThreadPanelController,
 } from "../agent-thread-panel.js";
 import type { ThreadPreviewContext } from "../agent-thread-panel-preview.js";
+import type { RecordingPanelSession } from "../interview-recording-panel.js";
 import { requestBrowserNewTab, takePendingBrowserNewTab } from "../browser-panel.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -25,6 +27,8 @@ type HarnessProps = {
   messages: AgentChatMessage[]; context: ThreadPreviewContext; workspaceRoot?: string | null;
   scopeKey?: string; keepMounted?: boolean; onController?: (controller: AgentThreadPanelController) => void;
   onRecordingVisibleChange?: (visible: boolean) => void;
+  pluginRecordingSession?: RecordingPanelSession | null;
+  onClosePluginRecording?: () => void;
 };
 function Harness(props: HarnessProps) {
   const layoutRef = useRef<HTMLDivElement | null>(null);
@@ -42,6 +46,8 @@ function Harness(props: HarnessProps) {
           workspaceRoot={props.workspaceRoot ?? null}
           previewContext={props.context}
           onRecordingVisibleChange={props.onRecordingVisibleChange}
+          pluginRecordingSession={props.pluginRecordingSession}
+          onClosePluginRecording={props.onClosePluginRecording}
         />
       ) : null}
     </div>
@@ -132,6 +138,24 @@ describe("AgentThreadPanel", () => {
     expect(panel.offset).toBe(0);
     expect(container.querySelector(".thread-panel--overlay")).not.toBeNull();
     expect(container.querySelector(".thread-panel__sash")).toBeNull();
+  });
+
+  it("opens a plugin interview beside file previews in the same task tab strip", () => {
+    layoutWidth = 620;
+    let panel!: AgentThreadPanelController;
+    const session: RecordingPanelSession = {
+      title: "访谈录音", status: "idle", elapsedMs: 0, lines: [], transcript: null, audioUrl: null,
+      onPause: vi.fn(), onResume: vi.fn(), onFinish: vi.fn(), onClose: vi.fn()
+    };
+    render({ messages: [], context: emptyContext(), pluginRecordingSession: session,
+      onController: (value) => { panel = value; } });
+    act(() => panel.openTab({ id: PLUGIN_RECORDING_TAB_ID, type: "recording", name: "录音" }));
+    expect(tabTitles()).toEqual(["录音"]);
+    expect(container.querySelector(".thread-panel__main .workspace-artifact-preview-pane--embedded")).not.toBeNull();
+    expect(container.querySelector(".thread-panel__main .sidebar-resize-handle")).toBeNull();
+
+    act(() => panel.openTab({ id: "file:/repo/notes.md", type: "file", name: "notes.md", path: "/repo/notes.md" }));
+    expect(tabTitles()).toEqual(["录音", "notes.md"]);
   });
 
   it('keeps user tabs mounted while switching and opens an Agent page in a separate tab', () => {

@@ -2140,6 +2140,33 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain('video src="/api/media/sig/clip"');
   });
 
+  it("renders delivered recordings as the same file bubble used for other files", () => {
+    const html = renderToString(
+      <I18nProvider language="zh-CN">
+        <AgentThreadMessages
+          chatScopeKey="chat-recording"
+          messages={[{
+            id: "answer",
+            role: "assistant",
+            content: "报告和录音已交付",
+            media: [
+              { kind: "audio", url: "/api/media/sig/recording", name: "录音-2026-10-27T10-13-53-172Z.webm" },
+              { kind: "file", url: "/api/media/sig/report", name: "诊断报告.docx" }
+            ]
+          }]}
+        />
+      </I18nProvider>
+    );
+
+    expect(html).toContain('data-testid="agent-attachment-card-file"');
+    expect(html).toContain("录音-2026-10-27T10-13-53-172Z.webm");
+    expect(html).toContain(">WEBM<");
+    expect(html).toContain("诊断报告.docx");
+    expect(html).not.toContain('video src="/api/media/sig/recording"');
+    expect(html).not.toContain('audio src="/api/media/sig/recording"');
+    expect(html).not.toContain("另存为");
+  });
+
   it("renders user media as compact thumbnails above the text bubble", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">
