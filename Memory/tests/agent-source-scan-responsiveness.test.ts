@@ -118,8 +118,7 @@ describe("standalone scan HTTP responsiveness", () => {
       resolveAgentSkillRoot: () => {
         if (!firstJob) return null;
         firstJob = false;
-        void executor.cancelScan();
-        replacement = executor.startScan({ sourceId: "codex", mode: "full" });
+        replacement = executor.cancelScan().then(() => executor.startScan({ sourceId: "codex", mode: "full" }));
         return skillRoot;
       },
     });

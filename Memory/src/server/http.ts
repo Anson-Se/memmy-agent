@@ -252,7 +252,8 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
         principal,
         Boolean(options.onShutdownRequested),
         pluginRuntimeAnalytics,
-        requestId
+        requestId,
+        agentSources
       );
       if (request.method === "POST" && url.pathname === "/api/v1/admin/shutdown") {
         response.once("finish", () => options.onShutdownRequested?.());
@@ -542,7 +543,8 @@ async function routeRequest(
   principal: AuthPrincipal,
   canShutdown: boolean,
   pluginRuntimeAnalytics: PluginRuntimeAnalytics,
-  requestId: string
+  requestId: string,
+  agentSources: AgentSourceExecutor
 ): Promise<unknown> {
   const path = url.pathname;
 
@@ -556,6 +558,7 @@ async function routeRequest(
   if (method === "POST" && path === "/api/v1/admin/reload-config") {
     requireAdminWrite(principal);
     const request = asObject(body, "admin.reload-config") as MemoryReloadConfigRequest;
+    await agentSources.reconcileScanPermission?.();
     const result = service.reloadConfig({
       requestId: typeof request.requestId === "string" ? request.requestId : undefined,
       adapterId: typeof request.adapterId === "string" ? request.adapterId : undefined,

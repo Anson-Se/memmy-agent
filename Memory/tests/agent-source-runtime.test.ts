@@ -55,7 +55,7 @@ describe("standalone Agent source executor", () => {
     } finally { await executor.dispose(); }
   });
 
-  it("also waits for a canceled scan when a replacement scan starts before disposal", async () => {
+  it("drains cancellation before replacement and waits for replacement during disposal", async () => {
     const root = tempRoot();
     let finishFirst!: () => void;
     let finishSecond!: () => void;
@@ -76,15 +76,17 @@ describe("standalone Agent source executor", () => {
     try {
       await executor.startScan({ sourceId: "fixture-agent" });
       await vi.waitFor(() => expect(detect).toHaveBeenCalledTimes(1));
-      await executor.cancelScan();
+      const cancellation = executor.cancelScan();
+      await expect(executor.startScan({ sourceId: "fixture-agent" })).rejects.toThrow("Canceling");
+      finishFirst();
+      await cancellation;
       await executor.startScan({ sourceId: "fixture-agent" });
       await vi.waitFor(() => expect(detect).toHaveBeenCalledTimes(2));
       let completed = false;
       const disposal = Promise.resolve(executor.dispose()).then(() => { completed = true; });
-      finishSecond();
       await new Promise((done) => setTimeout(done, 20));
       expect(completed).toBe(false);
-      finishFirst();
+      finishSecond();
       await disposal;
     } finally {
       finishFirst();
