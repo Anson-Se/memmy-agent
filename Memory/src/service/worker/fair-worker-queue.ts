@@ -46,7 +46,9 @@ type ScanContinuation = {
  * configuration, classification and due-time changes still invalidate the scan. */
 export interface FairWorkerScan {
   inspected: number;
+  /** Waiters survive a completed pass or a filled execution slot. */
   blocked: boolean;
+  /** Whether to yield and immediately continue; independent of cursor lifetime. */
   more: boolean;
   continuation?: ScanContinuation;
   fingerprint?: string;
@@ -60,6 +62,28 @@ export function releaseFairWorkerResources(scan: FairWorkerScan, resources: read
   if (!scan.continuation) return;
   scan.continuation.agingSkippedLanes = scan.continuation.agingSkippedLanes.filter(lane => !lanes.has(lane));
   if (lanes.has("interactive")) scan.continuation.interactiveDenied = false;
+}
+
+function dependencyKey(job: EvolutionJobRecord): string | undefined {
+  if (["l3_world_model_update", "work_memory_extract"].includes(job.jobType) && job.scopeKey) {
+    return JSON.stringify(["dependency", "scope", job.jobType, job.scopeKey]);
+  }
+  if (job.jobType === "reward" && typeof job.payload.l1MemoryId === "string") {
+    return JSON.stringify(["dependency", "memory", job.payload.l1MemoryId]);
+  }
+  return undefined;
+}
+
+/** Completion only wakes related SQL dependencies, not every historical task. */
+export function releaseFairWorkerDependencies(scan: FairWorkerScan, work: FairClaimedWork): void {
+  const keys: string[] = [];
+  if (work.queue === "main") {
+    if (["l3_world_model_update", "work_memory_extract"].includes(work.job.jobType)) {
+      const key = dependencyKey(work.job); if (key) keys.push(key);
+    }
+    if (work.job.targetMemoryId) keys.push(JSON.stringify(["dependency", "memory", work.job.targetMemoryId]));
+  } else keys.push(JSON.stringify(["dependency", "memory", work.retry.targetId]));
+  releaseFairWorkerResources(scan, keys);
 }
 
 function normalizeFilter(values: readonly string[] | undefined): string[] | undefined {
@@ -138,11 +162,13 @@ function claimAdmittedWorkerBatch(
     includeDueFailed: input.options.algorithm === "wrr"
   };
   const admissions: WorkAdmission[] = [];
+  let admissionBlocked = false;
   const limit = Math.max(0, Math.min(FAIR_CLAIM_BATCH_LIMIT, Math.floor(input.limit)));
   function tryClaim(work: FairClaimedWork, candidate?: SchedulingCandidate): FairClaimedWork | undefined {
     const acquired = input.admit!(work);
     if (!acquired) return undefined;
     if ("blockedOn" in acquired) {
+      admissionBlocked = true;
       if (candidate) input.scan?.waiting.park(candidate, acquired.blockedOn);
       return undefined;
     }
@@ -193,7 +219,12 @@ function claimAdmittedWorkerBatch(
       let inspected = 0;
       const inspectLimit = scan ? FAIR_SCAN_CANDIDATE_LIMIT : Number.POSITIVE_INFINITY;
       const saveScan = (more: boolean) => {
-        if (scan) { scan.inspected = inspected; scan.more = more; scan.continuation = more ? state : undefined; }
+        if (scan) {
+          scan.inspected = inspected;
+          scan.more = more || scan.waiting.hasPendingPrune;
+          scan.continuation = input.options.algorithm === "wrr" || more ? state : undefined;
+          scan.blocked = scan.waiting.size > 0;
+        }
       };
       if (input.options.algorithm === "legacy") {
         // Offsets become invalid when another macro task removes or leases an
@@ -234,16 +265,23 @@ function claimAdmittedWorkerBatch(
       // An upgrade may leave thousands of older rows with stale policy. Finish
       // their active-task projection before FIFO selection, but never do all writes in one
       // event-loop turn. Recheck each slice for metadata dirtied between turns.
+      const beforeProjectionRevision = repos.runtime.scheduling.getSelectionRevision();
       const projection = repos.runtime.scheduling.refreshActivePolicies({ includeRetries: input.includeRetries,
         ...(scan ? { maxRows: inspectLimit } : {}) });
       if (scan) {
         inspected += projection.refreshed;
-        if (projection.refreshed > 0) {
+        if (repos.runtime.scheduling.getSelectionRevision() !== beforeProjectionRevision) {
           scan.waiting.clear();
           state.candidates = [];
           for (const bucket of state.buckets) { bucket.after = 0; bucket.exhausted = false; }
         }
         if (projection.hasMore || inspected >= inspectLimit) { saveScan(true); return []; }
+      }
+      if (scan) {
+        inspected += scan.waiting.pruneHeads(candidate => repos.runtime.scheduling.isPendingCandidate(candidate), inspectLimit - inspected,
+          (candidate, resource) => resource.startsWith('["dependency",') &&
+            repos.runtime.scheduling.isEligibleCandidate(candidate, input.at, request));
+        if (inspected >= inspectLimit) { saveScan(true); return []; }
       }
       const cursorKey = scopeCursorKey(request);
       const weightsKey = QUEUE_LANES.map(lane => input.options.laneWeights[lane]).join("/");
@@ -256,18 +294,31 @@ function claimAdmittedWorkerBatch(
         for (const bucket of buckets) {
           if (bucket.exhausted || candidates.some(candidate => candidate.queue === bucket.queue && candidate.lane === bucket.lane)) continue;
           const page = repos.runtime.scheduling.candidatePage({ ...request, ...bucket, limit: 200,
-            afterEnqueueSeq: bucket.after, includeUnregistered: true });
+            afterEnqueueSeq: bucket.after, includeUnregistered: true, includeDependencyBlocked: true });
           if (page.length) bucket.after = page[page.length - 1]!.enqueueSeq;
           bucket.exhausted = page.length < 200;
           candidates.push(...page);
         }
       }
       let exhausted = false;
+      const deniedLanes = new Set<QueueLane>();
       while (claimed.length < limit && inspected < inspectLimit) {
         refill();
-        const ready = scan?.waiting.heads() ?? [];
+        // A deleted ID may already have been reinserted with a new sequence.
+        // Discard stale ready heads before combining them with discovery pages.
+        const heads = scan?.waiting.heads() ?? [];
+        const ready = heads.filter(candidate => {
+          if (repos.runtime.scheduling.isPendingCandidate(candidate)) return true;
+          scan?.waiting.take(candidate);
+          return false;
+        });
+        if (ready.length !== heads.length) { inspected++; continue; }
         const readyKeys = new Set(ready.map(candidate => `${candidate.queue}:${candidate.id}`));
-        const selectable = [...candidates.filter(candidate => !readyKeys.has(`${candidate.queue}:${candidate.id}`)), ...ready];
+        const available = [...candidates.filter(candidate => !readyKeys.has(`${candidate.queue}:${candidate.id}`)), ...ready];
+        // A denied lane consumes no ticket, but must let other lanes try their
+        // already assigned tickets before probing its next blocked row.
+        let selectable = available.filter(candidate => !deniedLanes.has(candidate.lane));
+        if (!selectable.length) { deniedLanes.clear(); selectable = available; }
         // A page that has never contained a row proves an empty lane. Exhausted
         // pages after rejected candidates do not: their unspent turn survives.
         selector.dropEmpty(new Set(QUEUE_LANES.filter(lane =>
@@ -283,15 +334,30 @@ function claimAdmittedWorkerBatch(
         inspected++;
         let result: FairClaimedWork | undefined;
         const acquiredBefore = admissions.length;
+        admissionBlocked = false;
         const blocked = scan?.waiting.isBlocked(chosen);
         if (blocked && scan) scan.blocked = true;
         if (!blocked) scan?.waiting.take(chosen);
-        if (!blocked && chosen.queue === "main") {
+        const eligible = !blocked && repos.runtime.scheduling.isEligibleCandidate(chosen, input.at, request);
+        if (!blocked && !eligible && scan && chosen.queue === "main") {
+          const job = repos.runtime.getJob(chosen.id);
+          const key = job && dependencyKey(job);
+          if (key && repos.runtime.scheduling.isPendingCandidate(chosen)) {
+            scan.waiting.park(chosen, key); admissionBlocked = true;
+          }
+        }
+        if (eligible && chosen.queue === "main") {
           const job = repos.runtime.getJob(chosen.id);
           if (job) result = tryClaim({ queue: "main", job }, chosen);
-        } else if (!blocked && chosen.queue === "embedding_retry") {
+        } else if (eligible && chosen.queue === "embedding_retry") {
           const retry = repos.runtime.getEmbeddingRetry(chosen.id);
           if (retry) result = tryClaim({ queue: "embedding_retry", retry }, chosen);
+        }
+        if (!result && (blocked || admissionBlocked)) deniedLanes.add(chosen.lane);
+        if (!result && admissions.length > acquiredBefore && scan && repos.runtime.scheduling.isEligibleCandidate(chosen, input.at, request)) {
+          // A transient CAS miss must not permanently hide a still-runnable row.
+          // Retry on the next fill, preserving its original sequence.
+          scan.waiting.park(chosen, "claim_retry");
         }
         if (result) {
           claimed.push({ ...result, selectionReason: interactive ? "interactive" : aged ? "aging" : "wrr" });
@@ -305,6 +371,7 @@ function claimAdmittedWorkerBatch(
         }
         if (interactive && !result && admissions.length === acquiredBefore) state.interactiveDenied = true;
       }
+      scan?.waiting.release(["claim_retry"]);
       state.turns = selector.snapshot();
       saveScan(!exhausted && claimed.length < limit);
       if (claimed.length) repos.runtime.setKv(cursorKey, { weightsKey, cursor: selector.getCursor(), turns: selector.snapshot() }, input.at);

@@ -7,6 +7,7 @@ import { MemoryDb } from "../../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../../src/storage/repositories.js";
 import { WorkerRunner, type WorkerRunnerDeps } from "../../../src/service/worker/worker-runner.js";
 import { WorkerConcurrencyController, type WorkerProviderDescriptor } from "../../../src/service/worker/worker-concurrency.js";
+import { WorkerAdmissionWaitSet } from "../../../src/service/worker/worker-admission-wait-set.js";
 import { createCapturingEmbedder } from "../../fixtures/memory-service-fixture.js";
 
 const resources: Array<{ root: string; db: MemoryDb; runner: WorkerRunner; concurrency: WorkerConcurrencyController }> = [];
@@ -89,6 +90,221 @@ function blockedBacklog(h: ReturnType<typeof harness>, count = 1000) {
 }
 
 describe("continuous worker event-loop fairness", () => {
+  it.each([1, 10_000, 50_000])("bounds repeated candidate reads with %i blocked rows and ongoing arrivals", async count => {
+    const h = harness(), backlog = blockedBacklog(h, count), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const enqueued = new Map<string, number>(), waits: number[] = [];
+    let pageCalls = 0, rowsRead = 0;
+    const inspections = vi.spyOn(WorkerAdmissionWaitSet.prototype, "isBlocked");
+    const page = h.repos.runtime.scheduling.candidatePage.bind(h.repos.runtime.scheduling);
+    vi.spyOn(h.repos.runtime.scheduling, "candidatePage").mockImplementation(input => {
+      const rows = page(input); pageCalls++; rowsRead += rows.length; return rows;
+    });
+    const process = h.deps.jobHandlers.processJob;
+    h.deps.jobHandlers.processJob = async job => {
+      waits.push(performance.now() - enqueued.get(job.id)!);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      await process(job);
+    };
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 49; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const id = `live-${i}`; enqueued.set(id, performance.now());
+        h.job(id, "user_memory_embedding"); h.runner.notifyWorkAvailable();
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const sample = { backlog: count, added: enqueued.size, started: waits.length, notStarted: enqueued.size - waits.length,
+        meanWaitMs: waits.reduce((a,b) => a+b, 0) / waits.length, maxWaitMs: Math.max(...waits), pageCalls, rowsRead, candidateChecks: inspections.mock.calls.length };
+      console.log("CONTINUOUS_ARRIVALS", JSON.stringify(sample));
+      expect(waits).toHaveLength(49);
+      expect(Math.max(...waits)).toBeLessThan(1000);
+      expect(rowsRead).toBeLessThanOrEqual(count + 49 + 200);
+      expect(inspections.mock.calls.length).toBeLessThanOrEqual(count + 49 + 200);
+      expect(pageCalls).toBeLessThan(count / 64 * 12 + 2000);
+      expect(backlog.prepared()).toBeLessThanOrEqual(count + 49);
+      expect(backlog.prepared()).toBeGreaterThan(49);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    // A later finite request starts from durable FIFO, not the cancelled scan.
+    h.deps.jobHandlers.processJob = process;
+    const resumed = await h.runner.runWorkerOnce(Math.min(3, count));
+    expect(resumed.jobs.map(job => job.jobId)).toEqual(Array.from({ length: Math.min(3, count) }, (_, i) => `blocked-${i}`));
+    h.expectClean();
+  }, 30_000);
+
+  it.each(["available", "runAfter", "expiredLease"] as const)("discovers a new delayed row behind the retained cursor when %s becomes due", async boundary => {
+    const h = harness(), backlog = blockedBacklog(h, 100), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    let clock = Date.now();
+    h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 8; i++) await nextTurn();
+      h.job("new-delayed", "user_memory_embedding");
+      const future = new Date(clock + 1000).toISOString();
+      if (boundary === "available") h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='new-delayed'").run(future);
+      else if (boundary === "runAfter") h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='new-delayed'").run(JSON.stringify({ runAfter: future }));
+      else h.db.db.prepare("UPDATE evolution_jobs SET status='leased', leased_until=? WHERE id='new-delayed'").run(future);
+      h.job("new-ready", "user_memory_embedding"); h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 12; i++) await nextTurn();
+      expect(h.processed).toEqual(["new-ready"]);
+      clock += 2000; h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 12; i++) await nextTurn();
+      expect(h.processed).toEqual(["new-ready", "new-delayed"]);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("finishes a bounded dependency sweep after one wake and then sleeps", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 1), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const at = new Date().toISOString();
+    h.repos.transaction(() => {
+      for (let i = 0; i < 200; i++) {
+        const id = `dependency-${i}`;
+        h.db.db.prepare(`INSERT INTO memories(id,timeline,user_id,memory_value,memory_layer,created_at,updated_at)
+          VALUES (?,?,'event-loop-user','synthetic','L1',?,?)`).run(id, at, at, at);
+        h.db.db.prepare(`INSERT INTO memory_processing_state(memory_id,state,stage,updated_at)
+          VALUES (?,'embedding_pending','embedding',?)`).run(id, at);
+        h.job(`reward-${i}`, "reward");
+        h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id=?")
+          .run(JSON.stringify({ l1MemoryId: id, polarity: "positive" }), `reward-${i}`);
+        h.repos.runtime.scheduling.refreshOne("main", `reward-${i}`);
+      }
+    });
+    const pending = vi.spyOn(h.repos.runtime.scheduling, "isPendingCandidate");
+    const eligible = vi.spyOn(h.repos.runtime.scheduling, "isEligibleCandidate");
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 40; i++) await nextTurn();
+      expect(h.processed).toEqual([]);
+      const idleChecks = pending.mock.calls.length;
+      for (let i = 0; i < 10; i++) await nextTurn();
+      expect(pending.mock.calls.length).toBe(idleChecks);
+      eligible.mockClear(); h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 20; i++) await nextTurn();
+      const target = eligible.mock.calls.filter(([candidate]) => candidate.id.startsWith("reward-")).at(-1)![0].id;
+      h.db.db.prepare("UPDATE memory_processing_state SET state='ready' WHERE memory_id=?")
+        .run(target.replace("reward-", "dependency-"));
+      h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 40; i++) await nextTurn();
+      expect(h.processed).toEqual([target]);
+      const completedChecks = pending.mock.calls.length;
+      for (let i = 0; i < 10; i++) await nextTurn();
+      expect(pending.mock.calls.length).toBe(completedChecks);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it.each(["available", "runAfter", "expiredLease", "failed"] as const)("retains a %s deadline crossed inside the final discovery page", async boundary => {
+    const h = harness(), abort = new AbortController();
+    let clock = Date.now();
+    h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    h.job("due-during-query", "trace_summary");
+    const future = new Date(clock + 10).toISOString();
+    if (boundary === "available" || boundary === "failed") {
+      h.db.db.prepare("UPDATE evolution_jobs SET available_at=?,status=? WHERE id='due-during-query'")
+        .run(future, boundary === "failed" ? "failed" : "queued");
+    } else if (boundary === "runAfter") {
+      h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='due-during-query'").run(JSON.stringify({ runAfter: future }));
+    } else h.db.db.prepare("UPDATE evolution_jobs SET status='leased',leased_until=? WHERE id='due-during-query'").run(future);
+    const backlog = blockedBacklog(h, 1);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    h.db.db.prepare("UPDATE evolution_jobs SET queue_lane='interactive'").run();
+    const prepare = h.deps.prepareExecution!;
+    h.deps.prepareExecution = work => work.queue === "main" && work.job.id === "due-during-query"
+      ? { providers: [], run: operation => operation() } : prepare(work);
+    const page = h.repos.runtime.scheduling.candidatePage.bind(h.repos.runtime.scheduling);
+    let crossed = false;
+    vi.spyOn(h.repos.runtime.scheduling, "candidatePage").mockImplementation(input => {
+      const rows = page(input);
+      if (!crossed && rows.some(row => row.id === "blocked-0")) { clock += 20; crossed = true; }
+      return rows;
+    });
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 20; i++) await nextTurn();
+      expect(crossed).toBe(true);
+      expect(h.processed).toEqual(["due-during-query"]);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("does not reread a fully scanned backlog after idle wakeups and a normal refill", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 1000), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const page = h.repos.runtime.scheduling.candidatePage.bind(h.repos.runtime.scheduling);
+    let rowsRead = 0;
+    vi.spyOn(h.repos.runtime.scheduling, "candidatePage").mockImplementation(input => {
+      const rows = page(input); rowsRead += rows.length; return rows;
+    });
+    let ended = false;
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal }).then(result => { ended = true; return result; });
+    try {
+      for (let i = 0; i < 50; i++) await nextTurn();
+      expect(backlog.prepared()).toBe(1000); expect(rowsRead).toBe(1000);
+      for (let i = 0; i < 10; i++) { h.runner.notifyWorkAvailable(); await nextTurn(); }
+      h.job("new-live", "user_memory_embedding"); h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 10; i++) await nextTurn();
+      expect(h.processed).toEqual(["new-live"]); expect(rowsRead).toBe(1001);
+      // Old/raw producers classify at the next slice, without rewinding older
+      // resource-blocked rows merely because this new sequence had no policy.
+      const at = new Date().toISOString();
+      h.db.db.prepare(`INSERT INTO evolution_jobs(id,job_type,status,user_id,payload_json,created_at,updated_at)
+        VALUES ('raw-live','user_memory_embedding','queued','event-loop-user','{}',?,?)`).run(at, at);
+      h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 10; i++) await nextTurn();
+      expect(h.processed).toEqual(["new-live", "raw-live"]); expect(rowsRead).toBe(1002);
+      expect(ended).toBe(false);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("keeps dependency-blocked rows parked through unrelated completions and rediscovers them after an external dependency change", async () => {
+    const h = harness(), backlog = blockedBacklog(h, 1), abort = new AbortController();
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const at = new Date().toISOString();
+    h.db.db.prepare(`INSERT INTO memories(id,timeline,user_id,memory_value,memory_layer,created_at,updated_at)
+      VALUES ('dependency',?,'event-loop-user','synthetic','L1',?,?)`).run(at, at, at);
+    h.db.db.prepare(`INSERT INTO memory_processing_state(memory_id,state,stage,updated_at)
+      VALUES ('dependency','embedding_pending','embedding',?)`).run(at);
+    h.repos.transaction(() => {
+      for (let i = 0; i < 500; i++) {
+        const job = h.job(`reward-${i}`, "reward");
+        h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id=?")
+          .run(JSON.stringify({ l1MemoryId: "dependency", polarity: "positive" }), job.id);
+        h.repos.runtime.scheduling.refreshOne("main", job.id);
+      }
+    });
+    let rowsRead = 0;
+    const page = h.repos.runtime.scheduling.candidatePage.bind(h.repos.runtime.scheduling);
+    vi.spyOn(h.repos.runtime.scheduling, "candidatePage").mockImplementation(input => {
+      const rows = page(input); rowsRead += rows.length; return rows;
+    });
+    const process = h.deps.jobHandlers.processJob;
+    h.deps.jobHandlers.processJob = async job => {
+      await process(job);
+      if (job.id === "reward-2") { abort.abort(); h.runner.notifyWorkAvailable(); }
+    };
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 40; i++) await nextTurn();
+      expect(rowsRead).toBe(501); expect(h.processed).toEqual([]);
+      for (let i = 0; i < 5; i++) {
+        h.job(`independent-${i}`, "user_memory_embedding"); h.runner.notifyWorkAvailable();
+        for (let j = 0; j < 5; j++) await nextTurn();
+      }
+      expect(h.processed).toEqual(Array.from({ length: 5 }, (_, i) => `independent-${i}`));
+      expect(rowsRead).toBe(506);
+      // This update does not change policy revision or emit a model release.
+      h.db.db.prepare("UPDATE memory_processing_state SET state='ready' WHERE memory_id='dependency'").run();
+      h.runner.notifyWorkAvailable(); await run;
+      expect(h.processed.filter(id => id.startsWith("reward-")).slice(0, 3)).toEqual(["reward-0", "reward-1", "reward-2"]);
+      expect(rowsRead).toBe(506);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
   it("reaches an independent evolution Provider behind 20,000 blocked jobs during ongoing interference", async () => {
     const h = harness(), backlog = blockedBacklog(h, 20_000), abort = new AbortController();
     h.deps.scheduling = { algorithm: "wrr", aging: { enabled: true, thresholdMs: 1 } };

@@ -7,7 +7,7 @@ export interface QueueEligibilityOptions {
   includeDueFailed?: boolean;
 }
 
-export function mainQueueEligibility(at: string, options: QueueEligibilityOptions = {}): {
+export function mainQueueEligibility(at: string, options: QueueEligibilityOptions = {}, includeDependencyBlocked = false): {
   sql: string; params: Array<string | number>;
 } {
   const { targetMemoryIds, allowedJobTypes, excludedJobTypes } = options;
@@ -22,7 +22,7 @@ export function mainQueueEligibility(at: string, options: QueueEligibilityOption
              AND failure_count < max_attempts
              AND (available_at IS NULL OR available_at <= ?)
              AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
-             AND NOT (
+             AND ${includeDependencyBlocked ? "1=1" : `NOT (
                job_type = 'reward'
                AND json_extract(payload_json, '$.l1MemoryId') IS NOT NULL
                AND (
@@ -46,12 +46,12 @@ export function mainQueueEligibility(at: string, options: QueueEligibilityOption
                    OR memory_processing_state.state IN ('summary_pending', 'summarizing')
                    )
                )
-             )
+             )`}
              AND (
                json_extract(payload_json, '$.runAfter') IS NULL
                OR CAST(json_extract(payload_json, '$.runAfter') AS TEXT) <= ?
              )
-             AND (
+             AND ${includeDependencyBlocked ? "1=1" : `(
                job_type NOT IN ('l3_world_model_update', 'work_memory_extract')
                OR (
                  scope_key IS NOT NULL
@@ -73,7 +73,7 @@ export function mainQueueEligibility(at: string, options: QueueEligibilityOption
                      AND earlier_l3_job.status IN ('queued', 'leased', 'failed')
                  )
                )
-             )
+             )`}
              ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
              ${excludedJobTypes?.length ? `AND job_type NOT IN (${excludedJobTypes.map(() => "?").join(", ")})` : ""}
              ${targetFilter}`,

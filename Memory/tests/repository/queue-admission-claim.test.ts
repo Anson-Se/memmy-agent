@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryDb } from "../../src/storage/db.js";
 import { Repositories, type EvolutionJobRecord } from "../../src/storage/repositories.js";
-import { claimFairWorkerBatch, createFairWorkerScan, FAIR_SCAN_CANDIDATE_LIMIT, type FairWorkerScan, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
+import { claimFairWorkerBatch, createFairWorkerScan, releaseFairWorkerResources, FAIR_SCAN_CANDIDATE_LIMIT, type FairWorkerScan, type FairClaimedWork } from "../../src/service/worker/fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions } from "../../src/service/worker/worker-scheduling-options.js";
 
 const at = "2026-10-22T00:00:00.000Z", now = Date.parse(at);
@@ -173,7 +173,7 @@ describe("atomic resource admission before queue claims", () => {
     work[0]!.admission!.release();
   });
 
-  it("revalidates buffered rows by ID-CAS and returns permits for stale candidates", () => {
+  it("rejects stale buffered rows before requesting permits and still leases the next FIFO row", () => {
     const h = harness(), scan = createFairWorkerScan();
     for (let i = 0; i < 100; i++) h.job(`job-${i}`);
     expect(h.claim(1, () => undefined, "wrr", false, scan)).toEqual([]);
@@ -182,10 +182,28 @@ describe("atomic resource admission before queue claims", () => {
     const release = vi.fn();
     const work = h.claim(1, () => ({ release }), "wrr", false, scan);
     expect(work.map(item => item.queue === "main" && item.job.id)).toEqual(["job-65"]);
-    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
     expect(h.runtime.getJob("job-64")).toMatchObject({ status: "succeeded", attempts: 0 });
     work[0]!.admission!.release();
-    expect(release).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("distinguishes a deleted parked ID from its replacement before merging ready and new candidates", () => {
+    const h = harness(), scan = createFairWorkerScan();
+    const first = h.job("reused");
+    const input = { at, limit: 1, includeRetries: true, owner: "main", retryOwner: "retry",
+      leaseSeconds: 60, retryLeaseMs: 60_000, options: resolveWorkerSchedulingOptions({ algorithm: "wrr" }, {}), scan };
+    claimFairWorkerBatch(h.repos, { ...input, admit: () => ({ blockedOn: "old-provider" }) });
+    expect(scan.waiting.size).toBe(1); expect(scan.more).toBe(false);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='reused'").run();
+    const replacement = h.job("reused");
+    expect(replacement.enqueueSeq).toBeGreaterThan(first.enqueueSeq!);
+    releaseFairWorkerResources(scan, ["old-provider"]);
+    const acquired = vi.fn(() => ({ release() {} }));
+    const work = claimFairWorkerBatch(h.repos, { ...input, admit: acquired });
+    expect(work.map(item => item.queue === "main" && item.job.enqueueSeq)).toEqual([replacement.enqueueSeq]);
+    expect(acquired).toHaveBeenCalledTimes(1); expect(scan.waiting.size).toBe(0);
+    work[0]!.admission!.release();
   });
 
   it("persists unspent model turns while maintenance wraps the compatible legacy cursor", () => {

@@ -53,7 +53,7 @@ import { isObservationMemory, observationJobPayload, observationMemoryState, OBS
 import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/history-skill-policy.js";
 import { WorkerSchedulingShadow, type WorkerSchedulingComparison } from "./worker-scheduling-shadow.js";
 import { WorkerScheduler } from "./worker-scheduler.js";
-import { claimFairWorkerBatch, createFairWorkerScan, releaseFairWorkerResources, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
+import { claimFairWorkerBatch, createFairWorkerScan, releaseFairWorkerResources, releaseFairWorkerDependencies, FAIR_CLAIM_BATCH_LIMIT, type FairClaimedWork } from "./fair-worker-queue.js";
 import { resolveWorkerSchedulingOptions, type WorkerSchedulingOptions, type ResolvedWorkerSchedulingOptions } from "./worker-scheduling-options.js";
 import { JobPolicyRegistry, UnknownJobPolicyError } from "./job-policy-registry.js";
 import { resolveWorkerLeaseOptions, type WorkerLeaseOptions } from "./worker-lease-options.js";
@@ -589,6 +589,7 @@ export class WorkerRunner {
     let scanFilters = "";
     let scanDenied = false;
     let scanDeadline: number | undefined;
+    let deadlineWakeVersion = -1;
     let prepareExecution: WorkerRunnerDeps["prepareExecution"];
     const active = new Set<Promise<void>>();
     const selectedMain: string[] = [];
@@ -632,7 +633,7 @@ export class WorkerRunner {
         const paused = this.deps.memoryBudgetPaused();
         const filters = JSON.stringify([retryOnly, paused, this.deps.memoryBudgetModelSources(), this.summaryJobsHeld(),
           this.deps.configurationFingerprint?.()]);
-        if (!scan.more) scanDenied = false;
+        if (!scan.more) scanDenied = scan.waiting.size > 0;
         if (scanFilters !== filters ||
           (scanDeadline !== undefined && scanDeadline <= this.nowMs())) {
           scan = createFairWorkerScan();
@@ -640,6 +641,16 @@ export class WorkerRunner {
           scanDenied = false;
           scanDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
           prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
+        }
+        if (deadlineWakeVersion !== this.wakeVersion) {
+          // A new enqueue/retry can introduce an earlier due time while a deep
+          // scan is yielding. Expired saved deadlines were handled above first.
+          const nextDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
+          // Keep the earlier deadline until the next loop handles it, including
+          // when time advances between the expiry check and this query.
+          scanDeadline = scanDeadline === undefined ? nextDeadline
+            : nextDeadline === undefined ? scanDeadline : Math.min(scanDeadline, nextDeadline);
+          deadlineWakeVersion = this.wakeVersion;
         }
         const capacity = Math.min(remaining, this.concurrency.availableJobs(), FAIR_CLAIM_BATCH_LIMIT);
         if (filled && capacity > 0 && !retryOnly && options.algorithm === "legacy") {
@@ -708,7 +719,7 @@ export class WorkerRunner {
           }
         }) : [];
         claiming = false;
-        scanDenied ||= denied || scan.blocked;
+        scanDenied = denied || scan.blocked;
         denied = scanDenied;
         remaining -= work.length;
         jobsThisTurn += work.length;
@@ -754,7 +765,10 @@ export class WorkerRunner {
               }
             } finally { stopMainHeartbeat(); stopRetryHeartbeat(); }
           }))).catch(error => { if (!failedDrain) fatal = error; failedDrain = true; }).finally(() => {
-            for (const item of group.work) item.admission?.release();
+            for (const item of group.work) {
+              releaseFairWorkerDependencies(scan, item);
+              item.admission?.release();
+            }
             active.delete(task);
             this.notifyWorkAvailable();
           });
@@ -770,13 +784,20 @@ export class WorkerRunner {
           jobsThisTurn = 0;
           continue;
         }
+        // SQLite discovery can cross a saved deadline within this synchronous
+        // turn. Handle it before either exiting or replacing it with a future
+        // deadline, otherwise a skipped older sequence can remain invisible.
+        const now = this.nowMs();
+        if (scanDeadline !== undefined && scanDeadline <= now) continue;
         if (active.size === 0) {
           const snapshot = this.concurrency.snapshot();
           if (!denied || (snapshot.activeJobs === 0 && snapshot.embeddingRequests === 0 && Object.keys(snapshot.providers).length === 0)) break;
         }
         const wake = waitForWake(this.wakeVersion);
-        const now = this.nowMs();
         const deadline = this.nextAdmissionDeadline(now, request.targetMemoryIds, retryOnly);
+        // Newly queued delays and retries may appear after the initial scan.
+        // Retain their wake deadline so an older sequence is revisited when due.
+        scanDeadline = deadline;
         // Already due rows may be blocked on a permit or dependency. They must
         // not hide a future deadline or create a repeating zero-delay timer.
         const timer = deadline === undefined ? undefined : setTimeout(

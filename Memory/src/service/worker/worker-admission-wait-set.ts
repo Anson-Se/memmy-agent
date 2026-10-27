@@ -2,8 +2,9 @@ import type { SchedulingCandidate } from "../../storage/queue-scheduling-store.j
 import { QUEUE_LANES, type QueueLane } from "./job-policy-registry.js";
 
 type Entry = { candidate: SchedulingCandidate; group: { ready: boolean } };
+type BlockedGroup = { ready: boolean; root?: Node };
 type Node = { entry: Entry; child?: Node; sibling?: Node };
-const keyOf = (candidate: SchedulingCandidate) => `${candidate.queue}:${candidate.id}`;
+const keyOf = (candidate: SchedulingCandidate) => `${candidate.queue}:${candidate.id}:${candidate.enqueueSeq}`;
 function before(a: Node, b: Node): boolean {
   const x = a.entry.candidate, y = b.entry.candidate;
   return x.enqueueSeq < y.enqueueSeq || (x.enqueueSeq === y.enqueueSeq &&
@@ -37,11 +38,19 @@ function pop(root: Node): Node | undefined {
  * lease CAS. Waiting never changes the persisted enqueue sequence or owns permits. */
 export class WorkerAdmissionWaitSet {
   private readonly entries = new Map<string, Entry>();
-  private readonly blocked = new Map<string, Map<QueueLane, { ready: boolean; root?: Node }>>();
+  private readonly blocked = new Map<string, Map<QueueLane, BlockedGroup>>();
   private readonly ready = new Map<QueueLane, Node | undefined>();
 
+  private pruning?: Generator<{ resource: string; lane: QueueLane; lanes: Map<QueueLane, BlockedGroup>; group: BlockedGroup }>;
+  private *pruneGroups() {
+    for (const [resource, lanes] of this.blocked) for (const [lane, group] of lanes) yield { resource, lanes, lane, group };
+  }
+
   get size(): number { return this.entries.size; }
-  clear(): void { this.entries.clear(); this.blocked.clear(); this.ready.clear(); }
+  /** Finish this bounded sweep before sleeping; a completed sweep stays idle
+   * until the next refill/wake initiates another one. */
+  get hasPendingPrune(): boolean { return this.pruning !== undefined; }
+  clear(): void { this.entries.clear(); this.blocked.clear(); this.ready.clear(); this.pruning = undefined; }
   isBlocked(candidate: SchedulingCandidate): boolean {
     const entry = this.entries.get(keyOf(candidate));
     return entry !== undefined && !entry.group.ready;
@@ -70,6 +79,34 @@ export class WorkerAdmissionWaitSet {
       }
     }
     return lanes;
+  }
+  /** Probe only heap heads, never walk the stable blocked backlog on a refill.
+   * Terminal/deleted entries are removed in bounded slices. */
+  pruneHeads(isPending: (candidate: SchedulingCandidate) => boolean, limit: number,
+    isReady?: (candidate: SchedulingCandidate, resource: string) => boolean): number {
+    let removed = 0, checked = 0;
+    this.pruning ??= this.pruneGroups();
+    while (checked < limit) {
+      const next = this.pruning.next();
+      if (next.done) { this.pruning = undefined; break; }
+      const { resource, lane, lanes, group } = next.value;
+      if (group.ready || !group.root) continue;
+      while (group.root && checked < limit) {
+        checked++;
+        if (isPending(group.root.entry.candidate)) {
+          if (isReady?.(group.root.entry.candidate, resource)) this.release([resource]);
+          break;
+        }
+        const root = group.root;
+        this.entries.delete(keyOf(root.entry.candidate));
+        group.root = pop(root); removed++;
+      }
+      if (!group.root) lanes.delete(lane);
+      if (!lanes.size) this.blocked.delete(resource);
+      // Restart at this resource next slice after a full batch of removals.
+      if (removed === limit) { this.pruning = undefined; break; }
+    }
+    return removed;
   }
   heads(): SchedulingCandidate[] {
     return QUEUE_LANES.flatMap(lane => {

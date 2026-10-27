@@ -53,6 +53,20 @@ export class QueueSchedulingStore {
     return selectionRevisions.get(this.db) ?? 0;
   }
 
+  isPendingCandidate(candidate: SchedulingCandidate): boolean {
+    const table = candidate.queue === "main" ? "evolution_jobs" : "embedding_retry_queue";
+    return !!this.db.prepare(`SELECT 1 FROM ${table} WHERE id = ? AND enqueue_seq = ?
+      AND ${activePolicyPredicate(table)}`).get(candidate.id, candidate.enqueueSeq);
+  }
+
+  isEligibleCandidate(candidate: SchedulingCandidate, at: string, options: QueueEligibilityOptions): boolean {
+    const condition = candidate.queue === "main" ? mainQueueEligibility(at, options)
+      : retryQueueEligibility(Date.parse(at), options.targetMemoryIds);
+    const table = candidate.queue === "main" ? "evolution_jobs" : "embedding_retry_queue q";
+    return !!this.db.prepare(`SELECT 1 FROM ${table} WHERE ${condition.sql} AND id = ? AND enqueue_seq = ?`)
+      .get(...condition.params, candidate.id, candidate.enqueueSeq);
+  }
+
   readSnapshot<T>(read: () => T): T {
     return this.db.transaction(read)();
   }
@@ -259,9 +273,11 @@ export class QueueSchedulingStore {
   candidatePage(input: QueueEligibilityOptions & {
     at: string; limit: number; queue: SchedulingCandidate["queue"]; lane: QueueLane;
     afterEnqueueSeq?: number; includeUnregistered?: boolean;
+    /** Discovery only; ID eligibility and lease CAS still enforce dependencies. */
+    includeDependencyBlocked?: boolean;
   }): SchedulingCandidate[] {
     if (input.limit <= 0) return [];
-    const main = mainQueueEligibility(input.at, input);
+    const main = mainQueueEligibility(input.at, input, input.includeDependencyBlocked);
     const retry = retryQueueEligibility(Date.parse(input.at), input.targetMemoryIds);
     const limit = Math.max(1, Math.min(200, Math.floor(input.limit)));
     const includeUnknown = input.includeUnregistered === true && input.lane === "maintenance";

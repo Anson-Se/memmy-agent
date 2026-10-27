@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WorkerConcurrencyController, workerCapacityKey, type WorkerConcurrencyOptions, type WorkerRequirements } from "../../../src/service/worker/worker-concurrency.js";
 import { WorkerAdmissionWaitSet } from "../../../src/service/worker/worker-admission-wait-set.js";
 import type { SchedulingCandidate } from "../../../src/storage/queue-scheduling-store.js";
@@ -62,6 +62,22 @@ describe("resource-specific worker wakeups", () => {
       workerCapacityKey("provider", "embedding-model"), workerCapacityKey("embedding_request")
     ]));
     await c.close();
+  });
+
+  it("bounds stale-head cleanup across many resources and continues it on later fills", () => {
+    const waiting = new WorkerAdmissionWaitSet();
+    for (let i = 0; i < 200; i++) waiting.park({ id: `job-${i}`, queue: "main", jobType: "trace_summary",
+      lane: "import", enqueueSeq: i + 1, basePriority: 2 }, `provider-${i}`);
+    const pending = vi.fn(() => true);
+    waiting.pruneHeads(pending, 64);
+    expect(pending).toHaveBeenCalledTimes(64);
+    pending.mockImplementation(() => false);
+    for (let i = 0; i < 6; i++) {
+      pending.mockClear(); waiting.pruneHeads(pending, 64);
+      expect(pending.mock.calls.length).toBeLessThanOrEqual(64);
+    }
+    expect(waiting.size).toBe(0);
+    expect(waiting.release(["provider-0"])).toEqual(new Set());
   });
 
   it("merges reawakened main and retry rows by their original FIFO sequence, including repeated blocking", () => {
