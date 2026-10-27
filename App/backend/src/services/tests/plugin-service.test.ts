@@ -105,6 +105,31 @@ function createContext(
 }
 
 describe("PluginService", () => {
+  it("hides a legacy private install after revocation and restores visibility when regranted", async () => {
+    let granted = true;
+    const legalRelease: PluginRelease = { manifest: {
+      ...release.manifest, id: "legal-labor", requiredEntitlement: "plugin:legal-labor",
+      permissions: [], configSchema: undefined
+    } };
+    const { service, artifactManager } = createContext([legalRelease], undefined, () => true,
+      () => granted ? ["legal-labor"] : [], () => granted);
+    await service.install("legal-labor");
+    expect(service.list()[0].eligibility?.visible).toBe(true);
+
+    granted = false;
+    expect(service.list()[0].eligibility).toEqual({
+      visible: false, canInstall: false, canUse: false, reason: "entitlement_required"
+    });
+    expect(await service.catalog()).toEqual([]);
+    await expect(service.enable("legal-labor")).rejects.toThrow(/access denied/);
+    expect(artifactManager.remove).not.toHaveBeenCalled();
+
+    granted = true;
+    expect(service.list()[0].eligibility?.visible).toBe(true);
+    expect((await service.catalog())[0].manifest.id).toBe("legal-labor");
+    expect(artifactManager.install).toHaveBeenCalledTimes(1);
+  });
+
   it("does not expose a private plugin from the public registry without its entitlement", async () => {
     const publicRelease: PluginRelease = { manifest: {
       ...release.manifest, id: "office", permissions: [], configSchema: undefined
