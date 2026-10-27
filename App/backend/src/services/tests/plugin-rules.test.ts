@@ -19,8 +19,15 @@ describe("plugin product policy", () => {
       const manifest = { requiredEntitlement: "plugin:legal", ...(rules ? { rules } : {}) };
       expect(pluginEligibility(manifest, true, () => false).canInstall).toBe(false);
       expect(pluginEligibility(manifest, true, () => false).reason).toBe("entitlement_required");
+      if (!rules) expect(pluginEligibility(manifest, true, () => false).visible).toBe(false);
       expect(pluginEligibility(manifest, true, (grant) => grant === "plugin:legal").canUse).toBe(true);
     }
+  });
+  it("allows an explicit policy to show an unavailable private plugin", () => {
+    const manifest = { requiredEntitlement: "plugin:legal", rules: PluginRulesSchema.parse({ unavailableVisibility: "visible" }) };
+    expect(pluginEligibility(manifest, true, () => false)).toEqual({
+      visible: true, canInstall: false, canUse: false, reason: "entitlement_required"
+    });
   });
   it("does not turn a model recommendation into an access restriction", () => {
     const manifest = { rules: PluginRulesSchema.parse({ recommendsOfficialModel: true }) };

@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstalledPluginSchema, type PluginPermission } from "@memmy/local-api-contracts";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
-import { PluginMarketplace } from "../plugin-marketplace.js";
+import { marketplacePlugins, PluginMarketplace } from "../plugin-marketplace.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const context = vi.hoisted(() => ({
@@ -183,6 +183,49 @@ describe("live marketplace controller", () => {
     expect(addToChatButton()).not.toBeNull();
   });
 
+  it("refreshes installed eligibility after account revocation even when the catalog fails", async () => {
+    records = [legal];
+    let finishSession!: () => void;
+    clients.account.getSession.mockImplementationOnce(() => new Promise<undefined>((resolve) => {
+      finishSession = () => {
+        records = [{ ...legal, eligibility: {
+          visible: false, canInstall: false, canUse: false, reason: "entitlement_required"
+        } }];
+        resolve(undefined);
+      };
+    }));
+    clients.plugins.catalog.mockRejectedValueOnce(new Error("catalog unavailable"));
+    await render();
+    expect(container.querySelector('article[aria-label="用工合规诊断"]')).not.toBeNull();
+    await act(async () => finishSession());
+    expect(container.querySelector('article[aria-label="用工合规诊断"]')).toBeNull();
+    expect(container.textContent).toContain("已安装 (0)");
+    await click("已安装 (0)");
+    expect(container.querySelector('article[aria-label="用工合规诊断"]')).toBeNull();
+    expect(records).toHaveLength(1);
+    expect(clients.plugins.uninstall).not.toHaveBeenCalled();
+  });
+
+  it("does not reintroduce hidden plugins when catalog and installed eligibility disagree", () => {
+    const denied = { visible: false, canInstall: false, canUse: false, reason: "entitlement_required" as const };
+    const allowed = { visible: true, canInstall: true, canUse: true, reason: null };
+    expect(marketplacePlugins([{ manifest: legal.manifest, eligibility: denied }], [legal])).toEqual([]);
+    expect(marketplacePlugins([{ manifest: legal.manifest, eligibility: allowed }], [{ ...legal, eligibility: denied }])).toEqual([]);
+  });
+
+  it("ignores an older installation read that finishes after refreshed eligibility", async () => {
+    let finishOldRead!: (plugins: typeof records) => void;
+    clients.plugins.list.mockImplementationOnce(() => new Promise(resolve => { finishOldRead = resolve; }));
+    records = [{ ...legal, eligibility: {
+      visible: false, canInstall: false, canUse: false, reason: "entitlement_required"
+    } }];
+    await render();
+    expect(clients.plugins.list).toHaveBeenCalledTimes(2);
+    await act(async () => finishOldRead([legal]));
+    expect(container.querySelector('article[aria-label="用工合规诊断"]')).toBeNull();
+    expect(container.textContent).toContain("已安装 (0)");
+  });
+
   it("loads local plugins while account refresh and remote catalog are unavailable", async () => {
     records = [legal];
     clients.account.getSession.mockImplementationOnce(() => new Promise<undefined>(() => undefined));
@@ -200,7 +243,7 @@ describe("live marketplace controller", () => {
     let resolveModel!: (value: Awaited<ReturnType<typeof clients.config.getModelConfig>>) => void;
     clients.config.getModelConfig.mockImplementationOnce(() => new Promise((resolve) => { resolveModel = resolve; }));
     await render();
-    expect(clients.plugins.list).toHaveBeenCalledOnce();
+    expect(clients.plugins.list).toHaveBeenCalledTimes(2);
     expect(container.textContent).not.toContain("正在加载插件");
     expect(button("安装文献综述").disabled).toBe(false);
     await act(async () => resolveModel({ catalog: { effectiveCandidates: { account: [] } } }));
@@ -285,25 +328,27 @@ describe("live marketplace controller", () => {
 
   it("does not publish active state when final readback fails", async () => {
     await render();
-    clients.plugins.list.mockRejectedValueOnce(new Error("readback failed"));
+    clients.plugins.list.mockRejectedValue(new Error("readback failed"));
     await click("安装文献综述");
     expect(clients.plugins.enable).toHaveBeenCalledTimes(1);
     expect(addToChatButton()).toBeNull();
     expect(container.textContent).toContain("插件列表加载失败");
     expect(button("安装文献综述").disabled).toBe(true);
+    clients.plugins.list.mockImplementation(async () => [...records]);
     await click("刷新");
     expect(clients.plugins.install).toHaveBeenCalledTimes(1);
     expect(addToChatButton()).not.toBeNull();
   });
 
   it("does not turn an API failure into a forthcoming release and refresh recovers", async () => {
-    clients.plugins.list.mockRejectedValueOnce(new Error("offline"));
+    clients.plugins.list.mockRejectedValue(new Error("offline"));
     await render();
     expect(container.textContent).toContain("插件列表加载失败");
     expect(button("安装文献综述").disabled).toBe(true);
     expect(container.querySelector('article[aria-label="文献综述"]')?.textContent).not.toContain("即将上线");
     // The server catalog remains visible when reading installation state fails.
     expect(container.textContent).not.toContain("即将上线");
+    clients.plugins.list.mockImplementation(async () => [...records]);
     await click("刷新");
     expect(button("安装文献综述").disabled).toBe(false);
     expect(container.textContent).not.toContain("插件列表加载失败");
