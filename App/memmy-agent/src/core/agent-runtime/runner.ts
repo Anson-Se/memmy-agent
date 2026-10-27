@@ -1,19 +1,20 @@
+import { requestTiming } from "../../utils/request-timing.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
 import path from "node:path";
 import { LLMProvider, LLMResponse, ToolCallRequest } from "../../providers/base.js";
 import {
   coversInputModalities,
-  getModelInputModalities,
   hasDeclaredInputModalities,
   requiredInputModalities,
+  resolveModelInputModalities,
 } from "../../providers/model-input-capabilities.js";
 import type { ActualModelContext } from "@memmy/local-api-contracts";
 import { CONTEXT_SAFETY_BUFFER_TOKENS } from "../../token-budget.js";
 import { ToolRegistry } from "./tools/registry.js";
 import type { FileMutationOutcome, ToolExecutionContext } from "./tools/base.js";
 import { withToolExecutionRequestContext } from "./tools/context.js";
-import { AgentHook, AgentHookContext } from "./hook.js";
+import { AgentHook, AgentHookContext, type AgentHookMessage } from "./hook.js";
 import {
   buildFinalizationRetryMessage,
   buildLengthRecoveryMessage,
@@ -29,6 +30,8 @@ import {
   extractReasoning,
   IncrementalThinkExtractor,
   maybePersistToolResult,
+  formatExternalToolText,
+  type ToolOutputFile,
   stripThink,
   truncateText,
 } from "../../utils/helpers.js";
@@ -48,6 +51,7 @@ import { renderTemplate } from "../../utils/prompt-templates.js";
 import type { TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
 import { resolveToolResultMaxChars, type ToolResultMaxCharsByName } from "./tool-result-budget.js";
 import { convertMcpToolContent } from "./tools/mcp.js";
+import { OUTPUT_FEEDBACK_KEY, takeOutputPaths, withOutputPaths, type OutputDelivery } from "./tools/output-location.js";
 
 const DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
 const PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]";
@@ -157,6 +161,7 @@ export class AgentRunSpec {
   maxIterationsMessage: string | null;
   maxIterationsFinalPrompt: string | null;
   workspace?: string | null;
+  outputLocation?: OutputDelivery;
   sessionKey?: string | null;
   hostProjectId?: string | null;
   contextWindowTokens?: number | null;
@@ -196,6 +201,7 @@ export class AgentRunSpec {
     maxIterationsMessage?: string | null;
     maxIterationsFinalPrompt?: string | null;
     workspace?: string | null;
+    outputLocation?: OutputDelivery;
     sessionKey?: string | null;
     hostProjectId?: string | null;
     contextWindowTokens?: number | null;
@@ -233,6 +239,7 @@ export class AgentRunSpec {
     this.maxIterationsMessage = init.maxIterationsMessage ?? null;
     this.maxIterationsFinalPrompt = init.maxIterationsFinalPrompt ?? null;
     this.workspace = init.workspace ?? null;
+    this.outputLocation = init.outputLocation;
     this.sessionKey = init.sessionKey ?? null;
     this.hostProjectId = init.hostProjectId ?? null;
     this.contextWindowTokens = init.contextWindowTokens ?? null;
@@ -425,6 +432,7 @@ export class AgentRunner {
         delete providerMessage.turn_source;
         delete providerMessage.webui_queue_steer_origin;
         delete providerMessage.webui_queue_steer_recovery;
+        delete providerMessage[OUTPUT_FEEDBACK_KEY];
         return providerMessage;
       }),
       tools,
@@ -436,6 +444,21 @@ export class AgentRunner {
     if (spec.maxTokens != null) args.maxTokens = spec.maxTokens;
     if (spec.reasoningEffort != null) args.reasoningEffort = spec.reasoningEffort;
     return args;
+  }
+
+  private toolDefinitions(spec: AgentRunSpec): Record<string, any>[] {
+    const definitions = spec.tools?.getDefinitions?.() ?? [];
+    return spec.outputLocation ? withOutputPaths(definitions) : definitions;
+  }
+
+  private withOutputInstruction(spec: AgentRunSpec, messages: Record<string, any>[]): Record<string, any>[] {
+    if (!spec.outputLocation) return messages;
+    const instruction = spec.outputLocation.instruction();
+    const index = messages.findIndex((message) => message.role === "system" && typeof message.content === "string");
+    if (index < 0) return [{ role: "system", content: instruction }, ...messages];
+    return messages.map((message, position) => position === index
+      ? { ...message, content: `${message.content}\n\n${instruction}` }
+      : message);
   }
 
   private static imageIdentity(block: Record<string, any>): string {
@@ -676,15 +699,18 @@ export class AgentRunner {
     const messagesForModel = this.prepareImageMessages(this.applyToolResultBudget(spec, messages), imageTextState);
     const model = spec.actualModelContext?.model ?? spec.model;
     const required = requiredInputModalities(messagesForModel);
-    const supported = getModelInputModalities(model);
+    const declared = spec.actualModelContext?.inputModalities;
+    const supported = resolveModelInputModalities(model, declared);
     const missing = required.filter((modality) => !supported.includes(modality));
     const canUseAccountFallback = missing.length === 1
       && missing[0] === "image"
       && this.canRunAccountImageTextFallback(spec, null);
     // A BYOK model ID we have never reviewed may well be multimodal, and BYOK has no
     // image2text fallback to fall back on, so let the user's own endpoint answer rather
-    // than refusing the request here.
+    // than refusing the request here. Custom models always declare modalities, so a
+    // declaration is authoritative and must not defer.
     const deferToProvider = spec.actualModelContext?.source === "byok"
+      && !declared
       && !hasDeclaredInputModalities(model);
 
     let initialResponse: LLMResponse | null = null;
@@ -789,6 +815,7 @@ export class AgentRunner {
   }
 
   private async callProvider(provider: any, args: any, stream = false): Promise<LLMResponse> {
+    requestTiming("model.call_start");
     if (stream) {
       if (typeof provider.chatStreamWithRetry === "function") return provider.chatStreamWithRetry(args);
       if (typeof provider.chatStream === "function") return provider.chatStream(args);
@@ -811,7 +838,7 @@ export class AgentRunner {
     const shouldEmitLive = (): boolean => boundary?.shouldEmitLive() ?? spec.abortSignal?.aborted !== true;
     const timeoutS = normalizeTimeout(spec.llmTimeoutS);
     const tools = options.toolsOverride === undefined
-      ? spec.tools?.getDefinitions?.() ?? []
+      ? this.toolDefinitions(spec)
       : options.toolsOverride;
     const inputBudget = this.inputTokenBudget(spec);
     if (inputBudget != null) {
@@ -827,10 +854,11 @@ export class AgentRunner {
         });
       }
     }
-    const wantsStreaming = options.forceNonStreaming ? false : hook.wantsStreaming();
+    const forceNonStreaming = options.forceNonStreaming || hook.requiresBufferedLlmContent();
+    const wantsStreaming = forceNonStreaming ? false : hook.wantsStreaming();
     const providerRuntime = provider as any;
     const wantsProgressStreaming =
-      !options.forceNonStreaming &&
+      !forceNonStreaming &&
       !wantsStreaming &&
       spec.streamProgressDeltas &&
       spec.progressCallback &&
@@ -839,7 +867,7 @@ export class AgentRunner {
         (provider.constructor as any)?.supportsProgressDeltas === true
       );
     const args = this.buildRequestArgs(spec, messages, tools);
-    const liveFileEdits = !options.forceNonStreaming && spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
+    const liveFileEdits = !forceNonStreaming && spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
       ? new StreamingFileEditTracker({
         workspace: spec.workspace ?? null,
         tools: spec.tools,
@@ -1074,13 +1102,36 @@ export class AgentRunner {
       return { call, result: repeatedLookup + hint, event, error: spec.failOnToolError ? new Error(repeatedLookup) : null };
     }
 
+    if (call.name === "message" && spec.outputLocation) {
+      // A message is a delivery channel: it may not reach the user before the files do.
+      const problem = await spec.outputLocation.verify();
+      if (problem) {
+        const result = `Error: message not sent. ${problem} Do not tell the user the files are ready; finish them first.`;
+        const event = { name: call.name, status: "error", detail: eventDetail("", result, 120) };
+        return { call, result: result + hint, event, error: spec.failOnToolError ? new Error(result) : null };
+      }
+    }
+    const { args: toolArgs, outputPaths } = takeOutputPaths(call.name, call.arguments);
+    const declaresOutputs = Boolean(spec.outputLocation && Array.isArray(outputPaths) && outputPaths.length);
+    // Checked now, recorded only once the tool succeeded: a failed call leaves nothing to deliver.
+    let outputFiles: string[] = [];
+    if (spec.outputLocation && outputPaths !== undefined) {
+      const resolved = await spec.outputLocation.resolveOutputs(outputPaths);
+      if (typeof resolved === "string") {
+        const declarationError = resolved;
+        const event = { name: call.name, status: "error", detail: eventDetail("", declarationError, 120) };
+        return { call, result: declarationError + hint, event, error: spec.failOnToolError ? new Error(declarationError) : null };
+      }
+      outputFiles = resolved;
+    }
+
     const prepare = spec.tools?.prepareCall;
     let tool: any = null;
-    let params: any = call.arguments;
+    let params: any = toolArgs;
     let prepError: string | null = null;
     if (typeof prepare === "function") {
       try {
-        const prepared = prepare.call(spec.tools, call.name, call.arguments);
+        const prepared = prepare.call(spec.tools, call.name, toolArgs);
         if (Array.isArray(prepared) && prepared.length === 3) [tool, params, prepError] = prepared;
       } catch (error) {
         prepError = String((error as Error).message ?? error);
@@ -1123,9 +1174,23 @@ export class AgentRunner {
     let stopTurn: string | undefined;
     try {
       let raw: any;
+      let preparedText: { content: string; displayText?: string } | undefined;
+      let outputFile: ToolOutputFile | undefined;
       const fileMutationOutcomes = new Map<string, FileMutationOutcome>();
       await spec.hook?.beforeToolCall(new AgentHookContext({ spec, toolCalls: [call] }), call);
       const toolContext: ToolExecutionContext = {
+        outputLocation: spec.outputLocation,
+        ...(declaresOutputs ? { trackOutputProducer: (isRunning: () => boolean) => spec.outputLocation!.track(isRunning) } : {}),
+        maxResultChars: resolveToolResultMaxChars(call.name, spec.maxToolResultChars, spec.toolResultMaxCharsByName),
+        availableTools: (spec.tools?.getDefinitions?.() ?? []).map((definition: any) => definition.function?.name ?? definition.name).filter(Boolean),
+        formatTextResult: (text, options) => {
+          preparedText = formatExternalToolText(text, options, {
+            workspace: spec.workspace, sessionKey: spec.sessionKey, callId: call.id ?? "tool",
+            maxChars: resolveToolResultMaxChars(call.name, spec.maxToolResultChars, spec.toolResultMaxCharsByName),
+            onFile: (file) => { outputFile = file; },
+          });
+          return preparedText.content;
+        },
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
         callId: call.id ?? null,
@@ -1136,6 +1201,7 @@ export class AgentRunner {
             changed: outcome.changed,
           });
         },
+
       };
       const run = tool && typeof tool.execute === "function"
         ? tool.execute(params, toolContext)
@@ -1145,7 +1211,7 @@ export class AgentRunner {
       let event: Record<string, any>;
       let error: any = null;
       if (typeof raw === "string" && raw.startsWith("Error")) {
-        if (progressCallback && fileEditTrackers.length) {
+          if (progressCallback && fileEditTrackers.length) {
           await invokeFileEditProgress(
             progressCallback,
             fileEditTrackers.map((tracker) => buildFileEditErrorEvent(tracker, raw)),
@@ -1160,6 +1226,7 @@ export class AgentRunner {
         error = spec.failOnToolError ? new Error(raw) : null;
         raw = raw + hint;
       } else {
+        spec.outputLocation?.record(outputFiles);
         const detail = toolEventDetail(raw);
         event = { name: call.name, status: "ok", detail };
       }
@@ -1174,7 +1241,9 @@ export class AgentRunner {
           )),
         );
       }
-      const result = this.normalizeToolResult(spec, call.id, call.name, raw);
+      const result = preparedText?.content === raw ? raw : this.normalizeToolResult(spec, call.id, call.name, raw);
+      if (preparedText?.displayText !== undefined) event.display_text = preparedText.displayText;
+      if (outputFile) event.output_file = outputFile;
       if (stopTurn) event.status = "error";
       await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
       return { call, result, event, error, ...(stopTurn ? { stopTurn } : {}) };
@@ -1425,7 +1494,7 @@ export class AgentRunner {
     spec: AgentRunSpec,
     messages: Record<string, any>[],
     options: PrepareMessagesOptions = {
-      toolsForRequest: spec.tools?.getDefinitions?.() ?? [],
+      toolsForRequest: this.toolDefinitions(spec),
       reservedPromptTokens: 0,
     },
   ): Record<string, any>[] {
@@ -1576,6 +1645,8 @@ export class AgentRunner {
     spec.provider ??= this.provider;
     if (!spec.provider) throw new Error("AgentRunSpec.provider is required");
     const hook = spec.hook ?? new AgentHook();
+    const requiresBufferedLlmContent = hook.requiresBufferedLlmContent();
+    const streamsHookContent = hook.wantsStreaming() && !requiresBufferedLlmContent;
     const messages = [...spec.initialMessages];
     const toolCalls: any[] = [];
     const toolEvents: Record<string, any>[] = [];
@@ -1590,8 +1661,11 @@ export class AgentRunner {
     let error: string | null = null;
     let emptyContentRetries = 0;
     let lengthRecoveries = 0;
+    let deliveryRetries = 0;
     let injectionCycles = 0;
     let hadInjections = false;
+    let pendingHookInjections: AgentHookMessage[] = [];
+    let hookContinuationExhausted = false;
     const imageTextState: TurnImageTextState = {
       nextImageNumber: 1,
       nextBatchId: 1,
@@ -1610,7 +1684,7 @@ export class AgentRunner {
         error = finalContent;
         break;
       }
-      const toolsForRequest = spec.tools?.getDefinitions?.() ?? [];
+      const toolsForRequest = this.toolDefinitions(spec);
       if (iteration > 0) {
         modelContextProjection = await this.updateProjectionBeforeFollowup(
           spec,
@@ -1630,21 +1704,31 @@ export class AgentRunner {
           break;
         }
       }
-      let messagesForModel = this.modelContextMessages(messages, modelContextProjection);
+      const context = new AgentHookContext({ spec, messages, iteration, usage });
+      const beforeIterationInjections = await hook.beforeIteration(context) ?? [];
+      const requestOnlyInjections = [...pendingHookInjections, ...beforeIterationInjections];
+      pendingHookInjections = [];
+      let requestMessages = messages;
+      if (requestOnlyInjections.length) {
+        requestMessages = messages.map((message) => ({ ...message }));
+        AgentRunner.appendInjectedMessages(requestMessages, requestOnlyInjections);
+        console.info("AgentHook.beforeIteration injected request-only content:", requestOnlyInjections);
+      }
+      let messagesForModel = this.withOutputInstruction(spec, this.modelContextMessages(requestMessages, modelContextProjection));
       messagesForModel = this.prepareMessagesForModel(spec, messagesForModel, {
         toolsForRequest,
         reservedPromptTokens: 0,
       });
       messagesForModel = this.prepareImageMessages(messagesForModel, imageTextState);
 
-      const context = new AgentHookContext({ spec, messages, iteration, usage });
-      await hook.beforeIteration(context);
       response = await this.requestModelWithImagePolicy(
         spec,
         messagesForModel,
         hook,
         context,
         imageTextState,
+        // A reply claiming delivery must not reach the user before it is verified.
+        { forceNonStreaming: requiresBufferedLlmContent || Boolean(spec.outputLocation?.hasFiles) },
       );
       const iterationUsage = this.usageDict(response.usage);
       this.accumulateUsage(usage, iterationUsage);
@@ -1681,8 +1765,25 @@ export class AgentRunner {
         context.streamedReasoning = true;
       }
 
+      const rewritten = await hook.rewriteLlmContent(context, response.content);
+      const shouldContinueFromHook = rewritten !== null && typeof rewritten === "object";
+      const rewrittenContent = shouldContinueFromHook ? (rewritten as { content: string | null }).content : rewritten;
+      response.content = rewrittenContent;
+      if (shouldContinueFromHook) {
+        if (typeof rewrittenContent === "string" && !isBlankText(rewrittenContent)) {
+          pendingHookInjections = [{ role: "user", content: rewrittenContent }];
+        }
+        if (streamsHookContent) {
+          await hook.onStreamEnd(context, { resuming: iteration + 1 < spec.maxIterations });
+        }
+        await hook.afterIteration(context);
+        if (iteration + 1 < spec.maxIterations) continue;
+        hookContinuationExhausted = true;
+        break;
+      }
+
       if (response.shouldExecuteTools && spec.tools && response.toolCalls.length) {
-        if (hook.wantsStreaming()) {
+        if (streamsHookContent) {
           await hook.onStreamEnd(context, { resuming: true });
         }
         const assistant = this.assistantMessage(response);
@@ -1785,13 +1886,13 @@ export class AgentRunner {
       if (response.finishReason !== "error" && isBlankText(clean)) {
         emptyContentRetries += 1;
         if (emptyContentRetries < MAX_EMPTY_RETRIES) {
-          if (hook.wantsStreaming()) {
+          if (streamsHookContent) {
             await hook.onStreamEnd(context, { resuming: false });
           }
           await hook.afterIteration(context);
           continue;
         }
-        if (hook.wantsStreaming()) {
+        if (streamsHookContent) {
           await hook.onStreamEnd(context, { resuming: false });
         }
         response = await this.requestFinalizationRetry(
@@ -1839,15 +1940,18 @@ export class AgentRunner {
         injectionCycles = cycles;
         if (shouldContinue) hadInjections = true;
       }
-      if (hook.wantsStreaming()) {
-        await hook.onStreamEnd(context, { resuming: shouldContinue });
-      }
       if (shouldContinue) {
+        if (streamsHookContent) {
+          await hook.onStreamEnd(context, { resuming: true });
+        }
         await hook.afterIteration(context);
         continue;
       }
 
       if (response.finishReason === "error") {
+        if (streamsHookContent) {
+          await hook.onStreamEnd(context, { resuming: false });
+        }
         finalContent = clean || spec.errorMessage || DEFAULT_ERROR_MESSAGE;
         stopReason = "error";
         error = finalContent;
@@ -1867,6 +1971,9 @@ export class AgentRunner {
       }
 
       if (isBlankText(clean)) {
+        if (streamsHookContent) {
+          await hook.onStreamEnd(context, { resuming: false });
+        }
         finalContent = EMPTY_FINAL_RESPONSE_MESSAGE;
         stopReason = "emptyFinalResponse";
         error = finalContent;
@@ -1884,6 +1991,40 @@ export class AgentRunner {
         break;
       }
 
+      const finalizeInjections = await hook.beforeFinalize?.(context, clean as string);
+      if (finalizeInjections?.length) {
+        const canContinue = iteration + 1 < spec.maxIterations;
+        if (streamsHookContent) {
+          // A terminal stream end follows the delivery check; its result is applied after the loop.
+          if (!canContinue) await spec.outputLocation?.verify();
+          await hook.onStreamEnd(context, { resuming: canContinue });
+        }
+        await hook.afterIteration(context);
+        if (canContinue) {
+          pendingHookInjections = finalizeInjections;
+          continue;
+        }
+        hookContinuationExhausted = true;
+        break;
+      }
+
+      // A reply claiming delivery must be verified before it becomes the final answer.
+      // Checked before the stream ends; retries and remaining iterations only decide whether the model may fix it.
+      const deliveryProblem = spec.outputLocation ? await spec.outputLocation.verify() : null;
+      if (deliveryProblem && deliveryRetries < 2 && iteration + 1 < spec.maxIterations) {
+        // Let the model fix it; neither the unverified reply nor this feedback is persisted.
+        deliveryRetries += 1;
+        if (streamsHookContent) {
+          await hook.onStreamEnd(context, { resuming: true });
+        }
+        messages.push({ ...(assistant ?? buildAssistantMessage(clean)), [OUTPUT_FEEDBACK_KEY]: true });
+        messages.push({ role: "user", content: deliveryProblem, [OUTPUT_FEEDBACK_KEY]: true });
+        await hook.afterIteration(context);
+        continue;
+      }
+      if (streamsHookContent) {
+        await hook.onStreamEnd(context, { resuming: false });
+      }
       messages.push(assistant ?? buildAssistantMessage(clean));
       await this.emitCheckpoint(spec, {
         phase: "finalResponse",
@@ -1909,7 +2050,7 @@ export class AgentRunner {
           strip: true,
           maxIterations: spec.maxIterations,
         });
-      if (spec.maxIterationsFinalPrompt) {
+      if (spec.maxIterationsFinalPrompt && !hookContinuationExhausted) {
         spec.onMaxFinalizationStarting?.();
         const reservedPromptTokens = estimateMessageTokens({
           role: "user",
@@ -1933,7 +2074,7 @@ export class AgentRunner {
           stopReason = "cancelled";
           error = finalContent;
         } else {
-          const finalizationMessages = this.modelContextMessages(messages, modelContextProjection);
+          const finalizationMessages = this.withOutputInstruction(spec, this.modelContextMessages(messages, modelContextProjection));
           const preparedMessages = this.prepareMessagesForModel(spec, finalizationMessages, {
             toolsForRequest: null,
             reservedPromptTokens,
@@ -1987,11 +2128,33 @@ export class AgentRunner {
                 response.content,
               );
               response.content = cleanedContent;
-              const clean = hook.finalizeContent(context, response.content);
-              finalContent = response.finishReason !== "error" && !isBlankText(clean)
-                ? clean
-                : fallback;
-              AgentRunner.appendFinalMessage(messages, finalContent);
+              context.response = response;
+              context.toolCalls = [...response.toolCalls];
+              const finalRewrite = await hook.rewriteLlmContent(context, response.content);
+              const continueFromFinalization = finalRewrite !== null && typeof finalRewrite === "object";
+              response.content = continueFromFinalization
+                ? (finalRewrite as { content: string | null }).content
+                : finalRewrite;
+              if (continueFromFinalization) {
+                finalContent = fallback;
+                AgentRunner.appendFinalMessage(messages, finalContent);
+              } else if (response.finishReason === "error" && AgentRunner.terminalImageError(response)) {
+                finalContent = hook.finalizeContent(context, response.content)
+                  || spec.errorMessage
+                  || DEFAULT_ERROR_MESSAGE;
+                stopReason = "error";
+                error = finalContent;
+                AgentRunner.appendModelErrorPlaceholder(messages);
+              } else {
+                const clean = hook.finalizeContent(context, response.content);
+                const finalizeInjections = response.finishReason !== "error" && !isBlankText(clean)
+                  ? await hook.beforeFinalize?.(context, clean as string)
+                  : [];
+                finalContent = finalizeInjections?.length || response.finishReason === "error" || isBlankText(clean)
+                  ? fallback
+                  : clean;
+                AgentRunner.appendFinalMessage(messages, finalContent);
+              }
             }
           } catch (requestError) {
             if (isAbortError(requestError) || spec.abortSignal?.aborted) {
@@ -2010,6 +2173,21 @@ export class AgentRunner {
         const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after maxIterations" });
         injectionCycles = cycles;
         if (drained) hadInjections = true;
+      }
+    }
+
+    // Every ending that would tell the user the work is done is checked once more here.
+    if (spec.outputLocation && finalContent != null && ["completed", "maxIterations", "emptyFinalResponse"].includes(stopReason)) {
+      const deliveryProblem = await spec.outputLocation.verify();
+      if (deliveryProblem) {
+        finalContent = deliveryProblem;
+        finalContentStreamed = false;
+        stopReason = "toolError";
+        error = "Output delivery not confirmed";
+        AgentRunner.appendFinalMessage(messages, finalContent);
+      } else if (stopReason !== "maxIterations") {
+        // An unfinished run keeps its list; an empty reply after a message-tool delivery does not.
+        spec.outputLocation.complete();
       }
     }
 

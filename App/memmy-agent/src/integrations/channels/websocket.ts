@@ -235,6 +235,36 @@ type SessionDeletionServices = {
 };
 export type WebuiLanguage = "zh-CN" | "en-US";
 
+export type WebuiMessageDigestInput = {
+  chatId: string;
+  content: string;
+  mediaPaths: string[];
+  language: WebuiLanguage | null;
+  target: WebuiSessionTarget | null;
+  modelPreset: string | null | undefined;
+  queueSurface: "chat_composer" | null;
+  turnAdmission: "queue" | "steer";
+  expectedTurnId: string | null;
+  thinkingEnabled?: boolean;
+  thinkingLevel?: string | null;
+};
+
+export function computeWebuiMessageDigest(input: WebuiMessageDigestInput): string {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    chat_id: input.chatId,
+    content: input.content,
+    media_paths: input.mediaPaths,
+    language: input.language,
+    target: input.target,
+    model_preset: input.modelPreset,
+    queue_surface: input.queueSurface,
+    turn_admission: input.turnAdmission,
+    expected_turn_id: input.expectedTurnId,
+    thinking_enabled: input.thinkingEnabled ?? null,
+    thinking_level: input.thinkingLevel ?? null,
+  })).digest("hex");
+}
+
 const CHAT_ID_RE = /^[A-Za-z0-9_:-]{1,64}$/;
 const API_KEY_RE = /^[A-Za-z0-9_:.-]{1,128}$/;
 const WEBUI_LANGUAGE_VALUES = new Set<WebuiLanguage>(["zh-CN", "en-US"]);
@@ -967,38 +997,8 @@ export class WebSocketChannel extends BaseChannel {
     return null;
   }
 
-  private webuiMessageDigest({
-    chatId,
-    content,
-    mediaPaths,
-    language,
-    target,
-    modelPreset,
-    queueSurface,
-    turnAdmission,
-    expectedTurnId,
-  }: {
-    chatId: string;
-    content: string;
-    mediaPaths: string[];
-    language: WebuiLanguage | null;
-    target: WebuiSessionTarget | null;
-    modelPreset: string | null | undefined;
-    queueSurface: "chat_composer" | null;
-    turnAdmission: "queue" | "steer";
-    expectedTurnId: string | null;
-  }): string {
-    return crypto.createHash("sha256").update(JSON.stringify({
-      chat_id: chatId,
-      content,
-      media_paths: mediaPaths,
-      language,
-      target,
-      model_preset: modelPreset,
-      queue_surface: queueSurface,
-      turn_admission: turnAdmission,
-      expected_turn_id: expectedTurnId,
-    })).digest("hex");
+  private webuiMessageDigest(input: WebuiMessageDigestInput): string {
+    return computeWebuiMessageDigest(input);
   }
 
   private resolveMessageModel(
@@ -2993,7 +2993,7 @@ export class WebSocketChannel extends BaseChannel {
       }
     }
     match = got.match(/^\/api\/media\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)$/);
-    if (match) return this.handleMediaFetch(match[1], match[2]);
+    if (match) return this.handleMediaFetch(match[1], match[2], request);
     if (got === this.expectedPath() && isWebsocketUpgrade(request)) {
       const clientId = (queryFirst(query, "client_id") ?? "").slice(0, 128);
       if (!this.isAllowed(clientId)) return connectionRespond(connection, 403, "Forbidden");
@@ -3571,6 +3571,8 @@ export class WebSocketChannel extends BaseChannel {
           queueSurface,
           turnAdmission,
           expectedTurnId,
+          thinkingEnabled: typeof envelope.thinking_enabled === "boolean" ? envelope.thinking_enabled : undefined,
+          thinkingLevel: typeof envelope.thinking_level === "string" ? envelope.thinking_level : undefined,
         })
       : null;
     if (existing && clientRequestId) {
@@ -3680,6 +3682,8 @@ export class WebSocketChannel extends BaseChannel {
       model: modelSelection.model,
       model_selection: modelSelectionWire(modelSelection),
     };
+    if (typeof envelope.thinking_enabled === "boolean") metadata.thinking_enabled = envelope.thinking_enabled;
+    if (typeof envelope.thinking_level === "string") metadata.thinking_level = envelope.thinking_level;
     if (clientRequestId && digest) {
       metadata.client_request_id = clientRequestId;
       metadata.webui_request_digest = digest;
@@ -4348,7 +4352,7 @@ export class WebSocketChannel extends BaseChannel {
     };
   }
 
-  handleMediaFetch(sig: string, payload: string): HttpLikeResponse {
+  handleMediaFetch(sig: string, payload: string, request?: Pick<HttpRequestLike, "headers">): HttpLikeResponse {
     const expected = crypto.createHmac("sha256", this.mediaSecret).update(payload).digest().subarray(0, 16);
     let provided: Buffer;
     try {
@@ -4370,6 +4374,29 @@ export class WebSocketChannel extends BaseChannel {
     if (!pathIsInside(candidate, mediaRoot)) return httpError(404, "not found");
     if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) return httpError(404, "not found");
     const mime = String(lookupMime(candidate) || "application/octet-stream");
+    const size = fs.statSync(candidate).size;
+    const range = getHeader(request?.headers, "range");
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      const suffix = match && !match[1];
+      const start = match ? (suffix ? Math.max(0, size - Number(match[2])) : Number(match[1])) : NaN;
+      const requestedEnd = match ? (suffix || !match[2] ? size - 1 : Number(match[2])) : NaN;
+      if (!match || (!match[1] && !match[2]) || !Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd)
+        || start < 0 || start >= size || requestedEnd < start) {
+        return { status: 416, headers: { "content-range": `bytes */${size}` }, body: Buffer.alloc(0) };
+      }
+      const end = Math.min(size - 1, requestedEnd, start + 2 * 1024 * 1024 - 1);
+      const body = Buffer.alloc(end - start + 1);
+      const descriptor = fs.openSync(candidate, "r");
+      try { fs.readSync(descriptor, body, 0, body.length, start); }
+      finally { fs.closeSync(descriptor); }
+      return { status: 206, headers: {
+        "content-type": DISPLAY_MEDIA_RESPONSE_MIMES.has(mime) ? mime : "application/octet-stream",
+        "accept-ranges": "bytes", "content-range": `bytes ${start}-${end}/${size}`,
+        "cache-control": "private, no-store", "x-content-type-options": "nosniff",
+      }, body };
+    }
+
     return {
       status: 200,
       headers: {
@@ -5337,6 +5364,7 @@ function corsHeadersForRequest(config: WebSocketConfig, request: { headers?: htt
       "x-memmy-agent-auth",
       MCP_VALUES_HEADER,
     ].join(", "),
+    "access-control-expose-headers": "Content-Range, Accept-Ranges",
     "access-control-max-age": "600",
   };
 }

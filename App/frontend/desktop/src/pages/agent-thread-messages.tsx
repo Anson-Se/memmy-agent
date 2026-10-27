@@ -142,7 +142,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
     () => buildAgentDisplayUnits(props.messages, { chatScopeKey: props.chatScopeKey, retryWaitStatus: props.retryWaitStatus ?? null }),
     [props.chatScopeKey, props.messages, props.retryWaitStatus]
   );
-  const finalAssistantAnswerIndex = useMemo(() => findFinalAssistantAnswerUnitIndex(units, { isSending: props.isSending }), [props.isSending, units]);
+  const finalAssistantAnswerIndices = useMemo(() => findFinalAssistantAnswerUnitIndices(units, { isSending: props.isSending }), [props.isSending, units]);
   const recallEvidenceAnchors = useMemo(
     () => findRecallEvidenceUserAnchors(units, { isSending: props.isSending }),
     [props.isSending, units]
@@ -243,7 +243,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
               onOpenActivityFile={props.onOpenActivityFile}
               chatScopeKey={props.chatScopeKey}
               unitIndex={index}
-              isFinalAssistantAnswer={index === finalAssistantAnswerIndex}
+              isFinalAssistantAnswer={finalAssistantAnswerIndices.has(index)}
               forceMessageActions={unit.message.id === (props.forceMessageActionsForMessageId ?? props.afterMessageId)}
               deferContentRender={shouldDeferAgentMessageContent(unit, index, units.length)}
               deferredRevealDelayMs={deferredAgentMessageRevealDelay(index, units.length)}
@@ -390,7 +390,7 @@ function isActivityAutoOpenRunning(unit: Extract<AgentDisplayUnit, { type: "acti
 
 /**
  * A queued follow-up is appended as a user row while this run is still the
- * latest work on screen. That row moves `lastUserIndex` past the activity, so
+ * latest work on screen. That row moves lastUserIndex past the activity, so
  * the cluster would otherwise drop out of the live set and fold to "Working".
  * Hold it open until the turn actually ends, a real answer arrives, or a
  * newer activity run starts. A finished cluster is not held: sending the next
@@ -430,27 +430,43 @@ function isVisibleAssistantAnswer(message: AgentChatMessage): boolean {
 }
 
 /**
- * Locate the index of the last "single" unit that is a finalized assistant
- * answer. While the current turn is still sending, assistant text after the
+ * Locate the last finalized assistant answer in each user-delimited turn.
+ * While the current turn is still sending, assistant text after the
  * latest user message is treated as continuation text, because the agent may
- * still alternate body → tool → reasoning → tool before the actual final answer.
+ * still alternate body -> tool -> reasoning -> tool before the actual final answer.
+ * Later activity also keeps an interrupted draft from becoming a final answer.
  */
-function findFinalAssistantAnswerUnitIndex(units: AgentDisplayUnit[], options: { isSending?: boolean } = {}): number {
+function findFinalAssistantAnswerUnitIndices(units: AgentDisplayUnit[], options: { isSending?: boolean } = {}): Set<number> {
+  const indices = new Set<number>();
   const lastUserUnitIndex = findLastUserUnitIndex(units);
+  let foundAnswerInTurn = false;
+  let laterActivityInTurn = false;
   for (let index = units.length - 1; index >= 0; index -= 1) {
     const unit = units[index];
+    if (unit?.type === "activity") {
+      laterActivityInTurn = true;
+      continue;
+    }
     if (unit?.type !== "single") continue;
+    if (unit.message.role === "user") {
+      foundAnswerInTurn = false;
+      laterActivityInTurn = false;
+      continue;
+    }
+    if (foundAnswerInTurn) continue;
     if (options.isSending && index > lastUserUnitIndex) continue;
     const message = unit.message;
     if (message.role === "assistant"
       && message.kind !== "trace"
       && message.kind !== "narration"
       && message.kind !== "context_compaction"
+      && !laterActivityInTurn
       && message.content.trim().length > 0) {
-      return index;
+      indices.add(index);
+      foundAnswerInTurn = true;
     }
   }
-  return -1;
+  return indices;
 }
 
 function findLastUserUnitIndex(units: AgentDisplayUnit[]): number {
@@ -2553,7 +2569,7 @@ function ToolGroupSegmentLabel(props: { segment: ActivityToolGroupSegment }) {
  * dimmed, result normal — with no form labels. This single
  * generic shape works for any tool, however exotic its payload.
  */
-function ToolDetailRows(props: { item: ActivityToolStepItem }) {
+function ToolDetailRows(props: { item: ActivityToolStepItem; t: Translate; onOpenActivityFile?: (file: ActivityPreviewFile) => void }) {
   const sections = props.item.details.filter((detail) => detail.value.trim().length > 0);
   if (!sections.length) {
     return null;
@@ -2566,7 +2582,17 @@ function ToolDetailRows(props: { item: ActivityToolStepItem }) {
           data-detail={detail.label.toLowerCase()}
           className="agent-activity-tool-card__section"
         >
-          <pre className="agent-activity-tool-card__value">{detail.value}</pre>
+          {detail.label === "Result" && props.item.event.output_file && props.item.event.display_text === undefined ? (
+            <div>
+              <button type="button" className="agent-activity-file-link agent-activity-output-file" data-activity-file-path={props.item.event.output_file.path}
+                onClick={() => props.onOpenActivityFile?.({ path: props.item.event.output_file!.path, name: props.item.event.output_file!.name })}>
+                <FileText size={14} aria-hidden="true" />
+                <span>{props.item.event.output_file.name}</span>
+                <span>({props.item.event.output_file.sizeBytes.toLocaleString()} B)</span>
+              </button>
+              <p className="agent-activity-output-file__notice">{props.t("agent.activity.savedOutput")}</p>
+            </div>
+          ) : <pre className="agent-activity-tool-card__value">{detail.value}</pre>}
         </div>
       ))}
     </div>
@@ -2715,7 +2741,7 @@ function TraceLine(props: { item: ActivityToolStepItem; t: Translate; onOpenActi
           {summary}
           <ChevronRight size={12} aria-hidden="true" className="agent-activity-tool-details__chevron" />
         </summary>
-        <ToolDetailRows item={props.item} />
+        <ToolDetailRows item={props.item} t={props.t} onOpenActivityFile={props.onOpenActivityFile} />
       </details>
     );
   }
@@ -3157,7 +3183,7 @@ function toolDetailRows(event: AgentToolProgressEvent, legacyLine: string | unde
   const rows: ActivityToolDetail[] = [];
   const rawArguments = isRecord(event.function) && "arguments" in event.function ? event.function.arguments : event.arguments;
   appendToolDetailRow(rows, "Arguments", rawArguments);
-  appendToolDetailRow(rows, "Result", event.result);
+  appendToolDetailRow(rows, "Result", event.display_text ?? event.result);
   appendToolDetailRow(rows, "Files", event.files);
   appendToolDetailRow(rows, "Embeds", event.embeds);
   appendToolDetailRow(rows, "Error", event.error);
@@ -3288,13 +3314,7 @@ function sanitizeDomId(value: string): string {
 
 function formatToolDetailValue(value: unknown): string {
   if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return "";
-    try {
-      return truncateToolDetailValue(formatStructuredToolDetail(JSON.parse(trimmed)));
-    } catch {
-      return truncateToolDetailValue(trimmed.replace(/\n{3,}/gu, "\n\n"));
-    }
+    return truncateToolDetailValue(value);
   }
   try {
     return truncateToolDetailValue(formatStructuredToolDetail(value));
