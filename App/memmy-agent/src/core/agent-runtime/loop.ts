@@ -1,3 +1,4 @@
+import { agentTaskActivity } from "./task-activity.js";
 import { requestTiming } from "../../utils/request-timing.js";
 import { initializeDesktopScreenCapture } from '../../tools/computer-use/desktop-screen-capture.js';
 import { closeNativeSurfacesForTurn, registerComputerUseTurnInterrupt } from '../../tools/computer-use/surface-preview.js';
@@ -4894,6 +4895,14 @@ export class AgentLoop {
   }
 
   async processMessageInternal(
+    message: InboundMessage,
+    sessionKey?: string,
+    options: Parameters<AgentLoop["processMessageTurn"]>[2] = {},
+  ): Promise<OutboundMessage | null> {
+    return agentTaskActivity.run(() => this.processMessageTurn(message, sessionKey, options));
+  }
+
+  private async processMessageTurn(
     message: InboundMessage,
     sessionKey?: string,
     {

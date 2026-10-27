@@ -90,6 +90,29 @@ describe("PluginMarketplaceSection", () => {
     await act(async () => button(text, scope).click());
   }
 
+  it.each([
+    ["zh-CN", "waiting", "等待更新", "等待任务完成后更新"],
+    ["zh-CN", "installing", "更新中", "正在更新…"],
+    ["en-US", "waiting", "Queued", "Waiting for tasks to finish before updating"],
+    ["en-US", "installing", "Updating", "Updating…"]
+  ] as const)("shows a compact %s %s badge with the full explanation available", async (language, state, label, explanation) => {
+    const plugin = installed({ ...literature, version: "2.0.0" });
+    plugin.installed!.update = { status: state, version: "2.0.0" };
+    await render({ plugins: [plugin], signedIn: true }, language);
+    const badge = container.querySelector<HTMLElement>(".plugin-marketplace-update-status")!;
+    expect(badge.textContent).toBe(label);
+    expect(badge.getAttribute("aria-label")).toBe(explanation);
+    expect(badge.getAttribute("data-update-state")).toBe(state);
+    expect(badge.tabIndex).toBe(0);
+    expect(badge.querySelector(".animate-spin") !== null).toBe(state === "installing");
+    await act(async () => badge.focus());
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe(explanation);
+    await act(async () => badge.blur());
+    await act(async () => container.querySelector<HTMLButtonElement>(".plugin-marketplace-summary")!.click());
+    expect(document.querySelector(".plugin-marketplace-update-note")?.textContent).toBe(explanation);
+    expect(document.querySelector(".plugin-marketplace-detail-actions")?.textContent).toContain(label);
+  });
+
   async function search(value: string, label = "搜索任务插件") {
     const input = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
     if (!input) throw new Error(`Search input not found: ${label}`);

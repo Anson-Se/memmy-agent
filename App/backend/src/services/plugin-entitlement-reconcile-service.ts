@@ -63,17 +63,15 @@ async function reconcileOnce(
     if (declared.has(pluginId) && !declared.get(pluginId)!.eligibility.canInstall) continue;
     try {
       const existing = options.plugins.list().find((plugin) => plugin.id === pluginId);
+      if (existing?.update) continue;
       // Freeze the catalog selection across resolve/download, even if the server default changes.
       const entry = declared.get(pluginId);
-      let plugin = existing
-        ? entry && (existing.version === entry.manifest.version || !pluginRules(entry.manifest).autoUpdate)
-          ? existing
-          : entry
-            ? await options.plugins.update(pluginId, entry.manifest.version)
-            : await options.plugins.update(pluginId)
-        : entry
-          ? await options.plugins.install(pluginId, entry.manifest.version)
-          : await options.plugins.install(pluginId);
+      // Publishing a new catalog entry never authorizes replacing an installed
+      // plugin. Updates are an explicit user action, including legacy manifests
+      // with autoUpdate=true and entitlement-only/offline catalog paths.
+      let plugin = existing ?? (entry
+        ? await options.plugins.install(pluginId, entry.manifest.version)
+        : await options.plugins.install(pluginId));
       plugin = await options.plugins.approvePermissions(pluginId, plugin.manifest.permissions);
       if (plugin.state !== "active") {
         await options.plugins.enable(pluginId);

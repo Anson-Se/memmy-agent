@@ -44,7 +44,7 @@ export async function suppressBundledPlugins(
 }
 
 /**
- * Installs or upgrades trusted bundled releases, grants their fixed declared
+ * Installs missing trusted bundled releases, grants their fixed declared
  * permissions, and applies the config.yaml desired state without deleting data
  * or reinstalling plugins the user explicitly removed.
  */
@@ -55,12 +55,9 @@ export async function reconcileBundledPlugins(
   for (const release of options.releases) {
     try {
       const existing = options.plugins.list().find((plugin) => plugin.id === release.id);
+      if (existing?.update) continue;
       if (!existing && options.userUninstalledIds?.has(release.id)) continue;
-      let plugin = existing
-        ? existing.version === release.version
-          ? await options.plugins.install(release.id, release.version)
-          : await options.plugins.update(release.id, release.version)
-        : await options.plugins.install(release.id, release.version);
+      let plugin = existing ?? await options.plugins.install(release.id, release.version);
 
       plugin = await options.plugins.approvePermissions(release.id, plugin.manifest.permissions);
       if (options.enabledById[release.id] !== false) {

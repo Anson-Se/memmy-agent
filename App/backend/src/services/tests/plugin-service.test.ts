@@ -55,7 +55,8 @@ function createContext(
   localArtifactService?: PluginLocalArtifactService,
   isAuthenticated?: () => boolean,
   catalogPluginIds?: () => readonly string[],
-  isEntitlementGranted?: (entitlement: string) => boolean
+  isEntitlementGranted?: (entitlement: string) => boolean,
+  hasActiveAgentTasks?: (signal: AbortSignal) => Promise<boolean>
 ) {
   root = mkdtempSync(join(tmpdir(), "memmy-plugin-service-"));
   store = createAppStateStore({ databasePath: join(root, "app.sqlite") });
@@ -97,7 +98,8 @@ function createContext(
       localArtifactService,
       isAuthenticated,
       catalogPluginIds,
-      isEntitlementGranted
+      isEntitlementGranted,
+      hasActiveAgentTasks
     })
   };
 }
@@ -341,6 +343,167 @@ describe("PluginService", () => {
       approvedPermissions: release.manifest.permissions,
       lastError: "busy"
     });
+  });
+
+  it("waits for all calls before resolving/downloading, deduplicates manual updates and pins the target", async () => {
+    const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+    const { service, runtimeHost, artifactManager, registry } = createContext([release, next]);
+    await service.install(release.manifest.id, "1.0.0");
+    service.configure(release.manifest.id, { config: { database: "crossref" }, secrets: { "api-key": "secret" } });
+    await service.approvePermissions(release.manifest.id, release.manifest.permissions);
+    await service.enable(release.manifest.id);
+    const releaseCalls = new Map<string, () => void>();
+    runtimeHost.invoke = async function* (call) {
+      yield { type: "progress", current: 1 };
+      await new Promise<void>(resolve => releaseCalls.set(call.callId, resolve));
+      yield { type: "result", output: { ok: true } };
+    };
+    const call = (callId: string) => service.invoke({
+      callId, pluginId: release.manifest.id, capabilityId: "run", conversationId: "chat", input: {}
+    })[Symbol.asyncIterator]();
+    const one = call("one"), two = call("two");
+    await one.next();
+    await two.next();
+    const finishOne = one.next(), finishTwo = two.next();
+    const resolveSpy = vi.spyOn(registry, "resolve");
+    vi.mocked(artifactManager.install).mockClear();
+    const updated = service.update(release.manifest.id, "2.0.0");
+    const duplicate = service.update(release.manifest.id, "2.0.0");
+    await expect(service.update(release.manifest.id, "3.0.0")).rejects.toThrow(/another version/);
+    expect(service.get(release.manifest.id)).toMatchObject({
+      version: "1.0.0", activeCallCount: 2, update: { status: "waiting", version: "2.0.0" }
+    });
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(artifactManager.install).not.toHaveBeenCalled();
+    releaseCalls.get("one")!();
+    await finishOne;
+    await one.next();
+    expect(artifactManager.install).not.toHaveBeenCalled();
+    releaseCalls.get("two")!();
+    await finishTwo;
+    await two.next();
+    expect((await updated).version).toBe("2.0.0");
+    expect((await duplicate).version).toBe("2.0.0");
+    expect(artifactManager.install).toHaveBeenCalledTimes(1);
+    expect(resolveSpy).toHaveBeenCalledWith(release.manifest.id, "2.0.0");
+    expect(service.get(release.manifest.id)).toMatchObject({ state: "active", activeCallCount: 0 });
+    expect(service.get(release.manifest.id).update).toBeUndefined();
+  });
+
+  it("blocks new calls during installation and preserves the old active version on download failure", async () => {
+    const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+    const { service, artifactManager } = createContext([release, next]);
+    await service.install(release.manifest.id, "1.0.0");
+    service.configure(release.manifest.id, { config: { database: "crossref" }, secrets: { "api-key": "secret" } });
+    await service.approvePermissions(release.manifest.id, release.manifest.permissions);
+    await service.enable(release.manifest.id);
+    let rejectDownload!: (error: Error) => void;
+    vi.mocked(artifactManager.install).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectDownload = reject; }));
+    const update = service.update(release.manifest.id, "2.0.0");
+    const failed = expect(update).rejects.toThrow("download failed");
+    await vi.waitFor(() => expect(rejectDownload).toBeDefined());
+    await expect(service.invoke({
+      callId: "new", pluginId: release.manifest.id, capabilityId: "run", conversationId: "chat", input: {}
+    })[Symbol.asyncIterator]().next()).rejects.toThrow(/being installed/);
+    rejectDownload(new Error("download failed"));
+    await failed;
+    expect(service.get(release.manifest.id)).toMatchObject({ version: "1.0.0", state: "active" });
+    expect(service.get(release.manifest.id).update).toBeUndefined();
+  });
+
+  it.each(["return", "error", "shutdown"] as const)("releases a queued update when a call ends via %s", async (ending) => {
+    const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+    const { service, runtimeHost, artifactManager } = createContext([release, next]);
+    await service.install(release.manifest.id, "1.0.0");
+    service.configure(release.manifest.id, { config: { database: "crossref" }, secrets: { "api-key": "secret" } });
+    await service.approvePermissions(release.manifest.id, release.manifest.permissions);
+    await service.enable(release.manifest.id);
+    runtimeHost.invoke = async function* () {
+      yield { type: "progress", current: 1 };
+      throw new Error("task failed");
+    };
+    const task = service.invoke({ callId: "running", pluginId: release.manifest.id, capabilityId: "run", conversationId: "chat", input: {} })[Symbol.asyncIterator]();
+    await task.next();
+    vi.mocked(artifactManager.install).mockClear();
+    const update = service.update(release.manifest.id, "2.0.0");
+    if (ending === "shutdown") {
+      const rejected = expect(update).rejects.toThrow(/shutting down/);
+      await service.shutdown();
+      await rejected;
+      await task.return?.();
+      expect(artifactManager.install).not.toHaveBeenCalled();
+    } else {
+      if (ending === "error") await expect(task.next()).rejects.toThrow("task failed");
+      else await task.return?.();
+      expect((await update).version).toBe("2.0.0");
+      expect(artifactManager.install).toHaveBeenCalledOnce();
+    }
+    expect(service.get(release.manifest.id).update).toBeUndefined();
+  });
+
+  it("keeps the old version between sequential calls until the entire Agent task finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      let agentBusy = true;
+      const activity = vi.fn(async () => agentBusy);
+      const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+      const { service, artifactManager, registry, runtimeHost } = createContext([release, next], undefined, undefined, undefined, undefined, activity);
+      await service.install(release.manifest.id, "1.0.0");
+      service.configure(release.manifest.id, { config: { database: "crossref" }, secrets: { "api-key": "secret" } });
+      await service.approvePermissions(release.manifest.id, release.manifest.permissions);
+      await service.enable(release.manifest.id);
+      const invoke = async (callId: string) => {
+        for await (const _event of service.invoke({ callId, pluginId: release.manifest.id, capabilityId: "run", conversationId: "chat", input: {} })) { /* drain */ }
+      };
+      await invoke("first-step");
+      const resolve = vi.spyOn(registry, "resolve");
+      vi.mocked(artifactManager.install).mockClear();
+      const update = service.update(release.manifest.id, "2.0.0");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(service.get(release.manifest.id)).toMatchObject({ version: "1.0.0", activeCallCount: 0, update: { status: "waiting" } });
+      expect(resolve).not.toHaveBeenCalled();
+      expect(artifactManager.install).not.toHaveBeenCalled();
+      expect(runtimeHost.deactivate).not.toHaveBeenCalled();
+      // The same turn can think, wait for user input, then invoke another step.
+      await invoke("second-step");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(artifactManager.install).not.toHaveBeenCalled();
+      agentBusy = false;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await update).version).toBe("2.0.0");
+      expect(resolve).toHaveBeenCalledExactlyOnceWith(release.manifest.id, "2.0.0");
+      expect(artifactManager.install).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("fails closed when the Agent task state cannot be confirmed", async () => {
+    const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+    const { service, artifactManager, registry } = createContext([release, next], undefined, undefined, undefined, undefined, async () => { throw new Error("runtime unavailable"); });
+    await service.install(release.manifest.id, "1.0.0");
+    vi.mocked(artifactManager.install).mockClear();
+    const resolve = vi.spyOn(registry, "resolve");
+    await expect(service.update(release.manifest.id, "2.0.0")).rejects.toThrow("runtime unavailable");
+    expect(artifactManager.install).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(service.get(release.manifest.id).version).toBe("1.0.0");
+    expect(service.get(release.manifest.id).update).toBeUndefined();
+  });
+
+  it("cancels whole-task waiting on shutdown without downloading", async () => {
+    vi.useFakeTimers();
+    try {
+      const next = { manifest: { ...release.manifest, version: "2.0.0" } };
+      const { service, artifactManager } = createContext([release, next], undefined, undefined, undefined, undefined, async () => true);
+      await service.install(release.manifest.id, "1.0.0");
+      vi.mocked(artifactManager.install).mockClear();
+      const updated = service.update(release.manifest.id, "2.0.0");
+      const rejected = expect(updated).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(0);
+      await service.shutdown();
+      await rejected;
+      expect(artifactManager.install).not.toHaveBeenCalled();
+      expect(service.get(release.manifest.id).update).toBeUndefined();
+    } finally { vi.useRealTimers(); }
   });
 
   it("invokes only active declared capabilities", async () => {

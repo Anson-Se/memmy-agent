@@ -1,3 +1,4 @@
+import { agentTaskActivity } from "../../../src/core/agent-runtime/task-activity.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,6 +57,30 @@ afterEach(async () => {
 });
 
 describe("WebSocket HTTP route helpers", () => {
+  it("protects task activity and reports an entire turn rather than only tool calls", async () => {
+    const channel = new WebSocketChannel(
+      { enabled: true, allowFrom: ["*"], host: "127.0.0.1", port: 0, path: "/", websocketRequiresToken: false },
+      new MessageBus(), { sessionManager: new SessionManager(tmpRoot()) }
+    );
+    running.push(channel);
+    await channel.start();
+    const base = `http://127.0.0.1:${(channel as any).server.address().port}`;
+    expect((await fetch(`${base}/api/runtime/task-activity`)).status).toBe(401);
+    const bootstrap = await (await fetch(`${base}/webui/bootstrap`)).json() as { token: string };
+    const headers = { Authorization: `Bearer ${bootstrap.token}` };
+    const activity = async () => (await fetch(`${base}/api/runtime/task-activity`, { headers })).json();
+    expect(await activity()).toEqual({ busy: false });
+    let finish!: () => void;
+    const turn = agentTaskActivity.run(() => new Promise<void>(resolve => { finish = resolve; }));
+    try { expect(await activity()).toEqual({ busy: true }); }
+    finally { finish(); await turn; }
+    expect(await activity()).toEqual({ busy: false });
+    await channel.terminalRunControl!.create("cli:external", "external-turn");
+    expect(await activity()).toEqual({ busy: true });
+    await channel.terminalRunControl!.remove("cli:external", "external-turn");
+    expect(await activity()).toEqual({ busy: false });
+  });
+
   function tmpRoot(prefix = "memmy-ws-http-"): string {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
     tmpDirs.push(root);

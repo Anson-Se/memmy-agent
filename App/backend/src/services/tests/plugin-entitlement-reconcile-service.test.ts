@@ -1,5 +1,5 @@
 /** Entitlement-gated plugin reconciliation tests. */
-import type { InstalledPlugin, PluginManifest } from "@memmy/local-api-contracts";
+import { PluginRulesSchema, type InstalledPlugin, type PluginManifest } from "@memmy/local-api-contracts";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginService } from "../plugin-service.js";
 import { entitledPluginIds, reconcileEntitledPlugins } from "../plugin-entitlement-reconcile-service.js";
@@ -20,12 +20,12 @@ describe("entitled plugin reconciliation", () => {
     ]);
   });
 
-  it("updates an already installed plugin instead of reinstalling it", async () => {
+  it("preserves an installed plugin until a manual update", async () => {
     const plugins = fakePluginService([installed("vertical-demo", "active")], new Set(), ["vertical-demo"]);
     await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
 
     // Already active, so no redundant enable is issued.
-    expect(plugins.calls).toEqual(["update:vertical-demo", "approvePermissions:vertical-demo"]);
+    expect(plugins.calls).toEqual(["approvePermissions:vertical-demo"]);
   });
 
   it("disables a plugin whose grant was revoked without uninstalling its data", async () => {
@@ -60,14 +60,32 @@ describe("entitled plugin reconciliation", () => {
     expect(plugins.calls).toContain("enable:healthy");
   });
 
-  it("pins install and update to the catalog version when the default changes", async () => {
-    for (const initial of [[], [installed("vertical-demo", "active")]]) {
-      const plugins = fakePluginService(initial, new Set(), ["vertical-demo"]);
-      const action = initial.length ? "update" : "install";
-      const spy = vi.spyOn(plugins.service, action);
+  it("pins first installation to the advertised version but never upgrades existing installations", async () => {
+    const plugins = fakePluginService([], new Set(), ["vertical-demo"]);
+    await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
+    expect(plugins.service.install).toHaveBeenCalledWith("vertical-demo", "2.0.0");
+    expect(plugins.service.update).not.toHaveBeenCalled();
+  });
+
+  it("ignores legacy autoUpdate=true, absent catalogs and failed catalog lookups for existing plugins", async () => {
+    for (const mode of ["legacy", "absent", "offline"]) {
+      const plugins = fakePluginService([installed("vertical-demo", "active")], new Set(), mode === "legacy" ? ["vertical-demo"] : []);
+      if (mode === "legacy") vi.spyOn(plugins.service, "catalog").mockResolvedValue([{
+        manifest: { ...manifest("vertical-demo"), version: "2.0.0", rules: PluginRulesSchema.parse({ autoUpdate: true, installation: "automatic" }) },
+        eligibility: { visible: true, canInstall: true, canUse: true, reason: null }
+      }]);
+      if (mode === "offline") vi.spyOn(plugins.service, "catalog").mockRejectedValue(new Error("offline"));
       await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
-      expect(spy).toHaveBeenCalledWith("vertical-demo", "2.0.0");
+      expect(plugins.service.update).not.toHaveBeenCalled();
+      expect(plugins.service.install).not.toHaveBeenCalled();
+      expect(plugins.service.list()[0].version).toBe("1.0.0");
     }
+  });
+
+  it("leaves a queued manual update untouched during account reconciliation", async () => {
+    const plugins = fakePluginService([{ ...installed("vertical-demo", "active"), update: { status: "waiting", version: "2.0.0" } }]);
+    await reconcileEntitledPlugins({ plugins: plugins.service, entitlements: ["plugin:vertical-demo"] });
+    expect(plugins.calls).toEqual([]);
   });
 
   it("installs an entitled private plugin omitted from the public catalog", async () => {

@@ -162,7 +162,7 @@ export const PluginRulesSchema = z.object({
   installation: z.enum(["manual", "automatic"]).default("manual"),
   requiresLogin: z.boolean().default(false),
   unavailableVisibility: z.enum(["visible", "hidden"]).default("visible"),
-  autoUpdate: z.boolean().default(true),
+  autoUpdate: z.boolean().default(false),
   recommendsOfficialModel: z.boolean().default(false)
 });
 export type PluginRules = z.infer<typeof PluginRulesSchema>;
@@ -364,6 +364,11 @@ export const PluginStateSchema = z.enum([
 export type PluginState = z.infer<typeof PluginStateSchema>;
 
 export const InstalledPluginSchema = z.object({
+  activeCallCount: z.number().int().nonnegative().optional(),
+  update: z.object({
+    status: z.enum(["waiting", "installing"]),
+    version: z.string().optional()
+  }).optional(),
   id: PluginIdentifierSchema,
   version: z.string().min(1),
   manifest: PluginManifestSchema,

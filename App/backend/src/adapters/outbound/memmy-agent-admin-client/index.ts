@@ -6,6 +6,8 @@ import type {
 } from "@memmy/local-api-contracts";
 
 export interface MemmyAgentAdminClient {
+  /** True for the entire Agent turn, including model thinking and interaction waits. */
+  hasActiveTasks?(signal?: AbortSignal): Promise<boolean>;
   getChannelDefinitions(): Promise<ChannelDefinitionsResponse>;
   getChannelConnections(): Promise<ChannelConnectionsResponse>;
   /** Returns the canonical workspace currently bound to a WebUI conversation. */

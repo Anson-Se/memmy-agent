@@ -1,4 +1,5 @@
 import "./plugin-tools-layout.css";
+import { usePluginUpdateAvailable, PluginUpdateDot } from "./plugin-update-indicator.js";
 /** Tools page module. */
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link2, MessageCircle, Puzzle } from "lucide-react";
@@ -41,6 +42,7 @@ export interface ToolsPageViewProps {
   connectionFilter?: ConnectionCatalogFilter;
   onConnectionFilterChange?: (filter: ConnectionCatalogFilter, section?: "connections" | "channels") => void;
   marketplace?: ReactNode;
+  pluginUpdatesAvailable?: boolean;
   onSectionChange?: (section: ToolsSection) => void;
   onSearchChange: (value: string, section?: "connections" | "channels") => void;
   onCategoryChange: (category: IntegrationCategoryTab) => void;
@@ -53,6 +55,7 @@ export interface ToolsPageViewProps {
 export function ToolsPage() {
   const { state, dispatch } = useAppState();
   const { clients } = useApiClients();
+  const pluginUpdatesAvailable = usePluginUpdateAvailable(clients?.plugins, state.account.userId);
   const [searchBySection, setSearchBySection] = useState({ connections: "", channels: "" });
   const [filterBySection, setFilterBySection] = useState<Record<"connections" | "channels", ConnectionCatalogFilter>>({ connections: "all", channels: "all" });
   const [activeCategory, setActiveCategory] = useState<IntegrationCategoryTab>("All");
@@ -111,6 +114,7 @@ export function ToolsPage() {
 
   return (
     <ToolsPageView
+      pluginUpdatesAvailable={pluginUpdatesAvailable}
       tools={state.tools}
       client={clients?.integrations}
       channelsClient={clients?.channels}
@@ -215,6 +219,7 @@ export function ToolsPageView(props: ToolsPageViewProps) {
                   ? <MessageCircle size={17} strokeWidth={1.8} aria-hidden="true" />
                   : <Puzzle size={17} strokeWidth={1.8} aria-hidden="true" />}
               {t(item === "plugins" ? "tools.pluginsTab" : item === "channels" ? "tools.channelsTab" : "tools.connectionsTab")}
+              {item === "plugins" && props.pluginUpdatesAvailable ? <PluginUpdateDot /> : null}
             </button>
           ))}
         </div>
