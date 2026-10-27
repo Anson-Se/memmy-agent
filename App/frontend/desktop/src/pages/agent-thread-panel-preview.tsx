@@ -25,6 +25,7 @@ import { FilePreview } from "./file-preview/file-preview.js";
 
 export const THREAD_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 export const THREAD_CSV_PREVIEW_MAX_ROWS = 500;
+export const THREAD_LIVE_EDIT_RETRY_DELAYS_MS = [250, 1_000, 2_000, 4_000] as const;
 
 type ThreadPreviewState =
   | { status: "loading" }
@@ -51,18 +52,25 @@ export type ThreadPreviewContext = {
   fetchFn?: typeof fetch;
 };
 
-export function ThreadTabPreview(props: { tab: ThreadPanelTab; context: ThreadPreviewContext }) {
+export function ThreadTabPreview(props: { tab: Extract<ThreadPanelTab, { type: "file" | "change" }>; context: ThreadPreviewContext; revision?: string }) {
   const { t } = useTranslation();
   const [attempt, setAttempt] = useState(0);
   const [result, setResult] = useState<LoadResult>({ state: { status: "loading" }, path: null });
+  const [loadedVersion, setLoadedVersion] = useState(0);
   const { tab, context } = props;
   const environmentRevision = tab.type === "change" ? context.environment?.snapshot.revision ?? "" : "";
 
   useEffect(() => {
     let cancelled = false;
     let objectUrl: string | undefined;
-    setResult({ state: { status: "loading" }, path: null });
-    const load = tab.type === "change" ? loadChangePreview(tab, context) : loadFilePreview(tab, context);
+    const abortController = new AbortController();
+    setResult((current) => current.state.status === "ready" && current.state.kind !== "pdf" && current.state.kind !== "html"
+      ? current
+      : { state: { status: "loading" }, path: null });
+    const load = loadPreviewDuringLiveEdit(
+      () => tab.type === "change" ? loadChangePreview(tab, context) : loadFilePreview(tab, context),
+      abortController.signal,
+    );
     load
       .then((next) => {
         if (cancelled) {
@@ -71,16 +79,18 @@ export function ThreadTabPreview(props: { tab: ThreadPanelTab; context: ThreadPr
         }
         objectUrl = next.objectUrl;
         setResult(next);
+        setLoadedVersion((value) => value + 1);
       })
       .catch(() => {
         if (!cancelled) setResult({ state: { status: "error" }, path: null });
       });
     return () => {
       cancelled = true;
+      abortController.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
     // Change previews reload when Git status arrives. File edits keep their own draft.
-  }, [tab.id, attempt, environmentRevision]);
+  }, [tab, attempt, environmentRevision, props.revision]);
 
   const filePath = result.path ?? (tab.type === "change" ? tab.absolutePath ?? tab.path : tab.path ?? null);
   const fileActions = Boolean(context.artifactClient && filePath);
@@ -153,6 +163,7 @@ export function ThreadTabPreview(props: { tab: ThreadPanelTab; context: ThreadPr
           name={tab.name}
           path={filePath ?? tab.name}
           state={result.state}
+          loadedVersion={loadedVersion}
           artifactClient={context.artifactClient}
           onPreviewFile={context.onPreviewFile}
           onRetry={() => setAttempt((value) => value + 1)}
@@ -168,10 +179,45 @@ export function ThreadTabPreview(props: { tab: ThreadPanelTab; context: ThreadPr
   );
 }
 
+/**
+ * Editors commonly save by replacing the destination atomically, leaving a
+ * short interval where resolve/fetch cannot see the file. WorkBuddy uses the
+ * same shape of protection: debounce the first read and retry with a small
+ * backoff instead of turning that transient window into a moved/deleted error.
+ */
+export async function loadPreviewDuringLiveEdit<T>(
+  load: () => Promise<T>,
+  signal?: AbortSignal,
+  delays: readonly number[] = THREAD_LIVE_EDIT_RETRY_DELAYS_MS,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    if (signal?.aborted) throw new DOMException("Preview load aborted", "AbortError");
+    if (attempt > 0) await waitForPreviewRetry(delays[attempt - 1]!, signal);
+    try {
+      return await load();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+function waitForPreviewRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(resolve, delayMs);
+    signal?.addEventListener("abort", () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Preview load aborted", "AbortError"));
+    }, { once: true });
+  });
+}
+
 function ThreadPreviewBody(props: {
   name: string;
   path: string;
   state: ThreadPreviewState;
+  loadedVersion: number;
   artifactClient: AgentArtifactClient | null;
   onPreviewFile?: (file: { name: string; path?: string; url?: string }) => boolean;
   onRetry: () => void;
@@ -271,7 +317,7 @@ function ThreadPreviewBody(props: {
       if (canEditWorkspacePreview(props.path, props.workspaceRoot)) {
         return (
           <EditableCodePreview
-            key={props.path}
+            key={`${props.path}:${props.loadedVersion}`}
             path={props.path}
             workspaceRoot={props.workspaceRoot ?? ""}
             diskText={state.text}
@@ -373,11 +419,7 @@ async function loadFilePreview(
       id: path ?? url,
       name: tab.name,
       path: path ?? undefined,
-      load: async (signal) => {
-        const response = await (context.fetchFn ?? fetch)(url, { signal });
-        if (!response.ok) throw new Error("media_fetch_failed");
-        return response.blob();
-      },
+      load: (signal) => loadPreviewDuringLiveEdit(() => fetchBlob(url, context.fetchFn, signal), signal),
       open: path && context.artifactClient ? () => context.artifactClient!.openArtifact(path!) : undefined,
       reveal: path && context.artifactClient ? () => context.artifactClient!.revealArtifact(path!) : undefined,
     };
@@ -470,8 +512,8 @@ async function readWorkspaceText(absolute: string, context: ThreadPreviewContext
   }
 }
 
-async function fetchBlob(url: string, fetchFn: typeof fetch = fetch): Promise<Blob> {
-  const response = await fetchFn(url, { cache: "no-store" });
+async function fetchBlob(url: string, fetchFn: typeof fetch = fetch, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetchFn(url, { cache: "no-store", signal });
   if (!response.ok) throw new Error(`preview request failed: ${response.status}`);
   return response.blob();
 }

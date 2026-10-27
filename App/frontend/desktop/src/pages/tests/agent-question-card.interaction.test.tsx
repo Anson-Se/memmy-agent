@@ -357,18 +357,4 @@ describe("AgentQuestionCard", () => {
     expect(container.querySelector(".agent-confirmation-card")).toBeNull();
     expect(container.textContent).not.toContain("提交回答");
   });
-
-  it("keeps the online plugin workflow card layout for contextual questions", async () => {
-    const pluginCard: AgentQuestionCardPayload = {
-      ...card,
-      context: { workflow: "literature-review", taskId: "review-1" },
-      questions: [card.questions[0]!, { ...card.questions[0]!, id: "range", prompt: "检索时间范围？" }],
-    };
-    await act(async () => root.render(<I18nProvider language="zh-CN">
-      <AgentQuestionCard card={pluginCard} />
-    </I18nProvider>));
-    expect(container.querySelectorAll('[role="group"]')).toHaveLength(2);
-    expect(container.querySelector('[data-workflow="literature-review"]')).not.toBeNull();
-    expect(container.querySelector(".agent-confirmation-card")).toBeNull();
-  });
 });

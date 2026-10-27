@@ -285,74 +285,6 @@ describe("memmy-agent client", () => {
     expect(calls).toContain("/api/projects/project-1/environment/branch");
   });
 
-  it("lists and reads scoped workspace files with authenticated actions", async () => {
-    const calls: Array<{ url: string; method: string; authorization?: string }> = [];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(String(input));
-      const headers = init?.headers as Record<string, string> | undefined;
-      calls.push({
-        url: `${url.pathname}${url.search}`,
-        method: init?.method ?? "GET",
-        authorization: headers?.Authorization
-      });
-      if (url.pathname === "/webui/bootstrap") return json(bootstrap);
-      if (url.pathname.endsWith("/workspace/files")) {
-        return json({
-          root: { kind: "project", label: "Memmy" },
-          path: url.searchParams.get("path") ?? "",
-          entries: [{
-            name: "index.ts",
-            path: "src/index.ts",
-            kind: "file",
-            size: 12,
-            modifiedAt: "2026-08-25T08:00:00.000Z"
-          }],
-          truncated: false
-        });
-      }
-      if (url.pathname.endsWith("/workspace/file")) {
-        return new Response("export {};\n", {
-          status: 200,
-          headers: { "content-type": "text/plain; charset=utf-8" }
-        });
-      }
-      if (url.pathname.endsWith("/workspace/file/open") || url.pathname.endsWith("/workspace/file/reveal")) {
-        return json({ ok: true });
-      }
-      return json({ error: "not found" }, 404);
-    });
-    const client = createMemmyAgentClient({
-      baseUrl: "http://127.0.0.1:18980",
-      fetchFn: fetchMock as typeof fetch
-    });
-
-    await expect(client.listWorkspaceFiles({ kind: "project", key: "project-1" }, "src")).resolves.toMatchObject({
-      root: { kind: "project", label: "Memmy" },
-      path: "src",
-      entries: [{
-        name: "index.ts",
-        path: "src/index.ts",
-        kind: "file"
-      }]
-    });
-    const blob = await client.readWorkspaceFile({ kind: "project", key: "project-1" }, "src/index.ts");
-    await expect(blob.text()).resolves.toBe("export {};\n");
-    await expect(client.openWorkspaceFile({ kind: "project", key: "project-1" }, "src/index.ts")).resolves.toBeUndefined();
-    await expect(client.revealWorkspaceFile({ kind: "project", key: "project-1" }, "src/index.ts")).resolves.toBeUndefined();
-    expect(calls).toContainEqual(expect.objectContaining({
-      url: "/api/projects/project-1/workspace/files?path=src",
-      authorization: "Bearer agent-token"
-    }));
-    expect(calls).toContainEqual(expect.objectContaining({
-      url: "/api/projects/project-1/workspace/file?path=src%2Findex.ts",
-      authorization: "Bearer agent-token"
-    }));
-    expect(calls).toContainEqual(expect.objectContaining({
-      url: "/api/projects/project-1/workspace/file/open?path=src%2Findex.ts",
-      method: "POST"
-    }));
-  });
-
   it("prefers env override, then current origin, then local gateway default for base URL", () => {
     vi.stubEnv("VITE_MEMMY_AGENT_WEBUI_URL", "http://127.0.0.1:19000");
     expect(defaultMemmyAgentBaseUrl()).toBe("http://127.0.0.1:19000");
@@ -820,6 +752,20 @@ describe("memmy-agent client", () => {
     ]);
   });
 
+  it("renews recording playback without a chat session", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/webui/bootstrap") return json(bootstrap);
+      expect(url.pathname).toBe("/api/webui/recordings/resolve");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({ path: "/workspace/recordings/interview.webm" });
+      return json({ media_url: "/api/media/ws/signed/audio" });
+    });
+    const client = createMemmyAgentClient({ baseUrl: "http://127.0.0.1:18980", clientId: "frontend-test", fetchFn: fetchMock as typeof fetch });
+    await expect(client.resolveRecording("/workspace/recordings/interview.webm"))
+      .resolves.toBe("http://127.0.0.1:18980/api/media/ws/signed/audio");
+  });
+
   it("uploads agent attachments as multipart and normalizes returned signed URLs", async () => {
     const calls: Array<{ path: string; init?: RequestInit }> = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1033,12 +979,8 @@ describe("memmy-agent client", () => {
     expect(sockets[0]?.closeCalls[0]).toEqual({ code: 1011, reason: "ready timeout" });
     sockets[0]?.emitClose(1011);
     await rejection;
-    // The first attempt did fail, but a connection that never reached ready is
-    // still a dropped connection: it is now reported the same way as a
-    // post-ready drop and falls through to the reconnect scheduling below,
-    // instead of leaving the transport down until an outer caller retries.
-    // (The reconnect itself is covered by the post-ready reconnect test above.)
-    expect(events.map((event) => event.event)).toEqual(["connection_attempt_failed", "connection_closed"]);
+    expect(sockets).toHaveLength(1);
+    expect(events).toEqual([]);
   });
 
   it("newChat resolves server assigned chat id", async () => {
@@ -2207,7 +2149,7 @@ describe("memmy-agent client", () => {
     await expect(removal).resolves.toEqual({ outcome: "already_dequeued", revision: 8 });
   });
 
-  it("sends question answers directly and resolves their acknowledgement", async () => {
+  it("sends the full queue order with the current revision", async () => {
     const sockets: FakeSocket[] = [];
     const client = createMemmyAgentClient({
       baseUrl: "https://agent.local:18980",
@@ -2220,34 +2162,12 @@ describe("memmy-agent client", () => {
       }
     });
     const connection = await connectReady(client, sockets);
-    const requestId = "66666666-6666-4666-8666-666666666666";
-    const response = connection.respondToQuestion("chat-question", {
-      requestId,
-      answers: [{
-        questionId: "choice",
-        selectedOptionIds: ["yes"],
-        otherText: "details"
-      }]
-    }, 1);
-    const frame = JSON.parse(sockets[0]!.sent.at(-1)!);
-    expect(frame).toEqual({
-      type: "agent_question_response",
-      chat_id: "chat-question",
-      request_id: requestId,
-      answers: [{
-        question_id: "choice",
-        selected_option_ids: ["yes"],
-        other_text: "details"
-      }]
+    const orderedIds = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+    connection.reorderQueuedMessages("chat-reorder", orderedIds, 7, 1);
+    expect(JSON.parse(sockets[0]!.sent.at(-1)!)).toMatchObject({
+      type: "queue_reorder", chat_id: "chat-reorder", ordered_ids: orderedIds,
+      expected_revision: 7, request_id: expect.any(String),
     });
-
-    sockets[0]!.emit({
-      event: "agent_question_response_result",
-      chat_id: "chat-question",
-      request_id: requestId,
-      ok: true
-    });
-    await expect(response).resolves.toBeUndefined();
   });
 
   it("sends one queue-steer control and terminates the original queued attempt", async () => {

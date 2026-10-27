@@ -76,8 +76,7 @@ export function App() {
 function RuntimeApp() {
   const { state, dispatch } = useAppState();
   const { clients, setClients } = useApiClients();
-  const { receive: receivePluginEvent } = usePluginUi();
-  const historyModelScope = state.agent.currentChatId ?? "draft-new-task";
+  const { receive: receivePluginEvent, reconcilePendingCalls } = usePluginUi();
   useComputerHistoryTrayIndicator(clients?.memmyAgent ?? null);
   useComputerHistoryModelSync({
     client: clients?.memmyAgent ?? null,
@@ -343,6 +342,10 @@ function RuntimeApp() {
           const parsed = parseSseEvent(event);
           if (parsed?.type === "plugin.capability_event") receivePluginEvent(parsed.payload);
         });
+        events.addEventListener("plugin.capability_snapshot", (event) => {
+          const parsed = parseSseEvent(event);
+          if (parsed?.type === "plugin.capability_snapshot") reconcilePendingCalls(parsed.payload.calls);
+        });
         events.onerror = () => dispatch(appActions.eventStatusChanged("reconnecting"));
       } catch (error) {
         if (!isActive) {
@@ -362,7 +365,7 @@ function RuntimeApp() {
         clearTimeout(timeout);
       }
     };
-  }, [bootKey, dispatch, receivePluginEvent, setClients]);
+  }, [bootKey, dispatch, receivePluginEvent, reconcilePendingCalls, setClients]);
 
   return (
     <UpdateCoordinatorProvider>

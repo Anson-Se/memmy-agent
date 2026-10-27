@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { zhCNMessages } from "../../i18n/messages.js";
-import { formatRecordedAt, transcriptFile, type Translate } from "../recording-entry.js";
+import { applySidebarRecordingAction, canUseAccountRecording, formatRecordedAt, sidebarRecordingStatus, transcriptFile, type RecordingEntrySession, type Translate } from "../recording-entry.js";
 
 /** Minimal translator, so the file's labels come from the shipped messages. */
 const t: Translate = ((key: string, params?: Record<string, unknown>) =>
@@ -10,6 +10,55 @@ function formatMessage(template: string, params?: Record<string, unknown>): stri
   if (!params) return template;
   return template.replace(/\{(\w+)\}/g, (_, name: string) => String(params[name] ?? ""));
 }
+
+describe("canUseAccountRecording", () => {
+  it("requires account mode and a signed-in user, including after switching to API Key mode", () => {
+    expect(canUseAccountRecording("account", "user-1")).toBe(true);
+    expect(canUseAccountRecording("account", null)).toBe(false);
+    expect(canUseAccountRecording("byok", "user-1")).toBe(false);
+    expect(canUseAccountRecording("byok", null)).toBe(false);
+  });
+});
+
+describe("sidebar recording action", () => {
+  it("opens without capturing, then starts, pauses, and resumes through the separate control", () => {
+    const calls: string[] = [];
+    const session: Pick<RecordingEntrySession, "status" | "start" | "pause" | "resume" | "finish" | "showLive"> = {
+      status: "idle",
+      start: () => calls.push("start"),
+      pause: () => calls.push("pause"),
+      resume: () => calls.push("resume"),
+      finish: () => calls.push("finish"),
+      showLive: () => calls.push("showLive")
+    };
+    applySidebarRecordingAction(session, "open");
+    expect(calls).toEqual([]);
+    applySidebarRecordingAction(session, "control");
+    expect(calls).toEqual(["start"]);
+    session.status = "recording";
+    applySidebarRecordingAction(session, "control");
+    expect(calls.slice(-2)).toEqual(["showLive", "pause"]);
+    session.status = "paused";
+    applySidebarRecordingAction(session, "control");
+    expect(calls.slice(-2)).toEqual(["showLive", "resume"]);
+    applySidebarRecordingAction(session, "finish");
+    expect(calls.at(-1)).toBe("finish");
+    session.status = "idle";
+    applySidebarRecordingAction(session, "finish");
+    expect(calls.filter((call) => call === "finish")).toHaveLength(1);
+  });
+});
+
+describe("sidebar recording status", () => {
+  it("keeps transcription and its result visible after capture ends", () => {
+    const live = { status: "transcribing" } as RecordingEntrySession["live"];
+    expect(sidebarRecordingStatus({ status: "idle", live })).toBe("transcribing");
+    expect(sidebarRecordingStatus({ status: "transcribing", live: null })).toBe("transcribing");
+    expect(sidebarRecordingStatus({ status: "idle", live: { ...live!, status: "ready" } })).toBe("ready");
+    expect(sidebarRecordingStatus({ status: "idle", live: { ...live!, status: "failed" } })).toBe("failed");
+    expect(sidebarRecordingStatus({ status: "recording", live })).toBe("recording");
+  });
+});
 
 describe("formatRecordedAt", () => {
   it("shows the stamp the way the recording list does", () => {

@@ -442,6 +442,8 @@ export const PluginCapabilityEventPayloadSchema = z.object({
   callId: z.string().min(1),
   conversationId: z.string().min(1),
   origin: PluginInvocationOriginSchema.default("agent"),
+  agentToolCallId: z.string().min(1).optional(),
+  turnId: z.string().min(1).optional(),
   event: CapabilityEventSchema
 });
 export type PluginCapabilityEventPayload = z.infer<typeof PluginCapabilityEventPayloadSchema>;

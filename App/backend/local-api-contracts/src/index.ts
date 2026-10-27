@@ -1744,12 +1744,22 @@ export const PluginCapabilitySseEventSchema = z.object({
     payload: PluginCapabilityEventPayloadSchema
 });
 
+export const PluginCapabilitySnapshotSseEventSchema = z.object({
+    id: z.string(),
+    type: z.literal("plugin.capability_snapshot"),
+    timestamp: z.string().datetime(),
+    payload: z.object({
+        calls: z.array(PluginCapabilityEventPayloadSchema.pick({ pluginId: true, capabilityId: true, callId: true, conversationId: true }))
+    })
+});
+
 export const SseEventSchema = z.discriminatedUnion("type", [
     ConnectedSseEventSchema,
     HeartbeatSseEventSchema,
     ScanProgressSseEventSchema,
     ScanCompletedSseEventSchema,
-    PluginCapabilitySseEventSchema
+    PluginCapabilitySseEventSchema,
+    PluginCapabilitySnapshotSseEventSchema
 ]);
 export type SseEvent = z.infer<typeof SseEventSchema>;
 

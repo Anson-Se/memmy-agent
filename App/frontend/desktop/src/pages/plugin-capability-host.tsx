@@ -1,3 +1,4 @@
+import "./plugin-interaction-frame.css";
 import { createPortal } from "react-dom";
 import { Button } from "../components/button.js";
 import { FileTypeIcon } from "../components/file-type-icon.js";
@@ -18,7 +19,9 @@ import {
 } from "react";
 import {
   AlertCircle,
+  ArrowRight,
   Check,
+  ChevronLeft,
   ChevronRight,
   Download,
   FileOutput,
@@ -27,9 +30,11 @@ import {
   Plus,
   Upload,
   HelpCircle,
+  LoaderCircle,
   MessageSquarePlus,
   Mic,
   Paperclip,
+  PenLine,
   X
 } from "lucide-react";
 import type {
@@ -43,7 +48,7 @@ import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { PluginsClient } from "../api/plugins-client.js";
 import { asrRecordingTimeRemainingMs, isLiveAsrTimeout, useAsrRecorder } from "./asr-recorder.js";
-import { normalizePluginConversationId, usePluginChatFeedback, usePluginQuestionDrafts, usePluginRecordingMaterials, usePluginTranscriptions, type PluginChatFeedback, type PluginRecordingMaterial, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { normalizePluginConversationId, usePluginChatFeedback, usePluginQuestionDrafts, useRecordLegalQuestionAnswer, usePluginRecordingMaterials, usePluginTranscriptions, type PluginChatFeedback, type PluginRecordingMaterial, type PluginUiCall } from "../app/plugin-ui-context.js";
 import { handOverRecording } from "../lib/recording-handover.js";
 import { PLUGIN_TRANSCRIPTION_ATTEMPTS, type PluginRecordingTranscript, type PluginTranscriptionJob, type PluginTranscriptionState } from "../lib/plugin-transcription-jobs.js";
 import type { MessageKey } from "../i18n/messages.js";
@@ -60,6 +65,11 @@ import {
 import { materializePluginUploadFile } from "../lib/plugin-upload-file.js";
 import { startBrowserDownload } from "./agent-message-content.js";
 import { RecordingWaveform, WAVE_BARS } from "./recording-waveform.js";
+const REVIEW_PLUGIN_ID = "literature-review";
+import { themeLiteratureReviewCard } from "./literature-review-card-theme.js";
+import { ReviewSourceCard } from "./literature-review-source-card.js";
+import "./agent-confirmation-dock.css";
+import "./agent-question-card.css";
 
 /** Moving only the bar leaves its microphone owner mounted in the side pane. */
 export const RecordingBarPortalContext = createContext<{ target: HTMLElement | null; hidden: boolean } | null>(null);
@@ -68,13 +78,21 @@ export const RecordingBarPortalContext = createContext<{ target: HTMLElement | n
 export function isLegalFlowInteraction(call: PluginUiCall): boolean {
   return call.pluginId === "legal-labor"
     && !call.events.some((event) => event.type === "result" || event.type === "error")
-    && call.events.some((event) => event.type === "interaction" && (
+    && ((call.capabilityId === "session-start" && guidanceQuestion(call.events) !== undefined)
+      || call.events.some((event) => event.type === "interaction" && (
       event.request.type === "file-input"
       || (event.request.type === "question" && readQuestions(asRecord(event.request.payload).questions).length > 0)
-    ));
+    )));
 }
 
-import { collectReviewPreparation, isReviewPreparation, reviewResponseKey, ReviewPreparationHistory } from "./review-preparation-history.js";
+/** Any live legal workflow card takes priority over the optional reference guide. */
+export function isActiveLegalWorkflowCard(call: PluginUiCall): boolean {
+  return call.pluginId === "legal-labor"
+    && call.capabilityId !== "guide-open"
+    && !call.events.some((event) => event.type === "result" || event.type === "error")
+    && call.events.some((event) => event.type === "interaction");
+}
+
 
 const TASK_STATUS_KEYS = {
   pending: "plugin.ui.task.pending",
@@ -84,6 +102,10 @@ const TASK_STATUS_KEYS = {
 } as const;
 
 interface PluginCapabilityHostProps {
+  /** The owning Agent turn has ended; do not keep an agent-owned progress row spinning. */
+  agentRunActive?: boolean;
+  /** Chat surfaces keep all pending confirmations in the composer dock. Standalone plugin pages stay inline. */
+  dockInteractions?: boolean;
   calls: PluginUiCall[];
   plugins: InstalledPlugin[];
   client: (Pick<PluginsClient, "getUi" | "cancel" | "respond"> & Partial<Pick<PluginsClient, "readArtifact">>) | null;
@@ -92,14 +114,6 @@ interface PluginCapabilityHostProps {
   asrClient?: AsrClient;
   onAddArtifact?: (artifact: PluginArtifactRef) => void;
   onOpenArtifact?: (artifact: PluginArtifactRef) => void;
-  /**
-   * What the legal diagnosis hands over at the end, beside the report.
-   *
-   * `ready` stays false while the Agent is still working: the report can be
-   * rewritten chapter by chapter, and a card shown early would let the user
-   * open a preview that reloads under them with every pass.
-   */
-  legalDelivery?: { ready: boolean; recordings: PluginArtifactRef[] };
   /** Starts an explicitly requested report after user-raised material collection completes. */
   onRequestDiagnosis?: (call: PluginUiCall) => Promise<void>;
   /**
@@ -173,8 +187,8 @@ export interface PluginRendererInteractionState {
 
 export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
   const { t } = useTranslation();
+  const recordLegalQuestionAnswer = useRecordLegalQuestionAnswer();
   const [localAnsweredInteractions, setLocalAnsweredInteractions] = useState<Set<string>>(() => new Set());
-  const [reviewResponses, setReviewResponses] = useState<Map<string, unknown>>(() => new Map());
   const [dismissedCalls, setDismissedCalls] = useState<Set<string>>(() => new Set());
   const diagnosisRequested = useRef(new Set<string>());
   const responseFlights = useRef(new Map<string, Promise<void>>());
@@ -253,32 +267,33 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         ), pinnedCapabilities
       ),
       region,
-      pinnedCapabilities
+      pinnedCapabilities,
+      props.dockInteractions
     ),
-    [answeredInteractions, dismissedCalls, pinnedCapabilities, props.calls, props.dismissedCallIds, region]
+    [answeredInteractions, dismissedCalls, pinnedCapabilities, props.calls, props.dismissedCallIds, props.dockInteractions, region]
   );
-  const flowActive = selectVisiblePluginCalls(props.calls, answeredInteractions).some(isLegalFlowInteraction);
-  const orderedCalls = useMemo(() => orderPluginCallsForDisplay(deduplicateLegalInteractions(calls))
-    .filter((call) => !(flowActive && call.pluginId === "legal-labor" && guidanceQuestion(call.events))), [calls, flowActive]);
+  const orderedCalls = useMemo(() => orderPluginCallsForDisplay(deduplicateLegalInteractions(calls)), [calls]);
+  const displayCalls = orderedCalls.filter((call) => {
+    // Agent calls already return their error to the expandable tool result.
+    // Do not duplicate it as a persistent block beside the composer.
+    if (call.origin === "agent" && call.events.some((event) => event.type === "error")) return false;
+    if (props.dockInteractions && call.pluginId === REVIEW_PLUGIN_ID && isStatusOnlyPresentation(call)) return false;
+    // Agent-owned legal progress appears on its tool row. User-started jobs
+    // keep this standalone status because they have no Agent tool row.
+    if (props.dockInteractions && region === "flow" && call.pluginId === "legal-labor"
+      && call.origin === "agent" && isStatusOnlyPresentation(call)) return false;
+    if (region === "flow" && props.agentRunActive === false && call.pluginId === "legal-labor"
+      && call.origin === "agent" && isStatusOnlyPresentation(call)) return false;
+    // Agent-owned files are candidates until the Agent sends them through the
+    // ordinary message tool. Do not leave an empty plugin result shell here.
+    if (region === "flow" && call.origin === "agent"
+      && call.events.some((event) => event.type === "artifact" && event.artifact.role !== "setup")
+      && call.events.some((event) => event.type === "result")
+      && call.events.every((event) => ["artifact", "result", "progress", "task-list"].includes(event.type))) return false;
+    return true;
+  });
   const currentRetries = [...diagnosisRetries.values()].filter((retry) => props.calls.some((call) => call.callId === retry.callId));
-  // A run of the Agent pausing is not the diagnosis being finished: Memmy may
-  // be mid-revision, with the report about to be rewritten. The delivery waits
-  // for the plugin too — while a legal call is running, the report on screen is
-  // a draft the user should not be reading yet.
-  //
-  // Only the newest legal call decides. An earlier call that never received a
-  // terminal event — a plugin process killed mid-run, a stream that dropped, an
-  // app restarted while a card was open — would otherwise sit there looking
-  // active forever and suppress the delivery for the rest of the session, which
-  // is exactly what a stranded `session-start` did to a finished diagnosis.
-  const latestLegalCall = [...props.calls].reverse().find((call) => call.pluginId === "legal-labor");
-  const legalCallActive = Boolean(latestLegalCall
-    && !latestLegalCall.events.some((event) => event.type === "result" || event.type === "error"));
-  const deliveryReport = region === "flow" && props.legalDelivery?.ready && !legalCallActive
-    ? selectLegalDeliveryReport(props.calls) : null;
-  const deliveryFiles = deliveryReport ? [deliveryReport, ...props.legalDelivery!.recordings] : [];
-  const preparation = region === "flow" ? collectReviewPreparation(props.calls, reviewResponses) : [];
-  if (orderedCalls.length === 0 && currentRetries.length === 0 && deliveryFiles.length === 0 && preparation.length === 0) return null;
+  if (displayCalls.length === 0 && currentRetries.length === 0) return null;
 
   return (
     <section
@@ -291,7 +306,7 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
       {currentRetries.map((call) => <article key={`retry:${call.callId}`} className="diagnostic-upload-card">
         <div className="diagnostic-upload-card__body"><p className="diagnostic-upload-card__description" role="status">{t("plugin.ui.diagnosisSaved")}</p></div>
         <footer className="diagnostic-upload-card__footer"><p role="alert">{t("plugin.ui.responseFailed")}</p>
-          <button type="button" className="diagnostic-guidance-card__action diagnostic-guidance-card__action--primary"
+          <button type="button" className="diagnostic-upload-card__action diagnostic-upload-card__action--primary"
             disabled={retryingDiagnosis.has(call.callId)} onClick={() => {
               if (retryFlights.current.has(call.callId) || !props.onRequestDiagnosis) return;
               retryFlights.current.add(call.callId);
@@ -305,11 +320,12 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             }}>{t("plugin.ui.generateDiagnosis")}</button>
         </footer>
       </article>)}
-
-      <ReviewPreparationHistory groups={preparation} />
-      {orderedCalls.map((call) => {
+      {displayCalls.map((call) => {
+        // The review process owns status; keep actionable cards and artifacts here.
         const plugin = plugins.get(call.pluginId);
         const renderer = plugin?.manifest.ui?.renderer;
+        const reviewCard = call.pluginId === REVIEW_PLUGIN_ID;
+        const reviewDelivery = reviewCard && call.events.some((event) => event.type === "artifact" && event.artifact.role !== "setup");
         const usesRenderer = Boolean(
           renderer
           && (!renderer.capabilities || renderer.capabilities.includes(call.capabilityId))
@@ -330,7 +346,8 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             if (existing) return existing;
             const flight = props.client!.respond(target.pluginId, target.callId, targetId, response).then(() => {
               if (asRecord(response).action !== "refresh") {
-                if (isReviewPreparation(target)) setReviewResponses((current) => new Map(current).set(reviewResponseKey(target, targetId), response));
+                const answeredRequest = target.events.find((event) => event.type === "interaction" && event.request.interactionId === targetId);
+                if (answeredRequest?.type === "interaction") recordLegalQuestionAnswer?.(target, answeredRequest.request, response);
                 rememberAnswered(key);
               }
             });
@@ -346,10 +363,19 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         // Pinned cards can reopen the same interaction. Other dismissals
         // explicitly retire the call and hide its cancellation report.
         const dismiss = async () => {
+          if (call.pluginId === "legal-labor" && call.capabilityId === "guide-open") {
+            const event = [...call.events].reverse().find((item) => item.type === "interaction");
+            if (event?.type === "interaction") await respond(event.request.interactionId, { action: "close" });
+            setDismissedCalls((current) => new Set(current).add(`${call.pluginId}:${call.callId}`));
+            props.onCallDismissed?.(call.callId);
+            return;
+          }
           if (isLegalFlowInteraction(call)) {
             const event = [...call.events].reverse().find((item) => item.type === "interaction");
             if (event?.type === "interaction") await respond(event.request.interactionId,
-              event.request.type === "file-input" ? { action: "skip", files: [] } : { action: "skip", answers: {} });
+              call.capabilityId === "session-start" && guidanceQuestion(call.events)
+                ? { action: "cancel" }
+                : event.request.type === "file-input" ? { action: "skip", files: [] } : { action: "skip", answers: {} });
             return;
           }
           if (autoPinned && props.onCallHidden) {
@@ -372,9 +398,10 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
             conversationId={call.conversationId}
             pluginId={call.pluginId}
             origin={call.origin}
-            guidance={call.pluginId === "legal-labor" && call.capabilityId === "session-start"}
+            guidance={call.pluginId === "legal-labor" && ["session-start", "guide-open"].includes(call.capabilityId)}
+            guidanceReadOnly={call.pluginId === "legal-labor" && call.capabilityId === "guide-open"}
             diagnosticUpload={call.pluginId === "legal-labor" && ["session-start", "material-collect"].includes(call.capabilityId)}
-            hideDeliverables={call.pluginId === "legal-labor"}
+            hideDeliverables={call.origin === "agent" || call.pluginId === "legal-labor"}
             onGenerateDiagnosis={call.origin === "user" && props.onRequestDiagnosis
               ? () => setPendingDiagnoses((current) => new Set(current).add(call.callId)) : undefined}
             onRespond={respond}
@@ -395,18 +422,17 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
         // cards. Keep them in the chat flow as text so a job cannot take over
         // the conversation with a second progress panel.
         if (isBarePresentation(call) || isStatusOnlyPresentation(call)
+          || (call.pluginId === "legal-labor" && call.events.some((event) => event.type === "error")
+            && !call.events.some((event) => event.type === "interaction"))
+          || (reviewDelivery && !usesRenderer && (!call.events.some((event) => event.type === "interaction")
+            || call.events.some((event) => event.type === "result" || event.type === "error")))
           || isLegalFlowInteraction(call)
-          || (call.pluginId === "legal-labor" && ((call.capabilityId === "session-start" && guidanceQuestion(call.events))
-            || (["session-start", "material-collect"].includes(call.capabilityId) && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input"))))) return <div key={call.callId} hidden={hidden}>{cards}</div>;
-        if (isReviewPreparation(call)) return (
-          <div key={call.callId} data-review-active-card hidden={hidden}>
-            <p className="review-waiting" role="status">{t("plugin.ui.waitingForResponse")}</p>
-            {usesRenderer && renderer ? <SandboxedPluginRenderer call={call} interactionStates={interactionStates.get(call.pluginId + ":" + call.callId) ?? []} height={renderer.height ?? 680} client={props.client!} onRespond={respond} onUploadFiles={plugin?.approvedPermissions.some((permission) => permission.type === "host-service" && permission.services.includes("file-input")) ? props.uploadFiles : undefined} fallback={cards} /> : cards}
-          </div>
-        );
+          || (call.pluginId === "legal-labor" && ((["session-start", "guide-open"].includes(call.capabilityId) && guidanceQuestion(call.events))
+            || (["session-start", "material-collect"].includes(call.capabilityId)
+              && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input"))))) return <div key={call.callId} hidden={hidden}>{cards}</div>;
         return (
-          <div key={call.callId} hidden={hidden} className="rounded-card border border-border-stone/30 bg-background-paper p-3 shadow-sm">
-            <div className="mb-2 flex items-start justify-between gap-2">
+          <div key={call.callId} hidden={hidden} className={reviewCard ? `review-interaction-shell${usesRenderer ? "" : " review-interaction-shell--native"}` : "rounded-card border border-border-stone/30 bg-background-paper p-3 shadow-sm"}>
+            {!reviewCard && <div className="mb-2 flex items-start justify-between gap-2">
               <p className="text-xs font-medium text-text-ink/55">
                 {plugin?.manifest.name ?? call.pluginId}
               </p>
@@ -421,12 +447,13 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
                   ✕
                 </button>
               ) : null}
-            </div>
+            </div>}
             {usesRenderer && renderer ? (
               <SandboxedPluginRenderer
                 call={call}
                 interactionStates={interactionStates.get(call.pluginId + ":" + call.callId) ?? []}
                 height={renderer.height ?? 320}
+                docked={region === "pinned"}
                 client={props.client!}
                 onRespond={respond}
                 onUploadFiles={plugin?.approvedPermissions.some((permission) => permission.type === "host-service" && permission.services.includes("file-input")) ? props.uploadFiles : undefined}
@@ -438,42 +465,8 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
           </div>
         );
       })}
-      {deliveryFiles.length > 0 ? <LegalDeliveryCard files={deliveryFiles} onOpen={props.onOpenArtifact} /> : null}
     </section>
   );
-}
-
-/**
- * The finished report from the latest successful `report-render` run.
- *
- * Only the report is handed over: the workbook is the report's working sheet,
- * not something the client reads, so it never reaches the delivery card.
- */
-export function selectLegalDeliveryReport(calls: readonly PluginUiCall[]): PluginArtifactRef | null {
-  for (const call of [...calls].reverse()) {
-    if (call.pluginId !== "legal-labor" || call.capabilityId !== "report-render") continue;
-    if (!call.events.some((event) => event.type === "result")) continue;
-    const artifact = [...call.events].reverse().find((event) => event.type === "artifact" && event.artifact.role === "deliverable");
-    if (artifact?.type === "artifact") return artifact.artifact;
-  }
-  return null;
-}
-
-/**
- * The finished engagement's files, as a row of the same chips the composer
- * uses for attachments.
- *
- * Deliverables are few and short — a report, a recording, its transcript — so
- * one card per file made a handful of files read as a wall of cards. Chips wrap
- * a row at a time, which is what the file already looks like everywhere else.
- */
-function LegalDeliveryCard(props: { files: PluginArtifactRef[]; onOpen?: (artifact: PluginArtifactRef) => void }) {
-  const { t } = useTranslation();
-  const title = t("plugin.ui.artifactCollection", { count: props.files.length });
-  return <article className="legal-delivery-card" aria-label={title}>
-    {props.files.map((file) => <AgentAttachmentCard key={file.id} kind="file" name={file.name} mime={file.mediaType}
-      onClick={props.onOpen ? () => props.onOpen?.(file) : undefined} />)}
-  </article>;
 }
 
 function GenericPluginCards(props: {
@@ -481,8 +474,9 @@ function GenericPluginCards(props: {
   pluginId?: string;
   origin?: PluginInvocationOrigin;
   guidance?: boolean;
+  guidanceReadOnly?: boolean;
   diagnosticUpload?: boolean;
-  /** Deliverables are collected into the delivery card instead of each call's own. */
+  /** Agent-owned file candidates are attached by the main message flow. */
   hideDeliverables?: boolean;
   onGenerateDiagnosis?: () => void;
   events: CapabilityEvent[];
@@ -497,6 +491,7 @@ function GenericPluginCards(props: {
   onOpenArtifact?: (artifact: PluginArtifactRef) => void;
   onReadArtifact?: PluginsClient["readArtifact"];
 }) {
+  const { t } = useTranslation();
   const terminal = props.events.some((event) => event.type === "result" || event.type === "error");
   const artifactEvents = props.events.filter((event): event is Extract<CapabilityEvent, { type: "artifact" }> => event.type === "artifact");
   // Setup files (templates, checklists) and deliverables are both files, but
@@ -504,11 +499,16 @@ function GenericPluginCards(props: {
   // this produce" — so they are listed apart and named differently. A single
   // list called 交付文件 made a card full of blank templates read as a finished
   // engagement.
-  const setupEvents = artifactEvents.filter((event) => event.artifact.role === "setup");
+  const setupEvents = props.guidance || props.pluginId !== "legal-labor"
+    ? artifactEvents.filter((event) => event.artifact.role === "setup") : [];
   const deliverableEvents = props.hideDeliverables ? [] : artifactEvents.filter((event) => event.artifact.role !== "setup");
   // Template events remain in the call's history after the guide is answered.
   // A bare audio step belongs to the recorder, where those files are unrelated.
   const liveEvents = props.events.filter((event) => event.type !== "artifact");
+  const legalProgress = props.pluginId === "legal-labor" && !terminal
+    ? liveEvents.find((event): event is Extract<CapabilityEvent, { type: "progress" }> => event.type === "progress") : undefined;
+  const legalTasks = props.pluginId === "legal-labor" && !terminal
+    ? liveEvents.find((event): event is Extract<CapabilityEvent, { type: "task-list" }> => event.type === "task-list") : undefined;
   const recordingOnly = !terminal && liveEvents.length > 0
     && liveEvents.every((event) => event.type === "interaction" && event.request.type === "audio-record");
   const uploadInteraction = props.diagnosticUpload && !terminal
@@ -519,23 +519,25 @@ function GenericPluginCards(props: {
     onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} />;
   const guide = props.guidance && !terminal ? guidanceQuestion(props.events) : undefined;
   if (guide && setupEvents.length > 0) return <DiagnosticGuidanceCard
-    request={guide} templates={setupEvents} onRespond={props.onRespond}
+    request={guide} templates={setupEvents} readOnly={props.guidanceReadOnly} onRespond={props.onRespond}
     onClose={props.onDismiss} onRead={props.onReadArtifact} />;
-
   return (
     <div className="space-y-2">
+      {legalProgress || legalTasks ? <LegalProcessStatus progress={legalProgress} tasks={legalTasks} onCancel={props.onCancel} /> : null}
       {props.events.filter((event) => event.type !== "artifact").map((event) => {
-        if (event.type === "progress") return terminal ? null : <ProgressText key="progress" event={event} canCancel={Boolean(event.cancellable)} onCancel={props.onCancel} />;
-        if (event.type === "task-list") return terminal ? null : <TaskText key="tasks" event={event} />;
+        if (event.type === "progress") return terminal || props.pluginId === "legal-labor" ? null : <ProgressText key="progress" event={event} canCancel={Boolean(event.cancellable)} onCancel={props.onCancel} />;
+        if (event.type === "task-list") return terminal || props.pluginId === "legal-labor" ? null : <TaskText key="tasks" event={event} />;
         if (event.type === "interaction") {
           return terminal ? null : <InteractionCard key={`interaction:${event.request.interactionId}`} request={event.request} conversationId={props.conversationId} pluginId={props.pluginId} onRespond={props.onRespond} onUploadFiles={props.onUploadFiles} onDismiss={props.onDismiss} onRecordingSession={props.onRecordingSession} onRecordingArchived={props.onRecordingArchived} asrClient={props.asrClient} />;
         }
         if (event.type === "error") {
-          return props.origin === "user" && isCancellation(event.code) ? null : <ErrorCard key="error" event={event} />;
+          return props.origin === "user" && isCancellation(event.code) ? null
+            : props.pluginId === "legal-labor" ? <LegalProcessOutcome key="error" event={event} />
+              : <ErrorCard key="error" event={event} />;
         }
         return null;
       })}
-      {setupEvents.length > 0 && !recordingOnly ? (
+      {props.pluginId !== "legal-labor" && setupEvents.length > 0 && !recordingOnly ? (
         <ArtifactGroup
           events={setupEvents}
           labelKey="plugin.ui.setupCollection"
@@ -544,7 +546,9 @@ function GenericPluginCards(props: {
           onRead={props.onReadArtifact}
         />
       ) : null}
-      {deliverableEvents.length > 1 ? (
+      {props.pluginId === REVIEW_PLUGIN_ID && deliverableEvents.length > 0 ? (
+        <div className="agent-delivered-files">{deliverableEvents.map((event) => <ArtifactCard key={event.artifact.id} event={event} onAddToChat={props.onAddArtifact} onOpen={props.onOpenArtifact} onRead={props.onReadArtifact} presentation="chat" />)}</div>
+      ) : deliverableEvents.length > 1 ? (
         <ArtifactCollection
           events={deliverableEvents}
           onAddToChat={props.onAddArtifact}
@@ -558,29 +562,33 @@ function GenericPluginCards(props: {
   );
 }
 
-/** The legal plugin's two explicit guidance choices identify its template card. */
+/** The model's guide has choices; the pinned reference guide only offers downloads. */
 function guidanceQuestion(events: CapabilityEvent[]): PluginInteractionRequest | undefined {
   const event = events.find((candidate) => {
     if (candidate.type !== "interaction" || candidate.request.type !== "question") return false;
-    const options = readOptions(asRecord(candidate.request.payload).options);
+    const payload = asRecord(candidate.request.payload);
+    if (payload.readOnly === true) return true;
+    const options = readOptions(payload.options);
     return options.some((option) => option.value === "record") && options.some((option) => option.value === "upload");
   });
   return event?.type === "interaction" ? event.request : undefined;
 }
 
-/** Templates remain downloadable independently of the diagnosis interaction. */
 export function DiagnosticGuidanceCard(props: {
   request: PluginInteractionRequest;
+  readOnly?: boolean;
   templates: Array<Extract<CapabilityEvent, { type: "artifact" }>>;
   onRespond(interactionId: string, response: unknown): Promise<void>;
-  onClose?: () => void;
+  onClose?: () => void | Promise<void>;
   onRead?: PluginsClient["readArtifact"];
 }) {
   const { t } = useTranslation();
-  const [status, setStatus] = useState<"idle" | "submitting" | "answered" | "error">("idle");
   const payload = asRecord(props.request.payload);
+  const readOnly = props.readOnly === true || payload.readOnly === true;
+  const title = firstString(payload, ["title"]) ?? t("plugin.ui.question");
   const description = firstString(payload, ["description", "detail", "hint"]) ?? "";
-  const options = readOptions(payload.options);
+  const options = readOnly ? [] : readOptions(payload.options);
+  const [status, setStatus] = useState<"idle" | "submitting" | "answered" | "error">("idle");
   const submitting = useRef(false);
   const submit = async (value: unknown) => {
     if (submitting.current) return;
@@ -589,11 +597,11 @@ export function DiagnosticGuidanceCard(props: {
     try { await props.onRespond(props.request.interactionId, value); setStatus("answered"); }
     catch { submitting.current = false; setStatus("error"); }
   };
-  return <article className="diagnostic-guidance-card" aria-label={firstString(payload, ["title"]) ?? t("plugin.ui.question")}>
+  return <article className="diagnostic-guidance-card" aria-label={title}>
     <header className="diagnostic-guidance-card__header">
-      <h3>{firstString(payload, ["title"]) ?? t("plugin.ui.question")}</h3>
+      <h3>{title}</h3>
       {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
-        title={t("plugin.ui.dismissCard")} disabled={status === "submitting"} onClick={() => { if (!submitting.current) props.onClose?.(); }}><X size={15} /></button> : null}
+        title={t("plugin.ui.dismissCard")} disabled={status === "submitting"} onClick={() => { if (!submitting.current) void props.onClose?.(); }}><X size={15} /></button> : null}
     </header>
     <div className="diagnostic-guidance-card__templates">
       {props.templates.map((event) => {
@@ -602,15 +610,77 @@ export function DiagnosticGuidanceCard(props: {
         return <ArtifactCard key={event.artifact.id} event={event} onRead={props.onRead} guidanceDescription={detail} />;
       })}
     </div>
-    <footer className="diagnostic-guidance-card__footer">
+    {!readOnly ? <footer className="diagnostic-guidance-card__footer">
       {options.map((option) => <Button key={String(option.value)} type="button" size="sm" className="diagnostic-guidance-card__action"
         variant={option.value === "record" ? "primary" : "secondary"}
         disabled={status === "submitting" || status === "answered"} onClick={() => void submit(option.value)}>
         {option.value === "record" ? <Mic size={13} aria-hidden="true" /> : <Upload size={13} aria-hidden="true" />}{option.label}
       </Button>)}
       {status === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.responseFailed")}</p> : null}
-    </footer>
+    </footer> : null}
   </article>;
+}
+
+/** Legal jobs expose one current action; their task list is optional detail of that action. */
+function LegalProcessStatus(props: {
+  progress?: Extract<CapabilityEvent, { type: "progress" }>;
+  tasks?: Extract<CapabilityEvent, { type: "task-list" }>;
+  onCancel(): Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [cancelState, setCancelState] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const progress = props.progress;
+  const tasks = props.tasks?.tasks ?? [];
+  const activeTask = tasks.find((task) => task.status === "running") ?? tasks.find((task) => task.status === "pending");
+  const label = progress?.message?.trim() || activeTask?.title || t("plugin.ui.progress");
+  const percentage = progress?.total && progress.total > 1
+    ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : null;
+  // Some capabilities report current === total before writing their final file.
+  // Treat the text as complete only when the plugin explicitly says so.
+  const completed = progress ? progress.total !== undefined && progress.current >= progress.total
+    && /\u5b8c\u6210|\u5df2\u751f\u6210|complete|finished/iu.test(label)
+    : tasks.length > 0 && tasks.every((task) => task.status === "completed");
+  const heading = <>
+    {completed ? <Check size={14} className="legal-process-status__complete" aria-hidden="true" />
+      : <LoaderCircle size={14} className="legal-process-status__spinner" aria-hidden="true" />}
+    <span className="legal-process-status__label">{label}</span>
+    {percentage !== null && percentage > 0 && percentage < 100
+      ? <span className="legal-process-status__percent">{percentage}%</span> : null}
+  </>;
+  const cancel = async () => {
+    setCancelState("pending");
+    try { await props.onCancel(); setCancelState("done"); }
+    catch { setCancelState("error"); }
+  };
+  return <div className="legal-process-status" role="status" aria-live="polite">
+    <div className="legal-process-status__row">
+      {tasks.length > 0 ? <details className="agent-activity-tool-batch legal-process-status__details">
+        <summary className="agent-activity-tool-batch__summary legal-process-status__summary">
+          {heading}<ChevronRight size={14} className="agent-activity-tool-batch__chevron" aria-hidden="true" />
+        </summary>
+        <div className="agent-activity-tool-batch__body legal-process-status__tasks">
+          {tasks.map((task) => <div key={task.id} className={`legal-process-status__task legal-process-status__task--${task.status}`}>
+            <span className="legal-process-status__task-marker" aria-hidden="true">{task.status === "completed" ? "✓" : "·"}</span>
+            <span>{task.title}</span><span className="legal-process-status__task-state">{t(TASK_STATUS_KEYS[task.status])}</span>
+          </div>)}
+        </div>
+      </details> : <div className="legal-process-status__summary">{heading}</div>}
+      {progress?.cancellable && cancelState !== "done" ? <button type="button" className="legal-process-status__cancel"
+        disabled={cancelState === "pending"} onClick={() => void cancel()}>{t("plugin.ui.cancel")}</button> : null}
+      {cancelState === "done" ? <span className="legal-process-status__cancelled">{t("plugin.ui.cancelled")}</span> : null}
+    </div>
+    {cancelState === "error" ? <span className="legal-process-status__cancel-error" role="alert">{t("plugin.ui.cancelFailed")}</span> : null}
+  </div>;
+}
+
+function LegalProcessOutcome(props: { event: Extract<CapabilityEvent, { type: "error" }> }) {
+  const { t } = useTranslation();
+  const cancelled = isCancellation(props.event.code);
+  return <div className={`legal-process-outcome${cancelled ? " legal-process-outcome--cancelled" : ""}`}
+    role={cancelled ? "status" : "alert"}>
+    <AlertCircle size={14} aria-hidden="true" />
+    <span>{cancelled ? t("plugin.ui.cancelled") : props.event.message}</span>
+  </div>;
 }
 
 function ProgressText(props: {
@@ -689,7 +759,7 @@ function InteractionCard(props: {
   const payload = asRecord(props.request.payload);
   const title = firstString(payload, ["title", "question", "prompt", "message"])
     ?? (props.request.type === "approval" ? t("plugin.ui.approval") : t("plugin.ui.question"));
-  const description = firstString(payload, ["description", "detail", "hint"]);
+  const description = props.pluginId === REVIEW_PLUGIN_ID ? null : firstString(payload, ["description", "detail", "hint"]);
   const options = readOptions(payload.options);
   const questions = readQuestions(payload.questions);
   const multiple = payload.multiple === true;
@@ -741,10 +811,10 @@ function InteractionCard(props: {
     legal draftKey={JSON.stringify([props.pluginId, props.conversationId, props.request.interactionId])} title={title} description={description} questions={questions} disabled={disabled}
     error={status === "error" ? t("plugin.ui.responseFailed") : null}
     onSubmit={(answers) => void submit({ answers })}
-    onSkip={(answers) => void submit({ action: "skip", answers })} />;
+    onClose={(answers) => void submit({ action: "skip", answers })} />;
 
   return (
-    <div className="rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3">
+    <div className={props.pluginId === REVIEW_PLUGIN_ID ? "review-native-card" : "rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3"}>
       <div className="flex items-start gap-2">
         <HelpCircle size={16} className="mt-0.5 shrink-0 text-action-sky" aria-hidden="true" />
         <div className="min-w-0 flex-1">
@@ -1199,13 +1269,14 @@ export function FileInputCard(props: {
   onRespond(interactionId: string, response: unknown): Promise<void>;
   onUploadFiles?: (files: UploadAgentMediaInput[]) => Promise<UploadedAgentMedia[]>;
 }) {
-  const { t } = useTranslation();
+  const { t, language } = useTranslation();
   const payload = asRecord(props.request.payload);
   const recordingMaterials = usePluginRecordingMaterials(props.diagnosticUpload ? props.pluginId : undefined, props.conversationId);
   const stagedFiles = recordingMaterials.files;
 
   const reviewImport = props.pluginId === "literature-review" && payload.cardType === "source-import";
   const [files, setFiles] = useState<File[]>([]);
+  const [skippedFromFolder, setSkippedFromFolder] = useState(0);
   const localPreviewUrls = useRef<string[]>([]);
   useEffect(() => () => { for (const uri of localPreviewUrls.current) URL.revokeObjectURL(uri); }, []);
   const openSelected = (file: File) => {
@@ -1335,8 +1406,16 @@ export function FileInputCard(props: {
     setValidationError(validateReadyFileCount([...nextReady, ...stagedFiles], maxFiles, minFiles, t));
   };
   const choose = (event: ChangeEvent<HTMLInputElement>) => {
+    setSkippedFromFolder(0);
     addFiles(Array.from(event.target.files ?? []));
     event.target.value = "";
+  };
+  const chooseReviewFolder = (picked: File[]) => {
+    const supported = picked.filter((file) => classifyPluginInputFile(file, accept, maxBytes, fileRules, t).status === "ready");
+    const available = maxFiles ? Math.max(0, maxFiles - readyFiles.length) : supported.length;
+    const accepted = supported.slice(0, available);
+    setSkippedFromFolder(picked.length - accepted.length);
+    if (accepted.length) addFiles(accepted);
   };
   const remove = (index: number) => {
     if (submitting.current || props.disabled) return;
@@ -1404,14 +1483,13 @@ export function FileInputCard(props: {
     <header className="diagnostic-upload-card__header">
       <h3>{props.title}</h3>
       {files.length + stagedFiles.length > 0 ? <span className="diagnostic-upload-card__count">{t("plugin.ui.fileCount", { count: files.length + stagedFiles.length })}</span> : null}
-      {props.onClose ? <button type="button" className="diagnostic-guidance-card__close" aria-label={t("plugin.ui.dismissCard")}
+      {props.onClose ? <button type="button" className="diagnostic-upload-card__close" aria-label={t("plugin.ui.dismissCard")}
         disabled={props.disabled} onClick={() => { void close(); }}><X size={18} /></button> : null}
     </header>
     <div className={`diagnostic-upload-card__body${dragging ? " diagnostic-upload-card__body--dragging" : ""}`}
       onDragOver={(event) => { if (!props.disabled) { event.preventDefault(); event.stopPropagation(); setDragging(true); } }}
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
       onDrop={(event) => { event.preventDefault(); event.stopPropagation(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)); }}>
-      {props.description ? <p className="diagnostic-upload-card__description">{props.description}</p> : null}
       {fileStates.length || stagedFiles.length ? <ul className="diagnostic-upload-card__files" aria-label={t("plugin.ui.selectedFiles")}>
         {stagedFiles.map((file) => <li key={file.path} className="diagnostic-upload-card__file">
           <span className="diagnostic-upload-card__file-icon"><FileTypeIcon name={file.name} mime={file.mime} surface="row" /></span>
@@ -1457,30 +1535,40 @@ export function FileInputCard(props: {
         onClick={() => void upload()}>{t("plugin.ui.generateDiagnosis")}</Button>
     </footer>
   </article>;
-
-  if (reviewImport) return (
-    <section className="review-upload">
-      <header><h2>{props.title}</h2><button type="button" aria-label={t("plugin.ui.dismissCard")} disabled={props.disabled} onClick={() => { props.onStatus("submitting"); void props.onRespond(props.request.interactionId, { action: "cancel", files: [] }).then(() => props.onStatus("answered"), () => props.onStatus("error")); }}><X size={16} /></button></header>
-      <div className="review-upload-body">
-        <p>{props.description || t("plugin.review.uploadFormats", { count: maxFiles ?? 200 })}</p>
-        {files.length ? <ul className="review-upload-files">{fileStates.map((item, index) => <li key={`${index}:${item.file.name}`}>
-          <Paperclip size={16} aria-hidden="true"/><span>{item.file.name}<small>{item.status === "ready" ? t("plugin.ui.fileReady") : item.message}</small></span>
-          <button type="button" disabled={props.disabled} aria-label={t("plugin.ui.removeFile", { name: item.file.name })} onClick={() => remove(index)}><X size={14}/></button>
-        </li>)}</ul> : <div className="review-upload-empty">{t("plugin.review.uploadEmpty")}</div>}
-        <div className="review-upload-pickers">
-          <label>{t("plugin.ui.chooseFiles")}<input className="sr-only" type="file" accept={accept || undefined} multiple disabled={props.disabled} onChange={choose}/></label>
-          {payload.allowDirectory === true ? <label>{t("plugin.ui.chooseFolder")}<input className="sr-only" type="file" multiple disabled={props.disabled} onChange={choose} {...{ webkitdirectory: "" } as Record<string, string>}/></label> : null}
+  if (props.pluginId === REVIEW_PLUGIN_ID && payload.cardType === "source-import" && !payload.targetPaperId) return <ReviewSourceCard
+    files={fileStates.map((item) => ({ file: item.file, blocked: item.status === "blocked" ? item.message : null }))}
+    accept={accept} maxFiles={maxFiles} validationError={validationError}
+    skippedFromFolder={skippedFromFolder} status={props.status} disabled={props.disabled}
+    canUpload={Boolean(props.onUploadFiles) && readyFiles.length > 0} english={language === "en-US"}
+    onFilesPicked={(picked) => { setSkippedFromFolder(0); addFiles(picked); }} onFolderPicked={chooseReviewFolder}
+    onRemove={remove} onConfirm={() => { void upload(); }} onSkip={() => { void skip(); }} />;
+  if (props.pluginId === REVIEW_PLUGIN_ID) return <article className="review-native-card review-source-card">
+    <header className="review-card-header"><h3>{props.title}</h3>{files.length > 0 && <span>{t("plugin.ui.fileCount", { count: files.length })}</span>}</header>
+    <div className="review-card-body">
+      <p className="review-card-hint">{t("plugin.ui.uploadFullTextHint")}</p>
+      <div className="review-source-picker">
+        <Paperclip size={22} strokeWidth={1.5} aria-hidden="true" />
+        <div><p>{files.length ? t("plugin.ui.filesReadySummary", { ready: readyFiles.length, blocked: files.length - readyFiles.length }) : t("plugin.ui.noFiles")}</p>
+          {accept && <p className="review-card-hint">{t("plugin.ui.acceptedFormats", { formats: summarizeAcceptedFormats(accept, t) })}</p>}</div>
+        <div className="review-source-picker__actions">
+          <label className="review-secondary-button">{t("plugin.ui.chooseFiles")}<input className="sr-only" type="file" accept={accept || undefined} multiple={payload.multiple === true} disabled={props.disabled} onChange={choose} /></label>
+          {payload.allowDirectory === true && <label className="review-secondary-button">{t("plugin.ui.chooseFolder")}<input className="sr-only" type="file" multiple disabled={props.disabled} onChange={choose} {...{ webkitdirectory: "" } as Record<string, string>} /></label>}
         </div>
       </div>
-      {validationError || props.status === "error" ? <p className="review-upload-error" role="alert">{validationError || t("plugin.ui.responseFailed")}</p> : null}
-      <footer>
-        {files.length ? <span className="text-xs text-text-ink/45">{t("plugin.ui.filesReadySummary", { ready: readyFiles.length, blocked: files.length - readyFiles.length })}</span> : null}
-        <button type="button" disabled={props.disabled || Boolean(validationError) || (files.length > 0 && (readyFiles.length === 0 || !props.onUploadFiles))} onClick={() => void (files.length ? upload() : skip())}>
-          {files.length ? t("plugin.review.confirmSources") : t("plugin.review.continueWithoutSources")}
-        </button>
-      </footer>
-    </section>
-  );
+      {fileStates.length > 0 && <ul className="review-source-files" aria-label={t("plugin.ui.selectedFiles")}>{fileStates.map((item, index) => <li key={`${item.file.name}:${item.file.size}:${index}`}>
+        {item.status === "blocked" ? <AlertCircle size={16} className="text-status-error" aria-hidden="true" /> : <FileTypeIcon name={item.file.name} surface="row" />}
+        <div><p title={item.file.name}>{item.file.name}</p><span className={item.status === "blocked" ? "text-status-error" : "review-card-hint"} role={item.status === "blocked" ? "alert" : undefined}>{item.message ?? t("plugin.ui.fileReady")}</span></div>
+        <button type="button" disabled={props.disabled} aria-label={t("plugin.ui.removeFile", { name: item.file.name })} onClick={() => remove(index)}><X size={14} aria-hidden="true" /></button>
+      </li>)}</ul>}
+      {validationError && <p className="text-xs text-status-error" role="alert">{validationError}</p>}
+      {props.status === "answered" && <p className="text-xs text-status-success" role="status">{t("plugin.ui.answered")}</p>}
+      {props.status === "error" && <p className="text-xs text-status-error" role="alert">{t("plugin.ui.responseFailed")}</p>}
+    </div>
+    <footer className="review-card-footer">
+      {minFiles === 0 && files.length === 0 && <ResponseButton disabled={props.disabled} secondary onClick={() => void skip()}>{t("plugin.ui.skip")}</ResponseButton>}
+      <ResponseButton disabled={props.disabled || readyFiles.length === 0 || Boolean(validationError) || !props.onUploadFiles} onClick={() => void upload()}>{firstString(payload, ["submitLabel"]) ?? t("plugin.ui.upload")}</ResponseButton>
+    </footer>
+  </article>;
   return (
     <div className="rounded-card border border-action-sky/25 bg-action-sky/8 px-3 py-3">
       <div className="flex items-start gap-2">
@@ -1574,17 +1662,19 @@ function QuestionFields(props: {
   title?: string;
   description?: string | null;
   error?: string | null;
-  onSkip?: (answers: Record<string, string>) => void;
+  onClose?: (answers: Record<string, string>) => void;
   questions: PluginQuestionField[];
   disabled: boolean;
   onSubmit: (answers: Record<string, string>) => void;
 }) {
   const { t } = useTranslation();
   const drafts = usePluginQuestionDrafts();
-  const [answers, setAnswers] = useState<Record<string, string>>(() => (props.draftKey ? drafts?.get(props.draftKey) : undefined) ?? {});
-  const filled = props.questions.filter((question) => (answers[question.id] ?? "").trim());
-  const incomplete = props.questions.some((question) => question.required && !(answers[question.id] ?? "").trim());
-  const set = (id: string, value: string) => setAnswers((current) => {
+  const [answers, setAnswers] = useState<Record<string, string | null>>(() => (props.draftKey ? drafts?.get(props.draftKey) : undefined) ?? {});
+  const [activeIndex, setActiveIndex] = useState(0);
+  const filled = props.questions.filter((question) => typeof answers[question.id] === "string" && answers[question.id]!.trim());
+  const incomplete = props.questions.some((question) => question.required && answers[question.id] !== null && !(answers[question.id] ?? "").trim());
+  const activeQuestion = props.questions[Math.min(activeIndex, props.questions.length - 1)];
+  const set = (id: string, value: string | null) => setAnswers((current) => {
     const next = { ...current, [id]: value };
     if (props.draftKey) drafts?.set(props.draftKey, next);
     return next;
@@ -1595,28 +1685,86 @@ function QuestionFields(props: {
     props.onSubmit(Object.fromEntries(filled.map((question) => [question.id, answers[question.id]!.trim()])));
   };
 
-  if (props.legal) return <article className="legal-question-card" aria-label={props.title}>
-    <header className="legal-question-card__header"><h3>{props.title}</h3>
-      <span>{t("plugin.ui.answerCount", { filled: filled.length, total: props.questions.length })}</span>
-      <button type="button" className="diagnostic-guidance-card__close" disabled={props.disabled}
-        aria-label={t("plugin.ui.dismissCard")} onClick={() => props.onSkip?.(Object.fromEntries(filled.map((q) => [q.id, answers[q.id]!.trim()])))}><X size={18} /></button>
-    </header>
-    <form onSubmit={submit}>
-      {props.description ? <p className="legal-question-card__description">{props.description}</p> : null}
-      <div className="legal-question-card__list">{props.questions.map((question) => <fieldset key={question.id} className="legal-question-card__item" disabled={props.disabled}>
-        <legend><span>{question.label}</span><span className={question.required ? "legal-question-card__required" : "legal-question-card__optional"}>{t(question.required ? "plugin.ui.fieldRequired" : "plugin.ui.fieldOptional")}</span></legend>
-        {question.options.length > 0 ? <div className="legal-question-card__options">{question.options.map((option, index) => <label key={option} className="legal-question-card__option" data-selected={answers[question.id] === option}>
-          <input type="radio" name={`${question.id}-option`} value={option} checked={answers[question.id] === option} onChange={() => set(question.id, option)} />
-          <span className="legal-question-card__number" aria-hidden="true">{index + 1}</span><span>{option}</span>{answers[question.id] === option ? <Check size={14} aria-hidden="true" /> : null}
-        </label>)}</div> : null}
-        <input aria-label={question.label} className="legal-question-card__input" value={answers[question.id] ?? ""}
-          onChange={(event) => set(question.id, event.target.value)} placeholder={t(question.required ? "plugin.ui.requiredPlaceholder" : "plugin.ui.optionalPlaceholder")} />
-      </fieldset>)}</div>
-      <footer className="legal-question-card__footer">{props.error ? <p role="alert">{props.error}</p> : null}
-        <Button type="submit" size="sm" variant="primary" disabled={props.disabled || incomplete}>{t("plugin.ui.submit")}</Button>
+  if (props.legal && activeQuestion) {
+    const lastQuestion = activeIndex === props.questions.length - 1;
+    const value = answers[activeQuestion.id] ?? "";
+    const selectedOption = activeQuestion.options.includes(value);
+    const answerSnapshot = (draft: Record<string, string | null>) => Object.fromEntries(props.questions.flatMap((question) => {
+      const answer = draft[question.id];
+      return typeof answer === "string" && answer.trim() ? [[question.id, answer.trim()]] : [];
+    }));
+    const advanceOrSubmit = (draft: Record<string, string | null>) => {
+      if (!lastQuestion) { setActiveIndex((index) => index + 1); return; }
+      const pendingIndex = props.questions.findIndex((question) => draft[question.id] === undefined
+        || (question.required && draft[question.id] !== null && !draft[question.id]?.trim()));
+      if (pendingIndex >= 0) setActiveIndex(pendingIndex);
+      else props.onSubmit(answerSnapshot(draft));
+    };
+    const skipCurrent = () => {
+      if (props.disabled) return;
+      const next = { ...answers, [activeQuestion.id]: null };
+      setAnswers(next);
+      if (props.draftKey) drafts?.set(props.draftKey, next);
+      advanceOrSubmit(next);
+    };
+    const continueOrSubmit = (event: FormEvent) => {
+      event.preventDefault();
+      if (props.disabled || (activeQuestion.required && !value.trim() && answers[activeQuestion.id] !== null)) return;
+      const next = value.trim() ? answers : { ...answers, [activeQuestion.id]: null };
+      if (next !== answers) {
+        setAnswers(next);
+        if (props.draftKey) drafts?.set(props.draftKey, next);
+      }
+      advanceOrSubmit(next);
+    };
+    return <form className="agent-confirmation-card agent-question-card legal-question-card" aria-label={props.title} onSubmit={continueOrSubmit}>
+      <header className="agent-confirmation-card__header agent-question-card__header legal-question-card__header">
+        <h3 className="agent-question-card__prompt">{activeQuestion.label}</h3>
+        <div className="agent-question-card__header-actions">
+          <nav className="agent-question-card__pagination" aria-label={t("home.question.count", { count: props.questions.length })}>
+            <button type="button" disabled={activeIndex === 0 || props.disabled} aria-label={t("home.question.previous")}
+              onClick={() => setActiveIndex((index) => Math.max(0, index - 1))}><ChevronLeft size={16} aria-hidden="true" /></button>
+            <span aria-live="polite">{activeIndex + 1}/{props.questions.length}</span>
+            <button type="button" disabled={lastQuestion || props.disabled} aria-label={t("home.question.next")}
+              onClick={() => setActiveIndex((index) => Math.min(props.questions.length - 1, index + 1))}><ChevronRight size={16} aria-hidden="true" /></button>
+          </nav>
+          <button type="button" className="agent-question-card__close" disabled={props.disabled}
+            aria-label={t("plugin.ui.dismissCard")} onClick={() => props.onClose?.(answerSnapshot(answers))}><X size={18} aria-hidden="true" /></button>
+        </div>
+      </header>
+      <div className="agent-confirmation-card__body agent-question-card__body legal-question-card__list"
+        role="group" aria-label={activeQuestion.label} key={activeQuestion.id}>
+        {props.description ? <p className="legal-question-card__hint">{props.description}</p> : null}
+        <div className="agent-question-card__options">
+          {activeQuestion.options.map((option, index) => {
+            const selected = value === option;
+            return <button type="button" key={option} disabled={props.disabled} aria-pressed={selected}
+              className={`agent-question-card__option${selected ? " agent-question-card__option--selected" : ""}`}
+              onClick={() => set(activeQuestion.id, option)}>
+              <span className="agent-question-card__choice" aria-hidden="true">{index + 1}</span>
+              <span className="agent-question-card__option-copy"><span>{option}</span></span>
+              {selected ? <Check size={15} aria-hidden="true" /> : <ArrowRight size={17} className="agent-question-card__option-arrow" aria-hidden="true" />}
+            </button>;
+          })}
+          <div className="agent-question-card__other">
+            <span className="agent-question-card__other-icon" aria-hidden="true"><PenLine size={14} /></span>
+            <input aria-label={activeQuestion.label} disabled={props.disabled} value={selectedOption ? "" : value}
+              onChange={(event) => set(activeQuestion.id, event.target.value)}
+              placeholder={activeQuestion.options.length ? t("home.question.other") : t(activeQuestion.required ? "plugin.ui.requiredPlaceholder" : "plugin.ui.optionalPlaceholder")} />
+          </div>
+        </div>
+      </div>
+      <footer className="agent-confirmation-card__footer agent-question-card__footer legal-question-card__footer">
+        <span className="agent-question-card__selection">{props.error ? <span className="agent-question-card__error" role="alert">{props.error}</span> : null}</span>
+        <button type="button" className="agent-question-card__skip" disabled={props.disabled}
+          onClick={skipCurrent}>{t("plugin.ui.skip")}</button>
+        <button type="submit" className="agent-question-card__continue"
+          disabled={props.disabled || (activeQuestion.required && !value.trim() && answers[activeQuestion.id] !== null)}>
+          {t(lastQuestion ? "home.question.confirm" : "home.question.next")}
+        </button>
       </footer>
-    </form>
-  </article>;
+    </form>;
+  }
 
   return (
     <form className="flex w-full flex-col gap-2" onSubmit={submit}>
@@ -1689,13 +1837,23 @@ function ArtifactCard(props: {
   onAddToChat?: (artifact: PluginArtifactRef) => void;
   onOpen?: (artifact: PluginArtifactRef) => void;
   onRead?: PluginsClient["readArtifact"];
+  presentation?: "chat";
   guidanceDescription?: string;
 }) {
   const { t } = useTranslation();
   const artifact = props.event.artifact;
   const downloadUri = artifact.downloadUri ?? artifact.uri;
   const [downloadState, setDownloadState] = useState<"idle" | "pending" | "error">("idle");
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const downloading = useRef(false);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => { window.removeEventListener("pointerdown", close); window.removeEventListener("keydown", onKeyDown); };
+  }, [menu]);
   const download = async () => {
     if (downloading.current) return;
     if (!props.onRead) {
@@ -1732,8 +1890,28 @@ function ArtifactCard(props: {
       {downloadState === "error" ? <p className="diagnostic-guidance-card__error" role="alert">{t("plugin.ui.downloadFailed")}</p> : null}
     </button>;
   }
+  if (props.presentation === "chat") return <span className="agent-delivered-file">
+    <AgentAttachmentCard kind="file" name={artifact.name} mime={artifact.mediaType}
+      title={artifact.name} onClick={() => { if (props.onOpen) props.onOpen(artifact); else void download(); }}
+      onContextMenu={(event) => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY }); }}
+      onKeyDown={(event) => { if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+        event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); setMenu({ x: rect.left, y: rect.bottom });
+      } }} />
+    {menu && createPortal(<div role="menu" aria-label={t("agent.attachment.menu")}
+      className="agent-image-context-menu agent-file-context-menu"
+      style={{ left: Math.max(8, Math.min(menu.x, window.innerWidth - 180)), top: Math.max(8, Math.min(menu.y, window.innerHeight - 140)) }}
+      onPointerDown={(event) => event.stopPropagation()}>
+      {props.onOpen ? <button type="button" role="menuitem" className="agent-image-context-menu__item"
+        onClick={() => { setMenu(null); props.onOpen?.(artifact); }}>{t("plugin.ui.open")}</button> : null}
+      <button type="button" role="menuitem" className="agent-image-context-menu__item"
+        onClick={() => { setMenu(null); void download(); }}>{t("plugin.ui.download")}</button>
+      {props.onAddToChat ? <button type="button" role="menuitem" className="agent-image-context-menu__item"
+        onClick={() => { setMenu(null); props.onAddToChat?.(artifact); }}>{t("plugin.ui.addToChat")}</button> : null}
+    </div>, document.body)}
+    {downloadState === "error" ? <span className="text-xs text-status-error" role="alert">{t("plugin.ui.downloadFailed")}</span> : null}
+  </span>;
   return (
-    <div className="flex items-center gap-3 rounded-card border border-border-stone/30 px-3 py-2.5">
+    <div className="plugin-artifact-row flex items-center gap-3 rounded-card border border-border-stone/30 px-3 py-2.5">
       <FileTypeIcon name={artifact.name} mime={artifact.mediaType} surface="row" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-text-ink/75">{props.event.artifact.name}</p>
@@ -1856,8 +2034,7 @@ function legalInteractionKey(call: PluginUiCall): string | null {
   const event = [...call.events].reverse().find((item) => item.type === "interaction");
   if (event?.type !== "interaction") return null;
   const kind = event.request.type;
-  const phase = kind === "question" && guidanceQuestion([event]) ? "guide"
-    : kind === "file-input" ? "upload" : kind === "audio-record" ? "recording" : null;
+  const phase = kind === "file-input" ? "upload" : kind === "audio-record" ? "recording" : null;
   return phase ? JSON.stringify([call.pluginId, call.conversationId.replace(/^websocket:/, ""), phase]) : null;
 }
 
@@ -1922,6 +2099,9 @@ export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): Plugin
       for (const call of waiting.length ? deduplicateLegalInteractions(waiting) : group.live.slice(-1)) selected.add(call);
     } else if (group.finished?.events.some((event) => event.type === "artifact")) {
       selected.add(group.finished);
+    } else if (group.finished && [REVIEW_PLUGIN_ID, "legal-labor"].includes(group.finished.pluginId)
+      && group.finished.events.some((event) => event.type === "error" && !isCancellation(event.code))) {
+      selected.add(group.finished);
     }
   }
   return currentCalls.filter((call) => selected.has(call));
@@ -1929,12 +2109,19 @@ export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): Plugin
 
 /** Keeps history in the event store while limiting the conversation to actionable UI. */
 export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: ReadonlySet<string> = new Set()): PluginUiCall[] {
-  const prepared = calls.map((call) => ({
-    ...call,
-    events: call.events.filter((event) => (
-      event.type !== "interaction" || !answered.has(interactionKey(call, event.request.interactionId))
-    ))
-  }));
+  const prepared = calls.map((call) => {
+    // Legal collection asks sequentially: guide -> recorder -> upload. A new
+    // request supersedes the previous card even before its reply is acknowledged.
+    const sequential = call.pluginId === "legal-labor" && ["session-start", "material-collect"].includes(call.capabilityId);
+    const latestInteraction = [...call.events].reverse().find((event) => event.type === "interaction");
+    return {
+      ...call,
+      events: call.events.filter((event) => event.type !== "interaction" || (
+        (!sequential || event === latestInteraction)
+        && !answered.has(interactionKey(call, event.request.interactionId))
+      ))
+    };
+  });
   const latest = prepared[prepared.length - 1];
   const latestActive = latest && !latest.events.some((event) => event.type === "result" || event.type === "error")
     ? latest.callId
@@ -1943,8 +2130,8 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
     const artifactEvents = call.events.filter((event): event is Extract<CapabilityEvent, { type: "artifact" }> => event.type === "artifact");
     // A call that only handed over setup files (templates, checklists) carries
     // no real deliverable. Keeping it on screen after it terminates adds a card
-    // the user cannot act on. Deliverable artifacts — the workbook, the report
-    // — still stay because those are what the engagement produced.
+    // the user cannot act on. File events remain available to the Agent, but
+    // only a message/media attachment makes one a conversation deliverable.
     const hasDeliverableArtifact = artifactEvents.some((event) => event.artifact.role !== "setup");
     const hasArtifact = artifactEvents.length > 0;
     const hasError = call.events.some((event) => event.type === "error");
@@ -1955,10 +2142,7 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
       && candidate.conversationId === call.conversationId
       && candidate.events.some((event) => event.type === "result")
     ));
-    // The legal plugin's deliverables are collected into the delivery card
-    // rather than the call's own, so a finished call whose only artifacts are
-    // deliverables has nothing left to draw. Keeping it rendered a card with a
-    // title and an empty body.
+    // A completed legal file-only call has no user-facing card of its own.
     if (hasDeliverableArtifact) {
       return !(call.pluginId === "legal-labor" && terminal && !hasError
         && !artifactEvents.some((event) => event.artifact.role === "setup")
@@ -1967,7 +2151,8 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
     // A setup-only call that finished (result or dismissed) is history:
     // the templates were handed over and the card has nothing left to offer.
     if (hasArtifact && terminal && !hasError) return false;
-    if (hasArtifact && !terminal) return true;
+    if (hasArtifact && !terminal) return call.pluginId !== "legal-labor"
+      || call.events.some((event) => event.type === "interaction");
     if (hasError) return !recoveredByLaterRetry;
     if (!terminal && call.events.some((event) => event.type === "interaction")) return true;
     return call.callId === latestActive && call.events.some((event) => event.type !== "result");
@@ -1985,17 +2170,21 @@ export function selectVisiblePluginCalls(calls: PluginUiCall[], answered: Readon
  * @returns Calls with occluded ones removed.
  */
 export function occludeUserRaisedCalls(calls: PluginUiCall[], pinnedCapabilities: ReadonlySet<string> = new Set()): PluginUiCall[] {
-  const agentIsWaiting = calls.some((call) => (
+  const legalWorkflowCardOpen = calls.some(isActiveLegalWorkflowCard);
+  const visibleCalls = legalWorkflowCardOpen
+    ? calls.filter((call) => !(call.pluginId === "legal-labor" && call.capabilityId === "guide-open"))
+    : calls;
+  const agentIsWaiting = visibleCalls.some((call) => (
     call.origin === "agent"
     && call.events.some((event) => event.type === "interaction")
     && !call.events.some((event) => event.type === "result" || event.type === "error")
   ));
-  if (!agentIsWaiting) return calls;
+  if (!agentIsWaiting) return visibleCalls;
   // The recorder is never occluded: hiding it unmounts the card that owns the
   // microphone, and a recording in progress cannot be taken again. It is also
   // not competing for the same answer — one takes a recording, the other a
   // reply — so leaving it up costs the Agent's card nothing.
-  return calls.filter((call) => (
+  return visibleCalls.filter((call) => (
     call.origin !== "user"
     || pinnedCapabilities.has(`${call.pluginId}:${call.capabilityId}`)
     || isBarePresentation(call)
@@ -2067,19 +2256,16 @@ export function isStatusOnlyPresentation(call: PluginUiCall): boolean {
  * @param pinnedCapabilities Capability keys represented by a pinned command.
  * @returns The calls that belong to that region.
  */
-/** The guide and its upload step share one composer entry. */
+/** Pinned commands retain their own capability identity. */
 export function pinnedCapabilityKey(call: PluginUiCall): string {
-  if (call.pluginId === "legal-labor" && call.capabilityId === "material-collect"
-    && call.events.some((event) => event.type === "interaction" && event.request.type === "file-input")) {
-    return "legal-labor:session-start";
-  }
   return `${call.pluginId}:${call.capabilityId}`;
 }
 
 export function selectRegionPluginCalls(
   calls: PluginUiCall[],
   region: PluginCardRegion,
-  pinnedCapabilities: ReadonlySet<string> = new Set()
+  pinnedCapabilities: ReadonlySet<string> = new Set(),
+  dockInteractions = false
 ): PluginUiCall[] {
   const isLiveUserCall = (call: PluginUiCall) => (
     (call.origin === "user" || pinnedCapabilities.has(pinnedCapabilityKey(call)))
@@ -2087,6 +2273,13 @@ export function selectRegionPluginCalls(
   );
   return calls.filter((call) => {
     const live = isLiveUserCall(call);
+    // The model starts this recorder inside session-start, which has no
+    // pinned command. Its audio owner still belongs in the recording panel.
+    if (call.pluginId === "legal-labor" && isBarePresentation(call)) return region === "panel";
+    const pendingConfirmation = dockInteractions && !isBarePresentation(call)
+      && !call.events.some((event) => event.type === "result" || event.type === "error")
+      && call.events.some((event) => event.type === "interaction");
+    if (pendingConfirmation) return region === "pinned";
     if (isLegalFlowInteraction(call)) return region === "pinned";
     if (region === "panel") return live && isBarePresentation(call);
     if (region === "pinned") return live && !isBarePresentation(call);
@@ -2108,17 +2301,30 @@ export function orderPluginCallsForDisplay(calls: PluginUiCall[]): PluginUiCall[
 
 function ErrorCard(props: { event: Extract<CapabilityEvent, { type: "error" }> }) {
   return (
-    <div className="flex items-start gap-2 rounded-card border border-status-error/20 bg-status-error-soft px-3 py-2.5 text-sm text-status-error" role="alert">
+    <div className="plugin-error-card flex items-start gap-2 rounded-card border border-status-error/20 bg-status-error-soft px-3 py-2.5 text-sm text-status-error" role="alert">
       <AlertCircle size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
       <span>{props.event.message}</span>
     </div>
   );
 }
 
+/** Review cards render their own structured data; Agent prose is not card copy. */
+export function reviewPresentationEvents(events: CapabilityEvent[]): CapabilityEvent[] {
+  return events.map((event) => {
+    if (event.type !== "interaction") return event;
+    const payload = { ...asRecord(event.request.payload) };
+    delete payload.description;
+    delete payload.detail;
+    delete payload.hint;
+    return { ...event, request: { ...event.request, payload } };
+  });
+}
+
 function SandboxedPluginRenderer(props: {
   call: PluginUiCall;
   interactionStates: PluginRendererInteractionState[];
   height: number;
+  docked?: boolean;
   client: Pick<PluginsClient, "getUi">;
   onRespond(interactionId: string, response: unknown): Promise<void>;
   fallback: ReactNode;
@@ -2126,12 +2332,20 @@ function SandboxedPluginRenderer(props: {
 }) {
   const { t } = useTranslation();
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const reviewScopeCollapsed = useRef(false);
   const answered = useRef(new Set<string>());
   const uploading = useRef(new Set<string>());
   const [html, setHtml] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [viewportHeight, setViewportHeight] = useState(() => typeof window === "undefined" ? 900 : window.innerHeight);
+  const heightLimit = props.docked && props.call.pluginId === REVIEW_PLUGIN_ID ? Math.min(props.height, Math.max(220, viewportHeight - 310)) : props.height;
+  useEffect(() => {
+    const resize = () => setViewportHeight(window.innerHeight);
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
   const [rendererHeight, setRendererHeight] = useState(() => Math.min(props.height, 320));
-  const document = useMemo(() => html === null ? "" : buildRendererDocument(html), [html]);
+  const document = useMemo(() => html === null ? "" : buildRendererDocument(props.call.pluginId === REVIEW_PLUGIN_ID ? themeLiteratureReviewCard(html) : html), [html, props.call.pluginId]);
   const queuedChat = useRef<PluginChatFeedback | null>(null);
   const latestInteraction = [...props.call.events].reverse().find((event) => event.type === "interaction");
   const feedbackEnabled = latestInteraction?.type === "interaction" && asRecord(latestInteraction.request.payload).chatFeedback === true
@@ -2150,9 +2364,10 @@ function SandboxedPluginRenderer(props: {
     pluginId: props.call.pluginId,
     capabilityId: props.call.capabilityId,
     callId: props.call.callId,
-    events: props.call.events,
-    interactionStates: props.interactionStates
-  }), [props.call, props.interactionStates]);
+    events: props.call.pluginId === REVIEW_PLUGIN_ID ? reviewPresentationEvents(props.call.events) : props.call.events,
+    interactionStates: props.interactionStates,
+    presentation: { maxHeight: heightLimit }
+  }), [props.call, props.interactionStates, heightLimit]);
 
   useEffect(() => {
     let active = true;
@@ -2171,9 +2386,8 @@ function SandboxedPluginRenderer(props: {
     }, "*");
   }, [rendererMessage]);
 
-  useEffect(() => {
-    setRendererHeight(Math.min(props.height, 320));
-  }, [props.call.callId, props.height]);
+  useEffect(() => { reviewScopeCollapsed.current = false; }, [props.call.callId]);
+  useEffect(() => { setRendererHeight((current) => Math.min(current, heightLimit)); }, [heightLimit]);
 
   useEffect(() => {
     const receive = (event: MessageEvent) => {
@@ -2182,7 +2396,11 @@ function SandboxedPluginRenderer(props: {
       if (message.type === "memmy.plugin.resize" && message.version === 1) {
         const requestedHeight = typeof message.height === "number" ? message.height : Number.NaN;
         if (Number.isFinite(requestedHeight)) {
-          setRendererHeight(Math.min(props.height, Math.max(180, Math.ceil(requestedHeight))));
+          const reviewScope = props.call.pluginId === REVIEW_PLUGIN_ID && props.call.events.some((item) =>
+            item.type === "interaction" && asRecord(item.request.payload).cardType === "review-spec");
+          if (reviewScope && typeof message.collapsed === "boolean") reviewScopeCollapsed.current = message.collapsed;
+          else if (reviewScope && reviewScopeCollapsed.current) return;
+          setRendererHeight(Math.min(heightLimit, Math.max(reviewScopeCollapsed.current ? 48 : 180, Math.ceil(requestedHeight))));
         }
         return;
       }
@@ -2247,7 +2465,7 @@ function SandboxedPluginRenderer(props: {
     };
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [props.call.events, props.height, props.interactionStates, props.onRespond, props.onUploadFiles, t]);
+  }, [props.call.events, heightLimit, props.interactionStates, props.onRespond, props.onUploadFiles, t]);
 
   if (failed) return props.fallback;
   if (html === null) return <p className="py-3 text-center text-xs text-text-ink/40" role="status">{t("plugin.ui.rendererLoading")}</p>;

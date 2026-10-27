@@ -4,15 +4,13 @@ import { fileURLToPath } from "node:url";
 import { Window } from "happy-dom";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { InstalledPluginSchema } from "@memmy/local-api-contracts";
-import type { PluginUiCall } from "../../app/plugin-ui-context.js";
 import { MemmyAgentMessageRejectedError } from "../../api/memmy-agent-client.js";
 import { createModelWorkspace, type ModelCandidate } from "../../state/model-workspace.js";
 import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
 import { agentReducer, initialAgentState } from "../../state/agent-chat-slice.js";
 import { AppProviders } from "../../app/providers.js";
 import { FOCUSED_AGENT_CHAT_STORAGE_KEY } from "../../app/routes.js";
-import { filterSlashCommands, slashQueryFromInput, type SlashCommandPaletteItem, type SlashCommandStorageLike } from "../agent-command-palette.js";
+import type { SlashCommandPaletteItem, SlashCommandStorageLike } from "../agent-command-palette.js";
 import { buildAgentDisplayUnits } from "../agent-thread-messages.js";
 import {
   AGENT_RESTART_STATE_STORAGE_KEY,
@@ -27,20 +25,11 @@ import {
   agentStatusText,
   agentChatScopeKey,
   attachmentFilesFromDataTransfer,
-  buildAgentRoutedPluginPrompt,
   buildComposerCommandDraft,
-  collectPluginCommandTargets,
-  selectConversationPinnedCommands,
-  selectPluginCallsForConversation,
-  selectPluginThreadArtifacts,
-  selectRecordingDeliveryFiles,
-  selectRecordingMaterialFiles,
   clipboardAttachmentFilesFromDataTransfer,
   dataTransferHasAttachmentFiles,
   hasActiveAgentConversation,
   hydrateAgentThreadInBackground,
-  insertCapabilityAtSelection,
-  replaceSlashQueryAtSelection,
   isAgentConversationAtBottom,
   isComposingKeyboardEvent,
   isSingleLineComposerInput,
@@ -54,6 +43,7 @@ import {
   resolveComposerCommandDraft,
   shouldAcceptAgentStatusResult,
   submitAgentComposerMessage,
+  queuedMediaToPendingAttachment,
   thinkingPayloadForSend,
   toReadableAsrError,
   updateAgentComposerOverlayHeight,
@@ -83,104 +73,7 @@ function mockCallOrder(fn: { mock: { invocationCallOrder: readonly number[] } },
   return value;
 }
 
-describe("HomePage slash command completion", () => {
-  it.each([
-    ["/goal b", "/goal budget", true, "/goal budget  "],
-    ["/goal budget ", "/goal budget none", false, "/goal budget none"],
-    ["/model l", "/model list", false, "/model list"],
-    ["/pairing a", "/pairing approve", true, "/pairing approve  "],
-    ["/GOAL   P", "/goal pause", false, "/goal pause"]
-  ] as const)("replaces the entire leading query %s with %s", (input, command, appendSpace, value) => {
-    expect(replaceSlashQueryAtSelection(input, command, input.length, input.length, appendSpace))
-      .toEqual({ value, caret: value.length });
-  });
-
-  it("preserves text after the caret when completing a flat subcommand", () => {
-    expect(replaceSlashQueryAtSelection("/goal b remaining text", "/goal budget", 7, 7))
-      .toEqual({ value: "/goal budget  remaining text", caret: 13 });
-  });
-
-  it("preserves caret-based plugin capability insertion into an ordinary draft", () => {
-    expect(insertCapabilityAtSelection("before after", "/legal", 7, 7))
-      .toEqual({ value: "before /legal  after", caret: 15 });
-    expect(replaceSlashQueryAtSelection("before /leg after", "/legal", 11, 11))
-      .toEqual({ value: "before /legal  after", caret: 14 });
-  });
-});
-
 describe("HomePage", () => {
-  it("keeps plugin cards scoped to the active chat during navigation", () => {
-    const calls: PluginUiCall[] = [
-      { pluginId: "legal-labor", capabilityId: "session-start", callId: "chat-1-call", conversationId: "websocket:chat-1", origin: "agent", events: [] },
-      { pluginId: "legal-labor", capabilityId: "material-collect", callId: "chat-2-call", conversationId: "websocket:chat-2", origin: "agent", events: [] },
-    ];
-
-    expect(selectPluginCallsForConversation(calls, "chat-1", "websocket:chat-1", "draft-1").map((call) => call.callId))
-      .toEqual(["chat-1-call"]);
-    expect(selectPluginCallsForConversation(calls, "chat-2", "websocket:chat-1", "draft-1").map((call) => call.callId))
-      .toEqual(["chat-2-call"]);
-  });
-
-  it("stages only the transcript of a recording as a diagnosis material", () => {
-    const files = selectRecordingMaterialFiles({
-      id: "rec-1", title: "访谈录音", recordedAt: "2026-10-13T11:35:16Z", durationMs: 4000, speakerCount: 1,
-      transcript: { text: "对。", segments: [] }, status: "ready", sessionKey: "websocket:chat-1", collected: true,
-      files: [
-        { kind: "audio", path: "/media/interview.webm", name: "访谈录音.webm", mime: "audio/webm", bytes: 10, url: "/audio" },
-        { kind: "file", path: "/media/interview.txt", name: "访谈转写.txt", mime: "text/plain", bytes: 20, url: "/text" }
-      ]
-    });
-
-    expect(files.map((file) => [file.name, file.collected])).toEqual([["访谈转写.txt", true]]);
-  });
-
-  it("hands over this conversation's finished recordings, oldest first", () => {
-    const entry = (id: string, recordedAt: string, sessionKey: string, status?: "transcribing") => ({
-      id, title: id, recordedAt, durationMs: 1000, speakerCount: 1, transcript: { text: "", segments: [] }, audioUrl: null, sessionKey,
-      ...(status ? { status } : {}),
-      files: [
-        { kind: "audio" as const, path: `/ws/recordings/${id}.webm`, name: `${id}.webm`, mime: "audio/webm" as const, bytes: 10, url: `/a/${id}` },
-        { kind: "file" as const, path: `/ws/recordings/${id}.txt`, name: `${id}.txt`, mime: "text/plain" as const, bytes: 10, url: `/t/${id}` }
-      ]
-    });
-    const recordings = [
-      entry("later", "2026-10-13T12:00:00Z", "websocket:chat-1"),
-      entry("earlier", "2026-10-13T11:00:00Z", "chat-1"),
-      entry("pending", "2026-10-13T13:00:00Z", "websocket:chat-1", "transcribing"),
-      entry("other", "2026-10-13T10:00:00Z", "websocket:chat-2")
-    ];
-
-    expect(selectRecordingDeliveryFiles(recordings, "chat-1").map((file) => file.name))
-      .toEqual(["earlier.webm", "earlier.txt", "later.webm", "later.txt"]);
-    expect(selectRecordingDeliveryFiles(recordings, "chat-1")[1]).toMatchObject({ path: "/ws/recordings/earlier.txt", mediaType: "text/plain" });
-    expect(selectRecordingDeliveryFiles(recordings, null)).toEqual([]);
-  });
-
-  it("adds plugin and recording deliveries to the task overview and omits setup files", () => {
-    const calls: PluginUiCall[] = [{
-      pluginId: "legal-labor",
-      capabilityId: "report-render",
-      callId: "report-1",
-      conversationId: "websocket:chat-1",
-      origin: "agent",
-      events: [
-        { type: "artifact", artifact: { id: "setup", name: "诊断表.xlsx", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", uri: "file:///plugin/setup.xlsx", path: "/workspace/setup.xlsx", role: "setup" } },
-        { type: "artifact", artifact: { id: "audio", name: "访谈录音.webm", mediaType: "audio/webm", uri: "file:///plugin/audio.webm", path: "/workspace/outputs/访谈录音.webm", role: "deliverable" } },
-        { type: "artifact", artifact: { id: "report", name: "诊断报告.docx", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", uri: "file:///plugin/report.docx", path: "/workspace/outputs/诊断报告.docx", role: "deliverable" } },
-      ]
-    }];
-    const recordings = [
-      { id: "archive-audio", name: "访谈录音.webm", mediaType: "audio/webm", uri: "/media/audio", path: "/global/recordings/访谈录音.webm" },
-      { id: "archive-text", name: "访谈转写.txt", mediaType: "text/plain", uri: "/media/text", path: "/global/recordings/访谈转写.txt" },
-    ];
-
-    expect(selectPluginThreadArtifacts(calls, recordings)).toEqual([
-      { key: "/workspace/outputs/访谈录音.webm", name: "访谈录音.webm", path: "/workspace/outputs/访谈录音.webm", url: "file:///plugin/audio.webm" },
-      { key: "/workspace/outputs/诊断报告.docx", name: "诊断报告.docx", path: "/workspace/outputs/诊断报告.docx", url: "file:///plugin/report.docx" },
-      { key: "/global/recordings/访谈转写.txt", name: "访谈转写.txt", path: "/global/recordings/访谈转写.txt", url: "/media/text" },
-    ]);
-  });
-
   it("allows Goal steering when source metadata is missing without opening TUI or IM turns", () => {
     expect(isSteerableCurrentTurn(null, true)).toBe(true);
     expect(isSteerableCurrentTurn(null, false)).toBe(false);
@@ -199,13 +92,8 @@ describe("HomePage", () => {
     );
 
     expect(html).toContain("分配一个任务或提问任何问题...");
-    const document = new Window().document;
-    document.body.innerHTML = html;
-    const attachMenu = document.querySelector<HTMLDetailsElement>(".agent-composer-attach-menu");
-    expect(attachMenu?.querySelector("summary")?.getAttribute("aria-label")).toBe("添加资料");
-    expect(attachMenu?.hasAttribute("open")).toBe(false);
-    expect(Array.from(attachMenu?.querySelectorAll('[role="menuitem"]') ?? []).map((item) => item.textContent))
-      .toEqual(["上传文件", "上传文件夹"]);
+    expect(html).toContain('class="thread-toolbar__button" aria-label="展开右栏"');
+    expect(html).toContain("添加图片和文件");
     expect(html).toContain("语音输入");
     expect(html).toContain("发送");
     expect(html).toContain("Agent 正在连接");
@@ -223,7 +111,7 @@ describe("HomePage", () => {
     expect(html).not.toContain('data-icon="image-plus"');
     expect(html).not.toContain('data-icon="pause"');
     expect(html).toContain("内容由 AI 生成，请仔细甄别");
-    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-3");
+    expect(html).toContain("text-center text-[11px] text-text-ink/40 mt-4");
     expect(html).not.toContain("未选择任何文件");
   });
 
@@ -261,14 +149,13 @@ describe("HomePage", () => {
     expect(chipStyles).toContain("font-weight: 500;");
     expect(chipStyles).toMatch(/\.composer-command-chip__icon\s*{[^}]*position:\s*absolute;/s);
     expect(chipStyles).toMatch(/\.composer-command-chip__leading\s*{[^}]*display:\s*inline-flex;/s);
-    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(1);
-    expect(source.match(/\{renderComposerLeadingActions\(\)\}/g)).toHaveLength(2);
-    expect(source.match(/<(?:textarea|ComposerHighlightedTextarea)\b[^>]*value=\{composerInput\}/g)).toHaveLength(2);
+    expect(source.match(/<ComposerCommandChip/g)).toHaveLength(2);
+    expect(source.match(/value=\{composerInput\}/g)).toHaveLength(2);
     expect(source).toContain("setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, value));");
     expect(source).toContain("selectedComposerCommandsByScope[chatScopeKey] ?? null");
     expect(source).toContain("setSelectedComposerCommandForScope(chatScopeKey, COMPOSER_GOAL_COMMAND);");
     expect(source).toContain('label={t("home.command.goalChip")}');
-    expect(source.match(/placeholder=\{pendingQuestion \? t\("home.question.waitingInput"\) : selectedComposerCommand \? t\("home.goal.input"\) : t\("home.input"\)\}/g)).toHaveLength(2);
+    expect(source).toContain('placeholder={selectedComposerCommand ? t("home.goal.input") : t("home.input")}');
     expect(styles).toContain(".agent-composer-shell--expanded textarea.agent-composer-input--conversation");
   });
 
@@ -292,10 +179,7 @@ describe("HomePage", () => {
     expect(filterGoalModeSlashCommands(commands, false).map((item) => item.command)).toEqual([
       "/last-compaction"
     ]);
-    expect(slashQueryFromInput("消息 /new")).toBeNull();
-    expect(filterSlashCommands(filterGoalModeSlashCommands(commands, true), "new", [])).toEqual([]);
-    expect(filterSlashCommands(filterGoalModeSlashCommands(commands, true), "status", []).map((item) => item.command))
-      .toEqual(["/status"]);
+    expect(source).toContain("const slashQuery = slashMenuDismissed ? null : slashQueryFromInput(composerInput);");
     expect(source).toContain("clearAuxiliarySlashQuery();");
     expect(source).toContain('setCurrentComposerDraft(buildComposerCommandDraft(selectedComposerCommand, ""));');
   });
@@ -309,14 +193,6 @@ describe("HomePage", () => {
     expect(source).toContain("scopeKey={modelSelectionScopeKey}");
     expect(source).toContain("const modelWorkspaceMode = state.bootstrap?.app.userMode");
     expect(source).toContain("disabled={isCurrentAgentRunning || isCreatingChat || messageSendInFlight}");
-    // Login-required plugins gate on sign-in but no longer force/lock the model selector.
-    expect(source).not.toContain("locked={officialPluginActive}");
-    expect(source).not.toContain("forcedPresetId={officialPluginActive ? officialAgent?.id ?? null : undefined}");
-    expect(source).toContain("const loginRequiredPluginActive");
-    expect(source).toContain("home.modelSelector.pluginRequiresLogin");
-    expect(source).toContain("pluginCommandInvocation?.plugin.manifest.rules?.requiresLogin");
-    expect(source).toContain("mode={modelWorkspaceMode}");
-    expect(selectorSource).toContain("const locked = Boolean(props.locked)");
     expect(source).toContain("state.agent.pendingPresetByScope[modelSelectionScopeKey]");
     expect(source).toContain("state.agent.committedModelSelectionByScope[modelSelectionScopeKey]");
     expect(source).toContain("allowUnassignedSelected: pendingModelPreset == null && Boolean(committedModelSelection)");
@@ -407,8 +283,8 @@ describe("HomePage", () => {
       source.indexOf("  useEffect(() => {\n    if (!clients?.memmyAgent)")
     );
     const updateComposerInputBlock = source.slice(
-      source.indexOf("function updateComposerInput("),
-      source.indexOf("function clearSelectedComposerCommand()")
+      source.indexOf("function updateComposerInput(value: string)"),
+      source.indexOf("  /**\n   * 自动收缩或展开输入框高度。")
     );
 
     expect(source).not.toContain("SlashCommandsLoadStatus");
@@ -433,18 +309,13 @@ describe("HomePage", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
 
     expect(source).toContain("const slashMenuOpen = filteredSlashCommands.length > 0;");
-    expect(source.match(/\{slashMenuOpen && !slashPickerOpen \? \(/g)).toHaveLength(2);
-    expect(source.match(/\{slashMenuOpen && slashPickerOpen \? \(/g)).toHaveLength(1);
+    expect(source.match(/\{slashMenuOpen && \(/g)).toHaveLength(2);
     expect(source).toContain("const [lastCompactionPanel, setLastCompactionPanel] = useState<StatusPanelState>({ open: false });");
     expect(source).toContain("const lastCompactionSlashCommand: SlashCommandPaletteItem = {");
     expect(source).toContain('command: "/last-compaction"');
     expect(source).toContain("const slashCommandsWithLocal = [");
     expect(source).toContain("lastCompactionSlashCommand,");
-    const localCommands = source.slice(source.indexOf("const slashCommandsWithLocal = ["), source.indexOf("const visibleSlashCommands ="));
-    expect(localCommands).toContain("pluginSlashCommands,");
-    expect(localCommands).toContain("goalSlashCommand,");
-    expect(localCommands).toContain('command.command !== COMPOSER_GOAL_COMMAND');
-    expect(localCommands).toContain('command.command !== "/last-compaction"');
+    expect(source).toContain('...localizedSlashCommands.filter((command) => command.command !== "/last-compaction")');
     expect(source).toContain('buildVisibleSlashCommands(slashCommandsWithLocal, state.agent.isSending, stopSlashCommand, slashQuery ?? "")');
     expect(source).toContain("{statusPanel.open && !slashMenuOpen && (");
     expect(source).toContain("{lastCompactionPanel.open && !slashMenuOpen && (");
@@ -466,8 +337,7 @@ describe("HomePage", () => {
     expect(source).toContain("<AgentThreadToolbar");
     expect(source).toContain("title={activeConversationTitleDisplay}");
     expect(source).toContain("titleTrailing={activeImTitleDisplay ? <ImChannelTitleIcon");
-    const titleSelection = source.slice(source.indexOf("const activeConversationTitle ="), source.indexOf("const activeImTitleDisplay ="));
-    expect(titleSelection).not.toContain("selectedDraftProject?.name");
+    expect(source).not.toContain("selectedDraftProject?.name");
     expect(source).toContain("topBarBorder={hasActiveConversation}");
     expect(source).toContain("topBarInset={hasActiveConversation ? false : undefined}");
     expect(source).toContain("windowsTitlebarSafe={hasActiveConversation}");
@@ -682,14 +552,6 @@ describe("HomePage", () => {
 
     expect(sendBlock).toContain("if (runExactLocalSlashCommand(input))");
     expect(sendBlock.indexOf("runExactLocalSlashCommand(input)")).toBeLessThan(sendBlock.indexOf("submitAgentComposerMessage({"));
-    const agentSkillBlock = localSlashBlock.slice(
-      localSlashBlock.indexOf("if (pluginInvocation?.contribution.agentSkillId)"),
-      localSlashBlock.indexOf("if (pluginInvocation && pendingAttachments.length > 0)")
-    );
-    expect(agentSkillBlock).not.toContain("clients.plugins.invoke");
-    expect(sendBlock).toContain("content: agentRoutedPluginPrompt ?? input");
-    expect(sendBlock).not.toContain("invokeAgentRoutedPluginCapability");
-    expect(sendBlock).not.toContain("deferAgentSubmission");
     expect(localSlashBlock).toContain("if (pendingAttachments.length > 0) return false;");
     expect(localSlashBlock).toContain('normalized === "/last-compaction"');
     expect(localSlashBlock).toContain("requestLastCompactionPanel();");
@@ -810,11 +672,11 @@ describe("HomePage", () => {
     expect(composerRule).toContain("padding: 40px var(--codex-content-padding-x) 0;");
     expect(styles).toContain("container-name: agent-workspace;");
     expect(source).toContain("const threadPanel = useAgentThreadPanel({");
-    expect(source).toContain('className={`agent-workspace-layout ${threadPanelMotionClass}${legacySidePanelOpen ? " agent-workspace-layout--preview-open" : ""}`}');
-    expect(source).toContain('"--thread-panel-offset": `${visibleThreadPanelOffset}px`');
-    expect(source).toContain('"--agent-preview-panel-width": `${previewPanelWidth}px`');
-    expect(source).toContain("right: visibleThreadPanelOffset + (legacySidePanelOpen ? previewPanelWidth : 0)");
-    expect(source).toContain("sidePanel={sidePanelMounted && !recordingEntry.open && !recorderPaneOpen && !pluginArtifactPreview ? (\n        <AgentThreadPanel");
+    expect(source).toContain("className={`agent-workspace-layout ${threadPanelMotionClass}`}");
+    expect(source).toContain('style={{ "--thread-panel-offset": `${features.sidePanelWidth ?? threadPanel.offset}px` } as CSSProperties}');
+    expect(source).toContain("topBarStyle={{ right: features.sidePanelWidth ?? threadPanel.offset }}");
+    expect(source).toContain("topBarClassName={`thread-topbar ${threadPanelMotionClass}`}");
+    expect(source).toContain("sidePanel={features.sidePanel ?? (sidePanelMounted ? (\n        <AgentThreadPanel");
     expect(source).toContain("<AgentThreadPanel");
     expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-main\s*\{[^}]*isolation:\s*auto;/s);
     expect(styles).toMatch(/body\.memmy-thread-panel-fullscreen \.app-frame-content-topbar\.thread-topbar\s*\{[^}]*display:\s*none;/s);
@@ -822,6 +684,7 @@ describe("HomePage", () => {
     expect(source).not.toContain("<SlidersHorizontal");
     expect(conversationColumnRule).toContain("margin-right: var(--thread-panel-offset, 0px);");
     expect(conversationColumnRule).toContain("transition: margin-right 200ms cubic-bezier(0, 0, 0.2, 1);");
+    expect(styles).toMatch(/\.agent-workspace-layout > \.home-empty-screen\s*\{[^}]*margin-right: var\(--thread-panel-offset, 0px\);/s);
     expect(styles).toMatch(/\.thread-panel-motion--closing[^{]*\{[^}]*transition-duration:\s*150ms;[^}]*cubic-bezier\(0\.4, 0, 1, 1\)/s);
     expect(styles).toMatch(/\.thread-panel\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*20;/s);
   });
@@ -829,7 +692,7 @@ describe("HomePage", () => {
   it("lets expanded conversation text use the full width above the action footer", () => {
     const source = readFileSync(homePageSourcePath, "utf8");
     const composerStart = source.indexOf('className="agent-conversation-composer"');
-    const textareaStart = source.indexOf("<textarea", composerStart);
+    const textareaStart = source.indexOf("<ComposerHighlightedTextarea", composerStart);
     const toolbarStart = source.indexOf('className="agent-composer-toolbar"', textareaStart);
     const textareaSource = source.slice(textareaStart, toolbarStart);
 
@@ -1247,16 +1110,14 @@ describe("HomePage", () => {
     expect(focusInput).toHaveBeenCalledTimes(1);
   });
 
-  it("offers file and folder uploads through the native disclosure menu", () => {
-    const html = renderToString(<AppProviders><AgentRuntimeBridge><HomePage /></AgentRuntimeBridge></AppProviders>);
-    const document = new Window().document;
-    document.body.innerHTML = html;
-    const menu = document.querySelector<HTMLDetailsElement>(".agent-composer-attach-menu");
-    expect(menu?.querySelector("summary")?.tagName).toBe("SUMMARY");
-    expect(menu?.querySelector("summary")?.getAttribute("title")).toBe("添加文件或文件夹");
-    expect(Array.from(menu?.querySelectorAll('button[role="menuitem"]') ?? []).map((item) => item.textContent))
-      .toEqual(["上传文件", "上传文件夹"]);
-    expect(menu?.open).toBe(false);
+  it("opens the system media picker directly from the plus button without rendering a floating media menu", () => {
+    const source = readFileSync(homePageSourcePath, "utf8");
+
+    expect(source).toContain("onClick={openMediaFilePicker}");
+    expect(source).not.toContain("function ComposerMediaMenu");
+    expect(source).not.toContain("setMediaMenuOpen");
+    expect(source).not.toContain("aria-haspopup=\"menu\"");
+    expect(source).not.toContain("role=\"menuitem\"");
   });
 
   it("renders composer media previews as compact thumbnail and file chips", () => {
@@ -1293,47 +1154,35 @@ describe("HomePage", () => {
     expect(html).toContain("agent-attachment-card__name");
     expect(html).toContain("agent-attachment-card__meta");
     expect(html).toContain(">shot<");
-    expect(html).toContain(">report<");
-    expect(renderedAttachmentTitle(html, "report")).toContain("report.pdf");
-    expect(html).toContain(">brief<");
-    expect(renderedAttachmentTitle(html, "brief")).toContain("brief.docx");
-    expect(html).toContain(">sheet<");
-    expect(renderedAttachmentTitle(html, "sheet")).toContain("sheet.xlsx");
-    expect(html).toContain(">deck<");
-    expect(renderedAttachmentTitle(html, "deck")).toContain("deck.pptx");
-    expect(html).toContain(">notes<");
-    expect(renderedAttachmentTitle(html, "notes")).toContain("notes.txt");
-    expect(html).toContain(">table<");
-    expect(renderedAttachmentTitle(html, "table")).toContain("table.csv");
-    expect(html).toContain(">data<");
-    expect(renderedAttachmentTitle(html, "data")).toContain("data.json");
-    expect(html).toContain(">payload<");
-    expect(renderedAttachmentTitle(html, "payload")).toContain("payload.xml");
+    expect(html).toContain(">report.pdf<");
+    expect(html).toContain(">brief.docx<");
+    expect(html).toContain(">sheet.xlsx<");
+    expect(html).toContain(">deck.pptx<");
+    expect(html).toContain(">notes.txt<");
+    expect(html).toContain(">table.csv<");
+    expect(html).toContain(">data.json<");
+    expect(html).toContain(">payload.xml<");
     expect(compactHtml).toContain("XLSX · 2.0 KB");
     expect(compactHtml).toContain("PPTX · 1.5 KB");
     expect(compactHtml).toContain("TXT · 512 B");
     expect(compactHtml).toContain("CSV · 768 B");
     expect(compactHtml).toContain("JSON · 1.0 KB");
     expect(compactHtml).toContain("XML · 640 B");
-    const previewDocument = new Window().document;
-    previewDocument.body.innerHTML = html;
-    for (const [filename, kind, label] of [
-      ["report.pdf", "pdf", "PDF document"],
-      ["brief.docx", "word", "Word document"],
-      ["sheet.xlsx", "spreadsheet", "Spreadsheet"],
-      ["deck.pptx", "presentation", "Presentation"],
-      ["notes.txt", "text", "Text document"],
-      ["table.csv", "spreadsheet", "Spreadsheet"],
-      ["data.json", "code", "Code or configuration file"],
-      ["payload.xml", "code", "Code or configuration file"]
-    ] as const) {
-      const card = Array.from(previewDocument.querySelectorAll<HTMLElement>('[data-testid="agent-attachment-card-file"]'))
-        .find((item) => item.getAttribute("title")?.includes(filename));
-      expect(card).toBeDefined();
-      const icon = card!.querySelector(`[data-file-kind="${kind}"]`);
-      expect(icon?.classList.contains("file-type-icon--card")).toBe(true);
-      expect(icon?.getAttribute("aria-label")).toBe(label);
-    }
+    expect(html).toContain('data-testid="agent-file-icon-pdf"');
+    expect(html).toContain('data-testid="agent-file-icon-docx"');
+    expect(html).toContain('data-testid="agent-file-icon-xlsx"');
+    expect(html).toContain('data-testid="agent-file-icon-pptx"');
+    expect(html).toContain('data-testid="agent-file-icon-file"');
+    expect(html).toContain("agent-attachment-card__file-tile--pdf");
+    expect(html).toContain("agent-attachment-card__file-tile--docx");
+    expect(html).toContain("agent-attachment-card__file-tile--xlsx");
+    expect(html).toContain("agent-attachment-card__file-tile--pptx");
+    expect(html).toContain("agent-attachment-card__file-tile--file");
+    expect(html).toContain('aria-label="PDF file"');
+    expect(html).toContain('aria-label="Word document"');
+    expect(html).toContain('aria-label="Spreadsheet file"');
+    expect(html).toContain('aria-label="Presentation file"');
+    expect(html).toContain('aria-label="File attachment"');
     expect(html).not.toContain("absolute -right-1 -bottom-1");
     expect(html).not.toContain('data-testid="composer-file-kind-');
     expect(compactHtml).toContain("PNG · 2.0 KB");
@@ -1512,6 +1361,34 @@ describe("HomePage", () => {
     expect(clearComposer).toHaveBeenCalledTimes(1);
     expect(onNewChatMessageSent).toHaveBeenCalledWith("chat-new");
     expect(track).toHaveBeenCalledWith({ name: "agent_send_message", params: { page_path: "/main" }, consentTier: "basic" });
+  });
+
+  it("resends an edited queue attachment by its saved path without reuploading", async () => {
+    const image = queuedMediaToPendingAttachment({
+      kind: "image", name: "screenshot.png", url: "http://agent.local/media/screenshot", path: "/media/websocket/webui/screenshot.png",
+    }, "queued-id", 0);
+    const file = queuedMediaToPendingAttachment({
+      kind: "file", name: "notes.pdf", path: "/media/websocket/webui/notes.pdf",
+    }, "queued-id", 1);
+    const uploadAgentMedia = vi.fn(async () => []);
+    const submitMessage = vi.fn(async () => ({ status: "queued" as const }));
+    expect(await submitAgentComposerMessage({
+      chatId: "chat-1",
+      connection: { getReadyGeneration: () => 1, newChat: vi.fn(), submitMessage },
+      content: "改后的说明",
+      pendingAttachments: [image, file],
+      uploadAgentMedia,
+      dispatch: vi.fn(),
+      track: vi.fn(),
+      clearComposer: vi.fn(),
+    })).toBe(true);
+    expect(uploadAgentMedia).not.toHaveBeenCalled();
+    expect(submitMessage).toHaveBeenCalledWith(expect.objectContaining({
+      media: [
+        expect.objectContaining({ path: "/media/websocket/webui/screenshot.png", kind: "image" }),
+        expect.objectContaining({ path: "/media/websocket/webui/notes.pdf", kind: "file" }),
+      ],
+    }), 1);
   });
 
   it("keeps a new project target on the optimistic task action", async () => {
@@ -1745,25 +1622,25 @@ describe("HomePage", () => {
     });
   });
 
-  it("anchors composer popovers above the queue and keeps Goal next to the composer", () => {
+  it("keeps the queue above pending cards and Goal next to the composer", () => {
     const source = readFileSync(homePageSourcePath, "utf8").replace(/\r\n/g, "\n");
     const flowStart = source.indexOf('<div className="agent-composer-flow">');
-    const stackStart = source.indexOf('<div className="agent-composer-stack">', flowStart);
-    const queueStart = source.indexOf("<AgentQueuedMessageList", stackStart);
+    const slashStart = source.indexOf("{slashMenuOpen && (", flowStart);
+    const stackStart = source.indexOf('<div className="agent-composer-stack">', slashStart);
+    const queueStart = source.indexOf("<AgentQueuedMessageList", flowStart);
+    const pluginCardsStart = source.indexOf('className="conversation-feature-cards agent-confirmation-dock"', flowStart);
     const goalStart = source.indexOf("<AgentGoalBar", stackStart);
     const shellStart = source.indexOf('className="relative agent-composer-shell agent-composer-shell--expanded rounded-card-lg"', stackStart);
 
     expect(flowStart).toBeGreaterThan(0);
-    expect(stackStart).toBeGreaterThan(flowStart);
-    expect(queueStart).toBeGreaterThan(stackStart);
+    expect(slashStart).toBeGreaterThan(flowStart);
+    expect(stackStart).toBeGreaterThan(slashStart);
+    expect(queueStart).toBeGreaterThan(flowStart);
+    expect(pluginCardsStart).toBeGreaterThan(queueStart);
+    expect(stackStart).toBeGreaterThan(pluginCardsStart);
     expect(goalStart).toBeGreaterThan(queueStart);
     expect(shellStart).toBeGreaterThan(goalStart);
-    const caretMenuStart = source.indexOf("<ComposerCaretMenu", shellStart);
-    const toolbarStart = source.indexOf('className="agent-composer-toolbar"', shellStart);
-    expect(caretMenuStart).toBeGreaterThan(shellStart);
-    expect(caretMenuStart).toBeLessThan(toolbarStart);
-    expect(source.slice(caretMenuStart, toolbarStart)).toContain('placement="above"');
-    expect(source).toContain('ref={conversationPanelRef} className="agent-conversation-panel flex flex-col h-full"');
+    expect(source).toContain('ref={conversationPanelRef} data-waiting-card={pendingCardKey ? "true" : undefined} className="agent-conversation-panel flex flex-col h-full"');
     expect(source).toContain('ref={composerOverlayRef} className="agent-conversation-composer"');
     expect(source).toContain("updateAgentComposerOverlayHeight(panel, composer, measuredHeight)");
     expect(source).toContain('if (typeof ResizeObserver !== "undefined") return;');
@@ -2325,49 +2202,4 @@ class MemoryStorage implements SlashCommandStorageLike {
   removeItem(key: string): void {
     this.values.delete(key);
   }
-}
-
-
-it("hides legal composer shortcuts until the current conversation actually invokes the legal plugin", () => {
-  const legal=InstalledPluginSchema.parse({ id:"legal-labor", version:"1.0.0", state:"active", approvedPermissions:[], config:{}, lastError:null,
-    createdAt:"2026-10-13T00:00:00Z", updatedAt:"2026-10-13T00:00:00Z", manifest:{ apiVersion:"memmy/v1", id:"legal-labor", name:"Legal", version:"1.0.0",
-      runtime:{adapter:"http"}, permissions:[], capabilities:[{id:"session-start",name:"Guide",description:"Guide",inputSchema:{},outputSchema:{},execution:"job"}],
-      commands:[{command:"/legal-guide",name:"诊断指引",description:"Guide",capabilityId:"session-start",pinned:true},
-        {command:"/legal-record",name:"访谈录音",description:"Record",capabilityId:"session-start",pinned:true,topbar:true}] } });
-  const targets=collectPluginCommandTargets([legal]);
-  expect(selectConversationPinnedCommands(targets, [])).toEqual([]);
-  const invocation: PluginUiCall={pluginId:"legal-labor", capabilityId:"session-start",callId:"starting",conversationId:"law-chat",origin:"agent",events:[]};
-  expect(selectConversationPinnedCommands(targets,[invocation])).toHaveLength(2);
-  expect(selectConversationPinnedCommands(targets,[{...invocation,pluginId:"another-plugin"}])).toEqual([]);
-});
-
-it("routes a legal diagnosis command to the Agent Skill instead of opening the card locally", () => {
-  const legal = InstalledPluginSchema.parse({
-    id: "legal-labor", version: "1.0.0", state: "active", approvedPermissions: [], config: {}, lastError: null,
-    createdAt: "2026-10-13T00:00:00Z", updatedAt: "2026-10-13T00:00:00Z", manifest: {
-      apiVersion: "memmy/v1", id: "legal-labor", name: "Legal", version: "1.0.0", runtime: { adapter: "http" }, permissions: [],
-      capabilities: [{ id: "session-start", name: "Guide", description: "Guide", inputSchema: {}, outputSchema: {}, execution: "job" }],
-      skills: [{
-        id: "labor-risk-diagnosis", name: "用工合规风险诊断", description: "Diagnosis",
-        entry: "skills/labor-risk-diagnosis/SKILL.md"
-      }],
-      commands: [{
-        command: "/legal-diagnosis", name: "用工诊断", description: "Diagnosis", capabilityId: "session-start",
-        agentSkillId: "labor-risk-diagnosis"
-      }]
-    }
-  });
-
-  expect(buildAgentRoutedPluginPrompt(
-    "/legal-diagnosis 帮我生成用工风险诊断报告",
-    collectPluginCommandTargets([legal])
-  )).toBe("$labor-risk-diagnosis 帮我生成用工风险诊断报告");
-});
-
-function renderedAttachmentTitle(html: string, displayName: string): string | null | undefined {
-  const document = new Window().document;
-  document.body.innerHTML = html;
-  return Array.from(document.querySelectorAll<HTMLElement>(".agent-attachment-card"))
-    .find((card) => card.querySelector(".agent-attachment-card__name")?.textContent?.trim() === displayName)
-    ?.getAttribute("title");
 }

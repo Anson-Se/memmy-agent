@@ -12,9 +12,17 @@ import { appActions } from "../../state/app-actions.js";
 import { appReducer, createInitialAppState } from "../../state/app-reducer.js";
 import type { AgentTaskView } from "../../state/agent-chat-slice.js";
 import { mockBootstrap } from "./fixtures/bootstrap.js";
-import { AppFrame, TaskArchiveInlineAction, TaskRow, countProjectTasksToArchive, deriveSidebarPlacement, deriveVisibleSidebarPlacement, groupAgentTasks, groupTasksByTime, resolveSidebarAccountSummary, resolveSidebarContextMenuPlacement, resolveSidebarMenuOverlayStyle, resolveSidebarUpdateAction, resolveTaskAncestorGroupKeys, shouldCreateNewAgentDraft, truncateAccountDisplayText } from "../app-frame.js";
+import { AppFrame, TaskArchiveInlineAction, TaskRow, countProjectTasksToArchive, deriveSidebarPlacement, deriveVisibleSidebarPlacement, groupAgentTasks, groupTasksByTime, resolveSidebarAccountSummary, resolveSidebarContextMenuPlacement, resolveSidebarMenuOverlayStyle, resolveSidebarUpdateAction, resolveTaskAncestorGroupKeys, shouldCreateNewAgentDraft, shouldShowRecordingView, truncateAccountDisplayText } from "../app-frame.js";
 
 describe("AppFrame", () => {
+  it("hides the recording view shortcut while its tab is already open", () => {
+    expect(shouldShowRecordingView("ready", false)).toBe(true);
+    expect(shouldShowRecordingView("failed", false)).toBe(true);
+    expect(shouldShowRecordingView("ready", true)).toBe(false);
+    expect(shouldShowRecordingView("recording", false)).toBe(false);
+    expect(shouldShowRecordingView("ready", false, true)).toBe(false);
+    expect(shouldShowRecordingView("failed", false, true)).toBe(false);
+  });
   it("使用原型 MainLayout 的侧栏图标与导航文案", () => {
     const html = renderToString(
       <AppProviders>
@@ -25,8 +33,11 @@ describe("AppFrame", () => {
     );
 
     expect(html).toContain("新任务");
+    expect(html).toContain("录音");
+    expect(html).toContain('class="lucide lucide-mic"');
+    expect(html).toContain('class="app-frame-recording-nav__control app-frame-recording-nav__control--record"');
+    expect(html).toContain('aria-label="开始录音"');
     expect(html).toContain("连接与工具");
-    expect(html).toContain("app-frame-recording-nav");
     expect(html).toContain("项目");
     expect(html).toContain("任务");
     expect(html).toContain("暂无任务");
@@ -342,7 +353,7 @@ describe("AppFrame", () => {
     expect(overlayStyle).toEqual({
       right: 324,
       top: 428,
-      zIndex: 10010
+      zIndex: 9999
     });
   });
 
@@ -449,7 +460,6 @@ describe("AppFrame", () => {
     expect(shouldCreateNewAgentDraft(newAgentDraftState({ blankDraftActive: true }))).toBe(false);
     expect(shouldCreateNewAgentDraft(newAgentDraftState({ composerDraftsByScope: { "draft-3": "未发送" } }))).toBe(false);
     expect(shouldCreateNewAgentDraft(newAgentDraftState({ composerPendingAttachmentsByScope: { "draft-3": [{} as never] } }))).toBe(false);
-    expect(shouldCreateNewAgentDraft(newAgentDraftState({ composerContextReferencesByScope: { "draft-3": [{ kind: "path", id: "/docs", label: "docs/" }] } }))).toBe(false);
     expect(source).toContain("function openNewAgent(target?: WebuiSessionTarget)");
     expect(source).toContain("clearFocusedAgentTarget(");
     expect(source).toContain("if (shouldCreateNewAgentDraft(state.agent))");
@@ -536,7 +546,7 @@ describe("AppFrame", () => {
   it("does not keep New Agent highlighted while a session is current", () => {
     const source = readFileSync(resolve(__dirname, "..", "app-frame.tsx"), "utf8");
 
-    expect(source).toContain('item.path !== "/main" || (!state.agent.currentSessionKey && !props.recordingActive)');
+    expect(source).toContain('(!state.agent.currentSessionKey && !props.recordingActive)');
   });
 
   it("makes the whole sidebar account footer open settings", () => {
@@ -631,7 +641,6 @@ describe("AppFrame", () => {
   it("keeps sidebar account settings icon pinned to the footer right edge", () => {
     const source = readFileSync(resolve(__dirname, "..", "app-frame.tsx"), "utf8");
     const styles = readFileSync(resolve(__dirname, "..", "..", "styles.css"), "utf8");
-    const tokens = readFileSync(resolve(__dirname, "..", "..", "theme", "tokens.css"), "utf8");
     const profileTextRule = styles.match(/\.app-frame-profile-text\s*\{[^}]*\}/)?.[0] ?? "";
 
     expect(source).toContain('className="flex w-full items-center gap-2.5 px-2 py-1.5"');
@@ -876,25 +885,6 @@ describe("AppFrame", () => {
     expect(source).not.toContain("welcome.joinCommunity");
     expect(source).not.toContain("community-popover");
     expect(source).not.toContain("CommunityLink");
-  });
-
-  it("turns the sidebar into a dismissible overlay on compact viewports", () => {
-    const source = readFileSync(resolve(__dirname, "..", "app-frame.tsx"), "utf8");
-    const styles = readFileSync(resolve(__dirname, "..", "..", "styles.css"), "utf8");
-    const tokens = readFileSync(resolve(__dirname, "..", "..", "theme", "tokens.css"), "utf8");
-
-    expect(source).toContain('const COMPACT_APP_FRAME_QUERY = "(max-width: 720px)";');
-    expect(source).toContain("window.matchMedia(COMPACT_APP_FRAME_QUERY).matches");
-    expect(source).toContain("if (matches) setCompactSidebarOpen(false);");
-    expect(source).toContain("const sidebarHidden = compactViewport ? !compactSidebarOpen : desktopSidebarHidden;");
-    expect(source).toContain("closeCompactSidebar();");
-    expect(source).toContain("const sidebarMenuOverlayZIndex = 10010;");
-    expect(source).toContain('className="app-frame-sidebar-backdrop"');
-    expect(styles).toContain("@media (max-width: 720px)");
-    expect(styles).toContain(".sidebar-shell .app-frame-sidebar");
-    expect(styles).toContain("width: min(280px, calc(100vw - 48px));");
-    expect(styles).toContain(".sidebar-shell > .sidebar-resize-handle");
-    expect(tokens).toContain("--z-modal: 10020;");
   });
 
   it("renders archive as an inline confirmation instead of a modal-style action", () => {
@@ -1302,7 +1292,6 @@ function newAgentDraftState(overrides: Partial<NewAgentDraftTestState> = {}): Ne
     newChatRequestId: 3,
     composerDraftsByScope: {},
     composerPendingAttachmentsByScope: {},
-    composerContextReferencesByScope: {},
     ...overrides
   };
 }

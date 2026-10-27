@@ -16,7 +16,7 @@ vi.mock("../asr-recorder.js", async (original) => ({ ...await original<typeof im
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
 
-it("deletes local recording files only after confirmation and retains the row on failure", async () => {
+it("removes a local recording and transcript only after the row's confirmation succeeds", async () => {
   const scope = `recording-delete-${crypto.randomUUID()}`;
   const audioPath = "/workspace/recordings/interview.webm";
   const transcriptPath = "/workspace/recordings/interview.txt";
@@ -45,6 +45,7 @@ it("deletes local recording files only after confirmation and retains the row on
     await act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
       .find((button) => button.textContent?.includes("删除"))!.click());
     expect(deleteFiles).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("删除本地录音和转写文件？");
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__delete-confirm-action")!.click());
     expect(readRecordingArchive(scope)).toHaveLength(1);
     expect(container.textContent).toContain("offline");

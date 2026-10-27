@@ -18,7 +18,7 @@ import type { IntegrationsClient } from "../api/integrations-client.js";
 import type { IntegrationConnection } from "../integrations/connection-state.js";
 import type { IntegrationMeta } from "../integrations/integration-meta.js";
 import type { AgentGoalControlAction, ChatModelPreset, MemmyAgentRunStatusSnapshot, MemmyAgentSessionSnapshot, MemmyAgentSessionSummary, MemmyAgentSidebarState, MemmyAgentWebuiThread, MemmyAgentWsEvent, WebuiSessionTarget } from "../api/memmy-agent-client.js";
-import type { ComposerContextReference, PendingAttachment } from "./agent-composer-state.js";
+import type { PendingAttachment } from "./agent-composer-state.js";
 import type {
   AgentAction,
   AgentChatMediaAttachment,
@@ -32,6 +32,7 @@ import type { ToolsAction } from "./tools-slice.js";
 
 /** Type definition for event connection status. */
 export type EventConnectionStatus = "pending" | "connecting" | "connected" | "heartbeat" | "reconnecting";
+export type RecordingSidebarStatus = "idle" | "starting" | "recording" | "paused" | "transcribing" | "ready" | "failed";
 
 /** Contract for agent source scan progress. */
 export interface AgentSourceScanProgress {
@@ -51,7 +52,6 @@ export interface AgentSourceScanCompletion {
 export interface AgentSourceScanFinished extends AgentSourceScanCompletion {
   succeeded: boolean;
 }
-export type RecordingSidebarStatus = "idle" | "starting" | "recording" | "paused" | "transcribing" | "ready" | "failed";
 
 export const AGENT_SOURCE_SCAN_COMPLETION_FEEDBACK_MS = 5_000;
 
@@ -140,11 +140,26 @@ export const appActions = {
   navigate(path: AppRoutePath): AppAction {
     return { type: "navigation/changed", path };
   },
-  requestRecordingOpen(): AppAction { return { type: "recording/openRequested" }; },
-  requestRecordingControl(): AppAction { return { type: "recording/controlRequested" }; },
-  requestRecordingFinish(): AppAction { return { type: "recording/finishRequested" }; },
-  recordingRequestHandled(requestId: number): AppAction { return { type: "recording/requestHandled", requestId }; },
-  recordingStatusChanged(status: RecordingSidebarStatus): AppAction { return { type: "recording/statusChanged", status }; },
+
+  requestRecordingOpen(): AppAction {
+    return { type: "recording/openRequested" };
+  },
+
+  requestRecordingControl(): AppAction {
+    return { type: "recording/controlRequested" };
+  },
+
+  requestRecordingFinish(): AppAction {
+    return { type: "recording/finishRequested" };
+  },
+
+  recordingRequestHandled(requestId: number): AppAction {
+    return { type: "recording/requestHandled", requestId };
+  },
+
+  recordingStatusChanged(status: RecordingSidebarStatus): AppAction {
+    return { type: "recording/statusChanged", status };
+  },
 
   windowVisibilityChanged(visible: boolean): AppAction {
     return { type: "window/visibilityChanged", visible };
@@ -438,10 +453,6 @@ export const agentActions = {
     return { type: "agent/userMessageQueued", ...input };
   },
 
-  pluginFeedbackRecorded(chatId: string, content: string, clientRequestId: string): AppAction {
-    return { type: "agent/pluginFeedbackRecorded", chatId, content, clientRequestId };
-  },
-
   queueItemRemoveStarted(chatId: string, clientRequestId: string): AppAction {
     return { type: "agent/queueItemRemoveStarted", chatId, clientRequestId };
   },
@@ -468,10 +479,6 @@ export const agentActions = {
 
   composerPendingAttachmentsUpdated(scopeKey: string, attachments: PendingAttachment[]): AppAction {
     return { type: "agent/composerPendingAttachmentsUpdated", scopeKey, attachments };
-  },
-
-  composerContextReferencesUpdated(scopeKey: string, references: ComposerContextReference[]): AppAction {
-    return { type: "agent/composerContextReferencesUpdated", scopeKey, references };
   },
 
   draftTargetUpdated(scopeKey: string, target: WebuiSessionTarget): AppAction {

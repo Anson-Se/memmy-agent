@@ -25,6 +25,7 @@ import {
 } from "../../core/runtime-messages/index.js";
 import {
   respondToAgentQuestion,
+  isAgentQuestionPending,
   type AgentQuestionAnswer,
   type AgentQuestionResponse,
 } from "../../core/agent-runtime/tools/ask-question.js";
@@ -42,6 +43,7 @@ import type {
 } from "../../core/agent-runtime/goal-runtime.js";
 import type {
   RemoveQueuedWebuiMessageResult,
+  ReorderQueuedMessageResult,
   SteerQueuedMessageResult,
   StopExpectedTurnResult,
   WebuiQueueMessageDescriptor,
@@ -200,6 +202,7 @@ type WebuiQueuedMessage = {
   queue_surface?: "chat_composer" | null;
   turn_admission?: "steer";
   turn_id?: string;
+  user_event_on_consume?: boolean;
 };
 type ClientSurface = "gui" | "tui";
 type InflightWebuiMessageRequest = {
@@ -233,6 +236,11 @@ type WebSocketChannelOptions = {
     sessionKey: string,
     clientRequestId: string,
   ) => RemoveQueuedWebuiMessageResult | Promise<RemoveQueuedWebuiMessageResult>;
+  reorderQueuedWebuiMessages?: (
+    sessionKey: string,
+    orderedIds: string[],
+    expectedRevision: number,
+  ) => ReorderQueuedMessageResult | Promise<ReorderQueuedMessageResult>;
   steerQueuedWebuiMessage?: (
     sessionKey: string,
     clientRequestId: string,
@@ -261,6 +269,7 @@ export type WebuiMessageDigestInput = {
   expectedTurnId: string | null;
   thinkingEnabled?: boolean;
   thinkingLevel?: string | null;
+  interruptPendingTurnId?: string | null;
 };
 
 export function computeWebuiMessageDigest(input: WebuiMessageDigestInput): string {
@@ -276,6 +285,7 @@ export function computeWebuiMessageDigest(input: WebuiMessageDigestInput): strin
     expected_turn_id: input.expectedTurnId,
     thinking_enabled: input.thinkingEnabled ?? null,
     thinking_level: input.thinkingLevel ?? null,
+    ...(input.interruptPendingTurnId ? { interrupt_pending_turn_id: input.interruptPendingTurnId } : {}),
   })).digest("hex");
 }
 
@@ -822,6 +832,7 @@ export class WebSocketChannel extends BaseChannel {
   activeGoalStopHandler: WebSocketChannelOptions["activeGoalStopHandler"] = undefined;
   getWebuiQueueSnapshot: WebSocketChannelOptions["getWebuiQueueSnapshot"] = undefined;
   removeQueuedWebuiMessage: WebSocketChannelOptions["removeQueuedWebuiMessage"] = undefined;
+  reorderQueuedWebuiMessages: WebSocketChannelOptions["reorderQueuedWebuiMessages"] = undefined;
   steerQueuedWebuiMessage: WebSocketChannelOptions["steerQueuedWebuiMessage"] = undefined;
   stopExpectedTurn: WebSocketChannelOptions["stopExpectedTurn"] = undefined;
   goalControlConnections = new Map<string, Set<any>>();
@@ -856,6 +867,7 @@ export class WebSocketChannel extends BaseChannel {
     this.activeGoalStopHandler = options.activeGoalStopHandler ?? config?.activeGoalStopHandler;
     this.getWebuiQueueSnapshot = options.getWebuiQueueSnapshot ?? config?.getWebuiQueueSnapshot;
     this.removeQueuedWebuiMessage = options.removeQueuedWebuiMessage ?? config?.removeQueuedWebuiMessage;
+    this.reorderQueuedWebuiMessages = options.reorderQueuedWebuiMessages ?? config?.reorderQueuedWebuiMessages;
     this.steerQueuedWebuiMessage = options.steerQueuedWebuiMessage ?? config?.steerQueuedWebuiMessage;
     this.stopExpectedTurn = options.stopExpectedTurn ?? config?.stopExpectedTurn;
     const workspacePath = options.workspacePath ?? config?.workspacePath ?? getWorkspacePath();
@@ -1039,6 +1051,7 @@ export class WebSocketChannel extends BaseChannel {
       queue_surface: descriptor.queueSurface,
       ...(descriptor.turnAdmission ? { turn_admission: descriptor.turnAdmission } : {}),
       ...(descriptor.turnId ? { turn_id: descriptor.turnId } : {}),
+      ...(descriptor.turnAdmission === "steer" ? { user_event_on_consume: true } : {}),
     };
   }
 
@@ -1180,6 +1193,7 @@ export class WebSocketChannel extends BaseChannel {
       chat_id: chatId,
       text: typeof message.content === "string" ? visibleWebuiUserContent(message.content) : "",
       client_request_id: clientRequestId,
+      ...(message.webui_queue_steer_recovery ? { queue_steer_repaired: true } : {}),
     };
     const source = parseTurnSource(message.turn_source);
     if (source) wire.source = source;
@@ -1899,7 +1913,13 @@ export class WebSocketChannel extends BaseChannel {
       const diff = await readWorkspaceFileDiff(environment, relativePath);
       return diff ? httpJsonResponse(diff) : httpError(404, "changed file not found");
     } catch (error) {
-      if (error instanceof WorkspaceEnvironmentError) return httpError(error.status, error.code);
+      if (error instanceof WorkspaceEnvironmentError) {
+        return httpJsonResponse({
+          code: error.code,
+          message: error.code,
+          ...(error.worktreePath ? { worktreePath: error.worktreePath } : {}),
+        }, { status: error.status });
+      }
       throw error;
     }
   }
@@ -2387,6 +2407,7 @@ export class WebSocketChannel extends BaseChannel {
     }
     const data = buildWebuiThreadResponse(resolved.guiSessionKey, {
       surface,
+      isQuestionPending: (requestId) => isAgentQuestionPending(requestId, resolved.guiChatId),
       sessionMessages,
       augmentUserMedia: (paths: string[]) => this.augmentTranscriptUserMedia(paths, resolved.canonicalSessionKey),
       augmentAssistantMedia: (paths: string[]) => paths.flatMap((p) => this.webuiMediaAttachmentForPath(p, resolved.canonicalSessionKey) ?? []),
@@ -2466,13 +2487,16 @@ export class WebSocketChannel extends BaseChannel {
     });
   }
 
-  /** Renew playback access to a saved recording without relying on its original chat. */
+  /** Renew a saved recording's playback URL without requiring a chat session. */
   handleWebuiRecordingResolve(request: HttpRequestLike): HttpLikeResponse {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
     if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
     let rawPath: unknown;
-    try { rawPath = JSON.parse(requestBodyText(request)).path; }
-    catch { return httpError(400, "missing path"); }
+    try {
+      rawPath = JSON.parse(requestBodyText(request)).path;
+    } catch {
+      return httpError(400, "missing path");
+    }
     if (typeof rawPath !== "string" || !rawPath.trim()) return httpError(400, "missing path");
     const resolved = this.resolveWorkspaceRecordingPath(rawPath);
     if (!resolved?.mediaUrl) return httpError(404, "recording not found");
@@ -2595,7 +2619,7 @@ export class WebSocketChannel extends BaseChannel {
     });
   }
 
-  /** Remove only regular files inside the default workspace's recordings folder. */
+  /** Delete only files created in the default workspace's recordings folder. */
   handleWebuiRecordingDelete(request: HttpRequestLike): HttpLikeResponse {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
     if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
@@ -2620,11 +2644,16 @@ export class WebSocketChannel extends BaseChannel {
         if (!isPathInside(real, root)) return httpError(403, "path is outside recordings");
         targets.add(real);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return httpError(500, "could not inspect recording file");
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          return httpError(500, "could not inspect recording file");
+        }
       }
     }
-    try { for (const target of targets) fs.unlinkSync(target); }
-    catch { return httpError(500, "could not delete recording file"); }
+    try {
+      for (const target of targets) fs.unlinkSync(target);
+    } catch {
+      return httpError(500, "could not delete recording file");
+    }
     return httpJsonResponse({ ok: true, deleted: targets.size });
   }
 
@@ -3838,12 +3867,20 @@ export class WebSocketChannel extends BaseChannel {
         && envelope.expected_turn_id.length <= 128
         ? envelope.expected_turn_id.trim()
         : undefined;
-    if (!turnAdmission || expectedTurnId === undefined) {
+    const interruptPendingTurnId = envelope.interrupt_pending_turn_id == null
+      ? null
+      : typeof envelope.interrupt_pending_turn_id === "string"
+        && envelope.interrupt_pending_turn_id.trim().length > 0
+        && envelope.interrupt_pending_turn_id.length <= 128
+        ? envelope.interrupt_pending_turn_id.trim()
+        : undefined;
+    if (!turnAdmission || expectedTurnId === undefined || interruptPendingTurnId === undefined) {
       await this.sendWebuiRequestError(connection, {
         chatId,
         clientRequestId,
         detail: "message_request_rejected",
-        reason: !turnAdmission ? "turn_admission_invalid" : "expected_turn_id_invalid",
+        reason: !turnAdmission ? "turn_admission_invalid"
+          : expectedTurnId === undefined ? "expected_turn_id_invalid" : "interrupt_pending_turn_id_invalid",
       });
       return;
     }
@@ -3915,6 +3952,7 @@ export class WebSocketChannel extends BaseChannel {
           expectedTurnId,
           thinkingEnabled: typeof envelope.thinking_enabled === "boolean" ? envelope.thinking_enabled : undefined,
           thinkingLevel: typeof envelope.thinking_level === "string" ? envelope.thinking_level : undefined,
+          interruptPendingTurnId,
         })
       : null;
     if (existing && clientRequestId) {
@@ -4031,6 +4069,9 @@ export class WebSocketChannel extends BaseChannel {
       metadata.webui_request_digest = digest;
     }
     if (queueSurface) metadata.webui_queue_surface = queueSurface;
+    if (interruptPendingTurnId && queueSurface && this.connectionSurface.get(connection) !== "tui") {
+      metadata.webui_interrupt_pending_turn_id = interruptPendingTurnId;
+    }
     if (language) metadata.webui_language = language;
     const mcpPresets: any[] = normalizeMcpPresetMentions(envelope.mcp_presets);
     if (!mcpPresets.length) mcpPresets.push(...normalizeMentionList(envelope.mcp_presets));
@@ -4144,6 +4185,41 @@ export class WebSocketChannel extends BaseChannel {
         return;
       }
       await this.sendWebuiQueueSnapshot(connection, chatId);
+      return;
+    }
+    if (type === "queue_reorder") {
+      const chatId = typeof envelope.chat_id === "string" && isValidGuiChatId(envelope.chat_id)
+        ? envelope.chat_id : "";
+      const requestId = typeof envelope.request_id === "string" && UUID_RE.test(envelope.request_id)
+        ? envelope.request_id : "";
+      const orderedIds = Array.isArray(envelope.ordered_ids) ? envelope.ordered_ids : [];
+      const expectedRevision = envelope.expected_revision;
+      const sessionKey = chatId ? this.canonicalSessionKeyForChatId(chatId) : null;
+      if (!chatId || !requestId || !sessionKey || !this.connectionChats.get(connection)?.has(chatId)
+        || !this.reorderQueuedWebuiMessages
+        || orderedIds.length < 2 || orderedIds.length > 100
+        || !orderedIds.every((id: unknown) => typeof id === "string" && UUID_RE.test(id))
+        || typeof expectedRevision !== "number" || !Number.isSafeInteger(expectedRevision)
+        || expectedRevision < 0) {
+        await this.safeSendTo(connection, {
+          event: "queue_reorder_result", chat_id: chatId, request_id: requestId,
+          ok: false, outcome: "invalid_request",
+        });
+        return;
+      }
+      let outcome: ReorderQueuedMessageResult["outcome"] = "stale";
+      try {
+        outcome = (await this.reorderQueuedWebuiMessages(sessionKey, orderedIds, expectedRevision)).outcome;
+      } catch (error) {
+        console.warn("[websocket] queue reorder failed", { sessionKey, error });
+      }
+      for (const target of this.queueEventConnections(chatId)) {
+        await this.sendWebuiQueueSnapshot(target, chatId);
+      }
+      await this.safeSendTo(connection, {
+        event: "queue_reorder_result", chat_id: chatId, request_id: requestId,
+        ok: outcome === "reordered", outcome,
+      });
       return;
     }
     if (type === "queue_remove") {
@@ -4312,6 +4388,7 @@ export class WebSocketChannel extends BaseChannel {
             chat_id: chatId,
             client_request_id: clientRequestId,
             turn_id: result.turnId,
+            user_event_on_consume: true,
           };
           for (const target of new Set([connection, ...(inflight?.connections ?? [])])) {
             await this.safeSendTo(target, steered);
@@ -4516,7 +4593,7 @@ export class WebSocketChannel extends BaseChannel {
       await this.sendRunStatusSnapshot(connection, chatId);
       await this.sendWebuiQueueSnapshot(connection, chatId);
       await this.maybePushActiveGoalState(chatId);
-      await this.maybePushTaskPlanState(chatId);
+    await this.maybePushTaskPlanState(chatId);
       return;
     }
     if (type === "status") {

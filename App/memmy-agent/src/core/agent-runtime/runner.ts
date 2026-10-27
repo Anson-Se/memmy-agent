@@ -1167,6 +1167,7 @@ export class AgentRunner {
         abortSignal: spec.abortSignal ?? null,
         toolName: call.name,
         callId: call.id ?? null,
+        uiToolCallId: getOrCreateUiToolCallId(call),
         sessionKey: spec.sessionKey ?? null,
         modelPreset: spec.actualModelContext?.presetId ?? null,
         stopTurn: (message) => { stopTurn ??= message; },
@@ -1981,14 +1982,14 @@ export class AgentRunner {
         hookContinuationExhausted = true;
         break;
       }
-      const planContinuation = spec.finalResponseContinuation?.({ finalContent: clean as string, messages });
+      const deliveryContinuation = spec.finalResponseContinuation?.({ finalContent: clean as string, messages });
       if (streamsHookContent) {
-        await hook.onStreamEnd(context, { resuming: Boolean(planContinuation) });
+        await hook.onStreamEnd(context, { resuming: Boolean(deliveryContinuation) });
       }
 
       messages.push(assistant ?? buildAssistantMessage(clean));
-      if (planContinuation) {
-        messages.push({ role: "system", content: planContinuation });
+      if (deliveryContinuation) {
+        messages.push({ role: "system", content: deliveryContinuation });
         await hook.afterIteration(context);
         continue;
       }

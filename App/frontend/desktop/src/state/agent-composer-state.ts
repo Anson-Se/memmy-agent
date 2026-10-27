@@ -7,7 +7,7 @@
  */
 import type { MessageKey } from "../i18n/messages.js";
 import type { AgentImageMime } from "../lib/agent-image-encode.js";
-import type { UploadedAgentMedia } from "../api/memmy-agent-client.js";
+import type { MemmyAgentMediaAttachment, UploadedAgentMedia } from "../api/memmy-agent-client.js";
 
 export type ComposerDraftValue = string | ((currentValue: string) => string);
 
@@ -27,6 +27,8 @@ export interface PendingAttachmentBase {
   status: "encoding" | "ready" | "error";
   originalBytes: number;
   errorKey?: MessageKey;
+  /** The queued file already exists in the gateway media store. */
+  reusedMedia?: MemmyAgentMediaAttachment & { path: string };
 }
 
 export interface PendingImage extends PendingAttachmentBase {

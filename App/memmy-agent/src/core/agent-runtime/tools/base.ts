@@ -6,12 +6,13 @@ export type FileMutationOutcome = {
 };
 
 export type ToolExecutionContext = {
+  /** Unique UI identity, even when a provider reuses its tool-call ID. */
+  uiToolCallId?: string | null;
+  sessionKey?: string | null;
+  modelPreset?: string | null;
   abortSignal?: AbortSignal | null;
   toolName?: string;
   callId?: string | null;
-  sessionKey?: string | null;
-  /** The exact model preset selected for the turn that owns this tool call. */
-  modelPreset?: string | null;
   /** Stop this run without asking the model to select another executor. */
   stopTurn?: (message: string) => void;
   reportFileMutation?: (outcome: FileMutationOutcome) => void;

@@ -21,7 +21,7 @@ it("replays a pending confirmation to a late SSE subscriber, excluding its answe
     expect(response.status).toBe(200);
     const reader = response.body!.getReader();
     let content = "";
-    while (!content.includes("pending-upload")) {
+    while (!content.includes("plugin.capability_snapshot")) {
       const chunk = await reader.read();
       if (chunk.done) break;
       content += new TextDecoder().decode(chunk.value);
@@ -29,6 +29,8 @@ it("replays a pending confirmation to a late SSE subscriber, excluding its answe
     expect(content).toContain("plugin.capability_event");
     expect(content).toContain('"callId":"pending-call"');
     expect(content).not.toContain("answered-guide");
+    expect(content).toContain('"type":"plugin.capability_snapshot"');
+    expect(content).toContain('"calls":[{"pluginId":"legal-labor","capabilityId":"session-start","callId":"pending-call","conversationId":"websocket:chat-1"}]');
     await reader.cancel();
   } finally { abort.abort(); await app.close(); }
 });

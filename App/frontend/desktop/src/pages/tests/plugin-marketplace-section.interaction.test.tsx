@@ -99,39 +99,17 @@ describe("PluginMarketplaceSection", () => {
     });
   }
 
-  it("offers updates on the card and in details while displaying the actual installed version", async () => {
-    const plugin = { ...installed(office), version: "1.1.0" };
+  it("offers the catalog version as an explicit update for an installed plugin", async () => {
+    const plugin = { ...installed(literature), version: "1.1.0" };
     await render({ plugins: [plugin] });
-    await click("更新Office");
+    await click("更新文献综述");
     expect(props.onUpdate).toHaveBeenCalledExactlyOnceWith(plugin);
-    await click("查看Office详情");
-    const dialog = document.querySelector("[role=dialog]")!;
-    expect(dialog.querySelector(".plugin-marketplace-detail-status")?.textContent).toBe("已安装 · v1.0.0 ｜ 最新版本 · v1.1.0");
-    await click("更新Office", dialog);
-    expect(props.onUpdate).toHaveBeenCalledTimes(2);
-    expect(dialog.isConnected).toBe(true);
-    await render({ busyId: plugin.id });
-    expect(button("更新Office", dialog).disabled).toBe(true);
-    await render({ busyId: null, actionErrorPluginId: plugin.id, actionError: "更新失败" });
-    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("更新失败");
-    expect(dialog.querySelector(".plugin-marketplace-detail-status")?.textContent).toContain("已安装 · v1.0.0");
+    expect(props.onInstall).not.toHaveBeenCalled();
   });
 
-  it.each(["1.0.0", "0.9.0", undefined])("does not offer an upgrade for market version %s", async (version) => {
-    await render({ plugins: [{ ...installed(office), version }] });
-    expect(container.querySelector('[aria-label="更新Office"]')).toBeNull();
-    await click("查看Office详情");
-    expect(document.querySelector("[role=dialog]")?.textContent).toContain("已安装 · v1.0.0");
-  });
-
-  it("labels an uninstalled market release separately and respects update eligibility", async () => {
-    await render({ plugins: [{ ...office, version: "1.1.0" }] }, "en-US");
-    await click("View Office details");
-    expect(document.querySelector(".plugin-marketplace-detail-status")?.textContent).toContain("Latest version · v1.1.0");
-    expect(document.querySelector(".plugin-marketplace-detail-status")?.textContent).not.toContain("Installed · v");
-    await click("Close", document.querySelector("[role=dialog]")!);
-    await render({ plugins: [{ ...installed(office), version: "1.1.0", installable: false }] });
-    expect(container.querySelector('[aria-label="更新Office"]')).toBeNull();
+  it("does not offer a downgrade when the catalog is older than the installed version", async () => {
+    await render({ plugins: [{ ...installed(literature), version: "0.9.0" }] });
+    expect(container.querySelector('[aria-label="更新文献综述"]')).toBeNull();
   });
 
   it("presents task plugins and searches names and descriptions without changing installation counts", async () => {
@@ -142,7 +120,7 @@ describe("PluginMarketplaceSection", () => {
     await search("  oFFicE  ");
     expect(Array.from(container.querySelectorAll("article")).map((item) => item.getAttribute("aria-label"))).toEqual(["Office"]);
     expect(button("已安装 (1)")).toBeDefined();
-    await search("检索论文");
+    await search("检索文献");
     expect(Array.from(container.querySelectorAll("article")).map((item) => item.getAttribute("aria-label"))).toEqual(["文献综述"]);
     expect(button("已安装 (1)")).toBeDefined();
     expect(props.plugins).toHaveLength(2);
@@ -152,7 +130,7 @@ describe("PluginMarketplaceSection", () => {
 
   it("intersects search with the installed filter and preserves that filter when search is cleared", async () => {
     await render();
-    await search("演示文稿");
+    await search("办公文档");
     expect(container.querySelectorAll("article")).toHaveLength(1);
     await click("已安装 (1)");
     expect(container.querySelectorAll("article")).toHaveLength(0);
@@ -206,33 +184,19 @@ describe("PluginMarketplaceSection", () => {
     expect(props.onInstall).not.toHaveBeenCalled();
   });
 
-  it("recommends capable custom models for literature reviews without blocking use", async () => {
+  it("shows literature review model guidance without blocking custom models", async () => {
     await render({ officialModelReady: false });
     const reviewCard = container.querySelector('article[aria-label="文献综述"]')!;
     expect(reviewCard.textContent).not.toContain("需配置模型");
     expect(reviewCard.querySelector('[aria-label="将文献综述加入对话"]')).not.toBeNull();
     await click("查看文献综述详情");
-    expect(document.querySelector(".plugin-marketplace-detail-note")?.textContent).toBe("注：需登录账号使用。因消耗 Token 量较大且任务较为复杂，目前只建议使用自行配置且性能较强的模型。");
-    expect(document.querySelector("[role=dialog]")?.textContent).not.toContain("推荐使用 Memmy 官方模型");
+    expect(document.querySelector("[role=dialog]")?.textContent).toContain("只建议使用自行配置且性能较强的模型");
     await click("加入对话", document.querySelector("[role=dialog]")!);
     expect(props.onConfigureModel).not.toHaveBeenCalled();
     expect(props.onAddToChat).toHaveBeenCalledOnce();
     expect(props.onInstall).not.toHaveBeenCalled();
     expect(document.querySelector("[role=dialog]")).toBeNull();
     expect(button("安装Office", container.querySelector('article[aria-label="Office"]')!).disabled).toBe(false);
-  });
-
-  it("does not claim sign-in is required when the literature review policy does not require it", async () => {
-    await render({ plugins: [{ ...literature, requiresLogin: false }] });
-    await click("查看文献综述详情");
-    expect(document.querySelector(".plugin-marketplace-detail-note")).toBeNull();
-  });
-
-  it("shows the custom model guidance in English", async () => {
-    await render({}, "en-US");
-    await click("View 文献综述 details");
-    expect(document.querySelector(".plugin-marketplace-detail-note")?.textContent).toBe("Note: Sign-in is required. Due to high token usage and task complexity, we currently only recommend using a capable model that you configure yourself.");
-    expect(document.querySelector("[role=dialog]")?.textContent).not.toContain("Memmy official models");
   });
 
   it("installs from a catalog card with one click and no confirmation dialog", async () => {
@@ -271,18 +235,13 @@ describe("PluginMarketplaceSection", () => {
     await render({ plugins: [installed(literature, "pending_approval")] });
     expect(container.querySelector("article")?.textContent).not.toContain("默认提供");
     expect(container.querySelector("article")?.textContent).not.toContain("需官方模型");
-    const summary = container.querySelector(".plugin-marketplace-description")!;
-    expect(summary.textContent).toBe("根据研究主题检索论文、整理证据，生成可继续编辑的文献综述和参考文献。");
-    expect(summary.getAttribute("title")).toBe(summary.textContent);
     await click("查看文献综述详情");
     const dialog = document.querySelector("[role=dialog]")!;
     expect(dialog.querySelector("figure")).not.toBeNull();
     expect(dialog.querySelector("figure button")).toBeNull();
-    expect(dialog.textContent).toContain("注：需登录账号使用。因消耗 Token 量较大且任务较为复杂，目前只建议使用自行配置且性能较强的模型。");
-    expect(dialog.textContent).not.toContain("推荐 Memmy 官方模型");
+    expect(dialog.textContent).toContain("只建议使用自行配置且性能较强的模型");
     expect(dialog.textContent).not.toContain("能力说明");
     expect(dialog.textContent).toContain("根据研究主题检索论文");
-    expect(dialog.querySelector(".plugin-marketplace-detail-description")?.textContent).toBe(summary.textContent);
     expect(dialog.textContent).toContain("安装未完成");
     expect(dialog.textContent).not.toContain("arxiv.org");
     expect(dialog.textContent).not.toContain("host-service");

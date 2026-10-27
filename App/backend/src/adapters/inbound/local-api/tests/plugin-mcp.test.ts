@@ -70,6 +70,37 @@ async function connect(
 }
 
 describe("plugin MCP bridge", () => {
+  it("forwards tool and turn provenance for migrated process records", async () => {
+    const events: unknown[] = [];
+    const { service } = createPlugins();
+    const client = await connect(service, (event) => events.push(event));
+    const tools = await client.listTools();
+    await client.callTool({ name: tools.tools[0]!.name, arguments: { topic: "Questions" },
+      _meta: { "memmy.dev/session-key": "websocket:c1", "memmy.dev/tool-call-id": "tool-42", "memmy.dev/turn-id": "turn-7" } });
+    expect(events.length).toBeGreaterThan(0);
+    for (const event of events) expect(event).toMatchObject({
+      conversationId: "websocket:c1", agentToolCallId: "tool-42", turnId: "turn-7"
+    });
+  });
+
+  it("returns plugin-produced file inventory without replacing the result", async () => {
+    const service: PluginMcpService = {
+      list: () => [plugin],
+      invoke: async function* () {
+        yield { type: "artifact" as const, artifact: { id: "report", name: "report.docx",
+          mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          uri: "/preview", path: "/workspace/report.docx", role: "deliverable" as const } };
+        yield { type: "result" as const, output: { nextStep: "done", sessionId: "s1" } };
+      },
+      cancel: vi.fn(async () => undefined)
+    };
+    const client = await connect(service);
+    const result = await client.callTool({ name: capabilityToolName(plugin.id, "run"), arguments: {} });
+    expect(result.structuredContent).toMatchObject({
+      publishedFiles: [{ name: "report.docx", path: "/workspace/report.docx" }],
+      nextStep: "done"
+    });
+  });
   it("closes live HTTP MCP sessions before shutting down the Host", async () => {
     const { service } = createPlugins();
     const app = Fastify();
