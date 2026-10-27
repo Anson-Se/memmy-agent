@@ -1,3 +1,4 @@
+import { followEmbeddingMaintenance, type EmbeddingMaintenanceStats, type EmbeddingMaintenanceRunResult } from "../api/embedding-maintenance";
 /**
  * Settings view.
  *
@@ -118,25 +119,6 @@ interface ResolvedConfig {
   };
   telemetry?: { enabled?: boolean };
   agentAccess?: AgentAccessBlock;
-}
-
-interface EmbeddingMaintenanceStats {
-  dimension: number;
-  available: boolean;
-  totalSlots: number;
-  ready: number;
-  missing: number;
-  dimMismatch: number;
-  needsRepair: number;
-  dimensionError?: string;
-  retryQueue: { pending: number; active: number; stale: number; failed: number };
-}
-
-interface EmbeddingMaintenanceRunResult {
-  accepted: true;
-  mode: "repair" | "rebuild";
-  enqueued: number;
-  serverTime: string;
 }
 
 const SECRET_MASKED = (s: string | undefined | null): boolean =>
@@ -769,25 +751,49 @@ export function EmbeddingMaintenancePanel() {
     }
   };
 
+  const controller = useRef<AbortController | null>(null);
+  const showProgress = (r: EmbeddingMaintenanceRunResult) => {
+    setStats(r.statsAfter);
+    setStatus({
+      kind: r.error || r.failed > 0 ? "error" : r.done ? "ok" : "muted",
+      text: r.error || t(r.done ? "settings.embedding.rebuild.done" : "settings.embedding.rebuild.progress", {
+        updated: r.updated, failed: r.failed, remaining: r.pending, retrying: r.retrying,
+      }),
+    });
+  };
+  const follow = async (initial: EmbeddingMaintenanceRunResult, signal: AbortSignal) => {
+    setRunning(initial.mode);
+    try {
+      await followEmbeddingMaintenance(initial, showProgress, signal);
+    } catch (err) {
+      if (!signal.aborted) setStatus({ kind: "error", text: (err as Error).message });
+    } finally {
+      if (!signal.aborted) { setRunning(null); void refresh(); }
+    }
+  };
+
   useEffect(() => {
+    const next = new AbortController();
+    controller.current = next;
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
-    return () => window.clearInterval(timer);
+    void api.get<EmbeddingMaintenanceRunResult | null>("/api/v1/embeddings/rebuild", { signal: next.signal })
+      .then((result) => { if (result && !next.signal.aborted) return follow(result, next.signal); })
+      .catch((err) => { if (!next.signal.aborted) setStatus({ kind: "error", text: (err as Error).message }); });
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => { window.clearInterval(timer); controller.current?.abort(); };
   }, []);
 
   const run = async (mode: "repair" | "rebuild") => {
+    controller.current?.abort();
+    const next = new AbortController();
+    controller.current = next;
     setRunning(mode);
     setStatus({ kind: "muted", text: t("settings.embedding.rebuild.running") });
     try {
-      const result = await api.post<EmbeddingMaintenanceRunResult>(
-        "/api/v1/embeddings/rebuild", { mode },
-      );
-      setStatus({ kind: "ok", text: t("settings.embedding.rebuild.queued", { count: result.enqueued }) });
+      const initial = await api.post<EmbeddingMaintenanceRunResult>("/api/v1/embeddings/rebuild", { mode }, { signal: next.signal });
+      if (!next.signal.aborted) await follow(initial, next.signal);
     } catch (err) {
-      setStatus({ kind: "error", text: (err as Error).message });
-    } finally {
-      setRunning(null);
-      void refresh();
+      if (!next.signal.aborted) { setStatus({ kind: "error", text: (err as Error).message }); setRunning(null); }
     }
   };
 
@@ -799,6 +805,8 @@ export function EmbeddingMaintenancePanel() {
         total: stats.totalSlots,
         missing: stats.missing,
         mismatch: stats.dimMismatch,
+        modelMismatch: stats.modelMismatch,
+        contentMismatch: stats.contentMismatch ?? 0,
         dim: stats.dimension,
       })
     : t("common.loading");
@@ -816,7 +824,7 @@ export function EmbeddingMaintenancePanel() {
           <div class="muted" style="font-size:var(--fs-xs);margin-top:2px">
             {healthText}
           </div>
-          {stats && <div class="muted" style="font-size:var(--fs-xs);margin-top:2px">
+          {stats?.retryQueue && <div class="muted" style="font-size:var(--fs-xs);margin-top:2px">
             {t("settings.embedding.maintenance.queue", {
               pending: stats.retryQueue.pending,
               active: stats.retryQueue.active,

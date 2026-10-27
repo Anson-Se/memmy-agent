@@ -34,14 +34,42 @@ export interface SerializedMemoryVector {
   updated_at: string;
 }
 
+export interface EmbeddingMaintenanceEntry {
+  id: string;
+  kind: "memory" | "user_memory";
+  dimension: number;
+  vectorField?: MemoryVectorField;
+  embeddingModel: string | null;
+  embeddingProvider: string | null;
+}
+
 export interface EmbeddingDimensionCounts {
   totalSlots: number;
-  dimensions: Array<{ dimension: number; count: number; model: string | null; provider: string | null }>;
+  dimensions: Array<{ dimension: number; count: number }>;
 }
 
 /** Keeps sqlite-vec details out of the repository and retrieval layers. */
 export class SqliteVecStore {
   constructor(private readonly db: Database.Database) {}
+
+  maintenanceEntries(): EmbeddingMaintenanceEntry[] {
+    return this.db.prepare(`
+      SELECT m.id AS id, 'memory' AS kind,
+             CASE WHEN m.memory_layer = 'L1' THEN 'vec_summary' ELSE 'vec' END AS vectorField,
+             COALESCE(v.embedding_dim, 0) AS dimension,
+             v.embedding_model AS embeddingModel, v.embedding_provider AS embeddingProvider
+      FROM memories m LEFT JOIN memory_vector_entries v
+        ON v.memory_id = m.id
+        AND v.vector_field = CASE WHEN m.memory_layer = 'L1' THEN 'vec_summary' ELSE 'vec' END
+      WHERE m.deleted_at IS NULL AND m.status != 'deleted'
+      UNION ALL
+      SELECT m.id AS id, 'memory' AS kind, 'vec_action' AS vectorField, v.embedding_dim AS dimension,
+             v.embedding_model AS embeddingModel, v.embedding_provider AS embeddingProvider
+      FROM memories m JOIN memory_vector_entries v ON v.memory_id = m.id AND v.vector_field = 'vec_action'
+      WHERE m.memory_layer = 'L1' AND m.deleted_at IS NULL AND m.status != 'deleted'
+      ORDER BY id, vectorField
+    `).all() as EmbeddingMaintenanceEntry[];
+  }
 
   replace(memoryId: string, vectors: MemoryVectorValue[], updatedAt: string): void {
     this.db.transaction(() => {
@@ -221,18 +249,13 @@ export class SqliteVecStore {
        WHERE deleted_at IS NULL AND status != 'deleted'`
     ).pluck().get() ?? 0);
     const dimensions = this.db.prepare(
-      `SELECT entries.embedding_dim AS dimension, COUNT(*) AS count,
-         entries.embedding_model AS model, entries.embedding_provider AS provider
+      `SELECT entries.embedding_dim AS dimension, COUNT(DISTINCT entries.memory_id) AS count
        FROM memory_vector_entries AS entries
        INNER JOIN memories ON memories.id = entries.memory_id
        WHERE memories.deleted_at IS NULL AND memories.status != 'deleted'
-         AND entries.vector_field = CASE
-           WHEN memories.memory_layer = 'L1' THEN 'vec_summary'
-           ELSE 'vec'
-         END
-       GROUP BY entries.embedding_dim, entries.embedding_model, entries.embedding_provider
+       GROUP BY entries.embedding_dim
        ORDER BY count DESC, dimension DESC`
-    ).all() as EmbeddingDimensionCounts["dimensions"];
+    ).all() as Array<{ dimension: number; count: number }>;
     return { totalSlots, dimensions };
   }
 

@@ -5,7 +5,7 @@ import { embeddingTextForMemory, updateMemoryVectorField } from "../../../src/se
 import { Repositories } from "../../../src/storage/repositories.js";
 import { createCapturingEmbedder, createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
 
-const { cleanup, createTestService } = createMemoryServiceFixture();
+const { cleanup, createTestService, createTestRoot } = createMemoryServiceFixture();
 afterEach(() => {
   vi.restoreAllMocks();
   cleanup();
@@ -33,7 +33,7 @@ describe("v1.2.6 embedding retry reproduction", () => {
       }));
     }
     expect(await service.embeddingMaintenanceStats()).toMatchObject({
-      dimension: 3, ready: 1, dimMismatch: 2, needsRepair: 2
+      dimension: 3, ready: 1, modelMismatch: 2, needsRepair: 2
     });
     expect(await service.rebuildEmbeddings("repair")).toMatchObject({ enqueued: 2 });
     expect(db.db.prepare("SELECT target_id FROM embedding_retry_queue ORDER BY target_id").all())
@@ -89,6 +89,7 @@ describe("v1.2.6 embedding retry reproduction", () => {
     vi.spyOn(service, "nextWorkerRunAt").mockReturnValue(undefined);
     const run = vi.spyOn(service, "runWorkerOnce");
     const server = createMemoryHttpServer({
+      configPath: `${createTestRoot()}/config.yaml`,
       service, workerStartupFallbackMs: 0, workerIdlePollMs: 20, startAgentSourceAutomation: false
     });
     try {
@@ -212,6 +213,7 @@ describe("v1.2.6 embedding retry reproduction", () => {
       changeSeq: 0, syncCursor: "0", serverTime: new Date().toISOString()
     });
     const server = createMemoryHttpServer({
+      configPath: `${createTestRoot()}/config.yaml`,
       service,
       workerStartupFallbackMs: 3_600_000,
       workerPostHealthDelayMs: 3_600_000,
@@ -279,9 +281,9 @@ describe("v1.2.6 embedding retry reproduction", () => {
     }));
 
     expect(await service.embeddingMaintenanceStats()).toMatchObject({
-      totalSlots: 1, ready: 0, missing: 1, needsRepair: 1
+      totalSlots: 2, ready: 0, missing: 1, modelMismatch: 1, needsRepair: 2
     });
-    expect(await service.rebuildEmbeddings("repair")).toMatchObject({ enqueued: 1 });
+    expect(await service.rebuildEmbeddings("repair")).toMatchObject({ enqueued: 2 });
     expect(repos.runtime.getEmbeddingRetryByTarget("trace", memory.id, "vec_summary"))
       .toMatchObject({ status: "pending" });
   });

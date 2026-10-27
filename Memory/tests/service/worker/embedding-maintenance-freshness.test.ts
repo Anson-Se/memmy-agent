@@ -80,8 +80,12 @@ it.each([false, true])("repairs failed current content despite a retained old ve
   expect(await service.embeddingMaintenanceStats()).toMatchObject({ ready: 1, missing: 0, needsRepair: 1, retryQueue: { failed: 1 } });
   batch.mockResolvedValue([[0, 1, 0]]);
   single.mockResolvedValue([0, 1, 0]);
-  expect(await service.rebuildEmbeddings("repair")).toMatchObject({ enqueued: 1 });
+  const repair = await service.rebuildEmbeddings("repair");
+  expect(repair).toMatchObject({ enqueued: 1, pending: 1, done: false });
   await service.runWorkerOnce(10);
+  expect(service.embeddingMaintenanceProgress(repair.runId)).toMatchObject({
+    updated: 1, failed: 0, done: true, statsAfter: { ready: 2, needsRepair: 0, retryQueue: { failed: 0 } }
+  });
   expect(await service.embeddingMaintenanceStats()).toMatchObject({ ready: 2, needsRepair: 0, retryQueue: { failed: 0, pending: 0, active: 0 } });
   expect(await service.rebuildEmbeddings("repair")).toMatchObject({ enqueued: 0 });
 });
