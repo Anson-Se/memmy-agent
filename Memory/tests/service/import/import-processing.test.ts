@@ -59,18 +59,30 @@ describe("MemoryService / import / processing", () => {
     expectAutomaticRetry(false);
     expect(repos.runtime.leaseQueuedJobs(1, 60, [added.id])).toHaveLength(1);
     expectAutomaticRetry(false);
+    // A restart must not revoke another executor's still-valid lease.
+    expect(repos.runtime.requeueLeasedJobsAfterRestart()).toEqual([]);
+    db.db.prepare("UPDATE evolution_jobs SET leased_until=? WHERE id=?")
+      .run("2000-01-01T00:00:00.000Z", repos.processing.get(added.id)!.activeJobId);
     const recovered = repos.runtime.requeueLeasedJobsAfterRestart();
-    expect(recovered[0]?.after).toMatchObject({ status: "queued", attempts: 0, lastError: null });
+    expect(recovered[0]?.after).toMatchObject({ status: "queued", attempts: 0, failureCount: 0, lastError: null });
     expectAutomaticRetry(false);
 
     await service.runWorkerOnce(1);
     expect(repos.processing.get(added.id)).toMatchObject({ state: "summary_pending", errorCode: "transient_provider_error" });
     expectAutomaticRetry(true);
+    // Failure visibility is immediate, but execution still respects backoff.
+    expect(repos.runtime.requeueFailedJobs(1, undefined, [added.id])).toEqual([]);
+    db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id=?")
+      .run("2000-01-01T00:00:00.000Z", repos.processing.get(added.id)!.activeJobId);
     expect(repos.runtime.requeueFailedJobs(1, undefined, [added.id])).toHaveLength(1);
     expectAutomaticRetry(true);
     expect(repos.runtime.leaseQueuedJobs(1, 60, [added.id])).toHaveLength(1);
     expectAutomaticRetry(false);
-    repos.runtime.requeueLeasedJobsAfterRestart();
+    expect(repos.runtime.requeueLeasedJobsAfterRestart()).toEqual([]);
+    db.db.prepare("UPDATE evolution_jobs SET leased_until=? WHERE id=?")
+      .run("2000-01-01T00:00:00.000Z", repos.processing.get(added.id)!.activeJobId);
+    const retryRecovered = repos.runtime.requeueLeasedJobsAfterRestart();
+    expect(retryRecovered[0]?.after).toMatchObject({ status: "queued", failureCount: 1 });
     expectAutomaticRetry(true);
 
     failSummary = false;
