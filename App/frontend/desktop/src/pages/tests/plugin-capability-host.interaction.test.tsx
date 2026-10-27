@@ -1744,7 +1744,7 @@ describe("selectRegionPluginCalls", () => {
     };
   }
 
-  it("renders all four Office deliveries after Excel recalculation finishes last", async () => {
+  it("retains all four Agent Office deliveries without duplicating them above the composer", async () => {
     const office = InstalledPluginSchema.parse({ ...plugin, id: "office", manifest: {
       ...plugin.manifest, id: "office", name: "Office", capabilities: [{ ...plugin.manifest.capabilities[0], id: "office_deliver" }]
     } });
@@ -1756,11 +1756,9 @@ describe("selectRegionPluginCalls", () => {
     try {
       await act(async () => root.render(<I18nProvider language="zh-CN"><PluginCapabilityHost calls={calls} plugins={[office]}
         client={{ getUi: vi.fn(), respond: vi.fn(), cancel: vi.fn() }} onOpenArtifact={open} /></I18nProvider>));
-      const openButtons = [...container.querySelectorAll("button")].filter((button) => button.textContent === "打开");
-      expect(openButtons).toHaveLength(4);
-      for (const name of ["report.docx", "slides.pptx", "report.pdf", "budget.xlsx"]) expect(container.textContent).toContain(name);
-      for (const button of openButtons) await act(async () => button.click());
-      expect(open.mock.calls.map(([artifact]) => artifact.name)).toEqual(["report.docx", "slides.pptx", "report.pdf", "budget.xlsx"]);
+      expect(selectCurrentPluginCalls(calls).map((item) => item.callId)).toEqual(["word", "ppt", "pdf", "excel"]);
+      expect(container.querySelector(".plugin-capability-region")).toBeNull();
+      expect(open).not.toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
       container.remove();

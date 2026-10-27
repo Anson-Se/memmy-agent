@@ -481,4 +481,20 @@ describe("PluginService", () => {
     expect(runtimeHost.deactivate).toHaveBeenCalledWith(release.manifest.id);
     expect(service.get(release.manifest.id).state).toBe("active");
   });
+
+  it("recovers an installation interrupted while enabling", async () => {
+    const { service, runtimeHost } = createContext();
+    await service.install(release.manifest.id);
+    service.configure(release.manifest.id, {
+      config: { database: "crossref" },
+      secrets: { "api-key": "secret" }
+    });
+    await service.approvePermissions(release.manifest.id, release.manifest.permissions);
+    store!.repositories.plugins.setState(release.manifest.id, "enabling");
+
+    await service.restoreActive();
+
+    expect(runtimeHost.activate).toHaveBeenCalledOnce();
+    expect(service.get(release.manifest.id).state).toBe("active");
+  });
 });

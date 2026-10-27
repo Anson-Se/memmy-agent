@@ -192,4 +192,23 @@ describe("conversation feature integration", () => {
     expect(features.processInteraction).toBeNull();
   });
 
+  it("keeps Agent Office progress and files off the composer", async () => {
+    mocks.chatId = "office-chat";
+    await act(async () => render());
+    const call = { pluginId: "office", capabilityId: "office_create", callId: "office-call",
+      conversationId: "office-chat", origin: "agent" as const, turnId: "office-turn" };
+    await act(async () => ui.receive({ ...call,
+      event: { type: "progress", current: 0, message: "Office processing" } }));
+    expect(container.textContent).not.toContain("Office processing");
+    const path = "/workspace/outputs/office/office-smoke-test.docx";
+    await act(async () => {
+      ui.receive({ ...call, event: { type: "artifact", artifact: { id: "office-file", name: "office-smoke-test.docx",
+        path, mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        uri: "https://example.test/office-file", role: "deliverable" } } });
+      ui.receive({ ...call, event: { type: "result", output: { ok: true } } });
+    });
+    expect(container.textContent).not.toContain("office-smoke-test.docx");
+    expect(ui.calls.find((item) => item.callId === "office-call")?.events.some((event) => event.type === "artifact")).toBe(true);
+  });
+
 });

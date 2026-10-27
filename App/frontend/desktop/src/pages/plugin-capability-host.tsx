@@ -278,6 +278,8 @@ export function PluginCapabilityHost(props: PluginCapabilityHostProps) {
     // Do not duplicate it as a persistent block beside the composer.
     if (call.origin === "agent" && call.events.some((event) => event.type === "error")) return false;
     if (props.dockInteractions && call.pluginId === REVIEW_PLUGIN_ID && isStatusOnlyPresentation(call)) return false;
+    // Agent-owned Office progress already has a tool row in the conversation.
+    if (region === "flow" && call.pluginId === "office" && call.origin === "agent" && isStatusOnlyPresentation(call)) return false;
     // Agent-owned legal progress appears on its tool row. User-started jobs
     // keep this standalone status because they have no Agent tool row.
     if (props.dockInteractions && region === "flow" && call.pluginId === "legal-labor"

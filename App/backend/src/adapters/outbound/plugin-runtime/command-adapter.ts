@@ -590,9 +590,12 @@ export async function resolveOfficeRuntime(platform: NodeJS.Platform = process.p
       // Desktop soffice uses global named pipes that AppContainer rejects.
       // Windows requires the headless LibreOfficeKit bridge in our runtime.
       const binaryName = platform === "win32" ? name === "soffice" ? "memmy-office-convert.exe" : `${name}.exe` : name;
-      const candidates = [resolve(root, "bin", binaryName), resolve(root, "MacOS", binaryName), resolve(root, "Contents", "MacOS", binaryName), resolve(root, "program", binaryName),
+      const candidates = [...(configured === override && name === "soffice"
+        ? [resolve(root, "native", "libreoffice-headless", "libreoffice", "LibreOfficeDev.app", "Contents", "MacOS", binaryName)] : []),
+        resolve(root, "bin", binaryName), resolve(root, "MacOS", binaryName), resolve(root, "Contents", "MacOS", binaryName), resolve(root, "program", binaryName),
         resolve(root, "libreoffice", "program", binaryName), resolve(root, "poppler", "Library", "bin", binaryName),
         resolve(root, "bin", "override", binaryName), resolve(root, "native", "poppler", "bin", binaryName)];
+      if (configured === override) candidates.push(resolve(root, "native", "poppler", "poppler", "bin", binaryName));
       const binary = await firstExecutable(candidates);
       if (!binary) continue;
       const canonical = await realpath(binary);

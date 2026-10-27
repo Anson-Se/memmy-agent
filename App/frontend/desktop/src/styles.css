@@ -2581,6 +2581,17 @@ body.memmy-thread-panel-fullscreen .sidebar-restore-button {
   border-left: 0;
 }
 
+/* At narrow widths the preview owns the conversation area. The chat topbar
+   otherwise paints above its tabs because the topbar has a higher z-index. */
+.app-frame-main:has(> .thread-panel--overlay[aria-hidden="false"])
+  > .app-frame-content-topbar.thread-topbar {
+  display: none;
+}
+
+.app-frame-main--sidebar-hidden > .thread-panel--overlay .thread-panel__header {
+  padding-left: var(--codex-sidebar-hidden-topbar-padding);
+}
+
 .thread-panel--fullscreen {
   position: fixed;
   inset: var(--app-frame-topbar-offset, 0px) 0 0 0;

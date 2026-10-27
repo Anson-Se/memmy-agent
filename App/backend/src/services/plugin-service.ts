@@ -426,13 +426,14 @@ export function createPluginService(options: CreatePluginServiceOptions): Plugin
     },
 
     async restoreActive() {
-      for (const plugin of options.repository.list().filter((candidate) => candidate.state === "active")) {
+      for (const plugin of options.repository.list().filter((candidate) => candidate.state === "active" || candidate.state === "enabling")) {
         try {
           if (!eligibility(plugin.manifest).canUse) { options.repository.setState(plugin.id, "disabled"); continue; }
           assertEntitled(plugin.manifest);
           if (!hasAllPermissions(plugin)) throw new Error("Plugin permissions have changed");
           validateConfig(plugin, plugin.config);
           await activateContributions(plugin, readSecrets(plugin, options.secretStore));
+          if (plugin.state === "enabling") options.repository.setState(plugin.id, "active");
         } catch (error) {
           options.repository.setState(plugin.id, "failed", errorMessage(error));
         }
