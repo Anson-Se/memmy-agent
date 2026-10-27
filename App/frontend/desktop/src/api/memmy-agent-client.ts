@@ -496,7 +496,7 @@ const ResolvedArtifactSchema = z.object({
   ok: z.literal(true),
   path: z.string(),
   name: z.string(),
-  kind: z.union([z.literal("image"), z.literal("video"), z.literal("file"), z.literal("directory")]),
+  kind: z.union([z.literal("image"), z.literal("video"), z.literal("audio"), z.literal("file"), z.literal("directory")]),
   media_url: z.string().optional(),
   relative_path: z.string().optional()
 });

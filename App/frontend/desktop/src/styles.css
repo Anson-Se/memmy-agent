@@ -803,6 +803,7 @@ body.memmy-window-fullscreen {
 
 .agent-composer-toolbar .composer-actions {
   margin-left: auto;
+  min-width: 0;
 }
 
 /* Composer bottom-right controls: one shared hit size / color / spacing. */
@@ -811,6 +812,15 @@ body.memmy-window-fullscreen {
   align-items: center;
   gap: 4px;
   overflow: visible;
+}
+
+/* The home row is anchored at the right; give its model label a finite area
+   so the fixed-size file, microphone and send buttons cannot push it out. */
+.home-empty-composer > .composer-actions {
+  left: 12px;
+  right: 16px;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .composer-action-btn {
@@ -1073,6 +1083,7 @@ body.memmy-window-fullscreen {
   position: relative;
   z-index: 50;
   display: flex;
+  flex: 0 1 auto;
   width: max-content;
   max-width: 180px;
   min-width: 0;
@@ -1082,14 +1093,17 @@ body.memmy-window-fullscreen {
 }
 
 .agent-model-selector__control.select-control--compact {
-  width: max-content;
-  max-width: 180px;
+  flex-shrink: 1;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   overflow: visible;
 }
 
 .agent-model-selector__button {
-  width: max-content;
-  max-width: 180px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   height: 32px !important;
   min-height: 32px !important;
   padding: 0 28px 0 8px !important;
@@ -1104,7 +1118,7 @@ body.memmy-window-fullscreen {
 
 .agent-model-selector__button .select-control__selection {
   gap: 6px;
-  overflow: visible;
+  overflow: hidden;
   align-items: center;
 }
 

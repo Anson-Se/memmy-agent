@@ -2381,6 +2381,15 @@
   container-type: inline-size;
 }
 
+.thread-panel__main > .workspace-artifact-preview-pane--embedded {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  flex: 1 1 auto;
+  height: 100%;
+  border-left: 0;
+}
+
 .recording-panel__toolbar {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -2408,6 +2417,22 @@
   justify-content: flex-end;
 }
 
+/* The shared task sidebar already provides its own tab row. Keep live
+   recording controls in one line and let the title shrink before buttons. */
+.workspace-artifact-preview-pane--embedded .recording-panel__toolbar {
+  gap: 6px;
+  padding-inline: 8px;
+}
+
+.workspace-artifact-preview-pane--embedded .recording-panel__controls {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.workspace-artifact-preview-pane--embedded .recording-panel__action {
+  padding-inline: 6px;
+}
+
 .recording-panel__controls > button {
   flex: none;
   width: auto;
@@ -2416,9 +2441,9 @@
 }
 
 @container recording-panel (max-width: 430px) {
-  .recording-panel__toolbar-actions { display: contents; }
-  .recording-panel__controls { grid-column: 1 / -1; grid-row: 2; }
-  .recording-panel__toolbar-end { grid-column: 3; grid-row: 1; }
+  .workspace-artifact-preview-pane--recording:not(.workspace-artifact-preview-pane--embedded) .recording-panel__toolbar-actions { display: contents; }
+  .workspace-artifact-preview-pane--recording:not(.workspace-artifact-preview-pane--embedded) .recording-panel__controls { grid-column: 1 / -1; grid-row: 2; }
+  .workspace-artifact-preview-pane--recording:not(.workspace-artifact-preview-pane--embedded) .recording-panel__toolbar-end { grid-column: 3; grid-row: 1; }
 }
 
 .diagnostic-guidance-card, .diagnostic-upload-card, .legal-question-card {
@@ -2541,9 +2566,11 @@
 
 .diagnostic-upload-card__transcription--failed { color: var(--color-status-error); }
 
-.diagnostic-upload-card__transcription button { padding: 2px 8px; border: 1px solid var(--color-border-stone); border-radius: 6px; background: var(--color-background-paper); color: var(--color-action-sky-hover); font-size: 12px; cursor: pointer; }
+.diagnostic-upload-card__transcription button { padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--color-action-sky-hover); font-size: 12px; cursor: pointer; }
 
-.diagnostic-upload-card__transcription button:hover { background: color-mix(in srgb, var(--color-action-sky) 8%, var(--color-background-paper)); }
+.diagnostic-upload-card__transcription button:hover { color: var(--color-action-sky); text-decoration: underline; }
+
+.diagnostic-upload-card__transcription button:focus-visible { outline: 2px solid var(--color-action-sky); outline-offset: 2px; }
 
 .diagnostic-upload-card__waiting { margin: 8px 0 0; font-size: 12px; color: var(--color-action-sky-hover); }
 
@@ -2863,7 +2890,12 @@
 .diagnostic-upload-card__body { max-height: min(34vh, 300px); overflow-y: auto; overscroll-behavior: contain; }
 .conversation-feature-cards { min-width: 0; }
 
-.conversation-feature-sidepanel { position:absolute; inset:var(--app-frame-topbar-offset, 0px) 0 0 auto; display:flex; max-width:100%; z-index:16; background:var(--color-background-paper); }
+.app-frame-main > .conversation-feature-sidepanel { position:absolute; inset:var(--app-frame-topbar-offset, 0px) 0 0 auto; display:flex; max-width:100%; z-index:16; background:var(--color-background-paper); }
+.app-frame-main > .conversation-feature-sidepanel--overlay { left:0; width:100% !important; max-width:none; z-index:80; }
+.conversation-feature-sidepanel--overlay .sidebar-resize-handle { display:none; }
+.conversation-feature-sidepanel--overlay .workspace-artifact-preview-pane { width:100% !important; min-width:0 !important; max-width:none !important; flex-basis:auto !important; }
+.app-frame-main:has(> .conversation-feature-sidepanel--overlay) > .app-frame-content-topbar.thread-topbar { display:none; }
+.app-frame-main--sidebar-hidden > .conversation-feature-sidepanel--overlay :is(.recording-panel__toolbar, .workspace-artifact-preview-toolbar) { padding-left:var(--codex-sidebar-hidden-topbar-padding); }
 .plugin-tool-activity { margin:2px 0 8px 22px; font-size:12.5px; line-height:1.45; color:color-mix(in srgb,var(--color-text-ink) 52%,transparent); }
 .plugin-tool-activity details { padding:6px 0; }
 .plugin-tool-activity dt { opacity:.65; }

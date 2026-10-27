@@ -79,7 +79,7 @@ import { AgentAttachmentCard, splitAgentAttachmentName } from "./agent-file-atta
 import { AgentGoalBar, type AgentGoalControlRequest } from "./agent-goal-bar.js";
 import { AgentQueuedMessageList, queuedComposerEditDecision } from "./agent-queued-message-list.js";
 import { AgentThreadMessages, ChatImageLightbox } from "./agent-thread-messages.js";
-import { AgentThreadPanel, useAgentThreadPanel } from "./agent-thread-panel.js";
+import { AgentThreadPanel, PLUGIN_RECORDING_TAB_ID, useAgentThreadPanel } from "./agent-thread-panel.js";
 import { hasPendingBrowserOpen, MEMMY_BROWSER_OPEN_EVENT } from "./browser-panel.js";
 import { threadTabForInAppPreview, threadTabForPath } from "./agent-thread-panel-model.js";
 import { THREAD_SEARCH_SCROLL_OFFSET } from "./agent-thread-search.js";
@@ -1072,6 +1072,14 @@ export function HomePage() {
     agentMessages: state.agent.messages,
     onDraft: (text) => setCurrentComposerDraft(text),
     onStageFiles: (files) => attachMediaFilesToScope(chatScopeKey, files),
+    onOpenArtifact: (artifact) => {
+      if (!artifact.path) return false;
+      const tab = threadTabForInAppPreview({ name: artifact.name, path: artifact.path });
+      if (!tab) return false;
+      setSidePanelMounted(true);
+      threadPanel.openTab(tab);
+      return true;
+    },
     onOpenRecording: () => {
       setSidePanelMounted(true);
       threadPanel.openTab({ id: "recording:main", type: "recording", name: t("recording.page.title") });
@@ -1084,9 +1092,24 @@ export function HomePage() {
       chatSelectionEpoch: state.agent.chatSelectionEpoch, getChatSelectionEpoch: () => chatSelectionEpochRef.current,
     }),
   });
+  const pluginRecordingTabScopeRef = useRef<string | null>(null);
+  const pluginRecordingOpen = Boolean(features.pluginRecordingSession);
+  useEffect(() => {
+    if (pluginRecordingOpen) {
+      if (pluginRecordingTabScopeRef.current !== chatScopeKey) {
+        pluginRecordingTabScopeRef.current = chatScopeKey;
+        setSidePanelMounted(true);
+        threadPanel.openTab({ id: PLUGIN_RECORDING_TAB_ID, type: "recording", name: t("recording.page.title") });
+      }
+      return;
+    }
+    if (pluginRecordingTabScopeRef.current === chatScopeKey) threadPanel.closeTab(PLUGIN_RECORDING_TAB_ID);
+    pluginRecordingTabScopeRef.current = null;
+  }, [pluginRecordingOpen, chatScopeKey, threadPanel.openTab, threadPanel.closeTab, t]);
   const [viewedRecordingId, setViewedRecordingId] = useState<string | null>(null);
   const currentRecording = features.recording.session.live;
-  const recordingTabActive = !features.sidePanel && recordingTabVisible;
+  const recordingTabActive = !features.sidePanel && recordingTabVisible
+    && threadPanel.tabState.activeId === "recording:main";
   useEffect(() => {
     const session = features.recording.session;
     if (recordingTabActive && session.view === "transcript" && currentRecording
@@ -2993,12 +3016,17 @@ export function HomePage() {
       sidePanel={features.sidePanel ?? (sidePanelMounted ? (
         <AgentThreadPanel
           recordingSession={features.recording.session}
+          pluginRecordingSession={features.pluginRecordingSession}
           recordingAuthenticated={features.recordingAuthenticated}
           recordingRevealRequestId={state.navigation.recordingRequestId}
           onRecordingVisibleChange={setRecordingTabVisible}
           onRecordingSignIn={features.signIn}
           onOpenRecording={features.openRecording}
           onCloseRecording={features.recording.close}
+          onClosePluginRecording={() => {
+            features.closePluginRecording();
+            threadPanel.closeTab(PLUGIN_RECORDING_TAB_ID);
+          }}
           controller={threadPanel}
           messages={state.agent.messages}
           workspaceRoot={activeTask?.cwd.trim() || workspaceEnvironment.data?.snapshot.cwd || null}

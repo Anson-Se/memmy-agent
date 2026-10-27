@@ -1,12 +1,12 @@
 import { buildPluginCapabilityLabels } from "./plugin-tool-activity.js";
-import { SHARED_ROW_PRIMARY_RESERVE } from "./sidebar-resize.js";
-import { InterviewRecordingPanel, type RecordingPanelSession } from "./interview-recording-panel.js";
+import { SHARED_ROW_MIN_PANE_WIDTH, SHARED_ROW_PRIMARY_RESERVE } from "./sidebar-resize.js";
+import type { RecordingPanelSession } from "./interview-recording-panel.js";
 import { buildAgentRoutedPluginPrompt, buildLegalDiagnosisContinuation, pressPinnedPluginCommand, pluginInteractionSignature, reconcileHiddenPluginCalls, PinnedPluginCommandBar, selectConversationPinnedCommands, selectPinnedCommandsForLegalWorkflow, selectOpenPinnedCapabilities } from "./plugin-conversation-controls.js";
 import "./conversation-features.css";
 import { cloneElement, useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type ComponentProps } from "react";
 import type { InstalledPlugin, PluginArtifactRef, PluginCommandContribution } from "@memmy/local-api-contracts";
 import { useApiClients } from "../app/providers.js";
-import { normalizePluginConversationId, useOptionalPluginUi, type PluginUiCall } from "../app/plugin-ui-context.js";
+import { normalizePluginConversationId, useOptionalPluginUi, type PluginRecordingMaterial, type PluginUiCall } from "../app/plugin-ui-context.js";
 import { useAppState } from "../state/app-state.js";
 import { appActions } from "../state/app-actions.js";
 import { useTranslation } from "../i18n/use-translation.js";
@@ -18,6 +18,19 @@ import { type SlashCommandPaletteItem } from "./agent-command-palette.js";
 import type { AgentChatMessage } from "../state/agent-chat-slice.js";
 
 const NO_CALLS: PluginUiCall[] = [];
+
+/** A handed-over interview already has one pending row keyed by its audio path. */
+export function recordingArchiveMaterials(entry: RecordingArchiveEntry): PluginRecordingMaterial[] {
+  if (!entry.files?.length || (entry.handedOver && entry.id.startsWith("plugin:"))) return [];
+  const transcripts = entry.files.filter((file) => file.kind === "file");
+  return (transcripts.length ? transcripts : entry.files).map((file) => ({ ...file, collected: entry.collected }));
+}
+
+/** A standalone artifact preview covers the chat when both columns cannot fit. */
+export function conversationFeaturePanelOverlays(width: number | null | undefined): boolean {
+  return width != null && width > 0 && width < SHARED_ROW_PRIMARY_RESERVE + SHARED_ROW_MIN_PANE_WIDTH;
+}
+
 function PersistentPluginRecorder(props: {
   owner: string; host: ReactElement<ComponentProps<typeof PluginCapabilityHost>> | null;
   onSession(owner: string, session: RecordingPanelSession | null): void;
@@ -34,6 +47,7 @@ export function useConversationFeatures(options: {
   sharedRowWidth?: number | null;
   onDraft(text: string): void;
   onStageFiles(files: File[]): Promise<unknown>;
+  onOpenArtifact?(artifact: PluginArtifactRef): boolean;
   onSend(text: string): Promise<boolean>;
   onOpenRecording(): void;
 }) {
@@ -107,10 +121,9 @@ export function useConversationFeatures(options: {
   }, [clients?.plugins, state.account.userId]);
 
   const archiveRecording = useCallback((entry: RecordingArchiveEntry) => {
-    if (!entry.sessionKey || !entry.files?.length) return;
-    const transcripts = entry.files.filter((file) => file.kind === "file");
-    ui?.addRecordingMaterials("legal-labor", entry.sessionKey,
-      (transcripts.length ? transcripts : entry.files).map((file) => ({ ...file, collected: entry.collected })));
+    const materials = recordingArchiveMaterials(entry);
+    if (!entry.sessionKey || !materials.length) return;
+    ui?.addRecordingMaterials("legal-labor", entry.sessionKey, materials);
   }, [ui?.addRecordingMaterials]);
   const recording = useRecordingEntry(clients?.asr,
     clients ? (files) => clients.memmyAgent.uploadAgentMedia(files) : undefined,
@@ -135,9 +148,14 @@ export function useConversationFeatures(options: {
 
   const capabilityLabels = useMemo(() => buildPluginCapabilityLabels(plugins), [plugins]);
   const targets = useMemo(() => plugins.filter((plugin) => plugin.state === "active" && plugin.eligibility?.canUse !== false)
-    .flatMap((plugin) => (plugin.manifest.commands ?? []).map((command) => ({ plugin,
-      command: plugin.id === "legal-labor" && command.command === "/legal-guide"
-        ? { ...command, capabilityId: "guide-open" } : command }))), [plugins]);
+    .flatMap((plugin) => (plugin.manifest.commands ?? [])
+      // Older installed packages still map this shortcut to session-start.
+      // Never invoke the independent guide until the Host lists that capability.
+      .filter((command) => !(plugin.id === "legal-labor" && command.command === "/legal-guide"
+        && !plugin.manifest.capabilities.some((capability) => capability.id === "guide-open")))
+      .map((command) => ({ plugin,
+        command: plugin.id === "legal-labor" && command.command === "/legal-guide"
+          ? { ...command, capabilityId: "guide-open" } : command }))), [plugins]);
   const commandItems: SlashCommandPaletteItem[] = targets.map(({ command }) => ({
     command: command.command, title: command.name, description: command.description ?? "",
     icon: command.icon ?? "activity", argHint: command.argHint ?? "", synthetic: true
@@ -216,7 +234,10 @@ export function useConversationFeatures(options: {
       }}
       onCallDismissed={(callId) => ui.setDismissedCallIds((current) => new Set(current).add(callId))}
       onRecordingArchived={(entry) => { recording.archive(entry); archiveRecording(entry); }}
-      onOpenArtifact={setPreview} onAddArtifact={(artifact) => void addArtifact(artifact)}
+      onOpenArtifact={(artifact) => {
+        if (options.onOpenArtifact?.(artifact)) { setPreview(null); return; }
+        setPreview(artifact);
+      }} onAddArtifact={(artifact) => void addArtifact(artifact)}
       onRequestDiagnosis={async (call) => {
         if (normalizePluginConversationId(call.conversationId) !== normalizePluginConversationId(conversationId)) return;
         if (!await latest.current.onSend(buildLegalDiagnosisContinuation(call))) throw new Error(t("home.media.error.sendFailed"));
@@ -251,17 +272,14 @@ export function useConversationFeatures(options: {
     recordingOpen={recording.compactOpen || Boolean(pluginRecording && !hiddenRecordings.has(recordingOwner))}
     active={selectOpenPinnedCapabilities(prepared, ui?.dismissedCallIds, pinnedCapabilities, ui?.hiddenCallIds)}
     onRecordingPress={toggleCompactRecording} onPress={({ plugin, command }) => void invoke(plugin, command)} />;
-  const recordingPanel = pluginRecording && !hiddenRecordings.has(recordingOwner)
-    ? <InterviewRecordingPanel session={pluginRecording} onWidthChange={setFeaturePanelWidth}
-      sharedRowWidth={options.sharedRowWidth} sharedRowReservedWidth={SHARED_ROW_PRIMARY_RESERVE}
-      onClose={() => setHiddenRecordings((current) => new Set(current).add(recordingOwner))} /> : null;
   const artifactPanel = preview && clients?.plugins ? <PluginArtifactPreviewPanel artifact={preview}
     readArtifact={clients.plugins.readArtifact} onWidthChange={setFeaturePanelWidth}
     sharedRowWidth={options.sharedRowWidth} sharedRowReservedWidth={SHARED_ROW_PRIMARY_RESERVE}
     onClose={() => setPreview(null)} /> : null;
-  const content = artifactPanel ?? recordingPanel;
-  const closeSidePanel = useCallback(() => {
-    setPreview(null);
+  const content = artifactPanel;
+  const sidePanelOverlay = Boolean(content) && conversationFeaturePanelOverlays(options.sharedRowWidth);
+  const closeSidePanel = useCallback(() => setPreview(null), []);
+  const closePluginRecording = useCallback(() => {
     setHiddenRecordings((current) => new Set(current).add(recordingOwner));
   }, [recordingOwner]);
   // Capture only the current turn's cards for this steering gesture. A later question
@@ -285,13 +303,15 @@ export function useConversationFeatures(options: {
       }
     };
   };
-  return { cards, recorders, shortcuts, recording, openRecording, closeSidePanel, capabilityLabels,
+  return { cards, recorders, shortcuts, recording, openRecording, closeSidePanel, closePluginRecording,
+    pluginRecordingSession: pluginRecording && !hiddenRecordings.has(recordingOwner) ? pluginRecording : null, capabilityLabels,
     processInteraction,
     capturePendingInputRelease,
     pendingKey: pending ? `${pending.call.callId}:${pluginInteractionSignature(pending.call)}` : null,
     waitingLabel: pending ? pluginInteractionWaitingLabel(pending, language === "en-US") : null,
-    sidePanel: content ? <div className="conversation-feature-sidepanel" style={{ width: featurePanelWidth }}>{content}</div> : null,
-    sidePanelWidth: content ? featurePanelWidth : null,
+    sidePanel: content ? <div className={`conversation-feature-sidepanel${sidePanelOverlay ? " conversation-feature-sidepanel--overlay" : ""}`}
+      style={{ width: sidePanelOverlay ? "100%" : featurePanelWidth }}>{content}</div> : null,
+    sidePanelWidth: content ? sidePanelOverlay ? 0 : featurePanelWidth : null,
     agentPrompt: (text: string) => buildAgentRoutedPluginPrompt(text, targets), recordingAuthenticated, runCommand, commandItems,
     waiting: Boolean(pending), pendingAgentTurnId: pending?.call.origin === "agent" ? pending.call.turnId : null,
     signIn: () => dispatch(appActions.navigate("/welcome")) };

@@ -346,12 +346,13 @@ it("attaches a staged recording's transcript to the recording the plugin already
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
   let ui!: ReturnType<typeof usePluginUi>;
   const respond = vi.fn(async () => undefined);
+  const open = vi.fn();
   const audio = { kind: "audio" as const, path: "/media/handed.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio" };
   const transcriptFile = { kind: "file" as const, path: "/media/handed.txt", name: "访谈转写-2026-10-15T00-00-00-000Z.txt", mime: "text/plain" as const, bytes: 20, url: "/text" };
   const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "collected-upload", conversationId: "chat-collected", origin: "agent",
     events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
   function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[plugin]} region="pinned"
-    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} />; }
+    client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} onOpenArtifact={open} />; }
   try {
     await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
     await act(async () => {
@@ -359,8 +360,14 @@ it("attaches a staged recording's transcript to the recording the plugin already
       ui.addRecordingMaterials(plugin.id, "chat-collected", [{
         kind: "file", path: audio.path, url: audio.url, name: transcriptFile.name, mime: "text/plain", bytes: 0,
         collected: true, pending: true, pendingAudio: audio
-      }]);
+      }, { ...transcriptFile, collected: true }]);
     });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const row = container.querySelector(".diagnostic-upload-card__file")!;
+    expect(container.querySelectorAll(".diagnostic-upload-card__file")).toHaveLength(1);
+    expect(row.textContent).toContain("20 B");
+    await act(async () => row.querySelector<HTMLButtonElement>(".diagnostic-upload-card__file-info button")!.click());
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ path: transcriptFile.path, name: transcriptFile.name }));
     await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
     expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", {
       files: [],
@@ -370,14 +377,19 @@ it("attaches a staged recording's transcript to the recording the plugin already
   } finally { await act(async () => root.unmount()); container.remove(); }
 });
 
-it("asks the user once a staged recording's automatic retries are spent, and can go on without it", async () => {
+it("keeps a lightweight retry action after automatic transcription retries are spent", async () => {
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
   let ui!: ReturnType<typeof usePluginUi>;
   const respond = vi.fn(async () => undefined);
   const audio = { kind: "audio" as const, path: "/media/broken.webm", name: "访谈录音.webm", mime: "audio/webm" as const, bytes: 10, url: "/audio" };
+  const transcriptFile = { kind: "file" as const, path: "/media/recovered.txt", name: "访谈转写.txt", mime: "text/plain" as const, bytes: 20, url: "/text" };
   const call: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "failed-upload", conversationId: "chat-failed", origin: "agent",
     events: [{ type: "interaction", request: { type: "file-input", interactionId: "files", payload: { title: "补充诊断材料", multiple: true } } }] };
-  const attempt = vi.fn(async () => { throw new Error("ASR down"); });
+  let attempts = 0;
+  const attempt = vi.fn(async () => {
+    if (++attempts <= 3) throw new Error("ASR down");
+    return { text: "现场访谈内容", segments: [], transcribedAt: "2026-10-27T00:00:00Z", transcriptFile };
+  });
   function Page() { ui=usePluginUi(); return <PluginCapabilityHost calls={[call]} plugins={[plugin]} region="pinned"
     client={{ respond, cancel: vi.fn(), getUi: vi.fn() }} uploadFiles={vi.fn()} />; }
   try {
@@ -391,12 +403,15 @@ it("asks the user once a staged recording's automatic retries are spent, and can
     expect(container.textContent).toContain("转写失败（已自动重试 3 次）");
     await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-upload-card__footer button")!.click());
     expect(respond).not.toHaveBeenCalled();
-    // The choice stays live while the submission waits on it.
-    const skip = [...container.querySelectorAll<HTMLButtonElement>(".diagnostic-upload-card__transcription button")].find((button) => button.textContent === "不等了，直接继续")!;
-    expect(skip.disabled).toBe(false);
-    await act(async () => skip.click());
-    // The plugin already holds a collected recording; with no text, nothing more is sent for it.
-    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", { files: [] });
+    const actions = [...container.querySelectorAll<HTMLButtonElement>(".diagnostic-upload-card__transcription button")];
+    expect(actions.map((button) => button.textContent)).toEqual(["重试转写"]);
+    expect(actions[0]?.disabled).toBe(false);
+    await act(async () => actions[0]!.click());
+    expect(attempt).toHaveBeenCalledTimes(4);
+    expect(respond).toHaveBeenCalledWith(plugin.id, call.callId, "files", {
+      files: [], transcripts: { [audio.path]: { text: "现场访谈内容", segments: [] } },
+      recordingDeliverables: [transcriptFile]
+    });
   } finally { await act(async () => root.unmount()); container.remove(); }
 });
 

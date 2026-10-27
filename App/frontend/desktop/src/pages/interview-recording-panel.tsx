@@ -41,14 +41,11 @@ export interface RecordingPanelSession {
 }
 
 export interface InterviewRecordingPanelProps {
+  /** Render inside the shared file-preview task panel instead of owning a second sidebar. */
+  embedded?: boolean;
   /** Keeps the recorder mounted while the whole panel is out of view. */
   hidden?: boolean;
-  /**
-   * The live recording, once one has started.
-   *
-   * Absent while the recorder is only open and idle: the pane still has the
-   * compact recorder in it, there is just nothing transcribed yet.
-   */
+  /** The live recording, including its idle state before the microphone starts. */
   session: RecordingPanelSession | null;
   /** The compact recorder, shown above the transcript it is feeding. */
   bar?: ReactNode;
@@ -90,13 +87,13 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
   useEffect(() => {
     // The hidden recorder outlives its interview; only the visible pane owns
     // the width used to place the conversation controls beside the divider.
-    if (props.hidden) return;
+    if (props.hidden || props.embedded) return;
     props.onWidthChange?.(resize.appliedWidth);
-  }, [resize.appliedWidth, props.onWidthChange, props.hidden]);
+  }, [resize.appliedWidth, props.onWidthChange, props.hidden, props.embedded]);
 
   return (
     <>
-      {!props.hidden && <SidebarResizeHandle
+      {!props.hidden && !props.embedded && <SidebarResizeHandle
         label={t("workspaceArtifact.resize")}
         width={resize.appliedWidth}
         minWidth={resize.appliedMinWidth}
@@ -106,9 +103,11 @@ export function InterviewRecordingPanel(props: InterviewRecordingPanelProps): Re
         onResizeBy={resize.resizeBy}
       />}
       <aside
-        className="workspace-artifact-preview-pane workspace-artifact-preview-pane--lifted workspace-artifact-preview-pane--recording"
+        className={`workspace-artifact-preview-pane workspace-artifact-preview-pane--lifted workspace-artifact-preview-pane--recording${props.embedded ? " workspace-artifact-preview-pane--embedded" : ""}`}
         hidden={props.hidden}
-        style={{ ...resize.sidebarStyle, ...(props.hidden ? { display: "none" } : {}) }}
+        style={props.embedded ? { width: "100%", minWidth: 0, maxWidth: "none", flexBasis: "auto",
+          ...(props.hidden ? { display: "none" } : {}) }
+          : { ...resize.sidebarStyle, ...(props.hidden ? { display: "none" } : {}) }}
         aria-label={heading}
       >
       <header className="recording-panel__toolbar">
