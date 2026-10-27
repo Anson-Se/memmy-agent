@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { OutputDelivery } from "./tools/output-location.js";
 import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
 import { AgentHook, AgentHookContext } from "./hook.js";
@@ -270,6 +271,7 @@ export class SubagentManager {
     modelProvider?: string | null;
     actualModelContext?: ActualModelContext | null;
     computerUseAuthorization?: SubagentComputerUseAuthorization | null;
+    outputLocation?: OutputDelivery;
   }, label: string | null = null, originChannel = "cli", originChatId = "direct", sessionKey: string | null = null, originMessageId: string | null = null, temperature: number | null = null): Promise<string> {
     const args = typeof input === "string" ? { task: input, label, originChannel, originChatId, sessionKey, originMessageId, temperature } : input;
     const task = String(args.task ?? "");
@@ -327,7 +329,7 @@ export class SubagentManager {
       status,
       args.originMessageId ?? originMessageId,
       args.temperature ?? temperature,
-      { signal: controller.signal },
+      { signal: controller.signal, outputLocation: args.outputLocation?.forChild() },
     )
       .finally(() => {
         settled = true;
@@ -355,6 +357,8 @@ export class SubagentManager {
     running.cancelled = () => cancelled || controller.signal.aborted;
     running.signal = controller.signal;
     this.runningTasks.set(taskId, running);
+    // The parent may not confirm delivery while a child can still write its files.
+    args.outputLocation?.track(() => !settled);
     if (origin.sessionKey) {
       const ids = this.sessionTasks.get(origin.sessionKey) ?? new Set<string>();
       ids.add(taskId);
@@ -371,7 +375,7 @@ export class SubagentManager {
     status: SubagentStatus,
     originMessageId: string | null = null,
     temperature: number | null = null,
-    { signal = null }: { signal?: AbortSignal | null } = {},
+    { signal = null, outputLocation }: { signal?: AbortSignal | null; outputLocation?: OutputDelivery } = {},
   ): Promise<void> {
     let finalStatus = "error";
     let resultText: string | null = null;
@@ -434,6 +438,7 @@ export class SubagentManager {
         },
         sessionKey: origin.sessionKey ?? null,
         workspace,
+        outputLocation,
         llmTimeoutS: this.llmWallTimeoutForSession?.(sessKey) ?? null,
         abortSignal: signal,
         turnId,
