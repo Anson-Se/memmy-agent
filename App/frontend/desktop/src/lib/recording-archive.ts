@@ -44,6 +44,17 @@ export function saveRecordingArchiveEntry(scope: string, entry: RecordingArchive
   for (const notify of listeners.get(scope) ?? []) notify();
 }
 
+export function removeRecordingArchiveEntry(scope: string, id: string): void {
+  const next = readRecordingArchive(scope).filter((row) => row.id !== id);
+  snapshots.set(scope, next);
+  try {
+    window.localStorage.setItem(key(scope), JSON.stringify(next.map(({ audioUrl: _url, files, ...row }) => ({ ...row,
+      ...(files ? { files: files.map((file) => ({ ...file, url: "" })) } : {})
+    }))));
+  } catch { /* The in-memory list still reflects the user's deletion. */ }
+  for (const notify of listeners.get(scope) ?? []) notify();
+}
+
 export function useRecordingArchive(scope?: string): RecordingArchiveEntry[] {
   return useSyncExternalStore(
     (notify) => {

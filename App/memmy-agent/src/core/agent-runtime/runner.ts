@@ -13,6 +13,7 @@ import {
 } from "../../providers/model-input-capabilities.js";
 import type { ActualModelContext } from "@memmy/local-api-contracts";
 import { CONTEXT_SAFETY_BUFFER_TOKENS } from "../../token-budget.js";
+import { MessageTool } from "./tools/message.js";
 import { ToolRegistry } from "./tools/registry.js";
 import type { FileMutationOutcome, ToolExecutionContext } from "./tools/base.js";
 import { withToolExecutionRequestContext } from "./tools/context.js";
@@ -1214,6 +1215,8 @@ export class AgentRunner {
         );
       }
       const result = this.normalizeToolResult(spec, call.id, call.name, raw);
+      const messageTool = spec.tools?.get?.("message");
+      if (messageTool instanceof MessageTool) messageTool.observePluginToolResult(call.name, raw);
       if (stopTurn) event.status = "error";
       await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
       return { call, result, event, error, ...(stopTurn ? { stopTurn } : {}) };

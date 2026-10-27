@@ -6,7 +6,7 @@ import { InstalledPluginSchema } from "@memmy/local-api-contracts";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginCapabilityHost } from "../plugin-capability-host.js";
 import { RecordingEntryPage, useRecordingEntry, type RecordingEntryController } from "../recording-entry.js";
-import { readRecordingArchive } from "../../lib/recording-archive.js";
+import { readRecordingArchive, saveRecordingArchiveEntry } from "../../lib/recording-archive.js";
 import { PluginUiProvider, usePluginUi, type PluginUiCall } from "../../app/plugin-ui-context.js";
 import type { RecordingPanelSession } from "../interview-recording-panel.js";
 
@@ -15,6 +15,48 @@ const mock = vi.hoisted(() => ({ status: "idle", isRecording: false, isStarting:
 vi.mock("../asr-recorder.js", async (original) => ({ ...await original<typeof import("../asr-recorder.js")>(), useAsrRecorder: () => mock }));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
+
+it("deletes local recording files only after confirmation and retains the row on failure", async () => {
+  const scope = `recording-delete-${crypto.randomUUID()}`;
+  const audioPath = "/workspace/recordings/interview.webm";
+  const transcriptPath = "/workspace/recordings/interview.txt";
+  saveRecordingArchiveEntry(scope, {
+    id: "recording-1", title: "现场访谈", recordedAt: "2026-10-26T11:00:00Z",
+    durationMs: 4_000, speakerCount: 1, audioUrl: null, audioPath,
+    transcript: { text: "记录", segments: [] },
+    files: [
+      { path: audioPath, name: "interview.webm", kind: "audio", mime: "audio/webm", bytes: 10, url: "" },
+      { path: transcriptPath, name: "interview.txt", kind: "file", mime: "text/plain", bytes: 6, url: "" }
+    ]
+  });
+  const deleteFiles = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(undefined);
+  const container = document.createElement("div"); document.body.append(container);
+  const root = createRoot(container);
+  let controller!: RecordingEntryController;
+  function Page() {
+    controller = useRecordingEntry({} as never, undefined, undefined, {
+      scope, resolveAudio: async () => null, deleteFiles
+    });
+    return <RecordingEntryPage session={controller.session} />;
+  }
+  try {
+    await act(async () => root.render(<I18nProvider language="zh-CN"><Page /></I18nProvider>));
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__more-trigger")!.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent?.includes("删除"))!.click());
+    expect(deleteFiles).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__delete-confirm-action")!.click());
+    expect(readRecordingArchive(scope)).toHaveLength(1);
+    expect(container.textContent).toContain("offline");
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__delete-confirm-action")!.click());
+    expect(deleteFiles).toHaveBeenLastCalledWith([audioPath, transcriptPath]);
+    expect(readRecordingArchive(scope)).toHaveLength(0);
+    expect(container.querySelectorAll(".recording-page__list-row")).toHaveLength(0);
+  } finally {
+    await act(async () => root.unmount()); container.remove();
+    window.localStorage.removeItem(`memmy.recordingArchive.v1:${scope}`);
+  }
+});
 
 it("archives a guidance recording before its card disappears, reopens it from the list and retains it across route remounts", async () => {
   const storage=new Map<string,string>();

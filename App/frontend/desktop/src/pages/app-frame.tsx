@@ -1,3 +1,4 @@
+import "./recording-sidebar-migration.css";
 import { BookOpen } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -68,7 +69,7 @@ import {
 } from "./memory/memory-prototype-icons.js";
 import { AppContentTopbar } from "./app-content-topbar.js";
 import { SETTINGS_BROWSER_EXTENSION_EVENT, SETTINGS_EXCEL_CONNECTION_EVENT, SETTINGS_NAV_ITEMS, writeSettingsMemoryBudgetFocus, type SettingsTabId } from "./settings-nav.js";
-import { ArrowDown, Check, CheckCheck, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, FolderPlus, ListFilter, MoreHorizontal, MousePointer2, Plus, RotateCcw } from "lucide-react";
+import { ArrowDown, AudioLines, Check, CheckCheck, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Folder, FolderOpen, FolderPlus, ListFilter, Mic, MoreHorizontal, MousePointer2, Pause, Plus, RotateCcw, Square } from "lucide-react";
 
 export interface SettingsSidebarNav {
   activeTab: SettingsTabId;
@@ -87,6 +88,7 @@ export interface AppFrameProps {
   /** Full-height panel docked to the right edge of the main area, stacked above the top bar. */
   sidePanel?: ReactNode;
   windowsTitlebarSafe?: boolean;
+  recordingActive?: boolean;
   /** When set, replaces the main app sidebar with settings section navigation. */
   settingsNav?: SettingsSidebarNav;
   children: ReactNode;
@@ -95,7 +97,7 @@ export interface AppFrameProps {
 interface NavItem {
   path?: AppRoutePath;
   icon: ReactNode;
-  action?: "search";
+  action?: "search" | "record";
   labelKey?: string;
 }
 
@@ -206,6 +208,7 @@ interface SidebarUpdateActionView {
 const navItems: NavItem[] = [
   { path: "/main", icon: <MessageSquarePlus size={16} /> },
   { action: "search", icon: <Search size={16} />, labelKey: "appFrame.search" },
+  { action: "record", icon: <Mic size={16} />, labelKey: "recording.page.title" },
   { path: "/tools", icon: <Link2 size={16} /> },
   { path: "/memory", icon: <BrainCircuit size={16} /> },
   { path: "/knowledge", icon: <BookOpen size={16} /> }
@@ -1175,8 +1178,8 @@ export function AppFrame(props: AppFrameProps) {
         <nav className="space-y-0.5">
           {navItems.map((item) => {
             const key = item.path ?? item.action ?? "unknown";
-            const active = item.path
-              ? state.navigation.currentPath === item.path && (item.path !== "/main" || !state.agent.currentSessionKey)
+            const active = item.action === "record" ? props.recordingActive === true : item.path
+              ? state.navigation.currentPath === item.path && (item.path !== "/main" || (!state.agent.currentSessionKey && !props.recordingActive))
               : false;
 
             const label = item.path
@@ -1187,6 +1190,8 @@ export function AppFrame(props: AppFrameProps) {
               handleFirstSidebarInteraction();
               if (item.action === "search") {
                 setSearchPaletteOpen(true);
+              } else if (item.action === "record") {
+                dispatch(appActions.requestRecordingOpen());
               } else if (item.path) {
                 openSidebarRoute(item.path);
               }
@@ -1208,11 +1213,27 @@ export function AppFrame(props: AppFrameProps) {
               </button>
             );
 
-            return (
-              <div key={key}>
+            if (item.action === "record") {
+              const status = state.navigation.recordingStatus;
+              return <div key={key} className="app-frame-recording-nav">
                 {navButton}
-              </div>
-            );
+                {status === "transcribing" ? <span className="app-frame-recording-nav__status" role="status">{t("plugin.ui.audio.transcribing")}</span> : null}
+                {status === "ready" || status === "failed" ? <button type="button" className="app-frame-recording-nav__control"
+                  onClick={() => dispatch(appActions.requestRecordingOpen())}>{t("recording.page.view")}</button> : null}
+                {status !== "transcribing" && status !== "ready" && status !== "failed" ? <span className="app-frame-recording-nav__controls">
+                  {status === "recording" ? <span className="app-frame-recording-nav__signal" role="status" aria-label={t("plugin.ui.audio.recording")}><AudioLines size={16} aria-hidden="true" /></span> : null}
+                  <Tooltip content={status === "recording" ? t("plugin.ui.audio.pause") : status === "paused" ? t("plugin.ui.audio.resume") : t("plugin.ui.audio.start")}><button type="button" className="app-frame-recording-nav__control"
+                    disabled={status === "starting"} onClick={() => dispatch(appActions.requestRecordingControl())}>
+                    {status === "recording" ? <Pause size={15} aria-hidden="true" /> : <AudioLines size={16} aria-hidden="true" />}
+                  </button></Tooltip>
+                  {status === "recording" || status === "paused" ? <Tooltip content={t("plugin.ui.audio.stop")}><button type="button"
+                    className="app-frame-recording-nav__control" onClick={() => dispatch(appActions.requestRecordingFinish())}>
+                    <Square size={13} aria-hidden="true" />
+                  </button></Tooltip> : null}
+                </span> : null}
+              </div>;
+            }
+            return <div key={key}>{navButton}</div>;
           })}
         </nav>
         )}

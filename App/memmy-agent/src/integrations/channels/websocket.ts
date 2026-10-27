@@ -2466,6 +2466,19 @@ export class WebSocketChannel extends BaseChannel {
     });
   }
 
+  /** Renew playback access to a saved recording without relying on its original chat. */
+  handleWebuiRecordingResolve(request: HttpRequestLike): HttpLikeResponse {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
+    let rawPath: unknown;
+    try { rawPath = JSON.parse(requestBodyText(request)).path; }
+    catch { return httpError(400, "missing path"); }
+    if (typeof rawPath !== "string" || !rawPath.trim()) return httpError(400, "missing path");
+    const resolved = this.resolveWorkspaceRecordingPath(rawPath);
+    if (!resolved?.mediaUrl) return httpError(404, "recording not found");
+    return httpJsonResponse({ media_url: resolved.mediaUrl });
+  }
+
   handleArtifactReveal(request: HttpRequestLike): HttpLikeResponse {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
     if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
@@ -2580,6 +2593,39 @@ export class WebSocketChannel extends BaseChannel {
       attachments: saved,
       images: saved.filter((item) => item.kind === "image"),
     });
+  }
+
+  /** Remove only regular files inside the default workspace's recordings folder. */
+  handleWebuiRecordingDelete(request: HttpRequestLike): HttpLikeResponse {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
+    let input: unknown;
+    try { input = JSON.parse(requestBodyText(request)); }
+    catch { return httpError(400, "invalid JSON body"); }
+    const paths = input && typeof input === "object" && !Array.isArray(input)
+      ? (input as { paths?: unknown }).paths : null;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.length > 8
+      || paths.some((item) => typeof item !== "string" || !path.isAbsolute(item))) {
+      return httpError(400, "invalid recording paths");
+    }
+    const root = realpathIfExists(path.join(this.workspacePath, WEBUI_RECORDINGS_DIR));
+    const targets = new Set<string>();
+    for (const requested of paths as string[]) {
+      const candidate = path.resolve(requested);
+      if (candidate === root || !isPathInside(candidate, root)) return httpError(403, "path is outside recordings");
+      try {
+        const stat = fs.lstatSync(candidate);
+        if (stat.isSymbolicLink() || !stat.isFile()) return httpError(403, "invalid recording file");
+        const real = fs.realpathSync(candidate);
+        if (!isPathInside(real, root)) return httpError(403, "path is outside recordings");
+        targets.add(real);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return httpError(500, "could not inspect recording file");
+      }
+    }
+    try { for (const target of targets) fs.unlinkSync(target); }
+    catch { return httpError(500, "could not delete recording file"); }
+    return httpJsonResponse({ ok: true, deleted: targets.size });
   }
 
   private discardInflightForProject(projectId: string): void {
@@ -3222,9 +3268,11 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/webui/sidebar-state/update") return this.handleWebuiSidebarStateUpdate(request);
     if (got === "/api/webui/seed-chat") return this.handleWebuiSeedChat(request);
     if (got === "/api/webui/artifacts/resolve") return this.handleArtifactResolve(request);
+    if (got === "/api/webui/recordings/resolve") return this.handleWebuiRecordingResolve(request);
     if (got === "/api/webui/artifacts/reveal") return this.handleArtifactReveal(request);
     if (got === "/api/webui/artifacts/open") return this.handleArtifactOpen(request);
     if (got === "/api/webui/media/upload") return this.handleWebuiMediaUpload(request);
+    if (got === "/api/webui/recordings/delete") return this.handleWebuiRecordingDelete(request);
     if (got === "/api/settings/update") return this.handleSettingsUpdate(request);
     if (got === "/api/settings/model-configurations/create") return this.handleSettingsModelConfigurationCreate(request);
     if (got === "/api/settings/provider/update") return this.handleSettingsProviderUpdate(request);
