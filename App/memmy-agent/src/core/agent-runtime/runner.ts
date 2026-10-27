@@ -1,3 +1,4 @@
+import { executeManagedTool, emitManagedToolEvent, managedExecutionRequired, ManagedExecutionError } from "./managed-execution.js";
 import { requestTiming } from "../../utils/request-timing.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
@@ -1060,6 +1061,8 @@ export class AgentRunner {
         }
       }
     }
+    for (const item of out) emitManagedToolEvent({ type: "tool_result", callId: item.call.id, name: item.call.name,
+      output: item.result, ok: item.event.status !== "error", ...(item.event.executionError ? { error: item.event.executionError } : {}) });
     return out;
   }
 
@@ -1073,6 +1076,17 @@ export class AgentRunner {
     if (spec.abortSignal?.aborted) {
       const event = { name: call.name, status: "error", detail: "task cancelled" };
       return { call, result: "Error: task cancelled", event, error: spec.failOnToolError ? createAbortError() : null };
+    }
+    if (managedExecutionRequired()) {
+      try {
+        const authorized = await executeManagedTool(call.name, call.arguments, spec.abortSignal, call.id);
+        return { call, result: authorized.result, event: { name: call.name, status: "ok" } };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Managed runtime execution failed";
+        return { call, result: `Error: ${message}`, event: { name: call.name, status: "error", detail: message,
+          ...(error instanceof ManagedExecutionError ? { executionError: error.detail } : {}) },
+          error: spec.failOnToolError ? error : null };
+      }
     }
     const repeatedLookup = repeatedExternalLookupError(call.name, call.arguments, externalLookupCounts);
     if (repeatedLookup) {
