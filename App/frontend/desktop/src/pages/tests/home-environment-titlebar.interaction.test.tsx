@@ -8,6 +8,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntimeBridge } from "../../app/agent-runtime-bridge.js";
 import { AppProviders } from "../../app/providers.js";
+import { PRODUCT_TOUR_CHAT_CONTENT_ANCHOR } from "../../app/product-tour-layout.js";
 import { UpdateCoordinatorProvider } from "../../app/update-coordinator.js";
 import { agentActions } from "../../state/app-actions.js";
 import { useAppState } from "../../state/app-state.js";
@@ -303,6 +304,20 @@ describe("Windows chrome spacing and the HomePage thread side panel", () => {
     }
 
     const assertMenuSpacing = (sidebarHidden: boolean) => {
+      if (page === "tools") {
+        // The tabbed tools/plugin page is full bleed. Its AppFrame body, rather
+        // than an extra page inset, reserves the shared toolbar's full height.
+        expect(readTopPadding(pageContent)).toBe(0);
+        expect(pageContent.querySelector('[role="tablist"]')).not.toBeNull();
+        // happy-dom drops CSS-variable calc() assignments from inline styles.
+        // The SSR geometry contract verifies that actual formula separately.
+        expect(pageContent.parentElement!.getAttribute("data-tour-anchor"))
+          .toBe(PRODUCT_TOUR_CHAT_CONTENT_ANCHOR);
+        expect(window.getComputedStyle(toolbar).minHeight).toBe("46px");
+        expect(pageContent.parentElement!.classList.contains("flex-1")).toBe(true);
+        expect(window.getComputedStyle(pageContent).maxWidth || "none").toBe("none");
+        return;
+      }
       const expected = platform === "win32"
         ? paused ? 56 : 24
         : page === "settings" ? 56 : sidebarHidden ? 46 : 24;
@@ -313,6 +328,10 @@ describe("Windows chrome spacing and the HomePage thread side panel", () => {
         expect(readTopPadding(pageContent)).toBeGreaterThan(parseFloat(window.getComputedStyle(toolbar).minHeight));
       }
     };
+    const initialSidebar = container.querySelector(page === "computer-history" ? ".memory-page-sidebar" : ".app-frame-sidebar")!;
+    if (initialSidebar.getAttribute("aria-hidden") === "true") {
+      act(() => container.querySelector<HTMLButtonElement>(platform === "win32" ? ".windows-titlebar__sidebar" : ".sidebar-restore-button")!.click());
+    }
     assertMenuSpacing(false);
     act(() => container.querySelector<HTMLButtonElement>(".sidebar-toolbar-button")!.click());
     const sidebar = container.querySelector(page === "computer-history" ? ".memory-page-sidebar" : ".app-frame-sidebar")!;

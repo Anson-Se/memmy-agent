@@ -249,6 +249,36 @@ type SessionDeletionServices = {
 };
 export type WebuiLanguage = "zh-CN" | "en-US";
 
+export type WebuiMessageDigestInput = {
+  chatId: string;
+  content: string;
+  mediaPaths: string[];
+  language: WebuiLanguage | null;
+  target: WebuiSessionTarget | null;
+  modelPreset: string | null | undefined;
+  queueSurface: "chat_composer" | null;
+  turnAdmission: "queue" | "steer";
+  expectedTurnId: string | null;
+  thinkingEnabled?: boolean;
+  thinkingLevel?: string | null;
+};
+
+export function computeWebuiMessageDigest(input: WebuiMessageDigestInput): string {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    chat_id: input.chatId,
+    content: input.content,
+    media_paths: input.mediaPaths,
+    language: input.language,
+    target: input.target,
+    model_preset: input.modelPreset,
+    queue_surface: input.queueSurface,
+    turn_admission: input.turnAdmission,
+    expected_turn_id: input.expectedTurnId,
+    thinking_enabled: input.thinkingEnabled ?? null,
+    thinking_level: input.thinkingLevel ?? null,
+  })).digest("hex");
+}
+
 const CHAT_ID_RE = /^[A-Za-z0-9_:-]{1,64}$/;
 const API_KEY_RE = /^[A-Za-z0-9_:.-]{1,128}$/;
 const WEBUI_LANGUAGE_VALUES = new Set<WebuiLanguage>(["zh-CN", "en-US"]);
@@ -1038,38 +1068,8 @@ export class WebSocketChannel extends BaseChannel {
     return null;
   }
 
-  private webuiMessageDigest({
-    chatId,
-    content,
-    mediaPaths,
-    language,
-    target,
-    modelPreset,
-    queueSurface,
-    turnAdmission,
-    expectedTurnId,
-  }: {
-    chatId: string;
-    content: string;
-    mediaPaths: string[];
-    language: WebuiLanguage | null;
-    target: WebuiSessionTarget | null;
-    modelPreset: string | null | undefined;
-    queueSurface: "chat_composer" | null;
-    turnAdmission: "queue" | "steer";
-    expectedTurnId: string | null;
-  }): string {
-    return crypto.createHash("sha256").update(JSON.stringify({
-      chat_id: chatId,
-      content,
-      media_paths: mediaPaths,
-      language,
-      target,
-      model_preset: modelPreset,
-      queue_surface: queueSurface,
-      turn_admission: turnAdmission,
-      expected_turn_id: expectedTurnId,
-    })).digest("hex");
+  private webuiMessageDigest(input: WebuiMessageDigestInput): string {
+    return computeWebuiMessageDigest(input);
   }
 
   private resolveMessageModel(
@@ -2466,6 +2466,19 @@ export class WebSocketChannel extends BaseChannel {
     });
   }
 
+  /** Renew playback access to a saved recording without relying on its original chat. */
+  handleWebuiRecordingResolve(request: HttpRequestLike): HttpLikeResponse {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
+    let rawPath: unknown;
+    try { rawPath = JSON.parse(requestBodyText(request)).path; }
+    catch { return httpError(400, "missing path"); }
+    if (typeof rawPath !== "string" || !rawPath.trim()) return httpError(400, "missing path");
+    const resolved = this.resolveWorkspaceRecordingPath(rawPath);
+    if (!resolved?.mediaUrl) return httpError(404, "recording not found");
+    return httpJsonResponse({ media_url: resolved.mediaUrl });
+  }
+
   handleArtifactReveal(request: HttpRequestLike): HttpLikeResponse {
     if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
     if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
@@ -2580,6 +2593,39 @@ export class WebSocketChannel extends BaseChannel {
       attachments: saved,
       images: saved.filter((item) => item.kind === "image"),
     });
+  }
+
+  /** Remove only regular files inside the default workspace's recordings folder. */
+  handleWebuiRecordingDelete(request: HttpRequestLike): HttpLikeResponse {
+    if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+    if ((request.method ?? "GET").toUpperCase() !== "POST") return httpError(405, "method not allowed");
+    let input: unknown;
+    try { input = JSON.parse(requestBodyText(request)); }
+    catch { return httpError(400, "invalid JSON body"); }
+    const paths = input && typeof input === "object" && !Array.isArray(input)
+      ? (input as { paths?: unknown }).paths : null;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.length > 8
+      || paths.some((item) => typeof item !== "string" || !path.isAbsolute(item))) {
+      return httpError(400, "invalid recording paths");
+    }
+    const root = realpathIfExists(path.join(this.workspacePath, WEBUI_RECORDINGS_DIR));
+    const targets = new Set<string>();
+    for (const requested of paths as string[]) {
+      const candidate = path.resolve(requested);
+      if (candidate === root || !isPathInside(candidate, root)) return httpError(403, "path is outside recordings");
+      try {
+        const stat = fs.lstatSync(candidate);
+        if (stat.isSymbolicLink() || !stat.isFile()) return httpError(403, "invalid recording file");
+        const real = fs.realpathSync(candidate);
+        if (!isPathInside(real, root)) return httpError(403, "path is outside recordings");
+        targets.add(real);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return httpError(500, "could not inspect recording file");
+      }
+    }
+    try { for (const target of targets) fs.unlinkSync(target); }
+    catch { return httpError(500, "could not delete recording file"); }
+    return httpJsonResponse({ ok: true, deleted: targets.size });
   }
 
   private discardInflightForProject(projectId: string): void {
@@ -3222,9 +3268,11 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/webui/sidebar-state/update") return this.handleWebuiSidebarStateUpdate(request);
     if (got === "/api/webui/seed-chat") return this.handleWebuiSeedChat(request);
     if (got === "/api/webui/artifacts/resolve") return this.handleArtifactResolve(request);
+    if (got === "/api/webui/recordings/resolve") return this.handleWebuiRecordingResolve(request);
     if (got === "/api/webui/artifacts/reveal") return this.handleArtifactReveal(request);
     if (got === "/api/webui/artifacts/open") return this.handleArtifactOpen(request);
     if (got === "/api/webui/media/upload") return this.handleWebuiMediaUpload(request);
+    if (got === "/api/webui/recordings/delete") return this.handleWebuiRecordingDelete(request);
     if (got === "/api/settings/update") return this.handleSettingsUpdate(request);
     if (got === "/api/settings/model-configurations/create") return this.handleSettingsModelConfigurationCreate(request);
     if (got === "/api/settings/provider/update") return this.handleSettingsProviderUpdate(request);
@@ -3865,6 +3913,8 @@ export class WebSocketChannel extends BaseChannel {
           queueSurface,
           turnAdmission,
           expectedTurnId,
+          thinkingEnabled: typeof envelope.thinking_enabled === "boolean" ? envelope.thinking_enabled : undefined,
+          thinkingLevel: typeof envelope.thinking_level === "string" ? envelope.thinking_level : undefined,
         })
       : null;
     if (existing && clientRequestId) {
@@ -3974,6 +4024,8 @@ export class WebSocketChannel extends BaseChannel {
       model: modelSelection.model,
       model_selection: modelSelectionWire(modelSelection),
     };
+    if (typeof envelope.thinking_enabled === "boolean") metadata.thinking_enabled = envelope.thinking_enabled;
+    if (typeof envelope.thinking_level === "string") metadata.thinking_level = envelope.thinking_level;
     if (clientRequestId && digest) {
       metadata.client_request_id = clientRequestId;
       metadata.webui_request_digest = digest;

@@ -1,3 +1,4 @@
+import { requestTiming } from "../../utils/request-timing.js";
 import { initializeDesktopScreenCapture } from '../../tools/computer-use/desktop-screen-capture.js';
 import { closeNativeSurfacesForTurn, registerComputerUseTurnInterrupt } from '../../tools/computer-use/surface-preview.js';
 import fs from "node:fs";
@@ -26,6 +27,7 @@ import {
   type ModelSelectionInput,
   type ResolvedModelSelection,
 } from "../../providers/model-catalog.js";
+import { getModelThinkingConfig } from "@memmy/local-api-contracts";
 import type { ProviderErrorCategory } from "../../providers/provider-error-classifier.js";
 
 type UserFacingModelErrorCategory = ProviderErrorCategory | "model_failed";
@@ -103,6 +105,7 @@ import {
 } from "./goal-runtime.js";
 import { TaskPlanRuntime } from "./task-plan-runtime.js";
 import { createTaskPlanContinuation } from "./task-plan-continuation.js";
+import { createArtifactDeliveryContinuation } from "./artifact-delivery-continuation.js";
 import { resolveToolResultMaxChars, SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME } from "./tool-result-budget.js";
 import { AgentProgressHook } from "./progress-hook.js";
 import { createTurnCancellationBoundary, type TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
@@ -122,6 +125,7 @@ import {
   type TokenCompactionStatus,
 } from "./memory.js";
 import { AgentHook, AgentHookContext, CompositeAgentHook } from "./hook.js";
+import { loadExternalAgentHooks } from "./external-hook-loader.js";
 import { SubagentManager } from "./subagent.js";
 import { AutoCompact } from "./autocompact.js";
 import { configuredModelPresets, defaultSelectionSignature, makePresetSnapshotLoader, normalizePresetName } from "./model-presets.js";
@@ -741,6 +745,27 @@ export class SessionWorkspaceError extends Error {
   }
 }
 
+function thinkingFieldsFromMetadata(metadata: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  return {
+    ...(typeof metadata?.thinking_enabled === "boolean" ? { thinking_enabled: metadata.thinking_enabled } : {}),
+    ...(typeof metadata?.thinking_level === "string" ? { thinking_level: metadata.thinking_level } : {}),
+  };
+}
+
+export function reasoningEffortFromTurnMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  model: string | null | undefined,
+): string | undefined {
+  if (typeof metadata?.thinking_enabled !== "boolean") return undefined;
+  const config = metadata.model_provider === "custom" ? null : getModelThinkingConfig(model);
+  const enabled = config && !config.switchable ? true : metadata.thinking_enabled;
+  if (!enabled) return "none";
+  if (typeof metadata.thinking_level === "string" && metadata.thinking_level.trim()) {
+    return metadata.thinking_level;
+  }
+  return "medium";
+}
+
 export class AgentLoop {
   bus: MessageBus;
   config: Config;
@@ -781,6 +806,9 @@ export class AgentLoop {
   unifiedSession: boolean;
   backgroundTasks: Array<Promise<any>> = [];
   extraHooks: AgentHook[] = [];
+  private externalHooks: AgentHook[] = [];
+  private externalHooksLoadPromise: Promise<void> | null = null;
+  private externalHooksShutdownPromise: Promise<void> | null = null;
   startTime: number;
   lastUsageBySession: Map<string, Record<string, number>>;
   goalRuntime: GoalRuntime;
@@ -1211,7 +1239,7 @@ export class AgentLoop {
   private reportStartupStage(stage: string, startedAt: number): void {
     if (process.env.MEMMY_DESKTOP_MANAGED_GATEWAY !== "1") return;
     try {
-      console.info(`[agent-startup] ${JSON.stringify({ stage, elapsedMs: Date.now() - startedAt })}`);
+      console.info("[agent-startup] " + JSON.stringify({ stage, elapsedMs: Date.now() - startedAt }));
     } catch { /* Diagnostics cannot interrupt startup. */ }
   }
 
@@ -1225,6 +1253,8 @@ export class AgentLoop {
       if (!this.messageLoopReady) this.reportStartupStage(stage, startedAt);
     };
     const initialization = (async () => {
+      await this.ensureExternalHooksLoaded();
+      reportStage("external-hooks-ready");
       await initializeDesktopScreenCapture();
       reportStage("screen-capture-ready");
       await this.connectMcp();
@@ -1249,11 +1279,36 @@ export class AgentLoop {
   async closeRuntimeTools(): Promise<void> {
     this.messageLoopReady = false;
     this.runtimeToolsClosed = true;
-    // A failed attempt may still have opened some resources; clean those up too.
-    await this.runtimeToolsInitialization?.catch(() => undefined);
-    await this.browserSessionManager.close();
-    await this.closeMcp();
-    await this.memmyMemoryIntegration.dispose?.();
+    try {
+      // A failed attempt may still have opened some resources; clean those up too.
+      await this.runtimeToolsInitialization?.catch(() => undefined);
+      await this.browserSessionManager.close();
+      await this.closeMcp();
+      await this.memmyMemoryIntegration.dispose?.();
+    } finally {
+      await this.shutdownExternalHooks();
+    }
+  }
+
+  private ensureExternalHooksLoaded(): Promise<void> {
+    this.externalHooksLoadPromise ??= loadExternalAgentHooks(this.config.agentHooks)
+      .then((hooks) => {
+        this.externalHooks = hooks;
+        this.extraHooks.push(...hooks);
+      })
+      .catch((error) => {
+        console.error("Unable to initialize external agent hooks:", error);
+      });
+    return this.externalHooksLoadPromise;
+  }
+
+  private shutdownExternalHooks(): Promise<void> {
+    this.externalHooksShutdownPromise ??= new CompositeAgentHook(this.externalHooks)
+      .shutdown()
+      .catch((error) => {
+        console.error("Unable to shut down external agent hooks:", error);
+      });
+    return this.externalHooksShutdownPromise;
   }
 
   async closeBrowserSession(
@@ -1418,11 +1473,15 @@ export class AgentLoop {
     });
   }
 
-  registerHookTools(toolCtx: ToolContext, phase: string, registry: ToolRegistryInstance = this.tools): void {
+  registerHookTools(
+    toolCtx: ToolContext,
+    phase: string,
+    registry: ToolRegistryInstance = this.tools,
+  ): void {
     this.lifecycleHook().onRegisterTools({
       registry,
       toolContext: toolCtx,
-      workspace: this.workspace,
+      workspace: toolCtx.workspace ?? this.workspace,
       metadata: { phase },
     });
   }
@@ -1433,6 +1492,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
@@ -1444,6 +1506,9 @@ export class AgentLoop {
         session,
         sessionKey,
         reason,
+        workspace: typeof session?.metadata?.[WEBUI_WORKSPACE_CWD_METADATA_KEY] === "string"
+          ? session.metadata[WEBUI_WORKSPACE_CWD_METADATA_KEY]
+          : this.workspace,
         metadata: { lifecycle: "session" },
       }),
     );
@@ -3724,10 +3789,34 @@ export class AgentLoop {
     const activeContextWindowTokens = modelSelection?.snapshot.contextWindowTokens
       ?? this.contextWindowTokens;
     const activeTools = tools ?? this.tools;
+    const deliveryMessageTool = activeTools.get("message");
+    let heldDeliveryStream = "";
+    const deliveryAwareStream = onStream ? async (delta: string) => {
+      if (deliveryMessageTool instanceof MessageTool && deliveryMessageTool.hasPendingPluginFiles()) {
+        heldDeliveryStream += delta;
+      } else {
+        if (heldDeliveryStream) {
+          await onStream(heldDeliveryStream);
+          heldDeliveryStream = "";
+        }
+        await onStream(delta);
+      }
+    } : null;
+    const deliveryAwareStreamEnd = onStream || onStreamEnd ? async (options: { resuming?: boolean } = {}) => {
+      if (heldDeliveryStream) {
+        if (!options.resuming) await onStream?.(heldDeliveryStream);
+        heldDeliveryStream = "";
+      }
+      await onStreamEnd?.(options);
+    } : null;
+    const deliveryContinuation = createArtifactDeliveryContinuation(() => {
+      const messageTool = activeTools.get("message");
+      return messageTool instanceof MessageTool ? messageTool.turnDeliveredMediaPaths() : [];
+    });
     const checkpointSession = session;
     const checkpoint = checkpointSession ? (payload: Record<string, any>) => this.setRuntimeCheckpoint(checkpointSession, payload) : null;
     const activeSessionKey = session?.key ?? sessionKey ?? null;
-    const loopHook = new AgentProgressHook(onProgress, onStream, onStreamEnd, {
+    const loopHook = new AgentProgressHook(onProgress, deliveryAwareStream, deliveryAwareStreamEnd, {
       channel: channel ?? "cli",
       chatId: chatId ?? "direct",
       messageId: messageId ?? null,
@@ -3748,9 +3837,12 @@ export class AgentLoop {
       },
     });
     const hook = this.extraHooks.length ? new CompositeAgentHook([loopHook, ...this.extraHooks]) : loopHook;
+    const taskPlanContinuation = createTaskPlanContinuation(() => activeSessionKey
+      ? this.taskPlanRuntime.get(activeSessionKey) : null);
     const result = await this.runner.run(
       new AgentRunSpec({
         messages: initialMessages,
+        finalResponseContinuation: (response) => taskPlanContinuation(response) ?? deliveryContinuation(response),
         privateSkillRefs: session?.metadata?.privatePluginSkillRefs,
         onPrivateSkillRefsChanged: session ? (refs) => {
           session.metadata.privatePluginSkillRefs = refs;
@@ -3761,11 +3853,11 @@ export class AgentLoop {
         model: activeModel,
         maxIterations: this.maxIterations,
         maxIterationsFinalPrompt: renderTemplate("agent/max-iterations-final-response.md", { strip: true }),
-        finalResponseContinuation: createTaskPlanContinuation(() => activeSessionKey
-          ? this.taskPlanRuntime.get(activeSessionKey) : null),
         maxTokens: activeProvider?.generation?.maxTokens ?? this.config.agents.defaults.maxTokens,
         temperature: activeProvider?.generation?.temperature ?? this.config.agents.defaults.temperature,
-        reasoningEffort: activeProvider?.generation?.reasoningEffort ?? this.config.agents.defaults.reasoningEffort,
+        reasoningEffort: reasoningEffortFromTurnMetadata(metadata, activeModel)
+          ?? activeProvider?.generation?.reasoningEffort
+          ?? this.config.agents.defaults.reasoningEffort,
         maxToolResultChars: this.maxToolResultChars,
         toolResultMaxCharsByName: SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME,
         workspace: sessionWorkspace,
@@ -3775,7 +3867,7 @@ export class AgentLoop {
         contextBlockLimit: this.contextBlockLimit,
         providerRetryMode: this.providerRetryMode,
         progressCallback: onProgress,
-        streamProgressDeltas: Boolean(onStream),
+        streamProgressDeltas: Boolean(deliveryAwareStream),
         retryWaitCallback: onRetryWait,
         checkpointCallback: checkpoint,
         llmTimeoutS: runnerWallLlmTimeoutS(this.sessions, activeSessionKey, {
@@ -3932,6 +4024,7 @@ export class AgentLoop {
             model_provider: modelSelection.provider,
             model: modelSelection.model,
             model_selection: modelSelectionWire(modelSelection),
+            ...thinkingFieldsFromMetadata(msg.metadata),
           }
         : { ...(msg.metadata ?? {}) },
       sessionKey: ctx.sessionKey,
@@ -3956,6 +4049,7 @@ export class AgentLoop {
     }
     ctx.session.metadata.modelPreset = modelSelection.preset;
     ctx.session.metadata.modelSelection = persistedModelSelection(modelSelection);
+    Object.assign(ctx.session.metadata, thinkingFieldsFromMetadata(msg.metadata));
     const projectedBinding = this.guiTranscriptMirror?.prepareSession(
       msg,
       ctx.session,
@@ -4086,6 +4180,7 @@ export class AgentLoop {
         ctx.userPersistedEarly = Boolean(persisted.entry || ctx.msg.content.trim() || ctx.msg.media.length);
       } else {
         ctx.userPersistedEarly = this.persistUserMessageEarly(ctx.msg, ctx.session!);
+        requestTiming("agent.user_persisted");
       }
     }
     if (ctx.userPersistedEarly && !internalGoal) {
@@ -4108,6 +4203,7 @@ export class AgentLoop {
     if (revalidated.cwd !== sessionWorkspace || revalidated.projectId !== ctx.sessionProjectId) {
       throw new SessionWorkspaceError("workspace_conflict");
     }
+    requestTiming("agent.prompt_hooks_start");
     await this.lifecycleHook().beforeBuildSystemPrompt(new AgentHookContext({
       session: ctx.session,
       sessionKey: ctx.sessionKey,
@@ -4115,6 +4211,7 @@ export class AgentLoop {
       spec: { hostProjectId: ctx.sessionProjectId, workspace: sessionWorkspace, turnId: ctx.turnId, abortSignal: ctx.abortSignal },
       metadata: { lifecycle: "system_prompt" },
     }));
+    requestTiming("agent.prompt_hooks_end");
     const compactionOptions: {
       replayMaxMessages: number | null;
       notifyOnLockWait?: boolean;
@@ -4140,11 +4237,14 @@ export class AgentLoop {
       };
       compactionOptions.onCompactionEvent = ctx.onTokenCompactionEvent;
     }
+    requestTiming("agent.compaction_start");
     await (ctx.consolidator ?? this.consolidator).maybeConsolidateByTokens(
       ctx.session!,
       compactionOptions,
     );
+    requestTiming("agent.compaction_end");
     await initializeDesktopScreenCapture();
+    requestTiming("agent.screen_capture_ready");
     ctx.tools = this.createToolRegistry("turn", sessionWorkspace, {
       includeConnectedMcp: true,
       messageSendCallback: ctx.messageSendCallback,
@@ -4252,6 +4352,7 @@ export class AgentLoop {
   }
 
   async stateRun(ctx: TurnContext): Promise<string> {
+    requestTiming("agent.prepared");
     if (ctx.slot?.state === "running") ctx.slot.acceptingSteer = true;
     const settleSlot = (): void => {
       if (!ctx.slot || ctx.slot.state === "closed") return;
@@ -4524,6 +4625,7 @@ export class AgentLoop {
             model_provider: modelSelection.provider,
             model: modelSelection.model,
             model_selection: modelSelectionWire(modelSelection),
+            ...thinkingFieldsFromMetadata(msg.metadata),
           }
         : { ...(msg.metadata ?? {}) },
       sessionKey: key,
@@ -4537,6 +4639,7 @@ export class AgentLoop {
     let session = existingSession ?? await this.getOrCreateSession(key);
     session.metadata.modelPreset = modelSelection.preset;
     session.metadata.modelSelection = persistedModelSelection(modelSelection);
+    Object.assign(session.metadata, thinkingFieldsFromMetadata(msg.metadata));
     const sessionBinding = this.resolveSessionWorkspace(
       msg,
       session,
@@ -5738,7 +5841,9 @@ export class AgentLoop {
     const pendingMarker = new AsyncQueue<InboundMessage>();
     this.pendingQueues.set(key, pendingMarker);
     try {
+      requestTiming("agent.tools_start");
       await this.initializeRuntimeTools();
+      requestTiming("agent.tools_ready");
       const msg = new InboundMessage({
         channel,
         chatId,

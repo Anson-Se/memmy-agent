@@ -6,7 +6,7 @@ import { WorkflowQuestionCard } from "./review-preparation-history.js";
  * component keeps activity grouped and renders the complete trace list returned
  * by live WebSocket events and /webui-thread history.
  */
-import { Fragment, memo, useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode, type SVGProps } from "react";
+import { Fragment, memo, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode, type SVGProps } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
@@ -51,6 +51,8 @@ import { WINDOW_CONTROLS_OVERLAY_SAFE_TOP_STYLE } from "../theme/window-controls
 import type { AgentChatMediaAttachment, AgentChatMessage, AgentCompactionStatus, AgentRetryWaitStatus } from "../state/agent-chat-slice.js";
 import type { RecallEvidenceOutput, RecallHit } from "@memmy/local-api-contracts";
 import type { MemoryRuntimeClient } from "../api/memory-runtime-client.js";
+import type { AgentTaskPlanState } from "../api/memmy-agent-client.js";
+import { AgentTaskPlanBar } from "./agent-task-plan-bar.js";
 import {
   activityPreviewFileFromEdit,
   activityPreviewFileFromToolEvent,
@@ -71,6 +73,8 @@ import {
   shouldSuppressRetryWaitStatus,
 } from "./agent-model-error.js";
 import {
+  AgentQuestionCard,
+  AgentQuestionActiveRequestContext,
   normalizeAgentQuestionResponse,
   readAgentQuestionCard,
   readAgentQuestionResponse,
@@ -92,6 +96,7 @@ interface AgentThreadMessagesProps {
   chatScopeKey: string;
   historyVersion?: number;
   isSending?: boolean;
+  taskPlan?: AgentTaskPlanState | null;
   waitingForPluginInteraction?: boolean;
   sanitizePlatformApiErrors?: boolean;
   memoryRuntimeClient?: Pick<MemoryRuntimeClient, "recallEvidence" | "deleteMemory"> | null;
@@ -149,11 +154,13 @@ type ClipboardItemConstructor = {
 };
 
 export const AgentThreadMessages = memo(function AgentThreadMessages(props: AgentThreadMessagesProps) {
+  const activeQuestionId = useContext(AgentQuestionActiveRequestContext);
   const units = useMemo(
     () => buildAgentDisplayUnits(props.messages, { chatScopeKey: props.chatScopeKey, retryWaitStatus: props.retryWaitStatus ?? null }),
     [props.chatScopeKey, props.messages, props.retryWaitStatus]
   );
-  const finalAssistantAnswerIndex = useMemo(() => findFinalAssistantAnswerUnitIndex(units, { isSending: props.isSending }), [props.isSending, units]);
+  const taskPlanAnchor = props.taskPlan?.plan_id ? taskPlanActivityIndex(units, props.taskPlan) : -1;
+  const finalAssistantAnswerIndices = useMemo(() => findFinalAssistantAnswerUnitIndices(units, { isSending: props.isSending }), [props.isSending, units]);
   const recallEvidenceAnchors = useMemo(
     () => findRecallEvidenceUserAnchors(units, { isSending: props.isSending }),
     [props.isSending, units]
@@ -233,13 +240,17 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
         if (unit.type === "activity") {
           const isAutoOpenRunning = activityRunningByKey[unit.activityKey] === true;
           const manualOpen = manualOpenByActivityKey[unit.activityKey];
-          const open = isAutoOpenRunning ? manualOpen ?? true : manualOpen ?? unit.stoppedByUser;
+          const open = unit.messages.some((message) => Boolean(activeQuestionId && readAgentQuestionCard(message.agentUi)?.requestId === activeQuestionId))
+            || (isAutoOpenRunning ? manualOpen ?? true : manualOpen ?? unit.stoppedByUser);
           return (
             <Fragment key={unit.activityKey}>
               <AgentActivityCluster
+                onAnswerQuestion={props.onAnswerQuestion}
                 activityKey={unit.activityKey}
                 bodyId={unit.bodyId}
                 messages={unit.messages}
+                questionResponses={questionResponses}
+                taskPlan={index === taskPlanAnchor ? props.taskPlan : null}
                 isRunning={isAutoOpenRunning}
                 stoppedByUser={unit.stoppedByUser}
                 open={open}
@@ -263,7 +274,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
               onOpenActivityFile={props.onOpenActivityFile}
               chatScopeKey={props.chatScopeKey}
               unitIndex={index}
-              isFinalAssistantAnswer={index === finalAssistantAnswerIndex}
+              isFinalAssistantAnswer={finalAssistantAnswerIndices.has(index)}
               forceMessageActions={unit.message.id === (props.forceMessageActionsForMessageId ?? props.afterMessageId)}
               deferContentRender={shouldDeferAgentMessageContent(unit, index, units.length)}
               deferredRevealDelayMs={deferredAgentMessageRevealDelay(index, units.length)}
@@ -280,6 +291,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
           </Fragment>
         );
       })}
+      {props.taskPlan?.plan_id && taskPlanAnchor < 0 ? <AgentTaskPlanBar plan={props.taskPlan} runActive={props.isSending} /> : null}
       {shouldShowThinkingPlaceholder(props.messages, props.isSending) && (
         props.waitingForPluginInteraction ? <PluginInteractionWaitingPlaceholder /> : <ThinkingPlaceholder />
       )}
@@ -299,6 +311,7 @@ function areAgentThreadMessagesPropsEqual(previous: AgentThreadMessagesProps, ne
     && previous.historyVersion === next.historyVersion
     && previous.waitingForPluginInteraction === next.waitingForPluginInteraction
     && previous.isSending === next.isSending
+    && previous.taskPlan === next.taskPlan
     && previous.retryWaitStatus === next.retryWaitStatus
     && previous.sanitizePlatformApiErrors === next.sanitizePlatformApiErrors
     && previous.memoryRuntimeClient === next.memoryRuntimeClient
@@ -417,7 +430,7 @@ function isActivityAutoOpenRunning(unit: Extract<AgentDisplayUnit, { type: "acti
 
 /**
  * A queued follow-up is appended as a user row while this run is still the
- * latest work on screen. That row moves `lastUserIndex` past the activity, so
+ * latest work on screen. That row moves lastUserIndex past the activity, so
  * the cluster would otherwise drop out of the live set and fold to "Working".
  * Hold it open until the turn actually ends, a real answer arrives, or a
  * newer activity run starts. A finished cluster is not held: sending the next
@@ -457,16 +470,23 @@ function isVisibleAssistantAnswer(message: AgentChatMessage): boolean {
 }
 
 /**
- * Locate the index of the last "single" unit that is a finalized assistant
- * answer. While the current turn is still sending, assistant text after the
+ * Locate the last finalized assistant answer in each user-delimited turn.
+ * While the current turn is still sending, assistant text after the
  * latest user message is treated as continuation text, because the agent may
- * still alternate body → tool → reasoning → tool before the actual final answer.
+ * still alternate body -> tool -> reasoning -> tool before the actual final answer.
  */
-function findFinalAssistantAnswerUnitIndex(units: AgentDisplayUnit[], options: { isSending?: boolean } = {}): number {
+function findFinalAssistantAnswerUnitIndices(units: AgentDisplayUnit[], options: { isSending?: boolean } = {}): Set<number> {
+  const indices = new Set<number>();
   const lastUserUnitIndex = findLastUserUnitIndex(units);
+  let foundAnswerInTurn = false;
   for (let index = units.length - 1; index >= 0; index -= 1) {
     const unit = units[index];
     if (unit?.type !== "single") continue;
+    if (unit.message.role === "user") {
+      foundAnswerInTurn = false;
+      continue;
+    }
+    if (foundAnswerInTurn) continue;
     if (options.isSending && index > lastUserUnitIndex) continue;
     const message = unit.message;
     if (message.role === "assistant"
@@ -474,10 +494,11 @@ function findFinalAssistantAnswerUnitIndex(units: AgentDisplayUnit[], options: {
       && message.kind !== "narration"
       && message.kind !== "context_compaction"
       && message.content.trim().length > 0) {
-      return index;
+      indices.add(index);
+      foundAnswerInTurn = true;
     }
   }
-  return -1;
+  return indices;
 }
 
 function findLastUserUnitIndex(units: AgentDisplayUnit[]): number {
@@ -2343,9 +2364,12 @@ async function fetchAttachmentBytes(url: string): Promise<{ data: Uint8Array; mi
 }
 
 function AgentActivityCluster(props: {
+  onAnswerQuestion?: AgentThreadMessagesProps["onAnswerQuestion"];
+  questionResponses?: ReadonlyMap<string, AgentQuestionResponse>;
   activityKey: string;
   bodyId: string;
   messages: AgentChatMessage[];
+  taskPlan?: AgentTaskPlanState | null;
   isRunning: boolean;
   stoppedByUser: boolean;
   open: boolean;
@@ -2355,7 +2379,10 @@ function AgentActivityCluster(props: {
   onOpenActivityFile?: (file: ActivityPreviewFile) => void;
 }) {
   const { t } = useTranslation();
-  const segments = useMemo(() => buildActivitySegments(props.messages, t), [props.messages, t]);
+  const segments = useMemo(() => {
+    const ordinary = buildActivitySegments(props.messages, t);
+    return props.taskPlan?.plan_id ? embedTaskPlanInSegments(ordinary, props.taskPlan, t) : ordinary;
+  }, [props.messages, props.taskPlan, t]);
   const headerLabel = activityHeaderLabel(props.messages, props.isRunning, props.stoppedByUser, t);
   const Chevron = props.open ? ChevronDown : ChevronRight;
 
@@ -2373,6 +2400,15 @@ function AgentActivityCluster(props: {
           <span className="min-w-0 truncate">{headerLabel}</span>
           <Chevron data-icon={props.open ? "chevron-down" : "chevron-right"} size={12} className="shrink-0" />
         </button>
+        {!props.open && props.taskPlan?.plan_id ? <AgentTaskPlanBar plan={props.taskPlan} embeddedInProcess runActive={props.isRunning} /> : null}
+        {!props.open ? segments.flatMap((segment) => {
+          if (segment.type !== "question") return [];
+          const card = readAgentQuestionCard(segment.message.agentUi);
+          if (!card) return [];
+          const response = normalizeAgentQuestionResponse(segment.message.questionResponse)
+            ?? props.questionResponses?.get(card.requestId);
+          return response ? [<AgentQuestionCard key={segment.key} card={card} response={response} processView />] : [];
+        }) : null}
         {props.open && (
           <div id={props.bodyId} className="agent-activity-cluster__body min-w-0">
             {/* Segments preserve chronological order (thought → tool-group →
@@ -2386,9 +2422,12 @@ function AgentActivityCluster(props: {
             {segments.map((segment, index) => (
               <ActivitySegmentBlock
                 key={segment.key}
+                onAnswerQuestion={props.onAnswerQuestion}
+                questionResponses={props.questionResponses}
                 segment={segment}
                 t={t}
                 isLive={props.isRunning && index === segments.length - 1}
+                runActive={props.isRunning}
                 isOnlySegment={segments.length === 1}
                 artifactClient={props.artifactClient}
                 onPreviewFile={props.onPreviewFile}
@@ -2403,15 +2442,28 @@ function AgentActivityCluster(props: {
 }
 
 function ActivitySegmentBlock(props: {
+  onAnswerQuestion?: AgentThreadMessagesProps["onAnswerQuestion"];
+  questionResponses?: ReadonlyMap<string, AgentQuestionResponse>;
   segment: ActivitySegment;
   t: Translate;
   isLive?: boolean;
+  runActive?: boolean;
   isOnlySegment?: boolean;
   artifactClient?: AgentArtifactClient | null;
   onPreviewFile?: InAppFilePreviewHandler;
   onOpenActivityFile?: (file: ActivityPreviewFile) => void;
 }) {
   const { segment } = props;
+  if (segment.type === "taskPlan") {
+    return <AgentTaskPlanBar plan={segment.plan} embeddedInProcess runActive={props.runActive === true} />;
+  }
+  if (segment.type === "question") {
+    const card = readAgentQuestionCard(segment.message.agentUi)!;
+    return <AgentQuestionCard card={card} processView
+      response={normalizeAgentQuestionResponse(segment.message.questionResponse) ?? props.questionResponses?.get(card.requestId)}
+      interrupted={segment.message.stoppedByUser}
+      onSubmit={props.onAnswerQuestion ? (answer) => props.onAnswerQuestion!(card, answer) : undefined} />;
+  }
   if (segment.type === "thought") {
     return <ThoughtSegmentBlock text={segment.text} isLive={props.isLive === true} isOnlySegment={props.isOnlySegment === true} t={props.t} />;
   }
@@ -2882,7 +2934,60 @@ interface ActivityToolGroupSegment {
   items: ActivityRenderItem[];
 }
 
-type ActivitySegment = ActivityThoughtSegment | ActivityNarrationSegment | ActivityToolGroupSegment;
+type ActivitySegment = ActivityThoughtSegment | ActivityNarrationSegment | ActivityToolGroupSegment
+  | { type: "question"; key: string; message: AgentChatMessage }
+  | { type: "taskPlan"; key: string; plan: AgentTaskPlanState };
+
+function isTaskPlanToolEvent(event: AgentToolProgressEvent): boolean {
+  return toolEventName(event) === "create_task_plan" || toolEventName(event) === "update_task_plan";
+}
+
+function taskPlanActivityIndex(units: AgentDisplayUnit[], plan: AgentTaskPlanState): number {
+  let anchor = -1;
+  for (let index = 0; index < units.length; index += 1) {
+    const unit = units[index];
+    if (unit?.type !== "activity") continue;
+    if (unit.messages.some((message) => (message.toolEvents ?? []).some((event) => {
+      if (toolEventName(event) !== "create_task_plan") return false;
+      let args: unknown = event.arguments ?? event.function?.arguments;
+      if (typeof args === "string") { try { args = JSON.parse(args); } catch { return false; } }
+      return args != null && typeof args === "object" && !Array.isArray(args)
+        && (args as { title?: unknown }).title === plan.title;
+    }))) anchor = index;
+  }
+  return anchor;
+}
+
+function embedTaskPlanInSegments(segments: ActivitySegment[], plan: AgentTaskPlanState, t: Translate): ActivitySegment[] {
+  const result: ActivitySegment[] = [];
+  let inserted = false;
+  for (const segment of segments) {
+    if (segment.type !== "toolGroup") { result.push(segment); continue; }
+    let ordinary: ActivityRenderItem[] = [];
+    let part = 0;
+    const flush = () => {
+      if (!ordinary.length) return;
+      const label = toolGroupLabel(ordinary, t);
+      result.push({ ...segment, key: `${segment.key}:part:${part++}`, items: ordinary,
+        label: label.text, added: label.added, deleted: label.deleted });
+      ordinary = [];
+    };
+    for (const item of segment.items) {
+      if (item.type !== "toolStep" || !isTaskPlanToolEvent(item.event)) { ordinary.push(item); continue; }
+      flush();
+      if (!inserted && toolEventName(item.event) === "create_task_plan") {
+        const label = toolGroupLabel([item], t);
+        result.push({ ...segment, key: `${segment.key}:create`, items: [item],
+          label: label.text, added: label.added, deleted: label.deleted });
+        result.push({ type: "taskPlan", key: `plan:${plan.plan_id}`, plan });
+        inserted = true;
+      }
+    }
+    flush();
+  }
+  if (!inserted) result.push({ type: "taskPlan", key: `plan:${plan.plan_id}`, plan });
+  return result;
+}
 
 /**
  * Walk activity messages in chronological (arrival) order and emit alternating
@@ -2894,10 +2999,19 @@ type ActivitySegment = ActivityThoughtSegment | ActivityNarrationSegment | Activ
  */
 function buildActivitySegments(messages: AgentChatMessage[], t: Translate): ActivitySegment[] {
   const segments: ActivitySegment[] = [];
+  const hasQuestion = messages.some((message) => {
+    const card = readAgentQuestionCard(message.agentUi);
+    return Boolean(card && !card.context?.workflow);
+  });
   messages.forEach((message, messageIndex) => {
     const messageKey = message.id || `message-${messageIndex}`;
     if (message.reasoning) {
       segments.push({ type: "thought", key: `${messageKey}:thought`, text: message.reasoning });
+    }
+    const question = readAgentQuestionCard(message.agentUi);
+    if (question && !question.context?.workflow) {
+      segments.push({ type: "question", key: `${messageKey}:question`, message });
+      return;
     }
     if (message.kind === "narration") {
       if (message.content.trim()) {
@@ -2905,7 +3019,8 @@ function buildActivitySegments(messages: AgentChatMessage[], t: Translate): Acti
       }
       return;
     }
-    const toolItems = traceRenderItemsForMessage(message, messageKey);
+    const toolItems = traceRenderItemsForMessage(message, messageKey).filter((item) => !(hasQuestion
+      && item.type === "toolStep" && toolEventName(item.event) === "ask_question"));
     const fileEditItems: ActivityFileEditItem[] = (message.fileEdits ?? []).map((edit, index) => ({
       type: "fileEdit",
       edit,
@@ -3260,6 +3375,8 @@ function traceLinesForActivity(message: AgentChatMessage): string[] {
 }
 
 function isAgentActivityMessage(message: AgentChatMessage): boolean {
+  const question = readAgentQuestionCard(message.agentUi);
+  if (question && !question.context?.workflow) return true;
   // The whole loop process — thoughts, tools, and mid-turn drafts (narration)
   // — belongs to ONE per-run "Worked for" cluster, exactly like Cursor: while
   // the turn runs it reads chronologically in place, and when the turn ends

@@ -203,7 +203,8 @@ describe("MCPToolWrapper execution", () => {
     expect(callTool).toHaveBeenCalledWith("demo", {}, 0.1, {
       "memmy.dev/session-key": "desktop:conversation-1",
       "memmy.dev/tool-call-id": "tool-call-1",
-      "memmy.dev/model-preset": "account-deepseek-v4.1-flash"
+      "memmy.dev/model-preset": "account-deepseek-v4.1-flash",
+      "memmy.dev/cloud-skills": "1"
     }, undefined);
 
     callTool.mockClear();
