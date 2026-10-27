@@ -750,14 +750,18 @@ export class SessionTurnService {
           episodeId: target.id, dedupeKey: `episode_idle_close:${raw.id}`,
           payload: { triggerRawTurnId: raw.id, triggerEpisodeId: target.id, triggeredAt: raw.createdAt }, createdAt: at });
       }
-      for (const id of new Set([target.id, base?.id, ...(legacyRoute?.closedEpisodeIds ?? [])])) {
-        if (!id) continue;
-        const episode = this.deps.repos.runtime.getEpisode(id);
-        if (episode?.status === "closed") this.deps.finalizeClosedEpisode(episode, at, "capture_decided");
-      }
-      if (session.status !== "open" && !this.deps.repos.runtime.hasUnassignedTurns(session.id) && session.meta.l3_world_model_protocol_version === 2) {
-        this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "session_close", at });
-        this.deps.extractUnextractedWorkMemory(session.id, this.deps.repos.l3WorldModels.maxInputTraceSeq(session.id), at);
+      if (!this.deps.repos.runtime.hasUnassignedTurns(session.id)) {
+        // Finalization waits for attribution across the whole Session. Once it
+        // drains, revisit every closed Episode, including earlier deferred ones
+        // outside this turn's target/base. Existing completion and job guards
+        // make repeated sweeps safe; an open Session can also have closed tasks.
+        for (const episode of this.deps.repos.runtime.listEpisodesForSession(session.id)) {
+          if (episode.status === "closed") this.deps.finalizeClosedEpisode(episode, at, "capture_decided");
+        }
+        if (session.status !== "open" && session.meta.l3_world_model_protocol_version === 2) {
+          this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "session_close", at });
+          this.deps.extractUnextractedWorkMemory(session.id, this.deps.repos.l3WorldModels.maxInputTraceSeq(session.id), at);
+        }
       }
     });
   }
