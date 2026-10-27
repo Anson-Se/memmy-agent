@@ -45,7 +45,7 @@ describe("prompt templates", () => {
     expect(text).toContain("untrusted external data");
     expect(text).toContain("Format Hint");
     expect(text).toContain(
-      "only when the user explicitly asks for a visible checklist or a currently loaded Skill explicitly instructs you",
+      "only when the user explicitly asks for a checklist or a loaded Skill requires one",
     );
     expect(text).toContain(
       "Never infer authorization merely because work is complex, long-running, multi-step, or uses a plugin.",

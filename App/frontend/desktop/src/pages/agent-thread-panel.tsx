@@ -1,3 +1,4 @@
+import { RecordingEntryPage, type RecordingEntrySession } from "./recording-entry.js";
 import {
   useCallback,
   useEffect,
@@ -11,7 +12,7 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { Copy, Globe2, Maximize2, Minimize2, PanelRight, Pin, PinOff, Plus, X } from "lucide-react";
+import { AudioLines, LockKeyhole, Copy, Globe2, Maximize2, Minimize2, PanelRight, Pin, PinOff, Plus, X } from "lucide-react";
 import type { AgentChatMessage } from "../state/agent-chat-slice.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { ThreadFileIcon } from "./agent-thread-file-icon.js";
@@ -25,13 +26,13 @@ import {
   openThreadTab,
   threadPanelContentWidth,
   threadPanelOffset,
+  threadPanelUsesOverlay,
   threadTabForArtifact,
   threadTabForChange,
   threadTabForPath,
   THREAD_LIST_DEFAULT_WIDTH,
   THREAD_PANEL_MIN_WIDTH,
   THREAD_PANEL_NARROW_WIDTH,
-  type ThreadArtifact,
   type ThreadPanelTab,
   type ThreadPanelView,
   type ThreadTabState,
@@ -87,15 +88,16 @@ export type AgentThreadPanelController = ReturnType<typeof useAgentThreadPanel>;
 type PanelSession = {
   phase: ThreadPanelPhase; fullscreen: boolean; view: ThreadPanelView; tabState: ThreadTabState;
   pinned: boolean; artifactsCollapsed: boolean; listWidth: number; resizing: boolean;
-  closingWidth: number | null;
+  closingWidth: number | null; clearTabsOnClose: boolean;
 };
 const EMPTY_PANEL_SESSION: PanelSession = {
   phase: 'closed', fullscreen: false, view: 'overview', tabState: EMPTY_TABS, pinned: false,
   artifactsCollapsed: false, listWidth: THREAD_LIST_DEFAULT_WIDTH, resizing: false,
-  closingWidth: null,
+  closingWidth: null, clearTabsOnClose: false,
 };
 function finishPanelClose(state: PanelSession): PanelSession {
-  return { ...state, phase: 'closed', closingWidth: null, resizing: false };
+  return { ...state, phase: 'closed', closingWidth: null, resizing: false,
+    ...(state.clearTabsOnClose ? { tabState: EMPTY_TABS, pinned: false } : {}), clearTabsOnClose: false };
 }
 
 export function useAgentThreadPanel(options: { scopeKey: string; containerRef: RefObject<HTMLElement | null>; enabled: boolean }) {
@@ -167,12 +169,13 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
   }, [resizing, widths]);
 
   const hasContent = tabState.tabs.length > 0;
-  const liveWidth = hasContent
+  const overlay = threadPanelUsesOverlay(containerWidth);
+  const liveWidth = overlay ? containerWidth : hasContent
     ? clampThreadPanelWidth(widths.content ?? threadPanelContentWidth(containerWidth), containerWidth)
     : clampThreadPanelWidth(widths.sidebar, containerWidth);
   const width = phase === "closing" && session.closingWidth != null ? session.closingWidth : liveWidth;
   const visible = options.enabled && phase !== "closed";
-  const offset = options.enabled && phase === "open" ? threadPanelOffset(width, containerWidth) : 0;
+  const offset = options.enabled && phase === "open" && !overlay ? threadPanelOffset(width, containerWidth) : 0;
   const motion: ThreadPanelMotion = resizing ? "resizing" : phase === "closing" ? "closing" : "open";
   const liveWidthRef = useRef(liveWidth);
   liveWidthRef.current = liveWidth;
@@ -186,7 +189,8 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
   }, [ownerKey]);
   const open = useCallback(() => {
     cancelCloseTimer();
-    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null }));
+    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null, clearTabsOnClose: false,
+      ...(state.clearTabsOnClose ? { tabState: EMPTY_TABS, pinned: false } : {}) }));
   }, [ownerKey, updateSession, cancelCloseTimer]);
 
   const close = useCallback(() => {
@@ -210,8 +214,8 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
 
   const openTab = useCallback((tab: ThreadPanelTab) => {
     cancelCloseTimer();
-    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null,
-      tabState: openThreadTab(state.tabState, tab),
+    updateSession(ownerKey, state => ({ ...state, phase: 'open', closingWidth: null, clearTabsOnClose: false,
+      tabState: openThreadTab(state.clearTabsOnClose ? EMPTY_TABS : state.tabState, tab),
       pinned: liveWidthRef.current < THREAD_PANEL_NARROW_WIDTH ? false : state.pinned }));
     ensureContentWidth();
   }, [ownerKey, updateSession, cancelCloseTimer, ensureContentWidth]);
@@ -222,13 +226,14 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
   }, [ownerKey, updateSession]);
 
   const closeTab = useCallback((id: string) => {
-    updateSession(ownerKey, state => {
-      const tabState = closeThreadTab(state.tabState, id);
-      if (tabState === state.tabState) return state;
-      // With no previews left, keep the panel open on its file list.
-      return { ...state, tabState, pinned: tabState.tabs.length > 0 && state.pinned };
-    });
-  }, [ownerKey, updateSession]);
+    const next = closeThreadTab((sessionsRef.current.get(ownerKey) ?? EMPTY_PANEL_SESSION).tabState, id);
+    if (next.tabs.length) {
+      updateSession(ownerKey, state => ({ ...state, tabState: next }));
+      return;
+    }
+    updateSession(ownerKey, state => ({ ...state, clearTabsOnClose: true }));
+    close();
+  }, [ownerKey, updateSession, close]);
 
   const resize = useCallback((nextWidth: number) => {
     const clamped = clampThreadPanelWidth(nextWidth, containerWidthRef.current);
@@ -257,6 +262,7 @@ export function useAgentThreadPanel(options: { scopeKey: string; containerRef: R
     motion,
     width,
     offset,
+    overlay,
     fullscreen,
     view,
     tabState,
@@ -297,28 +303,24 @@ const EMPTY_BROWSER_SESSION: BrowserSession = {
 export function AgentThreadPanel(props: {
   controller: AgentThreadPanelController;
   messages: AgentChatMessage[];
-  /** Host/plugin files that are delivered outside the Agent transcript. */
-  artifacts?: ThreadArtifact[];
   workspaceRoot: string | null;
   previewContext: ThreadPreviewContext;
+  recordingSession?: RecordingEntrySession;
+  recordingAuthenticated?: boolean;
+  onRecordingSignIn?: () => void;
+  onOpenRecording?: () => void;
+  onCloseRecording?: () => void;
+  recordingRevealRequestId?: number;
+  onRecordingVisibleChange?: (visible: boolean) => void;
 }) {
   const { t } = useTranslation();
   const panel = props.controller;
-  const artifacts = useMemo(() => {
-    const merged = new Map<string, ThreadArtifact>();
-    for (const artifact of [...collectThreadArtifacts(props.messages), ...(props.artifacts ?? [])]) {
-      const key = normalizeThreadPath(artifact.path ?? artifact.url ?? artifact.key);
-      if (key && !merged.has(key)) merged.set(key, { ...artifact, key });
-    }
-    return [...merged.values()];
-  }, [props.artifacts, props.messages]);
+  const artifacts = useMemo(() => collectThreadArtifacts(props.messages), [props.messages]);
   const changes = useMemo(() => collectThreadFileChanges(props.messages), [props.messages]);
-  const filesRefreshToken = useMemo(() => [
-    changes.map((change) => `${change.key}:${change.added}:${change.deleted}`).join("|"),
-    artifacts.map((artifact) => [artifact.key, artifact.path ?? "", artifact.url ?? ""].join(":"))
-      .sort()
-      .join("|"),
-  ].join("#"), [artifacts, changes]);
+  const filesRefreshToken = useMemo(
+    () => changes.map((change) => `${change.key}:${change.added}:${change.deleted}`).join("|") + `#${artifacts.length}`,
+    [artifacts.length, changes],
+  );
   const activeTab = panel.tabState.tabs.find((tab) => tab.id === panel.tabState.activeId) ?? null;
   const activeFileKey = activeTab?.type === "file" ? normalizeThreadPath(activeTab.path ?? activeTab.url ?? "") : null;
   const activeChangeKey = activeTab?.type === "change" ? activeTab.id.slice("change:".length) : null;
@@ -339,6 +341,8 @@ export function AgentThreadPanel(props: {
   const browserSession = browserSessions.get(ownerKey) ?? EMPTY_BROWSER_SESSION;
   const { open: browserOpen, mounted: browserMounted, tabs: browserTabs,
     activeId: activeBrowserTabId, copiedId: copiedBrowserTabId } = browserSession;
+  const recordingVisible = panel.visible && panel.phase === "open" && !browserOpen && activeTab?.type === "recording";
+  useEffect(() => props.onRecordingVisibleChange?.(recordingVisible), [props.onRecordingVisibleChange, recordingVisible]);
   // The overview list is hidden behind either a file preview or a browser tab.
   // A pinned list is also hidden while the browser surface is selected.
   const pinnedListVisible = panel.pinned && panel.hasContent && !browserOpen;
@@ -355,12 +359,14 @@ export function AgentThreadPanel(props: {
     });
   }, []);
   const setBrowserOpen = (open: boolean) => updateBrowser(ownerKey, state => ({ ...state, open }));
+  const lastRecordingRevealRequest = useRef(0);
+  useEffect(() => {
+    const requestId = props.recordingRevealRequestId ?? 0;
+    if (!requestId || requestId <= lastRecordingRevealRequest.current) return;
+    lastRecordingRevealRequest.current = requestId;
+    updateBrowser(ownerKey, state => state.open ? { ...state, open: false } : state);
+  }, [props.recordingRevealRequestId, ownerKey, updateBrowser]);
   const setActiveBrowserTabId = (activeId: number) => updateBrowser(ownerKey, state => ({ ...state, activeId }));
-  const closeFileTab = (id: string) => {
-    const closingLastFile = panel.tabState.tabs.length === 1 && panel.tabState.tabs[0]?.id === id;
-    panel.closeTab(id);
-    if (closingLastFile && browserMounted && browserTabs.length > 0) setBrowserOpen(true);
-  };
   const addBrowserTab = useCallback((url?: string, owner = ownerKey, fromPagePopup = false) => {
     const id = nextBrowserTabId.current++;
     updateBrowser(owner, state => {
@@ -606,6 +612,7 @@ export function AgentThreadPanel(props: {
     panel.hasContent ? "thread-panel--content" : "thread-panel--sidebar",
     listVisible ? "thread-panel--list-visible" : "",
     fullscreen ? "thread-panel--fullscreen" : "",
+    panel.overlay ? "thread-panel--overlay" : "",
   ].filter(Boolean).join(" ");
 
   return (
@@ -615,7 +622,7 @@ export function AgentThreadPanel(props: {
         height: 600, opacity: 0, pointerEvents: 'none',
       } : { display: 'none' }) : fullscreen ? undefined : { width: panel.width }}
       aria-label={t("home.threadPanel.label")}>
-      {fullscreen ? null : (
+      {fullscreen || panel.overlay ? null : (
         <div
           className={`thread-panel__sash${panel.resizing ? " thread-panel__sash--active" : ""}`}
           role="separator"
@@ -662,7 +669,10 @@ export function AgentThreadPanel(props: {
                 setBrowserOpen(false);
                 panel.activateTab(id);
               }}
-              onClose={closeFileTab}
+              onClose={(id) => {
+                if (panel.tabState.tabs.find((tab) => tab.id === id)?.type === "recording") props.onCloseRecording?.();
+                panel.closeTab(id);
+              }}
               browserTabs={browserMounted ? browserTabs : []}
               activeBrowserTabId={activeBrowserTabId}
               onActivateBrowser={(id) => {
@@ -676,6 +686,12 @@ export function AgentThreadPanel(props: {
           ) : null}
         </div>
         <div className="thread-panel__header-actions">
+          {props.onOpenRecording && !panel.tabState.tabs.some((tab) => tab.type === "recording") ? (
+            <button type="button" className="thread-panel__icon-button" aria-label={t("recording.page.title")}
+              title={t("recording.page.title")} onClick={() => { setBrowserOpen(false); props.onOpenRecording?.(); }}>
+              <AudioLines size={16} aria-hidden="true" />
+            </button>
+          ) : null}
           {(panel.hasContent || browserMounted) ? (
             <button
               type="button"
@@ -766,7 +782,12 @@ export function AgentThreadPanel(props: {
         ) : null}
         {!browserOpen && activeTab ? (
           <div className="thread-panel__main">
-            <ThreadTabPreview key={activeTab.id} tab={activeTab} context={props.previewContext} />
+            {activeTab.type === "recording"
+              ? props.recordingAuthenticated || (props.recordingSession && props.recordingSession.status !== "idle")
+                ? props.recordingSession ? <RecordingEntryPage session={props.recordingSession} /> : null
+                : <div className="recording-sign-in"><LockKeyhole size={24} /><p>{t("recording.page.signInTitle")}</p>
+                  <button type="button" onClick={props.onRecordingSignIn}>{t("recording.page.signIn")}</button></div>
+              : <ThreadTabPreview key={activeTab.id} tab={activeTab} context={props.previewContext} />}
           </div>
         ) : null}
       </div>
@@ -935,7 +956,7 @@ function ThreadTabs(props: {
               data-thread-tab-id={tab.id}
               data-thread-tab-index={index}
               className={`thread-tab${active ? " thread-tab--active" : ""}`}
-              title={tab.type === "change" ? tab.absolutePath ?? tab.path : tab.path ?? tab.name}
+              title={tab.type === "change" ? tab.absolutePath ?? tab.path : tab.type === "file" ? tab.path ?? tab.name : tab.name}
               onClick={() => props.onActivate(tab.id)}
               onAuxClick={(event) => {
                 if (event.button !== 1) return;
@@ -945,7 +966,7 @@ function ThreadTabs(props: {
               onKeyDown={(event) => handleKeyDown(event, index)}
             >
               <span className="thread-tab__icon">
-                <ThreadFileIcon name={tab.name} />
+                {tab.type === "recording" ? <AudioLines size={16} /> : <ThreadFileIcon name={tab.name} />}
               </span>
               <span className="thread-tab__title">{tab.name}</span>
               <button

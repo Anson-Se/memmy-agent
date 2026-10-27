@@ -1543,6 +1543,33 @@ describe("app state store migrations", () => {
     expect(historicalMigration).toBeUndefined();
   });
 
+  it("recognizes the earlier plugin removal migration filename", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "memmy-app-state-"));
+    const databasePath = join(tempDir, "app.sqlite");
+    const initialStore = createAppStateStore({ databasePath });
+
+    initialStore.db
+      .prepare("UPDATE _migrations SET name = ? WHERE name = ?")
+      .run("0030-plugin-uninstall-preferences.sql", "0029-plugin-uninstall-preferences.sql");
+    initialStore.close();
+
+    const recoveredStore = createAppStateStore({ databasePath });
+    const currentMigration = recoveredStore.db
+      .prepare("SELECT name FROM _migrations WHERE name = ?")
+      .get("0029-plugin-uninstall-preferences.sql");
+    const historicalMigration = recoveredStore.db
+      .prepare("SELECT name FROM _migrations WHERE name = ?")
+      .get("0030-plugin-uninstall-preferences.sql");
+    const table = recoveredStore.db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plugin_uninstall_preferences'")
+      .get();
+    recoveredStore.close();
+
+    expect(currentMigration).toEqual({ name: "0029-plugin-uninstall-preferences.sql" });
+    expect(historicalMigration).toBeUndefined();
+    expect(table).toEqual({ name: "plugin_uninstall_preferences" });
+  });
+
   it("migrates the existing account scan permission into the installation scope", () => {
     tempDir = mkdtempSync(join(tmpdir(), "memmy-app-state-"));
     const databasePath = join(tempDir, "app.sqlite");

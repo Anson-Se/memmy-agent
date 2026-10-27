@@ -27,7 +27,7 @@ describe("plugin and connection catalog localization", () => {
   ])("localizes labels and examples while preserving supplied plugin names in %s", (language, title, search, install, caption, example) => {
     const html = renderToString(<I18nProvider language={language}>
       <PluginMarketplaceSection plugins={[{ id: "custom", name: "用户插件", description: "Supplied by the host", category: "research", installable: true }]}
-        officialModelReady={true} onInstall={vi.fn()} onUninstall={vi.fn()} onEnable={vi.fn()}
+        officialModelReady={true} onInstall={vi.fn()} onUpdate={vi.fn()} onUninstall={vi.fn()} onEnable={vi.fn()}
         onAddToChat={vi.fn()} onConfigureModel={vi.fn()} onRefresh={vi.fn()} />
       <PluginDetailPreview category="research" name="用户插件" />
     </I18nProvider>);
@@ -54,7 +54,7 @@ describe("plugin and connection catalog localization", () => {
     const name = "User $& $` $' \\path {name} {kind}";
     const html = renderToString(<I18nProvider language={language}>
       <PluginMarketplaceSection plugins={[{ id: "literal", name, description: "Supplied by the host", category: "research", installable: true }]}
-        officialModelReady={true} onInstall={vi.fn()} onUninstall={vi.fn()} onEnable={vi.fn()}
+        officialModelReady={true} onInstall={vi.fn()} onUpdate={vi.fn()} onUninstall={vi.fn()} onEnable={vi.fn()}
         onAddToChat={vi.fn()} onConfigureModel={vi.fn()} onRefresh={vi.fn()} />
     </I18nProvider>);
     const rendered = document.createElement("div");

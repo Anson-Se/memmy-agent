@@ -1,10 +1,15 @@
 import type { KeyboardEventHandler, MouseEventHandler, ReactNode } from "react";
 import { X } from "lucide-react";
-import { FileTypeIcon } from "../components/file-type-icon.js";
-import { resolveFileType, type FileDisplayKind, type ResolvedFileType } from "../lib/file-type.js";
 
-export type AgentFileDisplayKind = FileDisplayKind;
-export type AgentFileVisual = ResolvedFileType;
+export type AgentFileDisplayKind = "pdf" | "docx" | "xlsx" | "pptx" | "file";
+
+export interface AgentFileVisual {
+  kind: AgentFileDisplayKind;
+  label: string;
+  shortLabel: "PDF" | "DOC" | "XLS" | "PPT" | "FILE";
+  typeLabel: string;
+  tileClassName: string;
+}
 
 export interface AgentAttachmentNameParts {
   displayName: string;
@@ -33,8 +38,39 @@ export interface AgentAttachmentCardProps {
   align?: "left" | "right";
 }
 
+const TEXT_FILE_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".xml",
+  ".html",
+  ".htm",
+  ".log",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".cfg",
+]);
+
 export function resolveAgentFileVisual(name: string, mime?: string): AgentFileVisual {
-  return resolveFileType(name, mime);
+  const extension = fileExtension(name);
+  const normalizedMime = String(mime ?? "").toLowerCase();
+  const kind: AgentFileDisplayKind =
+    extension === ".pdf" || normalizedMime === "application/pdf"
+      ? "pdf"
+      : extension === ".docx" || normalizedMime.includes("wordprocessingml")
+        ? "docx"
+        : extension === ".xlsx" || normalizedMime.includes("spreadsheetml")
+          ? "xlsx"
+          : extension === ".pptx" || normalizedMime.includes("presentationml")
+            ? "pptx"
+            : TEXT_FILE_EXTENSIONS.has(extension)
+              ? "file"
+              : "file";
+
+  return visualForKind(kind, attachmentTypeLabel(name));
 }
 
 export function splitAgentAttachmentName(name: string, fallbackExtension?: string): AgentAttachmentNameParts {
@@ -52,24 +88,30 @@ export function splitAgentAttachmentName(name: string, fallbackExtension?: strin
 export function AgentFileIconTile(props: {
   name: string;
   mime?: string;
-  filePath?: string;
   size?: "sm" | "md";
 }) {
+  const visual = resolveAgentFileVisual(props.name, props.mime);
+  const sizeClassName = props.size === "md" ? "agent-attachment-card__file-tile--md" : "agent-attachment-card__file-tile--sm";
   return (
-    <FileTypeIcon
-      name={props.name}
-      mime={props.mime}
-      filePath={props.filePath}
-      surface={props.size === "md" ? "card" : "row"}
-      className="agent-attachment-card__file-type-icon"
-    />
+    <span
+      className={`agent-attachment-card__file-tile ${sizeClassName} ${visual.tileClassName}`}
+      aria-label={visual.label}
+      data-testid={`agent-file-icon-${visual.kind}`}
+    >
+      <FileTypeMark kind={visual.kind} />
+    </span>
   );
 }
 
 export function AgentAttachmentCard(props: AgentAttachmentCardProps) {
   const nameParts = splitAgentAttachmentName(props.name);
   const title = props.title ?? props.name;
-  const primaryLabel = props.disabled && props.busyLabel ? props.busyLabel : nameParts.displayName;
+  const fileLabel = basenameWithoutQuery(props.name) || nameParts.displayName;
+  const primaryLabel = props.disabled && props.busyLabel
+    ? props.busyLabel
+    : props.kind === "file"
+      ? fileLabel
+      : nameParts.displayName;
   const subline = props.subline ?? nameParts.extensionLabel;
   const baseClassName = [
     "agent-attachment-card",
@@ -103,7 +145,7 @@ export function AgentAttachmentCard(props: AgentAttachmentCardProps) {
           ) : null}
         </span>
       ) : (
-        <AgentFileIconTile name={props.name} mime={props.mime} filePath={props.filePath} size="md" />
+        <AgentFileIconTile name={props.name} mime={props.mime} size="md" />
       )}
       <span className="agent-attachment-card__body">
         <span className="agent-attachment-card__name">
@@ -191,6 +233,86 @@ export function AgentAttachmentCard(props: AgentAttachmentCardProps) {
       {content}
     </div>
   );
+}
+
+function FileTypeMark(props: { kind: AgentFileDisplayKind }) {
+  return (
+    <svg viewBox="0 0 32 32" aria-hidden="true">
+      <rect width="32" height="32" rx="8" fill="currentColor" />
+      {props.kind === "pdf" ? <path fill="#fff" d="M16 6.5 25.5 24h-19L16 6.5Zm0 6.2-3.2 7.3h6.4L16 12.7Z" /> : null}
+      {props.kind === "xlsx" ? <path fill="#fff" d="M8 9.2h4.6v4H8v-4Zm5.7 0h4.6v4h-4.6v-4Zm5.7 0H24v4h-4.6v-4ZM8 14.4h4.6v4H8v-4Zm5.7 0h4.6v4h-4.6v-4Zm5.7 0H24v4h-4.6v-4ZM8 19.6h4.6V23H8v-3.4Zm5.7 0h4.6V23h-4.6v-3.4Zm5.7 0H24V23h-4.6v-3.4Z" /> : null}
+      {props.kind === "docx" ? <path fill="#fff" d="M8.2 11.2h15.6v1.8H8.2v-1.8Zm0 4h15.6v1.8H8.2v-1.8Zm0 4h10.4v1.8H8.2V19.2Z" /> : null}
+      {props.kind === "pptx" ? (
+        <>
+          <rect x="7" y="9" width="18" height="12" rx="1.5" fill="none" stroke="#fff" strokeWidth="1.7" />
+          <path fill="#fff" d="M12.8 21.6h6.4v1.7h-6.4z" />
+        </>
+      ) : null}
+      {props.kind === "file" ? (
+        <>
+          <path fill="#fff" d="M11 7.5h6.2L22.5 13v11.2a1.3 1.3 0 0 1-1.3 1.3H11a1.3 1.3 0 0 1-1.3-1.3V8.8A1.3 1.3 0 0 1 11 7.5Z" />
+          <path fill="currentColor" d="M16.8 7.8v4.4h4.4" />
+          <path fill="currentColor" d="M12.2 16.4h7.2v1.3h-7.2v-1.3Zm0 2.6h7.2v1.3h-7.2v-1.3Zm0 2.6h4.8v1.3h-4.8v-1.3Z" />
+        </>
+      ) : null}
+    </svg>
+  );
+}
+
+function visualForKind(kind: AgentFileDisplayKind, typeLabel: string): AgentFileVisual {
+  switch (kind) {
+    case "pdf":
+      return {
+        kind,
+        label: "PDF file",
+        shortLabel: "PDF",
+        typeLabel,
+        tileClassName: "agent-attachment-card__file-tile--pdf"
+      };
+    case "docx":
+      return {
+        kind,
+        label: "Word document",
+        shortLabel: "DOC",
+        typeLabel,
+        tileClassName: "agent-attachment-card__file-tile--docx"
+      };
+    case "xlsx":
+      return {
+        kind,
+        label: "Spreadsheet file",
+        shortLabel: "XLS",
+        typeLabel,
+        tileClassName: "agent-attachment-card__file-tile--xlsx"
+      };
+    case "pptx":
+      return {
+        kind,
+        label: "Presentation file",
+        shortLabel: "PPT",
+        typeLabel,
+        tileClassName: "agent-attachment-card__file-tile--pptx"
+      };
+    case "file":
+    default:
+      return {
+        kind: "file",
+        label: "File attachment",
+        shortLabel: "FILE",
+        typeLabel,
+        tileClassName: "agent-attachment-card__file-tile--file"
+      };
+  }
+}
+
+function attachmentTypeLabel(name: string): string {
+  return fileExtension(name).replace(/^\./, "").slice(0, 4).toUpperCase() || "FILE";
+}
+
+function fileExtension(name: string): string {
+  const base = basenameWithoutQuery(name);
+  const index = base.lastIndexOf(".");
+  return index > 0 ? base.slice(index).toLowerCase() : "";
 }
 
 function basenameWithoutQuery(name: string): string {

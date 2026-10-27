@@ -283,7 +283,8 @@ export function AppRouter(props: { onRetry: () => void }) {
 
   return (
     <>
-      {(currentPath === "/main" || (preserveHomeBrowser
+      {(currentPath === "/main" || ((preserveHomeBrowser || state.navigation.recordingRequestId > 0
+        || state.navigation.recordingStatus !== "idle")
         && resolveMainWindowActionRoute(currentPath) === "workspace")) && (
         <div style={currentPath === "/main" ? { display: "contents" } : {
           position: "fixed", left: -10_000, top: 0, width: 800, height: 600,

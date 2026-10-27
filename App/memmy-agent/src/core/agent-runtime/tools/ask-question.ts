@@ -42,7 +42,10 @@ type NormalizedQuestion = {
 };
 
 type PendingQuestion = {
+  channel: string;
   chatId: string;
+  sessionKey: string | null;
+  turnId: string | null;
   questions: NormalizedQuestion[];
   resolve: (response: AgentQuestionResponse) => void;
   reject: (error: Error) => void;
@@ -70,7 +73,7 @@ function validateResponse(
     }
     const otherText = answer.otherText?.trim() ?? "";
     if (otherText && !question.allowOther) return "other_answer_not_allowed";
-    if (selectedIds.size === 0 && !otherText) return "empty_answer";
+    // An empty selection is an explicit skip from the question card.
   }
   return null;
 }
@@ -98,8 +101,26 @@ export function respondToAgentQuestion(input: {
   return { ok: true };
 }
 
+export function isAgentQuestionPending(requestId: string, chatId: string): boolean {
+  return pendingQuestions.get(requestId)?.chatId === chatId;
+}
+
 export function pendingAgentQuestionCount(): number {
   return pendingQuestions.size;
+}
+
+export function pendingAgentQuestionTurnId(input: {
+  channel: string;
+  chatId: string;
+  sessionKey: string;
+}): string | null {
+  for (const pending of pendingQuestions.values()) {
+    if (pending.channel === input.channel
+      && pending.chatId === input.chatId
+      && pending.sessionKey === input.sessionKey
+      && pending.turnId) return pending.turnId;
+  }
+  return null;
 }
 
 function questionFallback(title: string | undefined, questions: Question[]): string {
@@ -149,6 +170,9 @@ export class AskQuestionTool extends Tool {
     return (
       "Present a structured question card when you are blocked on a decision that genuinely belongs to the user. " +
       "Use this instead of asking a plain-text multiple-choice question. Each question needs at least two options. " +
+      "For each question, decide whether more than one option can apply and set allow_multiple accordingly. " +
+      "Use true for lists such as which categories to add, and false for mutually exclusive choices. " +
+      "Only add option descriptions when they distinguish choices in a way the short labels cannot; omit repetitive or obvious descriptions. " +
       "This tool waits for the user's card response and returns the structured answers; continue the current task after it returns. " +
       "Do not use it for rhetorical questions, information you can discover yourself, or routine confirmations."
     );
@@ -188,15 +212,22 @@ export class AskQuestionTool extends Tool {
                   properties: {
                     id: { type: "string", minLength: 1, maxLength: 64 },
                     label: { type: "string", minLength: 1, maxLength: 120 },
-                    description: { type: "string", maxLength: 240 },
+                    description: {
+                      type: "string",
+                      maxLength: 240,
+                      description: "Optional. Include only decision-critical details not already clear from the label; omit repeated explanations.",
+                    },
                   },
                   required: ["id", "label"],
                 },
               },
-              allow_multiple: { type: "boolean" },
+              allow_multiple: {
+                type: "boolean",
+                description: "Choose for this question: true when the user may select several applicable options (for example, multiple categories to add); false only when the options are mutually exclusive.",
+              },
               allow_other: { type: "boolean" },
             },
-            required: ["id", "prompt", "options"],
+            required: ["id", "prompt", "options", "allow_multiple"],
           },
         },
       },
@@ -262,7 +293,10 @@ export class AskQuestionTool extends Tool {
       };
       const cleanup = () => signal?.removeEventListener("abort", onAbort);
       pendingQuestions.set(requestId, {
+        channel: context.channel!,
         chatId: context.chatId!,
+        sessionKey: context.sessionKey ?? null,
+        turnId: typeof context.metadata?.turn_id === "string" ? context.metadata.turn_id : null,
         questions: normalizedQuestions,
         resolve,
         reject,
@@ -306,6 +340,13 @@ export class AskQuestionTool extends Tool {
     }
 
     const response = await responsePromise;
-    return JSON.stringify({ status: response.cancelled ? "cancelled" : "answered", ...response });
+    if (response.cancelled) return JSON.stringify({ status: "cancelled", ...response });
+    return JSON.stringify({
+      status: "answered",
+      ...response,
+      skippedQuestionIds: response.answers
+        .filter((answer) => answer.selectedOptionIds.length === 0 && !answer.otherText?.trim())
+        .map((answer) => answer.questionId),
+    });
   }
 }

@@ -1,3 +1,4 @@
+@import "./literature-review-original-cards.css";
 .agent-confirmation-dock { display: flex; flex-direction: column; gap: 10px; }
 .agent-question-dock:empty, .agent-confirmation-dock:empty { display: none; }
 /* The native question card covers the composer until the answer is submitted. */

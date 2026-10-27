@@ -113,7 +113,7 @@ describe("independent interview recording entries", () => {
     // mid-width are what made the wave read as bars of uneven thickness, and a
     // fractional bar width lets each one round to a different device pixel.
     // Read from the stylesheet — the test environment does not apply it.
-    const css = readFileSync(resolve(here, "../../styles.css"), "utf8");
+    const css = readFileSync(resolve(here, "../conversation-features.css"), "utf8");
     const barRule = /\.recording-waveform__bar \{[^}]*width: ([0-9.]+)px/.exec(css);
     const rowRule = /\.recording-waveform \{[^}]*gap: ([0-9.]+)px/.exec(css);
     expect(barRule).not.toBeNull();

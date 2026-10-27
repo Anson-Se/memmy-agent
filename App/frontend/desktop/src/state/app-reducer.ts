@@ -224,11 +224,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     case "recording/requestHandled":
       return action.requestId <= state.navigation.recordingHandledId ? state : {
-        ...state, navigation: { ...state.navigation, recordingHandledId: action.requestId }
+        ...state,
+        navigation: { ...state.navigation, recordingHandledId: action.requestId }
       };
     case "recording/statusChanged":
       return state.navigation.recordingStatus === action.status ? state : {
-        ...state, navigation: { ...state.navigation, recordingStatus: action.status }
+        ...state,
+        navigation: { ...state.navigation, recordingStatus: action.status }
       };
     case "window/visibilityChanged":
       if (state.navigation.windowVisible === action.visible) return state;

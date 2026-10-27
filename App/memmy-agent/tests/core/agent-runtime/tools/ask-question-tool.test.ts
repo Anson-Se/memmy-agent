@@ -8,6 +8,53 @@ import { RequestContext } from "../../../../src/core/agent-runtime/tools/context
 import type { OutboundMessage } from "../../../../src/core/runtime-messages/events.js";
 
 describe("AskQuestionTool", () => {
+  it("requires a per-question choice of single or multiple and accepts several selected categories", async () => {
+    const sent: OutboundMessage[] = [];
+    const tool = new AskQuestionTool({ sendCallback: async (message) => { sent.push(message); } });
+    tool.setContext(new RequestContext({ channel: "websocket", chatId: "chat-categories" }));
+    expect(tool.parameters.properties.questions.items.required).toContain("allow_multiple");
+    const resultPromise = tool.execute({ questions: [{
+      id: "categories",
+      prompt: "Which categories should I add?",
+      options: [
+        { id: "pets", label: "Pets" },
+        { id: "fitness", label: "Fitness" },
+      ],
+      allow_multiple: true,
+    }] });
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const card = sent[0]!.metadata.agentUi.questionCard;
+    expect(card.questions[0].allowMultiple).toBe(true);
+    expect(sent[0]!.buttons).toEqual([]);
+    expect(respondToAgentQuestion({ chatId: "chat-categories", response: {
+      requestId: card.requestId,
+      answers: [{ questionId: "categories", selectedOptionIds: ["pets", "fitness"] }],
+    } })).toEqual({ ok: true });
+    await expect(resultPromise).resolves.toSatisfy((value) => (
+      JSON.parse(value).answers[0].selectedOptionIds.join(",") === "pets,fitness"
+    ));
+  });
+
+  it("continues the turn when the user explicitly skips a question", async () => {
+    const sent: OutboundMessage[] = [];
+    const tool = new AskQuestionTool({ sendCallback: async (message) => { sent.push(message); } });
+    tool.setContext(new RequestContext({ channel: "websocket", chatId: "chat-skip" }));
+    const resultPromise = tool.execute({ questions: [{
+      id: "optional",
+      prompt: "Which format?",
+      options: [{ id: "pdf", label: "PDF" }, { id: "docx", label: "Word" }],
+    }] });
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const requestId = sent[0]!.metadata.agentUi.questionCard.requestId;
+    expect(respondToAgentQuestion({ chatId: "chat-skip", response: {
+      requestId, answers: [{ questionId: "optional", selectedOptionIds: [] }],
+    } })).toEqual({ ok: true });
+    await expect(resultPromise).resolves.toSatisfy((value) => {
+      const result = JSON.parse(value);
+      return result.status === "answered" && result.skippedQuestionIds[0] === "optional";
+    });
+  });
+
   it("sends a persistent structured question to the active conversation", async () => {
     const sent: OutboundMessage[] = [];
     const tool = new AskQuestionTool({ sendCallback: async (message) => { sent.push(message); } });

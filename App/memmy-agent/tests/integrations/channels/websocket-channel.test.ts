@@ -833,6 +833,38 @@ describe("WebSocket channel", () => {
     expect(channel.getWebuiQueueSnapshot).toHaveBeenCalledTimes(1);
   });
 
+  it("accepts reorder only from an attached chat and broadcasts the new snapshot", async () => {
+    const channel = webuiChannel(new MessageBus());
+    const first = connection();
+    const second = connection();
+    const chatId = "chat-queue-reorder";
+    const ids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+    channel.attachConnection(first, chatId);
+    channel.attachConnection(second, chatId);
+    channel.reorderQueuedWebuiMessages = vi.fn(async () => ({ outcome: "reordered" as const, revision: 4 }));
+    channel.getWebuiQueueSnapshot = vi.fn(async () => ({ revision: 4, items: [], startedItems: [] }));
+
+    await channel.dispatchEnvelope(first, "client", {
+      type: "queue_reorder", chat_id: chatId,
+      request_id: "33333333-3333-4333-8333-333333333333",
+      ordered_ids: [...ids].reverse(), expected_revision: 3,
+    });
+    expect(channel.reorderQueuedWebuiMessages).toHaveBeenCalledWith(`websocket:${chatId}`, [...ids].reverse(), 3);
+    for (const ws of [first, second]) {
+      expect(ws.send.mock.calls.map(([payload]) => JSON.parse(payload))).toContainEqual(expect.objectContaining({
+        event: "message_queue_snapshot", chat_id: chatId, revision: 4,
+      }));
+    }
+    expect(first.send.mock.calls.map(([payload]) => JSON.parse(payload))).toContainEqual(expect.objectContaining({
+      event: "queue_reorder_result", chat_id: chatId, ok: true,
+    }));
+    await channel.dispatchEnvelope(first, "client", {
+      type: "queue_reorder", chat_id: "other-chat", request_id: "44444444-4444-4444-8444-444444444444",
+      ordered_ids: ids, expected_revision: 4,
+    });
+    expect(channel.reorderQueuedWebuiMessages).toHaveBeenCalledTimes(1);
+  });
+
   it("projects an IM queue event only to the matching canonical Session subscribers", async () => {
     const channel = webuiChannel(new MessageBus());
     const matching = connection();

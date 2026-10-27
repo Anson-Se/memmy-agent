@@ -20,6 +20,8 @@ type AugmentAssistantText = (text: string) => string;
 type TranscriptMediaKind = "image" | "video" | "file";
 
 export interface ReplayTranscriptOptions {
+  /** Runtime truth for cards after a gateway restart; does not reorder or settle other messages. */
+  isQuestionPending?: (requestId: string) => boolean;
   augmentUserMedia?: AugmentUserMedia | null;
   augmentAssistantMedia?: AugmentAssistantMedia | null;
   augmentAssistantText?: AugmentAssistantText | null;
@@ -1279,6 +1281,7 @@ export function replayTranscriptToUiMessages(lines: Dict[], options: ReplayTrans
         messages[index] = {
           ...candidate,
           questionResponse: { requestId, answers: rec.answers, ...(rec.cancelled === true ? { cancelled: true } : {}) },
+          ...(rec.cancelled === true ? { questionInterrupted: true } : {}),
         };
         break;
       }
@@ -1566,6 +1569,14 @@ export function replayTranscriptToUiMessages(lines: Dict[], options: ReplayTrans
       && !closedReplayTurnIds.has(out.turnId);
     if (out.kind !== "context_compaction" && !belongsToOpenIdentifiedTurn) delete out.isStreaming;
     if (!belongsToOpenIdentifiedTurn) delete out.reasoningStreaming;
+    const card = isDict(out.agent_ui) && isDict(out.agent_ui.questionCard) ? out.agent_ui.questionCard : null;
+    if (card && !out.questionResponse && (
+      (typeof out.turnId === "string" && closedReplayTurnIds.has(out.turnId))
+      || (typeof card.requestId === "string" && options.isQuestionPending?.(card.requestId) === false)
+    )) {
+      out.questionInterrupted = true;
+      delete out.isStreaming;
+    }
     return out;
   });
 }

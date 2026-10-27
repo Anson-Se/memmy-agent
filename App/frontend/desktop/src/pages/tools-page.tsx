@@ -1,3 +1,4 @@
+import "./plugin-tools-layout.css";
 /** Tools page module. */
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link2, MessageCircle, Puzzle } from "lucide-react";
@@ -197,10 +198,10 @@ export function ToolsPageView(props: ToolsPageViewProps) {
   const modalConnection = modalIntegration ? selectConnectionForIntegration(props.tools, modalIntegration) : undefined;
 
   return (
-    <AppFrame title={t("tools.hubTitle")} topBarInset={true}>
+    <AppFrame title={t("tools.hubTitle")} topBarInset={true} topBarInsetOffsetPx={-8}>
       <div
         className="app-frame-page-content h-full overflow-y-auto tools-page-content"
-        style={{ paddingTop: 0, paddingBottom: 24 }}
+        style={{ paddingBottom: 24 }}
       >
         <div role="tablist" aria-label={t("tools.hubTitle")} className="plugin-marketplace-tabs" data-window-drag-exclusion="tools-tabs">
           {(["connections", "channels", "plugins"] as const).map((item) => (

@@ -266,30 +266,6 @@ describe("prototype style alignment", () => {
     expect(globalCss).not.toContain(".agent-conversation-scroll::-webkit-scrollbar");
   });
 
-  it("keeps the closed and open thread-panel controls on one toolbar grid", () => {
-    const collapsedThreadTopbarRule = globalCss.match(
-      /\.app-frame-content-topbar\.thread-topbar:not\(:has\(\.memory-token-budget-capsule\)\)\s*\{[^}]*\}/
-    )?.[0] ?? "";
-    const threadPanelHeaderRule = globalCss.match(/\.thread-panel__header\s*\{[^}]*\}/)?.[0] ?? "";
-
-    expect(collapsedThreadTopbarRule).toContain("grid-template-columns: minmax(0, 1fr) 0 0;");
-    expect(collapsedThreadTopbarRule).toContain("column-gap: 0;");
-    expect(threadPanelHeaderRule).toContain("height: var(--codex-toolbar-height);");
-    expect(threadPanelHeaderRule).toContain("flex: 0 0 var(--codex-toolbar-height);");
-    expect(threadPanelHeaderRule).toContain("align-items: center;");
-    expect(threadPanelHeaderRule).toContain("padding: 0 12px;");
-    expect(threadPanelHeaderRule).toContain("box-shadow: inset 0 -1px");
-    expect(threadPanelHeaderRule).not.toContain("border-bottom:");
-  });
-
-  it("keeps the live recording status clear of the page divider", () => {
-    const recordingStatusSpacingRule = globalCss.match(
-      /\.recording-page > \.recording-panel__status\s*\{[^}]*\}/
-    )?.[0] ?? "";
-
-    expect(recordingStatusSpacingRule).toContain("margin-top: 8px;");
-  });
-
   it("clips content glows without turning their surfaces into scroll containers", () => {
     const glowSurfaceRule = globalCss.match(/^\.bg-content-bg,\n\.agent-conversation-panel\s*\{[^}]*\}/m)?.[0] ?? "";
     const conversationPanelRules = Array.from(globalCss.matchAll(/^\.agent-conversation-panel\s*\{[^}]*\}/gm), (match) => match[0]);

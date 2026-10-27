@@ -103,9 +103,6 @@ import {
   type GoalTurnInboxEntry,
   type WebuiQueueSteerTransferRecord,
 } from "./goal-runtime.js";
-import { TaskPlanRuntime } from "./task-plan-runtime.js";
-import { createTaskPlanContinuation } from "./task-plan-continuation.js";
-import { createArtifactDeliveryContinuation } from "./artifact-delivery-continuation.js";
 import { resolveToolResultMaxChars, SESSION_TOOL_RESULT_MAX_CHARS_BY_NAME } from "./tool-result-budget.js";
 import { AgentProgressHook } from "./progress-hook.js";
 import { createTurnCancellationBoundary, type TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
@@ -113,6 +110,9 @@ import { ToolLoader } from "./tools/loader.js";
 import { RequestContext, ToolContext } from "./tools/context.js";
 import { ExecSessionManager } from "./tools/exec-session.js";
 import { MessageTool, type MessageSendCallback } from "./tools/message.js";
+import { TaskPlanRuntime } from "./task-plan-runtime.js";
+import { createTaskPlanContinuation } from "./task-plan-continuation.js";
+import { createArtifactDeliveryContinuation } from "./artifact-delivery-continuation.js";
 import { FileStateStore } from "./tools/file-state.js";
 import { connectMissingServers, handleRuntimeControl, reloadLock, runtimeLines as mcpRuntimeLines, sessionExtra as mcpSessionExtra } from "./tools/mcp.js";
 import { BrowserSessionManager, type BrowserScope } from "./tools/browser.js";
@@ -583,13 +583,13 @@ export function hasReportedInOutUsage(
 
 class AsyncMutex {
   private locked = false;
-  private waiters: Array<{ priority: number; resume: () => void }> = [];
+  private waiters: Array<{ priority: number; key?: string; resume: () => void }> = [];
 
-  async runExclusive<T>(fn: () => Promise<T>, priority = Date.now()): Promise<T> {
+  async runExclusive<T>(fn: () => Promise<T>, priority = Date.now(), key?: string): Promise<T> {
     if (this.locked) {
       await new Promise<void>((resume) => {
         const index = this.waiters.findIndex((waiter) => waiter.priority > priority);
-        const waiter = { priority, resume };
+        const waiter = { priority, key, resume };
         if (index < 0) this.waiters.push(waiter);
         else this.waiters.splice(index, 0, waiter);
       });
@@ -603,6 +603,15 @@ class AsyncMutex {
       if (next) next.resume();
       else this.locked = false;
     }
+  }
+
+  reorderWaiters(orderedKeys: readonly string[]): void {
+    const rank = new Map(orderedKeys.map((key, index) => [key, index]));
+    const indices = this.waiters.flatMap((waiter, index) =>
+      waiter.key && rank.has(waiter.key) ? [index] : []);
+    const reordered = indices.map((index) => this.waiters[index]!)
+      .sort((left, right) => rank.get(left.key!)! - rank.get(right.key!)!);
+    indices.forEach((index, position) => { this.waiters[index] = reordered[position]!; });
   }
 }
 
@@ -638,6 +647,11 @@ export type QueueSnapshotDescriptor = {
 
 export type RemoveQueuedMessageResult = {
   outcome: "removed" | "already_dequeued" | "missing";
+  revision: number;
+};
+
+export type ReorderQueuedMessageResult = {
+  outcome: "reordered" | "stale" | "unsupported";
   revision: number;
 };
 
@@ -926,10 +940,7 @@ export class AgentLoop {
       scheduleGoalWork: (sessionKey, goal) => this.scheduleGoalWork(sessionKey, goal),
       invalidateGoalWork: (sessionKey) => this.scheduledGoalSessions.delete(sessionKey),
     });
-    this.taskPlanRuntime = new TaskPlanRuntime({
-      sessions: this.sessions,
-      bus: this.bus,
-    });
+    this.taskPlanRuntime = new TaskPlanRuntime({ sessions: this.sessions, bus: this.bus });
     this.projectStore = init.projectStore ?? null;
     this.guiTranscriptMirror = init.guiTranscriptMirror ?? null;
     const terminalControlRoot = this.sessions.root
@@ -2199,6 +2210,45 @@ export class AgentLoop {
 
   async getWebuiQueueSnapshot(sessionKey: string): Promise<QueueSnapshotDescriptor> {
     return this.getQueueSnapshot(sessionKey);
+  }
+
+  async reorderQueuedWebuiMessages(
+    sessionKey: string,
+    orderedIds: readonly string[],
+    expectedRevision: number,
+  ): Promise<ReorderQueuedMessageResult> {
+    return this.queueMutationLockFor(sessionKey).runExclusive(async () => {
+      const revision = this.queueRevision(sessionKey);
+      const slots = (this.turnSlots.get(sessionKey) ?? []).filter((slot) =>
+        slot.state === "queued" && slot.announcedToWebui && isSharedQueueMessage(slot.root));
+      const inbox = this.goalRuntime.inbox(sessionKey).filter((entry) =>
+        entry.turnId === null && this.queueDescriptorFromInboxEntry(sessionKey, entry) !== null);
+      const currentIds = [
+        ...slots.map((slot) => String(slot.root.metadata.client_request_id)),
+        ...inbox.map((entry) => String(entry.metadata.client_request_id)),
+      ];
+      if (revision !== expectedRevision || orderedIds.length < 2
+        || orderedIds.length !== currentIds.length
+        || new Set(orderedIds).size !== orderedIds.length
+        || orderedIds.some((id) => !currentIds.includes(id))) {
+        return { outcome: "stale" as const, revision };
+      }
+      if (slots.length && inbox.length) return { outcome: "unsupported" as const, revision };
+      const originalTimes = [...slots.map((slot) => Date.parse(String(slot.root.metadata.queued_at))),
+        ...inbox.map((entry) => Date.parse(String(entry.metadata.queued_at)))];
+      const first = Math.min(...originalTimes.filter(Number.isFinite));
+      const queuedAtById = new Map(orderedIds.map((id, index) =>
+        [id, new Date(first + index).toISOString()]));
+      if (slots.length) {
+        for (const slot of slots) {
+          slot.root.metadata.queued_at = queuedAtById.get(String(slot.root.metadata.client_request_id))!;
+        }
+        this.lockFor(sessionKey).reorderWaiters(orderedIds);
+      } else {
+        await this.goalRuntime.reorderInboxEntries(sessionKey, orderedIds, queuedAtById);
+      }
+      return { outcome: "reordered" as const, revision: this.advanceQueueRevision(sessionKey) };
+    });
   }
 
   async removeQueuedMessage(
@@ -5514,7 +5564,7 @@ export class AgentLoop {
           }
           return;
         }
-      }, queuedAt);
+      }, queuedAt, String(initialSlot.root.metadata?.client_request_id ?? ""));
     } finally {
       await this.cleanupOwnedSlots(
         sessionKey,

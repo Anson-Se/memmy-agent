@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import {
+  formatRecordingTitleTimestamp,
   RecordingEntryPage,
   type RecordingArchiveEntry,
   type RecordingEntrySession
@@ -45,6 +46,7 @@ function session(overrides: Partial<RecordingEntrySession> = {}): RecordingEntry
     resume: vi.fn(),
     finish: vi.fn(),
     back: vi.fn(),
+    showLive: vi.fn(),
     open: vi.fn(),
     upload: vi.fn(),
     retry: vi.fn(),
@@ -89,17 +91,35 @@ describe("RecordingEntryPage", () => {
     expect(container.textContent).toContain("已转写");
   });
 
+  it("does not repeat the timestamp beneath a generated recording title", async () => {
+    const stamp = formatRecordingTitleTimestamp(entry.recordedAt);
+    await render(session({ recordings: [{ ...entry, title: `录音记录 ${stamp}` }] }));
+    const row = container.querySelector(".recording-page__list-row")!;
+    expect(row.textContent?.split(stamp)).toHaveLength(2);
+  });
+
+  it("distinguishes older recordings that still have the undated default title", async () => {
+    const stamp = formatRecordingTitleTimestamp(entry.recordedAt);
+    await render(session({ recordings: [{ ...entry, title: "录音记录" }] }));
+    const row = container.querySelector(".recording-page__list-row")!;
+    expect(row.textContent).toContain(`录音记录 ${stamp}`);
+    expect(row.textContent?.split(stamp)).toHaveLength(2);
+  });
+
   it("sends a row as a summary task or into the current conversation", async () => {
     const value = session();
     await render(value);
 
-    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__list-action")!.click());
+    // 总结 starts a new task; 添加到会话 stays where the user is. Both send the
+    // same transcript, so the two must be distinguishable by more than a click.
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__more-trigger")!.click());
-    await act(async () => [...container.querySelectorAll<HTMLButtonElement>(".recording-page__more-menu button")]
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
       .find((button) => button.textContent?.includes("总结"))!.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>(".recording-page__list-action")]
+      .find((button) => button.textContent?.includes("添加到会话"))!.click());
 
-    expect(value.deliver).toHaveBeenNthCalledWith(1, entry, "attach");
-    expect(value.deliver).toHaveBeenNthCalledWith(2, entry, "summarize");
+    expect(value.deliver).toHaveBeenNthCalledWith(1, entry, "summarize");
+    expect(value.deliver).toHaveBeenNthCalledWith(2, entry, "attach");
   });
 
   it("opens a row's transcript without leaving the page", async () => {
@@ -108,6 +128,18 @@ describe("RecordingEntryPage", () => {
 
     await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__list-open")!.click());
     expect(value.open).toHaveBeenCalledWith(entry);
+  });
+
+  it("labels the active recording action as a view, without implying playback resumes", async () => {
+    const value = session({ status: "recording", recordings: [] });
+    await render(value);
+    const view = [...container.querySelectorAll<HTMLButtonElement>(".recording-page__list-action")]
+      .find((button) => button.textContent === "查看")!;
+    expect(container.textContent).toContain("正在录音");
+    expect(container.textContent).not.toContain("继续");
+    await act(async () => view.click());
+    expect(value.showLive).toHaveBeenCalledTimes(1);
+    expect(value.resume).not.toHaveBeenCalled();
   });
 
   it("shows the live transcript and the stop control while recording", async () => {
@@ -148,6 +180,55 @@ describe("RecordingEntryPage", () => {
     await act(async () => actions[0]!.click());
     expect(value.retry).toHaveBeenCalledTimes(1);
     expect(value.deliver).not.toHaveBeenCalled();
+  });
+
+  it("keeps raw ASR errors out of the list while retaining the failed row and retry", async () => {
+    const failed = { ...entry, status: "failed" as const };
+    await render(session({ recordings: [failed], live: failed, error: "API接口错误: ASR upstream request failed" }));
+
+    expect(container.querySelector(".recording-page__error")).toBeNull();
+    expect(container.textContent).toContain("转写失败，录音已保留");
+    expect(container.textContent).not.toContain("ASR upstream request failed");
+    expect(container.querySelector(".recording-page__list-action--retry")).not.toBeNull();
+  });
+
+  it("shows a failed recording's details without offering transcript delivery", async () => {
+    const failed = { ...entry, status: "failed" as const };
+    const value = session({ view: "transcript", opened: failed, live: failed,
+      error: "API接口错误: ASR upstream request failed" });
+    await render(value);
+
+    expect(container.textContent).toContain("转写失败，录音已保留");
+    expect(container.textContent).toContain("错误详情");
+    expect(container.querySelector(".recording-panel__turns")).toBeNull();
+    expect(container.textContent).not.toContain("添加到会话");
+    expect(container.textContent).not.toContain("总结");
+    expect(container.textContent).toContain("重试转写");
+  });
+
+  it("does not call a stopped failed recording live", async () => {
+    const failed = { ...entry, status: "failed" as const };
+    await render(session({ view: "live", live: failed, error: "ASR upstream request failed" }));
+    expect(container.querySelector(".recording-panel__status")?.textContent).toContain("转写失败，录音已保留");
+    expect(container.querySelector(".recording-panel__status")?.textContent).not.toContain("正在录音");
+  });
+
+  it("does not call a completed recording live after it stops", async () => {
+    await render(session({ view: "live", live: { ...entry, status: "ready" } }));
+    expect(container.querySelector(".recording-panel__status")?.textContent).toContain("已转写");
+    expect(container.querySelector(".recording-panel__status")?.textContent).not.toContain("正在录音");
+    expect(container.querySelector(".recording-panel__pulse")).toBeNull();
+  });
+
+  it("asks before deleting a saved recording and its local files", async () => {
+    const value = session({ remove: vi.fn(async () => true) });
+    await render(value);
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__more-trigger")!.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((button) => button.textContent?.includes("删除"))!.click());
+    expect(document.body.textContent).toContain("删除本地录音和转写文件？");
+    await act(async () => container.querySelector<HTMLButtonElement>(".recording-page__delete-confirm-action")!.click());
+    expect(value.remove).toHaveBeenCalledWith(entry);
   });
 
   it("keeps a failed row out of the ready actions and shows a retry in flight", async () => {

@@ -66,9 +66,14 @@ describe("WebSocket media route", () => {
       headers: authenticated ? { authorization: "Bearer api-token" } : {},
       body: JSON.stringify({ path: pathValue })
     });
+
     expect(request(audio, false).status).toBe(401);
     const resolved = request(audio);
     expect(resolved.status).toBe(200);
+    expect((await channel.dispatchHttp(null, {
+      path: "/api/webui/recordings/resolve", method: "POST",
+      headers: { authorization: "Bearer api-token" }, body: JSON.stringify({ path: audio })
+    }))?.status).toBe(200);
     const mediaUrl = JSON.parse(String(resolved.body)).media_url as string;
     expect(mediaUrl).toMatch(/^\/api\/media\/ws\//);
     const [sig, payload] = mediaUrl.slice("/api/media/ws/".length).split("/");
@@ -76,6 +81,7 @@ describe("WebSocket media route", () => {
     expect(request(outside).status).toBe(404);
     expect(request(path.join(recordings, "missing.webm")).status).toBe(404);
   });
+
   it("keeps media route root stable when users configure trailing slashes", () => {
     expect(normalizeConfigPath("/media/")).toBe("/media");
     expect(normalizeConfigPath("")).toBe("/");

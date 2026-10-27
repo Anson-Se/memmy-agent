@@ -2,9 +2,9 @@ import { createContext, useContext, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { ArrowRight, Check, ChevronLeft, ChevronRight, Loader2, MessageCircleQuestionMark, PenLine, X } from "lucide-react";
 import { useTranslation } from "../i18n/use-translation.js";
+import { questionWaitingLabel } from "../app/plugin-interaction-waiting-label.js";
 import "./agent-confirmation-dock.css";
 import "./agent-question-card.css";
-import { AgentWorkflowQuestionCard } from "./agent-workflow-question-card.js";
 
 /** Undefined keeps standalone cards interactive; chat history only owns the answer record. */
 export const AgentQuestionActiveRequestContext = createContext<string | null | undefined>(undefined);
@@ -29,7 +29,6 @@ export type AgentQuestionCardPayload = {
   version: 1;
   requestId: string;
   title?: string;
-  context?: { workflow: string; taskId: string };
   questions: AgentQuestion[];
 };
 
@@ -85,13 +84,10 @@ export function readAgentQuestionCard(value: unknown): AgentQuestionCardPayload 
     });
   }
   const title = nonemptyString(raw.title);
-  const context = isRecord(raw.context) ? raw.context : {};
-  const workflow = nonemptyString(context.workflow), taskId = nonemptyString(context.taskId);
   return {
     version: 1,
     requestId,
     ...(title ? { title } : {}),
-    ...(workflow && taskId ? { context: { workflow, taskId } } : {}),
     questions,
   };
 }
@@ -153,8 +149,7 @@ type AgentQuestionMessage = { agentUi?: unknown; questionResponse?: unknown; que
 export function pendingAgentQuestion(messages: ReadonlyArray<AgentQuestionMessage>, activeTurnId: string | null): AgentQuestionCardPayload | null {
   if (!activeTurnId) return null;
   const answered = new Set(messages.flatMap((message) => {
-    const response = normalizeAgentQuestionResponse(message.questionResponse)
-      ?? (message.role === "user" ? readAgentQuestionResponse(message.content) : null);
+    const response = message.role === "user" ? readAgentQuestionResponse(message.content) : normalizeAgentQuestionResponse(message.questionResponse);
     return response ? [response.requestId] : [];
   }));
   for (const message of [...messages].reverse()) {
@@ -167,12 +162,6 @@ export function pendingAgentQuestion(messages: ReadonlyArray<AgentQuestionMessag
 
 export function hasPendingAgentQuestion(messages: ReadonlyArray<AgentQuestionMessage>, activeTurnId: string | null): boolean {
   return pendingAgentQuestion(messages, activeTurnId) !== null;
-}
-
-export function composerQuestionAnswer(card: AgentQuestionCardPayload, content: string): AgentQuestionResponse | null {
-  const question = card.questions[0];
-  if (card.questions.length !== 1 || !question?.allowOther || !content.trim() || content.trimStart().startsWith("/")) return null;
-  return { requestId: card.requestId, answers: [{ questionId: question.id, selectedOptionIds: [], otherText: content.trim() }] };
 }
 
 type DraftAnswer = {
@@ -227,20 +216,7 @@ export function AgentQuestionCard(props: {
   interrupted?: boolean;
   onSubmit?: (response: AgentQuestionResponse) => Promise<boolean> | boolean;
 }) {
-  if (props.card.context?.workflow && !props.processView) {
-    return <AgentWorkflowQuestionCard card={props.card} response={props.response} onSubmit={props.onSubmit} />;
-  }
-  return <AgentNativeQuestionCard {...props} />;
-}
-
-function AgentNativeQuestionCard(props: {
-  card: AgentQuestionCardPayload;
-  response?: AgentQuestionResponse | null;
-  processView?: boolean;
-  interrupted?: boolean;
-  onSubmit?: (response: AgentQuestionResponse) => Promise<boolean> | boolean;
-}) {
-  const { t } = useTranslation();
+  const { t, language } = useTranslation();
   const dock = useContext(AgentQuestionDockContext);
   const activeRequestId = useContext(AgentQuestionActiveRequestContext);
   const [draft, setDraft] = useState(() => initialDraft(props.card));
@@ -370,10 +346,7 @@ function AgentNativeQuestionCard(props: {
   if (!answered && props.processView && activeRequestId === props.card.requestId) {
     return <div className="agent-question-answer agent-question-answer--review" data-waiting-input-anchor={props.card.requestId}>
       <MessageCircleQuestionMark size={14} aria-hidden="true" />
-      <span>{props.card.title?.trim()
-        ? props.card.title.trim().startsWith(t("home.question.waitPrefix"))
-          ? props.card.title.trim() : t("home.question.waitingNamed", { title: props.card.title.trim() })
-        : t("home.question.waitingForAnswer")}</span>
+      <span>{questionWaitingLabel(props.card.title, language === "en-US")}</span>
     </div>;
   }
   const card = (

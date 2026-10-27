@@ -76,7 +76,7 @@ afterEach(() => {
 });
 
 describe("WebUI media upload route", () => {
-  it("deletes confirmed recording files but rejects paths outside recordings", async () => {
+  it("deletes confirmed recording files but rejects paths outside the recordings folder", async () => {
     const root = tmpRoot();
     const workspace = path.join(root, "workspace");
     const recordingDir = path.join(workspace, "recordings");
@@ -94,12 +94,16 @@ describe("WebUI media upload route", () => {
       headers: authorized ? { authorization: `Bearer ${token}` } : {},
       body: JSON.stringify({ paths })
     });
+
     expect((await call([audio], false))?.status).toBe(401);
     expect((await call([audio, unrelated]))?.status).toBe(403);
     expect(fs.existsSync(audio)).toBe(true);
+    expect(fs.existsSync(unrelated)).toBe(true);
     const linked = path.join(recordingDir, "linked.wav");
     fs.symlinkSync(unrelated, linked);
     expect((await call([linked]))?.status).toBe(403);
+    expect(fs.existsSync(unrelated)).toBe(true);
+
     const deleted = await call([audio, transcript]);
     expect(deleted?.status).toBe(200);
     expect(jsonBody(deleted).deleted).toBe(2);

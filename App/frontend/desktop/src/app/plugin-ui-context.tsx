@@ -13,6 +13,8 @@ import {
 import type { UploadedAgentMedia } from "../api/memmy-agent-client.js";
 import type { CapabilityEvent, PluginCapabilityEventPayload, PluginInvocationOrigin } from "@memmy/local-api-contracts";
 import { createTranscriptionJob, type PluginTranscriptionJob, type PluginTranscriptionState, type TranscribeAttempt } from "../lib/plugin-transcription-jobs.js";
+import { pendingPluginInteraction } from "./plugin-interaction-waiting-label.js";
+import { legalQuestionFields, legalQuestionRecordKey, legalQuestionTitle, readLegalQuestionHistory, upsertLegalQuestionRecord, writeLegalQuestionHistory, type LegalQuestionRecord } from "./legal-question-history.js";
 
 export interface PluginUiCall {
   pluginId: string;
@@ -21,6 +23,8 @@ export interface PluginUiCall {
   conversationId: string;
   /** Who asked for this call; decides occlusion and what closing a card means. */
   origin: PluginInvocationOrigin;
+  agentToolCallId?: string;
+  turnId?: string;
   events: CapabilityEvent[];
 }
 
@@ -40,7 +44,10 @@ interface PluginUiContextValue {
   registerChatFeedback(conversationId: string, handler: (feedback: PluginChatFeedback) => boolean): () => void;
   routeChatFeedback(chatId: string, feedback: PluginChatFeedback): boolean;
   fileDrafts: Map<string, File[]>;
-  questionDrafts: Map<string, Record<string, string>>;
+  questionDrafts: Map<string, Record<string, string | null>>;
+  legalQuestionHistory: LegalQuestionRecord[];
+  recordLegalQuestionAnswer(call: Pick<PluginUiCall, "conversationId" | "callId" | "capabilityId" | "pluginId">,
+    request: Extract<CapabilityEvent, { type: "interaction" }>["request"], response: unknown): void;
   recordingMaterials: Map<string, PluginRecordingMaterial[]>;
   setRecordingMaterials: Dispatch<SetStateAction<Map<string, PluginRecordingMaterial[]>>>;
   addRecordingMaterials(pluginId: string, conversationId: string, files: PluginRecordingMaterial[]): void;
@@ -63,6 +70,8 @@ interface PluginUiContextValue {
   openSurface(context: PluginInvocationContext): void;
   closeSurface(): void;
   receive(payload: PluginCapabilityEventPayload): void;
+  reconcilePendingCalls(calls: Array<Pick<PluginUiCall, "pluginId" | "capabilityId" | "callId" | "conversationId">>): void;
+  interruptPendingInteractions(keys: readonly string[]): void;
 }
 
 /**
@@ -109,7 +118,29 @@ export function normalizePluginConversationId(conversationId: string | null | un
 export function PluginUiProvider(props: { children: ReactNode }) {
   const feedbackHandlers = useRef(new Map<symbol, { conversationId: string; handler: (feedback: PluginChatFeedback) => boolean }>());
   const fileDrafts = useRef(new Map<string, File[]>()).current;
-  const questionDrafts = useRef(new Map<string, Record<string, string>>()).current;
+  const questionDrafts = useRef(new Map<string, Record<string, string | null>>()).current;
+  const [legalQuestionHistory, setLegalQuestionHistory] = useState<LegalQuestionRecord[]>(() =>
+    readLegalQuestionHistory(typeof window === "undefined" ? null : window.localStorage));
+  useEffect(() => {
+    writeLegalQuestionHistory(legalQuestionHistory, typeof window === "undefined" ? null : window.localStorage);
+  }, [legalQuestionHistory]);
+  const recordLegalQuestionAnswer = useCallback((call: Pick<PluginUiCall, "conversationId" | "callId" | "capabilityId" | "pluginId">,
+    request: Extract<CapabilityEvent, { type: "interaction" }>["request"], response: unknown) => {
+    if (call.pluginId !== "legal-labor" || call.capabilityId !== "gap-resolve") return;
+    const questions = legalQuestionFields(request);
+    if (!questions.length) return;
+    const raw = response && typeof response === "object" ? response as { answers?: unknown } : {};
+    const answerValues = raw.answers && typeof raw.answers === "object" && !Array.isArray(raw.answers)
+      ? raw.answers as Record<string, unknown> : {};
+    const answers = Object.fromEntries(questions.flatMap((question) => {
+      const value = answerValues[question.id];
+      return typeof value === "string" && value.trim() ? [[question.id, value.trim()]] : [];
+    }));
+    setLegalQuestionHistory((current) => upsertLegalQuestionRecord(current, {
+      conversationId: call.conversationId, callId: call.callId, interactionId: request.interactionId,
+      askedAt: Date.now(), title: legalQuestionTitle(request), questions, answers, status: "answered"
+    }));
+  }, []);
   const [recordingMaterials, setRecordingMaterials] = useState(new Map<string, PluginRecordingMaterial[]>());
   const addRecordingMaterials = useCallback((pluginId: string, conversationId: string, files: PluginRecordingMaterial[]) => {
     if (!files.length) return;
@@ -158,23 +189,78 @@ export function PluginUiProvider(props: { children: ReactNode }) {
   const [activeSurface, setActiveSurface] = useState<PluginInvocationContext | null>(null);
   const receive = useCallback((payload: PluginCapabilityEventPayload) => {
     setCalls((current) => reducePluginUiCalls(current, payload));
+    if (payload.pluginId !== "legal-labor" || payload.capabilityId !== "gap-resolve") return;
+    const event = payload.event;
+    if (event.type === "interaction") {
+      const questions = legalQuestionFields(event.request);
+      if (!questions.length) return;
+      setLegalQuestionHistory((current) => {
+        const key = legalQuestionRecordKey({ conversationId: payload.conversationId, callId: payload.callId,
+          interactionId: event.request.interactionId });
+        if (current.some((record) => legalQuestionRecordKey(record) === key)) return current;
+        return upsertLegalQuestionRecord(current, { conversationId: payload.conversationId, callId: payload.callId,
+          agentToolCallId: payload.agentToolCallId, turnId: payload.turnId,
+          interactionId: event.request.interactionId, askedAt: Date.now(), title: legalQuestionTitle(event.request),
+          questions, answers: null, status: "pending" });
+      });
+    } else if (event.type === "result" || event.type === "error") {
+      setLegalQuestionHistory((current) => current.map((record) => record.callId === payload.callId && record.status === "pending"
+        ? { ...record, status: "interrupted" } : record));
+    }
+  }, []);
+  const reconcilePendingCalls = useCallback((activeCalls: Array<Pick<PluginUiCall, "pluginId" | "capabilityId" | "callId" | "conversationId">>) => {
+    const key = (call: Pick<PluginUiCall, "pluginId" | "capabilityId" | "callId" | "conversationId">) =>
+      JSON.stringify([call.pluginId, call.capabilityId, call.callId, normalizePluginConversationId(call.conversationId)]);
+    const active = new Set(activeCalls.map(key));
+    setCalls((current) => current.filter((call) => call.events.some((event) => event.type === "result" || event.type === "error")
+      || active.has(key(call))));
+    setLegalQuestionHistory((current) => current.map((record) => record.status === "pending"
+      && !activeCalls.some((call) => call.pluginId === "legal-labor" && call.capabilityId === "gap-resolve"
+        && call.callId === record.callId && normalizePluginConversationId(call.conversationId) === normalizePluginConversationId(record.conversationId))
+      ? { ...record, status: "interrupted" } : record));
+  }, []);
+  const interruptPendingInteractions = useCallback((keys: readonly string[]) => {
+    if (!keys.length) return;
+    const interrupted = new Set(keys);
+    setAnsweredInteractions((current) => new Set([...current, ...interrupted]));
+    setLegalQuestionHistory((current) => current.map((record) => record.status === "pending"
+      && interrupted.has(`legal-labor:${record.callId}:${record.interactionId}`)
+      ? { ...record, status: "interrupted" } : record));
   }, []);
   const openSurface = useCallback((context: PluginInvocationContext) => setActiveSurface(context), []);
   const closeSurface = useCallback(() => setActiveSurface(null), []);
-  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
+  const value = useMemo(() => ({ calls, activeSurface, openSurface, closeSurface, receive, reconcilePendingCalls, interruptPendingInteractions, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
+    legalQuestionHistory, recordLegalQuestionAnswer,
     hiddenCallIds, setHiddenCallIds, hiddenInteractionSteps, dismissedCallIds, setDismissedCallIds,
     answeredInteractions, setAnsweredInteractions, openingCommands, recordingMaterials, setRecordingMaterials, addRecordingMaterials,
     transcriptions, startTranscription, transcriptionJob
-  }), [activeSurface, calls, closeSurface, openSurface, receive, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
+  }), [activeSurface, calls, closeSurface, openSurface, receive, reconcilePendingCalls, interruptPendingInteractions, registerChatFeedback, routeChatFeedback, fileDrafts, questionDrafts,
+    legalQuestionHistory, recordLegalQuestionAnswer,
     hiddenCallIds, hiddenInteractionSteps, dismissedCallIds, answeredInteractions, openingCommands, recordingMaterials, addRecordingMaterials,
     transcriptions, startTranscription, transcriptionJob]);
   return <PluginUiContext.Provider value={value}>{props.children}</PluginUiContext.Provider>;
 }
 
+export function useOptionalPluginUi(): PluginUiContextValue | null { return useContext(PluginUiContext); }
+
 export function usePluginUi(): PluginUiContextValue {
   const value = useContext(PluginUiContext);
   if (!value) throw new Error("usePluginUi must be used within PluginUiProvider");
   return value;
+}
+
+/** Presentation-only waiting state; does not end or interrupt the owning Agent run. */
+export function usePendingPluginInteraction(conversationId: string | null | undefined): ReturnType<typeof pendingPluginInteraction> {
+  const value = useContext(PluginUiContext);
+  const normalized = normalizePluginConversationId(conversationId);
+  if (!normalized || !value) return null;
+  return pendingPluginInteraction(value.calls.filter((call) => normalizePluginConversationId(call.conversationId) === normalized
+    && !value.hiddenCallIds.has(call.callId) && !value.dismissedCallIds.has(call.callId)),
+    value.answeredInteractions);
+}
+
+export function usePluginInteractionWaiting(conversationId: string | null | undefined): boolean {
+  return usePendingPluginInteraction(conversationId) !== null;
 }
 
 export function reducePluginUiCalls(
@@ -193,6 +279,7 @@ export function reducePluginUiCalls(
       callId: payload.callId,
       conversationId: payload.conversationId,
       origin: payload.origin,
+      agentToolCallId: payload.agentToolCallId, turnId: payload.turnId,
       events: [payload.event]
     }].filter((call, position, all) => {
       // Prune completed history, never the sole UI for a still waiting tool.
@@ -264,6 +351,14 @@ export function usePluginTranscriptions() {
 
 /** Keep typed legal answers when a settings route temporarily unmounts the chat. */
 export function usePluginQuestionDrafts() { return useContext(PluginUiContext)?.questionDrafts; }
+
+export function useLegalQuestionHistory(): LegalQuestionRecord[] {
+  return useContext(PluginUiContext)?.legalQuestionHistory ?? [];
+}
+
+export function useRecordLegalQuestionAnswer() {
+  return useContext(PluginUiContext)?.recordLegalQuestionAnswer;
+}
 
 /** Optional for native question rendering outside the desktop plugin provider. */
 export function useOptionalPluginUiCalls(): PluginUiCall[] {

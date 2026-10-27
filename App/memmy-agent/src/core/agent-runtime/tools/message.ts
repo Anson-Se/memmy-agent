@@ -80,11 +80,9 @@ export class MessageTool extends Tool {
       "Proactively send a message to a user/channel, optionally with file attachments. " +
       "Use this for reminders, cross-channel delivery, or explicit proactive sends. " +
       "Do not use this for a text-only normal reply in the current chat: answer naturally instead. " +
-      "When a file is the task's final deliverable, attach it to the current conversation " +
-      "through the message tool's media parameter by default. " +
-      "When generate_image creates images in the current chat, use the message tool " +
-      "with the artifact paths in the media parameter to deliver the images to the user. " +
-      "For proactive attachment delivery, use the 'media' parameter with file paths. " +
+      "Use the media parameter to attach existing files when sending them. " +
+      "When generate_image creates images in the current chat, attach the generated artifact paths in media. " +
+      "Do not include local file paths in cross-channel delivery text. " +
       "Do NOT use read_file to send files - that only reads content for your own analysis."
     );
   }

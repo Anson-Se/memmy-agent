@@ -685,6 +685,8 @@ export class MCPToolWrapper extends Tool {
     }
     if (context?.abortSignal?.aborted) return "(MCP tool call was cancelled)";
     const meta = this.sendMemmyContext ? pluginCallMeta(context) : undefined;
+    const turnId = this.requestContext.get()?.metadata?.turn_id;
+    if (meta && typeof turnId === "string") meta["memmy.dev/turn-id"] = turnId;
     const ready = PRIVATE_SKILL_READY.get(this.session)?.get(context?.sessionKey ?? "default");
     if (meta && ready?.size) meta["memmy.dev/private-skills-ready"] = JSON.stringify([...ready.values()]);
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -719,7 +721,7 @@ function pluginCallMeta(context?: ToolExecutionContext): Record<string, string> 
   const entries = [
     ["memmy.dev/cloud-skills", "1"],
     ["memmy.dev/session-key", context?.sessionKey],
-    ["memmy.dev/tool-call-id", context?.callId],
+    ["memmy.dev/tool-call-id", context?.uiToolCallId ?? context?.callId],
     ["memmy.dev/model-preset", context?.modelPreset],
   ].filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0);
   return entries.length ? Object.fromEntries(entries) : undefined;

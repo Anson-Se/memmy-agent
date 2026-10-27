@@ -103,7 +103,28 @@ export function buildPluginMcpServer(
       ...(modelPreset ? { modelPreset } : {}),
       input
     };
-    const cancel = () => void plugins.cancel(tool.plugin.id, callId).catch(() => undefined);
+    const provenance = {
+      ...(metaString(extra._meta, "memmy.dev/tool-call-id") ? { agentToolCallId: metaString(extra._meta, "memmy.dev/tool-call-id")! } : {}),
+      ...(metaString(extra._meta, "memmy.dev/turn-id") ? { turnId: metaString(extra._meta, "memmy.dev/turn-id")! } : {}),
+    };
+    let terminal = false;
+    let retired = false;
+    let publishedEvent = false;
+    const publishedFiles: Array<{ name: string; path: string; mediaType: string }> = [];
+    const retire = (cancelled: boolean) => {
+      if (terminal || retired) return;
+      retired = true;
+      if (!publishedEvent) return;
+      progressBus.emit("plugin.capability_event", {
+        pluginId: tool.plugin.id, capabilityId: tool.capability.id, callId, conversationId, origin: "agent", ...provenance,
+        event: { type: "error", code: cancelled ? "plugin_call_cancelled" : "plugin_runtime_error",
+          message: cancelled ? "Plugin call was cancelled" : "Plugin call ended unexpectedly", retryable: false },
+      });
+    };
+    const cancel = () => {
+      retire(true);
+      void plugins.cancel(tool.plugin.id, callId).catch(() => undefined);
+    };
     const progressToken = extra._meta?.progressToken;
     let progressSequence = 0;
     const sendTransportProgress = (message: string, current?: number, total?: number) => {
@@ -127,6 +148,8 @@ export function buildPluginMcpServer(
     const artifacts: PluginArtifactRef[] = [];
     try {
       for await (const event of plugins.invoke(call)) {
+        if (extra.signal.aborted) break;
+        publishedEvent = true;
         progressBus.emit("plugin.capability_event", {
           pluginId: tool.plugin.id,
           capabilityId: tool.capability.id,
@@ -136,8 +159,13 @@ export function buildPluginMcpServer(
           // are part of a turn and closing one has to answer rather than
           // silently leave the turn waiting.
           origin: "agent",
+          ...provenance,
           event
         });
+        if (event.type === "artifact" && event.artifact.role !== "setup" && event.artifact.path) {
+          const file = { name: event.artifact.name, path: event.artifact.path, mediaType: event.artifact.mediaType };
+          if (!publishedFiles.some((item) => item.path === file.path)) publishedFiles.push(file);
+        }
         await sendTransportProgress(
           event.type === "progress" ? event.message ?? "Plugin progress" : `Plugin ${event.type}`,
           event.type === "progress" ? event.current : undefined,
@@ -145,9 +173,12 @@ export function buildPluginMcpServer(
         );
         if (event.type === "artifact") artifacts.push(event.artifact);
         if (event.type === "result") {
-          if (!artifacts.length) return toolResult(event.output);
-          const output = event.output && typeof event.output === "object" && !Array.isArray(event.output)
-            ? { ...event.output, artifacts } : { output: event.output, artifacts };
+          terminal = true;
+          const visible = modelVisiblePluginResult(event.output, publishedFiles);
+          const output = artifacts.length
+            ? visible && typeof visible === "object" && !Array.isArray(visible)
+              ? { ...visible as Record<string, unknown>, artifacts } : { output: visible, artifacts }
+            : visible;
           const result = toolResult(output);
           // QA pages must reach the model as pixels, not merely a download URL.
           // Resolve only Host-issued artifact tokens; never fetch plugin URLs.
@@ -168,7 +199,7 @@ export function buildPluginMcpServer(
           }
           return { ...result, content: [...result.content, ...images] };
         }
-        if (event.type === "error") return toolError(`${event.code}: ${event.message}`);
+        if (event.type === "error") { terminal = true; return toolError(`${event.code}: ${event.message}`); }
       }
       return toolError("Plugin ended without a terminal event");
     } catch (error) {
@@ -176,10 +207,23 @@ export function buildPluginMcpServer(
     } finally {
       clearInterval(keepalive);
       extra.signal.removeEventListener("abort", cancel);
+      retire(extra.signal.aborted);
     }
   });
 
   return server;
+}
+
+/** Preserve the plugin result while exposing its produced files to the main Agent. */
+function modelVisiblePluginResult(
+  output: unknown,
+  publishedFiles: Array<{ name: string; path: string; mediaType: string }>
+): unknown {
+  if (!publishedFiles.length) return output;
+  const value: Record<string, unknown> = output && typeof output === "object" && !Array.isArray(output)
+    ? { ...output as Record<string, unknown> }
+    : { output };
+  return { ...value, publishedFiles };
 }
 
 export function registerPluginMcpRoutes(app: FastifyInstance, options: RegisterPluginMcpRoutesOptions): void {

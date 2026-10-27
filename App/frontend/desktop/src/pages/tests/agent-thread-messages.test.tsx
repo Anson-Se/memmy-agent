@@ -1,4 +1,3 @@
-import { Window } from "happy-dom";
 import { readFileSync } from "node:fs";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -6,7 +5,6 @@ import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { WINDOW_CONTROLS_OVERLAY_SAFE_TOP_STYLE } from "../../theme/window-controls-overlay.js";
 import { AttachmentActionError, emailAddressFromMailtoHref, estimateDeferredMarkdownHeight, isLikelyExpensiveAgentMarkdown, isMailtoHref, localArtifactPathFromHref, runAttachmentAction } from "../agent-message-content.js";
 import { AgentThreadMessages, buildAgentDisplayUnits, CHAT_IMAGE_LIGHTBOX_CLOSE_BUTTON_CLASS, CHAT_IMAGE_LIGHTBOX_NAV_BUTTON_CLASS, copyImageToClipboard, deliveredFileSaveName, resolveAgentMessageDisplayContent, runDeliveredFileMenuAction, saveImageToFile } from "../agent-thread-messages.js";
-import { type AgentQuestionCardPayload } from "../agent-question-card.js";
 
 const agentThreadMessagesSourceUrl = new URL("../agent-thread-messages.tsx", import.meta.url);
 const agentMessageContentSourceUrl = new URL("../agent-message-content.tsx", import.meta.url);
@@ -45,58 +43,6 @@ describe("delivered file save names", () => {
 });
 
 describe("AgentThreadMessages", () => {
-  it("keeps a task plan visible in the thread even without a matching creation trace", () => {
-    const html = renderToString(<I18nProvider language="zh-CN"><AgentThreadMessages
-      chatScopeKey="chat-plan" messages={[]}
-      taskPlan={{ plan_id: "plan-1", title: "写综述", status: "active",
-        items: [{ id: "draft", content: "整理文献", status: "in_progress" }],
-        created_at: null, updated_at: null }} />
-    </I18nProvider>);
-    expect(html).toContain("任务清单");
-    expect(html).toContain("整理文献");
-  });
-  it("updates a question card in place without rendering its response as a user bubble", () => {
-    const card: AgentQuestionCardPayload = {
-      version: 1,
-      requestId: "question-1",
-      questions: [{
-        id: "uploads",
-        prompt: "还有其他文件需要上传吗？",
-        options: [
-          { id: "more", label: "继续上传" },
-          { id: "done", label: "已全部上传" }
-        ],
-        allowMultiple: false,
-        allowOther: true
-      }]
-    };
-    const html = renderToString(
-      <I18nProvider language="zh-CN">
-        <AgentThreadMessages
-          chatScopeKey="chat-question"
-          messages={[
-            {
-              id: "question",
-              role: "assistant",
-              content: "请选择",
-              agentUi: { questionCard: card },
-              questionResponse: {
-                requestId: card.requestId,
-                answers: [{ questionId: "uploads", selectedOptionIds: ["done"] }]
-              }
-            }
-          ]}
-        />
-      </I18nProvider>
-    );
-
-    expect(html).toContain("还有其他文件需要上传吗？");
-    expect(html).toContain("已全部上传");
-    expect(html).toContain("向用户提问");
-    expect(html).not.toContain("agent-chat-bubble--user");
-    expect(html).not.toContain("memmy-question-response");
-  });
-
   it("shows a per-answer control for inspecting injected memories", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">
@@ -1138,6 +1084,31 @@ describe("AgentThreadMessages", () => {
     expect(html).not.toContain("正在执行 2 个步骤");
     expect(html).not.toContain("执行了 2 个步骤");
     expect(html).not.toContain("text-status-success");
+  });
+
+  it("labels the live thought after a tool so the older thought heading cannot appear to own it", () => {
+    const html = renderToString(
+      <I18nProvider language="zh-CN">
+        <AgentThreadMessages chatScopeKey="chat-thought-tool-thought" isSending messages={[
+          { id: "question", role: "user", content: "继续" },
+          { id: "before", role: "assistant", content: "", reasoning: "先生成小节。", activitySegmentId: "activity-review" },
+          { id: "tool", role: "tool", kind: "trace", content: "Generate review sections",
+            traces: ["Generate review sections"], activitySegmentId: "activity-review" },
+          { id: "after", role: "assistant", content: "", reasoning: "All 4 paragraphs saved; continue.",
+            activitySegmentId: "activity-review", isStreaming: true, reasoningStreaming: true }
+        ]} />
+      </I18nProvider>
+    );
+
+    const oldThought = html.indexOf("思考一下");
+    const tool = html.indexOf("Generate review sections");
+    const liveThought = html.indexOf("agent-activity-segment__live-thought-label");
+    const liveBody = html.indexOf("All 4 paragraphs saved; continue.");
+    expect(oldThought).toBeGreaterThanOrEqual(0);
+    expect(tool).toBeGreaterThan(oldThought);
+    expect(liveThought).toBeGreaterThan(tool);
+    expect(liveBody).toBeGreaterThan(liveThought);
+    expect(html).not.toContain("先生成小节。");
   });
 
   it("renders reasoning as muted prose while preserving real markdown blocks", () => {
@@ -2196,14 +2167,13 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain('data-testid="agent-attachment-card-file"');
     expect(html).toContain("agent-attachment-card");
     expect(html).toContain("agent-attachment-card__preview");
-    expect(html).toContain("file-type-icon--pdf");
+    expect(html).toContain("agent-attachment-card__file-tile--pdf");
     expect(html).toContain('style="max-width:min(100%, 32rem)"');
     expect(html).toContain('style="width:100%;max-height:26rem"');
     expect(html).toContain('data-testid="user-file-attachment"');
-    expect(html).toContain('data-testid="file-type-icon-pdf"');
+    expect(html).toContain('data-testid="agent-file-icon-pdf"');
     expect(html).toContain(">shot<");
-    expect(html).toContain(">report<");
-    expect(renderedAttachmentTitle(html, "report")).toContain("report.pdf");
+    expect(html).toContain(">report.pdf<");
     expect(html).toContain('title="report.pdf"');
     expect(html).toContain(">PNG<");
     expect(html).toContain(">PDF<");
@@ -2560,37 +2530,16 @@ describe("AgentThreadMessages", () => {
 
     expect(html).toContain("<button");
     expect(html).toContain('title="/Users/yuan/deck.pptx"');
-    expect(html).toContain(">deck<");
-    expect(renderedAttachmentTitle(html, "deck")).toContain("deck.pptx");
+    expect(html).toContain(">deck.pptx<");
     expect(html).toContain("agent-delivered-files");
     expect(html).toContain(">PPTX<");
-    expect(html).toContain('data-testid="file-type-icon-presentation"');
+    expect(html).toContain('data-testid="agent-file-icon-pptx"');
     expect(html).toContain('data-testid="agent-attachment-card-file"');
     expect(html).toContain("agent-attachment-card");
-    expect(html).toContain("file-type-icon--presentation");
+    expect(html).toContain("agent-attachment-card__file-tile--pptx");
     expect(html).not.toContain("rounded-tag");
     expect(html).not.toContain('href="/Users/yuan/deck.pptx"');
     expect(html).not.toContain('img src="/Users/yuan/deck.pptx"');
-  });
-
-  it("prefers in-app workspace preview before opening with the system default", async () => {
-    const previewArtifact = vi.fn(async () => true);
-    const openArtifact = vi.fn(async () => undefined);
-    const revealArtifact = vi.fn(async () => undefined);
-    const resolveArtifact = vi.fn(async () => ({
-      ...fileArtifact("/Users/yuan/project/outputs/review.pdf"),
-      relative_path: "outputs/review.pdf"
-    }));
-
-    await expect(runAttachmentAction({
-      path: "/Users/yuan/project/outputs/review.pdf",
-      label: "review.pdf",
-      artifactClient: { resolveArtifact, openArtifact, revealArtifact, previewArtifact }
-    })).resolves.toBe("opened");
-
-    expect(previewArtifact).toHaveBeenCalledWith("/Users/yuan/project/outputs/review.pdf");
-    expect(openArtifact).not.toHaveBeenCalled();
-    expect(revealArtifact).not.toHaveBeenCalled();
   });
 
   it("runs file attachment actions as open, reveal, download, then final failure", async () => {
@@ -2838,12 +2787,4 @@ function fileArtifact(path: string, name = "deck.pptx", mediaUrl?: string) {
     kind: "file" as const,
     ...(mediaUrl ? { media_url: mediaUrl } : {})
   };
-}
-
-function renderedAttachmentTitle(html: string, displayName: string): string | null | undefined {
-  const document = new Window().document;
-  document.body.innerHTML = html;
-  return Array.from(document.querySelectorAll<HTMLElement>(".agent-attachment-card"))
-    .find((card) => card.querySelector(".agent-attachment-card__name")?.textContent?.trim() === displayName)
-    ?.getAttribute("title");
 }

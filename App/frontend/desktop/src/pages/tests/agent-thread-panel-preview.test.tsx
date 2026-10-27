@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
-import { ThreadTabPreview, type ThreadPreviewContext } from "../agent-thread-panel-preview.js";
+import { loadPreviewDuringLiveEdit, ThreadTabPreview, type ThreadPreviewContext } from "../agent-thread-panel-preview.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -22,6 +22,7 @@ describe("Office and source files in the merged thread preview", () => {
   afterEach(() => {
     act(() => root.unmount());
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     container.remove();
   });
 
@@ -46,6 +47,62 @@ describe("Office and source files in the merged thread preview", () => {
     }
     return { context, fetchFn };
   }
+
+  it("waits through a transient live-edit replacement instead of reporting the file missing", async () => {
+    const load = vi.fn()
+      .mockRejectedValueOnce(new Error("ENOENT"))
+      .mockRejectedValueOnce(new Error("media_fetch_failed"))
+      .mockResolvedValue("latest file");
+
+    await expect(loadPreviewDuringLiveEdit(load, undefined, [0, 0])).resolves.toBe("latest file");
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  it("reloads an open document after its completed edit revision changes", async () => {
+    const path = "/work/report.md";
+    let currentText = "旧内容";
+    const fetchFn = vi.fn(async () => new Response(currentText)) as unknown as typeof fetch;
+    const context: ThreadPreviewContext = {
+      artifactClient: {
+        resolveArtifact: vi.fn(async () => ({ ok: true, path, name: "report.md", kind: "file", media_url: "http://127.0.0.1:18980/media/report" })),
+        openArtifact: vi.fn(async () => undefined),
+        revealArtifact: vi.fn(async () => undefined),
+      },
+      agentClient: null, sessionScope: null, environment: null, workspaceRoot: null, fetchFn,
+    };
+    const tab = { id: `file:${path}`, type: "file" as const, name: "report.md", path };
+    const preview = (revision: string) => <I18nProvider language="zh-CN"><ThreadTabPreview tab={tab} context={context} revision={revision} /></I18nProvider>;
+
+    await act(async () => root.render(preview("")));
+    await vi.waitFor(() => expect(container.textContent).toContain("旧内容"));
+    currentText = "修改后的内容";
+    await act(async () => root.render(preview("write-1:1:1")));
+    await vi.waitFor(() => expect(container.textContent).toContain("修改后的内容"));
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates an open code editor when the agent finishes editing its file", async () => {
+    vi.stubGlobal("memmy", { writeWorkspaceFile: vi.fn(async () => undefined) });
+    const path = "/work/report.txt";
+    let currentText = "旧版本";
+    const fetchFn = vi.fn(async () => new Response(currentText)) as unknown as typeof fetch;
+    const context: ThreadPreviewContext = {
+      artifactClient: {
+        resolveArtifact: vi.fn(async () => ({ ok: true, path, name: "report.txt", kind: "file", media_url: "http://127.0.0.1:18980/media/report" })),
+        openArtifact: vi.fn(async () => undefined),
+        revealArtifact: vi.fn(async () => undefined),
+      },
+      agentClient: null, sessionScope: null, environment: null, workspaceRoot: "/work", fetchFn,
+    };
+    const tab = { id: `file:${path}`, type: "file" as const, name: "report.txt", path };
+    const preview = (revision: string) => <I18nProvider language="zh-CN"><ThreadTabPreview tab={tab} context={context} revision={revision} /></I18nProvider>;
+
+    await act(async () => root.render(preview("")));
+    await vi.waitFor(() => expect(container.querySelector<HTMLTextAreaElement>(".editable-code-preview__plain")?.value).toBe("旧版本"));
+    currentText = "新版本";
+    await act(async () => root.render(preview("edit-2:1:1")));
+    await vi.waitFor(() => expect(container.querySelector<HTMLTextAreaElement>(".editable-code-preview__plain")?.value).toBe("新版本"));
+  });
 
   it("loads DOCX through the existing renderer and preserves table merges", async () => {
     const ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";

@@ -5,7 +5,7 @@ import { InstalledPluginSchema } from "@memmy/local-api-contracts";
 import { expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginUiProvider, usePluginUi, type PluginUiCall } from "../../app/plugin-ui-context.js";
-import { PluginCapabilityHost } from "../plugin-capability-host.js";
+import { PluginCapabilityHost, selectVisiblePluginCalls, selectRegionPluginCalls } from "../plugin-capability-host.js";
 import { InterviewRecordingPanel } from "../interview-recording-panel.js";
 import { pressPinnedPluginCommand } from "../home-page.js";
 
@@ -27,6 +27,37 @@ const plugin = InstalledPluginSchema.parse({
     commands: [{ command: "/record", name: "Record", description: "Record", capabilityId: "interview-record", pinned: true }], permissions: []
   }, state: "active", approvedPermissions: [], config: {}, lastError: null,
   createdAt: "2026-10-09T00:00:00.000Z", updatedAt: "2026-10-09T00:00:00.000Z"
+});
+
+it("moves the model's session-start guide into the recording panel without a pinned session-start command", async () => {
+  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
+  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
+    { command: "/legal-guide", name: "诊断指引", description: "Guide", capabilityId: "guide-open", pinned: true }
+  ] } };
+  const guide: PluginUiCall = { pluginId: "legal-labor", capabilityId: "session-start", callId: "model-start", origin: "agent", events: [
+    { type: "artifact", artifact: { id: "template", name: "准备清单.xlsx", role: "setup", uri: "plugin-artifact://template", mediaType: "application/vnd.ms-excel" } },
+    { type: "interaction", request: { interactionId: "choice", type: "question", payload: { title: "诊断指引",
+      options: [{ label: "我在现场，要录音", value: "record" }, { label: "已完成调研，上传资料", value: "upload" }] } } }
+  ] };
+  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
+  const render = (call: PluginUiCall) => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
+    {(["pinned", "panel", "flow"] as const).map(region => <PluginCapabilityHost key={region} region={region} dockInteractions
+      calls={[call]} plugins={[legal]} client={client} />)}
+  </I18nProvider></PluginUiProvider>);
+  try {
+    await act(async () => render(guide));
+    await act(async () => container.querySelector<HTMLButtonElement>(".diagnostic-guidance-card__footer button")!.click());
+    expect(client.respond).toHaveBeenCalledWith("legal-labor", "model-start", "choice", "record");
+    const recording: PluginUiCall = { ...guide, events: [...guide.events,
+      { type: "interaction", request: { interactionId: "audio", type: "audio-record", payload: { title: "记录现场访谈" } } }
+    ] };
+    const prepared = selectVisiblePluginCalls([recording]);
+    expect(selectRegionPluginCalls(prepared, "panel", new Set(["legal-labor:guide-open"]))).toHaveLength(1);
+    await act(async () => render(recording));
+    expect(container.querySelectorAll(".recording-bar")).toHaveLength(1);
+    expect(container.querySelector(".diagnostic-guidance-card")).toBeNull();
+    expect(container.querySelector(".plugin-artifact-row")).toBeNull();
+  } finally { act(() => root.unmount()); container.remove(); }
 });
 
 it.each(["user", "agent"] as const)("keeps templates out of the %s recorder and restores it without stopping audio", async (origin) => {
@@ -200,9 +231,9 @@ it("skips an Agent upload round on close without starting another collection", a
   const root = createRoot(container);
   const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
   const open = vi.fn(async () => undefined);
-  const pinned = new Set(["legal-labor:session-start"]);
+  const pinned = new Set(["legal-labor:material-collect"]);
   const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
-    ...(plugin.manifest.commands ?? []), { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
+    ...(plugin.manifest.commands ?? []), { command: "/legal-record", name: "Record", description: "Record", capabilityId: "material-collect", pinned: true }
   ] } };
   const upload: PluginUiCall = { pluginId: plugin.id, capabilityId: "material-collect", callId: "agent-upload",
     conversationId: "chat", origin: "agent", events: [{ type: "interaction", request: {
@@ -210,12 +241,12 @@ it("skips an Agent upload round on close without starting another collection", a
     } }] };
   expect(selectRegionPluginCalls([upload], "flow", pinned)).toEqual([]);
   expect(selectRegionPluginCalls([upload], "pinned", pinned)).toEqual([upload]);
-  expect(selectOpenPinnedCapabilities([upload], new Set(), pinned)).toEqual(new Set(["legal-labor:session-start"]));
+  expect(selectOpenPinnedCapabilities([upload], new Set(), pinned)).toEqual(new Set(["legal-labor:material-collect"]));
   function Page() {
     const [hidden, setHidden] = useState(new Set<string>());
     const hide = (id: string) => setHidden((current) => new Set(current).add(id));
     return <><button data-testid="guide" onClick={() => void pressPinnedPluginCommand({
-      calls: [upload], pluginId: plugin.id, capabilityId: "session-start", pinnedCapabilities: pinned,
+      calls: [upload], pluginId: plugin.id, capabilityId: "material-collect", pinnedCapabilities: pinned,
       open, toggleVisibility: (id) => setHidden((current) => {
         const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next;
       })
@@ -236,110 +267,6 @@ it("skips an Agent upload round on close without starting another collection", a
     expect(client.respond).toHaveBeenCalledWith(plugin.id, "agent-upload", "upload", { action: "skip", files: [] });
     expect(client.cancel).not.toHaveBeenCalled();
   } finally { act(() => root.unmount()); container.remove(); }
-});
-
-it("keeps a closed card and answered guidance closed across settings route remounts", async () => {
-  const { pluginInteractionSignature, reconcileHiddenPluginCalls } = await import("../home-page.js");
-  const { selectVisiblePluginCalls } = await import("../plugin-capability-host.js");
-  const container = document.createElement("div"); document.body.append(container);
-  const root = createRoot(container);
-  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn(async () => undefined) };
-  const open = vi.fn(async () => undefined);
-  const pinned = new Set(["legal-labor:session-start"]);
-  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
-    { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
-  ] } };
-  let ui!: ReturnType<typeof usePluginUi>;
-  let settings!: (value: boolean) => void;
-  function Chat() {
-    const context = usePluginUi();
-    const calls = selectVisiblePluginCalls(context.calls, context.answeredInteractions);
-    useEffect(() => context.setHiddenCallIds((current) => reconcileHiddenPluginCalls(current, context.hiddenInteractionSteps, calls)), [context.calls, context.answeredInteractions]);
-    const hide = (id: string) => {
-      context.hiddenInteractionSteps.set(id, pluginInteractionSignature(calls.find((call) => call.callId === id)));
-      context.setHiddenCallIds((current) => new Set(current).add(id));
-    };
-    return <><button data-testid="guide" onClick={() => void pressPinnedPluginCommand({
-      calls, pluginId: legal.id, capabilityId: "session-start", pinnedCapabilities: pinned, open,
-      toggleVisibility: (id) => context.setHiddenCallIds((current) => {
-        const next = new Set(current); if (next.has(id)) next.delete(id);
-        else { context.hiddenInteractionSteps.set(id, pluginInteractionSignature(calls.find((call) => call.callId === id))); next.add(id); }
-        return next;
-      })
-    })}>Guide</button><PluginCapabilityHost calls={context.calls} plugins={[legal]} client={client} region="pinned"
-      hiddenCallIds={context.hiddenCallIds} answeredInteractions={context.answeredInteractions} onCallHidden={hide}
-      onInteractionAnswered={(key) => context.setAnsweredInteractions((current) => new Set(current).add(key))} /></>;
-  }
-  function Routes() { ui = usePluginUi(); const [isSettings, setSettings] = useState(false); settings = setSettings; return isSettings ? <div>Settings</div> : <Chat />; }
-  const event = (interactionId: string, type: "question" | "file-input") => ({
-    pluginId: legal.id, capabilityId: "session-start", callId: "route-guide", conversationId: "chat", origin: "agent" as const,
-    event: { type: "interaction" as const, request: { interactionId, type, payload: type === "question"
-      ? { title: "Diagnosis guidance", options: [{ label: "Record", value: "record" }, { label: "Upload", value: "upload" }] }
-      : { title: "Supplement diagnosis materials", multiple: true } } }
-  });
-  const close = () => container.querySelector<HTMLButtonElement>('button[aria-label="Close card"]')!;
-  try {
-    await act(async () => root.render(<PluginUiProvider><I18nProvider language="en-US"><Routes /></I18nProvider></PluginUiProvider>));
-    await act(async () => ui.receive({ ...event("guide", "question"), event: { type: "artifact", artifact: {
-      id: "route-template", name: "Survey.xlsx", mediaType: "application/vnd.ms-excel", role: "setup",
-      uri: "plugin-artifact://legal-labor/route-template"
-    } } }));
-    await act(async () => ui.receive(event("guide", "question")));
-    await act(async () => close().click());
-    for (let index = 0; index < 3; index++) {
-      await act(async () => settings(true)); await act(async () => settings(false));
-      expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("none");
-    }
-    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="guide"]')!.click());
-    expect(container.querySelector<HTMLElement>(".plugin-capability-region--pinned")!.style.display).toBe("");
-    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Upload")!.click());
-    expect(ui.answeredInteractions.has("legal-labor:route-guide:guide")).toBe(true);
-    await act(async () => ui.receive(event("upload", "file-input")));
-    expect(container.querySelector(".diagnostic-upload-card")).not.toBeNull();
-    await act(async () => close().click());
-    await act(async () => settings(true)); await act(async () => settings(false));
-    expect(container.querySelector(".diagnostic-upload-card")).toBeNull();
-    expect(container.querySelector(".diagnostic-guidance-card")).toBeNull();
-    expect(ui.answeredInteractions.has("legal-labor:route-guide:upload")).toBe(true);
-    expect(client.respond).toHaveBeenCalledTimes(2);
-    expect(client.cancel).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
-  } finally { act(() => root.unmount()); container.remove(); }
-});
-
-
-it("shows one guide when an Agent invocation arrives after the manually opened guide and answers both waiting calls", async () => {
-  const container = document.createElement("div"); document.body.append(container); const root = createRoot(container);
-  const legal = { ...plugin, manifest: { ...plugin.manifest, commands: [
-    { command: "/legal-guide", name: "Guide", description: "Guide", capabilityId: "session-start", pinned: true }
-  ] } };
-  const guide = (callId: string, origin: "agent" | "user"): PluginUiCall => ({ pluginId: plugin.id, capabilityId: "session-start",
-    callId, origin, conversationId: "websocket:race-chat", events: [
-      { type: "artifact", artifact: { id: `template-${callId}`, uri: "/template.xlsx", name: "调研模板.xlsx", mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", role: "setup" } },
-      { type: "interaction", request: { interactionId: `guide-${callId}`, type: "question", payload: { title: "诊断指引", options: [
-        { label: "我在现场，要录音", value: "record" }, { label: "已完成调研，上传资料", value: "upload" }
-      ] } } }
-    ] });
-  let setCalls!: (calls: PluginUiCall[]) => void;
-  const respond = vi.fn(async () => undefined);
-  const cancel = vi.fn();
-  function Page() {
-    const [calls, update] = useState([guide("manual", "user")]); setCalls = update;
-    const ui = usePluginUi();
-    return <PluginCapabilityHost calls={calls} plugins={[legal]} region="pinned" client={{ respond, cancel, getUi: vi.fn() }}
-      answeredInteractions={ui.answeredInteractions} onInteractionAnswered={(key) => ui.setAnsweredInteractions((current) => new Set(current).add(key))} />;
-  }
-  try {
-    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN"><Page /></I18nProvider></PluginUiProvider>));
-    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(1);
-    await act(async () => setCalls([guide("manual", "user"), guide("automatic", "agent")]));
-    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(1);
-    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.includes("已完成调研"))!.click());
-    expect(respond.mock.calls).toEqual([
-      [plugin.id, "manual", "guide-manual", "upload"], [plugin.id, "automatic", "guide-automatic", "upload"]
-    ]);
-    expect(container.querySelectorAll(".diagnostic-guidance-card")).toHaveLength(0);
-    expect(cancel).not.toHaveBeenCalled();
-  } finally { await act(async () => root.unmount()); container.remove(); }
 });
 
 it.each([false, true])("automatically lists saved recording files, scopes them to the chat and avoids another upload (already collected: %s)", async (collected) => {
@@ -497,142 +424,39 @@ it("keeps the microphone owner mounted while its composer bar is occluded", asyn
   } finally { act(() => root.unmount()); container.remove(); dock.remove(); }
 });
 
-it("holds the delivery back while the plugin is still working on the report", async () => {
+it("keeps Agent plugin files out of automatic delivery cards", async () => {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const finished: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
-    { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx } },
-    { type: "result", output: {} }
-  ] };
-  // Memmy paused between two of its own turns, but the plugin is mid-revision.
-  const running: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-again", conversationId: "chat-1", origin: "agent", events: [
-    { type: "progress", message: "正在重写第三章" }
-  ] };
-  const render = (calls: PluginUiCall[]) => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
-    <PluginCapabilityHost region="flow" calls={calls} plugins={[plugin]} client={{ getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() }} legalDelivery={{ ready: true, recordings: [] }} />
-  </I18nProvider></PluginUiProvider>);
-  try {
-    await act(async () => render([finished, running]));
-    expect(container.querySelector(".legal-delivery-card")).toBeNull();
-    // Nothing to preview of a report that is being rewritten.
-    expect(container.textContent).not.toContain(".docx");
-    await act(async () => render([finished]));
-    expect(container.querySelector(".legal-delivery-card")).not.toBeNull();
-  } finally {
-    act(() => root.unmount());
-    container.remove();
-  }
-});
-
-it("delivers the report even though an earlier call was stranded without a terminal event", async () => {
-  const container = document.createElement("div");
-  document.body.append(container);
-  const root = createRoot(container);
-  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  // A plugin process killed mid-run, or a stream that dropped: this call never
-  // received a result or an error, so it looks active for the rest of the
-  // session. It must not hold the delivery back forever.
-  const stranded: PluginUiCall = { pluginId: plugin.id, capabilityId: "session-start", callId: "stranded", conversationId: "chat-1", origin: "agent", events: [
-    { type: "artifact", artifact: { id: "checklist", name: "资料准备清单.xlsx", role: "setup", uri: "plugin-artifact://legal-labor/checklist", mediaType: "application/vnd.ms-excel" } }
-  ] };
-  const report: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
-    { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx, path: "/ws/report.docx" } },
-    { type: "result", output: {} }
-  ] };
+  const report: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final",
+    conversationId: "chat-1", origin: "agent", events: [
+      { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable",
+        uri: "plugin-artifact://legal-labor/final", mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", path: "/ws/report.docx" } },
+      { type: "result", output: {} }
+    ] };
   try {
     await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
-      <PluginCapabilityHost region="flow" calls={[stranded, report]} plugins={[plugin]} client={{ getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() }}
-        legalDelivery={{ ready: true, recordings: [] }} />
+      <PluginCapabilityHost region="flow" calls={[report]} plugins={[plugin]}
+        client={{ getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() }} />
     </I18nProvider></PluginUiProvider>));
-    const card = container.querySelector(".legal-delivery-card");
-    expect(card).not.toBeNull();
-    expect(card!.textContent).toContain("企业-诊断报告");
+    expect(container.querySelector(".legal-delivery-card")).toBeNull();
+    expect(container.textContent).not.toContain("企业-诊断报告");
   } finally {
     act(() => root.unmount());
     container.remove();
   }
 });
 
-it("still holds the delivery back while the newest legal call is running", async () => {
-  const container = document.createElement("div");
-  document.body.append(container);
+it.each(["user", "agent"] as const)("keeps %s review failures in their owning result surface", async (origin) => {
+  const container = document.createElement("div"); document.body.append(container);
   const root = createRoot(container);
-  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const report: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
-    { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx } },
-    { type: "result", output: {} }
-  ] };
-  // A re-run started after the report: the newest call is still going.
-  const revising: PluginUiCall = { pluginId: plugin.id, capabilityId: "report-render", callId: "report-again", conversationId: "chat-1", origin: "agent", events: [
-    { type: "progress", message: "正在重写第三章" }
-  ] };
+  const failed: PluginUiCall = { pluginId: "literature-review", capabilityId: "review_fetch_fulltext", callId: "failed", origin, events: [{ type: "error", code: "download_failed", message: "全文获取失败" }] };
+  const render = async (calls: PluginUiCall[]) => act(async () => root.render(<I18nProvider language="zh-CN"><PluginCapabilityHost calls={calls} plugins={[]} /></I18nProvider>));
   try {
-    await act(async () => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
-      <PluginCapabilityHost region="flow" calls={[report, revising]} plugins={[plugin]} client={{ getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() }}
-        legalDelivery={{ ready: true, recordings: [] }} />
-    </I18nProvider></PluginUiProvider>));
-    expect(container.querySelector(".legal-delivery-card")).toBeNull();
-  } finally {
-    act(() => root.unmount());
-    container.remove();
-  }
-});
-
-it("delivers the finished report with the recordings only once the Agent is done", async () => {
-  const container = document.createElement("div");
-  document.body.append(container);
-  const root = createRoot(container);
-  const client = { getUi: vi.fn(), cancel: vi.fn(), respond: vi.fn() };
-  const open = vi.fn();
-  const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const calls: PluginUiCall[] = [
-    { pluginId: plugin.id, capabilityId: "workbook-compose", callId: "workbook", conversationId: "chat-1", origin: "agent", events: [
-      { type: "artifact", artifact: { id: "xlsx", name: "企业-诊断表.xlsx", role: "deliverable", uri: "plugin-artifact://legal-labor/xlsx", mediaType: "application/vnd.ms-excel" } },
-      { type: "result", output: {} }
-    ] },
-    { pluginId: plugin.id, capabilityId: "report-render", callId: "report-draft", conversationId: "chat-1", origin: "agent", events: [
-      { type: "artifact", artifact: { id: "draft", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/draft", mediaType: docx } },
-      { type: "result", output: {} }
-    ] },
-    { pluginId: plugin.id, capabilityId: "report-render", callId: "report-final", conversationId: "chat-1", origin: "agent", events: [
-      { type: "artifact", artifact: { id: "final", name: "企业-诊断报告.docx", role: "deliverable", uri: "plugin-artifact://legal-labor/final", mediaType: docx, path: "/ws/report.docx" } },
-      { type: "result", output: {} }
-    ] }
-  ];
-  const recordings = [
-    { id: "recording:/ws/recordings/a.webm", name: "访谈录音.webm", mediaType: "audio/webm", uri: "/a", path: "/ws/recordings/a.webm" },
-    { id: "recording:/ws/recordings/a.txt", name: "访谈转写.txt", mediaType: "text/plain", uri: "/t", path: "/ws/recordings/a.txt" }
-  ];
-  const render = (ready: boolean) => root.render(<PluginUiProvider><I18nProvider language="zh-CN">
-    <PluginCapabilityHost region="flow" calls={calls} plugins={[plugin]} client={client} onOpenArtifact={open} legalDelivery={{ ready, recordings }} />
-  </I18nProvider></PluginUiProvider>);
-  // The two finished calls are the empty shells the delivery card replaces:
-  // their only artifacts are deliverables, which are not drawn here.
-  const shellOf = (capabilityId: string) => [...container.querySelectorAll<HTMLElement>("div")]
-    .find((node) => node.className.includes("rounded-card") && node.textContent?.trim() === "Legal");
-  try {
-    await act(async () => render(false));
-    expect(container.querySelector(".legal-delivery-card")).toBeNull();
-    expect(container.textContent).not.toContain(".docx");
-    expect(container.textContent).not.toContain(".xlsx");
-
-    await act(async () => render(true));
-    const card = container.querySelector(".legal-delivery-card")!;
-    const chips = [...card.querySelectorAll<HTMLButtonElement>(".agent-attachment-card")];
-    expect(chips.map((chip) => chip.querySelector(".agent-attachment-card__name")?.textContent))
-      .toEqual(["企业-诊断报告", "访谈录音", "访谈转写"]);
-    expect(card.querySelectorAll("button")).toHaveLength(3);
-    // The workbook is the report's working sheet, so it is not delivered.
-    expect(container.textContent).not.toContain(".xlsx");
-    // And the finished calls no longer leave a titled card with an empty body.
-    expect(shellOf("workbook-compose")).toBeUndefined();
-    expect(shellOf("report-render")).toBeUndefined();
-    await act(async () => chips[0]!.click());
-    expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: "final", path: "/ws/report.docx" }));
-  } finally {
-    act(() => root.unmount());
-    container.remove();
-  }
+    await render([failed]);
+    if (origin === "user") expect(container.querySelector('[role="alert"]')?.textContent).toContain("全文获取失败");
+    else expect(container.textContent).not.toContain("全文获取失败");
+    await render([failed, { ...failed, callId: "recovered", events: [{ type: "result", output: { ok: true } }] }]);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  } finally { await act(async () => root.unmount()); container.remove(); }
 });

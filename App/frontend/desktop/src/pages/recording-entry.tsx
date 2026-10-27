@@ -12,12 +12,12 @@
  * They share one recording session. Sending a recording is an explicit action
  * on its row. Agent-requested recording cards remain separate inputs.
  */
-import "./recording-entry-migration.css";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronLeft, ChevronRight, Check, MoreHorizontal, Pencil, Mic, Pause, Play, Plus, RotateCw, Sparkles, Square, Trash2, Upload, X } from "lucide-react";
 import type { AsrTranscriptSegment } from "@memmy/local-api-contracts";
 import type { AsrClient } from "../api/asr-client.js";
 import type { UploadAgentMediaInput, UploadedAgentMedia } from "../api/memmy-agent-client.js";
+import type { RecordingSidebarStatus } from "../state/app-actions.js";
 import type { I18nContextValue } from "../i18n/i18n-provider.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { enUSMessages, zhCNMessages } from "../i18n/messages.js";
@@ -40,7 +40,6 @@ import { RecordingWaveform, WAVE_BARS } from "./recording-waveform.js";
  * which is what 添加到会话 does.
  */
 export type RecordingDelivery = "summarize" | "attach";
-type RecordingSidebarStatus = "idle" | "starting" | "recording" | "paused" | "transcribing" | "ready" | "failed";
 
 /** Account recordings are available only to an authenticated account session. */
 export function canUseAccountRecording(userMode: string | undefined, userId: string | null): boolean {

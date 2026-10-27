@@ -1,3 +1,4 @@
+import "./file-type-icon.css";
 import type { DesktopSystemFolderIconKind } from "@memmy/desktop-interface";
 import { useEffect, useState } from "react";
 import { resolveFileType, type FileDisplayKind } from "../lib/file-type.js";

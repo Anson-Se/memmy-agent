@@ -359,6 +359,9 @@ function startSse(
   for (const payload of progressBus.pendingPluginEvents()) {
     send({ id: randomUUID(), type: "plugin.capability_event", timestamp: new Date().toISOString(), payload });
   }
+  const pendingCalls = [...new Map(progressBus.pendingPluginEvents().map(({ pluginId, capabilityId, callId, conversationId }) =>
+    [JSON.stringify([pluginId, capabilityId, callId, conversationId]), { pluginId, capabilityId, callId, conversationId }])).values()];
+  send({ id: randomUUID(), type: "plugin.capability_snapshot", timestamp: new Date().toISOString(), payload: { calls: pendingCalls } });
 
   const cleanup = () => {
     // Clean up the heartbeat timer promptly after the client disconnects, avoiding orphaned tasks lingering in the background.
