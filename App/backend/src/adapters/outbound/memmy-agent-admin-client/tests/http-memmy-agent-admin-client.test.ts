@@ -17,6 +17,23 @@ afterEach(async () => {
 });
 
 describe("http memmy-agent admin client", () => {
+  it("reads authenticated task activity with a timeout and rejects malformed status", async () => {
+    const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/webui/bootstrap") return Response.json({ token: "boot-token" });
+      expect(path).toBe("/api/runtime/task-activity");
+      expect(init?.headers).toMatchObject({ authorization: "Bearer boot-token" });
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      return Response.json({ busy: true });
+    });
+    const client = createHttpMemmyAgentAdminClient({ fetchFn: fetchFn as typeof fetch });
+    expect(await client.hasActiveTasks!()).toBe(true);
+    fetchFn.mockResolvedValueOnce(Response.json({ busy: false }));
+    expect(await client.hasActiveTasks!()).toBe(false);
+    fetchFn.mockResolvedValueOnce(Response.json({}));
+    await expect(client.hasActiveTasks!()).rejects.toThrow();
+  });
+
   it("applies one hard timeout to MCP reload bootstrap and admin requests", async () => {
     const signals: Array<AbortSignal | null | undefined> = [];
     const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

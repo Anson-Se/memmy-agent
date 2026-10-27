@@ -69,6 +69,14 @@ class HttpMemmyAgentAdminClient implements MemmyAgentAdminClient {
     this.fetchFn = options.fetchFn ?? fetch.bind(globalThis);
   }
 
+  async hasActiveTasks(signal?: AbortSignal): Promise<boolean> {
+    const timeout = AbortSignal.timeout(10_000);
+    const response = await this.request("/api/runtime/task-activity", z.object({ busy: z.boolean() }), {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+    });
+    return response.busy;
+  }
+
   async getChannelDefinitions() {
     return this.request("/api/channels/definitions", ChannelDefinitionsResponseSchema);
   }

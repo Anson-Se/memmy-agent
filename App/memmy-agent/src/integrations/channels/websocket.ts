@@ -1,3 +1,4 @@
+import { agentTaskActivity } from "../../core/agent-runtime/task-activity.js";
 import { historySummaryRuntime } from "../../providers/history-summary-runtime.js";
 import crypto from "node:crypto";
 import * as childProcess from "node:child_process";
@@ -3298,6 +3299,10 @@ export class WebSocketChannel extends BaseChannel {
     if (got === "/api/channels/feishu/login/start") return this.handleChannelAdmin(request, "feishu-login-start");
     channelAdminMatch = got.match(/^\/api\/channels\/feishu\/login\/([^/]+)$/);
     if (channelAdminMatch) return this.handleChannelAdmin(request, "feishu-login-poll", decodeURIComponent(channelAdminMatch[1]));
+    if (got === "/api/runtime/task-activity") {
+      if (!this.checkApiToken(request)) return httpError(401, "Unauthorized");
+      return httpJsonResponse({ busy: agentTaskActivity.busy || Boolean(this.terminalRunControl?.hasActiveRuns()) });
+    }
     if (got === "/api/sessions") return this.handleSessionsList(request);
     if (got === "/api/projects") return this.handleProjectCreate(request);
     if (got === "/api/settings") return this.handleSettings(request);
