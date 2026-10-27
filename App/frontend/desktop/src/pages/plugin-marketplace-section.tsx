@@ -9,6 +9,7 @@ import { Tooltip } from "../components/tooltip.js";
 import { useTranslation } from "../i18n/use-translation.js";
 import { Memmy } from "../components/mascot/memmy.js";
 import { PluginDetailPreview } from "./plugin-detail-preview.js";
+import { LITERATURE_REVIEW_PLUGIN_ID } from "./official-plugin-catalog.js";
 import { isNewerPluginVersion } from "./plugin-version.js";
 
 export interface MarketplacePlugin {
@@ -81,7 +82,7 @@ function pluginNeedsSignIn(plugin: MarketplacePlugin, signedIn: boolean): boolea
 export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
   const { t } = useTranslation();
   const descriptionOf = (plugin: MarketplacePlugin) => capabilityDescription(plugin.category, t)
-    + (plugin.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : "");
+    + (plugin.id !== LITERATURE_REVIEW_PLUGIN_ID && plugin.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : "");
   const [filter, setFilter] = useState<"all" | "installed">("all");
   const [query, setQuery] = useState("");
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -95,6 +96,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
     && `${plugin.name}\n${descriptionOf(plugin)}`.toLocaleLowerCase().includes(normalizedQuery)
   ));
   const detail = props.plugins.find((plugin) => plugin.id === detailId);
+  const detailNote = detail ? detailModelNote(detail, t) : null;
   const confirmedPlugin = props.plugins.find((plugin) => plugin.id === uninstallId);
   const busy = Boolean(props.busyId) || Boolean(props.loading);
   const actionsDisabled = busy || Boolean(props.actionsDisabled);
@@ -342,7 +344,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
             <p className="plugin-marketplace-detail-description">
               {descriptionOf(detail)}
             </p>
-            {detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.signInRequired")}{detail.requiresOfficialModel ? t("plugins.ui.memmyOfficialModelsRecommended") : ""}</p> : null}
+            {detailNote ? <p className="plugin-marketplace-detail-note">{detailNote}</p> : null}
             {!detail.installed && !detail.installable && !detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.anInstallableReleaseIsNotAvailableYet")}</p> : null}
             {detail.installed?.state === "failed" ? <p className="plugin-marketplace-detail-error">{t("plugins.ui.installationCouldNotCompleteRetryInstallationOrContact")}</p> : null}
           </div>
@@ -364,6 +366,13 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
         }} />
     </section>
   );
+}
+
+function detailModelNote(plugin: MarketplacePlugin, t: ReturnType<typeof useTranslation>["t"]): string | null {
+  if (!plugin.requiresLogin) return null;
+  if (plugin.id === LITERATURE_REVIEW_PLUGIN_ID) return t("plugins.ui.literatureReviewModelNote");
+  const recommendation = plugin.requiresOfficialModel ? t("plugins.ui.memmyOfficialModelsRecommended") : "";
+  return `${t("plugins.ui.signInRequired")}${recommendation}`;
 }
 
 function isTransitioning(plugin: MarketplacePlugin): boolean {

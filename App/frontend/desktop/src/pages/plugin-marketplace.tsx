@@ -11,6 +11,7 @@ import {
   pluginComposerCommand,
   type MarketplacePlugin
 } from "./plugin-marketplace-section.js";
+import { LITERATURE_REVIEW_PLUGIN_ID } from "./official-plugin-catalog.js";
 import { writeSettingsTabHash } from "./settings-nav.js";
 import { isNewerPluginVersion } from "./plugin-version.js";
 
@@ -170,7 +171,7 @@ export function PluginMarketplace() {
 
 function pluginCategory(pluginId: string): MarketplacePlugin["category"] {
   if (pluginId === "legal-labor") return "legal";
-  if (pluginId === "literature-review") return "research";
+  if (pluginId === LITERATURE_REVIEW_PLUGIN_ID) return "research";
   if (pluginId === "office") return "office";
   return "other";
 }

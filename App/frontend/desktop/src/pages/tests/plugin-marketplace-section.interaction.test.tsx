@@ -206,19 +206,33 @@ describe("PluginMarketplaceSection", () => {
     expect(props.onInstall).not.toHaveBeenCalled();
   });
 
-  it("recommends official models without blocking use of custom models", async () => {
+  it("recommends capable custom models for literature reviews without blocking use", async () => {
     await render({ officialModelReady: false });
     const reviewCard = container.querySelector('article[aria-label="文献综述"]')!;
     expect(reviewCard.textContent).not.toContain("需配置模型");
     expect(reviewCard.querySelector('[aria-label="将文献综述加入对话"]')).not.toBeNull();
     await click("查看文献综述详情");
-    expect(document.querySelector("[role=dialog]")?.textContent).toContain("该插件推荐使用 Memmy 官方模型");
+    expect(document.querySelector(".plugin-marketplace-detail-note")?.textContent).toBe("注：需登录账号使用。因消耗 Token 量较大且任务较为复杂，目前只建议使用自行配置且性能较强的模型。");
+    expect(document.querySelector("[role=dialog]")?.textContent).not.toContain("推荐使用 Memmy 官方模型");
     await click("加入对话", document.querySelector("[role=dialog]")!);
     expect(props.onConfigureModel).not.toHaveBeenCalled();
     expect(props.onAddToChat).toHaveBeenCalledOnce();
     expect(props.onInstall).not.toHaveBeenCalled();
     expect(document.querySelector("[role=dialog]")).toBeNull();
     expect(button("安装Office", container.querySelector('article[aria-label="Office"]')!).disabled).toBe(false);
+  });
+
+  it("does not claim sign-in is required when the literature review policy does not require it", async () => {
+    await render({ plugins: [{ ...literature, requiresLogin: false }] });
+    await click("查看文献综述详情");
+    expect(document.querySelector(".plugin-marketplace-detail-note")).toBeNull();
+  });
+
+  it("shows the custom model guidance in English", async () => {
+    await render({}, "en-US");
+    await click("View 文献综述 details");
+    expect(document.querySelector(".plugin-marketplace-detail-note")?.textContent).toBe("Note: Sign-in is required. Due to high token usage and task complexity, we currently only recommend using a capable model that you configure yourself.");
+    expect(document.querySelector("[role=dialog]")?.textContent).not.toContain("Memmy official models");
   });
 
   it("installs from a catalog card with one click and no confirmation dialog", async () => {
@@ -258,13 +272,14 @@ describe("PluginMarketplaceSection", () => {
     expect(container.querySelector("article")?.textContent).not.toContain("默认提供");
     expect(container.querySelector("article")?.textContent).not.toContain("需官方模型");
     const summary = container.querySelector(".plugin-marketplace-description")!;
-    expect(summary.textContent).toBe("根据研究主题检索论文、整理证据，生成可继续编辑的文献综述和参考文献。 该插件推荐使用 Memmy 官方模型。");
+    expect(summary.textContent).toBe("根据研究主题检索论文、整理证据，生成可继续编辑的文献综述和参考文献。");
     expect(summary.getAttribute("title")).toBe(summary.textContent);
     await click("查看文献综述详情");
     const dialog = document.querySelector("[role=dialog]")!;
     expect(dialog.querySelector("figure")).not.toBeNull();
     expect(dialog.querySelector("figure button")).toBeNull();
-    expect(dialog.textContent).toContain("需登录；推荐 Memmy 官方模型");
+    expect(dialog.textContent).toContain("注：需登录账号使用。因消耗 Token 量较大且任务较为复杂，目前只建议使用自行配置且性能较强的模型。");
+    expect(dialog.textContent).not.toContain("推荐 Memmy 官方模型");
     expect(dialog.textContent).not.toContain("能力说明");
     expect(dialog.textContent).toContain("根据研究主题检索论文");
     expect(dialog.querySelector(".plugin-marketplace-detail-description")?.textContent).toBe(summary.textContent);
