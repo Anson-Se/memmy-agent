@@ -1877,49 +1877,54 @@ function deduplicateLegalInteractions(calls: PluginUiCall[]): PluginUiCall[] {
   return calls.filter((call) => [...chosen.values()].includes(call));
 }
 
-/**
- * Reduces the calls of one capability to the ones worth a card.
- *
- * The conversation is not a log of everything the plugin did — it is where the
- * work is happening. So for each capability only two things survive: the run
- * that is still going, and the most recent run that produced something. An
- * earlier attempt that failed, a run the user started again, a cancelled one:
- * those are history, and rendering each as its own card buries the one card the
- * user is supposed to act on.
- *
- * A newer live run supersedes an older one for the same reason the plugin can
- * only serve one at a time — only the newest is still answering.
- *
- * @param calls Calls the region is considering, oldest first.
- * @returns The calls that deserve a card, oldest first.
- */
+/** Keeps delivered files across calls while collapsing superseded interaction cards. */
 export function selectCurrentPluginCalls(calls: readonly PluginUiCall[]): PluginUiCall[] {
   const isLive = (call: PluginUiCall) => !call.events.some((event) => event.type === "result" || event.type === "error");
-  const groups = new Map<string, { live: PluginUiCall[]; finished?: PluginUiCall }>();
-  const order: string[] = [];
+  const deliveryKey = (call: PluginUiCall, artifact: PluginArtifactRef) => JSON.stringify([
+    normalizePluginConversationId(call.conversationId) ?? call.conversationId,
+    call.pluginId,
+    artifact.path ? ["path", artifact.path] : ["id", artifact.id]
+  ]);
+  // Host download URLs and artifact IDs can change when a file is delivered
+  // again. Its workspace path identifies that file without merging same-named
+  // files from different tasks. Artifacts without a path retain their own IDs.
+  const latestDeliveries = new Map<string, CapabilityEvent>();
   for (const call of calls) {
+    for (const event of call.events) {
+      if (event.type === "artifact" && event.artifact.role !== "setup") {
+        latestDeliveries.set(deliveryKey(call, event.artifact), event);
+      }
+    }
+  }
+  const currentCalls = calls.map((call) => ({
+    ...call,
+    events: call.events.filter((event) => event.type !== "artifact" || event.artifact.role === "setup"
+      || latestDeliveries.get(deliveryKey(call, event.artifact)) === event)
+  }));
+  const selected = new Set(currentCalls.filter((call) => call.events.some((event) => (
+    event.type === "artifact" && event.artifact.role !== "setup"
+  ))));
+  const groups = new Map<string, { live: PluginUiCall[]; finished?: PluginUiCall }>();
+  for (const call of currentCalls) {
     const key = `${normalizePluginConversationId(call.conversationId) ?? call.conversationId}:${call.pluginId}:${call.capabilityId}:${isBarePresentation(call) ? "recorder" : "card"}`;
     let group = groups.get(key);
     if (!group) {
       group = { live: [] };
       groups.set(key, group);
-      order.push(key);
     }
     if (isLive(call)) group.live.push(call);
     else group.finished = call;
   }
-  return order
-    .flatMap((key) => {
-      const group = groups.get(key)!;
-      if (group.live.length) {
-        // A second invocation cannot hide a tool that still needs an answer.
-        const waiting = group.live.filter((call) => call.events.some((event) => event.type === "interaction"));
-        return waiting.length ? deduplicateLegalInteractions(waiting) : group.live.slice(-1);
-      }
-      if (group.finished?.events.some((event) => event.type === "artifact")) return [group.finished];
-      return [];
-    })
-    .sort((left, right) => calls.indexOf(left) - calls.indexOf(right));
+  for (const group of groups.values()) {
+    if (group.live.length) {
+      // A second invocation cannot hide a tool that still needs an answer.
+      const waiting = group.live.filter((call) => call.events.some((event) => event.type === "interaction"));
+      for (const call of waiting.length ? deduplicateLegalInteractions(waiting) : group.live.slice(-1)) selected.add(call);
+    } else if (group.finished?.events.some((event) => event.type === "artifact")) {
+      selected.add(group.finished);
+    }
+  }
+  return currentCalls.filter((call) => selected.has(call));
 }
 
 /** Keeps history in the event store while limiting the conversation to actionable UI. */
