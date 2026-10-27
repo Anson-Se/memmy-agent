@@ -1124,7 +1124,7 @@ describe("MemoryService / import / processing", () => {
     const summaryRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
     const embeddingRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
 
-    expect(summaryRun.jobs).toEqual([
+    expect(summaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "import_summary", targetMemoryId: first.id })
     ]);
     expect(embeddingRun.jobs).toEqual([
@@ -1406,7 +1406,7 @@ describe("MemoryService / import / processing", () => {
     const embeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const scanRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
 
-    expect(summaryRun.jobs).toEqual([
+    expect(summaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
     ]);
     expect(embeddingRun.jobs).toEqual([
@@ -1484,7 +1484,7 @@ describe("MemoryService / import / processing", () => {
     expect(reportEmbeddingRun.jobs).toEqual([
       expect.objectContaining({ jobType: "embedding", targetMemoryId: firstReport.id })
     ]);
-    expect(liveSummaryRun.jobs).toEqual([
+    expect(liveSummaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
     ]);
     expect(liveSummaryRun.jobs.map((job) => job.targetMemoryId)).not.toContain(scanned.id);

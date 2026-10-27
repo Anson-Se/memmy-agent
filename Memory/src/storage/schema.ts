@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
 import { memoryCaptureQaHash, normalizeMemoryCaptureSource } from "../utils/memory-capture-claim.js";
 
-export const SCHEMA_VERSION = 9;
-export const SCHEMA_MIGRATION_ID = "009_token_usage_outbox";
+export const SCHEMA_VERSION = 10;
+export const SCHEMA_MIGRATION_ID = "010_pending_episode_assignment";
 const API_LOG_SOURCE_AGENT_MIGRATION_FROM_VERSION = 2;
 const PROCESSING_TAGS = new Set([
   "摘要排队中",
@@ -207,7 +207,7 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS raw_turns (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    episode_id TEXT REFERENCES episodes(id) ON DELETE CASCADE,
     turn_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     conversation_id TEXT,
@@ -384,7 +384,7 @@ const statements = [
     project_id TEXT,
     skill_memory_id TEXT NOT NULL,
     session_id TEXT,
-    episode_id TEXT NOT NULL,
+    episode_id TEXT,
     l1_memory_id TEXT,
     raw_turn_id TEXT,
     turn_id TEXT,
@@ -695,7 +695,7 @@ export function migrate(db: Database.Database): void {
   const hasMemories = tableExists(db, "memories");
   const version = currentSchemaVersion(db);
 
-  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8) {
+  if (hasMemories && version !== SCHEMA_VERSION && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9) {
     throw new Error(
       `Unsupported memory database schema version ${version}; the database was left unchanged`
     );
@@ -716,6 +716,23 @@ export function migrate(db: Database.Database): void {
       if (version > 0 && version < 6) {
         addColumnIfMissing(db, "evolution_jobs", "scope_key", "TEXT");
         addColumnIfMissing(db, "evolution_jobs", "scope_seq", "INTEGER");
+      }
+      // Rebuild only the parent table, with foreign keys disabled outside this
+      // transaction. Preserve rowid: it is the tie-breaker for turn ordering.
+      if (tableExists(db, "raw_turns") && (db.prepare("PRAGMA table_info(raw_turns)").all() as Array<{ name: string; notnull: number }>).some(c => c.name === "episode_id" && c.notnull)) {
+        const create = statements.find(s => s.startsWith("CREATE TABLE IF NOT EXISTS raw_turns ("))!;
+        db.exec(create.replace("IF NOT EXISTS raw_turns", "raw_turns_pending"));
+        const columns = (db.prepare("PRAGMA table_info(raw_turns)").all() as Array<{ name: string }>).map(c => `"${c.name}"`).join(", ");
+        db.exec(`INSERT INTO raw_turns_pending(rowid, ${columns}) SELECT rowid, ${columns} FROM raw_turns`);
+        db.exec("DROP TABLE raw_turns");
+        db.exec("ALTER TABLE raw_turns_pending RENAME TO raw_turns");
+      }
+      if (tableExists(db, "skill_trials") && (db.prepare("PRAGMA table_info(skill_trials)").all() as Array<{ name: string; notnull: number }>).some(c => c.name === "episode_id" && c.notnull)) {
+        const create = statements.find(s => s.startsWith("CREATE TABLE IF NOT EXISTS skill_trials ("))!;
+        db.exec(create.replace("IF NOT EXISTS skill_trials", "skill_trials_pending"));
+        db.exec("INSERT INTO skill_trials_pending SELECT * FROM skill_trials ORDER BY rowid");
+        db.exec("DROP TABLE skill_trials");
+        db.exec("ALTER TABLE skill_trials_pending RENAME TO skill_trials");
       }
       for (const statement of statements) {
         db.prepare(statement).run();

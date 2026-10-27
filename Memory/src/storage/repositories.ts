@@ -38,7 +38,7 @@ import type {
 import { DEFAULT_NAMESPACE_SOURCE } from "../types.js";
 import { agentSourceFamilyRoots, normalizeAgentIdKey } from "../utils/agent-source-id.js";
 import { newId, stableHash } from "../utils/id.js";
-import { asStringArray, parseJson, toJson } from "../utils/json.js";
+import { asStringArray, isRecord, parseJson, toJson } from "../utils/json.js";
 import { firstSemanticUserLine } from "../utils/text.js";
 import { nowIso } from "../utils/time.js";
 import {
@@ -202,7 +202,7 @@ export interface SkillClusterMemberRecord {
 export interface RawTurnRecord {
   id: string;
   sessionId: string;
-  episodeId: string;
+  episodeId?: string;
   turnId: string;
   userId: string;
   conversationId?: string;
@@ -2356,10 +2356,11 @@ export class RuntimeRepository {
     return episode;
   }
 
-  getEpisode(id: string): EpisodeRecord | undefined {
+  getEpisode(id: string | undefined): EpisodeRecord | undefined {
+    if (!id) return undefined;
     const row = this.db
       .prepare(`SELECT * FROM episodes WHERE id = ?`)
-      .get(id) as SqlEpisodeRow | undefined;
+      .get(id ?? null) as SqlEpisodeRow | undefined;
     return row ? episodeFromSql(row) : undefined;
   }
 
@@ -2678,6 +2679,52 @@ export class RuntimeRepository {
     };
   }
 
+  l1MemoryIdsForRawTurn(rawTurnId: string): string[] {
+    return (this.db.prepare(`SELECT id FROM memories WHERE memory_layer = 'L1' AND
+      (json_extract(info_json, '$.raw_turn_id') = ? OR json_extract(properties_json, '$.internal_info.trace.raw_turn_id') = ?)`)
+      .all(rawTurnId, rawTurnId) as Array<{ id: string }>).map(r => r.id);
+  }
+
+  hasUnassignedTurns(sessionId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM raw_turns WHERE session_id = ? AND deleted_at IS NULL AND redacted_at IS NULL
+      AND (episode_id IS NULL OR json_extract(message_payload_json, '$.episode_assignment.status') IN ('pending', 'selected', 'applying')) LIMIT 1`).get(sessionId));
+  }
+
+  isRawTurnAttributionPending(rawTurnId: string | undefined): boolean {
+    const raw = rawTurnId ? this.getRawTurn(rawTurnId) : undefined;
+    if (!raw || raw.deletedAt || raw.redactedAt) return false;
+    const assignment = raw.messagePayload?.episode_assignment;
+    return !raw.episodeId || (isRecord(assignment) && ["pending", "selected", "applying"].includes(String(assignment.status)));
+  }
+
+  bindRawTurnEpisode(rawTurnId: string, episodeId: string, at: string): void {
+    const raw = this.getRawTurn(rawTurnId);
+    const episode = this.getEpisode(episodeId);
+    if (!raw || !episode || raw.sessionId !== episode.sessionId) throw new Error("invalid first episode binding");
+    const l1Ids = this.l1MemoryIdsForRawTurn(rawTurnId);
+    if (raw.episodeId && raw.episodeId !== episodeId) {
+      this.moveTurnLinks({ rawTurnId, l1MemoryIds: l1Ids, fromEpisodeId: raw.episodeId, toEpisodeId: episodeId, at });
+    }
+    this.updateRawTurn({ ...raw, episodeId });
+    this.appendEpisodeRawTurn(episodeId, rawTurnId, at);
+    for (const id of l1Ids) {
+      this.db.prepare(`UPDATE memories SET info_json = json_set(info_json, '$.episode_id', ?),
+        properties_json = json_set(properties_json, '$.info.episode_id', ?, '$.internal_info.trace.episode_id', ?) WHERE id = ?`)
+        .run(episodeId, episodeId, episodeId, id);
+      this.appendEpisodeTurn(episodeId, rawTurnId, id, at);
+    }
+    for (const table of ['artifacts', 'feedback', 'decision_repairs', 'l3_world_model_input_traces', 'source_turn_captures', 'skill_trials']) {
+      this.db.prepare(`UPDATE ${table} SET episode_id = ? WHERE raw_turn_id = ?`).run(episodeId, rawTurnId);
+    }
+    this.db.prepare(`UPDATE evolution_jobs SET episode_id = ? WHERE json_extract(payload_json, '$.rawTurnId') = ?
+      OR target_memory_id IN (SELECT id FROM memories WHERE json_extract(info_json, '$.raw_turn_id') = ?)`)
+      .run(episodeId, rawTurnId, rawTurnId);
+    for (const row of this.db.prepare("SELECT id FROM feedback WHERE raw_turn_id = ?").all(rawTurnId) as Array<{ id: string }>) this.appendEpisodeFeedback(episodeId, row.id, at);
+    for (const row of this.db.prepare("SELECT id FROM decision_repairs WHERE raw_turn_id = ?").all(rawTurnId) as Array<{ id: string }>) this.appendEpisodeDecisionRepair(episodeId, row.id, at);
+    for (const row of this.db.prepare("SELECT skill_memory_id FROM skill_trials WHERE raw_turn_id = ?").all(rawTurnId) as Array<{ skill_memory_id: string }>) this.appendEpisodeDerivedMemory(episodeId, "Skill", row.skill_memory_id, at);
+    this.orderEpisodeTurnsBySourceTime(episodeId);
+  }
+
   insertRawTurn(rawTurn: RawTurnRecord): RawTurnRecord {
     this.db
       .prepare(
@@ -2695,6 +2742,7 @@ export class RuntimeRepository {
       )
       .run({
         ...rawTurn,
+        episodeId: rawTurn.episodeId ?? null,
         conversationId: rawTurn.conversationId ?? null,
         userText: rawTurn.userText ?? null,
         assistantText: rawTurn.assistantText ?? null,
@@ -2730,7 +2778,7 @@ export class RuntimeRepository {
       )
       .run({
         id: rawTurn.id,
-        episodeId: rawTurn.episodeId,
+        episodeId: rawTurn.episodeId ?? null,
         userText: rawTurn.userText ?? null,
         assistantText: rawTurn.assistantText ?? null,
         reasoningSummary: rawTurn.reasoningSummary ?? null,
@@ -2910,6 +2958,11 @@ export class RuntimeRepository {
       LIMIT 1
     `).get(input) as { found: number } | undefined;
     return row?.found === 1;
+  }
+
+  listUnassignedRawTurnsBySession(sessionId: string): RawTurnRecord[] {
+    return (this.db.prepare("SELECT * FROM raw_turns WHERE session_id=? AND episode_id IS NULL AND deleted_at IS NULL ORDER BY created_at,rowid")
+      .all(sessionId) as SqlRawTurnRow[]).map(rawTurnFromSql);
   }
 
   listRecentRawTurnsBySession(sessionId: string, limit = 8): RawTurnRecord[] {
@@ -3370,20 +3423,6 @@ export class RuntimeRepository {
     };
   }
 
-  /** Reserve a durable capture before waiting for its Episode selection. */
-  reserveCaptureReplay(job: EvolutionJobRecord): EvolutionJobRecord | undefined {
-    return this.db.transaction(() => {
-      const existing = this.getActiveJobByDedupeKey(job.dedupeKey!);
-      if (existing?.status === "leased" && existing.leasedUntil && existing.leasedUntil > job.createdAt) return undefined;
-      if (existing) {
-        this.db.prepare(`UPDATE evolution_jobs SET status = 'leased', leased_until = ?, updated_at = ? WHERE id = ?`)
-          .run(job.leasedUntil!, job.updatedAt, existing.id);
-        return this.getJob(existing.id);
-      }
-      return this.enqueueJobInTransaction(job);
-    })();
-  }
-
   enqueueJob(job: EvolutionJobRecord): EvolutionJobRecord {
     return this.db.transaction(() => this.enqueueJobInTransaction(job))();
   }
@@ -3787,6 +3826,16 @@ export class RuntimeRepository {
               OR (status = 'leased' AND leased_until IS NOT NULL AND leased_until <= ?))
              AND attempts < max_attempts
              AND NOT (
+               job_type = 'feedback_experience'
+               AND EXISTS (
+                 SELECT 1 FROM raw_turns pending_feedback_turn
+                 WHERE pending_feedback_turn.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                   AND pending_feedback_turn.deleted_at IS NULL AND pending_feedback_turn.redacted_at IS NULL
+                   AND (pending_feedback_turn.episode_id IS NULL OR
+                     json_extract(pending_feedback_turn.message_payload_json, '$.episode_assignment.status') IN ('pending', 'selected', 'applying'))
+               )
+             )
+             AND NOT (
                job_type = 'reward'
                AND json_extract(payload_json, '$.l1MemoryId') IS NOT NULL
                AND (
@@ -3864,6 +3913,25 @@ export class RuntimeRepository {
                    )
                )
              )
+             AND NOT (
+               (job_type IN ('episode_assignment', 'episode_finalize') OR (job_type = 'trace_summary' AND COALESCE(json_extract(payload_json, '$.turnJudge'), 0) = 1))
+               AND json_extract(payload_json, '$.rawTurnId') IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM raw_turns prior JOIN raw_turns current ON current.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                 WHERE prior.session_id = current.session_id AND prior.deleted_at IS NULL AND prior.redacted_at IS NULL
+                   AND json_extract(prior.message_payload_json, '$.episode_assignment.status') IN ('pending', 'selected', 'applying')
+                   AND (prior.created_at < current.created_at OR (prior.created_at = current.created_at AND prior.rowid < current.rowid))
+               )
+             )
+             AND (job_type <> 'episode_finalize' OR EXISTS (
+               SELECT 1 FROM raw_turns r WHERE r.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                 AND (r.deleted_at IS NOT NULL OR r.redacted_at IS NOT NULL OR (
+                   json_extract(r.message_payload_json, '$.episode_assignment.selection') IS NOT NULL
+                   AND (COALESCE(json_extract(r.message_payload_json, '$.episode_assignment.turnJudge'), 0) = 0
+                     OR json_extract(r.message_payload_json, '$.episode_assignment.judgment') IS NOT NULL
+                     OR json_extract(r.message_payload_json, '$.turn_judge.status') = 'skipped')
+                 ))
+             ))
              ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
              ${excludedJobTypes?.length ? `AND job_type NOT IN (${excludedJobTypes.map(() => "?").join(", ")})` : ""}
              ${targetFilter}
@@ -3916,14 +3984,6 @@ export class RuntimeRepository {
     return this.getJob(id);
   }
 
-  completeCaptureReplay(id: string, at = nowIso()): void {
-    // The raw content now lives in the normal capture tables. Do not retain a
-    // second copy in completed jobs that would escape later raw-turn redaction.
-    this.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded', leased_until = NULL,
-      payload_json = json_object('operation', json_extract(payload_json, '$.command.operation'), 'captured', json('true')),
-      updated_at = ? WHERE id = ? AND job_type = 'capture_replay'`).run(at, id);
-  }
-
   /** Waiting for a dependency is not a model failure and does not consume an attempt. */
   deferProcessingJob(id: string, runAfter: string, at = nowIso(), restoreAttempt = true): EvolutionJobRecord | undefined {
     this.db.prepare(`UPDATE evolution_jobs SET status = 'queued', leased_until = NULL,
@@ -3931,6 +3991,22 @@ export class RuntimeRepository {
       payload_json = json_set(payload_json, '$.runAfter', ?)
       WHERE id = ? AND status = 'leased'`).run(restoreAttempt ? 1 : 0, at, runAfter, id);
     return this.getJob(id);
+  }
+
+  requeueFailedEpisodeAssignments(at = nowIso(), rawTurnId?: string): Array<{ before: EvolutionJobRecord; after: EvolutionJobRecord }> {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM evolution_jobs j WHERE job_type IN ('episode_assignment','episode_finalize')
+        AND status IN ('failed','dead_letter') ${rawTurnId ? "AND json_extract(payload_json, '$.rawTurnId') = ?" : ""}
+        AND EXISTS (SELECT 1 FROM raw_turns r WHERE r.id=json_extract(j.payload_json,'$.rawTurnId')
+          AND r.deleted_at IS NULL AND r.redacted_at IS NULL
+          AND json_extract(r.message_payload_json,'$.episode_assignment.status') <> 'assigned'
+          AND json_extract(r.message_payload_json,'$.episode_assignment.generation') = json_extract(j.payload_json,'$.generation'))`)
+        .all(...(rawTurnId ? [rawTurnId] : [])) as SqlJobRow[];
+      return rows.map(row => {
+        this.db.prepare("UPDATE evolution_jobs SET status='queued',attempts=0,leased_until=NULL,last_error=NULL,updated_at=?,payload_json=json_remove(payload_json,'$.runAfter') WHERE id=?").run(at,row.id);
+        return { before: jobFromSql(row), after: this.getJob(row.id)! };
+      });
+    })();
   }
 
   requeueFailedJobs(
@@ -7552,7 +7628,7 @@ function skillClusterMemberFromSql(row: SqlSkillClusterMemberRow): SkillClusterM
 interface SqlRawTurnRow {
   id: string;
   session_id: string;
-  episode_id: string;
+  episode_id: string | null;
   turn_id: string;
   user_id: string;
   conversation_id: string | null;
@@ -7592,7 +7668,7 @@ function rawTurnFromSql(row: SqlRawTurnRow): RawTurnRecord {
   return {
     id: row.id,
     sessionId: row.session_id,
-    episodeId: row.episode_id,
+    episodeId: row.episode_id ?? undefined,
     turnId: row.turn_id,
     userId: row.user_id,
     conversationId: row.conversation_id ?? undefined,
@@ -8159,6 +8235,9 @@ function nestedString(record: Record<string, unknown>, ...path: string[]): strin
 }
 
 function redactBundleRow(table: BundleTableName, row: Record<string, unknown>): Record<string, unknown> {
+  if (table === "evolution_jobs" && row.job_type === "capture_replay") {
+    return { ...row, payload_json: JSON.stringify({ rawTextExcluded: true }) };
+  }
   if (table !== "raw_turns") {
     return row;
   }
@@ -8337,7 +8416,7 @@ function evolutionJobOrderSql(): string {
              ELSE ''
            END DESC,
            CASE
-             WHEN job_type IN ('trace_summary', 'import_summary', 'observation_extract') THEN 0
+             WHEN job_type IN ('episode_assignment', 'episode_finalize', 'trace_summary', 'import_summary', 'observation_extract') THEN 0
              WHEN job_type = 'embedding' THEN 1
              ELSE 2
            END ASC,
@@ -8364,7 +8443,7 @@ function evolutionJobPrioritySql(): string {
                  'startup.processing_repair',
                  'startup.placeholder_summary_repair'
                ) THEN 90
-             WHEN job_type IN ('capture_replay', 'trace_summary', 'observation_extract')
+             WHEN job_type IN ('episode_assignment', 'episode_finalize', 'trace_summary', 'observation_extract')
                OR (job_type = 'embedding' AND ${interactiveL1Target}) THEN 1
              WHEN job_type = 'import_summary'
                OR (job_type = 'embedding' AND ${importedTarget}) THEN 2

@@ -465,7 +465,8 @@ export class ImportJobProcessor {
         if (!current || current.state !== "failed" || !current.stage || current.retryAction === "none") return undefined;
         const jobType = current.stage === "summary" ? summaryProcessingJobType(memory) : "embedding";
         const job = d.enqueueJob({ jobType, userId: memory.userId, sessionId: memory.sessionId, targetMemoryId: memory.id,
-          payload: { source: "memory.processing.lifecycle_retry", previousErrorCode: current.errorCode ?? undefined, ...observationJobPayload(memory), ...externalSkillJobPayload(memory) },
+          payload: { source: "memory.processing.lifecycle_retry", previousErrorCode: current.errorCode ?? undefined, ...observationJobPayload(memory), ...externalSkillJobPayload(memory),
+            ...(jobType === "trace_summary" ? turnJudgeJobFlags(d.runtime.latestJobForTarget(memory.id, jobType)?.payload) : {}) },
           maxAttempts: current.stage === "summary" ? 3 : 6, createdAt: at });
         const processing = d.processing.save({ ...current, state: current.stage === "summary" ? "summary_pending" : "embedding_pending", activeJobId: job.id,
           attemptCount: 0, retryAction: "retry", updatedAt: at });

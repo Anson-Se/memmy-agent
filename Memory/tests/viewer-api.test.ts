@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "./fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "./fixtures/memory-service-fixture.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
@@ -588,7 +589,7 @@ describe("local Viewer API", () => {
     );
     expect(await tasks.json()).toMatchObject({
       total: 1,
-      tasks: [expect.objectContaining({ id: codexTurn.episodeId })],
+      tasks: [expect.objectContaining({ id: assignedEpisodeId(fixture.service, codexTurn) })],
     });
   });
 });

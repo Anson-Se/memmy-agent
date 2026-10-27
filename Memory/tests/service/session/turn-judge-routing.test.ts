@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Repositories } from "../../../src/storage/repositories.js";
 import { heuristicHumanScore } from "../../../src/algorithm/plugin-algorithms.js";
@@ -76,11 +77,13 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const { service } = createTestService({ llm, config: turnJudgeConfig() });
     const session = openSession(service, "route-start");
     (await service.completeTurn("t1", { sessionId: session.sessionId, query: "写部署脚本", answer: "好的。" }));
+    await settle(service);
+    const judgedBeforeStart = judgeCalls.length;
     const started = await service.startTurn({ turnId: "t2", sessionId: session.sessionId, query: "接下来加回滚" });
 
     expect(started.status).toContain("relation:pending:proposed");
     expect(otherCalls.some((call) => call.options.operation.startsWith("relation."))).toBe(false);
-    expect(judgeCalls).toHaveLength(0);
+    expect(judgeCalls).toHaveLength(judgedBeforeStart);
   });
 
   it("keeps a follow_up in the task and writes a neutral reaction pointing at the previous turn", async () => {
@@ -92,10 +95,10 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：加回滚", answer: "已加。" }));
     await settle(service);
 
-    expect(episodeOf(db, second.rawTurnId)).toBe(first.episodeId);
+    expect(episodeOf(db, second.rawTurnId)).toBe(assignedEpisodeId(service, first));
     const [feedback] = feedbackRows(db, session.sessionId);
     expect(feedback).toMatchObject({
-      episode_id: first.episodeId,
+      episode_id: assignedEpisodeId(service, first),
       raw_turn_id: first.rawTurnId,
       l1_memory_id: first.l1MemoryId,
       channel: "explicit",
@@ -105,7 +108,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     });
     expect(feedback!.raw_payload).toMatchObject({ source: "turn_judge", promptVersion: "turn.judge.v1", sourceRawTurnId: second.rawTurnId });
     expect(jobsOf(db, "decision_repair")).toHaveLength(0);
-    expect(service.getMemory(first.episodeId).refs).toMatchObject({ feedbackCounts: { positive: 0, negative: 0, neutral: 1 } });
+    expect(service.getMemory(assignedEpisodeId(service, first)).refs).toMatchObject({ feedbackCounts: { positive: 0, negative: 0, neutral: 1 } });
     expect(service.serviceMetrics().feedback).toMatchObject({ recent: 1, positive: 0, negative: 0, neutral: 1 });
     const relation = rawTurnPayload(db, second.rawTurnId).turn_start.routeProposal.relationDecision;
     expect(relation).toEqual({ relation: "follow_up", reason: "follow_up/neutral", signals: ["llm", "turn.judge.v1"] });
@@ -123,26 +126,26 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：订高铁", answer: "订了 8 点的。" }));
     await settle(service);
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：换个事，写求职信", answer: "初稿如下。" }));
-    expect(second.episodeId).toBe(first.episodeId);
+    expect(second.episodeId).toBeUndefined();
     await settle(service);
 
     const moved = episodeOf(db, second.rawTurnId);
-    expect(moved).not.toBe(first.episodeId);
-    const oldTask = episodeRow(db, first.episodeId);
+    expect(moved).not.toBe(assignedEpisodeId(service, first));
+    const oldTask = episodeRow(db, assignedEpisodeId(service, first));
     const newTask = episodeRow(db, moved);
     expect(oldTask).toMatchObject({ status: "closed", rawTurnIds: [first.rawTurnId], l1MemoryIds: [first.l1MemoryId] });
     expect(oldTask.meta).toMatchObject({ closeReason: "topic_boundary", relation: "new_task" });
     expect(newTask).toMatchObject({ status: "open", rawTurnIds: [second.rawTurnId], l1MemoryIds: [second.l1MemoryId] });
-    expect(newTask.meta).toMatchObject({ relation: "new_task", previousEpisodeId: first.episodeId });
+    expect(newTask.meta).toMatchObject({ relation: "new_task", previousEpisodeId: assignedEpisodeId(service, first) });
     const l1 = memoryProperties(db, second.l1MemoryId);
     expect(l1.info.episode_id).toBe(moved);
     expect(l1.internal_info.trace.episode_id).toBe(moved);
-    expect(l1.internal_info.trace.key.startsWith(`${moved}:`)).toBe(true);
+    expect(l1.internal_info.trace.key.startsWith(`${session.sessionId}:`)).toBe(true);
 
     const l3Inputs = db.db.prepare("SELECT raw_turn_id, episode_id FROM l3_world_model_input_traces WHERE session_id = ? ORDER BY trace_seq")
       .all(session.sessionId) as Array<{ raw_turn_id: string; episode_id: string }>;
     expect(l3Inputs).toEqual([
-      { raw_turn_id: first.rawTurnId, episode_id: first.episodeId },
+      { raw_turn_id: first.rawTurnId, episode_id: assignedEpisodeId(service, first) },
       { raw_turn_id: second.rawTurnId, episode_id: moved }
     ]);
     // L3 freezes through the old task's last trace only, not the moved turn.
@@ -160,7 +163,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     }
 
     const [feedback] = feedbackRows(db, session.sessionId);
-    expect(feedback).toMatchObject({ episode_id: first.episodeId, raw_turn_id: first.rawTurnId, polarity, magnitude: 1 });
+    expect(feedback).toMatchObject({ episode_id: assignedEpisodeId(service, first), raw_turn_id: first.rawTurnId, polarity, magnitude: 1 });
     expect(oldTask.feedbackIds).toEqual([feedback!.id]);
     const evidence = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id = ?")
       .all(session.sessionId) as Array<{ feedback_ids_json: string }>;
@@ -171,9 +174,9 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const after = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id = ?")
       .all(session.sessionId) as Array<{ feedback_ids_json: string }>;
     expect(after.flatMap(row => JSON.parse(row.feedback_ids_json)).filter(id => id === feedback!.id)).toHaveLength(1);
-    expect(jobsOf(db, "decision_repair", first.episodeId)).toHaveLength(polarity === "negative" ? 1 : 0);
+    expect(jobsOf(db, "decision_repair", assignedEpisodeId(service, first))).toHaveLength(polarity === "negative" ? 1 : 0);
     // The old task's closing work runs once its turns are settled.
-    expect(jobsOf(db, "reward", first.episodeId).length + jobsOf(db, "reflection", first.episodeId).length).toBeGreaterThan(0);
+    expect(jobsOf(db, "reward", assignedEpisodeId(service, first)).length + jobsOf(db, "reflection", assignedEpisodeId(service, first)).length).toBeGreaterThan(0);
   });
 
   it.each(["positive", "negative"])("preserves %s feedback with backlog and a reopened historical Episode", async polarity => {
@@ -188,28 +191,28 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const historical = await service.completeTurn("historical", { sessionId: session.sessionId, query: "Historical task", answer: "Historical output" });
     await settle(service);
     const repos = new Repositories(db.db);
-    repos.runtime.closeEpisode(historical.episodeId, { closeReason: "idle_timeout" });
+    repos.runtime.closeEpisode(assignedEpisodeId(service, historical), { closeReason: "idle_timeout" });
     const first = await service.completeTurn("a", { sessionId: session.sessionId, query: "A task", answer: "A done" });
     await settle(service);
     // Selection reopens a historical task during B's routing. C was already
     // captured provisionally in A and must subsequently follow B.
     const completeJson = llm.completeJson;
     llm.completeJson = async (messages, options) => {
-      if (options.operation === "episode.select.v1") return { episodeId: historical.episodeId, title: "A reopened", summary: "Historical task" } as any;
+      if (options.operation === "episode.select.v1") return { episodeId: assignedEpisodeId(service, historical), title: "A reopened", summary: "Historical task" } as any;
       return completeJson(messages, options);
     };
     const second = await service.completeTurn("b", { sessionId: session.sessionId, query: "B task", answer: "B done" });
     const third = await service.completeTurn("c", { sessionId: session.sessionId, query: "C task", answer: "C done" });
     await settle(service, 10);
-    expect(repos.runtime.getEpisode(historical.episodeId)?.meta.reopenReason).toBe("episode_selection");
+    expect(repos.runtime.getEpisode(assignedEpisodeId(service, historical))?.meta.reopenReason).toBe("episode_selection");
     const feedback = feedbackRows(db, session.sessionId).find(row => row.raw_turn_id === first.rawTurnId)!;
     expect(feedback.polarity).toBe(polarity);
     const batches = db.db.prepare("SELECT feedback_ids_json FROM l3_world_model_evidence_batches WHERE session_id=?").all(session.sessionId) as Array<{ feedback_ids_json: string }>;
     expect(batches.flatMap(row => JSON.parse(row.feedback_ids_json)).filter(id => id === feedback.id)).toHaveLength(1);
     expect(l3Evidence.flatMap(input => input.raw_turns).find(turn => turn.raw_turn_id === first.rawTurnId)?.feedback)
       .toEqual([expect.objectContaining({ polarity })]);
-    expect(episodeOf(db, second.rawTurnId)).toBe(historical.episodeId);
-    expect(episodeOf(db, third.rawTurnId)).toBe(historical.episodeId);
+    expect(episodeOf(db, second.rawTurnId)).toBe(assignedEpisodeId(service, historical));
+    expect(episodeOf(db, third.rawTurnId)).toBe(assignedEpisodeId(service, historical));
     expect(rawTurnPayload(db, second.rawTurnId).turn_judge.status).toBe("judged");
     expect(rawTurnPayload(db, third.rawTurnId).turn_judge.status).toBe("judged");
   });
@@ -225,13 +228,13 @@ describe("turn.judge.v1 routing (switch on)", () => {
     await settle(service);
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：开新任务", answer: "好。" }));
     const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "第三轮：接着新任务", answer: "好。" }));
-    expect(third.episodeId).toBe(first.episodeId);
+    expect(third.episodeId).toBeUndefined();
     await settle(service);
 
     expect(judgeCalls.map((call) => call.user.slice(0, 3))).toEqual(["第一轮", "第二轮", "第三轮"]);
     const newTask = episodeOf(db, second.rawTurnId);
     expect(episodeOf(db, third.rawTurnId)).toBe(newTask);
-    expect(episodeRow(db, first.episodeId).rawTurnIds).toEqual([first.rawTurnId]);
+    expect(episodeRow(db, assignedEpisodeId(service, first)).rawTurnIds).toEqual([first.rawTurnId]);
     expect(episodeRow(db, newTask).rawTurnIds).toEqual([second.rawTurnId, third.rawTurnId]);
     const thirdInput = judgeCalls[2]!.messages.at(-1)!.content;
     expect(thirdInput).toContain("<first_user_message>第二轮：开新任务</first_user_message>");
@@ -248,11 +251,12 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" }));
     await settle(service);
 
-    expect(episodeOf(db, second.rawTurnId)).toBe(first.episodeId);
-    expect(episodeRow(db, first.episodeId)).toMatchObject({ status: "closed" });
-    expect(episodeRow(db, first.episodeId).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
+    expect(episodeOf(db, second.rawTurnId)).toBe(assignedEpisodeId(service, first));
+    expect(episodeRow(db, assignedEpisodeId(service, first))).toMatchObject({ status: "closed" });
+    expect(episodeRow(db, assignedEpisodeId(service, first)).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
     const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题", answer: "好。" }));
-    expect(third.episodeId).not.toBe(first.episodeId);
+    await settle(service);
+    expect(assignedEpisodeId(service, third)).not.toBe(assignedEpisodeId(service, first));
   });
 
   it("sends an explicit end command through the model instead of the old rule", async () => {
@@ -266,7 +270,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     await settle(service);
 
     expect(judgeCalls.some((call) => call.user === "结束会话")).toBe(true);
-    expect(episodeRow(db, first.episodeId).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
+    expect(episodeRow(db, assignedEpisodeId(service, first)).meta).toMatchObject({ closeReason: "end_topic", endTopicTurnId: "t2" });
   });
 
   it("starts a new task by rule when the previous turn's task is closed", async () => {
@@ -276,16 +280,17 @@ describe("turn.judge.v1 routing (switch on)", () => {
     const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写脚本", answer: "好。" }));
     await settle(service);
     db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'idle_timeout') WHERE id = ?`)
-      .run(first.episodeId);
+      .run(assignedEpisodeId(service, first));
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：接着做", answer: "好。" }));
-    expect(second.episodeId).not.toBe(first.episodeId);
+    expect(second.episodeId).toBeUndefined();
     await settle(service);
+    expect(assignedEpisodeId(service, second)).not.toBe(assignedEpisodeId(service, first));
 
     expect(judgeCalls.find((call) => call.user.startsWith("第二轮"))!.messages.at(-1)!.content)
       .toContain("<first_user_message></first_user_message>");
-    expect(episodeOf(db, second.rawTurnId)).toBe(second.episodeId);
-    expect(episodeRow(db, first.episodeId).status).toBe("closed");
-    expect(episodeRow(db, second.episodeId).meta).toMatchObject({ relation: "new_task", previousEpisodeId: first.episodeId });
+    expect(episodeOf(db, second.rawTurnId)).toBe(assignedEpisodeId(service, second));
+    expect(episodeRow(db, assignedEpisodeId(service, first)).status).toBe("closed");
+    expect(episodeRow(db, assignedEpisodeId(service, second)).meta).toMatchObject({ relation: "new_task", previousEpisodeId: assignedEpisodeId(service, first) });
     expect(rawTurnPayload(db, second.rawTurnId).turn_judge.route).toMatchObject({ action: "selected_before_capture" });
     expect(feedbackRows(db, session.sessionId)).toHaveLength(0);
   });
@@ -298,17 +303,16 @@ describe("turn.judge.v1 routing (switch on)", () => {
     await settle(service);
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "今天就到这吧，谢谢", answer: "不客气。" }));
     const third = (await service.completeTurn("t3", { sessionId: session.sessionId, query: "新的问题：订机票", answer: "好。" }));
-    expect(third.episodeId).toBe(first.episodeId);
+    expect(third.episodeId).toBeUndefined();
     await settle(service);
 
-    expect(episodeRow(db, first.episodeId)).toMatchObject({ status: "closed", rawTurnIds: [first.rawTurnId, second.rawTurnId] });
+    expect(episodeRow(db, assignedEpisodeId(service, first))).toMatchObject({ status: "closed", rawTurnIds: [first.rawTurnId, second.rawTurnId] });
     const moved = episodeOf(db, third.rawTurnId);
-    expect(moved).not.toBe(first.episodeId);
+    expect(moved).not.toBe(assignedEpisodeId(service, first));
     expect(episodeRow(db, moved)).toMatchObject({ status: "open", rawTurnIds: [third.rawTurnId], l1MemoryIds: [third.l1MemoryId] });
     expect(rawTurnPayload(db, third.rawTurnId).turn_judge.route).toMatchObject({
-      action: "start_new_task_episode",
-      reason: "previous_task_closed",
-      fromEpisodeId: first.episodeId
+      action: "selected_before_capture",
+      episodeId: moved
     });
     // Only the end_topic turn's reaction is recorded; the turn after it has no previous result.
     expect(feedbackRows(db, session.sessionId).map((row) => row.raw_payload.sourceRawTurnId)).toEqual([second.rawTurnId]);
@@ -325,11 +329,11 @@ describe("turn.judge.v1 routing (switch on)", () => {
 
     const rejected = memoryProperties(db, second.l1MemoryId);
     expect(rejected.internal_info.capture_decision.status).toBe("rejected");
-    expect(episodeOf(db, second.rawTurnId)).not.toBe(first.episodeId);
+    expect(episodeOf(db, second.rawTurnId)).not.toBe(assignedEpisodeId(service, first));
     expect(rejected.info.episode_id).toBe(episodeOf(db, second.rawTurnId));
     expect(rejected.internal_info.trace.episode_id).toBe(episodeOf(db, second.rawTurnId));
-    expect(episodeRow(db, first.episodeId).status).toBe("closed");
-    expect(feedbackRows(db, session.sessionId)[0]).toMatchObject({ episode_id: first.episodeId, polarity: "positive", magnitude: 1 });
+    expect(episodeRow(db, assignedEpisodeId(service, first)).status).toBe("closed");
+    expect(feedbackRows(db, session.sessionId)[0]).toMatchObject({ episode_id: assignedEpisodeId(service, first), polarity: "positive", magnitude: 1 });
   });
 
   it("records a reaction once per judged turn and without L1 when the previous turn has none", async () => {
@@ -364,8 +368,8 @@ describe("turn.judge.v1 routing (switch on)", () => {
     db.db.prepare("UPDATE raw_turns SET created_at = ? WHERE id = ?").run("2020-01-02T00:00:00.000Z", late.rawTurnId);
     await settle(service);
 
-    expect(episodeOf(db, late.rawTurnId)).toBe(first.episodeId);
-    expect(episodeRow(db, first.episodeId).status).toBe("open");
+    expect(episodeOf(db, late.rawTurnId)).toBe(assignedEpisodeId(service, first));
+    expect(episodeRow(db, assignedEpisodeId(service, first)).status).toBe("open");
     expect(rawTurnPayload(db, late.rawTurnId).turn_judge.route).toMatchObject({ action: "kept", reason: "later_turn_already_judged" });
     expect(feedbackRows(db, session.sessionId).find((row) => row.raw_payload.sourceRawTurnId === late.rawTurnId))
       .toMatchObject({ raw_turn_id: first.rawTurnId, polarity: "neutral" });
@@ -390,7 +394,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(feedbackRows(db, session.sessionId)).toHaveLength(0);
   });
 
-  it("marks a judgment that failed every attempt, lets later turns run, and reruns it with the same input", async () => {
+  it("keeps later turns durable while judgment failed, then retries with the same input", async () => {
     const invalid = { relation: "revision", feedback: "neutral", reason: "old label", l1: null, user: null };
     const { llm, judgeCalls } = createTurnJudgeLlm({
       "第二轮": [invalid, invalid, invalid, judged("follow_up", "negative", l1For("第二轮：不对，重做"))]
@@ -405,7 +409,8 @@ describe("turn.judge.v1 routing (switch on)", () => {
 
     expect(memoryProperties(db, second.l1MemoryId).internal_info.capture_decision).toMatchObject({ status: "failed", prompt_version: "turn.judge.v1" });
     expect(rawTurnPayload(db, second.rawTurnId).turn_judge.status).toBe("failed");
-    expect(memoryProperties(db, third.l1MemoryId).internal_info.capture_decision.status).toBe("accepted");
+    expect(memoryProperties(db, third.l1MemoryId).internal_info.capture_decision.status).toBe("pending");
+    expect(rawTurnPayload(db, third.rawTurnId).episode_assignment.status).toBe("pending");
     expect(feedbackRows(db, session.sessionId).filter((row) => row.raw_payload.sourceRawTurnId === second.rawTurnId)).toHaveLength(0);
 
     const retried = service.retryMemoryProcessing(second.l1MemoryId);
@@ -418,6 +423,7 @@ describe("turn.judge.v1 routing (switch on)", () => {
     expect(secondCalls).toHaveLength(4);
     expect(secondCalls[3]!.messages).toEqual(secondCalls[0]!.messages);
     expect(memoryProperties(db, second.l1MemoryId).internal_info.capture_decision.status).toBe("accepted");
+    expect(memoryProperties(db, third.l1MemoryId).internal_info.capture_decision.status).toBe("accepted");
     expect(feedbackRows(db, session.sessionId).some((row) => row.polarity === "negative")).toBe(true);
   });
 
@@ -430,7 +436,8 @@ describe("turn.judge.v1 routing (switch on)", () => {
     await settle(service);
 
     expect(judgeCalls).toHaveLength(0);
-    expect(second.closedEpisodeIds).toEqual([first.episodeId]);
+    expect(second.closedEpisodeIds).toEqual([]);
+    expect(episodeRow(db, assignedEpisodeId(service, first)).status).toBe("closed");
     expect(rawTurnPayload(db, second.rawTurnId).turn_judge).toBeUndefined();
   });
 });

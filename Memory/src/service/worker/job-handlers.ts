@@ -115,15 +115,6 @@ export function appendJobChange(
   op: JobChangeOperation,
   before?: EvolutionJobRecord
 ): void {
-  // Pending capture payloads contain original conversation content. Job audit
-  // events must not make additional copies outside the capture retention path.
-  if (job.jobType === "capture_replay") {
-    const metadata = (record: EvolutionJobRecord): EvolutionJobRecord => ({ ...record, payload: {
-      operation: (record.payload.command as { operation?: string } | undefined)?.operation ?? record.payload.operation
-    } });
-    job = metadata(job);
-    if (before) before = metadata(before);
-  }
   const session = job.sessionId ? deps.repos.runtime.getSession(job.sessionId) : undefined;
   deps.repos.runtime.appendChange({
     memoryId: job.id,
@@ -394,7 +385,7 @@ export function finalizeClosedEpisode(
 ): EvolutionJobRecord[] {
   const current = deps.repos.runtime.getEpisode(episode.id) ?? episode;
   if (current.status !== "closed" || current.l1MemoryIds.length === 0) return [];
-  if (episodeHasPendingCaptureDecision(deps, current)) return [];
+  if (episodeHasPendingCaptureDecision(deps, current) || deps.repos.runtime.hasUnassignedTurns(current.sessionId)) return [];
   // Titling is independent of reward and reflection, so it must be queued before
   // the mutually exclusive branches below can return.
   const titleJobs = enqueueEpisodeTitle(deps, current, at, "final");
@@ -574,7 +565,8 @@ export function episodeRewardWasSkipped(episode: EpisodeRecord): boolean {
 }
 
 export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
-  return job.jobType === "trace_summary" ||
+  return job.jobType === "episode_assignment" ||
+    job.jobType === "trace_summary" ||
     job.jobType === "import_summary" ||
     job.jobType === "observation_extract" ||
     job.jobType === "embedding" ||

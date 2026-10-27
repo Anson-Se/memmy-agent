@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { type LlmClient } from "../../../src/index.js";
@@ -142,9 +143,10 @@ describe("MemoryService / evolution / negative experience", () => {
       answer: "I configured port 80 and skipped TLS verification."
     }));
 
+    await settleCaptureAssignments(service);
     const feedback = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: turn.episodeId,
+      episodeId: assignedEpisodeId(service, turn),
       l1MemoryId: turn.l1MemoryId,
       channel: "explicit",
       polarity: "negative",
@@ -157,7 +159,6 @@ describe("MemoryService / evolution / negative experience", () => {
     expect(feedback.jobs.map((job) => job.jobType)).not.toContain("reward");
 
     service.closeSession(session.sessionId);
-    await service.runWorkerOnce(50);
     await service.runWorkerOnce(50);
     expect(service.panelItems({ namespace, layer: "L2" }).items).toEqual([]);
     expect(service.panelJobs({ namespace, status: "queued" }).items).toEqual(
@@ -290,9 +291,10 @@ describe("MemoryService / evolution / negative experience", () => {
       query: "Configure TLS on the correct port and verify it.",
       answer: "Configured port 80 without verification."
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: turn.episodeId,
+      episodeId: assignedEpisodeId(service, turn),
       l1MemoryId: turn.l1MemoryId,
       channel: "explicit",
       polarity: "neutral",
@@ -300,7 +302,6 @@ describe("MemoryService / evolution / negative experience", () => {
     });
 
     service.closeSession(session.sessionId);
-    await service.runWorkerOnce(50);
     await service.runWorkerOnce(50);
     expect(service.panelJobs({ namespace, status: "queued" }).items).toEqual(
       expect.arrayContaining([
@@ -369,9 +370,10 @@ describe("MemoryService / evolution / negative experience", () => {
         query: "Configure TLS and verify the service port.",
         answer: "I configured port 80 and skipped TLS verification."
       }));
-      await service.feedback({
+      await settleCaptureAssignments(service);
+    await service.feedback({
         sessionId: session.sessionId,
-        episodeId: turn.episodeId,
+        episodeId: assignedEpisodeId(service, turn),
         l1MemoryId: turn.l1MemoryId,
         channel: "explicit",
         polarity: "negative",
@@ -420,9 +422,10 @@ describe("MemoryService / evolution / negative experience", () => {
       query: "Configure TLS and verify the service port.",
       answer: "I configured port 80 and skipped TLS verification."
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: otherSession.sessionId,
-      episodeId: otherTurn.episodeId,
+      episodeId: assignedEpisodeId(service, otherTurn),
       l1MemoryId: otherTurn.l1MemoryId,
       channel: "explicit",
       polarity: "negative",
@@ -491,7 +494,7 @@ describe("MemoryService / evolution / negative experience", () => {
     }));
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: turn.episodeId,
+      episodeId: assignedEpisodeId(service, turn),
       l1MemoryId: turn.l1MemoryId,
       channel: "explicit",
       polarity: "negative",
@@ -548,9 +551,10 @@ describe("MemoryService / evolution / negative experience", () => {
         query: "Verify TLS certificate rotation.",
         answer: "Skipped TLS certificate verification."
       }));
-      await service.feedback({
+      await settleCaptureAssignments(service);
+    await service.feedback({
         sessionId: session.sessionId,
-        episodeId: turn.episodeId,
+        episodeId: assignedEpisodeId(service, turn),
         l1MemoryId: turn.l1MemoryId,
         channel: "explicit",
         polarity: "negative",

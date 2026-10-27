@@ -590,7 +590,7 @@ describe("MemoryService / embedding / processing", () => {
       answer: "Use focused checks first, then broaden only after the migration path is verified."
     }));
 
-    expect(complete.jobs.map((job) => job.jobType)).toEqual(["trace_summary", "episode_idle_close"]);
+    expect(complete.jobs.map((job) => job.jobType)).toEqual(["episode_assignment", "episode_finalize", "trace_summary"]);
     expect(new Repositories(db.db).processing.get(complete.l1MemoryId)).toMatchObject({
       state: "summary_pending",
       stage: "summary",
@@ -603,7 +603,7 @@ describe("MemoryService / embedding / processing", () => {
     });
     expect(recall.hits.some((hit) => hit.id === complete.l1MemoryId)).toBe(false);
     const openEpisodeRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
-    expect(openEpisodeRun.jobs.map((job) => job.jobType)).toEqual(["trace_summary"]);
+    expect(openEpisodeRun.jobs.map((job) => job.jobType)).toEqual(["trace_summary", "episode_assignment", "episode_finalize"]);
     expect(llmCalls.filter((call) => call.options.operation === "capture.summarize")).toHaveLength(1);
     const embeddingRun = await service.runWorkerOnce(10, { priorityCohortOnly: true });
     expect(embeddingRun.jobs.map((job) => job.jobType)).toEqual(["embedding"]);

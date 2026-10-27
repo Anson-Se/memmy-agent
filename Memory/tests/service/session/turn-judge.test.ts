@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
 import {
@@ -85,7 +86,7 @@ describe("turn.judge.v1 capture (switch on)", () => {
     const first = (await service.completeTurn("t1", { sessionId: session.sessionId, query: "第一轮：写周报", answer: "好。" }));
     await service.runWorkerOnce(20);
     db.db.prepare(`UPDATE episodes SET status = 'closed', meta_json = json_set(meta_json, '$.closeReason', 'end_topic') WHERE id = ?`)
-      .run(first.episodeId);
+      .run(assignedEpisodeId(service, first));
     const second = (await service.completeTurn("t2", { sessionId: session.sessionId, query: "第二轮：接着写周报", answer: "好。" }));
     await service.runWorkerOnce(20);
 
@@ -94,7 +95,7 @@ describe("turn.judge.v1 capture (switch on)", () => {
     expect(rawTurnPayload(db, second.rawTurnId).turn_judge.input).toMatchObject({
       taskEmpty: true,
       filedByRule: "previous_task_closed",
-      baseEpisodeId: first.episodeId
+      baseEpisodeId: assignedEpisodeId(service, first)
     });
   });
 

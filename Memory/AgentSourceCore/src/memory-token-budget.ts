@@ -8,7 +8,8 @@ export const MEMORY_WORKER_JOB_TYPES = [
   "episode_idle_close",
   "episode_title",
   "trace_summary",
-  "capture_replay",
+  "episode_assignment",
+  "episode_finalize",
   "observation_extract",
   "user_memory_embedding",
   "import_summary",
@@ -79,6 +80,7 @@ export function isBudgetedMemoryUsage(input: {
 export function jobTypeBudgetRoles(jobType: string): MemoryBudgetModelRole[] {
   switch (jobType) {
     case EPISODE_IDLE_CLOSE_JOB_TYPE:
+    case "episode_finalize":
     case "negative_experience":
     case "l2_association":
     case "l3_abstraction":
@@ -87,7 +89,7 @@ export function jobTypeBudgetRoles(jobType: string): MemoryBudgetModelRole[] {
       return [];
     case "episode_title":
     case "trace_summary":
-    case "capture_replay":
+    case "episode_assignment":
     case "observation_extract":
     case "import_summary":
     case "span_big_turn":

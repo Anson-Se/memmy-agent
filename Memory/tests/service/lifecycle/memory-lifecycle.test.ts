@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,7 +45,7 @@ describe("MemoryService / lifecycle / governance", () => {
       appId: "restorable-policy-workspace",
       profileId: namespace.profileId,
       sourceTraceId: trace.l1MemoryId,
-      sourceEpisodeId: trace.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, trace)
     });
 
     const first = service.reconcileWorkerStartup();
@@ -164,13 +165,13 @@ describe("MemoryService / lifecycle / governance", () => {
       ...policyInput,
       id: "policy_dependency_p1",
       sourceTraceId: p1Trace.l1MemoryId,
-      sourceEpisodeId: p1Trace.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, p1Trace)
     });
     insertActivePolicyMemory(db, {
       ...policyInput,
       id: "policy_dependency_p2",
       sourceTraceId: p2Trace.l1MemoryId,
-      sourceEpisodeId: p2Trace.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, p2Trace)
     });
     insertTracePolicyLinkForTest(db, {
       userId: namespace.userId,

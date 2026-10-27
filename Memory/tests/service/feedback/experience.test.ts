@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -95,7 +96,7 @@ describe("MemoryService / feedback / experience", () => {
 
     const ok = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -135,7 +136,7 @@ describe("MemoryService / feedback / experience", () => {
 
     const avoid = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "negative",
@@ -260,7 +261,7 @@ describe("MemoryService / feedback / experience", () => {
 
     const feedbackResponse = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "negative",

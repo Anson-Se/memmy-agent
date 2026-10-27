@@ -1,5 +1,6 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type LlmClient, type LlmCompletionOptions, type LlmMessage } from "../../../src/index.js";
 import {
   createCapturingEmbedder,
@@ -12,7 +13,7 @@ const {
   createTestService
 } = createMemoryServiceFixture();
 
-afterEach(cleanup);
+afterEach(() => { vi.useRealTimers(); cleanup(); });
 
 function createSpanBigTurnLlm(
   calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }>,
@@ -186,16 +187,19 @@ describe("MemoryService / evolution / span big turn", () => {
     ).run(JSON.stringify(rawToolCalls), completed.rawTurnId);
 
     service.closeSession(session.sessionId);
+    await settleCaptureAssignments(service);
     await service.feedback({
       namespace,
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
       magnitude: 1,
       rationale: "复杂任务已经正确完成"
     });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
     await runWorkerRounds(service, 8);
 
     const spanCall = calls.find((call) => call.options.operation === "span.big_turn.v1");
@@ -319,7 +323,7 @@ describe("MemoryService / evolution / span big turn", () => {
     });
     expect(completed.l1MemoryIds).toHaveLength(1);
 
-    const deleted = service.deletePanelTask(completed.episodeId, { namespace });
+    const deleted = service.deletePanelTask(assignedEpisodeId(service, completed), { namespace });
     expect(new Set(deleted.deletedMemoryIds)).toEqual(new Set([
       completed.l1MemoryId,
       ...storedSpanIds
@@ -387,7 +391,9 @@ describe("MemoryService / evolution / span big turn", () => {
         l1MemoryId: task.l1MemoryId, channel: "explicit", polarity: "positive",
         magnitude: 1, rationale: "构建修复正确"
       });
-      await runWorkerRounds(service, 8);
+      vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
+    await runWorkerRounds(service, 8);
     }
     function spanIds(episodeId: string): string[] {
       return (db.db.prepare(`SELECT id FROM memories
@@ -397,7 +403,7 @@ describe("MemoryService / evolution / span big turn", () => {
     }
     const task = await createTask("cascade-target");
     await reward(task);
-    const originalSpans = spanIds(task.episodeId);
+    const originalSpans = spanIds(assignedEpisodeId(service, task));
     expect(originalSpans).toHaveLength(3);
     if (splitAgain) {
       await reward(task);
@@ -408,11 +414,11 @@ describe("MemoryService / evolution / span big turn", () => {
       expect(latestIds).toHaveLength(2);
       expect(latestIds.every((id) => !originalSpans.includes(id))).toBe(true);
     }
-    const targetIds = spanIds(task.episodeId);
+    const targetIds = spanIds(assignedEpisodeId(service, task));
     expect(targetIds).toHaveLength(splitAgain ? 5 : 3);
     const control = await createTask("cascade-control");
     await reward(control);
-    const controlIds = spanIds(control.episodeId);
+    const controlIds = spanIds(assignedEpisodeId(service, control));
     expect(controlIds.length).toBeGreaterThan(0);
     const controlBefore = db.db.prepare("SELECT * FROM memories WHERE id IN (SELECT value FROM json_each(?))")
       .all(JSON.stringify(controlIds));
@@ -423,7 +429,7 @@ describe("MemoryService / evolution / span big turn", () => {
     const controlVectorCount = countVectors(controlIds);
     if (deleteParent) service.deleteMemory(task.l1MemoryId!, { namespace });
 
-    const deleted = service.deletePanelTask(task.episodeId, { namespace });
+    const deleted = service.deletePanelTask(assignedEpisodeId(service, task), { namespace });
     expect(new Set(deleted.deletedMemoryIds)).toEqual(new Set([
       ...targetIds, ...(deleteParent ? [] : [task.l1MemoryId])
     ]));
@@ -445,7 +451,7 @@ describe("MemoryService / evolution / span big turn", () => {
       .all(JSON.stringify(controlIds))).toEqual(controlBefore);
     expect(countVectors(controlIds)).toBe(controlVectorCount);
     for (const id of controlIds) expect(() => service.getMemory(id, { namespace })).not.toThrow();
-    expect(service.panelTasks({ namespace, page: 1 }).tasks.map((item) => item.id)).toContain(control.episodeId);
+    expect(service.panelTasks({ namespace, page: 1 }).tasks.map((item) => item.id)).toContain(assignedEpisodeId(service, control));
     db.close();
   });
 
@@ -482,16 +488,19 @@ describe("MemoryService / evolution / span big turn", () => {
     }));
 
     service.closeSession(session.sessionId);
+    await settleCaptureAssignments(service);
     await service.feedback({
       namespace,
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
       magnitude: 1,
       rationale: "迁移结果正确"
     });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
     await runWorkerRounds(service, 8);
 
     expect(calls.filter((call) => call.options.operation === "span.big_turn.v1")).toHaveLength(1);
@@ -548,16 +557,19 @@ describe("MemoryService / evolution / span big turn", () => {
     }));
     service.closeSession(session.sessionId);
 
+    await settleCaptureAssignments(service);
     await service.feedback({
       namespace,
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
       magnitude: 1,
       rationale: "任务结果正确"
     });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
     await runWorkerRounds(service, 8);
 
     const spans = service.panelItems({ namespace, layer: "L1" }).items.filter(
@@ -616,17 +628,20 @@ describe("MemoryService / evolution / span big turn", () => {
         }))
       }));
       service.closeSession(session.sessionId);
-      await service.feedback({
+      await settleCaptureAssignments(service);
+    await service.feedback({
         namespace,
         sessionId: session.sessionId,
-        episodeId: completed.episodeId,
+        episodeId: assignedEpisodeId(service, completed),
         l1MemoryId: completed.l1MemoryId,
         channel: "explicit",
         polarity: scenario.polarity,
         magnitude: 1,
         rationale: scenario.polarity === "positive" ? "结果正确" : "任务没有正确完成"
       });
-      await runWorkerRounds(service, 8);
+      vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
+    await runWorkerRounds(service, 8);
 
       expect(calls.some((call) => call.options.operation === "span.big_turn.v1")).toBe(false);
       expect(service.panelItems({ namespace, layer: "L1" }).items.some(
@@ -681,16 +696,19 @@ describe("MemoryService / evolution / span big turn", () => {
       }))
     }));
     service.closeSession(session.sessionId);
+    await settleCaptureAssignments(service);
     await service.feedback({
       namespace,
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
       magnitude: 1,
       rationale: "任务结果正确"
     });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
     await runWorkerRounds(service, 8);
 
     expect(calls.filter((call) => call.options.operation === "span.big_turn.v1")).toHaveLength(3);

@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import type { MemoryService } from "../../../src/index.js";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
@@ -85,7 +86,7 @@ describe("MemoryService / import / QA capture dedup", () => {
     ).get(completed.rawTurnId)).toEqual({ count: 1 });
     const episode = db.db.prepare(
       `SELECT l1_memory_ids_json, raw_turn_ids_json FROM episodes WHERE id = ?`
-    ).get(completed.episodeId) as { l1_memory_ids_json: string; raw_turn_ids_json: string };
+    ).get(assignedEpisodeId(service, completed)) as { l1_memory_ids_json: string; raw_turn_ids_json: string };
     expect(JSON.parse(episode.l1_memory_ids_json)).toContain(scanned.id);
     expect(JSON.parse(episode.raw_turn_ids_json)).toContain(completed.rawTurnId);
     expect(db.db.prepare(

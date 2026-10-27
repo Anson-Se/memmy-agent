@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -47,7 +48,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "bc-24-workspace",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     insertActiveSkillMemoryForTest(db, {
       id: "skill_bc24_generated",
@@ -102,7 +103,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       id: "job_bc24_update",
       userId,
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       policyId: "policy_bc24"
     });
     await service.runWorkerOnce(20);
@@ -225,7 +226,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-fresh-skill",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     const firstAt = new Date().toISOString();
@@ -238,7 +239,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_fresh_skill_create",
       "user-fresh-skill-skip",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_fresh_skill_skip",
       firstAt,
       firstAt
@@ -274,7 +275,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_fresh_skill_skip",
       "user-fresh-skill-skip",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_fresh_skill_skip",
       secondAt,
       secondAt
@@ -329,7 +330,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-compatible-skill-merge",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     insertActiveSkillMemoryForTest(db, {
       id: "skill-compatible-a",
@@ -383,7 +384,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       id: "job-compatible-skill-merge",
       userId,
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       policyId: "policy-compatible-skill-target"
     });
 
@@ -450,7 +451,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-shared-policy-skill-fanout",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     insertActiveSkillMemoryForTest(db, {
       id: "skill-shared-policy-pytest",
@@ -481,7 +482,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       id: "job-shared-policy-skill-fanout",
       userId,
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       policyId
     });
 
@@ -562,7 +563,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-skill-cooldown",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     const firstAt = new Date().toISOString();
@@ -575,7 +576,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_skill_cooldown_create",
       "user-skill-cooldown",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_skill_cooldown",
       firstAt,
       firstAt
@@ -608,7 +609,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_skill_cooldown_skip",
       "user-skill-cooldown",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_skill_cooldown",
       secondAt,
       secondAt
@@ -663,7 +664,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-source-policy-skill",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     const policyRow = db.db.prepare(
       `SELECT updated_at
@@ -751,7 +752,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_source_policy_skill_skip",
       "user-source-policy-skill-skip",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_source_policy_skill_skip",
       jobAt,
       jobAt
@@ -808,7 +809,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-archived-skill-recreate",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     db.db.prepare(
       `UPDATE memories
@@ -889,7 +890,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_archived_skill_recreate",
       "user-archived-skill-recreate",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_archived_skill_recreate",
       jobAt,
       jobAt
@@ -955,7 +956,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "workspace-skill-drift",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     const at = new Date().toISOString();
@@ -968,7 +969,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_skill_reward_drift_crystallize",
       "user-skill-reward-drift",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       "policy_skill_reward_drift",
       at,
       at
@@ -1001,7 +1002,7 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       "job_skill_reward_drift_association",
       "user-skill-reward-drift",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       complete.l1MemoryId,
       associationAt,
       associationAt
@@ -1168,14 +1169,14 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "",
       profileId: "jiang",
       sourceTraceId: first.l1MemoryId,
-      sourceEpisodeId: first.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, first)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     queueSkillCrystallizationJobForTest(db, {
       id: "job_default_skill_name",
       userId,
       sessionId: session.sessionId,
-      episodeId: first.episodeId,
+      episodeId: assignedEpisodeId(service, first),
       policyId
     });
     for (let i = 0; i < 40; i += 1) {
@@ -1362,14 +1363,14 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "",
       profileId: "jiang",
       sourceTraceId: first.l1MemoryId,
-      sourceEpisodeId: first.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, first)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     queueSkillCrystallizationJobForTest(db, {
       id: "job_invalid_string_skill_steps",
       userId,
       sessionId: session.sessionId,
-      episodeId: first.episodeId,
+      episodeId: assignedEpisodeId(service, first),
       policyId
     });
     for (let i = 0; i < 40; i += 1) {
@@ -1506,14 +1507,14 @@ describe("MemoryService / evolution / skill lifecycle", () => {
       appId: "",
       profileId: "jiang",
       sourceTraceId: first.l1MemoryId,
-      sourceEpisodeId: first.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, first)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     queueSkillCrystallizationJobForTest(db, {
       id: "job_refusal_skill_draft",
       userId,
       sessionId: session.sessionId,
-      episodeId: first.episodeId,
+      episodeId: assignedEpisodeId(service, first),
       policyId
     });
     for (let i = 0; i < 40; i += 1) {

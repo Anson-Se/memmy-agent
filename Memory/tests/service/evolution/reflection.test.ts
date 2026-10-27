@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -12,6 +13,8 @@ import {
   createBatchReflectionLlm,
   createMemoryServiceFixture,
   runWorkerRounds,
+  settleCaptureWork,
+  settleCaptureAssignments,
   withTurnJudgeKeys
 } from "../../fixtures/memory-service-fixture.js";
 
@@ -30,7 +33,7 @@ async function closeSessionAndRunWorkerRounds(
   limit = 100
 ): Promise<void> {
   service.closeSession(sessionId);
-  await runWorkerRounds(service, rounds, limit);
+  await settleCaptureWork(service);
 }
 
 function createUnusableReflectionLlm(): LlmClient {
@@ -172,9 +175,10 @@ describe("MemoryService / evolution / reflection", () => {
       query: "record an unusable reflection scorer result",
       answer: "done"
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -226,9 +230,10 @@ describe("MemoryService / evolution / reflection", () => {
       query: "Record that the deployment verification command runs through zsh.",
       answer: "The deployment verification command runs through zsh."
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -340,9 +345,10 @@ describe("MemoryService / evolution / reflection", () => {
       query: "谢谢，辛苦了",
       answer: "不客气。"
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -437,9 +443,10 @@ describe("MemoryService / evolution / reflection", () => {
       query: "Hi, thanks",
       answer: "You're welcome."
     }));
+    await settleCaptureAssignments(service);
     const knowledge = (await service.completeTurn("turn-reflection-mixed-knowledge", {
       sessionId: session.sessionId,
-      episodeId: social.episodeId,
+      episodeId: assignedEpisodeId(service, social),
       query: "为什么黑美人西瓜不常见？",
       answer: "主要受市场偏好、运输和品种迭代影响。"
     }));
@@ -765,9 +772,10 @@ describe("MemoryService / evolution / reflection", () => {
         }
       ]
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryIds[0]!,
       channel: "explicit",
       polarity: "positive",
@@ -835,9 +843,10 @@ describe("MemoryService / evolution / reflection", () => {
       ]
     }));
     expect(complete.l1MemoryIds).toHaveLength(1);
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryIds[0]!,
       channel: "explicit",
       polarity: "positive",

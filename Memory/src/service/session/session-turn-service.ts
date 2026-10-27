@@ -1,4 +1,3 @@
-import type { CaptureRecovery } from "./capture-recovery.js";
 import { EpisodeSelectionRequired, selectionInput, selectionKey, selectEpisode, type EpisodeSelectionContext, type EpisodeSelectionResult } from "./episode-selection.js";
 import {
   captureTurnSteps,
@@ -108,7 +107,6 @@ interface ToolFailureBurst extends ToolFailureState { contextHash: string; failu
 interface DecisionRepairSummary { repairId?: string; contextHash?: string; skipped?: boolean; reason?: string; attachedPolicyIds?: string[]; }
 type SessionTurnDependencies = {
   repos: Repositories;
-  captureRecovery?: CaptureRecovery;
   readonly config: MemmyConfig;
   readonly llm: LlmClient;
   readonly skillLlm: LlmClient;
@@ -463,7 +461,7 @@ export function summarizeTurn(rawTurn: RawTurnRecord): string {
 
 export function rawTurnSummary(rawTurn: RawTurnRecord): {
   rawTurnId: string;
-  episodeId: string;
+  episodeId?: string;
   turnId: string;
   userText?: string;
   assistantText?: string;
@@ -510,32 +508,259 @@ export class SessionTurnService {
 
   private selectionScope?: { context: EpisodeSelectionContext; results: Map<string, EpisodeSelectionResult>; selectedEpisodeId?: string };
 
-  // Retry only database work. No model request runs inside a SQLite transaction;
-  // each retry rebuilds candidates, so stale results cannot be committed.
+  // Acceptance never waits for a model. The original rows and work commit together.
   async withEpisodeSelection<T>(context: EpisodeSelectionContext, operation: () => T): Promise<T> {
+    const raw = context.rawTurnId ? this.deps.repos.runtime.getRawTurn(context.rawTurnId) : undefined;
+    if (!raw || raw.messagePayload?.episode_assignment) return this.deps.repos.transaction(operation);
+    // Existing pre-upgrade raw records already have durable input. Finish their
+    // legacy judgment without converting it into a new capture request.
     const results = new Map<string, EpisodeSelectionResult>();
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt++) {
       try {
         this.selectionScope = { context, results };
-        return this.deps.captureRecovery
-          ? this.deps.captureRecovery.commit(operation)
-          : this.deps.repos.transaction(operation);
+        return this.deps.repos.transaction(operation);
       } catch (error) {
         if (!(error instanceof EpisodeSelectionRequired)) throw error;
         this.selectionScope = undefined;
-        this.deps.captureRecovery?.beforeModel();
-        if (!this.deps.llm.isConfigured()) throw new MemoryServiceError("conflict", "episode selection requires a configured summary model");
-        if (this.deps.shouldDeferEpisodeSelection?.()) {
-          throw new MemoryServiceError("conflict", "episode selection is waiting for the summary model token budget");
-        }
         results.set(error.key, await selectEpisode(this.deps.llm, error.input));
-      } finally {
-        this.selectionScope = undefined;
-      }
+      } finally { this.selectionScope = undefined; }
     }
-    throw new MemoryServiceError("conflict", "episode candidates kept changing; retry the turn");
+    throw new Error("episode candidates kept changing");
   }
 
+  captureEpisode(session: SessionRecord, episodeId?: string): EpisodeRecord | undefined {
+    if (episodeId) {
+      const episode = this.deps.repos.runtime.getEpisode(episodeId);
+      if (!episode) return this.deps.llm.isConfigured() ? undefined : this.ensureEpisode(session, episodeId);
+      if (episode.sessionId !== session.id) throw new MemoryServiceError("forbidden", "episode belongs to another session");
+      return episode;
+    }
+    return this.deps.llm.isConfigured() ? undefined : this.ensureEpisode(session);
+  }
+
+  queueAssignment(raw: RawTurnRecord, turnJudge = false, requestedEpisodeId = raw.episodeId): EvolutionJobRecord[] {
+    if (!this.deps.llm.isConfigured()) return [];
+    const at = nowIso();
+    const generation = stableHash({ user: raw.userText, assistant: raw.assistantText, tools: raw.toolResults, turnJudge });
+    const previous = isRecord(raw.messagePayload?.episode_assignment) ? raw.messagePayload.episode_assignment : {};
+    this.deps.repos.runtime.updateRawTurn({ ...raw, messagePayload: {
+      ...raw.messagePayload, episode_assignment: previous.generation === generation ? previous : { status: "pending", turnJudge, requestedEpisodeId, generation }
+    } });
+    return (["episode_assignment", "episode_finalize"] as const).map(jobType => this.deps.enqueueJob({
+      jobType, userId: raw.userId, sessionId: raw.sessionId,
+      dedupeKey: `${jobType}:${raw.id}:${generation}`, payload: { rawTurnId: raw.id, turnAt: raw.createdAt, generation }, createdAt: at
+    }));
+  }
+
+
+  // One-time data conversion, not a worker or public-interface replay. Legacy
+  // commands are removed only in the transaction that creates their formal rows.
+  migrateLegacyCaptures(): void {
+    const rows = this.deps.repos.db.prepare("SELECT id, session_id, user_id, payload_json, created_at FROM evolution_jobs WHERE job_type='capture_replay' ORDER BY created_at, rowid").all() as Array<{ id: string; session_id: string | null; user_id: string; payload_json: string; created_at: string }>;
+    for (const row of rows) this.deps.repos.transaction(() => {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      const command = isRecord(payload.command) ? payload.command : undefined;
+      if (!command || payload.rawTextExcluded) {
+        this.deps.repos.db.prepare("DELETE FROM evolution_jobs WHERE id=?").run(row.id);
+        return;
+      }
+      const args = Array.isArray(command.args) ? command.args : [];
+      const operation = String(command.operation);
+      const request = { ...(isRecord(args[1]) ? args[1] : isRecord(args[0]) ? args[0] : {}) };
+      let sessionId = typeof request.sessionId === "string" ? request.sessionId : row.session_id ?? undefined;
+      const source = operation === "completeSourceTurn" && isRecord(request.sourceTurn) ? request.sourceTurn as unknown as SourceTurnIdentity : undefined;
+      let scope: SourceTurnCaptureScope | undefined;
+      if (source) {
+        const namespace = normalizeNamespace({ source: source.source, profileId: source.profileId,
+          sessionKey: source.conversationId, ...(isRecord(request.namespace) ? request.namespace : {}), userId: row.user_id });
+        request.namespace = namespace;
+        scope = { userId: row.user_id, source: source.source, profileId: source.profileId, conversationId: source.conversationId,
+          namespaceKey: stableHash({ tenantId: namespace.tenantId ?? null, projectId: namespace.projectId ?? null, workspaceId: namespace.workspaceId ?? null }) };
+        const existing = this.deps.repos.runtime.getSourceTurnCapture(scope, source.turnId);
+        if (existing) { this.deps.repos.db.prepare("DELETE FROM evolution_jobs WHERE id=?").run(row.id); return; }
+        sessionId = this.deps.repos.runtime.sourceConversationSessions(scope)[0]?.id;
+        if (!sessionId) sessionId = this.openSession({ namespace, source: source.source, profileId: source.profileId,
+          meta: { conversationId: source.conversationId, source_namespace_key: scope.namespaceKey } }, { createNew: true, at: source.startedAt }).sessionId;
+      } else if (operation === "compactSession") sessionId = String(args[0]);
+      const session = sessionId ? this.deps.repos.runtime.getSession(sessionId) : undefined;
+      // A removed Session must not be resurrected by legacy recovery.
+      if (!session) { this.deps.repos.db.prepare("DELETE FROM evolution_jobs WHERE id=?").run(row.id); return; }
+      if (operation === "completeTurn" || source || operation === "subagentComplete") {
+        const turnId = source?.turnId ?? (operation === "completeTurn" ? String(args[0]) : `subagent:complete:${request.subagentId ?? row.id}`);
+        const normalized = sanitizeTurnCompleteRequest({ ...request, sessionId: session.id,
+          ...(operation === "subagentComplete" ? { query: `[Subagent completed] ${request.subagentId ?? ""}`, answer: String(request.summary ?? "") } : {}) } as TurnCompleteRequest & Record<string, unknown>);
+        const result = this.completeTurn(turnId, { ...normalized }, source, row.created_at);
+        if (source && scope) {
+          const contentHash = stableHash({ query: normalized.query, answer: normalized.answer, status: normalized.status ?? "succeeded",
+            reasoningSummary: normalized.reasoningSummary ?? null, toolCalls: normalizeCompleteTurnToolCalls(normalized), toolResults: normalizeCompleteTurnToolResults(normalized) });
+          this.deps.repos.runtime.insertSourceTurnCapture({ ...scope, turnId, contentHash, sessionId: session.id,
+            rawTurnId: result.rawTurnId, episodeId: result.episodeId, startedAt: new Date(source.startedAt).toISOString(),
+            completedAt: new Date(source.completedAt).toISOString(), sequence: source.sequence,
+            response: { status: "stored", result }, createdAt: row.created_at });
+        }
+      } else if (operation === "compactSession") {
+        this.compactSession(session.id, request as SessionCompactRequest, row.created_at);
+      } else {
+        const turnId = typeof request.turnId === "string" ? request.turnId : `legacy-event:${row.id}`;
+        let raw = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
+        if (!raw) {
+          const observation = operation === "observeTool" ? toolObservationEvent(request as unknown as ToolObserveRequest) : undefined;
+          raw = this.deps.repos.runtime.insertRawTurn({ id: rawTurnIdForSessionTurn(session.id, turnId), sessionId: session.id,
+            userId: session.userId, conversationId: session.conversationId, turnId,
+            userText: typeof request.task === "string" ? request.task : undefined,
+            toolCalls: observation ? [observation.toolCall] : [], toolResults: observation?.toolResult ? [observation.toolResult] : [],
+            sourceMemoryIds: [], usage: {}, messagePayload: { legacy_event: { operation, subagentId: request.subagentId, metadata: request.metadata } },
+            status: operation === "subagentStart" ? "started" : "observed", createdAt: row.created_at });
+          this.deps.repos.runtime.insertArtifact({ sessionId: session.id, rawTurnId: raw.id, userId: session.userId,
+            kind: operation === "observeTool" ? "tool_call" : operation === "useSkill" ? "skill_use" : "subagent_start",
+            payload: observation ? { phase: observation.phase, value: observation.event } : { subagentId: request.subagentId, task: request.task, skillId: args[0], metadata: request.metadata }, createdAt: row.created_at });
+          this.queueAssignment(raw);
+          if (operation === "useSkill") this.deps.repos.runtime.insertSkillTrial({ id: `trial_${stableHash(row.id).slice(0, 20)}`,
+            userId: session.userId, sessionId: session.id, skillMemoryId: String(args[0]), rawTurnId: raw.id,
+            turnId, status: "pending", outcome: "unknown", createdAt: row.created_at });
+        }
+      }
+      this.deps.repos.db.prepare("DELETE FROM evolution_jobs WHERE id=?").run(row.id);
+    });
+  }
+
+  async assignEpisode(job: EvolutionJobRecord): Promise<void> {
+    const rawId = String(job.payload.rawTurnId ?? "");
+    const raw = this.deps.repos.runtime.getRawTurn(rawId);
+    if (!raw || raw.deletedAt || raw.redactedAt) return;
+    const session = this.deps.repos.runtime.getSession(raw.sessionId);
+    if (!session) return;
+    const state = isRecord(raw.messagePayload?.episode_assignment) ? raw.messagePayload.episode_assignment : {};
+    if ((job.payload.generation && state.generation !== job.payload.generation) || state.selection || state.status === "assigned") return;
+    const latest = !isRecord(raw.messagePayload?.turn_complete) ? this.deps.repos.runtime.latestEpisodeForSession(session.id) : undefined;
+    const requested = typeof state.requestedEpisodeId === "string" ? this.deps.repos.runtime.getEpisode(state.requestedEpisodeId)
+      : latest?.status === "open" ? latest : undefined;
+    let selection: EpisodeSelectionResult | undefined;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const input = selectionInput(this.deps.repos, session, { userText: raw.userText ?? "", rawTurnId: raw.id });
+      const proposed = requested
+        ? { episodeId: requested.id, title: requested.title || "Task", summary: requested.summary || raw.userText || "Task" }
+        : await selectEpisode(this.deps.llm, input);
+      if (requested || stableHash(input) === stableHash(selectionInput(this.deps.repos, session, { userText: raw.userText ?? "", rawTurnId: raw.id }))) {
+        selection = proposed;
+        break;
+      }
+    }
+    if (!selection) throw new Error("episode candidates kept changing");
+    this.deps.repos.transaction(() => {
+      const current = this.deps.repos.runtime.getRawTurn(raw.id);
+      const lease = this.deps.repos.runtime.getJob(job.id);
+      if (!current || current.deletedAt || current.redactedAt || !lease || lease.status !== "leased" || lease.leasedUntil !== job.leasedUntil) return;
+      const latest = isRecord(current.messagePayload?.episode_assignment) ? current.messagePayload.episode_assignment : {};
+      if (latest.generation !== state.generation) return;
+      this.deps.repos.runtime.updateRawTurn({ ...current, messagePayload: {
+        ...current.messagePayload, episode_assignment: { ...latest, selection, status: "selected" }
+      } });
+    });
+  }
+
+  // The model calls finish independently. Only the local application of their
+  // results joins here; no model or public capture API is invoked by this job.
+  finalizeAssignment(job: EvolutionJobRecord): void {
+    this.deps.repos.transaction(() => {
+      const raw = this.deps.repos.runtime.getRawTurn(String(job.payload.rawTurnId ?? ""));
+      if (!raw || raw.deletedAt || raw.redactedAt) return;
+      const session = this.deps.repos.runtime.getSession(raw.sessionId);
+      if (!session) return;
+      const state = isRecord(raw.messagePayload?.episode_assignment) ? raw.messagePayload.episode_assignment : {};
+      if (job.payload.generation && state.generation !== job.payload.generation) return;
+      if (state.status === "assigned") { this.applyDeferredToolOutcomes(raw, session, nowIso()); return; }
+      const selection = state.selection as EpisodeSelectionResult | undefined;
+      if (!selection) throw new Error("episode selection is not ready");
+      const judgment = state.judgment as Parameters<SessionTurnService["applyTurnJudgment"]>[0] | undefined;
+      const at = nowIso();
+      let legacyRoute: CommittedTurnRoute | undefined;
+      if (!state.turnJudge && isRecord(raw.messagePayload?.turn_complete)) {
+        const context = { userText: raw.userText ?? "", rawTurnId: raw.id };
+        this.selectionScope = { context, results: new Map([[selectionKey(session, selectionInput(this.deps.repos, session, context)), selection]]) };
+        try {
+          if (typeof state.requestedEpisodeId === "string") {
+            const episode = this.ensureEpisode(session, state.requestedEpisodeId, raw.createdAt);
+            legacyRoute = { episode, closedEpisodeIds: [], jobs: [], proposalStale: false,
+              proposal: this.buildTurnRouteProposal(episode, classifyTurnRelation({ prevUserText: "", prevAssistantText: "", newUserText: raw.userText ?? "", prevTags: [] }), undefined, at) };
+          } else {
+            const saved = isRecord(raw.messagePayload?.turn_start) ? raw.messagePayload.turn_start.routeProposal as TurnRouteProposal | undefined : undefined;
+            const latest = this.deps.repos.runtime.latestEpisodeForSession(session.id);
+            const proposal = saved && saved.baseEpisodeId === latest?.id && latest?.status === "open"
+              ? saved : this.proposeEpisodeRoute(session, raw.userText ?? "", explicitEndTopicDecision(raw.userText ?? ""), raw.createdAt);
+            legacyRoute = this.commitTurnRouteProposal(session, proposal, raw.userText ?? "", "episode.assignment", at, false, raw.createdAt);
+          }
+        } finally { this.selectionScope = undefined; }
+      }
+      const baseId = judgment?.baseEpisodeId ?? (judgment?.filedByRule === "previous_task_closed"
+        ? this.deps.repos.runtime.completedRawTurnsBefore(raw.id).at(-1)?.episodeId : undefined);
+      const base = this.deps.repos.runtime.getEpisode(baseId);
+      const late = this.deps.repos.runtime.sessionHasJudgedTurnAfter(raw.id);
+      const continueBase = base && (late || judgment?.relation === "follow_up" || judgment?.relation === "end_topic");
+      let target = legacyRoute?.episode ?? (continueBase ? base : selection.episodeId ? this.deps.repos.runtime.getEpisode(selection.episodeId) : undefined);
+      if (target && target.sessionId !== session.id) throw new Error("episode assignment crossed sessions");
+      if (selection.episodeId && !target && !continueBase) throw new Error("selected episode was removed");
+      if (!target) {
+        target = this.deps.repos.runtime.createEpisode({
+          id: typeof state.requestedEpisodeId === "string" ? state.requestedEpisodeId : newId("episode"), sessionId: session.id, userId: session.userId,
+          projectId: session.projectId ?? session.workspaceId, conversationId: session.conversationId,
+          status: "open", l1MemoryIds: [], rawTurnIds: [], feedbackIds: [], decisionRepairIds: [],
+          l2PolicyIds: [], l3WorldModelIds: [], skillMemoryIds: [], turnCount: 0,
+          rewardDetail: {}, pipelineStatus: "idle", meta: {}, openedAt: raw.createdAt, updatedAt: at
+        });
+      } else if (target.status !== "open" && !late) {
+        target = this.deps.repos.runtime.reopenEpisode(target.id, { reopenReason: "episode_selection", reopenedAt: at }, at)!;
+      }
+      if (!legacyRoute && (!continueBase || selection.episodeId === target.id)) {
+        this.writeSelectionTitle(target, selection, at, { rawTurnId: raw.id, userText: raw.userText ?? "" });
+      }
+      this.deps.repos.runtime.bindRawTurnEpisode(raw.id, target.id, at);
+      // New-task closure must precede feedback application, but evidence freezes
+      // below only after the feedback has been persisted.
+      if (base && base.id !== target.id && judgment?.relation === "new_task" && !late && base.status === "open") {
+        this.closeForJudgedTurn(session, base, { closeReason: "topic_boundary", relation: "new_task", closedBy: "turn.judge" }, at);
+      }
+      if (base && target.id !== base.id && (judgment?.relation === "new_task" || judgment?.filedByRule === "previous_task_closed")) {
+        this.deps.repos.runtime.updateEpisodeMeta(target.id, { relation: "new_task", previousEpisodeId: base.id }, at);
+      }
+      const bound = this.deps.repos.runtime.getRawTurn(raw.id)!;
+      this.deps.repos.runtime.updateRawTurn({ ...bound, messagePayload: {
+        ...bound.messagePayload,
+        turn_start: { ...(isRecord(bound.messagePayload?.turn_start) ? bound.messagePayload.turn_start : {}), ...(!late ? { episodeSelection: { episodeId: target.id } } : {}) },
+        episode_assignment: { ...state, status: "applying" }
+      } });
+      if (judgment) this.applyTurnJudgment(judgment);
+      const current = this.deps.repos.runtime.getRawTurn(raw.id)!;
+      this.deps.repos.runtime.updateRawTurn({ ...current, messagePayload: {
+        ...current.messagePayload, episode_assignment: { ...state, status: "assigned", assignedAt: at }
+      } });
+      this.deps.repos.runtime.appendChange({ memoryId: raw.id, entityId: raw.id, kind: "raw_turn", op: "updated",
+        userId: raw.userId, namespaceId: this.deps.namespaceIdFromSession(session), changeType: "raw_turn_assigned",
+        before: raw, after: this.deps.repos.runtime.getRawTurn(raw.id), source: "episode.assignment", createdAt: at });
+      this.applyDeferredToolOutcomes(this.deps.repos.runtime.getRawTurn(raw.id)!, session, at);
+      if (legacyRoute?.endTopicDecision) {
+        this.deps.repos.runtime.closeEpisode(target.id, { closeReason: "end_topic", topicState: "ended", endTopicTurnId: raw.turnId,
+          relationDecision: legacyRoute.endTopicDecision, closedBy: "turn.complete" }, at);
+      }
+      if (session.status !== "open") {
+        const closed = this.deps.repos.runtime.closeEpisode(target.id, { closeReason: "session_closed" }, at);
+        if (closed) this.deps.finalizeClosedEpisode(closed, at, "session_closed");
+      } else {
+        this.deps.enqueueJob({ jobType: "episode_idle_close", userId: session.userId, sessionId: session.id,
+          episodeId: target.id, dedupeKey: `episode_idle_close:${raw.id}`,
+          payload: { triggerRawTurnId: raw.id, triggerEpisodeId: target.id, triggeredAt: raw.createdAt }, createdAt: at });
+      }
+      for (const id of new Set([target.id, base?.id, ...(legacyRoute?.closedEpisodeIds ?? [])])) {
+        if (!id) continue;
+        const episode = this.deps.repos.runtime.getEpisode(id);
+        if (episode?.status === "closed") this.deps.finalizeClosedEpisode(episode, at, "capture_decided");
+      }
+      if (session.status !== "open" && !this.deps.repos.runtime.hasUnassignedTurns(session.id) && session.meta.l3_world_model_protocol_version === 2) {
+        this.deps.repos.l3WorldModels.freezeBatches({ sessionId: session.id, trigger: "session_close", at });
+        this.deps.extractUnextractedWorkMemory(session.id, this.deps.repos.l3WorldModels.maxInputTraceSeq(session.id), at);
+      }
+    });
+  }
 
   openSession(request: SessionOpenRequest, options: { createNew?: boolean; at?: string } = {}): {
     sessionId: string;
@@ -957,7 +1182,7 @@ export class SessionTurnService {
         });
         this.deps.finalizeClosedEpisode(episode, at, "session_closed");
       }
-      if (session.meta.l3_world_model_protocol_version === 2) {
+      if (session.meta.l3_world_model_protocol_version === 2 && !this.deps.repos.runtime.hasUnassignedTurns(session.id)) {
         this.deps.repos.l3WorldModels.freezeBatches({
           sessionId,
           trigger: "session_close",
@@ -995,7 +1220,7 @@ export class SessionTurnService {
     });
   }
 
-  compactSession(sessionId: string, request: SessionCompactRequest = {}): {
+  compactSession(sessionId: string, request: SessionCompactRequest = {}, acceptedAt?: string): {
     memorySnapshot: {
       summary: string;
       sourceTurnIds: string[];
@@ -1013,11 +1238,11 @@ export class SessionTurnService {
     this.deps.assertMemoryAddEnabled();
     const session = this.deps.requireSession(sessionId);
     this.deps.assertSessionInScope(session, request.namespace);
-    const episode = this.ensureEpisode(session, request.episodeId);
-    const at = nowIso();
+    const episode = this.captureEpisode(session, request.episodeId);
+    const at = acceptedAt ?? nowIso();
     const sourceMemoryIds = request.sourceMemoryIds?.length
       ? request.sourceMemoryIds
-      : episode.l1MemoryIds.slice(-12);
+      : (episode?.l1MemoryIds ?? []).slice(-12);
     const sourceMemories = this.deps.repos.memories.getMany(sourceMemoryIds);
     const sourceTurnIds = request.sourceTurnIds?.length
       ? request.sourceTurnIds
@@ -1028,12 +1253,12 @@ export class SessionTurnService {
       sourceMemories.map((memory) => this.deps.firstLine(memory.memoryValue)).filter(Boolean).slice(0, 8).join("\n") ||
       `Compact snapshot for session ${sessionId}`;
     const rawTurnId = newId("raw");
-    const contextPacketId = `ctx_${stableHash(`${sessionId}:${episode.id}:${summary}:${rawTurnId}`).slice(0, 20)}`;
+    const contextPacketId = `ctx_${stableHash(`${sessionId}:${episode?.id}:${summary}:${rawTurnId}`).slice(0, 20)}`;
     const turnId = `compact:${contextPacketId}`;
     const rawTurn = this.deps.repos.runtime.insertRawTurn({
       id: rawTurnId,
       sessionId: session.id,
-      episodeId: episode.id,
+      episodeId: episode?.id,
       turnId,
       userId: session.userId,
       conversationId: session.conversationId,
@@ -1054,7 +1279,8 @@ export class SessionTurnService {
       status: "succeeded",
       createdAt: at
     });
-    this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
+    if (episode) this.deps.repos.runtime.appendEpisodeRawTurn(episode?.id, rawTurn.id, at);
+    this.queueAssignment(this.deps.repos.runtime.getRawTurn(rawTurn.id)!);
     this.deps.repos.runtime.appendChange({
       memoryId: rawTurn.id,
       namespaceId: this.deps.namespaceIdFromSession(session),
@@ -1097,7 +1323,7 @@ export class SessionTurnService {
         info: {
           turn_id: turnId,
           raw_turn_id: rawTurn.id,
-          episode_id: episode.id,
+          episode_id: episode?.id,
           summary,
           source_memory_ids: sourceMemoryIds,
           time_zone: timeZone
@@ -1117,13 +1343,13 @@ export class SessionTurnService {
           raw_span: { compact: true },
           error_signatures: [],
           trace: {
-            key: `${episode.id}:${Date.parse(at)}:compact`,
+            key: `${episode?.id}:${Date.parse(at)}:compact`,
             ts: Date.parse(at),
             time_zone: timeZone,
             turn_id: turnId,
             raw_turn_id: rawTurn.id,
             raw_span: { compact: true },
-            episode_id: episode.id,
+            episode_id: episode?.id,
             step_index: 0,
             sub_step_total: 1,
             tool_calls: [],
@@ -1156,12 +1382,12 @@ export class SessionTurnService {
         source: "session.compact",
         createdAt: at
       });
-      this.deps.repos.runtime.appendEpisodeTurn(episode.id, rawTurn.id, upsert.memory.id, at);
+      if (episode) this.deps.repos.runtime.appendEpisodeTurn(episode?.id, rawTurn.id, upsert.memory.id, at);
       jobs.push(this.deps.enqueueJob({
         jobType: "embedding",
         userId: session.userId,
         sessionId: session.id,
-        episodeId: episode.id,
+        episodeId: episode?.id,
         targetMemoryId: upsert.memory.id,
         payload: { reason: "compact.snapshot" },
         createdAt: at
@@ -1351,7 +1577,8 @@ export class SessionTurnService {
         }
         const result = existing.response.result;
         if (!result) return existing.response;
-        const responseResult = { ...result, duplicate: true, scheduledEvolution: false, jobs: [] };
+        const assigned = this.deps.repos.runtime.getRawTurn(result.rawTurnId);
+        const responseResult = { ...result, episodeId: assigned?.episodeId, assignmentStatus: assigned?.episodeId ? "assigned" as const : "pending" as const, duplicate: true, scheduledEvolution: false, jobs: [] };
         const memories = result.l1MemoryIds.map((id) => this.deps.repos.memories.getIncludingDeleted(id));
         if (memories.some((memory) => isRecord(memory?.properties.internal_info.capture_decision) &&
             memory.properties.internal_info.capture_decision.status === "rejected")) {
@@ -1394,7 +1621,7 @@ export class SessionTurnService {
       let targetSessionId = previous?.sessionId;
       // A replayed capture was accepted before later turns were stored. Keep it as
       // detached history instead of dropping it as out of order.
-      const legacyBackfill = allowsLegacyHistoryCapture(request) || this.deps.captureRecovery?.replaying() === true;
+      const legacyBackfill = allowsLegacyHistoryCapture(request);
       const detachLegacyHistory = (reason: string): SourceTurnCompleteResponse => {
         if (!legacyBackfill) return { status: "pending", reason };
         return this.captureDetachedLegacyHistory(request, normalized, sourceTurn, scope, contentHash);
@@ -1438,7 +1665,7 @@ export class SessionTurnService {
       namespace.userId = session.userId;
       scope.userId = session.userId;
       const observed = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, identity.turnId);
-      if (observed && this.deps.repos.runtime.getEpisode(observed.episodeId)?.status !== "open") {
+      if (observed?.episodeId && this.deps.repos.runtime.getEpisode(observed.episodeId)?.status !== "open") {
         return detachLegacyHistory("source_episode_closed");
       }
       const requestedEpisodeId = gapEpisode?.id ?? request.episodeId;
@@ -1721,7 +1948,8 @@ export class SessionTurnService {
   completeTurn(
     turnId: string,
     request: TurnCompleteRequest & Record<string, unknown>,
-    sourceTurn?: SourceTurnIdentity
+    sourceTurn?: SourceTurnIdentity,
+    acceptedAt?: string
   ): CompleteTurnResponse {
     request = sanitizeTurnCompleteRequest(request);
     if (request.status === "cancelled") {
@@ -1753,8 +1981,11 @@ export class SessionTurnService {
         if (existing.requestHash !== requestHash) {
           throw new MemoryServiceError("conflict", "idempotency key reused with different request body");
         }
+        const raw = this.deps.repos.runtime.getRawTurn((existing.response as CompleteTurnResponse).rawTurnId);
         return {
           ...(existing.response as CompleteTurnResponse),
+          episodeId: raw?.episodeId,
+          assignmentStatus: raw?.episodeId ? "assigned" : "pending",
           scheduledEvolution: false,
           jobs: [],
           duplicate: true
@@ -1764,7 +1995,7 @@ export class SessionTurnService {
 
     const newlyStoredL1MemoryIds: string[] = [];
     const response = this.deps.repos.transaction(() => {
-      const session = this.deps.requireOpenSession(request.sessionId);
+      const session = this.deps.requireSession(request.sessionId);
       this.deps.assertSessionInScope(session, request.namespace);
       const existingRawTurn = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
       if (existingRawTurn) {
@@ -1772,7 +2003,7 @@ export class SessionTurnService {
       }
       if (existingRawTurn && isRecord(existingRawTurn.messagePayload?.turn_complete)) {
         const at = nowIso();
-        const episode = this.deps.requireEpisode(existingRawTurn.episodeId);
+        const episode = this.deps.repos.runtime.getEpisode(existingRawTurn.episodeId);
         const existingCaptureClaim = !sourceTurn && existingRawTurn.userText && existingRawTurn.assistantText
           ? this.deps.repos.captureClaims.get(
               session.userId,
@@ -1780,7 +2011,7 @@ export class SessionTurnService {
               memoryCaptureQaHash(existingRawTurn.userText, existingRawTurn.assistantText)
             )
           : undefined;
-        const l1MemoryIds = episode.l1MemoryIds.filter((memoryId: string) => {
+        const l1MemoryIds = this.deps.repos.runtime.l1MemoryIdsForRawTurn(existingRawTurn.id).filter((memoryId: string) => {
           const memory = this.deps.repos.memories.get(memoryId);
           return memory && (
             this.deps.rawTurnIdFromMemory(memory) === existingRawTurn.id ||
@@ -1798,13 +2029,14 @@ export class SessionTurnService {
         const body: CompleteTurnResponse = {
           turnId,
           sessionId: session.id,
-          episodeId: episode.id,
+          episodeId: episode?.id,
+          assignmentStatus: episode ? "assigned" : "pending",
           rawTurnId: existingRawTurn.id,
           userMemoryId: userMemoryIds[0] ?? "",
           userMemoryIds,
           l1MemoryId: l1MemoryIds[0] ?? "",
           l1MemoryIds,
-          closedEpisodeIds: episodeClosedByEndTopicTurn(episode, turnId) ? [episode.id] : [],
+          closedEpisodeIds: (episode && episodeClosedByEndTopicTurn(episode, turnId)) ? [episode?.id] : [],
           scheduledEvolution: false,
           jobs: [],
           changeSeq: responseChangeSeq,
@@ -1822,6 +2054,7 @@ export class SessionTurnService {
         }
         return body;
       }
+      if (!acceptedAt) this.deps.requireOpenSession(session.id);
       const turnStartRecall = this.deps.repos.runtime.getTurnStartRecallEvent(session.id, turnId);
       const requestSourceMemoryIds = normalizeCompleteTurnSourceMemoryIds(request);
       const sourceMemoryIds = requestSourceMemoryIds.length > 0
@@ -1837,10 +2070,13 @@ export class SessionTurnService {
         ? undefined
         : explicitEndTopicDecision(request.query) ??
           (existingRawTurn ? endTopicDecisionFromRawTurn(existingRawTurn) : undefined);
-      const at = sourceTurn?.completedAt ?? nowIso();
+      const at = sourceTurn?.completedAt ?? acceptedAt ?? nowIso();
       const recalledProposal = turnJudgeRouting ? undefined : turnRouteProposalFromRecallRequest(turnStartRecall?.request);
-      let route: CommittedTurnRoute;
-      if (turnJudgeRouting) {
+      let route: Omit<CommittedTurnRoute, "episode"> & { episode?: EpisodeRecord };
+      if (this.deps.llm.isConfigured()) {
+        route = { episode: this.captureEpisode(session, request.episodeId), closedEpisodeIds: [], jobs: [],
+          proposal: provisionalTurnRouteProposal(this.deps.repos.runtime.latestEpisodeForSession(session.id), turnId, at), proposalStale: false };
+      } else if (turnJudgeRouting) {
         route = this.attachTurnProvisionally(session, turnId, request.episodeId, existingRawTurn, at, sourceTurn?.startedAt);
       } else if (request.episodeId) {
         const episode = this.ensureEpisode(session, request.episodeId);
@@ -1861,7 +2097,7 @@ export class SessionTurnService {
           proposal: {
             ...(recalledProposal ?? this.buildTurnRouteProposal(episode, decision, undefined, at)),
             action: routedEndTopicDecision ? "end_topic" : "append",
-            baseEpisodeId: episode.id,
+            baseEpisodeId: episode?.id,
             relationDecision: decision
           },
           proposalStale: false
@@ -1873,7 +2109,7 @@ export class SessionTurnService {
           recalledProposal.baseEpisodeId === undefined &&
           existingRawTurn &&
           latest?.id === existingRawTurn.episodeId &&
-          !this.episodeRelationContext(latest).prevUserText
+          !this.episodeRelationContext(latest!).prevUserText
         );
         const proposalIsCurrent = Boolean(recalledProposal) &&
           !(sourceTurn && latest && latest.status !== "open") &&
@@ -1900,7 +2136,7 @@ export class SessionTurnService {
             proposal: {
               ...this.buildTurnRouteProposal(episode, decision, undefined, at),
               action: routedEndTopicDecision ? "end_topic" : "append",
-              baseEpisodeId: episode.id
+              baseEpisodeId: episode?.id
             },
             proposalStale: true
           };
@@ -1922,11 +2158,11 @@ export class SessionTurnService {
       const episode = route.episode;
       const committedEndTopicDecision = route.endTopicDecision ?? endTopicDecision;
       const closedEpisodeIds = [...route.closedEpisodeIds];
-      this.deps.assertEpisodeInScope(episode, request.namespace);
-      if (existingRawTurn && existingRawTurn.episodeId !== episode.id) {
+      if (episode) this.deps.assertEpisodeInScope(episode, request.namespace);
+      if (episode && existingRawTurn && existingRawTurn.episodeId !== episode.id) {
         this.deps.repos.runtime.rebindRawTurnEpisode(
           existingRawTurn.id,
-          existingRawTurn.episodeId,
+          existingRawTurn.episodeId!,
           episode.id,
           at
         );
@@ -1934,7 +2170,7 @@ export class SessionTurnService {
       let activityAt = at;
       if (sourceTurn) {
         activityAt = new Date(Math.max(Date.parse(at), Date.parse(session.lastSeenAt ?? session.updatedAt),
-          Date.parse(episode.updatedAt))).toISOString();
+          Date.parse(episode?.updatedAt ?? at))).toISOString();
       }
       this.deps.repos.runtime.touchSession(session.id, activityAt);
       const rawTurnId = rawTurnIdForSessionTurn(session.id, turnId);
@@ -1942,7 +2178,7 @@ export class SessionTurnService {
       const requestToolResults = normalizeCompleteTurnToolResults(completionRequest);
       const requestArtifacts = normalizeCompleteTurnArtifacts(completionRequest);
       const turnStartPayload = {
-        ...(this.selectionScope?.selectedEpisodeId === episode.id ? { episodeSelection: { episodeId: episode.id } } : {}),
+        ...(episode && this.selectionScope?.selectedEpisodeId === episode.id ? { episodeSelection: { episodeId: episode?.id } } : {}),
         intent_decision: intentDecision,
         routeProposal: recalledProposal ?? route.proposal,
         ...(route.proposalStale ? { routeProposalStale: true } : {}),
@@ -1973,7 +2209,7 @@ export class SessionTurnService {
         this.deps.repos.runtime.insertRawTurn({
           id: rawTurnId,
           sessionId: session.id,
-          episodeId: episode.id,
+          episodeId: episode?.id,
           turnId,
           userId: session.userId,
           conversationId: session.conversationId,
@@ -2003,7 +2239,7 @@ export class SessionTurnService {
         ? {
             ...completeObservedRawTurn(existingRawTurn, completionRequest, at),
             ...(sourceTurn ? { createdAt: sourceTurn.startedAt } : {}),
-            episodeId: episode.id
+            episodeId: episode?.id
           }
         : undefined;
       const rawTurn = completedObservedRawTurn
@@ -2044,16 +2280,16 @@ export class SessionTurnService {
           createdAt: at
         });
       }
-      if (episode.rawTurnIds.every((rawTurnId) => rawTurnId === rawTurn.id)) {
-        this.deps.repos.runtime.updateEpisodeMeta(episode.id, {
+      if (episode && episode.rawTurnIds.every((rawTurnId) => rawTurnId === rawTurn.id)) {
+        this.deps.repos.runtime.updateEpisodeMeta(episode?.id, {
           intentDecision
         });
       }
-      this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, activityAt);
+      if (episode) this.deps.repos.runtime.appendEpisodeRawTurn(episode?.id, rawTurn.id, activityAt);
 
       const userMemoryCapture = this.captureUserMemory(rawTurn, request, at);
       const requestTags = this.deps.normalizeRequestTags(request.tags);
-      const capturedSteps = this.captureEpisodeIncrementalSteps(episode, rawTurn, at, Boolean(sourceTurn))
+      const capturedSteps = this.captureEpisodeIncrementalSteps(episode, rawTurn, at, !episode || Boolean(sourceTurn))
         .map((step) => {
           const stepRawTurnId = step.rawTurnId ?? rawTurn.id;
           return stepRawTurnId === rawTurn.id && requestTags.length > 0
@@ -2064,7 +2300,7 @@ export class SessionTurnService {
       const l1MemoryIds: string[] = [];
       const captureClaimByRawTurnId = new Map<string, boolean>();
       let changeSeq = 0;
-      const jobs: EvolutionJobRecord[] = [...route.jobs, ...userMemoryCapture.jobs];
+      const jobs: EvolutionJobRecord[] = [...route.jobs, ...userMemoryCapture.jobs, ...this.queueAssignment(rawTurn, this.deps.config.algorithm.session.turnJudge && this.deps.llm.isConfigured(), request.episodeId)];
 
       for (const step of capturedSteps) {
         const stepRawTurnId = step.rawTurnId ?? rawTurn.id;
@@ -2100,7 +2336,7 @@ export class SessionTurnService {
           info: {
             turn_id: step.turnId,
             raw_turn_id: stepRawTurnId,
-            episode_id: episode.id,
+            episode_id: episode?.id,
             status: rawTurn.status,
             summary: "",
             time_zone: step.timeZone,
@@ -2136,7 +2372,7 @@ export class SessionTurnService {
                 agent_text: Boolean(step.agentText),
                 tool_call_count: step.toolCalls.length
               },
-              episode_id: episode.id,
+              episode_id: episode?.id,
               step_index: step.stepIndex,
               sub_step_total: step.subStepTotal,
               agent_thinking: step.agentThinking,
@@ -2187,11 +2423,11 @@ export class SessionTurnService {
                     sessionId: session.id,
                     l1MemoryId: existing.id,
                     rawTurnId: stepRawTurnId,
-                    episodeId: episode.id,
+                    episodeId: episode?.id,
                     createdAt: at
                   });
                 }
-                this.deps.repos.runtime.appendEpisodeTurn(episode.id, stepRawTurnId, existing.id, activityAt);
+                if (episode) this.deps.repos.runtime.appendEpisodeTurn(episode?.id, stepRawTurnId, existing.id, activityAt);
               }
             }
           } else {
@@ -2209,7 +2445,7 @@ export class SessionTurnService {
             sessionId: session.id,
             l1MemoryId: upsert.memory.id,
             rawTurnId: stepRawTurnId,
-            episodeId: episode.id,
+            episodeId: episode?.id,
             createdAt: at
           });
         }
@@ -2226,7 +2462,7 @@ export class SessionTurnService {
           source: "turn.complete.capture.v7",
           createdAt: at
         });
-        this.deps.repos.runtime.appendEpisodeTurn(episode.id, stepRawTurnId, upsert.memory.id, activityAt);
+        if (episode) this.deps.repos.runtime.appendEpisodeTurn(episode?.id, stepRawTurnId, upsert.memory.id, activityAt);
         const existingProcessing = this.deps.repos.processing.get(upsert.memory.id);
         const contentChanged = Boolean(
           !upsert.created && upsert.previous?.contentHash !== upsert.memory.contentHash
@@ -2253,18 +2489,18 @@ export class SessionTurnService {
             jobType: "trace_summary",
             userId: session.userId,
             sessionId: session.id,
-            episodeId: episode.id,
+            episodeId: episode?.id,
             targetMemoryId: upsert.memory.id,
             payload: {
               source: "turn.complete.capture",
+              rawTurnId: sourceRawTurn.id,
+              turnAt: sourceRawTurn.createdAt,
               contentHash: upsert.memory.contentHash,
               decideCapture: modelDecidesCapture,
               ...(turnJudge ? {
                 turnJudge: true,
                 promptVersion: TURN_JUDGE_PROMPT_VERSION,
                 // Judgments of one session run in turn order (see leaseQueuedJobs).
-                turnAt: sourceRawTurn.createdAt,
-                rawTurnId: sourceRawTurn.id,
                 ...(stepRawTurnId !== rawTurn.id ? { turnJudgeCatchUp: true } : {}),
                 ...(turnJudgeNoiseKind(sourceRawTurn.userText) ? { turnJudgeNoise: turnJudgeNoiseKind(sourceRawTurn.userText) } : {})
               } : {}),
@@ -2283,7 +2519,7 @@ export class SessionTurnService {
       for (const artifact of requestArtifacts) {
         const artifactId = this.deps.repos.runtime.insertArtifact({
           sessionId: session.id,
-          episodeId: episode.id,
+          episodeId: episode?.id,
           rawTurnId: rawTurn.id,
           userId: session.userId,
           kind: artifact.kind,
@@ -2302,7 +2538,7 @@ export class SessionTurnService {
           after: {
             id: artifactId,
             sessionId: session.id,
-            episodeId: episode.id,
+            episodeId: episode?.id,
             rawTurnId: rawTurn.id,
             userId: session.userId,
             kind: artifact.kind,
@@ -2315,9 +2551,9 @@ export class SessionTurnService {
         });
       }
       const completedEndTopicDecision = committedEndTopicDecision ?? endTopicDecisionFromRawTurn(rawTurn);
-      if (rawTurnFirstCompleted && completedEndTopicDecision) {
-        const beforeClose = this.deps.repos.runtime.getEpisode(episode.id) ?? episode;
-        const closed = this.deps.repos.runtime.closeEpisode(episode.id, {
+      if (episode && rawTurnFirstCompleted && completedEndTopicDecision) {
+        const beforeClose = this.deps.repos.runtime.getEpisode(episode?.id) ?? episode;
+        const closed = this.deps.repos.runtime.closeEpisode(episode?.id, {
           closeReason: "end_topic",
           topicState: "ended",
           relationDecision: completedEndTopicDecision,
@@ -2341,19 +2577,19 @@ export class SessionTurnService {
           jobs.push(...this.deps.finalizeClosedEpisode(closed, at, "end_topic"));
           closedEpisodeIds.push(closed.id);
         }
-      } else if (episodeClosedByEndTopicTurn(episode, turnId)) {
-        closedEpisodeIds.push(episode.id);
+      } else if ((episode && episodeClosedByEndTopicTurn(episode, turnId))) {
+        closedEpisodeIds.push(episode?.id);
       }
-      if (rawTurnFirstCompleted && !completedEndTopicDecision) {
+      if (episode && rawTurnFirstCompleted && !completedEndTopicDecision) {
         jobs.push(this.deps.enqueueJob({
           jobType: "episode_idle_close",
           userId: session.userId,
           sessionId: session.id,
-          episodeId: episode.id,
+          episodeId: episode?.id,
           dedupeKey: `episode_idle_close:${rawTurn.id}`,
           payload: {
             triggerRawTurnId: rawTurn.id,
-            triggerEpisodeId: episode.id,
+            triggerEpisodeId: episode?.id,
             triggeredAt: at
           },
           createdAt: at
@@ -2366,7 +2602,7 @@ export class SessionTurnService {
             jobType: "episode_title",
             userId: session.userId,
             sessionId: session.id,
-            episodeId: episode.id,
+            episodeId: episode?.id,
             payload: { stage: "provisional" },
             createdAt: at
           }));
@@ -2384,7 +2620,8 @@ export class SessionTurnService {
       const body: CompleteTurnResponse = {
         turnId,
         sessionId: session.id,
-        episodeId: episode.id,
+        episodeId: episode?.id,
+        assignmentStatus: episode ? "assigned" : "pending",
         rawTurnId: rawTurn.id,
         userMemoryId: userMemoryCapture.memoryIds[0] ?? "",
         userMemoryIds: userMemoryCapture.memoryIds,
@@ -2457,7 +2694,8 @@ export class SessionTurnService {
     const turnId = input.turnId ?? `observe:${stableHash(`${session.id}:${at}:${stableStringify(observation.event)}`).slice(0, 16)}`;
     const { episode, rawTurn, updatedRawTurn, eventId } = await this.withEpisodeSelection({ userText: "", turnId }, () => {
       this.deps.requireOpenSession(session.id);
-      const episode = this.ensureEpisode(session, input.episodeId);
+      const latest = this.deps.repos.runtime.latestEpisodeForSession(session.id);
+      const episode = this.captureEpisode(session, input.episodeId) ?? (latest?.status === "open" ? latest : undefined);
       const existing = this.deps.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
       if (existing) {
         this.deps.assertRawTurnInScope(existing, input.namespace);
@@ -2472,7 +2710,7 @@ export class SessionTurnService {
       const rawTurn = existing ?? this.deps.repos.runtime.insertRawTurn({
         id: `raw_${stableHash(`${session.id}:${turnId}`).slice(0, 20)}`,
         sessionId: session.id,
-        episodeId: episode.id,
+        episodeId: episode?.id,
         turnId,
         userId: session.userId,
         conversationId: session.conversationId,
@@ -2508,10 +2746,10 @@ export class SessionTurnService {
         }
       };
       this.deps.repos.runtime.updateRawTurn(updatedRawTurn);
-      this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
+      if (episode) this.deps.repos.runtime.appendEpisodeRawTurn(episode?.id, rawTurn.id, at);
       const eventId = this.deps.repos.runtime.insertArtifact({
         sessionId: session.id,
-        episodeId: episode.id,
+        episodeId: episode?.id,
         rawTurnId: rawTurn.id,
         userId: session.userId,
         kind: "tool_call",
@@ -2521,6 +2759,14 @@ export class SessionTurnService {
         },
         createdAt: at
       });
+      if (!episode) {
+        const outcome = toolOutcomeFromObservation(input, rawTurn, updatedRawTurn);
+        const saved = this.deps.repos.runtime.getRawTurn(rawTurn.id)!;
+        const outcomes = Array.isArray(saved.messagePayload?.tool_outcomes) ? saved.messagePayload.tool_outcomes : [];
+        this.deps.repos.runtime.updateRawTurn({ ...saved, messagePayload: { ...saved.messagePayload,
+          tool_outcomes: [...outcomes, { eventId, at, ...outcome }] } });
+        this.queueAssignment(this.deps.repos.runtime.getRawTurn(rawTurn.id)!);
+      }
       this.deps.repos.runtime.appendChange({
         memoryId: rawTurn.id,
         namespaceId: this.deps.namespaceIdFromSession(session),
@@ -2549,16 +2795,53 @@ export class SessionTurnService {
     };
   }
 
+  private applyDeferredToolOutcomes(raw: RawTurnRecord, session: SessionRecord, at: string): void {
+    const episode = this.deps.repos.runtime.getEpisode(raw.episodeId);
+    const own = raw.messagePayload?.tool_outcomes;
+    if (!episode || !Array.isArray(own) || raw.messagePayload?.tool_outcomes_applied === own.length) return;
+    const rows = this.deps.repos.db.prepare("SELECT id, message_payload_json FROM raw_turns WHERE session_id=? AND episode_id=? AND deleted_at IS NULL AND redacted_at IS NULL ORDER BY created_at,rowid")
+      .all(session.id, episode.id) as Array<{ id: string; message_payload_json: string }>;
+    const events: Array<{ rawTurnId: string; eventId: string; at: string; toolId: string; success?: boolean; reason?: string }> = [];
+    for (const row of rows) {
+      const outcomes = JSON.parse(row.message_payload_json).tool_outcomes;
+      if (Array.isArray(outcomes)) for (const item of outcomes) events.push({ ...item, rawTurnId: row.id });
+      if (row.id === raw.id) break;
+    }
+    const applied = Number(raw.messagePayload?.tool_outcomes_applied ?? 0);
+    const context = toolRepairContext(session, episode);
+    for (const event of own.slice(applied) as typeof events) {
+      if (event.success !== false) continue;
+      const index = events.findIndex(item => item.eventId === event.eventId);
+      const series = events.slice(0, index + 1).filter(item => item.toolId === event.toolId && item.success !== undefined);
+      const window = series.slice(-this.deps.config.algorithm.feedback.failureWindow);
+      if (window.some(item => item.success) || window.length < this.deps.config.algorithm.feedback.failureThreshold) continue;
+      const contextHash = toolRepairContextHash(event.toolId, context);
+      const since = new Date(Date.parse(event.at) - this.deps.config.algorithm.feedback.cooldownMs).toISOString();
+      if (this.deps.config.algorithm.feedback.cooldownMs > 0 && this.deps.repos.runtime.listDecisionRepairs({ userId: session.userId, contextHash, since, limit: 1 }).length) continue;
+      const evidence = this.failureBurstRepairEvidence({ session, toolId: event.toolId, reason: event.reason ?? "tool failed", limit: this.deps.config.algorithm.feedback.evidenceLimit });
+      const valueDiff = repairEvidenceValueDiff(evidence.highValueMemories, evidence.lowValueMemories);
+      if (valueDiff < this.deps.config.algorithm.feedback.valueDelta) continue;
+      const burst: ToolFailureBurst = { toolId: event.toolId, context, contextHash, firstSeen: Date.parse(window[0]!.at), lastSeen: Date.parse(event.at),
+        windowStart: series.length - window.length + 1, failureCount: window.length,
+        occurrences: window.map((item, i) => ({ toolId: item.toolId, context, step: series.length - window.length + i + 1,
+          reason: item.reason ?? "tool failed", ts: Date.parse(item.at), rawTurnId: item.rawTurnId, sessionId: session.id, episodeId: episode.id })) };
+      this.persistFailureBurstRepair({ burst, session, episode, rawTurn: raw, reason: event.reason ?? "tool failed", at }, evidence, valueDiff, undefined, true);
+    }
+    const latest = this.deps.repos.runtime.getRawTurn(raw.id)!;
+    this.deps.repos.runtime.updateRawTurn({ ...latest, messagePayload: { ...latest.messagePayload, tool_outcomes_applied: own.length } });
+  }
+
   private async recordToolOutcomeForRepair(
     input: ToolObserveRequest,
     session: SessionRecord,
-    episode: EpisodeRecord,
+    episode: EpisodeRecord | undefined,
     rawTurn: RawTurnRecord,
     updatedRawTurn: RawTurnRecord,
     at: string
   ): Promise<DecisionRepairSummary | undefined> {
     const outcome = toolOutcomeFromObservation(input, rawTurn, updatedRawTurn);
     if (!outcome || outcome.success === undefined) return undefined;
+    if (!episode) return undefined; // Saved observations are assigned before Episode-dependent repair.
     const context = toolRepairContext(session, episode);
     const step = this.nextToolObservationStep(outcome.toolId, context);
     if (outcome.success) {
@@ -2678,6 +2961,16 @@ export class SessionTurnService {
     const llmDraft = deferDecisionRepair
       ? undefined
       : await this.maybeSynthesizeFailureBurstDecisionRepair(burst, reason, evidence);
+    return this.persistFailureBurstRepair(input, evidence, valueDiff, llmDraft, deferDecisionRepair);
+  }
+
+  private persistFailureBurstRepair(
+    input: { burst: ToolFailureBurst; session: SessionRecord; episode: EpisodeRecord; rawTurn: RawTurnRecord; reason: string; at: string },
+    evidence: ReturnType<SessionTurnService["failureBurstRepairEvidence"]>, valueDiff: number,
+    llmDraft: Awaited<ReturnType<SessionTurnService["maybeSynthesizeFailureBurstDecisionRepair"]>>,
+    deferDecisionRepair: boolean
+  ): DecisionRepairSummary {
+    const { burst, session, episode, rawTurn, reason, at } = input;
     const preference = llmDraft?.preference ?? failureBurstPreference(burst, reason, evidence.highValueMemories[0]);
     const antiPattern = llmDraft?.antiPattern ?? failureBurstAntiPattern(burst, reason);
     const repair = this.deps.repos.runtime.insertDecisionRepair({
@@ -2877,7 +3170,7 @@ export class SessionTurnService {
     }
     const session = this.deps.requireOpenSession(input.sessionId);
     this.deps.assertSessionInScope(session, input.namespace);
-    const episode = this.ensureEpisode(session, input.episodeId);
+    const episode = this.captureEpisode(session, input.episodeId);
     const at = nowIso();
     const metadata = input.metadata ?? {};
     const subagentId = input.subagentId ?? newId("subagent");
@@ -2886,7 +3179,7 @@ export class SessionTurnService {
     const rawTurn = this.deps.repos.runtime.insertRawTurn({
       id: rawTurnId,
       sessionId: session.id,
-      episodeId: episode.id,
+      episodeId: episode?.id,
       turnId,
       userId: session.userId,
       conversationId: session.conversationId,
@@ -2905,7 +3198,8 @@ export class SessionTurnService {
       status: "started",
       createdAt: at
     });
-    this.deps.repos.runtime.appendEpisodeRawTurn(episode.id, rawTurn.id, at);
+    if (episode) this.deps.repos.runtime.appendEpisodeRawTurn(episode?.id, rawTurn.id, at);
+    this.queueAssignment(this.deps.repos.runtime.getRawTurn(rawTurn.id)!);
     const changeSeq = this.deps.repos.runtime.appendChange({
       memoryId: rawTurn.id,
       namespaceId: this.deps.namespaceIdFromSession(session),
@@ -2920,7 +3214,7 @@ export class SessionTurnService {
     });
     const eventId = this.deps.repos.runtime.insertArtifact({
       sessionId: session.id,
-      episodeId: episode.id,
+      episodeId: episode?.id,
       rawTurnId: rawTurn.id,
       userId: session.userId,
       kind: "subagent_start",
@@ -3140,7 +3434,7 @@ export class SessionTurnService {
   }
 
   private captureEpisodeIncrementalSteps(
-    episode: EpisodeRecord,
+    episode: EpisodeRecord | undefined,
     currentRawTurn: RawTurnRecord,
     at: string,
     currentTurnOnly = false
@@ -3148,13 +3442,13 @@ export class SessionTurnService {
     const seenRawTurnIds = currentTurnOnly
       ? new Set<string>()
       : new Set(
-          episode.l1MemoryIds
+          (episode?.l1MemoryIds ?? [])
             .map((id) => this.deps.repos.memories.getIncludingDeleted(id))
             .filter((memory): memory is MemoryRow => Boolean(memory))
             .map((memory) => this.deps.rawTurnIdFromMemory(memory))
             .filter((id): id is string => Boolean(id))
         );
-    const rawTurns = uniq(currentTurnOnly ? [currentRawTurn.id] : [...episode.rawTurnIds, currentRawTurn.id])
+    const rawTurns = uniq(currentTurnOnly ? [currentRawTurn.id] : [...(episode?.rawTurnIds ?? []), currentRawTurn.id])
       .map((id) => id === currentRawTurn.id ? currentRawTurn : this.deps.repos.runtime.getRawTurn(id))
       .filter((rawTurn): rawTurn is RawTurnRecord =>
         Boolean(rawTurn && (rawTurn.id === currentRawTurn.id || !seenRawTurnIds.has(rawTurn.id)))
@@ -3167,7 +3461,7 @@ export class SessionTurnService {
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     return rawTurns.flatMap((rawTurn) =>
       captureTurnSteps({
-        episodeId: episode.id,
+        episodeId: episode?.id,
         sessionId: rawTurn.sessionId,
         turnId: rawTurn.turnId,
         userText: rawTurn.userText ?? "",
@@ -3355,6 +3649,13 @@ export class SessionTurnService {
     const session = rawTurn ? this.deps.repos.runtime.getSession(rawTurn.sessionId) : undefined;
     // The episode-per-turn mode keeps its own routing and feedback.
     if (!rawTurn || !session || !this.turnJudgeRouting()) return { affectedEpisodeIds: [], jobs: [] };
+    const assignment = isRecord(rawTurn.messagePayload?.episode_assignment) ? rawTurn.messagePayload.episode_assignment : undefined;
+    if (assignment && assignment.status !== "applying" && assignment.status !== "assigned") {
+      this.deps.repos.runtime.updateRawTurn({ ...rawTurn, messagePayload: {
+        ...rawTurn.messagePayload, episode_assignment: { ...assignment, judgment: input }
+      } });
+      return { affectedEpisodeIds: [], jobs: [] };
+    }
     const affected = new Set<string>();
     const jobs: EvolutionJobRecord[] = [];
     const decision: TurnRelationDecision | undefined = input.relation
@@ -3363,7 +3664,9 @@ export class SessionTurnService {
     let route: Record<string, unknown> = { action: "filed_by_rule" };
     const turnStartSelection = isRecord(rawTurn.messagePayload?.turn_start) ? rawTurn.messagePayload.turn_start.episodeSelection : undefined;
     const selectedBeforeCapture = isRecord(turnStartSelection) && turnStartSelection.episodeId === rawTurn.episodeId;
-    if (selectedBeforeCapture && (decision?.relation === "new_task" || input.filedByRule === "previous_task_closed")) {
+    if (this.deps.repos.runtime.sessionHasJudgedTurnAfter(rawTurn.id)) {
+      route = { action: "kept", reason: "later_turn_already_judged", episodeId: rawTurn.episodeId };
+    } else if (selectedBeforeCapture && (decision?.relation === "new_task" || input.filedByRule === "previous_task_closed")) {
       route = { action: "selected_before_capture", episodeId: rawTurn.episodeId };
     } else if (input.filedByRule === "previous_task_closed") {
       route = this.startTaskAfterClosedOne(session, rawTurn, input.at, affected);
@@ -3654,7 +3957,7 @@ export class SessionTurnService {
       contextHash,
       createdAt: at
     });
-    this.deps.repos.runtime.appendEpisodeFeedback(previous.episodeId, feedback.id, at);
+    this.deps.repos.runtime.appendEpisodeFeedback(previous.episodeId!, feedback.id, at);
     if (attitude === "negative") {
       jobs.push(this.deps.enqueueJob({
         jobType: "decision_repair",
@@ -4186,9 +4489,9 @@ export class SessionTurnService {
     });
   }
 
-  private writeSelectionTitle(episode: EpisodeRecord, selection: EpisodeSelectionResult, at: string): EpisodeRecord {
-    this.selectionScope!.selectedEpisodeId = episode.id;
-    const context = this.selectionScope!.context;
+  private writeSelectionTitle(episode: EpisodeRecord, selection: EpisodeSelectionResult, at: string, selectionContext?: EpisodeSelectionContext): EpisodeRecord {
+    if (this.selectionScope) this.selectionScope.selectedEpisodeId = episode.id;
+    const context = selectionContext ?? this.selectionScope!.context;
     const current = context.rawTurnId ? this.deps.repos.runtime.getRawTurn(context.rawTurnId) : undefined;
     const before = current ? new Set(this.deps.repos.runtime.completedRawTurnsBefore(current.id).map(t => t.id)) : undefined;
     const coveredUserTurns = episode.rawTurnIds.map(id => this.deps.repos.runtime.getRawTurn(id))

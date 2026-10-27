@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -748,9 +749,10 @@ describe("MemoryService / feedback / decision repair", () => {
       query: "sqlite database sql migration workflow should inspect schema first",
       answer: "Inspect schema output before retrying the sqlite SQL migration."
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: positive.episodeId,
+      episodeId: assignedEpisodeId(service, positive),
       l1MemoryId: positive.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -775,9 +777,10 @@ describe("MemoryService / feedback / decision repair", () => {
       query: "sqlite database sql migration workflow should inspect schema first",
       answer: "Repeated the same SQL query without reading the migration output."
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: negativeSession.sessionId,
-      episodeId: negative.episodeId,
+      episodeId: assignedEpisodeId(service, negative),
       l1MemoryId: negative.l1MemoryId,
       channel: "explicit",
       polarity: "negative",
@@ -828,7 +831,7 @@ describe("MemoryService / feedback / decision repair", () => {
       `SELECT decision_repair_ids_json
        FROM episodes
        WHERE id = ?`
-    ).get(negative.episodeId) as { decision_repair_ids_json: string };
+    ).get(assignedEpisodeId(service, negative)) as { decision_repair_ids_json: string };
     expect(JSON.parse(episode.decision_repair_ids_json)).toContain(repair!.id);
     const change = db.db.prepare(
       `SELECT kind, op

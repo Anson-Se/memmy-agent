@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   insertActivePolicyMemory,
@@ -323,9 +324,10 @@ describe("MemoryService / retrieval / injected context", () => {
       query: "sqlite migration pytest failed because migration table was missing",
       answer: "inspected the migration output and fixed the sqlite migration path"
     }));
+    await settleCaptureAssignments(service);
     (await service.completeTurn("turn-episode-get-hint-b", {
       sessionId: session.sessionId,
-      episodeId: first.episodeId,
+      episodeId: assignedEpisodeId(service, first),
       query: "rerun the focused sqlite migration pytest after the fix",
       answer: "reran the focused pytest and verified the migration state"
     }));
@@ -345,14 +347,14 @@ describe("MemoryService / retrieval / injected context", () => {
 
     expect(recall.hits).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        id: first.episodeId,
+        id: assignedEpisodeId(service, first),
         source: "episode",
         memoryLayer: "L1"
       })
     ]));
     expect(recall.injectedContext.markdown).not.toContain("## L1 Trace Memories");
     expect(recall.injectedContext.markdown).toContain("## Similar Past Episodes");
-    expect(recall.injectedContext.markdown).toContain(`id: ${first.episodeId}`);
+    expect(recall.injectedContext.markdown).toContain(`id: ${assignedEpisodeId(service, first)}`);
     expect(recall.injectedContext.markdown).toContain("step 1");
     expect(recall.injectedContext.markdown).not.toContain(`memmy_memory_get(id="${first.l1MemoryId}")`);
     expect(recall.injectedContext.markdown).not.toContain("trace_id:");
@@ -501,7 +503,7 @@ describe("MemoryService / retrieval / injected context", () => {
       answer: "The sqlite budget migration is fixed."
     }));
     expect(prepared).not.toHaveProperty("episodeId");
-    expect(completed.episodeId).toMatch(/^episode_/u);
+    expect(assignedEpisodeId(service, completed)).toMatch(/^episode_/u);
     const rawTurn = db.db.prepare(
       "SELECT source_memory_ids_json, message_payload_json FROM raw_turns WHERE id = ?"
     ).get(completed.rawTurnId) as {
@@ -583,7 +585,7 @@ describe("MemoryService / retrieval / injected context", () => {
             policy_confidence: 0.8,
             status: "active",
             source_trace_ids: [complete.l1MemoryId],
-            source_episode_ids: [complete.episodeId],
+            source_episode_ids: [assignedEpisodeId(service, complete)],
             decision_guidance: {
               preference: ["prefer linked policy guidance when the visible trace is recalled"],
               anti_pattern: ["avoid dropping guidance source ids from injected recall packets"]
@@ -638,7 +640,7 @@ describe("MemoryService / retrieval / injected context", () => {
       appId: "memmy-test",
       profileId: namespace.profileId,
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     };
     insertActivePolicyMemory(db, {
       ...base,
@@ -881,7 +883,8 @@ describe("MemoryService / retrieval / injected context", () => {
         query: "Fix the pytest failure and run the tests again.",
         answer: "The pytest failure is fixed and the tests pass."
       });
-      insertActivePolicyMemory(db, {
+      await settleCaptureAssignments(service);
+    insertActivePolicyMemory(db, {
         id: "policy-introduction-test",
         userId: namespace.userId,
         sessionId: session.sessionId,
@@ -889,7 +892,7 @@ describe("MemoryService / retrieval / injected context", () => {
         appId: "memmy",
         profileId: namespace.profileId,
         sourceTraceId: previous.l1MemoryId,
-        sourceEpisodeId: previous.episodeId
+        sourceEpisodeId: assignedEpisodeId(service, previous)
       });
       expect(db.db.prepare("SELECT status FROM memories WHERE id = ?").get("policy-introduction-test"))
         .toEqual({ status: "activated" });

@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { Repositories } from "../../../src/storage/repositories.js";
 import { selectionInput, type EpisodeSelectionInput } from "../../../src/service/session/episode-selection.js";
@@ -42,20 +43,20 @@ describe("episode selection before creation", () => {
     const b = await service.completeTurn("b1", { sessionId: session.sessionId, query: "B task", answer: "assistant-secret-B" });
     await settle(service);
     const bid = repos.runtime.getRawTurn(b.rawTurnId)!.episodeId;
-    expect(bid).not.toBe(a.episodeId);
+    expect(bid).not.toBe(assignedEpisodeId(service, a));
     db.db.prepare("UPDATE episodes SET title = NULL, summary = NULL, meta_json = '{}' WHERE session_id = ?").run(session.sessionId);
     const a2 = await service.completeTurn("a2", { sessionId: session.sessionId, query: "A2 resume", answer: "assistant-secret-A2" });
     await settle(service);
-    expect(repos.runtime.getRawTurn(a2.rawTurnId)?.episodeId).toBe(a.episodeId);
+    expect(repos.runtime.getRawTurn(a2.rawTurnId)?.episodeId).toBe(assignedEpisodeId(service, a));
     const episodes = repos.runtime.listEpisodesForSession(session.sessionId);
     expect(episodes).toHaveLength(2);
     expect(episodes.every(e => e.rawTurnIds.length > 0)).toBe(true);
-    expect(repos.runtime.getEpisode(a.episodeId)?.status).toBe("open");
+    expect(repos.runtime.getEpisode(assignedEpisodeId(service, a))?.status).toBe("open");
     expect(repos.runtime.getEpisode(bid)?.status).toBe("closed");
     expect(calls).toHaveLength(3);
     expect(JSON.stringify(calls.at(-1))).not.toContain("assistant-secret");
     expect(JSON.stringify(calls.at(-1)!.candidates)).not.toContain("A2 resume");
-    expect(repos.memories.get(a2.l1MemoryId)?.info.episode_id).toBe(a.episodeId);
+    expect(repos.memories.get(a2.l1MemoryId)?.info.episode_id).toBe(assignedEpisodeId(service, a));
   });
 
   it("resumes a closed task without creating a provisional empty episode", async () => {
@@ -63,14 +64,14 @@ describe("episode selection before creation", () => {
     const session = openSession(service, "closed");
     const a = await service.completeTurn("a1", { sessionId: session.sessionId, query: "A task", answer: "done" });
     await settle(service);
-    repos.runtime.closeEpisode(a.episodeId, { closeReason: "end_topic" });
+    repos.runtime.closeEpisode(assignedEpisodeId(service, a), { closeReason: "end_topic" });
     const resumed = await service.completeTurn("a2", { sessionId: session.sessionId, query: "A2 resume", answer: "continued" });
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toHaveLength(1);
     await settle(service);
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toHaveLength(1);
-    expect(repos.runtime.getRawTurn(resumed.rawTurnId)?.episodeId).toBe(a.episodeId);
+    expect(repos.runtime.getRawTurn(resumed.rawTurnId)?.episodeId).toBe(assignedEpisodeId(service, a));
     expect(calls).toHaveLength(2);
-    expect(repos.runtime.getEpisode(a.episodeId)?.status).toBe("open");
+    expect(repos.runtime.getEpisode(assignedEpisodeId(service, a))?.status).toBe("open");
   });
 
   it("does not offer episodes from another session", async () => {
@@ -79,6 +80,7 @@ describe("episode selection before creation", () => {
     await service.completeTurn("a1", { sessionId: a.sessionId, query: "A task", answer: "done" });
     const b = openSession(service, "session-two");
     await service.completeTurn("a2", { sessionId: b.sessionId, query: "A2 resume", answer: "done" });
+    await settle(service);
     expect(calls.at(-1)?.candidates).toEqual([]);
   });
 
@@ -89,11 +91,12 @@ describe("episode selection before creation", () => {
     const second = await service.completeTurn("t2", { sessionId: session.sessionId, query: "add rollback", answer: "secret two" });
     const third = await service.completeTurn("t3", { sessionId: session.sessionId, query: "current", answer: "secret three" });
     await service.completeTurn("t4", { sessionId: session.sessionId, query: "future", answer: "secret four" });
-    repos.runtime.updateEpisodeTitle(first.episodeId, { title: "A", summary: "A task", meta: {
+    await settle(service);
+    repos.runtime.updateEpisodeTitle(assignedEpisodeId(service, first), { title: "A", summary: "A task", meta: {
       episodeTitle: { coveredUserTurns: [{ id: first.rawTurnId, hash: stableHash("A task") }] }
     } });
     const input = selectionInput(repos, repos.runtime.getSession(session.sessionId)!, { userText: "current", rawTurnId: third.rawTurnId });
-    expect(input.candidates[0]).toEqual({ episodeId: first.episodeId, title: "A", summary: "A task", users: [{ rawTurnId: second.rawTurnId, text: "add rollback" }] });
+    expect(input.candidates[0]).toEqual({ episodeId: assignedEpisodeId(service, first), title: "A", summary: "A task", users: [{ rawTurnId: second.rawTurnId, text: "add rollback" }] });
     expect(JSON.stringify(input)).not.toMatch(/secret|future/);
   });
 
@@ -104,7 +107,7 @@ describe("episode selection before creation", () => {
     for (const [index, query] of ["A task", "B task", "A2 resume", "B2 resume"].entries()) {
       const turn = await service.completeTurn(`t${index}`, { sessionId: session.sessionId, query, answer: "done" });
       await settle(service);
-      ids.push(repos.runtime.getRawTurn(turn.rawTurnId)!.episodeId);
+      ids.push(assignedEpisodeId(service, turn));
       db.db.prepare("UPDATE episodes SET summary = NULL, title = NULL WHERE session_id = ?").run(session.sessionId);
     }
     expect(ids[0]).toBe(ids[2]);
@@ -137,14 +140,14 @@ describe("episode selection before creation", () => {
       const result = await complete<T>(messages, options);
       if (options.operation === "episode.select.v1" && !changed) {
         changed = true;
-        repos.runtime.updateEpisodeTitle(a.episodeId, { title: "updated A", summary: "A task changed while model waited" });
+        repos.runtime.updateEpisodeTitle(assignedEpisodeId(service, a), { title: "updated A", summary: "A task changed while model waited" });
       }
       return result;
     };
     await service.completeTurn("b", { sessionId: session.sessionId, query: "B task", answer: "done" });
     await settle(service);
     expect(calls.filter(c => c.userText === "B task")).toHaveLength(2);
-    expect(calls.at(-1)!.candidates.find(c => c.episodeId === a.episodeId)?.summary).toContain("changed while model waited");
+    expect(calls.at(-1)!.candidates.find(c => c.episodeId === assignedEpisodeId(service, a))?.summary).toContain("changed while model waited");
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toHaveLength(2);
   });
 
@@ -152,7 +155,10 @@ describe("episode selection before creation", () => {
     const { service, repos, llm } = setup();
     llm.completeJson = async <T extends Record<string, unknown>>() => ({ episodeId: "foreign", title: "bad", summary: "bad" } as unknown as T);
     const session = openSession(service, "invalid");
-    await expect(service.completeTurn("x", { sessionId: session.sessionId, query: "A task", answer: "done" })).rejects.toThrow("invalid episode selection");
+    const saved = await service.completeTurn("x", { sessionId: session.sessionId, query: "A task", answer: "done" });
+    await settle(service);
+    expect(repos.runtime.getRawTurn(saved.rawTurnId)?.userText).toBe("A task");
+    expect(repos.runtime.listJobs().find(j => j.jobType === "episode_assignment")?.lastError).toContain("invalid episode selection");
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toEqual([]);
   });
 
@@ -165,14 +171,18 @@ describe("episode selection before creation", () => {
   });
 
   it("model failure leaves no empty episode and a retry succeeds once", async () => {
-    const { service, repos, llm } = setup();
+    const { service, repos, llm, db } = setup();
     const complete = llm.completeJson;
     llm.completeJson = async () => { throw new Error("summary unavailable"); };
     const session = openSession(service, "retry");
     const request = { sessionId: session.sessionId, query: "A task", answer: "done" };
-    await expect(service.completeTurn("x", request)).rejects.toThrow("summary unavailable");
+    const accepted = await service.completeTurn("x", request);
+    await settle(service);
+    expect(repos.runtime.getRawTurn(accepted.rawTurnId)?.userText).toBe(request.query);
     expect(repos.runtime.listEpisodesForSession(session.sessionId)).toEqual([]);
     llm.completeJson = complete;
+    db.db.prepare("UPDATE evolution_jobs SET status='queued',attempts=0,leased_until=NULL WHERE status IN ('failed','dead_letter')").run();
+    await settle(service);
     const first = await service.completeTurn("x", request);
     const retry = await service.completeTurn("x", request);
     expect(retry.rawTurnId).toBe(first.rawTurnId);

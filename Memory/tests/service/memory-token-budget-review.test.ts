@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { localCalendarDate } from "@memmy/agent-source-core";
 import { DEFAULT_MEMMY_CONFIG } from "../../src/config/index.js";
@@ -30,6 +31,7 @@ describe("memory token budget review regressions", () => {
       skillLlm: createDecisionRepairLlm(calls)
     });
     const repos = new Repositories(db.db);
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -95,6 +97,7 @@ describe("memory token budget review regressions", () => {
       skillLlm: createDecisionRepairLlm(calls)
     });
     const repos = new Repositories(db.db);
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -191,6 +194,7 @@ describe("memory token budget review regressions", () => {
     });
     // Existing tasks can still collect tool observations while model work is paused.
     await service.completeTurn("setup", { sessionId: session.sessionId, episodeId: "episode-budget-burst", query: "Fix migration", answer: "Investigating" });
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -324,6 +328,7 @@ describe("memory token budget review regressions", () => {
         output: { ok: true, index }
       }))
     }));
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -439,6 +444,7 @@ describe("memory token budget review regressions", () => {
       query: "Parse a SEC 13F filing and extract issuer CUSIP holdings.",
       answer: "I parsed the filename as the issuer name."
     }));
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -446,7 +452,7 @@ describe("memory token budget review regressions", () => {
     });
     const first = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -456,7 +462,7 @@ describe("memory token budget review regressions", () => {
     });
     const repeat = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -505,6 +511,8 @@ describe("memory token budget review regressions", () => {
       query: "Parse a SEC 13F filing and extract issuer CUSIP holdings.",
       answer: "I parsed the filename as the issuer name."
     }));
+    await settleCaptureAssignments(service);
+    calls.length = 0;
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000,
@@ -512,7 +520,7 @@ describe("memory token budget review regressions", () => {
     });
     const first = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: completed.episodeId,
+      episodeId: assignedEpisodeId(service, completed),
       l1MemoryId: completed.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -571,6 +579,7 @@ describe("memory token budget review regressions", () => {
       fetchAppMemoryBudget: async () => remote
     });
     const repos = new Repositories(db.db);
+    await settleCaptureAssignments(service);
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
       dailyUsed: 10_000_000,
       lifetimeUsed: 10_000_000,
@@ -617,6 +626,8 @@ function createTrackingLlm(
     ): Promise<T> {
       if (options.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as T;
       calls.push(options.operation);
+      if (options.operation === "capture.summarize") return { relation: null, feedback: null, reason: "first task",
+        l1: { title: "Saved task", summary: "Stored completed task", evidence: [], unverified_answer: false }, user: null } as unknown as T;
       return (responses[options.operation] ?? {}) as T;
     },
     status() {

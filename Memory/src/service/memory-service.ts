@@ -1,4 +1,3 @@
-import { CaptureRecovery, type CaptureCommand } from "./session/capture-recovery.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -288,7 +287,6 @@ export class MemoryService {
   private readonly projectEnvironment: ProjectEnvironmentService;
   private readonly panelReadModel: PanelReadModel;
   private readonly retrieval: RetrievalService;
-  private readonly captureRecovery: CaptureRecovery;
   private readonly sessionTurns: SessionTurnService;
   private readonly skillReadModel: SkillReadModel;
   private readonly workerHandlers: ReturnType<typeof createWorkerJobHandlers>;
@@ -327,7 +325,6 @@ export class MemoryService {
   constructor(private readonly options: MemoryServiceOptions) {
     this.viewerEndpoint = options.viewerEndpoint;
     this.repos = options.backend?.repositories() ?? new Repositories(requireMemoryDb(options).db);
-    this.captureRecovery = new CaptureRecovery(this.repos, () => this.capturePendingListener?.());
     this.l3WorldModelContextReadModel = new L3WorldModelContextReadModel(this.repos);
     this.mode = options.mode ?? "local";
     this.config = cloneMemmyConfig(options.config ?? DEFAULT_MEMMY_CONFIG);
@@ -556,7 +553,6 @@ export class MemoryService {
     });
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
-      activeCaptureJobs: () => [...this.captureRecovery.activeForegroundJobs],
       onTurnJudgeDeadLetter: (job) => this.embeddingJobs.markTurnJudgeFailed(job),
       repos: this.repos,
       get embedder() { return workerRunnerOwner.embedder; },
@@ -583,9 +579,11 @@ export class MemoryService {
       appendEmbeddingRetryChange: this.workerHandlers.appendEmbeddingRetryChange,
       jobHandlers: {
         processJob: (job) => this.withModelTaskContext(
-          () => job.jobType === "capture_replay"
-            ? this.captureRecovery.replay(job, (command) => this.replayCapture(command))
-            : this.workerHandlers.processJob(job)
+          async () => job.jobType === "episode_assignment"
+            ? this.sessionTurns.assignEpisode(job)
+            : job.jobType === "episode_finalize"
+              ? this.sessionTurns.finalizeAssignment(job)
+              : this.workerHandlers.processJob(job)
         )
       },
       embeddingJobs: this.embeddingJobs
@@ -621,7 +619,19 @@ export class MemoryService {
       assertMemoryInScope: this.assertMemoryInScope.bind(this),
       assertSessionInScope: this.assertSessionInScope.bind(this),
       requireOpenSession: this.requireOpenSession.bind(this),
-      ensureEpisode: this.ensureEpisode.bind(this),
+      ensureEpisode: (session, episodeId) => this.sessionTurns.captureEpisode(session, episodeId),
+      persistSkillEvent: (session, skillId, request) => {
+        const at = nowIso();
+        const turnId = request.turnId ?? `skill:${request.adapterId ?? ""}:${request.requestId ?? newId("event")}`;
+        const existing = this.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
+        if (existing) return existing;
+        const raw = this.repos.runtime.insertRawTurn({ id: `raw_${stableHash(`${session.id}:${turnId}`).slice(0, 20)}`,
+          userId: session.userId, sessionId: session.id, turnId, createdAt: at,
+          conversationId: session.conversationId, userText: `Use skill ${skillId}`, toolCalls: [], toolResults: [],
+          sourceMemoryIds: [skillId], usage: {}, messagePayload: { skill_use: { skillId, toolCallId: request.toolCallId } }, status: "observed" });
+        this.sessionTurns.queueAssignment(raw);
+        return raw;
+      },
       resolveSkillTrialEvidence: this.skillTrials.resolveSkillTrialEvidence.bind(this.skillTrials),
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
       skillMetaFromMemory,
@@ -683,7 +693,6 @@ export class MemoryService {
     });
     const sessionTurnOwner = this;
     this.sessionTurns = new SessionTurnService({
-      captureRecovery: this.captureRecovery,
       repos: this.repos,
       get config() { return sessionTurnOwner.config; },
       get llm() { return sessionTurnOwner.llm; },
@@ -741,6 +750,7 @@ export class MemoryService {
       stringifyForMemory,
       withDuplicateFlag
     });
+    this.sessionTurns.migrateLegacyCaptures();
     serviceLogger.info("initialized", memoryConfigLogFields(this.config));
     this.tokenUsageRecorder.start();
   }
@@ -1069,6 +1079,8 @@ export class MemoryService {
     this.startAppBudgetReconcile();
     if (!requiresRestart && request.restartFailedProcessing !== false) {
       this.restartFailedProcessing(reloadedAt);
+      for (const { before, after } of this.repos.runtime.requeueFailedEpisodeAssignments(reloadedAt)) this.workerHandlers.appendJobChange(after, "queued", before);
+      this.capturePendingListener?.();
     }
     serviceLogger.info("config.reloaded", {
       changed,
@@ -1349,7 +1361,7 @@ export class MemoryService {
     jobs: JobRef[];
     serverTime: string;
   }> {
-    return this.withCaptureRecovery("compactSession", [sessionId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.summary ?? "" },
       () => this.sessionTurns.compactSession(sessionId, this.withTimeZone(request))
     )));
@@ -1376,36 +1388,16 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
-  private withCaptureRecovery<T>(operation: CaptureCommand["operation"], args: unknown[], execute: () => Promise<T>): Promise<T> {
-    const saved = JSON.parse(JSON.stringify(args)) as unknown[];
-    const request = saved.find(isRecord) ?? {};
-    // Preserve the effective owner across configuration/account changes before retry.
-    const namespace = isRecord(request.namespace) ? request.namespace : {};
-    if (operation === "completeSourceTurn") request.namespace = { ...namespace, userId: namespace.userId ?? this.config.userId };
-    const sessionId = typeof request.sessionId === "string" ? request.sessionId
-      : operation === "compactSession" ? String(saved[0]) : undefined;
-    return this.captureRecovery.run({ operation, args: saved, sessionId,
-      userId: String(namespace.userId ?? (sessionId ? this.repos.runtime.getSession(sessionId)?.userId : undefined) ?? this.config.userId ?? "local-user") }, execute);
-  }
-
-  private async replayCapture(command: CaptureCommand): Promise<unknown> {
-    const [first, second] = command.args;
-    switch (command.operation) {
-      case "completeTurn": return this.completeTurn(String(first), second as TurnCompleteRequest & Record<string, unknown>);
-      case "completeSourceTurn": return this.completeSourceTurn(first as SourceTurnCompleteRequest);
-      case "observeTool": return this.observeTool(first as ToolObserveRequest);
-      case "compactSession": return this.compactSession(String(first), second as SessionCompactRequest);
-      case "subagentStart": return this.subagentStart(first as SubagentStartRequest);
-      case "subagentComplete": return this.subagentComplete(first as SubagentCompleteRequest);
-      case "useSkill": return this.useSkill(String(first), second as SkillUseRequest);
-      default: throw new Error("unsupported capture recovery operation");
-    }
+  private async acceptCapture<T>(execute: () => Promise<T>): Promise<T> {
+    const result = await execute();
+    this.capturePendingListener?.();
+    return result;
   }
 
   async completeSourceTurn(request: SourceTurnCompleteRequest): Promise<SourceTurnCompleteResponse> {
     // Native scans have no Hook envelope. Use the configured owner only when
     // the request (including authenticated scope) did not provide one.
-    const response = await this.withCaptureRecovery("completeSourceTurn", [request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    const response = await this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.query, turnId: request.sourceTurn?.turnId },
       () => this.sessionTurns.completeSourceTurn(this.withTimeZone({
         ...request,
@@ -1435,7 +1427,7 @@ export class MemoryService {
   }
 
   async completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): Promise<CompleteTurnResponse> {
-    return this.withCaptureRecovery("completeTurn", [turnId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: request.query, turnId },
       () => this.sessionTurns.completeTurn(turnId, this.withTimeZone(request))
     )));
@@ -1450,7 +1442,7 @@ export class MemoryService {
     syncCursor?: string;
     serverTime: string;
   }> {
-    return this.withCaptureRecovery("observeTool", [input], () => this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input))));
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input))));
   }
 
 
@@ -1463,14 +1455,14 @@ export class MemoryService {
     syncCursor: string;
     serverTime: string;
   }> {
-    return this.withCaptureRecovery("subagentStart", [input], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: input.task ?? "" },
       () => this.sessionTurns.subagentStart(this.withTimeZone(input))
     )));
   }
 
   async subagentComplete(input: SubagentCompleteRequest): Promise<CompleteTurnResponse> {
-    return this.withCaptureRecovery("subagentComplete", [input], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: input.summary ?? "Subagent completed" },
       () => this.sessionTurns.subagentComplete(this.withTimeZone(input))
     )));
@@ -2283,7 +2275,7 @@ export class MemoryService {
     serverTime: string;
     duplicate?: boolean;
   }> {
-    return this.withCaptureRecovery("useSkill", [skillId, request], () => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
       { userText: `Use skill ${skillId}` },
       () => this.skillReadModel.useSkill(skillId, this.withTimeZone(request))
     )));
@@ -2418,6 +2410,7 @@ export class MemoryService {
     const result = this.repos.runtime.importBundleTables(request.bundle.tables, {
       conflictStrategy: request.conflictStrategy ?? "skip"
     });
+    this.sessionTurns.migrateLegacyCaptures();
     const importedVectors = importedMemoryVectors(request.bundle.tables.memory_vectors);
     this.repos.vectors.importRows(importedVectors);
     result.inserted.memory_vectors = importedVectors.length;
@@ -3073,7 +3066,14 @@ export class MemoryService {
     job?: JobRef;
     serverTime: string;
   } {
-    return this.importJobs.retryMemoryProcessing(memoryId, request);
+    // The existing operation validates memory ownership before touching its raw work.
+    const result = this.importJobs.retryMemoryProcessing(memoryId, request);
+    const memory = this.repos.memories.get(memoryId);
+    const rawId = memory ? rawTurnIdFromMemory(memory) : undefined;
+    const retried = rawId ? this.repos.runtime.requeueFailedEpisodeAssignments(nowIso(), rawId) : [];
+    for (const { before, after } of retried) this.workerHandlers.appendJobChange(after, "queued", before);
+    if (retried.length) this.capturePendingListener?.();
+    return retried.length ? { ...result, accepted: true, job: result.job ?? jobToRef(retried[0]!.after) } : result;
   }
 
   rebuildEmbeddings(): {

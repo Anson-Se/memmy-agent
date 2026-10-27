@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { deriveWorkspaceHostId } from "../../../src/contracts/index.js";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
@@ -99,7 +100,7 @@ describe("MemoryService / session / lifecycle", () => {
        FROM evolution_jobs
        WHERE job_type = 'episode_idle_close'
          AND episode_id = ?`
-    ).get(complete.episodeId) as { count: number };
+    ).get(assignedEpisodeId(service, complete)) as { count: number };
     expect(idleCloseJobs.count).toBe(1);
     expect(complete.changeSeq).toBeGreaterThan(0);
     expect(complete.syncCursor).toMatch(/^cur_/);
@@ -132,21 +133,21 @@ describe("MemoryService / session / lifecycle", () => {
       `SELECT turn_count
        FROM episodes
        WHERE id = ?`
-    ).get(complete.episodeId) as { turn_count: number };
+    ).get(assignedEpisodeId(service, complete)) as { turn_count: number };
     expect(episodeState.turn_count).toBe(1);
     const initialChangeKinds = db.db.prepare(
       `SELECT kind, op, entity_id
        FROM memory_change_log
        WHERE entity_id IN (?, ?, ?, ?)
        ORDER BY seq ASC`
-    ).all(session.sessionId, complete.episodeId, complete.rawTurnId, complete.l1MemoryId) as Array<{
+    ).all(session.sessionId, assignedEpisodeId(service, complete), complete.rawTurnId, complete.l1MemoryId) as Array<{
       kind: string;
       op: string;
       entity_id: string;
     }>;
     expect(initialChangeKinds).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "session", op: "created", entity_id: session.sessionId }),
-      expect.objectContaining({ kind: "episode", op: "created", entity_id: complete.episodeId }),
+      expect.objectContaining({ kind: "episode", op: "created", entity_id: assignedEpisodeId(service, complete) }),
       expect.objectContaining({ kind: "raw_turn", op: "created", entity_id: complete.rawTurnId }),
       expect.objectContaining({ kind: "trace", op: "created", entity_id: complete.l1MemoryId })
     ]));
@@ -577,7 +578,7 @@ describe("MemoryService / session / lifecycle", () => {
       status: "closed",
       close_reason: "l3_world_model_protocol_v2"
     });
-    expect(db.db.prepare(`SELECT status FROM episodes WHERE id = ?`).get(complete.episodeId))
+    expect(db.db.prepare(`SELECT status FROM episodes WHERE id = ?`).get(assignedEpisodeId(service, complete)))
       .toEqual({ status: "closed" });
     expect(db.db.prepare(
       `SELECT json_extract(meta_json, '$.l3_world_model_protocol_version') AS protocol
@@ -622,7 +623,7 @@ describe("MemoryService / session / lifecycle", () => {
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0]).toMatchObject({
       session_id: session.sessionId,
-      episode_id: complete.episodeId,
+      episode_id: assignedEpisodeId(service, complete),
       raw_turn_id: complete.rawTurnId,
       user_id: namespace.userId,
       kind: "file",

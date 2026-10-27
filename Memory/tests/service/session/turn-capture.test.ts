@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -159,7 +160,7 @@ describe("MemoryService / session / turn capture", () => {
       status: string;
     };
     expect(completedRawTurn).toMatchObject({
-      episode_id: completed.episodeId,
+      episode_id: assignedEpisodeId(service, completed),
       user_text: "Implement the sqlite persistence transaction after inspecting the schema.",
       assistant_text: "The complete user and assistant turn is now safe to persist.",
       status: "succeeded"
@@ -351,7 +352,7 @@ describe("MemoryService / session / turn capture", () => {
     expect(observed.rawTurnId).toMatch(/^raw_/u);
     expect(db.db.prepare(
       "SELECT episode_id FROM raw_turns WHERE id = ?"
-    ).get(observed.rawTurnId)).toEqual({ episode_id: first.episodeId });
+    ).get(observed.rawTurnId)).toEqual({ episode_id: assignedEpisodeId(service, first) });
 
     const completed = (await service.completeTurn("turn-observed-route-split", {
       sessionId: session.sessionId,
@@ -359,22 +360,22 @@ describe("MemoryService / session / turn capture", () => {
       answer: "The hiring plan is summarized."
     }));
     expect(completed.rawTurnId).toBe(observed.rawTurnId);
-    expect(completed.episodeId).not.toBe(first.episodeId);
-    expect(completed.closedEpisodeIds).toEqual([first.episodeId]);
+    expect(assignedEpisodeId(service, completed)).not.toBe(assignedEpisodeId(service, first));
+    expect(completed.closedEpisodeIds).toEqual([assignedEpisodeId(service, first)]);
     expect(db.db.prepare(
       "SELECT episode_id FROM raw_turns WHERE id = ?"
-    ).get(observed.rawTurnId)).toEqual({ episode_id: completed.episodeId });
+    ).get(observed.rawTurnId)).toEqual({ episode_id: assignedEpisodeId(service, completed) });
     expect(db.db.prepare(
       "SELECT DISTINCT episode_id FROM artifacts WHERE raw_turn_id = ?"
-    ).all(observed.rawTurnId)).toEqual([{ episode_id: completed.episodeId }]);
+    ).all(observed.rawTurnId)).toEqual([{ episode_id: assignedEpisodeId(service, completed) }]);
     const episodeRows = db.db.prepare(
       "SELECT id, raw_turn_ids_json FROM episodes WHERE id IN (?, ?) ORDER BY id"
-    ).all(first.episodeId, completed.episodeId) as Array<{
+    ).all(assignedEpisodeId(service, first), assignedEpisodeId(service, completed)) as Array<{
       id: string;
       raw_turn_ids_json: string;
     }>;
-    const firstRow = episodeRows.find((row) => row.id === first.episodeId);
-    const completedRow = episodeRows.find((row) => row.id === completed.episodeId);
+    const firstRow = episodeRows.find((row) => row.id === assignedEpisodeId(service, first));
+    const completedRow = episodeRows.find((row) => row.id === assignedEpisodeId(service, completed));
     expect(JSON.parse(firstRow!.raw_turn_ids_json)).not.toContain(observed.rawTurnId);
     expect(JSON.parse(completedRow!.raw_turn_ids_json)).toContain(observed.rawTurnId);
     db.close();
@@ -613,12 +614,12 @@ describe("MemoryService / session / turn capture", () => {
     expect(traceMeta.tool_calls?.map((call) => call.id)).toEqual(["call-bash", "call-node"]);
     expect(traceMeta.step_index).toBe(0);
     expect(traceMeta.sub_step_total).toBe(1);
-    const episodeDetail = service.getMemory(complete.episodeId);
+    const episodeDetail = service.getMemory(assignedEpisodeId(service, complete));
     expect(episodeDetail.kind).toBe("episode");
     if (episodeDetail.kind !== "episode") {
       throw new Error("expected episode detail");
     }
-    expect(episodeDetail.id).toBe(complete.episodeId);
+    expect(episodeDetail.id).toBe(assignedEpisodeId(service, complete));
     expect(episodeDetail.timeline.rawTurns?.map((turn) => turn.rawTurnId)).toContain(complete.rawTurnId);
     expect(episodeDetail.timeline.items.map((item) => item.id)).toContain(complete.l1MemoryId);
 
@@ -644,7 +645,7 @@ describe("MemoryService / session / turn capture", () => {
         action: "stored",
         sourceAgent: "memmy-agent",
         traceId: complete.l1MemoryId,
-        episodeId: complete.episodeId,
+        episodeId: assignedEpisodeId(service, complete),
         query: "Run pwd in the terminal.",
         agent: "The command completed."
       })
@@ -905,7 +906,7 @@ describe("MemoryService / session / turn capture", () => {
     expect(prepared.status).toContain("intent:chitchat:retrieval_skipped");
     expect(completed.l1MemoryId).toBe("");
     expect(completed.l1MemoryIds).toEqual([]);
-    const episode = service.getMemory(task.episodeId);
+    const episode = service.getMemory(assignedEpisodeId(service, task));
     if (episode.kind !== "episode") {
       throw new Error("expected episode detail");
     }
@@ -928,7 +929,7 @@ describe("MemoryService / session / turn capture", () => {
       answer: "可以使用自动续期任务。"
     }));
     expect(resumed.l1MemoryIds).toHaveLength(1);
-    const resumedEpisode = service.getMemory(task.episodeId);
+    const resumedEpisode = service.getMemory(assignedEpisodeId(service, task));
     if (resumedEpisode.kind !== "episode") {
       throw new Error("expected episode detail");
     }
@@ -956,7 +957,7 @@ describe("MemoryService / session / turn capture", () => {
 
     expect(completed.l1MemoryId).toBe("");
     expect(completed.l1MemoryIds).toEqual([]);
-    const episode = service.getMemory(completed.episodeId);
+    const episode = service.getMemory(assignedEpisodeId(service, completed));
     if (episode.kind !== "episode") {
       throw new Error("expected episode detail");
     }

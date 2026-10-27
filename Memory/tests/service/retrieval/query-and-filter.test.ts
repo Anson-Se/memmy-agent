@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -1477,7 +1478,7 @@ describe("MemoryService / retrieval / query and filtering", () => {
         profileId: "profile-a",
         userId: "shared-recall-user"
       },
-      episodeId: profileAMemory.episodeId,
+      episodeId: assignedEpisodeId(service, profileAMemory),
       limit: 10
     });
     expect(episodeTimelineA.sessionId).toBe(profileA.sessionId);

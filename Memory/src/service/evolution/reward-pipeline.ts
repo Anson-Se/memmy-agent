@@ -75,6 +75,9 @@ export class RewardPipeline {
     const rewardSource = this.rewardSourceForJob(job);
     if (!rewardSource) return;
     const { source, trace } = rewardSource;
+    // A queued feedback job may predate assignment. Closure will schedule a
+    // fresh Episode reward after binding; never score a pending turn alone.
+    if (this.deps.repos.runtime.isRawTurnAttributionPending(rawTurnIdFromMemory(source))) return;
     const episode = trace.episodeId ? this.deps.repos.runtime.getEpisode(trace.episodeId) : undefined;
     if (episode && episode.status !== "closed") return;
     const phase = episode ? "final" : "feedback";
@@ -105,7 +108,9 @@ export class RewardPipeline {
     const episodeTraces = this.deps.repos.memories
       .list({ memoryLayer: "L1", status: "activated" }, 1000)
       .map((memory) => this.deps.traceMeta(memory))
-      .filter((item): item is TraceMeta => Boolean(item && item.episodeId === trace.episodeId))
+      .filter((item): item is TraceMeta => Boolean(item && (trace.episodeId
+        ? item.episodeId === trace.episodeId
+        : item.id === trace.id)))
       .sort((a, b) => a.ts - b.ts);
     const skipReason = episodeFeedback.length > 0 || payloadHasFeedback
       ? null

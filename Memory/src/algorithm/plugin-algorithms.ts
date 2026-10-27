@@ -3194,7 +3194,7 @@ const DEFAULT_RETRIEVAL_TUNING: Required<RetrievalTuningConfig> = {
 };
 
 export function captureTurnSteps(input: {
-  episodeId: string;
+  episodeId?: string;
   sessionId: string;
   turnId: string;
   userText?: string;
@@ -3214,7 +3214,7 @@ export function captureTurnSteps(input: {
   const rawReflection = input.reasoningSummary?.trim() || extractedReflection;
 
   const rawSteps: Array<Omit<CapturedTraceStep, "summary" | "tags" | "vecSummary" | "vecAction" | "errorSignatures">> = [{
-    key: `${input.episodeId}:${input.turnId}:turn`,
+    key: `${input.episodeId ?? input.sessionId}:${input.turnId}:turn`,
     ts: Number.isFinite(baseTs) ? baseTs : Date.now(),
     timeZone: input.timeZone,
     turnId: input.turnId,

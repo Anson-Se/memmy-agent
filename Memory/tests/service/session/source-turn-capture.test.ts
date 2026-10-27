@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { Repositories, RuntimeRepository } from "../../../src/storage/repositories.js";
 import { memoryCaptureQaHash } from "../../../src/utils/memory-capture-claim.js";
 import { join } from "node:path";
@@ -409,7 +410,7 @@ describe("native source turn submission", () => {
     const first = (await service.completeSourceTurn(request()));
     const before = counts(db);
     expect((await service.completeSourceTurn(request({ sourceTurn: { ...request().sourceTurn, turnId: "late-turn", sequence: 0, startedAt: "2099-01-01T09:00:00.000Z", completedAt: "2099-01-01T09:01:00.000Z" } })))).toMatchObject({ status: "pending", reason: "source_turn_out_of_order" });
-    new Repositories(db.db).runtime.closeEpisode(first.result!.episodeId, { closeReason: "idle" }, "2099-01-01T10:01:30.000Z");
+    new Repositories(db.db).runtime.closeEpisode(assignedEpisodeId(service, first.result!), { closeReason: "idle" }, "2099-01-01T10:01:30.000Z");
     expect((await service.completeSourceTurn(request({ sourceTurn: { ...request().sourceTurn, turnId: "after-close", sequence: 2, startedAt: "2099-01-01T10:02:00.000Z", completedAt: "2099-01-01T10:03:00.000Z" } })))).toMatchObject({ status: "pending", reason: "source_episode_closed" });
     expect(counts(db)).toEqual(before);
   });
@@ -536,8 +537,8 @@ describe("native source turn submission", () => {
       query: "Implement the source capture transaction",
       answer: "Implemented and verified the source capture transaction"
     }));
-    runtime.closeEpisode(legacy.episodeId, { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
-    const beforeEpisode = runtime.getEpisode(legacy.episodeId)!;
+    runtime.closeEpisode(assignedEpisodeId(service, legacy), { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
+    const beforeEpisode = runtime.getEpisode(assignedEpisodeId(service, legacy))!;
     const historicalEpisode = (await service.completeSourceTurn(request({
       channel: "agent_source_scan",
       captureLegacyHistory: true,
@@ -561,9 +562,9 @@ describe("native source turn submission", () => {
       }
     })));
     expect(historicalEpisode).toMatchObject({ status: "stored" });
-    expect(historicalEpisode.result?.episodeId).not.toBe(legacy.episodeId);
+    expect(historicalEpisode.result?.episodeId).not.toBe(assignedEpisodeId(service, legacy));
     expect(historicalEpisodeRetry).toMatchObject({ status: "existing", result: { duplicate: true } });
-    expect(runtime.getEpisode(legacy.episodeId)).toMatchObject({
+    expect(runtime.getEpisode(assignedEpisodeId(service, legacy))).toMatchObject({
       status: "closed",
       l1MemoryIds: beforeEpisode.l1MemoryIds,
       rawTurnIds: beforeEpisode.rawTurnIds
@@ -583,13 +584,13 @@ describe("native source turn submission", () => {
       query: "Implement the source capture transaction",
       answer: "Implemented and verified the source capture transaction"
     }));
-    runtime.closeEpisode(legacy.episodeId, { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
-    const before = runtime.getEpisode(legacy.episodeId)!;
+    runtime.closeEpisode(assignedEpisodeId(service, legacy), { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
+    const before = runtime.getEpisode(assignedEpisodeId(service, legacy))!;
     const historical = (await service.completeSourceTurn(request({
       channel: "agent_source_scan",
       captureLegacyHistory: true,
       sessionId: opened.sessionId,
-      episodeId: legacy.episodeId,
+      episodeId: assignedEpisodeId(service, legacy),
       sourceTurn: {
         ...request().sourceTurn,
         conversationId: "explicit-episode",
@@ -600,8 +601,8 @@ describe("native source turn submission", () => {
     })));
     expect(historical).toMatchObject({ status: "stored" });
     expect(historical.result?.sessionId).not.toBe(opened.sessionId);
-    expect(historical.result?.episodeId).not.toBe(legacy.episodeId);
-    expect(runtime.getEpisode(legacy.episodeId)).toEqual(before);
+    expect(historical.result?.episodeId).not.toBe(assignedEpisodeId(service, legacy));
+    expect(runtime.getEpisode(assignedEpisodeId(service, legacy))).toEqual(before);
     const raw = runtime.getRawTurn(historical.result!.rawTurnId)!;
     expect(raw.sessionId).toBe(runtime.getEpisode(historical.result!.episodeId)?.sessionId);
     expect(db.db.prepare("SELECT COUNT(*) AS count FROM raw_turns r JOIN episodes e ON e.id = r.episode_id WHERE r.session_id <> e.session_id").get()).toEqual({ count: 0 });
@@ -615,7 +616,7 @@ describe("native source turn submission", () => {
       query: "Implement a separate transaction for the other workspace.",
       answer: "The separate transaction is ready and verified."
     }));
-    const foreignBefore = runtime.getEpisode(foreign.episodeId)!;
+    const foreignBefore = runtime.getEpisode(assignedEpisodeId(service, foreign))!;
     expect((await service.completeSourceTurn(request({
       channel: "agent_source_scan",
       captureLegacyHistory: true,
@@ -630,7 +631,7 @@ describe("native source turn submission", () => {
     await expect(async () => (await service.completeSourceTurn(request({
       channel: "agent_source_scan",
       captureLegacyHistory: true,
-      episodeId: foreign.episodeId,
+      episodeId: assignedEpisodeId(service, foreign),
       sourceTurn: {
         ...request().sourceTurn,
         conversationId: "review-conversation",
@@ -639,7 +640,7 @@ describe("native source turn submission", () => {
         completedAt: "2000-01-01T10:01:00.000Z"
       }
     })))).rejects.toThrow("source_episode_scope_conflict");
-    expect(runtime.getEpisode(foreign.episodeId)).toEqual(foreignBefore);
+    expect(runtime.getEpisode(assignedEpisodeId(service, foreign))).toEqual(foreignBefore);
   });
 
   it("does not recreate a source turn already completed by the old writer", async () => {
@@ -661,7 +662,7 @@ describe("native source turn submission", () => {
       meta: { conversationId: historicalTurn.conversationId }
     });
     const old = (await service.completeTurn("same-native-turn", { sessionId: opened.sessionId, ...content }));
-    runtime.closeEpisode(old.episodeId, { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
+    runtime.closeEpisode(assignedEpisodeId(service, old), { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
     const scan = async () => (await service.completeSourceTurn(request({
       channel: "agent_source_scan",
       captureLegacyHistory: true,
@@ -698,7 +699,7 @@ describe("native source turn submission", () => {
       meta: { conversationId: "legacy-deleted" }
     });
     const deletedTurn = (await service.completeTurn("same-native-turn", { sessionId: deleted.sessionId, ...content }));
-    runtime.closeEpisode(deletedTurn.episodeId, { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
+    runtime.closeEpisode(assignedEpisodeId(service, deletedTurn), { closeReason: "evaluated" }, "2099-01-01T00:00:00.000Z");
     service.deleteMemory(deletedTurn.l1MemoryId, { namespace: request().namespace });
     const deletedBefore = activeMemories();
     expect((await service.completeSourceTurn(request({
@@ -1060,7 +1061,7 @@ describe("native source turn submission", () => {
     service.closeSession(captured.result!.sessionId);
     await runWorkerRounds(service, 3);
     const jobs = db.db.prepare("SELECT job_type, status, episode_id FROM evolution_jobs WHERE episode_id = ?")
-      .all(captured.result!.episodeId) as Array<{ job_type: string; status: string; episode_id: string }>;
+      .all(assignedEpisodeId(service, captured.result!)) as Array<{ job_type: string; status: string; episode_id: string }>;
     expect(jobs).toEqual(expect.arrayContaining([
       expect.objectContaining({ job_type: "trace_summary", status: "succeeded" }),
       expect.objectContaining({ job_type: "reflection", status: "succeeded" }),
@@ -1077,7 +1078,7 @@ describe("native source turn submission", () => {
     await service.startTurn({ sessionId: opened.sessionId, turnId: "ordinary-turn", query: request().query });
     vi.setSystemTime("2099-01-01T10:05:00.000Z");
     const completed = (await service.completeTurn("ordinary-turn", { sessionId: opened.sessionId, query: request().query, answer: request().answer }));
-    expect(new Repositories(db.db).runtime.getEpisode(completed.episodeId)?.openedAt).toBe("2099-01-01T10:05:00.000Z");
+    expect(new Repositories(db.db).runtime.getEpisode(assignedEpisodeId(service, completed))?.openedAt).toBe("2099-01-01T10:05:00.000Z");
   });
 
   it("does not reopen a closed Episode from an earlier cached source turn proposal", async () => {
@@ -1086,7 +1087,7 @@ describe("native source turn submission", () => {
     const first = (await service.completeSourceTurn(request()));
     await service.startTurn({ namespace: request().namespace, sessionId: first.result!.sessionId, turnId: "changed-source-turn",
       query: "Continue with the same migration." });
-    runtime.closeEpisode(first.result!.episodeId, { closeReason: "idle" }, "2099-01-01T10:01:30.000Z");
+    runtime.closeEpisode(assignedEpisodeId(service, first.result!), { closeReason: "idle" }, "2099-01-01T10:01:30.000Z");
     const completed = (await service.completeSourceTurn(request({ query: "New task: implement a weather dashboard.",
       sourceTurn: { ...request().sourceTurn, turnId: "changed-source-turn", startedAt: "2099-01-01T10:02:00.000Z", completedAt: "2099-01-01T10:03:00.000Z" } })));
     expect(completed.status).toBe("stored");

@@ -91,6 +91,8 @@ export interface EpisodeReadModelRepositories {
     get(memoryId: string): MemoryProcessingRecord | undefined;
   };
   runtime: {
+    listUnassignedRawTurnsBySession(sessionId: string): RawTurnRecord[];
+    l1MemoryIdsForRawTurn(rawTurnId: string): string[];
     getEpisode(id: string): EpisodeRecord | undefined;
     getFeedback(id: string): FeedbackRecord | undefined;
     listEpisodesForSession(sessionId: string): EpisodeRecord[];
@@ -177,12 +179,12 @@ export class EpisodeReadModel {
         ? this.deps.repos.runtime.listEpisodesForSession(scopedSession.id)
             .sort((a, b) => Date.parse(a.openedAt) - Date.parse(b.openedAt) || a.id.localeCompare(b.id))
         : undefined;
-    const items = timelineEpisodes
+    let items = timelineEpisodes
       ? this.timelineItemsFromEpisodes(timelineEpisodes, layers, input.tags, limit, cursor)
       : this.deps.repos.memories
           .list({ memoryLayer: layers, tags: input.tags }, limit, cursor)
           .map((memory) => this.deps.repos.memories.toListItem(memory));
-    const rawTurns = timelineEpisodes
+    let rawTurns = timelineEpisodes
       ? timelineEpisodes
           .flatMap((episode) => this.deps.repos.runtime.listRawTurnsByEpisode(episode.id, limit))
           .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id))
@@ -190,6 +192,19 @@ export class EpisodeReadModel {
           .map((turn) => this.deps.rawTurnSummary(turn))
       : undefined;
 
+    if (scopedSession && !scopedEpisode) {
+      const pending = this.deps.repos.runtime.listUnassignedRawTurnsBySession(scopedSession.id);
+      rawTurns = [...(rawTurns ?? []), ...pending.map(turn => this.deps.rawTurnSummary(turn))]
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)).slice(0, limit);
+      const ids = dedupeStrings([
+        ...(timelineEpisodes ?? []).flatMap(episode => timelineMemoryIdsForEpisode(episode, new Set(layers))),
+        ...pending.flatMap(turn => this.deps.repos.runtime.l1MemoryIdsForRawTurn(turn.id))
+      ]);
+      items = this.deps.repos.memories.getMany(ids)
+        .filter(memory => layers.includes(memory.memoryLayer) && this.deps.memoryMatchesTags(memory, input.tags))
+        .sort((a, b) => this.deps.traceSortKey(a) - this.deps.traceSortKey(b) || a.id.localeCompare(b.id))
+        .slice(cursor, cursor + limit).map(memory => this.deps.repos.memories.toListItem(memory));
+    }
     return {
       sessionId: input.sessionId ?? scopedEpisode?.sessionId,
       episodeId: input.episodeId,

@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -195,7 +196,7 @@ describe("MemoryService / evolution / orchestration", () => {
       adapterId: "test-adapter",
       requestId: "skill-use-1",
       sessionId: trialSession.sessionId,
-      episodeId: trialTurn.episodeId,
+      episodeId: assignedEpisodeId(service, trialTurn),
       rawTurnId: trialTurn.rawTurnId,
       turnId: trialTurn.turnId
     }));
@@ -203,7 +204,7 @@ describe("MemoryService / evolution / orchestration", () => {
       adapterId: "test-adapter",
       requestId: "skill-use-1",
       sessionId: trialSession.sessionId,
-      episodeId: trialTurn.episodeId,
+      episodeId: assignedEpisodeId(service, trialTurn),
       rawTurnId: trialTurn.rawTurnId,
       turnId: trialTurn.turnId
     }));
@@ -213,7 +214,7 @@ describe("MemoryService / evolution / orchestration", () => {
       adapterId: "test-adapter",
       requestId: "skill-use-2",
       sessionId: trialSession.sessionId,
-      episodeId: trialTurn.episodeId,
+      episodeId: assignedEpisodeId(service, trialTurn),
       rawTurnId: trialTurn.rawTurnId,
       turnId: trialTurn.turnId
     }));
@@ -225,7 +226,7 @@ describe("MemoryService / evolution / orchestration", () => {
        WHERE skill_memory_id = ?
          AND episode_id = ?
          AND outcome = 'unknown'`
-    ).get(skillId, trialTurn.episodeId) as { count: number };
+    ).get(skillId, assignedEpisodeId(service, trialTurn)) as { count: number };
     expect(pendingTrialCount.count).toBe(1);
     const pendingTrial = db.db.prepare(
       `SELECT status, outcome, l1_memory_id
@@ -280,7 +281,7 @@ describe("MemoryService / evolution / orchestration", () => {
     });
     const skillFeedback = await service.feedback({
       sessionId: trialSession.sessionId,
-      episodeId: trialTurn.episodeId,
+      episodeId: assignedEpisodeId(service, trialTurn),
       rawTurnId: trialTurn.rawTurnId,
       channel: "explicit",
       polarity: "positive",
@@ -298,7 +299,7 @@ describe("MemoryService / evolution / orchestration", () => {
       target_memory_id: string | null;
       payload_json: string;
     };
-    expect(trialResolveJobRow.episode_id).toBe(trialTurn.episodeId);
+    expect(trialResolveJobRow.episode_id).toBe(assignedEpisodeId(service, trialTurn));
     expect(trialResolveJobRow.target_memory_id).toBeNull();
     expect(JSON.parse(trialResolveJobRow.payload_json)).toMatchObject({
       trialId: trial.trialId,
@@ -404,7 +405,7 @@ describe("MemoryService / evolution / orchestration", () => {
       {
         trialId: trial.trialId,
         status: "pass",
-        episodeId: trialTurn.episodeId,
+        episodeId: assignedEpisodeId(service, trialTurn),
         reward: undefined
       }
     ]));
@@ -531,7 +532,7 @@ describe("MemoryService / evolution / orchestration", () => {
       appId: "workspace-l2-activation",
       profileId: "jiang",
       sourceTraceId: first.l1MemoryId,
-      sourceEpisodeId: first.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, first)
     });
     const second = (await service.completeTurn("turn-l2-activation-2", {
       sessionId: session.sessionId,
@@ -560,7 +561,7 @@ describe("MemoryService / evolution / orchestration", () => {
     service.closeSession(session.sessionId);
     db.db.prepare(
       `UPDATE evolution_jobs SET status = 'succeeded' WHERE episode_id = ?`
-    ).run(first.episodeId);
+    ).run(assignedEpisodeId(service, first));
     await service.runWorkerOnce(20);
     await service.runWorkerOnce(20);
     await service.runWorkerOnce(20);
@@ -656,7 +657,7 @@ describe("MemoryService / evolution / orchestration", () => {
       appId: "workspace-shared",
       profileId: "profile-a",
       sourceTraceId: completeA.l1MemoryId,
-      sourceEpisodeId: completeA.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, completeA)
     });
     insertActivePolicyMemory(db, {
       id: "policy_downstream_profile_b",
@@ -666,7 +667,7 @@ describe("MemoryService / evolution / orchestration", () => {
       appId: "workspace-shared",
       profileId: "profile-b",
       sourceTraceId: completeB.l1MemoryId,
-      sourceEpisodeId: completeB.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, completeB)
     });
     db.db.prepare(`UPDATE evolution_jobs SET status = 'succeeded'`).run();
     db.db.prepare(
@@ -680,14 +681,14 @@ describe("MemoryService / evolution / orchestration", () => {
       "job_l3_downstream_profile_a",
       "shared-downstream-user",
       profileA.sessionId,
-      completeA.episodeId,
+      assignedEpisodeId(service, completeA),
       "policy_downstream_profile_a",
       at,
       at,
       "job_skill_downstream_profile_a",
       "shared-downstream-user",
       profileA.sessionId,
-      completeA.episodeId,
+      assignedEpisodeId(service, completeA),
       completeA.l1MemoryId,
       at,
       at

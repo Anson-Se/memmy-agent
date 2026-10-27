@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { localCalendarDate } from "@memmy/agent-source-core";
 import { DEFAULT_MEMMY_CONFIG } from "../../../src/config/index.js";
@@ -224,7 +225,7 @@ describe("MemoryService / worker / runtime", () => {
         id, job_type, status, user_id, session_id, episode_id, target_memory_id,
         payload_json, attempts, max_attempts, leased_until, last_error, created_at, updated_at
       ) VALUES (?, 'reflection', 'leased', ?, ?, ?, ?, '{}', 1, 3, ?, NULL, ?, ?)`
-    ).run(jobId, "user-expired-job", session.sessionId, complete.episodeId, complete.l1MemoryId, old, old, old);
+    ).run(jobId, "user-expired-job", session.sessionId, assignedEpisodeId(service, complete), complete.l1MemoryId, old, old, old);
 
     const run = await service.runWorkerOnce(10);
     expect(run.jobs).toEqual(expect.arrayContaining([

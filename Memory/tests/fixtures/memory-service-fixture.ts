@@ -493,3 +493,29 @@ export function withTurnJudgeKeys(
     user: answer.user
   };
 }
+
+/** Read the completed background assignment, never the acceptance response's pending ID. */
+export function assignedEpisodeId(service: MemoryService, turn: { sessionId: string; rawTurnId: string }): string {
+  const raw = service.timeline({ sessionId: turn.sessionId, limit: 1000 }).rawTurns?.find(row => row.rawTurnId === turn.rawTurnId);
+  if (!raw?.episodeId) throw new Error(`turn ${turn.rawTurnId} is still awaiting Episode assignment; run its background jobs first`);
+  return raw.episodeId;
+}
+
+export async function settleCaptureWork(service: MemoryService, maxRounds = 50): Promise<void> {
+  for (let round = 0; round < maxRounds; round++) {
+    const run = await service.runWorkerOnce(100);
+    if (!run.leased) return;
+  }
+  throw new Error("capture work did not settle");
+}
+
+/** Wait only for capture assignments, leaving downstream reward/reflection assertions observable. */
+export async function settleCaptureAssignments(service: MemoryService): Promise<void> {
+  for (let round = 0; round < 50; round++) {
+    const pending = service.panelJobs({ limit: 1000 }).items.filter(j => j.jobType === "episode_finalize" && (j.status === "queued" || j.status === "leased"));
+    if (!pending.length) return;
+    const run = await service.runWorkerOnce(100, { priorityCohortOnly: true });
+    if (!run.leased) throw new Error("capture assignment is blocked");
+  }
+  throw new Error("capture assignments did not finish");
+}

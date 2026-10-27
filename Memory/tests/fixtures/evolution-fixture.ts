@@ -365,7 +365,7 @@ export function insertWorldModelMemoryForTest(db: MemoryDb, input: {
 export async function addPositiveFeedbackForTurn(
   service: MemoryService,
   sessionId: string,
-  turn: { episodeId: string; l1MemoryId: string }
+  turn: { episodeId?: string; l1MemoryId: string }
 ): Promise<void> {
   await service.feedback({
     sessionId,

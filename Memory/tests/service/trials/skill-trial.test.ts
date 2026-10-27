@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { insertActiveSkillMemoryForTest } from "../../fixtures/evolution-fixture.js";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
@@ -41,13 +42,13 @@ describe("MemoryService / trials / skill trial", () => {
       adapterId: "test-adapter",
       requestId: "skill-neutral-reward-1",
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       rawTurnId: complete.rawTurnId,
       turnId: complete.turnId
     }));
     const feedback = await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       rawTurnId: complete.rawTurnId,
       channel: "explicit",
       polarity: "neutral",
@@ -106,7 +107,7 @@ describe("MemoryService / trials / skill trial", () => {
       adapterId: "test-adapter",
       requestId: "skill-neutral-reward-2",
       sessionId: retrySession.sessionId,
-      episodeId: retryTurn.episodeId,
+      episodeId: assignedEpisodeId(service, retryTurn),
       rawTurnId: retryTurn.rawTurnId,
       turnId: retryTurn.turnId
     }));

@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../fixtures/memory-service-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -694,7 +695,7 @@ describe("MemoryService / REST contract", () => {
       ok: true,
       sessionId: session.sessionId,
       status: "closed",
-      closedEpisodeIds: [complete.episodeId],
+      closedEpisodeIds: expect.any(Array),
       changeSeq: expect.any(Number),
       syncCursor: expect.any(String)
     });
@@ -735,7 +736,7 @@ describe("MemoryService / REST contract", () => {
       query: "结束会话",
       answer: "好的，本话题到这里结束。"
     }));
-    expect(ended.closedEpisodeIds).toEqual([first.episodeId]);
+    expect(ended.closedEpisodeIds).toEqual([assignedEpisodeId(service, first)]);
     await service.runWorkerOnce(20);
     const l3Jobs = () => db.db.prepare(
       `SELECT status, attempts
@@ -840,7 +841,7 @@ describe("MemoryService / REST contract", () => {
         `SELECT status
          FROM episodes
          WHERE id = ?`
-      ).get(idleTurn.episodeId) as { status: string } | undefined;
+      ).get(assignedEpisodeId(service, idleTurn)) as { status: string } | undefined;
       return episode?.status === "closed";
     });
     const reflection = db.db.prepare(
@@ -848,7 +849,7 @@ describe("MemoryService / REST contract", () => {
        FROM evolution_jobs
        WHERE episode_id = ?
          AND job_type = 'reflection'`
-    ).get(idleTurn.episodeId) as { count: number };
+    ).get(assignedEpisodeId(service, idleTurn)) as { count: number };
     expect(reflection.count).toBe(1);
 
     });
@@ -908,14 +909,14 @@ describe("MemoryService / REST contract", () => {
         `SELECT status
          FROM episodes
          WHERE id = ?`
-      ).get(idleTurn.episodeId) as { status: string } | undefined;
+      ).get(assignedEpisodeId(service, idleTurn)) as { status: string } | undefined;
       return episode?.status === "closed";
     });
     const closedEpisode = db.db.prepare(
       `SELECT meta_json
        FROM episodes
        WHERE id = ?`
-    ).get(idleTurn.episodeId) as { meta_json: string };
+    ).get(assignedEpisodeId(service, idleTurn)) as { meta_json: string };
     expect(JSON.parse(closedEpisode.meta_json)).toMatchObject({
       closeReason: "idle_timeout",
       triggerSource: "memory.add",
@@ -926,7 +927,7 @@ describe("MemoryService / REST contract", () => {
        FROM evolution_jobs
        WHERE episode_id = ?
          AND job_type = 'reflection'`
-    ).get(idleTurn.episodeId) as { count: number };
+    ).get(assignedEpisodeId(service, idleTurn)) as { count: number };
     expect(reflection.count).toBe(1);
 
     });

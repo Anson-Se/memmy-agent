@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMemoryServiceFixture,
@@ -59,18 +60,18 @@ describe("MemoryService / session / idle sweep", () => {
       `SELECT id, status, meta_json
        FROM episodes
        WHERE id IN (?, ?)`
-    ).all(idleTurn.episodeId, triggerTurn.episodeId) as Array<{
+    ).all(assignedEpisodeId(service, idleTurn), assignedEpisodeId(service, triggerTurn)) as Array<{
       id: string;
       status: string;
       meta_json: string;
     }>;
-    const closedIdleEpisode = episodes.find((episode) => episode.id === idleTurn.episodeId);
-    const currentEpisode = episodes.find((episode) => episode.id === triggerTurn.episodeId);
+    const closedIdleEpisode = episodes.find((episode) => episode.id === assignedEpisodeId(service, idleTurn));
+    const currentEpisode = episodes.find((episode) => episode.id === assignedEpisodeId(service, triggerTurn));
     expect(closedIdleEpisode?.status).toBe("closed");
     expect(JSON.parse(closedIdleEpisode!.meta_json)).toMatchObject({
       closeReason: "idle_timeout",
       closedBy: "worker.episode_idle_close",
-      triggerEpisodeId: triggerTurn.episodeId
+      triggerEpisodeId: assignedEpisodeId(service, triggerTurn)
     });
     expect(currentEpisode?.status).toBe("open");
 
@@ -79,7 +80,7 @@ describe("MemoryService / session / idle sweep", () => {
        FROM evolution_jobs
        WHERE episode_id = ?
          AND job_type = 'reflection'`
-    ).get(idleTurn.episodeId) as { status: string; payload_json: string } | undefined;
+    ).get(assignedEpisodeId(service, idleTurn)) as { status: string; payload_json: string } | undefined;
     expect(reflection?.status).toBe("queued");
     expect(JSON.parse(reflection!.payload_json)).toMatchObject({
       trigger: "idle_timeout",
@@ -93,7 +94,7 @@ describe("MemoryService / session / idle sweep", () => {
          AND change_type = 'episode_closed'
        ORDER BY seq DESC
        LIMIT 1`
-    ).get(idleTurn.episodeId) as { change_type: string; source: string } | undefined;
+    ).get(assignedEpisodeId(service, idleTurn)) as { change_type: string; source: string } | undefined;
     expect(change).toEqual({
       change_type: "episode_closed",
       source: "worker.episode_idle_close"
@@ -140,7 +141,7 @@ describe("MemoryService / session / idle sweep", () => {
       `SELECT status
        FROM episodes
        WHERE id = ?`
-    ).get(recentTurn.episodeId) as { status: string };
+    ).get(assignedEpisodeId(service, recentTurn)) as { status: string };
     expect(recentEpisode.status).toBe("open");
     db.close();
   });
@@ -186,7 +187,7 @@ describe("MemoryService / session / idle sweep", () => {
       `SELECT status
        FROM episodes
        WHERE id = ?`
-    ).get(idleTurn.episodeId) as { status: string };
+    ).get(assignedEpisodeId(service, idleTurn)) as { status: string };
     expect(closedEpisode.status).toBe("closed");
     db.close();
   });
@@ -215,12 +216,12 @@ describe("MemoryService / session / idle sweep", () => {
       query: "Run a long deployment verification",
       answer: "The long deployment verification completed."
     }));
-    expect(completed.episodeId).toMatch(/^episode_/u);
+    expect(assignedEpisodeId(service, completed)).toMatch(/^episode_/u);
     db.db.prepare(
       `UPDATE episodes
        SET updated_at = ?
        WHERE id = ?`
-    ).run(new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), completed.episodeId);
+    ).run(new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), assignedEpisodeId(service, completed));
 
     const triggerSession = service.openSession({
       namespace: {
@@ -241,7 +242,7 @@ describe("MemoryService / session / idle sweep", () => {
       `SELECT status
        FROM episodes
        WHERE id = ?`
-    ).get(completed.episodeId) as { status: string };
+    ).get(assignedEpisodeId(service, completed)) as { status: string };
     expect(episode.status).toBe("open");
     db.close();
   });
@@ -342,7 +343,7 @@ describe("MemoryService / session / idle sweep", () => {
        FROM evolution_jobs
        WHERE job_type = 'episode_idle_close'
          AND episode_id = ?`
-    ).get(first.episodeId) as { count: number };
+    ).get(assignedEpisodeId(service, first)) as { count: number };
     expect(idleCloseJobs.count).toBe(1);
     db.close();
   });

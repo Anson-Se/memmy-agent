@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type MemoryRow } from "../../../src/index.js";
 import { PanelItemsOutputSchema } from "../../../src/contracts/memory-runtime.js";
@@ -514,15 +515,18 @@ describe("MemoryService / read model / panel", () => {
       answer: "task answer"
     }));
 
+    await settleCaptureAssignments(service);
     expect(service.panelTasks({ namespace, q: "conversation", page: 99 })).toMatchObject({
-      tasks: [{ id: completed.episodeId, memoryIds: [completed.l1MemoryId] }],
+      tasks: [{ id: assignedEpisodeId(service, completed), memoryIds: [completed.l1MemoryId] }],
       page: 1,
       total: 1,
       totalPages: 1
     });
-    expect(service.deletePanelTask(completed.episodeId, { namespace })).toMatchObject({
+    await settleCaptureAssignments(service);
+    const taskId = assignedEpisodeId(service, completed);
+    expect(service.deletePanelTask(taskId, { namespace })).toMatchObject({
       ok: true,
-      id: completed.episodeId,
+      id: taskId,
       deletedMemoryIds: [completed.l1MemoryId]
     });
     expect(service.panelTasks({ namespace, page: 1 })).toMatchObject({ tasks: [], total: 0, page: 1 });
@@ -772,8 +776,9 @@ describe("MemoryService / read model / panel", () => {
     expect(detail.item.tags).toContain("摘要总结中");
     expect(detail.item.tags).not.toContain("openclaw");
     expect(detail.item.metadata.source).toBe("openclaw");
-    expect(detail.refs.episode).toMatchObject({
-      id: complete.episodeId,
+    await settleCaptureAssignments(service);
+    expect(service.getMemory(complete.l1MemoryId, { namespace }).refs.episode).toMatchObject({
+      id: assignedEpisodeId(service, complete),
       sessionId: session.sessionId,
       status: "open"
     });

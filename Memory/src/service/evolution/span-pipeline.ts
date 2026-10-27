@@ -94,6 +94,7 @@ export class SpanPipeline {
     if (!memory || memory.memoryLayer !== "L1" || memory.status !== "activated") {
       return;
     }
+    if (this.deps.repos.runtime.isRawTurnAttributionPending(rawTurnIdFromMemory(memory))) return;
     const trace = this.deps.traceMeta(memory);
     if (!trace || traceReflectionWasScored(memory)) {
       return;

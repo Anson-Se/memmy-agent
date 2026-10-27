@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryServiceFixture } from "../../fixtures/memory-service-fixture.js";
 
@@ -74,7 +75,7 @@ describe("MemoryService / read model / panel Agent filter", () => {
     }).items.map((item) => item.id)).toEqual(completed.userMemoryIds);
 
     expect(service.panelTasks({ namespace, sourceAgent: "memmy-agent" }).tasks.map((task) => task.id))
-      .toEqual([completed.episodeId]);
+      .toEqual([assignedEpisodeId(service, completed)]);
     db.close();
   });
 });

@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -227,7 +228,7 @@ describe("MemoryService / evolution / policy induction", () => {
       appId: "workspace-best-l2",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     insertActivePolicyMemory(db, {
       id: "policy_weaker_l2_association",
@@ -237,7 +238,7 @@ describe("MemoryService / evolution / policy induction", () => {
       appId: "workspace-best-l2",
       profileId: "jiang",
       sourceTraceId: complete.l1MemoryId,
-      sourceEpisodeId: complete.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, complete)
     });
     setPolicySignatureAndVectorForTest(db, "policy_best_l2_association", signature, [1, 0, 0]);
     setPolicySignatureAndVectorForTest(db, "policy_weaker_l2_association", signature, [0, 1, 0]);
@@ -260,7 +261,7 @@ describe("MemoryService / evolution / policy induction", () => {
       "job_best_l2_association",
       "user-best-l2-association",
       session.sessionId,
-      complete.episodeId,
+      assignedEpisodeId(service, complete),
       complete.l1MemoryId,
       associationAt,
       associationAt
@@ -327,7 +328,7 @@ describe("MemoryService / evolution / policy induction", () => {
         { name: "pytest", input: "pytest tests/b.py", output: "failed with EXIT_1", errorCode: "E_EXIT_1", success: false }
       ]
     }));
-    expect(completeB.episodeId).toBe(completeA.episodeId);
+    expect(assignedEpisodeId(service, completeB)).toBe(assignedEpisodeId(service, completeA));
     const evidenceIds = [completeA.l1MemoryId, completeB.l1MemoryId];
     expect(evidenceIds).toHaveLength(2);
     for (const id of evidenceIds) {
@@ -341,7 +342,7 @@ describe("MemoryService / evolution / policy induction", () => {
       appId: "workspace-l2-support",
       profileId: "jiang",
       sourceTraceId: evidenceIds[0]!,
-      sourceEpisodeId: completeA.episodeId
+      sourceEpisodeId: assignedEpisodeId(service, completeA)
     });
     setPolicySignatureAndVectorForTest(db, "policy_l2_support_traces", traceSignatureForTest(db, evidenceIds[0]!), [1, 0, 0]);
     setPolicyStatsForTest(db, "policy_l2_support_traces", {
@@ -370,7 +371,7 @@ describe("MemoryService / evolution / policy induction", () => {
       "job_l2_support_trace_count",
       "user-l2-support-traces",
       session.sessionId,
-      completeA.episodeId,
+      assignedEpisodeId(service, completeA),
       evidenceIds[0],
       at,
       at
@@ -902,7 +903,7 @@ describe("MemoryService / evolution / policy induction", () => {
         { name: "pytest", input: "pytest tests/b.py", output: "failed with EXIT_1", errorCode: "E_EXIT_1", success: false }
       ]
     }));
-    expect(completeB.episodeId).toBe(completeA.episodeId);
+    expect(assignedEpisodeId(service, completeB)).toBe(assignedEpisodeId(service, completeA));
     const evidenceIds = [completeA.l1MemoryId, completeB.l1MemoryId];
     expect(evidenceIds).toHaveLength(2);
     const signature = "pytest|python|pytest|EXIT_1";
@@ -939,7 +940,7 @@ describe("MemoryService / evolution / policy induction", () => {
       "job_l2_support_subset",
       "user-l2-support-subset",
       session.sessionId,
-      completeA.episodeId,
+      assignedEpisodeId(service, completeA),
       evidenceIds[0],
       at,
       at

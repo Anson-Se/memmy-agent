@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_MEMMY_CONFIG, type LlmClient, type MemoryDb, type MemoryService } from "../../src/index.js";
 import {
@@ -72,7 +73,7 @@ async function completeOneTurn(service: MemoryService, key = "episode-title"): P
     answer: FIRST_ASSISTANT_TEXT,
     status: "succeeded"
   }));
-  return { episodeId: completed.episodeId, l1MemoryIds: completed.l1MemoryIds };
+  return { episodeId: assignedEpisodeId(service, completed), l1MemoryIds: completed.l1MemoryIds };
 }
 
 function createTitleService(db: MemoryDb, llm: LlmClient, options: {
@@ -160,10 +161,10 @@ describe("episode title generation", () => {
     }));
     const { llm, calls } = respondWith("核对检索注入边界", "确认注入记忆不参与命名。");
     const { repos, titleService } = createTitleService(db, llm);
-    expect(later.episodeId).not.toBe(earlier.episodeId);
+    expect(assignedEpisodeId(service, later)).not.toBe(earlier.episodeId);
     expect(repos.runtime.getRawTurn(later.rawTurnId)!.sourceMemoryIds).toEqual(earlier.l1MemoryIds);
 
-    await titleService.generate(titleJob(later.episodeId, "provisional"));
+    await titleService.generate(titleJob(assignedEpisodeId(service, later), "provisional"));
 
     const sent = calls[0]!.input;
     expect(sent).toContain("检索注入");
@@ -185,7 +186,7 @@ describe("episode title generation", () => {
     const { llm, calls } = respondWith("架构判断改为运行时读取", "摘要");
     const { titleService } = createTitleService(db, llm);
 
-    await titleService.generate(titleJob(completed.episodeId, "provisional"));
+    await titleService.generate(titleJob(assignedEpisodeId(service, completed), "provisional"));
 
     const sent = calls[0]!.input;
     expect(sent).toContain("process.arch");
@@ -329,16 +330,16 @@ describe("episode title generation", () => {
         query: "再顺手把 x64 的构建也验证一遍。",
         answer: "x64 构建同样通过，两种架构都已确认。",
         status: "succeeded",
-        episodeId: first.episodeId
+        episodeId: assignedEpisodeId(service, first)
       }));
       return JSON.stringify({ title: "过期标题", summary: "只覆盖了第一轮的结论。" });
     });
     const { repos, titleService } = createTitleService(db, slowLlm);
 
-    await expect(titleService.generate(titleJob(first.episodeId, "final")))
+    await expect(titleService.generate(titleJob(assignedEpisodeId(service, first), "final")))
       .rejects.toThrow(/input changed during generation/u);
 
-    expect(repos.runtime.getEpisode(first.episodeId)!.title).toBeUndefined();
+    expect(repos.runtime.getEpisode(assignedEpisodeId(service, first))!.title).toBeUndefined();
   });
 
   it("keeps the real ending of an episode longer than the input window", async () => {
@@ -353,7 +354,7 @@ describe("episode title generation", () => {
         status: "succeeded",
         ...(episodeId ? { episodeId } : {})
       }));
-      episodeId = completed.episodeId;
+      episodeId = assignedEpisodeId(service, completed);
     }
     const { llm, calls } = respondWith("长任务标题", "长任务摘要");
     const { repos, titleService } = createTitleService(db, llm);
@@ -379,7 +380,7 @@ describe("episode title generation", () => {
       sessionId: opened.sessionId, query: FIRST_USER_TEXT, answer: FIRST_ASSISTANT_TEXT, status: "succeeded"
     }));
     const repos = new Repositories(db.db);
-    repos.runtime.updateEpisodeTitle(completed.episodeId, {
+    repos.runtime.updateEpisodeTitle(assignedEpisodeId(service, completed), {
       title: "已生成的终版标题",
       summary: "已生成的终版摘要",
       meta: {
@@ -387,7 +388,7 @@ describe("episode title generation", () => {
           stage: "final",
           generatedAt: "2026-02-02T03:04:05.000Z",
           model: "episode-title-test",
-          sourceTurnCount: repos.runtime.countRawTurnsByEpisode(completed.episodeId),
+          sourceTurnCount: repos.runtime.countRawTurnsByEpisode(assignedEpisodeId(service, completed)),
           sourceHash: "hash"
         }
       }
@@ -486,13 +487,13 @@ describe("episode title generation", () => {
     }));
     service.closeSession(opened.sessionId, {});
     await service.runWorkerOnce(20);
-    const waiting = service.panelTasks({}).tasks.find((task) => task.id === completed.episodeId);
+    const waiting = service.panelTasks({}).tasks.find((task) => task.id === assignedEpisodeId(service, completed));
     expect(waiting?.episode.titlePending).toBe(true);
     expect(waiting?.episode.title ?? "").toBe("");
 
     configured = true;
     await service.runWorkerOnce(20);
-    const ready = service.panelTasks({}).tasks.find((task) => task.id === completed.episodeId);
+    const ready = service.panelTasks({}).tasks.find((task) => task.id === assignedEpisodeId(service, completed));
     expect(ready?.episode.title).toBe("恢复后的标题");
     expect(ready?.episode.summary).toBe("恢复后的摘要");
     expect(ready?.episode.titlePending).toBe(false);

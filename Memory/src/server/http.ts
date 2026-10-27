@@ -1174,6 +1174,7 @@ function publicCompleteTurnResponse(result: unknown): Record<string, unknown> {
     turnId: record.turnId,
     sessionId: record.sessionId,
     episodeId: record.episodeId,
+    assignmentStatus: record.assignmentStatus,
     rawTurnId: record.rawTurnId,
     userMemoryId: record.userMemoryId,
     userMemoryIds: record.userMemoryIds,

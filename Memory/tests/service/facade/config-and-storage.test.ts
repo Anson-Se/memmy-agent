@@ -1,3 +1,4 @@
+import { assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -103,7 +104,7 @@ describe("MemoryService / facade / config and storage", () => {
       "status",
       "l1_memory_id"
     ]));
-    expect(skillTrialColumns.find((column) => column.name === "episode_id")?.notnull).toBe(1);
+    expect(skillTrialColumns.find((column) => column.name === "episode_id")?.notnull).toBe(0);
     const recallColumns = db.db.prepare(`PRAGMA table_info(recall_events)`).all() as Array<{ name: string }>;
     expect(recallColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
       "namespace_id",
@@ -325,7 +326,7 @@ describe("MemoryService / facade / config and storage", () => {
     });
 
     expect(complete.l1MemoryId).toMatch(/^trace_[a-f0-9]{20}$/);
-    expect(complete.episodeId).toMatch(/^episode_[a-f0-9]{20}$/);
+    expect(assignedEpisodeId(service, complete)).toMatch(/^episode_[a-f0-9]{20}$/);
     expect(policy.id).toMatch(/^policy_[a-f0-9]{20}$/);
     expect(world.id).toMatch(/^world_[a-f0-9]{20}$/);
     expect(skill.id).toMatch(/^skill_[a-f0-9]{20}$/);

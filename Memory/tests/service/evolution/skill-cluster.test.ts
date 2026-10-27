@@ -1,3 +1,4 @@
+import { assignedEpisodeId, settleCaptureAssignments } from "../../fixtures/memory-service-fixture.js";
 import { LEGACY_TEST_CONFIG } from "../../fixtures/memory-service-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { type LlmClient } from "../../../src/index.js";
@@ -123,8 +124,8 @@ async function runDirectSkillEpisode(input: {
   const repos = new Repositories(db.db);
   const at = new Date().toISOString();
   db.db.prepare(`UPDATE episodes SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?`)
-    .run(at, at, complete.episodeId);
-  repos.runtime.updateEpisodeReward(complete.episodeId, {
+    .run(at, at, assignedEpisodeId(service, complete));
+  repos.runtime.updateEpisodeReward(assignedEpisodeId(service, complete), {
     rTask: input.rTask,
     rewardDetail: { source: "test" }
   }, at);
@@ -134,7 +135,7 @@ async function runDirectSkillEpisode(input: {
     status: "queued",
     userId: input.userId,
     sessionId: session.sessionId,
-    episodeId: complete.episodeId,
+    episodeId: assignedEpisodeId(service, complete),
     payload: { reason: "test" },
     attempts: 0,
     maxAttempts: 3,
@@ -253,9 +254,10 @@ describe("MemoryService / evolution / skill cluster", () => {
         success: true
       }]
     }));
+    await settleCaptureAssignments(service);
     await service.feedback({
       sessionId: session.sessionId,
-      episodeId: complete.episodeId,
+      episodeId: assignedEpisodeId(service, complete),
       l1MemoryId: complete.l1MemoryId,
       channel: "explicit",
       polarity: "positive",
@@ -277,7 +279,7 @@ describe("MemoryService / evolution / skill cluster", () => {
     ).all() as Array<{ job_type: string; status: string }>;
     const rewarded = db.db.prepare(
       `SELECT r_task FROM episodes WHERE id = ?`
-    ).get(complete.episodeId) as { r_task: number | null };
+    ).get(assignedEpisodeId(service, complete)) as { r_task: number | null };
     expect(rewarded.r_task).toBe(1);
     expect(jobs.map((job) => job.job_type)).toEqual([
       "skill_cluster_assign",
@@ -375,8 +377,8 @@ describe("MemoryService / evolution / skill cluster", () => {
     const repos = new Repositories(db.db);
     const at = new Date().toISOString();
     const pairs = [
-      { episodeId: first.episodeId, sessionId: firstSession.sessionId },
-      { episodeId: second.episodeId, sessionId: secondSession.sessionId }
+      { episodeId: assignedEpisodeId(service, first), sessionId: firstSession.sessionId },
+      { episodeId: assignedEpisodeId(service, second), sessionId: secondSession.sessionId }
     ];
     for (const [index, pair] of pairs.entries()) {
       db.db.prepare(`UPDATE episodes SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?`)
