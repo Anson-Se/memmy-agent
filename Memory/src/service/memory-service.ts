@@ -60,11 +60,13 @@ import {
   type ChangeLogRecord,
   type EpisodeRecord,
   type EvolutionJobRecord,
+  type EmbeddingMaintenanceTask,
   type RawTurnRecord,
   type SessionRecord
 } from "../storage/repositories.js";
 import type { SerializedMemoryVector } from "../storage/sqlite-vec-store.js";
-import { memoryVector } from "../storage/memory-vector-state.js";
+import { memoryVectorEntries } from "../storage/memory-vector-state.js";
+import { embeddingTextForMemory, traceSummaryEmbeddingText } from "./embedding/embedding-pipeline.js";
 import type {
   FeedbackRequest,
   HealthResponse,
@@ -182,7 +184,7 @@ import {
   repairEvidenceValueDiff as sessionRepairEvidenceValueDiff
 } from "./session/session-turn-service.js";
 import { SkillTrialResolver } from "./trials/skill-trial-resolver.js";
-import { WorkMemoryPipeline } from "./work-memory/work-memory-pipeline.js";
+import { WorkMemoryPipeline, canonicalWorkMemoryText } from "./work-memory/work-memory-pipeline.js";
 import { ObservationMemoryPipeline } from "./evidence/observation-memory-pipeline.js";
 import { lookupExternalEvidence, lookupExternalEvidenceSkill, externalEvidenceSourceMatchesMemory, externalEvidenceNamespaceForMemory } from "./external-evidence-source.js";
 import { observationMemoryState, isObservationMemoryProcessed, OBSERVATION_SUMMARY_MODEL_UNCONFIGURED } from "./observation-memory-state.js";
@@ -3026,6 +3028,10 @@ export class MemoryService {
 
   private enqueueEmbeddingMaintenance(mode: "repair" | "rebuild", dimension: number) {
     const at = nowIso();
+    const userId = this.config.userId?.trim() || "local-user";
+    const outdatedVectors = mode === "repair"
+      ? this.currentEmbeddingMaintenanceState(userId, dimension).outdatedVectors
+      : new Set<string>();
     let offset = 0;
     let enqueued = 0;
     for (;;) {
@@ -3033,8 +3039,12 @@ export class MemoryService {
       for (const memory of memories) {
         if (memory.status === "deleted") continue;
         if (mode === "repair") {
-          const vector = memoryVector(memory, memory.memoryLayer === "L1" ? "vec_summary" : "vec");
-          if (vector && (dimension === 0 || vector.length === dimension)) continue;
+          const entry = memoryVectorEntries(memory).find(value =>
+            value.vectorField === (memory.memoryLayer === "L1" ? "vec_summary" : "vec"));
+          if (entry && entry.vector.length === dimension &&
+              entry.embeddingProvider === this.embedder.config.provider &&
+              entry.embeddingModel === (this.embedder.config.model ?? this.embedder.config.provider) &&
+              !outdatedVectors.has(`memory:${memory.id}`)) continue;
         }
         this.workerHandlers.enqueueEmbeddingRetry(memory, memory.memoryValue, at);
         enqueued += 1;
@@ -3042,7 +3052,6 @@ export class MemoryService {
       if (memories.length < 250) break;
       offset += memories.length;
     }
-    const userId = this.config.userId?.trim() || "local-user";
     offset = 0;
     for (;;) {
       const userMemories = this.repos.userMemories.listForPanel({
@@ -3053,7 +3062,9 @@ export class MemoryService {
       });
       for (const memory of userMemories) {
         if (mode === "repair" && memory.embedding?.length &&
-            (dimension === 0 || memory.embedding.length === dimension)) continue;
+            memory.embedding.length === dimension && memory.embeddingProvider === this.embedder.config.provider &&
+            memory.embeddingModel === this.embedder.config.model &&
+            !outdatedVectors.has(`user:${memory.id}`)) continue;
         this.workerHandlers.enqueueJob({
           jobType: "user_memory_embedding",
           userId: memory.userId,
@@ -3099,13 +3110,14 @@ export class MemoryService {
     const userId = this.config.userId?.trim() || "local-user";
     const regular = this.repos.vectors.maintenanceDimensionCounts();
     const user = this.repos.userMemories.embeddingDimensionCounts(userId);
-    const dimensions = new Map<number, number>();
-    for (const row of [...regular.dimensions, ...user.dimensions]) {
-      if (row.dimension > 0) dimensions.set(row.dimension, (dimensions.get(row.dimension) ?? 0) + row.count);
-    }
-    const stored = [...dimensions.values()].reduce((sum, count) => sum + count, 0);
+    const rows = [...regular.dimensions, ...user.dimensions].filter(row => row.dimension > 0);
+    const model = this.embedder.config;
+    const stored = rows.reduce((sum, row) => sum + row.count, 0);
     const totalSlots = regular.totalSlots + user.totalSlots;
-    const ready = dimension > 0 ? dimensions.get(dimension) ?? 0 : 0;
+    const maintenance = this.currentEmbeddingMaintenanceState(userId, dimension);
+    const ready = Math.max(0, rows.filter(row => row.dimension === dimension && row.provider === model.provider &&
+      row.model === (model.model ?? model.provider)).reduce((sum, row) => sum + row.count, 0)
+      - maintenance.outdatedVectors.size);
     const missing = Math.max(0, totalSlots - stored);
     const dimMismatch = Math.max(0, stored - ready);
     return {
@@ -3116,8 +3128,77 @@ export class MemoryService {
       missing,
       dimMismatch,
       needsRepair: missing + dimMismatch,
-      retryQueue: this.repos.runtime.embeddingMaintenanceQueueStats(userId)
+      retryQueue: maintenance.retryQueue
     };
+  }
+
+  private currentEmbeddingMaintenanceState(userId: string, dimension: number) {
+    // Only primary vectors that match the current model/dimension are included.
+    // Both the panel and repair enqueueing use this same set to reject old vectors
+    // while work for the current content remains unfinished.
+    const outdatedVectors = new Set<string>();
+    const memories = new Map<string, ReturnType<typeof this.repos.memories.get>>();
+    const userMemories = new Map<string, ReturnType<typeof this.repos.userMemories.get>>();
+    const model = this.embedder.config;
+    const isCurrentWork = (task: EmbeddingMaintenanceTask): boolean => {
+      const id = task.targetId;
+      // Pending, active and stale rows describe actual queue occupancy, even if
+      // their target was edited or deleted. Only historical failures are filtered.
+      const retainQueueRow = task.status !== "failed";
+      let primaryVector = true;
+      let vector: number[] | undefined;
+      let provider: string | null | undefined;
+      let embeddingModel: string | null | undefined;
+      let contentHash: string;
+      let sourceTexts: string[];
+      let vectorField = task.vectorField;
+      if (task.userMemory) {
+        if (!userMemories.has(id)) userMemories.set(id, this.repos.userMemories.get(id));
+        const memory = userMemories.get(id);
+        if (!memory || memory.status !== "active" || memory.deletedAt) return retainQueueRow;
+        contentHash = stableHash(memory.content);
+        vector = memory.embedding;
+        provider = memory.embeddingProvider;
+        embeddingModel = memory.embeddingModel;
+        sourceTexts = [memory.content];
+        vectorField = "vec";
+      } else {
+        if (!memories.has(id)) memories.set(id, this.repos.memories.get(id));
+        const memory = memories.get(id);
+        if (!memory || memory.status === "deleted" || memory.deletedAt) return retainQueueRow;
+        contentHash = memory.contentHash ?? stableHash(memory.memoryValue);
+        const primaryField = memory.memoryLayer === "L1" ? "vec_summary" : "vec";
+        vectorField ??= primaryField;
+        primaryVector = vectorField === primaryField;
+        const entry = memoryVectorEntries(memory).find(value => value.vectorField === vectorField);
+        vector = entry?.vector;
+        provider = entry?.embeddingProvider;
+        embeddingModel = entry?.embeddingModel;
+        sourceTexts = [memory.memoryValue, embeddingTextForMemory(memory), traceSummaryEmbeddingText(memory)]
+          .filter((text): text is string => text !== undefined);
+        if (kindFromMemory(memory) === "work_memory") {
+          const internal = memory.properties.internal_info;
+          sourceTexts.push(canonicalWorkMemoryText(
+            typeof internal.work_topic === "string" ? internal.work_topic : "Work requirements",
+            typeof internal.requirement === "string" ? internal.requirement : "",
+            typeof internal.reason === "string" ? internal.reason : ""
+          ));
+        }
+        if (task.sourceText && !sourceTexts.includes(task.sourceText)) return retainQueueRow;
+      }
+      if (task.contentHash && task.contentHash !== contentHash) return retainQueueRow;
+      // Merely retaining a vector does not prove current content was embedded.
+      if (dimension === 0 || vector?.length !== dimension ||
+          provider !== model.provider || embeddingModel !== (model.model ?? model.provider)) return true;
+      const completed = this.repos.runtime.hasSuccessfulEmbeddingWork({
+        targetId: id, userMemory: task.userMemory, vectorField,
+        contentHash, sourceTexts, since: task.updatedAt
+      });
+      if (!completed && primaryVector) outdatedVectors.add(`${task.userMemory ? "user" : "memory"}:${id}`);
+      return retainQueueRow || !completed;
+    };
+    const retryQueue = this.repos.runtime.embeddingMaintenanceQueueStats(userId, Date.now(), isCurrentWork);
+    return { retryQueue, outdatedVectors };
   }
 
   private currentEmbeddingDimension(): Promise<number> {

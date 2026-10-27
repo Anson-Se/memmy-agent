@@ -189,7 +189,7 @@ describe("v1.2.6 embedding retry reproduction", () => {
       };
       const withVector = index < 60
         ? updateMemoryVectorField(memory, "vec", [1, 0, 0], {
-          provider: "test", model: "test", updatedAt: "2026-10-01T00:00:00.000Z"
+          provider: "local", model: "capturing-test-embedding", updatedAt: "2026-10-01T00:00:00.000Z"
         })
         : memory;
       repos.memories.insert(withVector);

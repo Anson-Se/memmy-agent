@@ -752,7 +752,7 @@ function modelProviderLabel(
   return provider;
 }
 
-function EmbeddingMaintenancePanel() {
+export function EmbeddingMaintenancePanel() {
   const [stats, setStats] = useState<EmbeddingMaintenanceStats | null>(null);
   const [running, setRunning] = useState<"repair" | "rebuild" | null>(null);
   const [status, setStatus] = useState<{ kind: "ok" | "error" | "muted"; text: string } | null>(null);

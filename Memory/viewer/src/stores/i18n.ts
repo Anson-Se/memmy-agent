@@ -893,7 +893,7 @@ const en = {
     "Model ID: Xenova/all-MiniLM-L6-v2 · 384 dimensions · Inference runs on this device, and memory text is not sent to an external embedding API. The first test or use checks and prepares the model files.",
   "settings.embedding.maintenance.title": "Embedding maintenance",
   "settings.embedding.maintenance.stats":
-    "Ready {ready}/{total}; missing {missing}; dimension mismatch {mismatch}; current dim {dim}.",
+    "Ready {ready}/{total}; missing {missing}; dimension/model/content mismatch {mismatch}; current dim {dim}.",
   "settings.embedding.maintenance.queue":
     "Embedding tasks: pending {pending}; valid lease {active}; stale or unclaimed {stale}; failed {failed}.",
   "settings.embedding.maintenance.dimensionError": "Unable to check the current embedding dimension: {error}",
@@ -1855,7 +1855,7 @@ const zh: Record<TranslationKey, string> = {
     "模型 ID：Xenova/all-MiniLM-L6-v2 · 384 维 · 推理完全在本机进行，记忆文本不会发送到外部 Embedding API。首次测试或使用时会检查并准备模型文件。",
   "settings.embedding.maintenance.title": "向量维护",
   "settings.embedding.maintenance.stats":
-    "可用 {ready}/{total}；缺失 {missing}；维度不匹配 {mismatch}；当前维度 {dim}。",
+    "可用 {ready}/{total}；缺失 {missing}；维度、模型或内容不匹配 {mismatch}；当前维度 {dim}。",
   "settings.embedding.maintenance.queue":
     "向量任务队列：待处理 {pending}；租约有效 {active}；无主或租约失效 {stale}；失败 {failed}。",
   "settings.embedding.maintenance.dimensionError": "无法确认当前向量维度：{error}",
