@@ -52,6 +52,9 @@ export async function withWebDeadline<T>(seconds: number, parent: AbortSignal | 
     });
     return await Promise.race([run(controller.signal), aborted]);
   } finally {
+    // The operation owns its requests even when it returns before the deadline.
+    // Keep an existing timeout/user-cancellation reason intact.
+    controller.abort(new WebFailure("cancelled", "Web operation finished", "cleanup"));
     clearTimeout(timer);
     parent?.removeEventListener("abort", cancel);
     if (onAbort) controller.signal.removeEventListener("abort", onAbort);

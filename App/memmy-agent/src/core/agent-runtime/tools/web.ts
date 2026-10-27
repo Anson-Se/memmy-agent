@@ -783,10 +783,13 @@ export class WebFetchTool extends Tool {
     const [ok, err] = await validateUrlSafe(url);
     if (!ok) return JSON.stringify({ error: `URL validation failed: ${err}`, url });
 
+    let directFailure: WebFailure | undefined;
+    let preflight: Response | null = null;
     try {
       const [response, , redirectError] = await streamWithSafeRedirects(url, {
         "User-Agent": this.userAgent,
       }, signal);
+      preflight = response;
       if (redirectError) return JSON.stringify({ error: redirectError, url });
       if (!response) return JSON.stringify({ error: "Fetch failed", url });
       const contentType = response.headers.get("content-type") ?? "";
@@ -795,18 +798,23 @@ export class WebFetchTool extends Tool {
         const raw = new Uint8Array(await readWebBody<ArrayBuffer>(response, "arrayBuffer", signal));
         return buildImageContentBlocks(raw, contentType, url, `(Image fetched from: ${url})`);
       }
-      // Discard the preflight body before fetching readable content.
-      await response.body?.cancel().catch(() => {});
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
-      // Do not retry the same failing origin through readability after a network error.
-      throw error;
+      directFailure = webFailure(error);
+    } finally {
+      await preflight?.body?.cancel().catch(() => {});
     }
 
-    let result: any = null;
-    if (this.config.useJinaReader) result = await this.fetchJina(url, maxChars, context);
-    if (result == null) result = await this.fetchReadability(url, extractMode, maxChars, context);
-    return result;
+    signal?.throwIfAborted();
+    if (this.config.useJinaReader) {
+      const result = await this.fetchJina(url, maxChars, context);
+      if (result !== null) return result;
+    }
+    signal?.throwIfAborted();
+    // Reader uses a different origin. Its failure must not cause a second
+    // direct attempt when the preflight already proved direct access failed.
+    if (directFailure) throw directFailure;
+    return this.fetchReadability(url, extractMode, maxChars, context);
   }
 
   async fetchJina(
@@ -815,14 +823,15 @@ export class WebFetchTool extends Tool {
     context?: ToolExecutionContext,
   ): Promise<string | null> {
     const signal = context?.abortSignal ?? undefined;
+    let response: Response | null = null;
     try {
       const headers: Record<string, string> = {
         Accept: "application/json",
         "User-Agent": this.userAgent,
       };
       if (process.env.JINA_API_KEY) headers.Authorization = `Bearer ${process.env.JINA_API_KEY}`;
-      const response = await webRequest(`https://r.jina.ai/${url}`, { headers, signal });
-      if (response.status === 429) { await response.body?.cancel().catch(() => {}); return null; }
+      response = await webRequest(`https://r.jina.ai/${url}`, { headers, signal });
+      if (response.status === 429) return null;
       checkWebStatus(response);
       const data = (await responseJson(response, signal)).data ?? {};
       let text = String(data.content ?? "");
@@ -840,6 +849,8 @@ export class WebFetchTool extends Tool {
     } catch {
       if (signal?.aborted) throw signal.reason;
       return null;
+    } finally {
+      await response?.body?.cancel().catch(() => {});
     }
   }
 
@@ -850,10 +861,12 @@ export class WebFetchTool extends Tool {
     context?: ToolExecutionContext,
   ): Promise<any> {
     const signal = context?.abortSignal ?? undefined;
+    let response: Response | null = null;
     try {
-      const [response, redirectError] = await getWithSafeRedirects(url, {
+      const [fetchedResponse, redirectError] = await getWithSafeRedirects(url, {
         "User-Agent": this.userAgent,
       }, signal);
+      response = fetchedResponse;
       if (redirectError) return JSON.stringify({ error: redirectError, url });
       if (!response) return JSON.stringify({ error: "Fetch failed", url });
       checkWebStatus(response);
@@ -897,6 +910,8 @@ export class WebFetchTool extends Tool {
     } catch (err) {
       if (signal?.aborted) throw signal.reason;
       return formatWebFailure("web_fetch", err);
+    } finally {
+      await response?.body?.cancel().catch(() => {});
     }
   }
 
