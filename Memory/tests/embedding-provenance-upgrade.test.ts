@@ -1,3 +1,5 @@
+import { localCalendarDate } from "@memmy/agent-source-core";
+import { MEMORY_BYOK_BUDGET_KV_KEY } from "../src/service/memory-token-budget-ledger.js";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_MEMMY_CONFIG, type Embedder, type MemoryRow } from "../src/index.js";
@@ -5,7 +7,7 @@ import { createMemoryHttpServer, closeMemoryHttpServer } from "../src/server/htt
 import { rememberEmbeddingIdentity } from "../src/model/embedding-identity.js";
 import { Repositories } from "../src/storage/repositories.js";
 import { attachMemoryVector } from "../src/storage/memory-vector-state.js";
-import { createMemoryServiceFixture } from "./fixtures/memory-service-fixture.js";
+import { accountRuntimeConfig, byokRuntimeConfig, createMemoryServiceFixture } from "./fixtures/memory-service-fixture.js";
 
 const fixture = createMemoryServiceFixture();
 afterEach(() => fixture.cleanup());
@@ -286,4 +288,81 @@ describe("one-time upgrade repair", () => {
     expect(service.embeddingMaintenanceProgress()).toMatchObject({ updated: 1, done: true });
   });
 
+});
+
+describe("automatic provenance repair budget gates", () => {
+  function budgetSetup(kind: "local" | "account" | "byok", enabled = true) {
+    const texts: string[] = [];
+    const config = kind === "account" ? accountRuntimeConfig() : byokRuntimeConfig();
+    config.tokenBudget = { dailyLimitM: 1, totalLimitM: 500 };
+    config.algorithm = { ...config.algorithm, enableMemoryAdd: enabled };
+    if (kind === "local") config.embedding.mode = "local";
+    const model = embedder(texts);
+    Object.assign(model.config, config.embedding, identity, { extraBody: { dimensions: 3 } });
+    model.isRemote = () => kind !== "local";
+    model.status = () => ({ ...identity, configured: true, remote: kind !== "local" });
+    config.embedding = { ...model.config };
+    const result = fixture.createTestService({ config, embedder: model });
+    const repos = new Repositories(result.db.db);
+    repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
+      dailyUsed: 1_000_000, lifetimeUsed: 1_000_000, dailyDate: localCalendarDate()
+    });
+    repos.memories.insert(withVector(record("budget-action", "L1"), "vec_action", null));
+    repos.memories.insert(withVector(record("budget-feedback", "L2", true), "vec", null));
+    return { ...result, repos, model, config, texts };
+  }
+
+  it.each(["local", "account"] as const)("repairs historical vectors with %s embedding despite an exhausted BYOK budget", async kind => {
+    const { service, repos, texts } = budgetSetup(kind);
+    expect(service.isMemoryBudgetPaused()).toBe(true);
+    await service.runWorkerOnce();
+    expect(texts).toHaveLength(2);
+    expect(service.embeddingMaintenanceProgress()).toMatchObject({ updated: 2, done: true });
+    const query = rememberEmbeddingIdentity(vector(), identity);
+    expect(repos.memories.searchVectorIds(query, "vec_action").map(hit => hit.id)).toContain("budget-action");
+    expect(repos.memories.searchVectorIds(query, "vec").map(hit => hit.id)).toContain("budget-feedback");
+    await service.runWorkerOnce();
+    expect(texts).toHaveLength(2);
+  });
+
+  it("holds budgeted embedding until its budget recovers", async () => {
+    const { service, repos, texts } = budgetSetup("byok");
+    await service.runWorkerOnce();
+    expect(texts).toHaveLength(0);
+    expect(repos.runtime.getKv(key)).toBeUndefined();
+    repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, {
+      dailyUsed: 0, lifetimeUsed: 1_000_000, dailyDate: localCalendarDate()
+    });
+    await service.runWorkerOnce();
+    expect(texts).toHaveLength(2);
+    expect(service.embeddingMaintenanceProgress()).toMatchObject({ updated: 2, done: true });
+  });
+
+  it("keeps the local retry deadline after restart while the BYOK budget remains exhausted", async () => {
+    const { service, repos, model, db, config, root, texts } = budgetSetup("local");
+    model.status = () => ({ ...identity, configured: false, remote: false });
+    await service.runWorkerOnce();
+    const run = repos.runtime.getKv(key)?.value as any;
+    expect(run?.candidates).toHaveLength(2);
+    const due = Date.now() + 150;
+    repos.runtime.setKv(key, { ...run, nextAttemptAt: due });
+    model.status = () => ({ ...identity, configured: true, remote: false });
+    const restarted = fixture.createTestMemoryService({ db, config, embedder: model });
+    expect(restarted.nextWorkerRunAt()).toBe(due);
+    const server = createMemoryHttpServer({ service: restarted, configPath: join(root, "config.json"), workerStartupFallbackMs: 0 });
+    try {
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      await expect.poll(() => (repos.runtime.getKv(key)?.value as any)?.completedAt).toBeTruthy();
+      expect(texts).toHaveLength(2);
+    } finally { await closeMemoryHttpServer(server); }
+  });
+
+  it("does not start or schedule automatic repair when memory writes are disabled", async () => {
+    const { service, repos, texts } = budgetSetup("local", false);
+    await service.runWorkerOnce();
+    expect(texts).toHaveLength(0);
+    expect(repos.runtime.getKv(key)).toBeUndefined();
+    repos.runtime.setKv(key, { nextAttemptAt: Date.now() + 1000 });
+    expect(service.nextWorkerRunAt()).toBeUndefined();
+  });
 });

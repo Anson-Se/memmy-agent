@@ -783,6 +783,10 @@ export class MemoryService {
     return jobTypeConsumesMemoryBudget(jobType, this.budgetModelSources());
   }
 
+  private shouldDeferBudgetedEmbedding(): boolean {
+    return this.isMemoryBudgetPaused() && this.memoryBudgetJobConsumes("embedding");
+  }
+
   private shouldDeferBudgetedEvolutionLlm(): boolean {
     return this.isMemoryBudgetPaused() && this.memoryBudgetJobConsumes("decision_repair");
   }
@@ -3063,7 +3067,7 @@ export class MemoryService {
 
   nextWorkerRunAt(): number | undefined {
     const workerAt = this.workerRunner.nextWorkerRunAt();
-    const upgradeAt = this.config.algorithm.enableMemoryAdd && !this.isMemoryBudgetPaused()
+    const upgradeAt = this.config.algorithm.enableMemoryAdd && !this.shouldDeferBudgetedEmbedding()
       ? this.embeddingMaintenance().nextUpgradeAttemptAt() : undefined;
     const times = [workerAt, upgradeAt].filter((time): time is number => Number.isFinite(time));
     return times.length ? Math.min(...times) : undefined;
@@ -3097,7 +3101,7 @@ export class MemoryService {
     await this.ensureAppBudgetReconciled();
     // Run the bounded one-time provenance repair through the normal durable worker.
     // Respect explicit write/budget gates and scoped worker requests.
-    if (this.config.algorithm.enableMemoryAdd && !this.isMemoryBudgetPaused() && !request.targetMemoryIds) {
+    if (this.config.algorithm.enableMemoryAdd && !this.shouldDeferBudgetedEmbedding() && !request.targetMemoryIds) {
       this.embeddingUpgradeInFlight ??= this.withModelTaskContext(() => this.embeddingMaintenance().resumeUpgrade())
         .finally(() => { this.embeddingUpgradeInFlight = undefined; });
       await this.embeddingUpgradeInFlight;
