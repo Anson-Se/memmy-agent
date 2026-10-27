@@ -2,7 +2,9 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 import type { MemoryRow } from "../../../../../../../Memory/src/types.js";
-import type { PanelItemsOutput } from "@memmy/local-api-contracts";
+import type { GetMemoryOutput, PanelItemsOutput } from "@memmy/local-api-contracts";
+import { GetMemoryOutputSchema } from "@memmy/local-api-contracts";
+import { Window } from "happy-dom";
 import { Repositories } from "../../../../../../../Memory/src/storage/repositories.js";
 import { detailFromMemory } from "../../../../../../../Memory/src/service/read-model/memory.js";
 import { waitingSourceText } from "../../../../../../../Memory/src/service/read-model/display-fields.js";
@@ -16,6 +18,12 @@ const at = "2026-10-27T06:00:00.000Z";
 const context = '<in-app-browser-context source="ambient-ui-state">\n页面上下文\n</in-app-browser-context>';
 const request = "请修复扫描标题";
 
+function parseHTML(html: string) {
+  const document = new Window({ settings: { disableJavaScriptEvaluation: true } }).document.createElement("div");
+  document.innerHTML = html;
+  return { document };
+}
+
 function legacyMemory(body: string): MemoryRow {
   return {
     id: "trace_legacy_preview", timeline: at, userId: "review-user", agentId: "codex",
@@ -26,11 +34,11 @@ function legacyMemory(body: string): MemoryRow {
   };
 }
 
-function render(items: PanelItemsOutput["items"]): string {
+function render(items: PanelItemsOutput["items"], detail?: GetMemoryOutput): string {
   const noop = () => {};
   return renderToStaticMarkup(createElement(I18nProvider, { language: "zh-CN", children:
     createElement(MemoriesSubPageView, {
-      state: { status: "ready", detail: null, data: { items, page: 1, pageSize: 20, total: items.length, totalPages: 1, hasNext: false, hasPrev: false, serverTime: at } },
+      state: { status: "ready", detail: detail ? { status: "ready", data: detail } : null, data: { items, page: 1, pageSize: 20, total: items.length, totalPages: 1, hasNext: false, hasPrev: false, serverTime: at } },
       query: "", sourceAgent: "", onQueryChange: noop, onSourceAgentChange: noop,
       onSearch: noop, onPageChange: noop, onRefresh: noop, onOpenDetail: noop,
       onDeleteDetail: async () => {}, onCloseDetail: noop
@@ -39,6 +47,59 @@ function render(items: PanelItemsOutput["items"]): string {
 }
 
 describe("stored memory -> panel/detail -> rendered trace title", () => {
+  it.each([undefined, "trace"] as const)("shows a legacy body safely without manufacturing summary (kind %s)", (kind) => {
+    const { db, service } = createTestService();
+    const repos = new Repositories(db.db);
+    const body = '<pasted_content id="legacy">\n<script>alert("quoted")</script>\n<img src="https://example.com/private" onerror="alert(1)">\n</pasted_content>\n第一行请求\n第二行请求';
+    const row = legacyMemory(body);
+    row.properties.internal_info.memory_kind = kind;
+    repos.memories.insert(row);
+    const before = repos.memories.get(row.id)!;
+    const detail = GetMemoryOutputSchema.parse(service.getMemory(row.id));
+    expect(detail.item.summary).toBe("");
+    const { document } = parseHTML(render([], detail));
+    const drawer = document.querySelector('.memory-drawer__body')!;
+    const original = drawer.querySelector('.memory-detail-raw-body');
+    expect(original?.textContent).toBe(body);
+    expect(original?.children.length).toBe(0);
+    expect(repos.memories.get(row.id)).toEqual(before);
+  });
+
+  it("keeps structured turn rendering and empty-body handling without a duplicate raw body", () => {
+    const { db, service } = createTestService();
+    const added = service.addMemory({ adapterId: "agent-source:codex", source: "codex", layer: "L1", turnId: "structured-detail", content: `## user\n${request}\n## assistant\n完成。` });
+    const { document } = parseHTML(render([], GetMemoryOutputSchema.parse(service.getMemory(added.id))));
+    const drawer = document.querySelector('.memory-drawer__body')!;
+    expect(drawer.textContent).toContain(request);
+    expect(drawer.textContent).toContain("完成。");
+    expect(drawer.querySelector('.memory-detail-raw-body')).toBeNull();
+    const empty = legacyMemory(" \n\t");
+    new Repositories(db.db).memories.insert(empty);
+    const emptyHtml = render([], GetMemoryOutputSchema.parse(service.getMemory(empty.id)));
+    expect(emptyHtml).toContain("暂无本轮步骤");
+    expect(emptyHtml).not.toContain('memory-detail-raw-body');
+  });
+
+  it.each([
+    ["system_reminder", '<div title="<system_reminder>">引用</div>'],
+    ["system_reminder", '<div title="</system_reminder>">引用</div>'],
+    ["pasted_content", '<div title="<pasted_content>">引用</div>'],
+    ["pasted_content", '<!-- </pasted_content> -->引用']
+  ])("preserves imported role boundaries around tag text in %s payload: %s", (tag, payload) => {
+    const { db, service } = createTestService();
+    const input = `<${tag}>\n${payload}\n## assistant\n引用回复\n</${tag} id="261b">\n${request}`;
+    const added = service.addMemory({ adapterId: "agent-source:codex", source: "codex", layer: "L1", turnId: "quoted-tag-import", content: `## user\n${input}\n## assistant\n实际回复` });
+    expect(added.title).toBe(request);
+    const stored = new Repositories(db.db).memories.get(added.id)!;
+    const trace = stored.properties.internal_info.trace as Record<string, unknown>;
+    expect(trace.userText).toBe(input);
+    expect(trace.agentText).toBe("实际回复");
+    const item = service.panelItems({ layer: "L1" }).items[0]!;
+    expect(item.sourceText).toBe(request);
+    expect(render([item])).toContain(`class="memory-card__title">${request}`);
+    expect(service.getMemory(added.id).item.body).toContain(input);
+  });
+
   it.each([
     ["L1", "span", "span body"], ["L1", "work_memory", "work body"],
     ["L1", "observed_activity", "observation body"], ["L2", "policy", "policy body"],

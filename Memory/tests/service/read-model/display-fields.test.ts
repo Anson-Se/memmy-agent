@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MemoryRow } from "../../../src/types.js";
 import { displayFieldsForMemory, waitingSourceText } from "../../../src/service/read-model/display-fields.js";
-import { firstSemanticUserLine } from "../../../src/utils/text.js";
+import { firstSemanticUserLine, sourceEnvelopePrefixLength } from "../../../src/utils/text.js";
 
 const request = "请修复扫描后的记忆标题";
 const browser = '<in-app-browser-context source="ambient-ui-state">\n页面正文\n<user_query>页面内的引用</user_query>\n</in-app-browser-context>';
@@ -17,6 +17,35 @@ function memory(userText?: string, body = ""): MemoryRow {
 }
 
 describe("waiting memory previews", () => {
+  it.each([
+    '<div title="<system_reminder>">quoted</div>',
+    "<div title='</system_reminder>'>quoted</div>",
+    '<div title="a > b <system_reminder>" data-end="</system_reminder>">quoted</div>',
+    '<!-- <system_reminder> -->quoted',
+    '<!-- </system_reminder> -->quoted',
+    '<![CDATA[<system_reminder>quoted</system_reminder>]]>',
+    '<!DOCTYPE example "<system_reminder>">',
+    '<system_reminder note="</system_reminder>">nested</system_reminder>',
+    '<system_reminder />nested sibling',
+    'comparison: x < y and x > y'
+  ])("ignores quoted tag text while preserving real source nesting: %s", (payload) => {
+    const envelope = `<system_reminder>\n${payload}\n</system_reminder>`;
+    const input = `${envelope}\n${request}`;
+    expect(firstSemanticUserLine(input)).toBe(request);
+    expect(waitingSourceText(memory(input))).toBe(request);
+    expect(sourceEnvelopePrefixLength(input)).toBe(envelope.length);
+  });
+
+  it.each([
+    '<div title="unclosed <system_reminder>',
+    '<!-- unclosed </system_reminder>',
+    '<![CDATA[unclosed </system_reminder>'
+  ])("does not infer a source boundary inside an unfinished token: %s", (payload) => {
+    const input = `<system_reminder>\n${payload}\n</system_reminder>\n${request}`;
+    expect(firstSemanticUserLine(input)).toBe("");
+    expect(sourceEnvelopePrefixLength(input)).toBe(input.length);
+  });
+
   it.each([
     `<timestamp>Tuesday, Jun 16, 2026, 10:16 PM (UTC+8)</timestamp>\n${request}`,
     `${browser}\n${request}`,

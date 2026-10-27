@@ -967,6 +967,7 @@ function TraceMemoryDetail(props: {
     : detail.steps.flatMap((step) => step.toolCalls);
   const turnEvents = buildTraceTurnEvents(detail, toolCalls);
   const hasTurnSteps = turnEvents.length > 0;
+  const rawBody = !hasTurnSteps && props.item.body?.trim() ? props.item.body : undefined;
   // The read model owns summary validity and legacy field precedence. Raw trace
   // metadata may still contain a placeholder or an older copy of the summary.
   const summaryText = displayMemorySummaryText(props.item.summary, t, props.item.processing);
@@ -1000,11 +1001,13 @@ function TraceMemoryDetail(props: {
       </section>
 
       <section className="memory-detail-card">
-        <h5 className="memory-detail-card__label">{t("memory.memories.turnSteps")}</h5>
+        <h5 className="memory-detail-card__label">{t(rawBody ? "memory.memories.body" : "memory.memories.turnSteps")}</h5>
         {hasTurnSteps ? (
           <div className="memory-turn">
             {turnEvents.map((event) => <TraceTurnEventBlock key={event.key} event={event} />)}
           </div>
+        ) : rawBody ? (
+          <div className="memory-detail-text memory-detail-raw-body">{rawBody}</div>
         ) : (
           <MemoryStateBox message={t("memory.memories.noTurnSteps")} />
         )}

@@ -43,19 +43,43 @@ function leadingSourceBlock(value: string): SourceBlock | undefined {
   }
   const tag = opening[1]!.toLowerCase();
   if (/\/\s*>$/.test(opening[0])) return { start: opening[0].length, end: opening[0].length, contentEnd: opening[0].length, query: false };
-  const tokens = new RegExp(`<(/?)${tag}(?=[\\s/>])${TAG_ATTRIBUTES}`, "gi");
+  // Scan every markup token so a matching tag inside another tag's attribute
+  // or a comment cannot alter source nesting or the import role boundaries.
+  const tokens = /<!--|<!\[CDATA\[|<[!?]|<(\/?)([a-z][\w:-]*)(?=[\s/>])/gi;
   tokens.lastIndex = opening[0].length;
   let depth = 1;
-  let closing: RegExpExecArray | null;
-  while ((closing = tokens.exec(value))) {
-    if (closing[1]) depth -= 1;
-    else if (!/\/\s*>$/.test(closing[0])) depth += 1;
-    if (depth === 0) break;
+  let token: RegExpExecArray | null;
+  while ((token = tokens.exec(value))) {
+    const delimiter = token[0] === "<!--" ? "-->" : token[0].toUpperCase() === "<![CDATA[" ? "]]>" : undefined;
+    if (delimiter) {
+      const end = value.indexOf(delimiter, tokens.lastIndex);
+      if (end < 0) break;
+      tokens.lastIndex = end + delimiter.length;
+      continue;
+    }
+    let end = tokens.lastIndex;
+    let quote = "";
+    for (; end < value.length; end += 1) {
+      const char = value[end];
+      if (quote) {
+        if (char === quote) quote = "";
+      } else if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === ">") {
+        break;
+      }
+    }
+    if (end === value.length) break;
+    tokens.lastIndex = end + 1;
+    if (token[2]?.toLowerCase() !== tag) continue;
+    if (token[1]) depth -= 1;
+    else if (!/\/\s*>$/.test(value.slice(token.index, tokens.lastIndex))) depth += 1;
+    if (depth === 0) {
+      return { start: opening[0].length, contentEnd: token.index, end: tokens.lastIndex, query: tag === "user_query" };
+    }
   }
   // Missing closing boundaries must not expose payload as a user request.
-  return closing
-    ? { start: opening[0].length, contentEnd: closing.index, end: tokens.lastIndex, query: tag === "user_query" }
-    : { start: value.length, contentEnd: value.length, end: value.length, query: false };
+  return { start: value.length, contentEnd: value.length, end: value.length, query: false };
 }
 
 /** Protect role headings inside leading source blocks without changing raw text. */
