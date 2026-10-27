@@ -73,10 +73,10 @@ describe("Work Memory pipeline", () => {
     }));
   });
 
-  it("第一阶段只抽取 requirement/reason，第二阶段 create 时生成 topic 并写入 L1 Work Memory", async () => {
+  it.each(["codex", "claude-code"])("%s 创建的工作记忆保留会话来源并支持管理页 Agent 筛选", async (source) => {
     const { db, service } = createTestService();
     const namespace = {
-      source: "codex",
+      source,
       profileId: "default",
       sessionKey: "work-memory-create-session",
       userId: "work-memory-create-user"
@@ -98,7 +98,7 @@ describe("Work Memory pipeline", () => {
     service.l3WorldModelBoundary(opened.sessionId, {
       requestId: "work-memory-create-request",
       adapterId: "codex-memory",
-      source: "codex",
+      source,
       namespace: boundaryNamespace,
       trigger: "token_compaction",
       throughL1MemoryId: completed.l1MemoryId
@@ -132,9 +132,12 @@ describe("Work Memory pipeline", () => {
     }, 20);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
+      agentId: source,
+      appId: repos.runtime.getSession(opened.sessionId)?.workspaceId,
+      info: { source, project_id: opened.projectId },
       memoryLayer: "L1",
       memoryValue: canonicalWorkMemoryText("SFT training pipeline", "固定数据清洗流水线", "保证训练结果可复现"),
-      properties: { internal_info: expect.objectContaining({
+      properties: { info: { source, project_id: opened.projectId }, internal_info: expect.objectContaining({
         memory_kind: "work_memory",
         work_topic: "SFT training pipeline",
         requirement: "固定数据清洗流水线",
@@ -142,7 +145,14 @@ describe("Work Memory pipeline", () => {
         schema_version: 1
       }) }
     });
+    const panelItem = service.panelItems({ layer: "L1" }).items.find((item) => item.id === rows[0]!.id);
+    expect(panelItem?.metadata?.source).toBe(source);
+    const filtered = service.panelItems({ layer: "L1", sourceAgent: source });
+    expect(filtered.items.some((item) => item.id === rows[0]!.id)).toBe(true);
+    const otherSource = source === "codex" ? "claude-code" : "codex";
+    expect(service.panelItems({ layer: "L1", sourceAgent: otherSource }).items.some((item) => item.id === rows[0]!.id)).toBe(false);
     const detail = service.getMemory(rows[0]!.id, { namespace: boundaryNamespace });
+    expect(detail.item.metadata.source).toBe(source);
     expect("workMemory" in detail.item ? detail.item.workMemory : undefined).toEqual({
       workTopic: "SFT training pipeline",
       requirement: "固定数据清洗流水线",
@@ -157,7 +167,7 @@ describe("Work Memory pipeline", () => {
     expect(completeJson.mock.calls[1]?.[0]?.[1]?.content).toContain("## 待判断的新 Work Memory");
   });
 
-  it("merge 只更新召回到的旧行，并复用旧 Work Memory 的 topic", async () => {
+  it.each([false, true])("merge 保留旧工作记忆的内容标识和来源，已有明确来源=%s", async (hasSource) => {
     const { db, service } = createTestService();
     const namespace = {
       source: "codex",
@@ -173,6 +183,15 @@ describe("Work Memory pipeline", () => {
       namespace
     });
     const existing = workMemoryRow(opened.userId, opened.projectId ?? null);
+    if (hasSource) {
+      const original = service.openSession({
+        namespace: { source: "cursor", profileId: "default", userId: opened.userId }
+      });
+      existing.sessionId = original.sessionId;
+      existing.agentId = "cursor";
+      existing.appId = "original-workspace";
+      existing.info.source = "cursor";
+    }
     const repos = new Repositories(db.db);
     repos.memories.insert(existing);
     expect(repos.memories.searchPatternIds(["固定", "SFT", "数据清洗"], {
@@ -226,6 +245,15 @@ describe("Work Memory pipeline", () => {
       memoryValue: canonicalWorkMemoryText("SFT training pipeline", "固定 SFT 数据清洗流程", "保证训练结果可复现"),
       properties: { internal_info: expect.objectContaining({ work_topic: "SFT training pipeline" }) }
     });
+    expect(saved?.agentId).toBe(existing.agentId);
+    expect(saved?.appId).toBe(existing.appId);
+    expect(saved?.info.source).toBe(existing.info.source);
+    expect(saved?.properties.info).toEqual(saved?.info);
+    if (hasSource) {
+      expect(saved?.sessionId).toBe(existing.sessionId);
+      expect(service.panelItems({ layer: "L1", sourceAgent: "cursor" }).items.some((item) => item.id === existing.id)).toBe(true);
+      expect(service.panelItems({ layer: "L1", sourceAgent: "codex" }).items.some((item) => item.id === existing.id)).toBe(false);
+    }
     expect(repos.memories.list({ memoryKind: "work_memory", workMemoryUserId: opened.userId, workMemoryProjectId: opened.projectId ?? null }, 20)).toHaveLength(1);
   });
 
