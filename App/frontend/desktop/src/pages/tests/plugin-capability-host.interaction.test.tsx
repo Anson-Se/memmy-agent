@@ -1599,9 +1599,79 @@ describe("selectRegionPluginCalls", () => {
       { pluginId: plugin.id, capabilityId: "judge", callId: "failed", conversationId: "chat-1", origin: "agent", events: [{ type: "error", code: "model_inference_failed", message: "HTTP 504", retryable: true }] }
     ];
 
-    // A retry that is under way replaces the file list; a run that failed
-    // before producing anything leaves nothing behind to scroll past.
-    expect(selectCurrentPluginCalls(calls).map((item) => item.callId)).toEqual(["again"]);
+    // Retrying a capability keeps the files it already delivered.
+    expect(selectCurrentPluginCalls(calls).map((item) => item.callId)).toEqual(["delivered", "again"]);
+  });
+
+  function delivery(callId: string, names: string[], options: { conversationId?: string; prefix?: string } = {}): PluginUiCall {
+    return {
+      pluginId: "office", capabilityId: "office_deliver", callId,
+      conversationId: options.conversationId ?? "chat-office", origin: "agent",
+      events: [
+        ...names.map((name) => ({ type: "artifact" as const, artifact: {
+          id: `${callId}:${name}`, name, mediaType: "application/octet-stream", role: "deliverable" as const,
+          uri: `https://example.test/${callId}/${name}`, path: `${options.prefix ?? "/workspace/outputs"}/${name}`
+        } })),
+        { type: "result", output: { delivered: true } }
+      ]
+    };
+  }
+
+  it("renders all four Office deliveries after Excel recalculation finishes last", async () => {
+    const office = InstalledPluginSchema.parse({ ...plugin, id: "office", manifest: {
+      ...plugin.manifest, id: "office", name: "Office", capabilities: [{ ...plugin.manifest.capabilities[0], id: "office_deliver" }]
+    } });
+    const calls = [delivery("word", ["report.docx"]), delivery("ppt", ["slides.pptx"]), delivery("pdf", ["report.pdf"]), delivery("excel", ["budget.xlsx"])];
+    const open = vi.fn();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<I18nProvider language="zh-CN"><PluginCapabilityHost calls={calls} plugins={[office]}
+        client={{ getUi: vi.fn(), respond: vi.fn(), cancel: vi.fn() }} onOpenArtifact={open} /></I18nProvider>));
+      const openButtons = [...container.querySelectorAll("button")].filter((button) => button.textContent === "打开");
+      expect(openButtons).toHaveLength(4);
+      for (const name of ["report.docx", "slides.pptx", "report.pdf", "budget.xlsx"]) expect(container.textContent).toContain(name);
+      for (const button of openButtons) await act(async () => button.click());
+      expect(open.mock.calls.map(([artifact]) => artifact.name)).toEqual(["report.docx", "slides.pptx", "report.pdf", "budget.xlsx"]);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
+  it.each(["pending", "failed"])("keeps earlier deliveries when the next delivery is %s", (state) => {
+    const delivered = delivery("word", ["report.docx"]);
+    const next: PluginUiCall = { ...delivery("next", []), events: state === "failed"
+      ? [{ type: "error", code: "recalculation_required", message: "Recalculate first", retryable: false }]
+      : [{ type: "progress", current: 1, total: 2 }] };
+    expect(selectCurrentPluginCalls([delivered, next]).map((call) => call.callId)).toContain("word");
+  });
+
+  it("updates repeated files without removing other files from an earlier delivery", () => {
+    const calls = [delivery("batch", ["report.docx", "slides.pptx"]), delivery("retry", ["report.docx"])];
+    const selected = selectCurrentPluginCalls(calls);
+    const artifacts = selected.flatMap((call) => call.events.filter((event) => event.type === "artifact"));
+    expect(artifacts.map((event) => event.artifact.name)).toEqual(["slides.pptx", "report.docx"]);
+    expect(artifacts[1]!.artifact.id).toBe("retry:report.docx");
+    expect(calls[0]!.events).toHaveLength(3);
+  });
+
+  it("keeps same-named files from different tasks and scopes deduplication to the conversation", () => {
+    const calls = [delivery("one", ["report.docx"], { prefix: "/outputs/task-1" }),
+      delivery("two", ["report.docx"], { prefix: "/outputs/task-2" }),
+      delivery("other-chat", ["report.docx"], { prefix: "/outputs/task-1", conversationId: "chat-other" })];
+    expect(selectCurrentPluginCalls(calls).map((call) => call.callId)).toEqual(["one", "two", "other-chat"]);
+  });
+
+  it("deduplicates artifacts without workspace paths by artifact ID", () => {
+    const first = delivery("one", ["report.pdf"]);
+    const second = delivery("two", ["report.pdf"]);
+    for (const call of [first, second]) {
+      const event = call.events[0]!;
+      if (event.type === "artifact") { delete event.artifact.path; event.artifact.id = "shared-file"; }
+    }
+    expect(selectCurrentPluginCalls([first, second]).map((call) => call.callId)).toEqual(["two"]);
   });
 
 });
