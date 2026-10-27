@@ -78,6 +78,8 @@ function pluginNeedsSignIn(plugin: MarketplacePlugin, signedIn: boolean): boolea
 /** Catalog presentation only: installation state always comes from the parent. */
 export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
   const { t } = useTranslation();
+  const descriptionOf = (plugin: MarketplacePlugin) => capabilityDescription(plugin.category, t)
+    + (plugin.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : "");
   const [filter, setFilter] = useState<"all" | "installed">("all");
   const [query, setQuery] = useState("");
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -88,7 +90,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const visiblePlugins = props.plugins.filter((plugin) => (
     (filter === "all" || plugin.installed)
-    && `${plugin.name}\n${plugin.description}`.toLocaleLowerCase().includes(normalizedQuery)
+    && `${plugin.name}\n${descriptionOf(plugin)}`.toLocaleLowerCase().includes(normalizedQuery)
   ));
   const detail = props.plugins.find((plugin) => plugin.id === detailId);
   const confirmedPlugin = props.plugins.find((plugin) => plugin.id === uninstallId);
@@ -232,7 +234,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
                 <span className="plugin-marketplace-name-line">
                   <span className="plugin-marketplace-name">{plugin.name}</span>
                 </span>
-                <span className="plugin-marketplace-description" title={plugin.description}>{plugin.description}</span>
+                <span className="plugin-marketplace-description" title={descriptionOf(plugin)}>{descriptionOf(plugin)}</span>
               </span>
             </button>
             <div className="plugin-marketplace-row-actions">
@@ -318,7 +320,7 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
           <div className="plugin-marketplace-detail-content">
             <PluginDetailPreview category={detail.category} name={detail.name} />
             <p className="plugin-marketplace-detail-description">
-              {capabilityDescription(detail.category, t)}{detail.requiresOfficialModel ? ` ${t("plugins.ui.memmyOfficialModelsAreRecommendedForThisPlugin")}` : ""}
+              {descriptionOf(detail)}
             </p>
             {detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.signInRequired")}{detail.requiresOfficialModel ? t("plugins.ui.memmyOfficialModelsRecommended") : ""}</p> : null}
             {!detail.installed && !detail.installable && !detail.requiresLogin ? <p className="plugin-marketplace-detail-note">{t("plugins.ui.anInstallableReleaseIsNotAvailableYet")}</p> : null}
