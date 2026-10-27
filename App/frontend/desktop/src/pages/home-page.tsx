@@ -78,6 +78,7 @@ import {
 import { AgentAttachmentCard, splitAgentAttachmentName } from "./agent-file-attachment-chip.js";
 import { AgentGoalBar, type AgentGoalControlRequest } from "./agent-goal-bar.js";
 import { AgentQueuedMessageList, queuedComposerEditDecision } from "./agent-queued-message-list.js";
+import { agentOutputSignature, useStalledOutputShimmer } from "./agent-stall-shimmer.js";
 import { AgentThreadMessages, ChatImageLightbox } from "./agent-thread-messages.js";
 import { AgentThreadPanel, PLUGIN_RECORDING_TAB_ID, useAgentThreadPanel } from "./agent-thread-panel.js";
 import { hasPendingBrowserOpen, MEMMY_BROWSER_OPEN_EVENT } from "./browser-panel.js";
@@ -946,6 +947,7 @@ export function HomePage() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [workspaceLayoutRef, workspaceRowWidth] = useSharedRowWidth<HTMLDivElement>();
   const conversationPanelRef = useRef<HTMLElement | null>(null);
+  const conversationContentRef = useRef<HTMLDivElement | null>(null);
   const composerOverlayRef = useRef<HTMLDivElement | null>(null);
   const [questionDockTarget, setQuestionDockTarget] = useState<HTMLDivElement | null>(null);
   const pendingStatusChatRef = useRef<string | null>(null);
@@ -1202,6 +1204,11 @@ export function HomePage() {
       state.agent.runStartedAtByChatId[state.agent.currentChatId] ||
       state.agent.optimisticSendingByChatId[state.agent.currentChatId]
     )
+  );
+  useStalledOutputShimmer(
+    conversationContentRef,
+    (isCurrentAgentRunning || isCurrentGoalActive) && !pendingCardKey,
+    agentOutputSignature(state.agent.messages)
   );
   const currentTaskCompletedUnseen = state.agent.chatWindowFocused && state.agent.chatViewVisible && !state.agent.blankDraftActive
     ? false
@@ -3182,7 +3189,7 @@ export function HomePage() {
             onWheel={markAgentConversationUserScrollIntent}
             onTouchMove={markAgentConversationUserScrollIntent}
           >
-            <div className="agent-conversation-content agent-conversation-column space-y-3">
+            <div ref={conversationContentRef} className="agent-conversation-content agent-conversation-column space-y-3">
               {displayConnectionStatus !== "connected" && (
                 <div className="text-center">
                   <span className="inline-flex text-[11px] px-3 py-1 rounded-tag bg-background-paper text-text-ink/55 border border-border-stone/30">

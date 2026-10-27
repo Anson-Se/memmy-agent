@@ -2501,9 +2501,6 @@ function ThoughtSegmentBlock(props: { text: string; isLive: boolean; isOnlySegme
             : <ChevronRight size={12} aria-hidden="true" className="agent-narration-block__chevron" />}
         </button>
       ) : null}
-      {!props.isOnlySegment && props.isLive && open ? (
-        <p className="agent-activity-segment__live-thought-label">{props.t("agent.activity.thinking")}</p>
-      ) : null}
       {open ? (
         <div className="agent-activity-segment__body">
           <ReasoningMarkdown text={props.text} />
@@ -2522,6 +2519,15 @@ function ThoughtSegmentBlock(props: { text: string; isLive: boolean; isOnlySegme
  */
 function useFollowAlongOpen(isLive: boolean): { open: boolean; onToggle: (next: boolean) => void } {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  const wasLiveRef = useRef(isLive);
+
+  useEffect(() => {
+    if (wasLiveRef.current && !isLive) {
+      setManualOpen(null);
+    }
+    wasLiveRef.current = isLive;
+  }, [isLive]);
+
   return {
     open: manualOpen ?? isLive,
     onToggle: (next: boolean) => setManualOpen(next)

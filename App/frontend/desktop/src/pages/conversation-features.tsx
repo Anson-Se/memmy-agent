@@ -31,6 +31,13 @@ export function conversationFeaturePanelOverlays(width: number | null | undefine
   return width != null && width > 0 && width < SHARED_ROW_PRIMARY_RESERVE + SHARED_ROW_MIN_PANE_WIDTH;
 }
 
+export function recordingShortcutOpen(compactOpen: boolean,
+  pluginRecording: Pick<RecordingPanelSession, "status"> | null | undefined, pluginRecordingHidden: boolean): boolean {
+  // A completed interview may remain in the right panel, but this shortcut
+  // has already switched back to controlling the independent recording card.
+  return compactOpen || Boolean(pluginRecording && pluginRecording.status !== "done" && !pluginRecordingHidden);
+}
+
 function PersistentPluginRecorder(props: {
   owner: string; host: ReactElement<ComponentProps<typeof PluginCapabilityHost>> | null;
   onSession(owner: string, session: RecordingPanelSession | null): void;
@@ -269,7 +276,7 @@ export function useConversationFeatures(options: {
     ? selectPinnedCommandsForLegalWorkflow(selectConversationPinnedCommands(targets, calls), legalFlowCardOpen)
     : [];
   const shortcuts = <PinnedPluginCommandBar targets={pinnedTargets} disabled={!clients}
-    recordingOpen={recording.compactOpen || Boolean(pluginRecording && !hiddenRecordings.has(recordingOwner))}
+    recordingOpen={recordingShortcutOpen(recording.compactOpen, pluginRecording, hiddenRecordings.has(recordingOwner))}
     active={selectOpenPinnedCapabilities(prepared, ui?.dismissedCallIds, pinnedCapabilities, ui?.hiddenCallIds)}
     onRecordingPress={toggleCompactRecording} onPress={({ plugin, command }) => void invoke(plugin, command)} />;
   const artifactPanel = preview && clients?.plugins ? <PluginArtifactPreviewPanel artifact={preview}

@@ -3730,6 +3730,40 @@ body.memmy-thread-panel-fullscreen .app-frame-main {
   margin-bottom: 0;
 }
 
+/* A quiet running turn sweeps its last visible line after three seconds. */
+.agent-stall-shimmer {
+  background-image:
+    linear-gradient(90deg, transparent, var(--color-action-sky-hover), transparent),
+    linear-gradient(var(--agent-stall-ink), var(--agent-stall-ink));
+  background-repeat: no-repeat;
+  background-size: var(--agent-stall-band) var(--agent-stall-height), 100% 100%;
+  background-position: var(--agent-stall-from) var(--agent-stall-y), 0 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: agent-stall-sweep 1.8s linear infinite;
+}
+
+.agent-stall-shimmer :where(code, .agent-activity-diff, .agent-activity-diff *) {
+  -webkit-text-fill-color: currentColor;
+}
+
+@keyframes agent-stall-sweep {
+  from {
+    background-position: var(--agent-stall-from) var(--agent-stall-y), 0 0;
+  }
+  to {
+    background-position: var(--agent-stall-to) var(--agent-stall-y), 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-stall-shimmer {
+    animation: none;
+    background-position: calc((var(--agent-stall-from) + var(--agent-stall-to)) / 2) var(--agent-stall-y), 0 0;
+  }
+}
+
 .agent-thinking-pulse {
   display: inline-block;
   width: 6px;
@@ -4299,14 +4333,6 @@ button.agent-activity-file-link.agent-activity-timeline-item__detail {
 
 .agent-activity-segment--thought .agent-activity-segment__body {
   margin: 8px 0 4px;
-}
-
-.agent-activity-segment__live-thought-label {
-  margin: 0;
-  padding: 2px 0;
-  color: color-mix(in srgb, var(--color-text-ink) 50%, transparent);
-  font-size: 15px;
-  line-height: 26.25px;
 }
 
 /* Thinking-chain rail: a 2px hairline-coloured bar spanning the full height
