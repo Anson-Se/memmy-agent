@@ -89,13 +89,17 @@ export function createLocalApiServer(options: CreateLocalApiServerOptions): Fast
     return reply.send(response);
   });
 
-  registerAgentSourceRoutes(app, {
+  const desktopScans = registerAgentSourceRoutes(app, {
+    isScanAllowed: () => options.services.appConfig?.isScanAllowed?.() ?? true,
     agentSources: options.services.agentSources,
     agentSourceAutoInject: options.services.agentSourceAutoInject,
     progressBus: options.services.progressBus,
     permissionManager: options.permissionManager,
     authenticateRuntimeToken,
     scanProcess: options.scanProcess
+  });
+  options.services.appConfig?.setScanPermissionReconciler?.(async () => {
+    await Promise.all([desktopScans.cancel(), options.services.agentSourceAutoInject.reconcilePermission?.()]);
   });
   registerAppConfigRoutes(app, {
     appConfig: options.services.appConfig,

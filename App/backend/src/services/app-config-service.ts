@@ -33,6 +33,8 @@ import type { MemoryClient } from "../adapters/outbound/memory-client/index.js";
 import { createHttpModelConfigTester, type ModelConfigTester } from "./model-config-tester.js";
 
 export interface AppConfigService {
+  setScanPermissionReconciler?(reconcile: () => Promise<void>): void;
+  isScanAllowed?(): boolean;
   updateSettings(input: PatchAppSettingsInput): Promise<AppSettingsDto>;
   updatePrivacy(input: PatchPrivacyInput): Promise<PrivacySettingsDto>;
   getScanPreferences(): Promise<ScanPreferences>;
@@ -97,6 +99,7 @@ type ResolvedModelConfigTestInput = ModelConfigTestInput & { apiKey: string };
 export function createAppConfigService(options: CreateAppConfigServiceOptions): AppConfigService {
   const modelConfigTester = options.modelConfigTester ?? createHttpModelConfigTester();
   let scanSettingsWrite = Promise.resolve();
+  let reconcileDesktopScanPermission: (() => Promise<void>) | undefined;
   function serializeScanSettings<T>(operation: () => Promise<T>): Promise<T> {
     const result = scanSettingsWrite.then(operation);
     scanSettingsWrite = result.then(() => undefined, () => undefined);
@@ -104,6 +107,12 @@ export function createAppConfigService(options: CreateAppConfigServiceOptions): 
   }
 
   return {
+    setScanPermissionReconciler(reconcile) { reconcileDesktopScanPermission = reconcile; },
+    isScanAllowed() {
+      const permission = options.scanPreferencesStore?.getScanPermission()
+        ?? options.bootstrapRepository.getOnboardingState().scanPermission;
+      return permission === "scan_only" || permission === "scan_and_write_skill";
+    },
     async updateSettings(input) {
       const previousOnboarding = input.userMode === "byok" ? options.bootstrapRepository.getOnboardingState() : null;
       if (input.userMode) {
@@ -154,6 +163,9 @@ export function createAppConfigService(options: CreateAppConfigServiceOptions): 
         // the guide. A later failure leaves the durable refusal in place for restart.
         if (input.scanPermission !== undefined) {
           await options.scanPreferencesStore?.setScanPermission(input.scanPermission, input.currentStep === "scan_permission_required");
+          if (input.scanPermission === "none" || input.scanPermission === "unset") {
+            await reconcileDesktopScanPermission?.();
+          }
           await options.memoryClient?.reloadConfig({ reason: "scan_permission_saved" });
         }
         return options.bootstrapRepository.updateOnboarding(input);

@@ -3,12 +3,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
 import YAML from "yaml";
-import { createAppStateStore } from "../../infrastructure/app-state-store/index.js";
-import { createMemoryScanPreferencesStore, ensureMemoryScanPreferences } from "../../infrastructure/memmy-config/agent-access.js";
-import { createAppConfigService } from "../app-config-service.js";
-import { createAgentSourceExecutor } from "../../../../../Memory/src/agent-source/runtime.js";
-import { createSourceRegistry } from "../../../../../Memory/src/agent-source/adapters/source-registry.js";
-import type { MemoryService } from "../../../../../Memory/src/service/memory-service.js";
+import { createLocalApiServer } from "../adapters/inbound/local-api/server.js";
+import { createPermissionManager } from "../permission/index.js";
+import { createProgressBus } from "../services/progress-bus.js";
+import type { BackendServices } from "../services/index.js";
+import { createAppStateStore } from "../infrastructure/app-state-store/index.js";
+import { createMemoryScanPreferencesStore, ensureMemoryScanPreferences } from "../infrastructure/memmy-config/agent-access.js";
+import { createAppConfigService } from "../services/app-config-service.js";
+import { createAgentSourceExecutor } from "../../../../Memory/src/agent-source/runtime.js";
+import { createSourceRegistry } from "../../../../Memory/src/agent-source/adapters/source-registry.js";
+import type { MemoryService } from "../../../../Memory/src/service/memory-service.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
@@ -41,7 +45,7 @@ async function fixture() {
   const reloadConfig = vi.fn(async () => { await executor.reconcileScanPermission!(); return {} as never; });
   const service = createAppConfigService({ bootstrapRepository, scanPreferencesStore: preferences, memoryClient: { reloadConfig } });
   const access = () => YAML.parse(readFileSync(configPath, "utf8")).memmyMemory.agentAccess;
-  return { service, bootstrapRepository, preferences, executor, makeExecutor, reloadConfig, configPath, detect, scan, addMemory, access };
+  return { store, service, bootstrapRepository, preferences, executor, makeExecutor, reloadConfig, configPath, detect, scan, addMemory, access };
 }
 
 it("refusal disables automation and survives a new executor even if toggles are later enabled", async () => {
@@ -147,4 +151,51 @@ it("explicit manual reauthorization preserves disabled automation; onboarding gr
   expect(f.addMemory).toHaveBeenCalledOnce();
   await f.service.updateOnboarding({ scanPermission: "scan_only", currentStep: "scan_permission_required" });
   expect(f.access()).toMatchObject({ scanPermission: "scan_only", autoScanKnownAgents: true, watchFileChanges: true });
+});
+
+
+it.each([false, true])("desktop HTTP refusal drains the %s paused writer before acknowledging", async paused => {
+  const f = await fixture();
+  await f.service.updateOnboarding({ scanPermission: "scan_only" });
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  let aborted = false;
+  const writes = vi.fn();
+  const app = createLocalApiServer({
+    composioMcpToken: "synthetic", permissionManager: createPermissionManager({ appStateStore: f.store, runtimeToken: "synthetic" }),
+    services: {
+      appConfig: f.service, progressBus: createProgressBus(), agentAdapterRegistry: { listAdapters: () => [] },
+      agentSourceAutoInject: { reconcilePermission: vi.fn(async () => {}) },
+      agentSources: {
+        supportsPersistentScan: true,
+        async scanAll(options: { signal: AbortSignal }) {
+          entered = true;
+          options.signal.addEventListener("abort", () => { aborted = true; });
+          await held;
+          options.signal.throwIfAborted();
+          writes();
+          return [];
+        }
+      }
+    } as unknown as BackendServices
+  });
+  const headers = { "x-memmy-local-token": "synthetic" };
+  try {
+    expect((await app.inject({ method: "POST", url: "/api/agent-sources/scan", headers })).statusCode).toBe(200);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    if (paused) await app.inject({ method: "POST", url: "/api/agent-sources/scan/stop", headers });
+    let acknowledged = false;
+    const saving = app.inject({ method: "PATCH", url: "/api/app/onboarding", headers, payload: deny }).then(response => { acknowledged = true; return response; });
+    await vi.waitFor(() => expect(aborted).toBe(true));
+    await vi.waitFor(() => expect(f.access().scanPermission).toBe("none"));
+    expect(acknowledged).toBe(false);
+    expect(f.bootstrapRepository.getOnboardingState().scanPermission).toBe("scan_only");
+    expect((await app.inject({ method: "POST", url: "/api/agent-sources/scan", headers })).statusCode).toBe(403);
+    release();
+    expect((await saving).statusCode).toBe(200);
+    expect(writes).not.toHaveBeenCalled();
+    expect((await app.inject({ method: "GET", url: "/api/agent-sources/scan/status", headers })).json()).toEqual({ active: false, progress: null });
+    expect((await app.inject({ method: "PATCH", url: "/api/app/onboarding", headers, payload: deny })).statusCode).toBe(200);
+  } finally { release(); await app.close(); }
 });

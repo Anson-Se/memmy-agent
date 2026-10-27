@@ -51,19 +51,24 @@ export interface RegisterAgentSourceRoutesOptions {
   progressBus: ProgressBus;
   permissionManager: Pick<PermissionManager, "canScanAgentSource">;
   authenticateRuntimeToken: (request: FastifyRequest, reply: FastifyReply) => Promise<unknown>;
+  isScanAllowed?: () => boolean;
   scanProcess?: {
     databasePath: string;
   };
 }
 
 /** Registers register agent source routes. */
-export function registerAgentSourceRoutes(app: FastifyInstance, options: RegisterAgentSourceRoutesOptions): void {
+export function registerAgentSourceRoutes(app: FastifyInstance, options: RegisterAgentSourceRoutesOptions): { cancel(): Promise<void> } {
   type ActiveScanJob = Omit<AgentSourceScanJobState, "resume"> & {
     resume: RouteScanResumeState | null;
     process?: ChildProcess;
+    settled?: Promise<void>;
+    settle?: () => void;
   };
 
   let activeScanJob: ActiveScanJob | null = null;
+  const unsettledJobs = new Set<ActiveScanJob>();
+  let cancellation: Promise<void> | undefined;
   type PausedScanJob = {
     jobId: string;
     sourceId: string;
@@ -83,15 +88,12 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
   } | null = null;
 
   app.addHook("onClose", async () => {
-    if (!activeScanJob) {
-      return;
-    }
-
-    const closingJob = activeScanJob;
     activeScanJob = null;
-    abortScanJob(closingJob);
     pausedScanJob = null;
-    closingJob.process?.kill();
+    for (const job of unsettledJobs) {
+      abortScanJob(job);
+      job.process?.kill();
+    }
   });
 
   app.get("/api/agent-sources", { preHandler: options.authenticateRuntimeToken }, async (_request, reply) => {
@@ -154,7 +156,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     const sourceId = input.sourceId;
     const mode = input.mode;
 
-    if (!(await options.permissionManager.canScanAgentSource({ agentSourceId: sourceId }))) {
+    if (!(await options.permissionManager.canScanAgentSource({ agentSourceId: sourceId })) || options.isScanAllowed?.() === false) {
       return reply.code(403).send({
         error: {
           code: "scan_not_permitted",
@@ -163,6 +165,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
       });
     }
 
+    if (cancellation) return reply.code(409).send({ error: { code: "scan_canceling", message: "Scan cancellation is in progress" } });
     if (activeScanJob?.controller.signal.aborted) {
       activeScanJob = null;
     }
@@ -205,6 +208,8 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     });
 
     const scanJob = activeScanJob;
+    scanJob.settled = new Promise<void>(resolve => { scanJob.settle = resolve; });
+    unsettledJobs.add(scanJob);
     setImmediate(() => {
       startScanJob(scanJob);
     });
@@ -230,17 +235,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
   });
 
   app.post("/api/agent-sources/scan/cancel", { preHandler: options.authenticateRuntimeToken }, async (_request, reply) => {
-    if (activeScanJob) {
-      const canceledJob = activeScanJob;
-      activeScanJob = null;
-      abortScanJob(canceledJob);
-      cleanupResumeState(canceledJob.resume);
-      deleteDurableScanStore(options.scanProcess?.databasePath, canceledJob.jobId);
-    }
-    cleanupResumeState(pausedScanJob?.resume ?? null);
-    if (pausedScanJob) deleteDurableScanStore(options.scanProcess?.databasePath, pausedScanJob.jobId);
-    pausedScanJob = null;
-    lastScanProgress = null;
+    await cancelScans();
     return reply.send(OkResponseSchema.parse({ ok: true }));
   });
 
@@ -266,7 +261,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     { preHandler: options.authenticateRuntimeToken },
     withErrorEnvelope(async (request, reply) => {
       const params = AgentSourceIdParamsSchema.parse(request.params);
-      if (!(await options.permissionManager.canScanAgentSource({ agentSourceId: params.sourceId }))) {
+      if (!(await options.permissionManager.canScanAgentSource({ agentSourceId: params.sourceId })) || options.isScanAllowed?.() === false) {
         return reply.code(403).send({
           error: {
             code: "scan_not_permitted",
@@ -342,15 +337,44 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     })
   );
 
+  return { cancel: cancelScans };
+
+  async function cancelScans(): Promise<void> {
+    if (cancellation) return cancellation;
+    const jobs = [...unsettledJobs];
+    const paused = pausedScanJob;
+    activeScanJob = null;
+    pausedScanJob = null;
+    lastScanProgress = null;
+    lastScanCompletion = null;
+    for (const job of jobs) abortScanJob(job);
+    const pending = (async () => {
+      await Promise.all(jobs.map(job => job.settled));
+      for (const job of jobs) {
+        cleanupResumeState(job.resume);
+        deleteDurableScanStore(options.scanProcess?.databasePath, job.jobId);
+      }
+      cleanupResumeState(paused?.resume ?? null);
+      if (paused) deleteDurableScanStore(options.scanProcess?.databasePath, paused.jobId);
+      for (const job of jobs) options.progressBus.emit("agent_source.scan_completed", { jobId: job.jobId, sourceId: job.sourceId, results: [] });
+    })();
+    cancellation = pending;
+    try { await pending; } finally { if (cancellation === pending) cancellation = undefined; }
+  }
+
+  function settleJob(job: ActiveScanJob): void {
+    unsettledJobs.delete(job);
+    job.settle?.();
+  }
+
   function startScanJob(scanJob: ActiveScanJob): void {
     if (scanJob.controller.signal.aborted) {
-      if (!options.scanProcess) {
-        startInlineScanJob(scanJob);
-      }
+      settleJob(scanJob);
       return;
     }
 
     if (activeScanJob?.jobId !== scanJob.jobId) {
+      settleJob(scanJob);
       return;
     }
 
@@ -365,6 +389,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
   function startInlineScanJob(scanJob: ActiveScanJob): void {
     if (scanJob.resume && isScanResumeStateReference(scanJob.resume)) {
       handleProcessFailure(scanJob.jobId, new Error("SQLite-backed scan resume requires the scan process"));
+      settleJob(scanJob);
       return;
     }
 
@@ -378,6 +403,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     };
     void runAgentSourceScanJob(inlineJob, options.agentSources, {
       onProgress(progress) {
+        if (activeScanJob !== scanJob || scanJob.controller.signal.aborted) return;
         updateActiveProgress(scanJob.jobId, progress);
         options.progressBus.emit("agent_source.scan_progress", {
           jobId: scanJob.jobId,
@@ -400,6 +426,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
       }
     }).finally(() => {
       finishActiveScanJob(scanJob.jobId);
+      settleJob(scanJob);
     });
   }
 
@@ -425,6 +452,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
       });
     } catch (error) {
       handleProcessFailure(scanJob.jobId, error instanceof Error ? error : new Error("Agent source scan process failed to start"));
+      settleJob(scanJob);
       return;
     }
     scanJob.process = child;
@@ -435,6 +463,7 @@ export function registerAgentSourceRoutes(app: FastifyInstance, options: Registe
     child.on("error", (error) => {
       handleProcessFailure(scanJob.jobId, error instanceof Error ? error : new Error("Agent source scan process failed"));
     });
+    child.once("close", () => settleJob(scanJob));
     child.on("exit", (code, signal) => {
       if (code !== 0 && activeScanJob?.jobId === scanJob.jobId && !scanJob.controller.signal.aborted) {
         handleProcessFailure(

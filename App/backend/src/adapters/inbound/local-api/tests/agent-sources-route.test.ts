@@ -500,6 +500,7 @@ describe("agent sources local api routes", () => {
       url: "/api/agent-sources/scan",
       headers: { "x-memmy-local-token": "test-token" }
     });
+    await waitFor(() => collectCalls === 1);
     const stopResponse = await server.inject({
       method: "POST",
       url: "/api/agent-sources/scan/stop",
