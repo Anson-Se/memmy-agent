@@ -163,7 +163,7 @@ describe("reconcileBundledPlugins", () => {
     expect(service.disable).not.toHaveBeenCalled();
   });
 
-  it("upgrades an installed release and disables it without uninstalling", async () => {
+  it("preserves the installed version without automatic upgrade", async () => {
     const previous = installed("0.5.16");
     const current = installed();
     const service = {
@@ -181,7 +181,7 @@ describe("reconcileBundledPlugins", () => {
       releases: [{ id: manifest.id, version: manifest.version }],
       enabledById: { [manifest.id]: false }
     });
-    expect(service.update).toHaveBeenCalledWith(manifest.id, manifest.version);
+    expect(service.update).not.toHaveBeenCalled();
     expect(service.disable).toHaveBeenCalledWith(manifest.id);
     expect(service.uninstall).not.toHaveBeenCalled();
   });

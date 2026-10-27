@@ -235,6 +235,10 @@ export function createBackendServices(options: CreateBackendServicesOptions): Ba
   ]));
   const plugins = createPluginService({
     repository: pluginRepository,
+    hasActiveAgentTasks: async signal => {
+      if (!memmyAgentAdminClient.hasActiveTasks) throw new Error("Agent task activity is unavailable; update the runtime and retry");
+      return memmyAgentAdminClient.hasActiveTasks(signal);
+    },
     secretStore: options.appStateStore.secretStore,
     registry: options.pluginRegistry ?? unavailablePluginRegistry,
     runtimeHost: pluginRuntimeHost,

@@ -4,6 +4,7 @@ import { pluginEligibility, pluginRules } from "../plugin-rules.js";
 
 describe("plugin product policy", () => {
   it("preserves public manual installation defaults", () => {
+    expect(PluginRulesSchema.parse({}).autoUpdate).toBe(false);
     expect(pluginRules({}).installation).toBe("manual");
     expect(pluginEligibility({}, false, () => false)).toEqual({ visible: true, canInstall: true, canUse: true, reason: null });
   });
