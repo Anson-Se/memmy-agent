@@ -28,7 +28,15 @@ describe("waiting memory previews", () => {
     `<timestamp timezone="UTC+8">today</timestamp><user_query>\n${request}\n</user_query>`,
     `<system_reminder>outer<system_reminder>inner</system_reminder>tail</system_reminder>\n${request}`,
     `<system_notification reason="a > b">status</system_notification>\n${request}`,
-    `<image_files />\n<user_query><timestamp>today</timestamp>\n${request}</user_query>`
+    `<image_files />\n<user_query><timestamp>today</timestamp>\n${request}</user_query>`,
+    `<pasted_content id="261b">正文</pasted_content id="261b">\n${request}`,
+    `<pasted_content>正文</pasted_content>\n${request}`,
+    `<pasted_content>outer<pasted_content>inner</pasted_content>tail</pasted_content>\n${request}`,
+    `<pasted_content note="a > b">正文</pasted_content>\n<attached_files>附件</attached_files>\n<user_query>${request}</user_query>`,
+    `[Image]\n<image_files>附件</image_files>\n<user_query>${request}</user_query>`,
+    `<chat_selection>引用的对话</chat_selection>\n${request}`,
+    `\`\`\`chat_selection\n引用的对话\n\`\`\`\n${request}`,
+    `~~~~chat_selection\n引用的对话\n~~~~\n${request}`
   ])("extracts the same request for import titles and waiting previews: %s", (input) => {
     expect(firstSemanticUserLine(input)).toBe(request);
     const row = memory(input, `User:\n${input}\nAssistant:\n不要把回复当标题`);
@@ -45,7 +53,12 @@ describe("waiting memory previews", () => {
     '<in-app-browser-context source="ambient-ui-state"',
     "<timestamp>today</timestamp>\n<system_notification>done</system_notification>",
     "<user_query>未闭合请求",
-    "摘要总结中"
+    "摘要总结中",
+    '<pasted_content id="261b">正文</pasted_content id="261b">',
+    '<pasted_content id="261b">未闭合\n<user_query>嵌入的请求</user_query>',
+    '<pasted_content id="261b"',
+    '```chat_selection\n未闭合引用',
+    '<chat_selection>只有引用</chat_selection>'
   ])("does not recover rejected context from the raw body: %s", (input) => {
     expect(waitingSourceText(memory(input, `User:\n${input}\nAssistant:\n不要把回复当标题`))).toBeUndefined();
     expect(waitingSourceText(memory(undefined, `User:\n${input}\nAssistant:\n不要把回复当标题`))).toBeUndefined();
@@ -61,7 +74,14 @@ describe("waiting memory previews", () => {
     "> <timestamp>quoted example</timestamp>",
     "```xml\n<timestamp>code example</timestamp>\n```",
     "    <timestamp>indented code</timestamp>",
-    "The following is the Codex agent history whose request action you are assessing."
+    "The following is the Codex agent history whose request action you are assessing.",
+    "[Image]\n这是普通文字，没有附件协议",
+    "请解释下面的标签\n<pasted_content>示例</pasted_content>",
+    '<pasted_content_example>自定义标签</pasted_content_example>',
+    '> <pasted_content>引用示例</pasted_content>',
+    '```xml\n<pasted_content>代码示例</pasted_content>\n```',
+    '    ```chat_selection\n    普通缩进代码\n    ```',
+    '```typescript\n// chat_selection\n```'
   ])("preserves ordinary HTML, code, quotes and unverified review text: %s", (input) => {
     expect(firstSemanticUserLine(input)).toBe(input.split("\n")[0]!.trim());
     expect(waitingSourceText(memory(input))).toBe(input.split("\n")[0]!.trim());

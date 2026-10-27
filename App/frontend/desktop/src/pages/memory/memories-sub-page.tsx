@@ -967,7 +967,9 @@ function TraceMemoryDetail(props: {
     : detail.steps.flatMap((step) => step.toolCalls);
   const turnEvents = buildTraceTurnEvents(detail, toolCalls);
   const hasTurnSteps = turnEvents.length > 0;
-  const summaryText = displayMemorySummaryText(detail.summary || props.item.summary, t, props.item.processing);
+  // The read model owns summary validity and legacy field precedence. Raw trace
+  // metadata may still contain a placeholder or an older copy of the summary.
+  const summaryText = displayMemorySummaryText(props.item.summary, t, props.item.processing);
 
   return (
     <>

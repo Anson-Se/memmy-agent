@@ -80,7 +80,6 @@ import {
 } from "../namespace/namespace-scope.js";
 import {
   detailSummaryForMemory,
-  detailTitleForMemory,
   firstDetailDisplayString
 } from "../read-model/memory.js";
 import {
@@ -2323,7 +2322,7 @@ export class SessionTurnService {
           episodeId: response.episodeId,
           query: request.query,
           agent: request.answer,
-          summary: memory ? detailSummaryForMemory(memory) || detailTitleForMemory(memory) : undefined
+          summary: memory ? detailSummaryForMemory(memory) : undefined
         }]
       }, Date.now() - startedAt, true, response.serverTime, memory?.agentId);
     }

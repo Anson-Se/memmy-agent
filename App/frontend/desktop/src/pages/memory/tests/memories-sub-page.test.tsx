@@ -26,6 +26,20 @@ import {
 } from "../memory-agent-filter.js";
 
 describe("MemoriesSubPage", () => {
+  it("uses the canonical detail summary when legacy trace metadata still has a placeholder", () => {
+    const detail = { ...memoryDetailFixture, item: { ...memoryDetailFixture.item,
+      summary: "有效存储摘要", processing: undefined,
+      metadata: { ...memoryDetailFixture.item.metadata, traceDetail: {
+        ...(memoryDetailFixture.item.metadata.traceDetail as Record<string, unknown>), summary: "摘要总结中"
+      } }
+    } };
+    const html = renderMemories({ status: "ready", data: panelItemsOutput([]), detail: { status: "ready", data: detail } });
+    expect(html).toContain("有效存储摘要");
+    expect(html).not.toContain("摘要总结中");
+    detail.item.summary = "";
+    const empty = renderMemories({ status: "ready", data: panelItemsOutput([]), detail: { status: "ready", data: detail } });
+    expect(empty).not.toContain("摘要总结中");
+  });
   it("在所有记忆列表明确标注没有提炼为记忆的观察和原因", () => {
     const html = renderMemories({ status: "ready", data: panelItemsOutput([{
       ...memoryListItemFixture,

@@ -10,7 +10,7 @@ import {
   type WorkspaceUri
 } from "../contracts/index.js";
 import { retrievalDocumentForMemory } from "../algorithm/plugin-algorithms.js";
-import { displayFieldsForMemory } from "../service/read-model/display-fields.js";
+import { displayFieldsForMemory, isTraceMemory, storedTraceSummary } from "../service/read-model/display-fields.js";
 import type {
   ProjectEnvironmentKind,
   ProjectEnvironmentStateRecord
@@ -39,7 +39,7 @@ import { DEFAULT_NAMESPACE_SOURCE } from "../types.js";
 import { agentSourceFamilyRoots, normalizeAgentIdKey } from "../utils/agent-source-id.js";
 import { newId, stableHash } from "../utils/id.js";
 import { asStringArray, parseJson, toJson } from "../utils/json.js";
-import { firstSemanticUserLine } from "../utils/text.js";
+import { firstSemanticUserLine, semanticUserText } from "../utils/text.js";
 import { nowIso } from "../utils/time.js";
 import {
   attachMemoryVectors,
@@ -6539,6 +6539,7 @@ function listTitleForMemory(memory: MemoryRow): string {
 }
 
 function listSummaryForMemory(memory: MemoryRow): string {
+  if (isTraceMemory(memory)) return storedTraceSummary(memory) ?? "";
   const internal = memory.properties.internal_info;
   if (internal.memory_kind === "work_memory" && typeof internal.requirement === "string") {
     return internal.requirement.trim();
@@ -6602,26 +6603,25 @@ function firstReadableMemoryValueLine(value: string): string | undefined {
 }
 
 function firstUserMemoryValueLine(value: string): string | undefined {
-  let inUserSection = false;
-  const userLines: string[] = [];
-  for (const line of value.split(/\r?\n/)) {
+  const lines = semanticUserText(value).split(/\r?\n/);
+  let fence = "";
+  for (const [index, line] of lines.entries()) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (marker) {
+      if (!fence) fence = marker[1]!;
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length) fence = "";
+      continue;
+    }
+    if (fence) continue;
     const role = memoryValueRoleMarker(line);
-    if (role) {
-      if (inUserSection && role !== "user") {
-        break;
-      }
-      inUserSection = role === "user";
-      continue;
-    }
-    if (!inUserSection) {
-      continue;
-    }
-    userLines.push(line);
+    if (role !== "user") continue;
+    const userLines = semanticUserText(lines.slice(index + 1).join("\n")).split(/\r?\n/);
+    const nextRole = userLines.findIndex(line => Boolean(memoryValueRoleMarker(line)));
+    const title = firstSemanticUserLine((nextRole < 0 ? userLines : userLines.slice(0, nextRole)).join("\n"));
+    return title && !isPlaceholderMemorySummary(title) && !isWorldSectionHeading(title) && !isInternalMemoryKey(title)
+      ? title : undefined;
   }
-  const title = firstSemanticUserLine(userLines.join("\n"));
-  return title && !isPlaceholderMemorySummary(title) && !isWorldSectionHeading(title) && !isInternalMemoryKey(title)
-    ? title
-    : undefined;
+  return undefined;
 }
 
 function isPlaceholderMemorySummary(value: string | undefined): boolean {

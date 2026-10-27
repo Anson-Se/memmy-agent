@@ -7,12 +7,12 @@ describe("memory panel cache", () => {
     vi.unstubAllGlobals();
   });
 
-  it("discards fresh previews cached before source-envelope filtering", () => {
+  it.each([1, 2])("discards fresh previews from cache version %s", (version) => {
     const storage = createMemoryStorage();
     vi.stubGlobal("window", { sessionStorage: storage });
     const key = memoryPanelCacheKey("memories", "latest");
     storage.setItem(`memmy.memory-panel.${key}`, JSON.stringify({
-      version: 1, savedAt: new Date().toISOString(),
+      version, savedAt: new Date().toISOString(),
       data: { sourceText: '<in-app-browser-context source="ambient-ui-state">' }
     }));
     expect(readMemoryPanelCache(key)).toBeNull();

@@ -6,6 +6,24 @@ const PLACEHOLDER_LINE = /^(user|assistant|system|tool|developer|摘要排队中
 const INTERNAL_LINE = /^(RawTurn|TraceStep|Alpha|Value|Priority|Reflection|Signature|Vec Summary|Vec Action|Trigger|Procedure|Verification|Boundary|Support|Gain|Raw gain|Confidence|Evidence):/i;
 const DRAFT_TITLE = /^Policy:\s+/i;
 
+/** Undefined kind is the legacy L1 trace representation. */
+export function isTraceMemory(memory: MemoryRow): boolean {
+  return memory.memoryLayer === "L1" && (!memory.properties.internal_info.memory_kind || memory.properties.internal_info.memory_kind === "trace");
+}
+
+/** A missing stored summary must never be manufactured from source evidence. */
+export function storedTraceSummary(memory: MemoryRow): string | undefined {
+  const internal = memory.properties.internal_info;
+  const trace = isRecord(internal.trace) ? internal.trace : {};
+  for (const value of [memory.info.summary, internal.summary, trace.summary]) {
+    if (typeof value !== "string") continue;
+    const cleaned = value.replace(/^\s*Summary:\s*/i, "").replace(/^\s*#{1,6}\s+/, "").trim();
+    const first = cleaned.split(/\r?\n/).find(line => line.trim())?.trim();
+    if (first && !PLACEHOLDER_LINE.test(first) && first !== "处理失败") return cleaned;
+  }
+  return undefined;
+}
+
 export function evidenceMemoryIds(memory: MemoryRow): string[] {
   const internal = memory.properties.internal_info;
   const policy = isRecord(internal.policy) ? internal.policy : {};
