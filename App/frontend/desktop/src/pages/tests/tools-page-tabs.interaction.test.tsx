@@ -27,13 +27,13 @@ afterEach(() => {
   act(() => root.unmount());
   container.remove();
 });
-async function show(section: ToolsSection) {
+async function show(section: ToolsSection, pluginUpdatesAvailable = false) {
   await act(async () => root.render(
     <I18nProvider language="zh-CN">
       <ToolsPageView tools={{ ...initialToolsState, status: "ready" }} section={section}
         searchBySection={{ connections: "github", channels: "telegram" }}
         filterBySection={{ connections: "all", channels: "all" }}
-        marketplace={<MarketplaceFixture />}
+        pluginUpdatesAvailable={pluginUpdatesAvailable} marketplace={<MarketplaceFixture />}
         onSearchChange={() => {}} onCategoryChange={() => {}} onOpenIntegration={() => {}}
         onModalClose={() => {}} onConnectionsChanged={() => {}} />
     </I18nProvider>
@@ -67,4 +67,13 @@ it("loads the marketplace only on its first visit and retains its filter on retu
   expect(loadMarketplace).toHaveBeenCalledTimes(1);
   expect(container.querySelector('[aria-label="Plugin filter fixture"]')).toBe(input);
   expect(input.value).toBe("literature");
+});
+
+it("keeps the update dot on the marketplace tab until the installed version catches up", async () => {
+  await show("connections", true);
+  expect(container.querySelector('#tools-tab-plugins [aria-label="插件有可用更新"]')).not.toBeNull();
+  await show("plugins", true);
+  expect(container.querySelector('#tools-tab-plugins [aria-label="插件有可用更新"]')).not.toBeNull();
+  await show("plugins", false);
+  expect(container.querySelector('[aria-label="插件有可用更新"]')).toBeNull();
 });

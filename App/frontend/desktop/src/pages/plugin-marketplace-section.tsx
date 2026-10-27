@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { BookOpen, Check, FileText, Loader2, LogIn, MessageSquare, MoreHorizontal, Plus, Puzzle, RefreshCw, Scale, Search, X } from "lucide-react";
+import { BookOpen, Check, Clock3, FileText, Loader2, LogIn, MessageSquare, MoreHorizontal, Plus, Puzzle, RefreshCw, Scale, Search, X } from "lucide-react";
 import type { InstalledPlugin, PluginEligibility } from "@memmy/local-api-contracts";
 import { Button } from "../components/button.js";
 import { ConfirmDialog } from "../components/confirm-dialog.js";
@@ -157,11 +157,21 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
     props.onAddToChat(plugin);
   }
 
+  function updateStatus(plugin: MarketplacePlugin) {
+    if (plugin.installed?.update) return plugin.installed.update.status;
+    if (props.busyId === plugin.id && primaryAction(plugin, signedIn, props.officialModelReady) === "update") {
+      // The Agent can be busy between plugin calls; await the Host status.
+      return "waiting";
+    }
+    return undefined;
+  }
+
   function renderPrimary(plugin: MarketplacePlugin) {
     const action = primaryAction(plugin, signedIn, props.officialModelReady);
     if (!action) return null;
     const working = props.busyId === plugin.id || isTransitioning(plugin);
-    const label = action === "unavailable" ? plugin.eligibility?.reason ? t("plugins.ui.accessUnavailable") : t("plugins.ui.comingSoon")
+    const updating = updateStatus(plugin);
+    const label = updating === "waiting" ? t("plugins.ui.updateQueued") : updating === "installing" ? t("plugins.ui.updating") : action === "unavailable" ? plugin.eligibility?.reason ? t("plugins.ui.accessUnavailable") : t("plugins.ui.comingSoon")
       : action === "update" ? t("plugins.ui.updateToVersion", { version: plugin.version! })
       : action === "install" ? t("settings.computerUse.extensionInstall")
       : action === "configure" ? t("plugins.ui.setUpOfficialModel")
@@ -170,13 +180,29 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
     // Sign-in and model setup are navigation, not lifecycle mutations, so they stay enabled while actions are disabled.
     const bypassesActionsDisabled = action === "configure" || action === "sign-in";
     return (
-      <button type="button" className="w-full rounded-xl bg-action-sky text-white text-sm font-normal py-2.5 hover:bg-action-sky-hover transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+      <button type="button" className="plugin-marketplace-detail-primary w-full rounded-xl bg-action-sky text-white text-sm font-normal py-2.5 hover:bg-action-sky-hover transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
         aria-label={action === "update" ? t("plugins.ui.update", { name: plugin.name }) : action === "install" ? t("plugins.ui.install", { name: plugin.name }) : action === "enable" ? t("plugins.ui.retryInstalling", { name: plugin.name }) : undefined}
         disabled={busy || working || action === "unavailable" || (!bypassesActionsDisabled && actionsDisabled)} onClick={() => performPrimary(plugin)}>
-        {working ? <Loader2 size={13} className="mr-1.5 animate-spin" aria-hidden="true" /> : null}
-        {working ? t("settings.computerUse.extensionPreparing") : label}
+        {working ? updating === "waiting" ? <Clock3 size={14} aria-hidden="true" /> : <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : null}
+        {updating ? label : working ? t("settings.computerUse.extensionPreparing") : label}
       </button>
     );
+  }
+
+  function renderWorking(plugin: MarketplacePlugin) {
+    const updating = updateStatus(plugin);
+    const description = updating === "waiting" ? t("plugins.ui.waitingForTasks")
+      : updating === "installing" ? t("plugins.ui.installingUpdate")
+      : t("plugins.ui.workingOn", { name: plugin.name });
+    const indicator = (
+      <span className={`plugin-marketplace-working${updating ? " plugin-marketplace-update-status" : ""}`}
+        data-update-state={updating} role="status" aria-label={description} tabIndex={updating ? 0 : undefined}>
+        {updating === "waiting" ? <Clock3 size={14} aria-hidden="true" />
+          : <Loader2 size={updating ? 14 : 16} className="animate-spin" aria-hidden="true" />}
+        {updating ? <span className="plugin-marketplace-update-label">{t(updating === "waiting" ? "plugins.ui.updateQueued" : "plugins.ui.updating")}</span> : null}
+      </span>
+    );
+    return updating ? <Tooltip content={description}>{indicator}</Tooltip> : indicator;
   }
 
   const status = (plugin: MarketplacePlugin) => {
@@ -245,8 +271,8 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
               </span>
             </button>
             <div className="plugin-marketplace-row-actions">
-              {props.busyId === plugin.id || isTransitioning(plugin) ? (
-                <span className="plugin-marketplace-working" role="status" aria-label={t("plugins.ui.workingOn", { name: plugin.name })}><Loader2 size={16} className="animate-spin" aria-hidden="true" /></span>
+              {props.busyId === plugin.id || plugin.installed?.update || isTransitioning(plugin) ? (
+                renderWorking(plugin)
               ) : pluginNeedsSignIn(plugin, signedIn) ? (
                 <Button type="button" size="sm" variant="secondary"
                   aria-label={t("plugins.ui.signInToUse", { name: plugin.name })} title={t("plugins.ui.signInToUse2")}
@@ -323,6 +349,9 @@ export function PluginMarketplaceSection(props: PluginMarketplaceSectionProps) {
               {status(detail)}{detail.installed ? ` · v${detail.installed.version}` : ""}
               {detail.version ? `${detail.installed ? " ｜ " : " · "}${t("plugins.ui.latestVersion", { version: detail.version })}` : ""}
             </span>
+            {updateStatus(detail) ? <p className="plugin-marketplace-update-note" role="status">
+              {t(updateStatus(detail) === "waiting" ? "plugins.ui.waitingForTasks" : "plugins.ui.installingUpdate")}
+            </p> : null}
             <div className="plugin-marketplace-detail-actions">
               {detail.installed ? <button type="button" className="w-full rounded-xl border border-stone-200 bg-white text-stone-700 text-sm font-normal py-2.5 hover:bg-stone-50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed" disabled={actionsDisabled} onClick={() => requestUninstall(detail)}>{t("settings.plugins.uninstall")}</button> : null}
               {renderPrimary(detail) ?? (detail.installed?.state === "active"
@@ -368,7 +397,7 @@ function detailModelNote(plugin: MarketplacePlugin, t: ReturnType<typeof useTran
 }
 
 function isTransitioning(plugin: MarketplacePlugin): boolean {
-  return plugin.installed?.state === "enabling" || plugin.installed?.state === "disabling";
+  return Boolean(plugin.installed?.update) || plugin.installed?.state === "enabling" || plugin.installed?.state === "disabling";
 }
 
 function primaryAction(plugin: MarketplacePlugin, signedIn: boolean, officialModelReady: boolean | undefined): PrimaryAction {

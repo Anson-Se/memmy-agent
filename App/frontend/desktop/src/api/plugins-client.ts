@@ -1,3 +1,4 @@
+import { notifyPluginChange } from "../lib/plugin-change-event.js";
 import {
   InstalledPluginSchema,
   PluginCatalogSchema,
@@ -75,6 +76,7 @@ export function createHttpPluginsClient(config: RuntimeConfig): PluginsClient {
       for (const key of uiCache.keys()) {
         if (key.startsWith(`${pluginId}:`)) uiCache.delete(key);
       }
+      notifyPluginChange();
       return updated;
     },
     approvePermissions(pluginId, permissions) {
@@ -94,6 +96,7 @@ export function createHttpPluginsClient(config: RuntimeConfig): PluginsClient {
     },
     async uninstall(pluginId) {
       await requestJson({ config, path: pluginEndpointPaths.plugin(pluginId), init: { method: "DELETE" }, schema: OkResponseSchema });
+      notifyPluginChange();
     },
     getUi(pluginId, slot) {
       const cacheKey = `${pluginId}:${slot}`;

@@ -274,6 +274,28 @@
   background: transparent;
   color: color-mix(in srgb, var(--color-text-ink) 58%, transparent);
 }
+.plugin-marketplace-update-status {
+  width: auto;
+  max-width: 132px;
+  height: 28px;
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-action-sky) 8%, transparent);
+  color: var(--color-action-sky-hover);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.plugin-marketplace-update-status[data-update-state="waiting"] {
+  background: color-mix(in srgb, var(--color-text-ink) 5%, transparent);
+  color: color-mix(in srgb, var(--color-text-ink) 62%, transparent);
+}
+.plugin-marketplace-update-status > svg { flex-shrink: 0; }
+.plugin-marketplace-update-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.plugin-marketplace-update-status:focus-visible { outline: 2px solid var(--color-action-sky); outline-offset: 2px; }
+.plugin-marketplace-detail-primary { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 0; padding-inline: 12px; white-space: nowrap; }
+.plugin-marketplace-update-note { margin: 0; color: color-mix(in srgb, var(--color-text-ink) 62%, transparent); font-size: 12px; line-height: 18px; }
 .plugin-marketplace-icon-button:hover:not(:disabled) { background: color-mix(in srgb, var(--color-text-ink) 6%, transparent); color: var(--color-text-ink); }
 .plugin-marketplace-icon-button:disabled,
 .plugin-marketplace-menu > [role="menuitem"]:disabled { opacity: 0.4; cursor: default; }

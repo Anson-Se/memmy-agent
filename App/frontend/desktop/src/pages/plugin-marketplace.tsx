@@ -1,3 +1,4 @@
+import { notifyPluginChange } from "../lib/plugin-change-event.js";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { InstalledPlugin, PluginCatalogEntry } from "@memmy/local-api-contracts";
 import { useApiClients } from "../app/providers.js";
@@ -83,6 +84,15 @@ export function PluginMarketplace() {
     return () => { generation.current += 1; window.clearInterval(interval); };
   }, [refresh]);
 
+  useEffect(() => {
+    if (!clients || !busyId) return;
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      void clients.plugins.list().then(plugins => { if (!disposed) setInstalled(plugins); }, () => undefined);
+    }, 1_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [clients, busyId]);
+
   async function mutate(plugin: MarketplacePlugin, operation: () => Promise<unknown>) {
     if (!clients || loading || busy.current || error) return;
     busy.current = true;
@@ -99,6 +109,7 @@ export function PluginMarketplace() {
         setActionErrorPluginId(plugin.id);
       }
     } finally {
+      notifyPluginChange();
       setBusyId(null);
       busy.current = false;
     }
