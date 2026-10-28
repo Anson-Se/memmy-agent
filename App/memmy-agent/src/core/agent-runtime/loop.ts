@@ -2780,6 +2780,8 @@ export class AgentLoop {
     return {
       role: "user",
       content: this.context.buildUserContent(content, media),
+      ...(msg.internal || msg.channel === "system" || msg.senderId === "subagent"
+        ? { internal_context: "runtime_notification" } : {}),
       ...(clientRequestId
         ? { client_request_id: clientRequestId }
         : {}),

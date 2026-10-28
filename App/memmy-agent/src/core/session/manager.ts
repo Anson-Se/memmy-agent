@@ -5,6 +5,7 @@ import { modelSelectionWire } from "../../providers/model-catalog.js";
 import { scrubSubagentAnnounceBody } from "../../utils/subagent-channel-display.js";
 import { findLegalMessageStart, imagePlaceholderText, stripThink } from "../../utils/helpers.js";
 import { visibleWebuiUserContent } from "./webui-user-content.js";
+import { projectMemmyMemoryPrompt } from "../../memmy-memory/protocol.js";
 
 export const FILE_MAX_MESSAGES = 2_000;
 const WEBUI_SESSION_METADATA_KEY = "webui";
@@ -173,7 +174,8 @@ function synthesizeContent(message: Record<string, any>, includeTimestamps: bool
   for (const key of REPLAY_EXTRA_KEYS) {
     if (key in message) entry[key] = message[key];
   }
-  return entry;
+  // Replay the original runtime identity without changing the stored user text.
+  return message.memmy_prompt ? projectMemmyMemoryPrompt({ ...entry, memmy_prompt: message.memmy_prompt }) : entry;
 }
 
 function sanitizeCrossProviderReplay(

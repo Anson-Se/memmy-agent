@@ -14,44 +14,74 @@ export type MemmyMemoryReplaySnapshot = { turnId: string; content: Record<string
 /** Bound to one runner invocation, never persisted as conversation history. */
 export type MemmyMemoryTurnContext = { turnId: string; requestOnlyContext?: string };
 
+export type MemmyMemoryPromptKind = "user_request" | "user_followup" | "runtime_notification" | "hook_continuation"
+  | "length_recovery" | "empty_recovery" | "delivery_retry" | "max_iterations";
+
+/** Keep the transcript text intact; render its runtime-owned identity only for the model. */
+export function withMemmyMemoryPrompt(
+  message: Record<string, any>,
+  context: MemmyMemoryTurnContext | null | undefined,
+  kind: MemmyMemoryPromptKind,
+): Record<string, any> {
+  return context ? { ...message, memmy_prompt: { turnId: context.turnId, kind } } : message;
+}
+
+export function projectMemmyMemoryPrompt(message: Record<string, any>): Record<string, any> {
+  const prompt = message.memmy_prompt;
+  if (message.role !== "user" || typeof prompt?.turnId !== "string" || typeof prompt.kind !== "string") return message;
+  const { memmy_prompt: _, ...projected } = message;
+  // The turn-start hook already rendered the initial request with its recall.
+  if (prompt.kind === "user_request") return projected;
+  const tag = prompt.kind === "user_followup" ? CURRENT_USER_REQUEST_TAG : "memmy_internal_prompt";
+  if (prompt.kind !== "user_followup") projected.internal_context = "memmy_internal_prompt";
+  projected.content = [
+    { type: "text", text: `<${tag}${turnIdAttribute(prompt.turnId)} kind="${escapeAttribute(prompt.kind)}">` },
+    ...(Array.isArray(message.content) ? message.content : [{ type: "text", text: String(message.content ?? "") }]),
+    { type: "text", text: `</${tag}>` },
+  ];
+  return projected;
+}
+
 export function withMemmyMemoryTurnContext(
   messages: Record<string, any>[],
   context: MemmyMemoryTurnContext | null | undefined,
 ): Record<string, any>[] {
   if (!context) return messages;
   const declaration = `<memmy_runtime_context active_turn_id="${escapeAttribute(context.turnId)}" />`;
-  const projected = [...messages];
-  // Anthropic and Responses adapters use the last system message.
-  const systemIndex = projected.findLastIndex((message) => message.role === "system");
-  if (systemIndex < 0) {
-    projected.unshift({ role: "system", content: declaration });
-  } else {
-    const system = projected[systemIndex];
-    projected[systemIndex] = {
-      ...system,
-      content: Array.isArray(system.content)
-        ? [...system.content, { type: "text", text: declaration }]
-        : `${system.content ?? ""}\n\n${declaration}`,
-    };
-  }
-  // Assistant-only notifications have no new user message to own a snapshot.
-  // Deliver their recall/status as request-only data without retagging history.
-  if (context.requestOnlyContext) {
-    const last = projected.at(-1);
-    if (last?.role === "user") {
-      // Do not create adjacent user messages: provider normalization can discard
-      // a multimodal follow-up when it merges that message with a text packet.
-      projected[projected.length - 1] = {
-        ...last,
-        content: Array.isArray(last.content)
-          ? [{ type: "text", text: context.requestOnlyContext }, ...last.content]
-          : `${context.requestOnlyContext}\n\n${last.content ?? ""}`,
-      };
+  const projected: Record<string, any>[] = [];
+  for (const message of messages) {
+    const next = projectMemmyMemoryPrompt(message);
+    const previous = projected.at(-1);
+    // Providers may otherwise replace adjacent multimodal user messages. Merge
+    // their content here, preserving each request/internal-prompt boundary.
+    if (next.role === "user" && previous?.role === "user") {
+      projected[projected.length - 1] = { ...previous, content: appendContent(previous.content, next.content) };
     } else {
-      projected.push({ role: "user", content: context.requestOnlyContext });
+      projected.push(next);
     }
   }
+  // The changing scope belongs at the request tail, after all user/tool data.
+  // System instructions and retained history must remain a reusable prefix.
+  // Background recall has no user owner and stays in this request-only suffix.
+  const suffix = [context.requestOnlyContext, declaration].filter(Boolean).join("\n\n");
+  const last = projected.at(-1);
+  if (last?.role === "user") {
+    // Preserve multimodal content without introducing adjacent user messages.
+    projected[projected.length - 1] = {
+      ...last,
+      content: appendContent(last.content, suffix),
+    };
+  } else {
+    projected.push({ role: "user", content: suffix });
+  }
   return projected;
+}
+
+function appendContent(left: any, right: any): string | Record<string, any>[] {
+  if (!Array.isArray(left) && !Array.isArray(right)) return `${left ?? ""}\n\n${right ?? ""}`;
+  const blocks = (value: any): Record<string, any>[] => Array.isArray(value)
+    ? value : [{ type: "text", text: String(value ?? "") }];
+  return [...blocks(left), ...blocks(right)];
 }
 
 export function turnIdAttribute(turnId?: string | null): string {
