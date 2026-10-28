@@ -11,6 +11,49 @@ const MEMORY_CONTEXT_TAGS = [
 
 export type MemmyMemoryReplaySnapshot = { turnId: string; content: Record<string, any>[] };
 
+/** Bound to one runner invocation, never persisted as conversation history. */
+export type MemmyMemoryTurnContext = { turnId: string; requestOnlyContext?: string };
+
+export function withMemmyMemoryTurnContext(
+  messages: Record<string, any>[],
+  context: MemmyMemoryTurnContext | null | undefined,
+): Record<string, any>[] {
+  if (!context) return messages;
+  const declaration = `<memmy_runtime_context active_turn_id="${escapeAttribute(context.turnId)}" />`;
+  const projected = [...messages];
+  // Anthropic and Responses adapters use the last system message.
+  const systemIndex = projected.findLastIndex((message) => message.role === "system");
+  if (systemIndex < 0) {
+    projected.unshift({ role: "system", content: declaration });
+  } else {
+    const system = projected[systemIndex];
+    projected[systemIndex] = {
+      ...system,
+      content: Array.isArray(system.content)
+        ? [...system.content, { type: "text", text: declaration }]
+        : `${system.content ?? ""}\n\n${declaration}`,
+    };
+  }
+  // Assistant-only notifications have no new user message to own a snapshot.
+  // Deliver their recall/status as request-only data without retagging history.
+  if (context.requestOnlyContext) {
+    const last = projected.at(-1);
+    if (last?.role === "user") {
+      // Do not create adjacent user messages: provider normalization can discard
+      // a multimodal follow-up when it merges that message with a text packet.
+      projected[projected.length - 1] = {
+        ...last,
+        content: Array.isArray(last.content)
+          ? [{ type: "text", text: context.requestOnlyContext }, ...last.content]
+          : `${context.requestOnlyContext}\n\n${last.content ?? ""}`,
+      };
+    } else {
+      projected.push({ role: "user", content: context.requestOnlyContext });
+    }
+  }
+  return projected;
+}
+
 export function turnIdAttribute(turnId?: string | null): string {
   return turnId ? ` turn_id="${escapeAttribute(turnId)}"` : "";
 }

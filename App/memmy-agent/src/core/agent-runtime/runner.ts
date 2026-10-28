@@ -1,4 +1,5 @@
 import { requestTiming } from "../../utils/request-timing.js";
+import { withMemmyMemoryTurnContext, type MemmyMemoryTurnContext } from "../../memmy-memory/protocol.js";
 import crypto from "node:crypto";
 import { redactBrowserAuthArguments } from "../../utils/browser-auth-privacy.js";
 import path from "node:path";
@@ -155,6 +156,7 @@ export class AgentRunSpec {
   maxToolResultChars: number;
   toolResultCompressionEnabled: boolean;
   memoryContextCallback?: (turnId: string, content: Record<string, any>[]) => void;
+  memoryTurnContext: MemmyMemoryTurnContext | null = null;
   toolResultMaxCharsByName: ToolResultMaxCharsByName;
   failOnToolError: boolean;
   concurrentTools: boolean;
@@ -840,6 +842,9 @@ export class AgentRunner {
     const provider = spec.provider ?? this.provider;
     if (!provider) throw new Error("AgentRunSpec.provider is required");
     if (spec.abortSignal?.aborted) return abortedResponse();
+    // Every model request (including recovery/finalization retries) gets the
+    // same runtime-owned scope. Project a copy before the final budget guard.
+    messages = withMemmyMemoryTurnContext(messages, spec.memoryTurnContext);
     const boundary = spec.boundary ?? null;
     const shouldEmitLive = (): boolean => boundary?.shouldEmitLive() ?? spec.abortSignal?.aborted !== true;
     const timeoutS = normalizeTimeout(spec.llmTimeoutS);
@@ -1434,7 +1439,9 @@ export class AgentRunner {
     messages: Record<string, any>[],
     options: PrepareMessagesOptions,
   ): number {
-    const prepared = this.prepareMessagesBeforeSnip(spec, messages);
+    const prepared = withMemmyMemoryTurnContext(
+      this.prepareMessagesBeforeSnip(spec, messages), spec.memoryTurnContext,
+    );
     const estimateResult = estimatePromptTokensChain(
       spec.provider ?? this.provider,
       spec.model ?? null,
@@ -1513,7 +1520,7 @@ export class AgentRunner {
     const estimateResult = estimatePromptTokensChain(
       spec.provider ?? this.provider,
       spec.model ?? null,
-      messages,
+      withMemmyMemoryTurnContext(messages, spec.memoryTurnContext),
       options.toolsForRequest ?? [],
     );
     const estimate = Array.isArray(estimateResult) ? estimateResult[0] : estimateResult;
@@ -1525,7 +1532,7 @@ export class AgentRunner {
       const result = estimatePromptTokensChain(
         spec.provider ?? this.provider,
         spec.model ?? null,
-        candidate,
+        withMemmyMemoryTurnContext(candidate, spec.memoryTurnContext),
         options.toolsForRequest ?? [],
       );
       return Array.isArray(result) ? result[0] : result;
@@ -1649,6 +1656,7 @@ export class AgentRunner {
 
   async run(spec: AgentRunSpec): Promise<AgentRunResult> {
     spec.turnId ??= crypto.randomUUID();
+    spec.memoryTurnContext = null;
     spec.provider ??= this.provider;
     if (!spec.provider) throw new Error("AgentRunSpec.provider is required");
     const hook = spec.hook ?? new AgentHook();

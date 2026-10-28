@@ -117,10 +117,18 @@ describe("local agent memory smoke plan", () => {
     });
 
     expect(registry.toolNames.sort()).toEqual(["memmy_memory_get", "memmy_memory_search"]);
-    expect(searchResult).toContain('<memmy_memory_context source="tool_search">');
+    const searchTag = searchResult.match(/<memmy_memory_context\b([^>]*)>/)?.[1];
+    expect(searchTag).toContain('source="tool_search"');
+    expect(searchTag).toContain('turn_id="turn-smoke"');
     expect(searchResult).toContain("Verified release attachment history.");
-    expect(searchResult).toContain("<current_user_request>\nPublish v1.0.2 safely\n</current_user_request>");
-    expect(getResult).toContain('<memmy_memory_context source="tool_get">');
+    const getTag = getResult.match(/<memmy_memory_context\b([^>]*)>/)?.[1];
+    expect(getTag).toContain('source="tool_get"');
+    expect(getTag).toContain('turn_id="turn-smoke"');
+    for (const result of [searchResult, getResult]) {
+      const request = result.match(/<current_user_request\b([^>]*)>([\s\S]*?)<\/current_user_request>/);
+      expect(request?.[1]).toContain('turn_id="turn-smoke"');
+      expect(request?.[2].trim()).toBe("Publish v1.0.2 safely");
+    }
     expect(getResult).toContain("User:\nWhich files ship in v1.0.2?");
     expect(getResult).toContain("Assistant:\nFour signed desktop installers.");
     expect(getResult).not.toContain("embedding");
