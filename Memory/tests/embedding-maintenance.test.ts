@@ -43,15 +43,15 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     const { repos, service, inputs } = setup();
     for (let i = 0; i < 55; i++) repos.memories.insert(memory(`m-${i}`, { dimension: i ? 3 : undefined }));
     const before = repos.vectors.exportRows();
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     expect(run).toMatchObject({ mode: "repair", enqueued: 1, updated: 0, pending: 1, done: false });
     expect(adaptViewerResponse("POST", "/api/v1/embeddings/rebuild", {}, run)).toEqual(run);
-    expect(service.rebuildEmbeddings("repair").runId).toBe(run.runId);
+    expect((await service.rebuildEmbeddings("repair")).runId).toBe(run.runId);
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ updated: 1, failed: 0, pending: 0, done: true });
     expect(inputs).toHaveLength(1);
     expect(repos.vectors.exportRows().filter(row => row.memory_id !== "m-0")).toEqual(before);
-    const rebuild = service.rebuildEmbeddings("rebuild");
+    const rebuild = await service.rebuildEmbeddings("rebuild");
     expect(rebuild.enqueued).toBe(55);
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(rebuild.runId)).toMatchObject({ updated: 55, failed: 0, done: true });
@@ -65,34 +65,34 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     repos.memories.insert(memory("unknown", { dimension: 1024, model: null }));
     repos.memories.insert(memory("wrong-dim", { dimension: 384 }));
     repos.memories.insert(memory("missing"));
-    expect(service.embeddingMaintenanceStats()).toMatchObject({ dimension: 1024, ready: 1, modelMismatch: 2, dimMismatch: 1, missing: 1, needsRepair: 4 });
+    expect(await service.embeddingMaintenanceStats()).toMatchObject({ dimension: 1024, ready: 1, modelMismatch: 2, dimMismatch: 1, missing: 1, needsRepair: 4 });
     const query = rememberEmbeddingIdentity(vector(1024), identity);
     expect(repos.memories.searchVectorIds(query, "vec").map(hit => hit.id)).toEqual(["current"]);
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     expect(run.enqueued).toBe(4);
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ updated: 4, done: true, statsAfter: { ready: 5, needsRepair: 0 } });
     expect(repos.memories.searchVectorIds(query, "vec")).toHaveLength(5);
   });
 
-  it("counts an existing L1 action independently from its missing summary vector", () => {
+  it("counts an existing L1 action independently from its missing summary vector", async () => {
     const { repos, service } = setup();
     repos.memories.insert(memory("action-only", { dimension: 3, field: "vec_action", layer: "L1" }));
-    expect(service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 2, missing: 1, ready: 1 });
+    expect(await service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 2, missing: 1, ready: 1 });
   });
 
-  it("does not use foreign model dimensions as the current dimension", () => {
+  it("does not use foreign model dimensions as the current dimension", async () => {
     const embedder = model([]);
     embedder.config.extraBody = undefined;
     const { repos, service } = setup([], embedder);
     repos.memories.insert(memory("old", { dimension: 1024, model: "old-cloud-model" }));
-    expect(service.embeddingMaintenanceStats()).toMatchObject({ dimension: 0, ready: 0, modelMismatch: 1 });
+    expect(await service.embeddingMaintenanceStats()).toMatchObject({ dimension: 3, ready: 0, modelMismatch: 1 });
   });
 
   it("reports actual progress across 301 targets and retains the run after service recreation", async () => {
     const { repos, service, db, embedder, inputs } = setup();
     for (let i = 0; i < 301; i++) repos.memories.insert(memory(`m-${i}`));
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     expect(run).toMatchObject({ enqueued: 301, updated: 0, done: false });
     await service.runWorkerOnce(200);
     const middle = service.embeddingMaintenanceProgress(run.runId)!;
@@ -115,7 +115,7 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     embedder.embed = async texts => { entered(); await gate; return texts.map(() => vector()); };
     const { repos, service } = setup([], embedder);
     repos.memories.insert(memory("pending"));
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     const worker = service.runWorkerOnce(200);
     await started;
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ updated: 0, pending: 1, done: false });
@@ -128,7 +128,7 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     embedder.embed = async () => { throw new Error("synthetic provider unavailable"); };
     const { repos, service, db } = setup([], embedder);
     repos.memories.insert(memory("failure"));
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ updated: 0, failed: 0, pending: 1, retrying: 1, done: false });
     db.db.prepare("UPDATE embedding_retry_queue SET max_attempts = 2, next_attempt_at = 0").run();
@@ -143,9 +143,9 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
       repos.userMemories.insert({ ...buildUserMemory({ id, sourceTurnId: id, userId, memoryTypes: ["User Preference"], content: `I prefer ${id}`, createdAt: at }),
         embedding: vector(), embeddingModel: current ? identity.model : "old-model", embeddingProvider: identity.provider });
     }
-    expect(service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 2, ready: 1, modelMismatch: 1 });
+    expect(await service.embeddingMaintenanceStats()).toMatchObject({ totalSlots: 2, ready: 1, modelMismatch: 1 });
     expect(repos.userMemories.searchVectorIds("local-user", rememberEmbeddingIdentity(vector(), identity), 10).map(hit => hit.id)).toEqual(["healthy"]);
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ enqueued: 1, updated: 1, failed: 0, done: true });
     expect(repos.userMemories.get("foreign")!.embeddingModel).toBe("old-model");
@@ -160,7 +160,7 @@ describe("embedding maintenance regressions (MEMMY-709–711)", () => {
     embedder.embed = async texts => { entered(); await gate; return texts.map(() => vector()); };
     const { repos, service } = setup([], embedder);
     repos.memories.insert(memory("inflight"));
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     const worker = service.runWorkerOnce(200);
     await started;
     embedder.config.model = "new-model";

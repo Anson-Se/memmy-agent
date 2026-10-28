@@ -124,7 +124,7 @@ describe("one-time upgrade repair", () => {
   it("keeps separate summary/action targets in manual maintenance", async () => {
     const { service, repos } = setup();
     repos.memories.insert(withVector(record("both-fields", "L1"), "vec_action", null));
-    const run = service.rebuildEmbeddings("repair");
+    const run = await service.rebuildEmbeddings("repair");
     expect(run.enqueued).toBe(2);
     await service.runWorkerOnce(200);
     expect(service.embeddingMaintenanceProgress(run.runId)).toMatchObject({ updated: 2, failed: 0, done: true });

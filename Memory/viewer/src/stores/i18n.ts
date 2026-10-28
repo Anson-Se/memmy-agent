@@ -893,7 +893,10 @@ const en = {
     "Model ID: Xenova/all-MiniLM-L6-v2 · 384 dimensions · Inference runs on this device, and memory text is not sent to an external embedding API. The first test or use checks and prepares the model files.",
   "settings.embedding.maintenance.title": "Embedding maintenance",
   "settings.embedding.maintenance.stats":
-    "Ready {ready}/{total}; missing {missing}; dimension mismatch {mismatch}; model mismatch/unknown {modelMismatch}; current dim {dim}.",
+    "Ready {ready}/{total}; missing {missing}; dimension mismatch {mismatch}; model mismatch/unknown {modelMismatch}; outdated content {contentMismatch}; current dim {dim}.",
+  "settings.embedding.maintenance.queue":
+    "Embedding tasks: pending {pending}; valid lease {active}; stale or unclaimed {stale}; failed {failed}.",
+  "settings.embedding.maintenance.dimensionError": "Unable to check the current embedding dimension: {error}",
   "settings.embedding.maintenance.unavailable":
     "Configure an embedding provider before repairing or rebuilding vectors.",
   "settings.embedding.maxInputTokens.label": "Maximum input tokens",
@@ -904,7 +907,7 @@ const en = {
     "Maximum texts per provider request. Rejected oversized batches are split automatically.",
   "settings.embedding.repair": "Repair missing/mismatched",
   "settings.embedding.rebuild": "Rebuild all vectors",
-  "settings.embedding.rebuild.running": "Rebuilding embeddings…",
+  "settings.embedding.rebuild.running": "Scheduling embedding work…",
   "settings.embedding.rebuild.progress":
     "Updated {updated}, failed {failed}, pending {remaining} (retrying {retrying}).",
   "settings.embedding.rebuild.done": "Embedding rebuild complete: updated {updated}, failed {failed}.",
@@ -1852,7 +1855,10 @@ const zh: Record<TranslationKey, string> = {
     "模型 ID：Xenova/all-MiniLM-L6-v2 · 384 维 · 推理完全在本机进行，记忆文本不会发送到外部 Embedding API。首次测试或使用时会检查并准备模型文件。",
   "settings.embedding.maintenance.title": "向量维护",
   "settings.embedding.maintenance.stats":
-    "可用 {ready}/{total}；缺失 {missing}；维度不匹配 {mismatch}；模型不匹配/未知 {modelMismatch}；当前维度 {dim}。",
+    "可用 {ready}/{total}；缺失 {missing}；维度不匹配 {mismatch}；模型不匹配/未知 {modelMismatch}；内容待更新 {contentMismatch}；当前维度 {dim}。",
+  "settings.embedding.maintenance.queue":
+    "向量任务队列：待处理 {pending}；租约有效 {active}；无主或租约失效 {stale}；失败 {failed}。",
+  "settings.embedding.maintenance.dimensionError": "无法确认当前向量维度：{error}",
   "settings.embedding.maintenance.unavailable": "请先配置嵌入模型，再修复或重建向量。",
   "settings.embedding.maxInputTokens.label": "单条输入最大 Token 数",
   "settings.embedding.maxInputTokens.hint": "已知 OpenAI Embedding 模型使用 7500 Token 分块预算；模型信息不透明的 OpenAI 兼容服务使用保守的 4000 Token 预算。上下文窗口更短时可设置更低预算，修改后请重建向量。",

@@ -233,15 +233,17 @@ export async function routeViewerRequest(
     return { body: await context.service.testModels() };
   }
   if (method === "GET" && path === "/api/v1/embeddings/maintenance") {
-    return { body: context.service.embeddingMaintenanceStats() };
+    return { body: await context.service.embeddingMaintenanceStats() };
   }
   if (method === "GET" && path === "/api/v1/embeddings/rebuild") {
-    return { body: context.service.embeddingMaintenanceProgress(url.searchParams.get("runId") ?? undefined) };
+    return { body: await context.service.embeddingMaintenanceProgress(url.searchParams.get("runId") ?? undefined) };
   }
   if (method === "POST" && path === "/api/v1/embeddings/rebuild") {
-    const mode = body && typeof body === "object" && "mode" in body ? body.mode : "rebuild";
-    if (mode !== "repair" && mode !== "rebuild") throw new MemoryServiceError("invalid_argument", "Invalid embedding maintenance mode");
-    const result = context.service.rebuildEmbeddings(mode);
+    const requestedMode = body && typeof body === "object" ? (body as Record<string, unknown>).mode : undefined;
+    if (requestedMode !== undefined && requestedMode !== "repair" && requestedMode !== "rebuild") {
+      throw new MemoryServiceError("invalid_argument", "mode must be repair or rebuild");
+    }
+    const result = await context.service.rebuildEmbeddings(requestedMode ?? "rebuild");
     context.scheduleWorker();
     return { status: 202, body: result };
   }

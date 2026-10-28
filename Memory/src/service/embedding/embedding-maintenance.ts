@@ -9,7 +9,7 @@ import { embeddingTextForMemory, traceSummaryEmbeddingText, traceActionEmbedding
 import { canonicalWorkMemoryText } from "../work-memory/work-memory-pipeline.js";
 
 type Mode = "repair" | "rebuild";
-type Health = "ready" | "missing" | "dimMismatch" | "modelMismatch";
+type Health = "ready" | "missing" | "dimMismatch" | "modelMismatch" | "contentMismatch";
 interface Target {
   id: string;
   kind: "memory" | "user_memory";
@@ -42,6 +42,9 @@ export interface EmbeddingMaintenanceStats {
   dimMismatch: number;
   modelMismatch: number;
   needsRepair: number;
+  contentMismatch?: number;
+  dimensionError?: string;
+  retryQueue?: { pending: number; active: number; stale: number; failed: number };
 }
 export interface EmbeddingMaintenanceRunResult {
   runId: string;
@@ -62,6 +65,7 @@ interface Dependencies {
   repos: Repositories;
   embedder: Embedder;
   userId: string;
+  currentWork?(dimension: number): { retryQueue: { pending: number; active: number; stale: number; failed: number }; outdatedVectors: Set<string> };
   enqueueMemory(memory: MemoryRow, text: string, at: string, vectorField?: EmbeddingRetryVectorField): string;
   enqueueUserMemory(memory: UserMemoryRecord, at: string): string;
 }
@@ -93,29 +97,32 @@ export class EmbeddingMaintenance {
       : identity.provider === "local" && identity.model === "Xenova/all-MiniLM-L6-v2"
         ? 384
         : [...dimensions].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? 0);
+    const work = this.deps.currentWork?.(dimension);
     const health = (entry: EmbeddingMaintenanceEntry): Health => {
       if (entry.dimension <= 0) return "missing";
       if (!sameEmbeddingIdentity(entry, identity)) return "modelMismatch";
-      return dimension > 0 && entry.dimension !== dimension ? "dimMismatch" : "ready";
+      if (dimension > 0 && entry.dimension !== dimension) return "dimMismatch";
+      return work?.outdatedVectors.has(targetKey(entry)) ? "contentMismatch" : "ready";
     };
     const stats: EmbeddingMaintenanceStats = {
       dimension, available: this.deps.embedder.status().configured, totalSlots: entries.length,
-      ready: 0, missing: 0, dimMismatch: 0, modelMismatch: 0, needsRepair: 0
+      ready: 0, missing: 0, dimMismatch: 0, modelMismatch: 0, contentMismatch: 0, needsRepair: 0,
+      ...(work ? { retryQueue: work.retryQueue } : {})
     };
-    for (const entry of entries) stats[health(entry)] += 1;
-    stats.needsRepair = stats.missing + stats.dimMismatch + stats.modelMismatch;
+    for (const entry of entries) { const state = health(entry); stats[state] = (stats[state] ?? 0) + 1; }
+    stats.needsRepair = stats.missing + stats.dimMismatch + stats.modelMismatch + (stats.contentMismatch ?? 0);
     return { entries, identity, health, stats };
   }
 
-  stats(): EmbeddingMaintenanceStats { return this.snapshot().stats; }
+  stats(dimension?: number): EmbeddingMaintenanceStats { return this.snapshot(dimension).stats; }
 
-  start(mode: Mode): EmbeddingMaintenanceRunResult {
-    const snapshot = this.snapshot();
+  start(mode: Mode, dimension?: number): EmbeddingMaintenanceRunResult {
+    const snapshot = this.snapshot(dimension);
     if (!snapshot.stats.available) throw new MemoryServiceError("invalid_argument", "Embedding model is unavailable");
     const previous = this.progress();
     if (previous && !previous.done) return previous;
     const at = new Date().toISOString();
-    const run: Run = { runId: newId("embedding_maintenance"), mode, identity: snapshot.identity, createdAt: at, targets: [] };
+    const run: Run = { runId: newId("embedding_maintenance"), mode, identity: snapshot.identity, dimension, createdAt: at, targets: [] };
     // The snapshot and enqueue are one transaction: another poll never observes a partial run.
     this.deps.repos.transaction(() => {
       for (const entry of snapshot.entries) {
@@ -235,7 +242,7 @@ export class EmbeddingMaintenance {
   }
 
   private refresh(run: Run): EmbeddingMaintenanceRunResult {
-    const { entries, health, identity, stats } = this.snapshot(run.purpose === "upgrade" ? run.dimension : undefined);
+    const { entries, health, identity, stats } = this.snapshot(run.dimension);
     let changed = false;
     if (!run.completedAt && (run.purpose === "upgrade" || run.targets.some((target) => !target.result)) && (run.identity.provider !== identity.provider || run.identity.model !== identity.model)) {
       if (!run.error) {

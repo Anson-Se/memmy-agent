@@ -738,7 +738,7 @@ function modelProviderLabel(
   return provider;
 }
 
-function EmbeddingMaintenancePanel() {
+export function EmbeddingMaintenancePanel() {
   const [stats, setStats] = useState<EmbeddingMaintenanceStats | null>(null);
   const [running, setRunning] = useState<"repair" | "rebuild" | null>(null);
   const [status, setStatus] = useState<{ kind: "ok" | "error" | "muted"; text: string } | null>(null);
@@ -798,12 +798,15 @@ function EmbeddingMaintenancePanel() {
   };
 
   const healthText = stats
-    ? t("settings.embedding.maintenance.stats", {
+    ? stats.dimensionError
+      ? t("settings.embedding.maintenance.dimensionError", { error: stats.dimensionError })
+      : t("settings.embedding.maintenance.stats", {
         ready: stats.ready,
         total: stats.totalSlots,
         missing: stats.missing,
         mismatch: stats.dimMismatch,
         modelMismatch: stats.modelMismatch,
+        contentMismatch: stats.contentMismatch ?? 0,
         dim: stats.dimension,
       })
     : t("common.loading");
@@ -821,6 +824,14 @@ function EmbeddingMaintenancePanel() {
           <div class="muted" style="font-size:var(--fs-xs);margin-top:2px">
             {healthText}
           </div>
+          {stats?.retryQueue && <div class="muted" style="font-size:var(--fs-xs);margin-top:2px">
+            {t("settings.embedding.maintenance.queue", {
+              pending: stats.retryQueue.pending,
+              active: stats.retryQueue.active,
+              stale: stats.retryQueue.stale,
+              failed: stats.retryQueue.failed,
+            })}
+          </div>}
         </div>
         <div class="hstack" style="gap:var(--sp-2);flex-wrap:wrap">
           <button class="btn btn--sm" onClick={() => void refresh()} disabled={!!running}>
