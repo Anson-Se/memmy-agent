@@ -106,6 +106,9 @@
 .agent-task-plan-bar__status--completed {
   color: var(--color-action-sky);
 }
+.agent-task-plan-bar__status--paused {
+  color: color-mix(in srgb, var(--color-text-ink) 55%, transparent);
+}
 .agent-task-plan-bar__status--blocked {
   color: var(--color-status-error);
 }

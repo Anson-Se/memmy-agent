@@ -3231,6 +3231,7 @@ export function HomePage() {
                 forceMessageActionsForMessageId={firstEncounterRelayAnswerMessageId}
                 retryWaitStatus={state.agent.currentChatId ? state.agent.retryWaitStatusByChatId[state.agent.currentChatId] ?? null : null}
                 isSending={state.agent.isSending}
+                activeTurnId={currentActiveTurnId}
                 taskPlan={state.agent.taskPlanState}
                 pluginInteractionStatus={features.processInteraction}
                 sanitizePlatformApiErrors={sanitizePlatformApiErrors}

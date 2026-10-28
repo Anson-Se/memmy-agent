@@ -97,6 +97,7 @@ interface AgentThreadMessagesProps {
   chatScopeKey: string;
   historyVersion?: number;
   isSending?: boolean;
+  activeTurnId?: string | null;
   taskPlan?: AgentTaskPlanState | null;
   pluginInteractionStatus?: { label: string; agentToolCallId: string | null; awaiting: boolean } | null;
   sanitizePlatformApiErrors?: boolean;
@@ -192,11 +193,17 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
     const next: Record<string, boolean> = {};
     for (const unit of units) {
       if (unit.type === "activity") {
-        next[unit.activityKey] = isActivityDisplayRunning(unit, props.isSending, held.has(unit.activityKey), units);
+        next[unit.activityKey] = isActivityDisplayRunning(unit, props.isSending, held.has(unit.activityKey), units, props.activeTurnId);
       }
     }
     return next;
-  }, [props.isSending, units]);
+  }, [props.activeTurnId, props.isSending, units]);
+  const taskPlanToolActive = props.isSending === true && units.some((unit) => (
+    unit.type === "activity"
+    && !unit.stoppedByUser
+    && activityRunningByKey[unit.activityKey] === true
+    && unit.messages.some((message) => (message.toolEvents ?? []).some(isTaskPlanActivationEvent))
+  ));
 
   useEffect(() => {
     setManualOpenByActivityKey({});
@@ -258,6 +265,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
                 bodyId={unit.bodyId}
                 messages={unit.messages}
                 taskPlan={index === taskPlanAnchor ? props.taskPlan : null}
+                taskPlanRunActive={taskPlanToolActive}
                 pluginInteractionStatus={index === interactionAnchor ? processInteraction : null}
                 isRunning={isAutoOpenRunning}
                 stoppedByUser={unit.stoppedByUser}
@@ -300,7 +308,7 @@ export const AgentThreadMessages = memo(function AgentThreadMessages(props: Agen
         );
       })}
       {processInteraction && interactionAnchor < 0 ? <ProcessInteractionStatusLine status={processInteraction} /> : null}
-      {props.taskPlan?.plan_id && taskPlanAnchor < 0 ? <AgentTaskPlanBar plan={props.taskPlan} runActive={props.isSending} /> : null}
+      {props.taskPlan?.plan_id && taskPlanAnchor < 0 ? <AgentTaskPlanBar plan={props.taskPlan} runActive={taskPlanToolActive} /> : null}
       {shouldShowThinkingPlaceholder(props.messages, props.isSending) && (
         <ThinkingPlaceholder />
       )}
@@ -319,6 +327,7 @@ function areAgentThreadMessagesPropsEqual(previous: AgentThreadMessagesProps, ne
     && previous.chatScopeKey === next.chatScopeKey
     && previous.historyVersion === next.historyVersion
     && previous.isSending === next.isSending
+    && previous.activeTurnId === next.activeTurnId
     && previous.taskPlan === next.taskPlan
     && previous.pluginInteractionStatus?.label === next.pluginInteractionStatus?.label
     && previous.pluginInteractionStatus?.agentToolCallId === next.pluginInteractionStatus?.agentToolCallId
@@ -435,8 +444,19 @@ function lastUserMessageId(messages: AgentChatMessage[]): string | null {
   return null;
 }
 
-function isActivityAutoOpenRunning(unit: Extract<AgentDisplayUnit, { type: "activity" }>, isSending: boolean | undefined): boolean {
-  return Boolean(unit.isRunning || (isSending && unit.isCurrentTurnActivity && !unit.stoppedByUser));
+function activityMatchesActiveTurn(unit: Extract<AgentDisplayUnit, { type: "activity" }>, activeTurnId: string | null | undefined): boolean {
+  if (!activeTurnId) return unit.isCurrentTurnActivity;
+  const turnIds = unit.messages.flatMap((message) => message.turnId ? [message.turnId] : []);
+  return turnIds.length ? turnIds.includes(activeTurnId) : unit.isCurrentTurnActivity;
+}
+
+function isActivityAutoOpenRunning(
+  unit: Extract<AgentDisplayUnit, { type: "activity" }>,
+  isSending: boolean | undefined,
+  activeTurnId: string | null | undefined
+): boolean {
+  if (unit.stoppedByUser || isSending === false) return false;
+  return activityMatchesActiveTurn(unit, activeTurnId) && Boolean(unit.isRunning || isSending);
 }
 
 /**
@@ -451,10 +471,13 @@ function isActivityDisplayRunning(
   unit: Extract<AgentDisplayUnit, { type: "activity" }>,
   isSending: boolean | undefined,
   heldLive: boolean,
-  units: AgentDisplayUnit[]
+  units: AgentDisplayUnit[],
+  activeTurnId: string | null | undefined
 ): boolean {
-  if (isActivityAutoOpenRunning(unit, isSending)) return true;
-  return heldLive && isSending === true && !unit.stoppedByUser && activityStillOwnsLiveTurn(unit, units);
+  if (isActivityAutoOpenRunning(unit, isSending, activeTurnId)) return true;
+  return heldLive && isSending === true && !unit.stoppedByUser
+    && (!activeTurnId || activityMatchesActiveTurn(unit, activeTurnId))
+    && activityStillOwnsLiveTurn(unit, units);
 }
 
 function activityStillOwnsLiveTurn(
@@ -2374,6 +2397,7 @@ function AgentActivityCluster(props: {
   bodyId: string;
   messages: AgentChatMessage[];
   taskPlan?: AgentTaskPlanState | null;
+  taskPlanRunActive?: boolean;
   pluginInteractionStatus?: AgentThreadMessagesProps["pluginInteractionStatus"];
   isRunning: boolean;
   stoppedByUser: boolean;
@@ -2422,7 +2446,7 @@ function AgentActivityCluster(props: {
                 segment={segment}
                 t={t}
                 isLive={props.isRunning && index === segments.length - 1}
-                runActive={props.isRunning}
+                runActive={props.taskPlanRunActive === true}
                 isOnlySegment={segments.length === 1}
                 artifactClient={props.artifactClient}
                 onPreviewFile={props.onPreviewFile}
@@ -2954,6 +2978,10 @@ type ActivitySegment = ActivityThoughtSegment | ActivityNarrationSegment | Activ
 
 function isTaskPlanToolEvent(event: AgentToolProgressEvent): boolean {
   return toolEventName(event) === "create_task_plan" || toolEventName(event) === "update_task_plan";
+}
+
+function isTaskPlanActivationEvent(event: AgentToolProgressEvent): boolean {
+  return isTaskPlanToolEvent(event) || toolEventName(event) === "get_task_plan";
 }
 
 /** A plan stays at its creation step while updates change that card in place. */

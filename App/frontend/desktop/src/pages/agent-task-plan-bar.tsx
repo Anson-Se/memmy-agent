@@ -24,7 +24,7 @@ export interface AgentTaskPlanBarProps {
 
 export function AgentTaskPlanBar({ plan, embeddedInProcess = false, runActive = false }: AgentTaskPlanBarProps) {
   const { t } = useTranslation();
-  const autoCollapsed = plan.status !== "active" || (embeddedInProcess && !runActive);
+  const autoCollapsed = plan.status !== "active" || !runActive;
   const [collapsed, setCollapsed] = useState(autoCollapsed);
 
   useEffect(() => {
@@ -38,14 +38,15 @@ export function AgentTaskPlanBar({ plan, embeddedInProcess = false, runActive = 
     completed,
     total: plan.items.length,
   });
+  const visibleStatus = plan.status === "active" && !runActive ? "paused" : plan.status;
   const header = <>
     <span className="agent-task-plan-bar__heading">
       <ListChecks aria-hidden="true" />
       <span className="agent-task-plan-bar__title">{t("home.taskPlan.title")}</span>
     </span>
     <span className="agent-task-plan-bar__summary">
-      {!embeddedInProcess ? <span className={`agent-task-plan-bar__status agent-task-plan-bar__status--${plan.status}`}>
-        {t(`home.taskPlan.status.${plan.status}`)}
+      {!embeddedInProcess ? <span className={`agent-task-plan-bar__status agent-task-plan-bar__status--${visibleStatus}`}>
+        {t(`home.taskPlan.status.${visibleStatus}`)}
       </span> : null}
       <span className="agent-task-plan-bar__progress">{progressLabel}</span>
       <ChevronDown className="agent-task-plan-bar__chevron" aria-hidden="true" />
@@ -67,7 +68,7 @@ export function AgentTaskPlanBar({ plan, embeddedInProcess = false, runActive = 
       {!collapsed ? (
         <ol className="agent-task-plan-bar__items">
           {plan.items.map((item) => {
-            const status = embeddedInProcess && !runActive && item.status === "in_progress" ? "pending" : item.status;
+            const status = !runActive && item.status === "in_progress" ? "pending" : item.status;
             return (
             <li
               key={item.id}

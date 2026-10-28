@@ -4860,6 +4860,7 @@ function hasLoadedMessagePayload(message: AgentChatMessage): boolean {
     || message.reasoning?.trim()
     || message.media?.length
     || message.traces?.length
+    || message.toolEvents?.length
     || message.fileEdits?.length
   );
 }
