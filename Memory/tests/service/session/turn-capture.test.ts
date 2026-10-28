@@ -650,7 +650,8 @@ describe("MemoryService / session / turn capture", () => {
         agent: "The command completed."
       })
     ]);
-    expect(memoryAddOutput.details[0]?.summary).toMatch(/^RawTurn:/);
+    // No summary has been generated yet; internal body markers are not summaries.
+    expect(memoryAddOutput.details[0]?.summary).toBe("");
 
     db.close();
   });

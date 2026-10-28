@@ -246,7 +246,7 @@ export class PanelReadModel {
         const summary = memory && detail.role === "trace" ? detailSummaryForMemory(memory) : undefined;
         const key = detail.role === "span" ? "spanGoal" : "summary";
         const value = spanGoal ?? summary;
-        if (!value || detail[key] === value) return detail;
+        if (value === undefined || (detail.role === "span" && !value) || detail[key] === value) return detail;
         changed = true;
         return { ...detail, [key]: value };
       });
