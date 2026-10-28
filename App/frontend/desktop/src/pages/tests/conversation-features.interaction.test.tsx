@@ -78,6 +78,17 @@ describe("conversation feature integration", () => {
     expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
+  it("offers scenarios from active installed plugins on the new-task screen", async () => {
+    const scenario = { id: "labor-risk-diagnosis", name: "用工风险诊断", description: "生成诊断报告",
+      icon: "scale", prompt: "帮我生成诊断报告" };
+    mocks.list.mockResolvedValue([
+      { ...plugin, manifest: { ...plugin.manifest, scenarios: [scenario] } },
+      { ...plugin, id: "disabled-legal", state: "disabled", manifest: { ...plugin.manifest, scenarios: [scenario] } }
+    ]);
+    await act(async () => render());
+    expect(features.scenarios).toEqual([{ ...scenario, pluginId: "legal-labor" }]);
+  });
+
   it("publishes an idle interview for the shared right task panel", async () => {
     mocks.chatId = "legal-chat";
     await act(async () => render());

@@ -333,14 +333,14 @@ describe("HomePage", () => {
     expect(source).toContain("const activeConversationTitle = state.agent.currentSessionKey");
     expect(source).toContain("const activeImTitleDisplay = imChannelTitleDisplay(activeConversationTitle);");
     expect(source).toContain("formatConversationTitleForDisplay(activeImTitleDisplay?.title ?? activeConversationTitle)");
-    expect(source).toContain("topBar={hasActiveConversation ? (");
+    expect(source).toContain("topBar={hasConversationShell ? (");
     expect(source).toContain("<AgentThreadToolbar");
     expect(source).toContain("title={activeConversationTitleDisplay}");
     expect(source).toContain("titleTrailing={activeImTitleDisplay ? <ImChannelTitleIcon");
     expect(source).not.toContain("selectedDraftProject?.name");
-    expect(source).toContain("topBarBorder={hasActiveConversation}");
-    expect(source).toContain("topBarInset={hasActiveConversation ? false : undefined}");
-    expect(source).toContain("windowsTitlebarSafe={hasActiveConversation}");
+    expect(source).toContain("topBarBorder={hasConversationShell}");
+    expect(source).toContain("topBarInset={hasConversationShell ? false : undefined}");
+    expect(source).toContain("windowsTitlebarSafe={hasConversationShell}");
     expect(source).not.toContain("agent-conversation-titlebar");
     expect(source).toContain("app-frame-page-content agent-conversation-scroll flex-1 overflow-y-auto");
     expect(source).toContain("onScroll={handleAgentConversationScroll}");

@@ -105,6 +105,7 @@ import {
   writePendingFirstEncounterTaskLaunch
 } from "./first-encounter-task-launch.js";
 import { HistoryDagPanel, type HistoryDagPanelState } from "./history-dag-panel.js";
+import { HomeStarterActions } from "./home-starter-actions.js";
 import { LlmProviderLogo } from "./llm-provider-logo.js";
 import { Mic, Pause, Plus, Send } from "./memory/memory-prototype-icons.js";
 import { resolveWorkspaceEnvironmentScope, useWorkspaceEnvironment } from "./use-workspace-environment.js";
@@ -1061,11 +1062,13 @@ export function HomePage() {
     && !currentQueuedMessages.some((item) => item.status === "steering")
   );
   const hasActiveConversation = hasActiveAgentConversation(state.agent.currentChatId, state.agent.messages.length);
+  const isOpeningConversation = Boolean(state.agent.currentChatId && state.agent.isLoadingHistory && !hasActiveConversation);
+  const hasConversationShell = hasActiveConversation || isOpeningConversation;
   const [blankThreadPanelEnabled, setBlankThreadPanelEnabled] = useState(false);
   const threadPanel = useAgentThreadPanel({
     scopeKey: chatScopeKey,
     containerRef: workspaceLayoutRef,
-    enabled: hasActiveConversation || blankThreadPanelEnabled,
+    enabled: hasConversationShell || blankThreadPanelEnabled,
   });
   const [sidePanelMounted, setSidePanelMounted] = useState(false);
   const [recordingTabVisible, setRecordingTabVisible] = useState(false);
@@ -2414,6 +2417,19 @@ export function HomePage() {
     }
   }
 
+  function selectHomeStarter(prompt: string) {
+    setSelectedComposerCommandForScope(chatScopeKey, null);
+    setCurrentComposerDraft(prompt);
+    setSlashMenuDismissed(true);
+    window.requestAnimationFrame(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      resizeComposerInput(input);
+      input.focus();
+      input.setSelectionRange(prompt.length, prompt.length);
+    });
+  }
+
   /** Removes the selected command token while preserving the typed message. */
   function clearSelectedComposerCommand() {
     setSelectedComposerCommandForScope(chatScopeKey, null);
@@ -2993,7 +3009,7 @@ export function HomePage() {
       title={t("home.title")}
       recordingActive={recordingTabActive}
       recordingViewed={Boolean(currentRecording && viewedRecordingId === currentRecording.id)}
-      topBar={hasActiveConversation ? (
+      topBar={hasConversationShell ? (
         <AgentThreadToolbar
           key={chatScopeKey}
           title={activeConversationTitleDisplay}
@@ -3006,7 +3022,7 @@ export function HomePage() {
           getSearchRoot={getAgentConversationSearchRoot}
         />
       ) : null}
-      topBarEnd={!hasActiveConversation && threadPanel.phase !== "open" ? <button type="button"
+      topBarEnd={!hasConversationShell && threadPanel.phase !== "open" ? <button type="button"
         className="thread-toolbar__button" aria-label={t("home.threadPanel.open")}
         title={t("home.threadPanel.open")}
         onClick={() => {
@@ -3016,8 +3032,8 @@ export function HomePage() {
         }}>
         <PanelRight size={16} aria-hidden="true" />
       </button> : null}
-      topBarBorder={hasActiveConversation}
-      topBarInset={hasActiveConversation ? false : undefined}
+      topBarBorder={hasConversationShell}
+      topBarInset={hasConversationShell ? false : undefined}
       topBarClassName={`thread-topbar ${threadPanelMotionClass}`}
       topBarStyle={{ right: features.sidePanelWidth ?? threadPanel.offset }}
       sidePanel={features.sidePanel ?? (sidePanelMounted ? (
@@ -3047,7 +3063,7 @@ export function HomePage() {
           }}
         />
       ) : null)}
-      windowsTitlebarSafe={hasActiveConversation}
+      windowsTitlebarSafe={hasConversationShell}
     >
       {features.recorders}
       <div
@@ -3055,7 +3071,11 @@ export function HomePage() {
         className={`agent-workspace-layout ${threadPanelMotionClass}`}
         style={{ "--thread-panel-offset": `${features.sidePanelWidth ?? threadPanel.offset}px` } as CSSProperties}
       >
-        {!hasActiveConversation ? (
+        {isOpeningConversation ? (
+          <section className="agent-conversation-panel flex flex-col h-full" aria-busy="true">
+            <span className="sr-only">{t("home.history.loading")}</span>
+          </section>
+        ) : !hasActiveConversation ? (
         <section className="app-frame-page-content home-empty-screen flex flex-col items-center justify-center h-full">
           <div className="conversation-feature-cards agent-confirmation-dock">{features.cards}</div>
           <div className="text-center mb-8">
@@ -3173,6 +3193,7 @@ export function HomePage() {
                 />
               </div>
             </div>
+            <HomeStarterActions scenarios={features.scenarios} onSelect={selectHomeStarter} />
             <div className="home-empty-status-area">
               {statusText && <p className="text-center text-xs text-text-ink/45 mt-4">{statusText}</p>}
               <p className="text-center text-[11px] text-text-ink/40 mt-4">{t("home.notice")}</p>

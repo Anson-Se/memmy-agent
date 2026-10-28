@@ -1,7 +1,7 @@
 import { buildPluginCapabilityLabels } from "./plugin-tool-activity.js";
 import { SHARED_ROW_MIN_PANE_WIDTH, SHARED_ROW_PRIMARY_RESERVE } from "./sidebar-resize.js";
 import type { RecordingPanelSession } from "./interview-recording-panel.js";
-import { buildAgentRoutedPluginPrompt, buildLegalDiagnosisContinuation, pressPinnedPluginCommand, pluginInteractionSignature, reconcileHiddenPluginCalls, PinnedPluginCommandBar, selectConversationPinnedCommands, selectPinnedCommandsForLegalWorkflow, selectOpenPinnedCapabilities } from "./plugin-conversation-controls.js";
+import { buildAgentRoutedPluginPrompt, buildLegalDiagnosisContinuation, collectPluginScenarios, pressPinnedPluginCommand, pluginInteractionSignature, reconcileHiddenPluginCalls, PinnedPluginCommandBar, selectConversationPinnedCommands, selectPinnedCommandsForLegalWorkflow, selectOpenPinnedCapabilities } from "./plugin-conversation-controls.js";
 import "./conversation-features.css";
 import { cloneElement, useCallback, useEffect, useMemo, useRef, useState, type ReactElement, type ComponentProps } from "react";
 import type { InstalledPlugin, PluginArtifactRef, PluginCommandContribution } from "@memmy/local-api-contracts";
@@ -65,6 +65,7 @@ export function useConversationFeatures(options: {
   const currentUi = useRef(ui);
   currentUi.current = ui;
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
+  const scenarios = useMemo(() => collectPluginScenarios(plugins), [plugins]);
   const [error, setError] = useState<{ conversationId: string; message: string } | null>(null);
   const [featurePanelWidth, setFeaturePanelWidth] = useState(560);
   const [preview, setPreview] = useState<PluginArtifactRef | null>(null);
@@ -310,7 +311,7 @@ export function useConversationFeatures(options: {
       }
     };
   };
-  return { cards, recorders, shortcuts, recording, openRecording, closeSidePanel, closePluginRecording,
+  return { cards, recorders, shortcuts, scenarios, recording, openRecording, closeSidePanel, closePluginRecording,
     pluginRecordingSession: pluginRecording && !hiddenRecordings.has(recordingOwner) ? pluginRecording : null, capabilityLabels,
     processInteraction,
     capturePendingInputRelease,
