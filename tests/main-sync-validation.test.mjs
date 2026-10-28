@@ -53,6 +53,8 @@ describe('trusted validation workflow',()=>{
       with:{source_sha:'${{ needs.source.outputs.head }}',source_repository:'${{ needs.source.outputs.head_repository }}'}});
     expect(source).not.toMatch(/secrets\.|pull_request_target|codex-action|contents: write/);
     expect(jobs.record.needs).toEqual(['source','linux','windows']);
+    expect(jobs.linux.steps.map(step=>step.run??'').join('\n')).toContain('npm run version:check');
+    for(const job of Object.values(jobs))expect(job.name).toMatch(/^Main sync /);
   });
 });
 function record(overrides={}){

@@ -24,6 +24,7 @@ permissions:
   actions: read
 jobs:
   source:
+    name: Main sync source
     if: ${{ github.repository == 'MemTensor/memmy-agent' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -51,6 +52,7 @@ jobs:
           SYNC_VALIDATION_KEY: ${{ inputs.validation_key }}
         run: node scripts/main-sync/validate-source.mjs
   linux:
+    name: Main sync Linux
     needs: source
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -78,6 +80,7 @@ jobs:
           npm --prefix App/memmy-agent run build
       - name: Run repository lint and type checks
         run: |-
+          npm run version:check
           npm run lint
           npm run typecheck
           npm --prefix App/memmy-agent run typecheck
@@ -96,6 +99,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
           test -z "$(git status --porcelain --untracked-files=all)"
   windows:
+    name: Main sync Windows
     needs: source
     uses: MemTensor/memmy-agent/.github/workflows/windows-computer-history-validation.yml@main
     permissions:
@@ -104,6 +108,7 @@ jobs:
       source_sha: ${{ needs.source.outputs.head }}
       source_repository: ${{ needs.source.outputs.head_repository }}
   record:
+    name: Main sync record
     needs:
       - source
       - linux
