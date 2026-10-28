@@ -1,56 +1,70 @@
-# Draft Release 后同步 main
+# Synchronize main after a Draft Release
 
-Draft Release 的全部安装包和元数据上传成功后，发版工作流会校验 Release、
-source SHA 和资源清单，再上传同步请求 artifact。创建 Draft 即可触发，
-无需 Publish。上传失败沿用原有清理；后续同步请求失败不会删除已完整生成的 Draft。
+After the Draft Release workflow uploads all installers and metadata, it verifies
+the Release, source SHA and asset inventory, then publishes a synchronization request
+artifact. The Release does not need to be published. Upload failures retain the
+existing cleanup behavior; a later request failure preserves the completed Draft.
 
-云端 CodingAgent 的现有 GitHub webhook 接收 workflow_run.completed 通知。
-通知仅负责唤醒：Scheduler 会重新读取 GitHub 的具体 run attempt、原始 artifact
-及其摘要、Release、main 历史和配置，确认后为每个维护分支建立同一个同步任务。
-Actions 不执行模型修复，也不需要新增一套模型凭据。
+The existing cloud CodingAgent GitHub webhook receives `workflow_run.completed`
+notifications. Notifications only wake the Scheduler. It re-reads the exact workflow
+run attempt, original artifact and digest, Release, main history and target configuration
+before admitting a task for each maintained branch. Actions does not run the repair
+agent or require a separate model credential.
 
-## 维护分支和 PR
+## Maintained branches and PRs
 
-维护分支列在 `.github/main-sync.json` 的 targets 中。目前包含
-`v1.2.5`、`v1.2.6`、`v1.2.7`；新增或停止维护时通过代码评审修改此清单。
-不会将所有历史 v 分支都自动纳入。
+Maintained targets are listed in `.github/main-sync.json`: `v1.2.5`, `v1.2.6` and
+`v1.2.7`. Add or retire maintained branches by updating this list through code review.
+Historical v branches are not enrolled automatically.
 
-每个目标使用 `sync/main-to-<target>` 工作分支，创建或复用对应 Draft PR。
-CodingAgent 普通合并两边历史，解决冲突，保留远端人工提交，再推送同步工作分支。
-不会直接写 main 或目标分支，不会强推、自动合并 PR 或发布 Release。
+For each target, CodingAgent uses `sync/main-to-<target>` and creates or reuses the
+corresponding Draft PR. It merges both histories, preserves human commits and pushes
+only the managed synchronization branch. It never directly updates main or the target,
+force-pushes, merges a PR or publishes a Release.
 
-验证失败后继续原 CodingAgent 任务、分支和 PR，不会重新开一个编码任务。
-目标分支或 PR head 变化会使旧结果失效，重新合并并验证。只有当前 head/base
-的 Linux 全套公开测试、类型检查、lint、构建、关键 smoke 以及原生 Windows
-验证全部通过，并满足其余 GitHub 检查，才交付待审。
-CI 中的 `Main Sync / Full` 状态不代表 Project Harness 审批或维护者批准。
+Validation failures resume the same CodingAgent task, branch and PR. A changed PR head
+or target tip invalidates old results and requires fresh integration and validation.
+Review readiness requires successful Linux public suites, type checks, lint, builds,
+smoke plan tests and native Windows validation for the current head/base, plus the
+remaining GitHub checks. `Main Sync / Full` is a CI status, not Project Harness or
+maintainer approval.
 
-默认最多 6 轮修复、连续 2 轮无进展或总计 180 分钟后停下，保留代码和 PR，
-供维护者接手。这些上限可在同一配置文件中调整。关闭 PR 会停止管理。
+Defaults are six repair rounds, two consecutive rounds without progress and 180 minutes
+total. When a limit is reached, the loop stops and preserves the workspace and PR for
+a maintainer. These limits are configured in the same JSON file. Closing the PR stops
+management.
 
-## 部署与启用
+## Deployment and activation
 
-先将 Memmy 工作流变更合入 main，并部署配套的 cloud-coding-agent Scheduler、
-code-runner 和数据库迁移。云端仓库的 `docs/main-sync.md` 给出完整配置。
-需要在现有签名 GitHub repository webhook 上订阅 **Workflow runs**，
-并在现有 Memmy 仓库配置中启用 `main_sync.enabled`。功能默认关闭。
+Merge the Memmy workflow changes into main. Deploy the matching Scheduler and
+code-runner builds from `cloud-coding-agent`, and apply the database migration.
+The cloud repository's `docs/main-sync.md` contains the full configuration.
+Subscribe the existing signed GitHub repository webhook to **Workflow runs**, and
+enable `main_sync.enabled` in the registered Memmy repository configuration.
+The feature is disabled by default.
 
-复用现有 CodingAgent 的模型配置、机器人 push/fork 注册和仓库白名单。
-GitHub token 需具备 contents push、pull-request write、Actions read/write、
-checks read 和 commit-status write 权限。不要将凭据放入请求 artifact 或仓库。
-本次代码变更本身不修改线上配置、webhook 或部署。
+Reuse the existing model configuration, bot push/fork registration and repository
+allowlists. The GitHub token needs contents push, pull-request write, Actions
+read/write, checks read and commit-status write permissions. Keep credentials in
+secret management, not request artifacts or the repository. Source changes alone
+do not update live deployments, configuration or webhooks.
 
-## 失败恢复
+## Recovery
 
-若完整 Draft 已生成但同步通知失败，可在 main 上运行手动恢复工作流：
+If the Draft is complete but its synchronization request failed, run the recovery
+workflow on main. Set `RELEASE_ID` to the existing Release's numeric GitHub ID and
+`SOURCE_SHA` to its exact 40-character hexadecimal main commit SHA:
 
 ```sh
 gh workflow run main-sync.yml --repo MemTensor/memmy-agent --ref main \
-  -f release_id=<GitHub-Release-ID> -f source_sha=<40-hex-main-commit>
+  -f release_id="$RELEASE_ID" -f source_sha="$SOURCE_SHA"
 ```
 
-恢复工作流重新核对实际 Release 和 source，不接受任意分支名代替 SHA。
-同一 repository/release/source/target 的重试会复用业务请求，不重复创建编码任务。
-手动恢复也支持已发布的正式 Release；仍需 tag 精确指向指定 source。
-排查时分别查看请求工作流、云端原任务及 `main-sync-validation.yml` 的具体 run，
-不要把 workflow queued、模型自报完成或旧提交的绿色状态当成最终结果。
+Recovery re-reads the actual Release and source; branch names cannot replace SHAs.
+Repeated repository/release/source/target requests reuse the existing synchronization
+request rather than create duplicate coding tasks. Published stable Releases are
+supported if their tag resolves to the exact source.
+
+Diagnose failures using the request workflow, original cloud task and specific
+`main-sync-validation.yml` run. A queued workflow, model completion claim or green
+result for an older commit does not establish readiness.
