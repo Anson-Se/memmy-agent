@@ -3,6 +3,7 @@ import { DEFAULT_MEMMY_CONFIG } from "../src/config/index.js";
 import { MemoryModelTaskRouter, type MemoryModelTaskContext } from "../src/model/task-routing.js";
 import { WorkerConcurrencyController, providerDescriptor } from "../src/service/worker/worker-concurrency.js";
 import type { Embedder, LlmClient } from "../src/model/types.js";
+import { vectorEmbeddingIdentity } from "../src/model/embedding-identity.js";
 import { Repositories } from "../src/storage/repositories.js";
 import { createMemoryServiceFixture } from "./fixtures/memory-service-fixture.js";
 
@@ -27,6 +28,24 @@ function context(embed: Embedder["embed"]): MemoryModelTaskContext {
 }
 
 describe("routed embedding request batches", () => {
+  it("preserves the request's original model identity across batches and an asynchronous config change", async () => {
+    const controller = new WorkerConcurrencyController({ embeddingBatchSize: 2 }, {});
+    const task = context(async texts => {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      task.embedding.config.model = "later-model";
+      return texts.map(() => [1]);
+    });
+    const router = new MemoryModelTaskRouter(() => task, controller);
+    try {
+      const vectors = await router.embedder().embed(["one", "two", "three"]);
+      expect(vectors.map(vectorEmbeddingIdentity)).toEqual(Array.from({ length: 3 }, () => ({ provider: "openai_compatible", model: "embedding" })));
+      task.embedding.config.model = "single-model";
+      expect(vectorEmbeddingIdentity(await router.embedder().embedOne("single")))
+        .toEqual({ provider: "openai_compatible", model: "single-model" });
+      expect(controller.snapshot()).toMatchObject({ activeJobs: 0, providers: {}, embeddingRequests: 0 });
+    } finally { await Promise.all([router.stop(), controller.close()]); }
+  });
+
   it.each(["query", "document", undefined] as const)("caps every request at 16 and preserves %s role and vector order", async role => {
     const calls: Array<{ texts: string[]; role?: string }> = [];
     let active = 0, peak = 0;

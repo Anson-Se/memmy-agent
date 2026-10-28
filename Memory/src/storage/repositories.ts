@@ -1,4 +1,6 @@
 import { MAIN_DEADLINE, MAIN_TIMED, MAIN_LEASED, RETRY_DEADLINE, RETRY_LEASED } from "./queue-deadline-schema.js";
+import type { EmbeddingMaintenanceEntry } from "./sqlite-vec-store.js";
+import { sameEmbeddingIdentity, vectorEmbeddingIdentity, type EmbeddingIdentity } from "../model/embedding-identity.js";
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
@@ -336,6 +338,16 @@ export interface EvolutionJobRecord extends SchedulingMetadata {
   updatedAt: string;
 }
 
+export interface EmbeddingMaintenanceTask {
+  targetId: string;
+  userMemory: boolean;
+  vectorField?: MemoryVectorField;
+  contentHash?: string;
+  sourceText?: string;
+  status: "pending" | "active" | "stale" | "failed";
+  updatedAt: string;
+}
+
 export type L3WorldModelBatchTrigger =
   | "new_task"
   | "token_compaction"
@@ -436,6 +448,7 @@ export interface MemorySearchIdHit {
 export type MemorySearchChannel = EmbeddingRetryVectorField | "fts" | "pattern" | "structural";
 
 export interface MemoryVectorSearchOptions {
+  identity?: EmbeddingIdentity;
   anyOfTags?: string[];
 }
 
@@ -1179,6 +1192,7 @@ export class MemoryRepository {
       status: filter.status ?? ["activated", "resolving"]
     });
     const anyTag = buildAnyTagWhere(options.anyOfTags);
+    const identity = options.identity ?? vectorEmbeddingIdentity(query);
     const candidateWindow = VECTOR_SEARCH_WINDOW;
     const rows = this.db
       .prepare(
@@ -1189,11 +1203,13 @@ export class MemoryRepository {
          JOIN memories ON memories.id = memory_vector_entries.memory_id
          WHERE ${built.where}
            AND memory_vector_entries.vector_field = ?
+           AND memory_vector_entries.embedding_dim = ?
+           ${identity ? "AND memory_vector_entries.embedding_provider = ? AND memory_vector_entries.embedding_model = ?" : ""}
            ${anyTag.where ? `AND ${anyTag.where}` : ""}
          ORDER BY memory_vector_entries.updated_at DESC, memory_vector_entries.id DESC
          LIMIT ?`
       )
-      .all(...built.params, vectorField, ...anyTag.params, candidateWindow) as Array<{
+      .all(...built.params, vectorField, query.length, ...(identity ? [identity.provider, identity.model] : []), ...anyTag.params, candidateWindow) as Array<{
         id: string;
         vector_id: number;
         embedding_dim: number;
@@ -1609,6 +1625,15 @@ export class UserMemoryRepository {
     return row.count;
   }
 
+  embeddingMaintenanceEntries(userId: string): EmbeddingMaintenanceEntry[] {
+    return this.db.prepare(`
+      SELECT id, 'user_memory' AS kind, COALESCE(json_array_length(embedding_json), 0) AS dimension,
+             embedding_model AS embeddingModel, embedding_provider AS embeddingProvider
+      FROM user_memories WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL
+      ORDER BY id
+    `).all(userId) as EmbeddingMaintenanceEntry[];
+  }
+
   embeddingDimensionCounts(userId: string): {
     totalSlots: number;
     dimensions: Array<{ dimension: number; count: number }>;
@@ -1716,10 +1741,10 @@ export class UserMemoryRepository {
     return rows.map((row, index) => ({ id: row.id, score: 1 / (index + 1), channel: "pattern" }));
   }
 
-  searchVectorIds(userId: string, query: readonly number[], limit: number): MemorySearchIdHit[] {
+  searchVectorIds(userId: string, query: readonly number[], limit: number, identity = vectorEmbeddingIdentity(query)): MemorySearchIdHit[] {
     if (query.length === 0 || limit <= 0) return [];
     return this.listActive(userId)
-      .flatMap((memory) => memory.embedding?.length === query.length
+      .flatMap((memory) => memory.embedding?.length === query.length && (!identity || sameEmbeddingIdentity(memory, identity))
         ? [{ id: memory.id, score: cosineVectors(query, memory.embedding), channel: "vec" as const }]
         : [])
       .filter((hit) => hit.score > 0)
@@ -4063,6 +4088,7 @@ export class RuntimeRepository {
     const unchangedActive = `(embedding_retry_queue.source_text = excluded.source_text
       AND embedding_retry_queue.embed_role = excluded.embed_role
       AND embedding_retry_queue.status IN ('pending', 'in_progress'))`;
+    const unchangedPending = `(${unchangedActive} AND embedding_retry_queue.status = 'pending')`;
     this.db
       .prepare(
         `INSERT INTO embedding_retry_queue (
@@ -4077,16 +4103,21 @@ export class RuntimeRepository {
         ON CONFLICT(target_kind, target_id, vector_field) DO UPDATE SET
           source_text = excluded.source_text,
           embed_role = excluded.embed_role,
-          status = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.status ELSE 'pending' END,
+          status = CASE WHEN ${unchangedPending} THEN embedding_retry_queue.status ELSE 'pending' END,
           attempts = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.attempts ELSE 0 END,
           max_attempts = excluded.max_attempts,
           next_attempt_at = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.next_attempt_at ELSE excluded.next_attempt_at END,
-          claimed_by = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.claimed_by ELSE NULL END,
-          lease_until = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.lease_until ELSE NULL END,
-          lease_token = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.lease_token ELSE NULL END,
+          claimed_by = NULL,
+          lease_until = NULL,
+          lease_token = NULL,
           blocked_reason = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.blocked_reason ELSE NULL END,
           last_error = CASE WHEN ${unchangedActive} THEN embedding_retry_queue.last_error ELSE NULL END,
-          updated_at = excluded.updated_at`
+          updated_at = excluded.updated_at
+        WHERE NOT (${unchangedActive}
+          AND embedding_retry_queue.status = 'in_progress'
+          AND embedding_retry_queue.claimed_by IS NOT NULL
+          AND embedding_retry_queue.lease_until IS NOT NULL
+          AND embedding_retry_queue.lease_until > excluded.next_attempt_at)`
       )
       .run({
         id: input.id ?? newId("embed_retry"),
@@ -4165,6 +4196,103 @@ export class RuntimeRepository {
       .prepare(`SELECT COUNT(*) AS count FROM embedding_retry_queue WHERE status = ?`)
       .get(status) as { count: number } | undefined;
     return row?.count ?? 0;
+  }
+
+  embeddingRetryQueueStats(now = Date.now()): {
+    pending: number;
+    active: number;
+    stale: number;
+    failed: number;
+  } {
+    const row = this.db.prepare(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+         COUNT(*) FILTER (WHERE status = 'in_progress'
+           AND claimed_by IS NOT NULL AND lease_until > ?) AS active,
+         COUNT(*) FILTER (WHERE status = 'in_progress'
+           AND (claimed_by IS NULL OR lease_until IS NULL OR lease_until <= ?)) AS stale,
+         COUNT(*) FILTER (WHERE status = 'failed') AS failed
+       FROM embedding_retry_queue`
+    ).get(now, now) as { pending: number; active: number; stale: number; failed: number };
+    return row;
+  }
+
+  embeddingMaintenanceQueueStats(
+    userId: string,
+    now = Date.now(),
+    isCurrentWork: (task: EmbeddingMaintenanceTask) => boolean = () => true
+  ): {
+    pending: number;
+    active: number;
+    stale: number;
+    failed: number;
+  } {
+    const at = new Date(now).toISOString();
+    const retries = this.db.prepare(
+      `SELECT target_id, vector_field, source_text, status, claimed_by, lease_until, updated_at
+       FROM embedding_retry_queue WHERE status != 'succeeded'`
+    ).all() as Array<Pick<SqlEmbeddingRetryRow,
+      "target_id" | "vector_field" | "source_text" | "status" | "claimed_by" | "lease_until" | "updated_at">>;
+    const jobs = this.db.prepare(
+      `SELECT j.target_memory_id, j.job_type, j.payload_json, j.status, j.leased_until, j.updated_at,
+         m.memory_layer
+       FROM evolution_jobs j LEFT JOIN memories m ON m.id = j.target_memory_id
+       WHERE j.status != 'succeeded' AND (
+         j.job_type = 'embedding' OR (j.job_type = 'user_memory_embedding' AND j.user_id = ?))`
+    ).all(userId) as Array<Pick<SqlJobRow,
+      "target_memory_id" | "job_type" | "payload_json" | "status" | "leased_until" | "updated_at"> & { memory_layer: string | null }>;
+    const tasks: EmbeddingMaintenanceTask[] = [
+      ...retries.map(row => ({
+        targetId: row.target_id, userMemory: false, vectorField: row.vector_field,
+        sourceText: row.source_text, updatedAt: new Date(row.updated_at).toISOString(),
+        status: row.status === "pending" ? "pending" as const : row.status === "failed" ? "failed" as const
+          : row.claimed_by && row.lease_until !== null && row.lease_until > now ? "active" as const : "stale" as const
+      })),
+      ...jobs.flatMap(row => {
+        const payload = parseJson<Record<string, unknown>>(row.payload_json, {});
+        return [{
+          targetId: row.target_memory_id ?? "", userMemory: row.job_type === "user_memory_embedding",
+          vectorField: row.memory_layer === "L1" ? "vec_summary" as const : "vec" as const,
+          contentHash: typeof payload.contentHash === "string" ? payload.contentHash : undefined,
+          updatedAt: row.updated_at,
+          status: row.status === "queued" ? "pending" as const
+            : row.status === "leased" ? row.leased_until && row.leased_until > at ? "active" as const : "stale" as const
+              : "failed" as const
+        }];
+      })
+    ];
+    const counts = { pending: 0, active: 0, stale: 0, failed: 0 };
+    const failures = new Set<string>();
+    for (const task of tasks) {
+      if (!isCurrentWork(task)) continue;
+      if (task.status === "failed") {
+        // History can contain multiple failures for the same still-unresolved target.
+        failures.add(`${task.userMemory ? "user" : "memory"}:${task.targetId}:${task.vectorField ?? "default"}`);
+      } else counts[task.status]++;
+    }
+    counts.failed = failures.size;
+    return counts;
+  }
+
+  hasSuccessfulEmbeddingWork(input: {
+    targetId: string;
+    userMemory: boolean;
+    vectorField: MemoryVectorField;
+    contentHash: string;
+    sourceTexts: string[];
+    since: string;
+  }): boolean {
+    const job = input.vectorField !== "vec_action" && this.db.prepare(
+      `SELECT 1 FROM evolution_jobs WHERE target_memory_id = ? AND job_type = ?
+       AND status = 'succeeded' AND updated_at >= ?
+       AND json_extract(payload_json, '$.contentHash') = ? LIMIT 1`
+    ).get(input.targetId, input.userMemory ? "user_memory_embedding" : "embedding", input.since, input.contentHash);
+    if (job) return true;
+    if (input.userMemory) return false;
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM embedding_retry_queue WHERE target_id = ? AND vector_field = ?
+       AND status = 'succeeded' AND updated_at >= ? AND source_text IN (${input.sourceTexts.map(() => "?").join(",")}) LIMIT 1`
+    ).get(input.targetId, input.vectorField, Date.parse(input.since), ...input.sourceTexts));
   }
 
   requeueEmbeddingRetriesAfterRestart(
@@ -4247,7 +4375,9 @@ export class RuntimeRepository {
              WHERE id = ?
                AND (
                  status = 'pending'
-                 OR (status = 'in_progress' AND lease_until IS NOT NULL AND lease_until <= ?)
+                 OR (status = 'in_progress' AND (
+                   claimed_by IS NULL OR lease_until IS NULL OR lease_until <= ?
+                 ))
                )
                AND next_attempt_at <= ?`
           )

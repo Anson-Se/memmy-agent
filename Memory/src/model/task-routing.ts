@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { embeddingIdentity, rememberEmbeddingIdentity } from "./embedding-identity.js";
 import type { MemmyConfig } from "../config/index.js";
 import { providerDescriptor, type WorkerConcurrencyController } from "../service/worker/worker-concurrency.js";
 import { observeWorker, type WorkerObserver } from "../service/worker/worker-observability.js";
@@ -147,6 +148,7 @@ class TaskRoutedEmbedder implements Embedder {
     return this.router.run(async () => {
       if (texts.length === 0) return [];
       const delegate = this.delegate();
+      const identity = embeddingIdentity(delegate.config);
       const batchSize = this.router.embeddingBatchSize();
       const vectors: number[][] = [];
       // A business task may generate many texts internally (for example Work
@@ -155,14 +157,16 @@ class TaskRoutedEmbedder implements Embedder {
         const batch = texts.slice(offset, offset + batchSize);
         vectors.push(...await this.router.request(delegate.config, () => delegate.embed(batch, role), true, "embedding", batch.length));
       }
-      return vectors;
+      return vectors.map(vector => rememberEmbeddingIdentity(vector, identity));
     });
   }
 
   embedOne(text: string, role?: "query" | "document"): Promise<number[]> {
-    return this.router.run(() => {
+    return this.router.run(async () => {
       const delegate = this.delegate();
-      return this.router.request(delegate.config, () => delegate.embedOne(text, role), true, "embedding", 1);
+      const identity = embeddingIdentity(delegate.config);
+      const vector = await this.router.request(delegate.config, () => delegate.embedOne(text, role), true, "embedding", 1);
+      return rememberEmbeddingIdentity(vector, identity);
     });
   }
 

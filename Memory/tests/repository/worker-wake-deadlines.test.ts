@@ -30,6 +30,29 @@ afterEach(() => {
 });
 
 describe("future worker wake deadlines", () => {
+  it.each(["owner", "lease"])("uses retry backoff when an in-progress row has no %s", missing => {
+    const h = setup(); h.retry("orphan", 2000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by=?,lease_until=? WHERE id='orphan'")
+      .run(missing === "owner" ? null : "old-worker", missing === "lease" ? null : now + 10000);
+    expect(h.runtime.nextWorkerRunAt({ futureAfterMs: now })).toBe(now + 2000);
+    expect(h.runtime.nextWorkerRunAt({ futureAfterMs: now + 2000 })).toBeUndefined();
+    expect(h.runtime.claimEmbeddingRetryById("orphan", { now: now + 2000, workerId: "new", leaseUntil: now + 30000 }))
+      .toMatchObject({ claimedBy: "new", leaseToken: expect.any(String) });
+  });
+
+  it("upgrades the earlier lease-only index when reopening an existing database", () => {
+    const h = setup(); h.retry("orphan", 2000);
+    h.db.db.exec("DROP INDEX worker_retry_lease_deadline; CREATE INDEX worker_retry_lease_deadline ON embedding_retry_queue(MAX(next_attempt_at, lease_until)) WHERE status='in_progress' AND lease_until IS NOT NULL");
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by=NULL,lease_until=NULL WHERE id='orphan'").run();
+    h.db.close();
+    const reopened = new MemoryDb({ path: join(h.root, "memory.sqlite") });
+    try {
+      expect(new Repositories(reopened.db).runtime.nextWorkerRunAt({ futureAfterMs: now })).toBe(now + 2000);
+      expect((reopened.db.prepare("SELECT sql FROM sqlite_master WHERE name='worker_retry_lease_deadline'").get() as { sql: string }).sql)
+        .toContain(RETRY_DEADLINE);
+    } finally { reopened.close(); }
+  });
+
   it("preserves tokens on reopen and observes writes from another connection", () => {
     const h = setup(); h.job("timed", 5000);
     const before = h.runtime.scheduling.getDeadlineRevision();
@@ -115,7 +138,7 @@ describe("future worker wake deadlines", () => {
   });
   it("waits for both retry backoff and an in-progress lease to expire", () => {
     const h = setup(); h.retry("in-progress", 2_000);
-    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',lease_until=? WHERE id='in-progress'").run(now + 6_000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by='worker-A',lease_until=? WHERE id='in-progress'").run(now + 6_000);
     expect(h.runtime.nextWorkerRunAt({ futureAfterMs: now })).toBe(now + 6_000);
     expect(h.runtime.nextWorkerRunAt({ futureAfterMs: now + 6_000 })).toBeUndefined();
   });

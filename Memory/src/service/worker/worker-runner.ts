@@ -35,6 +35,7 @@ import {
 import type { PolicyEvidencePreflightReport } from "../evolution/evolution-job-processor.js";
 import {
   embeddingTextForMemory,
+  traceActionEmbeddingText,
   embeddingRetryBackoffMs,
   embeddingRetryToRunItem
 } from "../embedding/embedding-pipeline.js";
@@ -151,7 +152,8 @@ export interface WorkerRunnerDeps {
   memoryBudgetNextReconcileAtMs?: () => number | undefined;
   summaryModelConfigured: () => boolean;
   configurationFingerprint?: () => string;
-  beforeRun?: () => Promise<void>;
+  beforeRun?: (request?: { targetMemoryIds?: readonly string[] }) => Promise<void>;
+  maintenanceNextRunAtMs?: () => number | undefined;
   afterRun?: () => void;
   scheduling?: WorkerSchedulingOptions;
   leases?: WorkerLeaseOptions;
@@ -471,15 +473,15 @@ export class WorkerRunner {
       execution.signal?.addEventListener("abort", wake, { once: true });
       try { return await this.runWorkerOnceUnscoped(limit, request, execution); }
       finally { execution.signal?.removeEventListener("abort", wake); }
-    });
+    }, request);
   }
 
-  private runScheduled<T>(execute: () => Promise<T>): Promise<T> {
+  private runScheduled<T>(execute: () => Promise<T>, request?: { targetMemoryIds?: readonly string[] }): Promise<T> {
     // Every entry, including retry-only requests, must wake an automatic pump
     // so it can yield the shared entry boundary to the waiting request.
     this.notifyWorkAvailable();
     return withoutJobLeaseGuard(() => this.scheduler.run(async () => {
-      if (this.deps.beforeRun) await this.deps.beforeRun();
+      if (this.deps.beforeRun) await this.deps.beforeRun(request);
       const result = await execute();
       this.deps.afterRun?.();
       return result;
@@ -616,14 +618,16 @@ export class WorkerRunner {
           jobsThisTurn = 0;
           continue;
         }
-        const reconcileAt = this.deps.memoryBudgetNextReconcileAtMs?.();
+        const maintenanceTimes = [this.deps.memoryBudgetNextReconcileAtMs?.(), this.deps.maintenanceNextRunAtMs?.()]
+          .filter((time): time is number => time !== undefined && Number.isFinite(time));
+        const reconcileAt = maintenanceTimes.length ? Math.min(...maintenanceTimes) : undefined;
         if (execution.continuous && this.deps.beforeRun && reconcileAt !== undefined &&
           Number.isFinite(reconcileAt) && reconcileAt <= this.nowMs() && reconcileAt !== attemptedReconcileDeadline) {
           // A long automatic run no longer re-enters beforeRun every four jobs.
           // Preserve budget reconciliation at its due time, without retrying an
           // unchanged in-flight deadline on every completion/refill.
           attemptedReconcileDeadline = reconcileAt;
-          await this.deps.beforeRun();
+          await this.deps.beforeRun(retryOnly ? undefined : request);
           if (!this.deps.memoryAddEnabled() || this.stopping || failedDrain || execution.signal?.aborted || this.scheduler.hasPendingRequests()) break;
         }
         let denied = false;
@@ -822,7 +826,7 @@ export class WorkerRunner {
         const wake = waitForWake(this.wakeVersion);
         // Budget deadlines are cheap in-memory state and may change independently
         // of durable queue timestamps. Do not issue another SQL query to combine them.
-        const deadlines = [scanDeadline, this.deps.memoryBudgetNextReconcileAtMs?.(),
+        const deadlines = [scanDeadline, this.deps.memoryBudgetNextReconcileAtMs?.(), this.deps.maintenanceNextRunAtMs?.(),
           ...(paused ? [this.deps.memoryBudgetNextWakeAtMs()] : [])]
           .filter((time): time is number => time !== undefined && Number.isFinite(time) && time > now);
         const deadline = deadlines.length ? Math.min(...deadlines) : undefined;
@@ -1281,7 +1285,10 @@ export class WorkerRunner {
     if (!memory) {
       throw new Error(`embedding retry target not found: ${retry.targetKind}:${retry.targetId}`);
     }
-    if ((memory.memoryLayer === "Skill" || memory.memoryLayer === "L3") && embeddingTextForMemory(memory) !== retry.sourceText) {
+    const currentText = retry.vectorField === "vec_action" ? traceActionEmbeddingText(memory)
+      : memory.memoryLayer === "Skill" || memory.memoryLayer === "L3" || memory.memoryLayer === "L2"
+        ? embeddingTextForMemory(memory) : undefined;
+    if (currentText !== undefined && currentText !== retry.sourceText) {
       const completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {
         ...claim,
         now: this.nowMs()
@@ -1294,7 +1301,7 @@ export class WorkerRunner {
       if (completed) this.deps.appendEmbeddingRetryChange(completed, "succeeded", retry);
       const replacement = this.deps.enqueueEmbeddingRetry(
         memory,
-        embeddingTextForMemory(memory),
+        currentText,
         this.deps.nowIso(),
         retry.vectorField
       );

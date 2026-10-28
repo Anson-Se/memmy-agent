@@ -86,7 +86,7 @@ export function retryQueueEligibility(now: number, targetMemoryIds?: readonly st
 } {
   if (targetMemoryIds?.length === 0) return { sql: "0", params: [] };
   return {
-    sql: `(q.status = 'pending' OR (q.status = 'in_progress' AND q.lease_until IS NOT NULL AND q.lease_until <= ?))
+    sql: `(q.status = 'pending' OR (q.status = 'in_progress' AND (q.claimed_by IS NULL OR q.lease_until IS NULL OR q.lease_until <= ?)))
       AND q.next_attempt_at <= ?
       ${targetMemoryIds ? `AND q.target_id IN (${targetMemoryIds.map(() => "?").join(", ")})` : ""}`,
     params: [now, now, ...(targetMemoryIds ?? [])]

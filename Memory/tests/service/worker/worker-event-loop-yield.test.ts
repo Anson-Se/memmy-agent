@@ -90,6 +90,32 @@ function blockedBacklog(h: ReturnType<typeof harness>, count = 1000) {
 }
 
 describe("continuous worker event-loop fairness", () => {
+  it("resumes scheduled maintenance inside an open worker entry and preserves its target context", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = harness(), abort = new AbortController(), backlog = blockedBacklog(h, 1);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    let clock = Date.now(), maintenanceAt: number | undefined = clock + 100;
+    h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    h.deps.maintenanceNextRunAtMs = () => maintenanceAt;
+    const before = vi.fn(async (request?: { targetMemoryIds?: readonly string[] }) => {
+      expect(request).toEqual({});
+      if (maintenanceAt !== undefined && maintenanceAt <= clock) {
+        maintenanceAt = undefined; h.job("maintenance-ready", "user_memory_embedding");
+      }
+    });
+    h.deps.beforeRun = before;
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 12; i++) await nextTurn();
+      expect(before).toHaveBeenCalledTimes(1);
+      clock += 100; await vi.advanceTimersByTimeAsync(100);
+      for (let i = 0; i < 15; i++) await nextTurn();
+      expect(before).toHaveBeenCalledTimes(2);
+      expect(h.processed).toEqual(["maintenance-ready"]);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
   describe.each(["available", "runAfter", "mainLease", "retryTime", "retryLease", "failed"] as const)("refreshing an old %s deadline", kind => {
     it.each([0, 1])("retains the deadline when a new insert's snapshot crosses it by %i ms", async crossedBy => {
       const h = harness(), abort = new AbortController();
@@ -100,7 +126,7 @@ describe("continuous worker event-loop fairness", () => {
       if (retry) {
         h.repos.runtime.enqueueEmbeddingRetry({ id: "old-deadline", targetKind: "trace", targetId: "missing",
           vectorField: "vec_summary", sourceText: "synthetic", now: due });
-        if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',next_attempt_at=?,lease_until=? WHERE id='old-deadline'").run(clock - 1, due);
+        if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by='old-worker',next_attempt_at=?,lease_until=? WHERE id='old-deadline'").run(clock - 1, due);
       } else {
         h.job("old-deadline", "user_memory_embedding");
         if (kind === "available" || kind === "failed") h.db.db.prepare("UPDATE evolution_jobs SET available_at=?,status=?,failure_count=? WHERE id='old-deadline'")
@@ -233,7 +259,7 @@ describe("continuous worker event-loop fairness", () => {
     if (retry) {
       h.repos.runtime.enqueueEmbeddingRetry({ id: "old-timed", targetKind: "trace", targetId: "missing",
         vectorField: "vec_summary", sourceText: "synthetic", now: clock + 10_000 });
-      if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',next_attempt_at=?,lease_until=? WHERE id='old-timed'").run(clock - 1, clock + 10_000);
+      if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by='old-worker',next_attempt_at=?,lease_until=? WHERE id='old-timed'").run(clock - 1, clock + 10_000);
     } else {
       h.job("old-timed", "user_memory_embedding");
       if (kind === "available") h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='old-timed'").run(future);
