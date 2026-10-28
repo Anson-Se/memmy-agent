@@ -218,20 +218,14 @@ export async function runLocalAgentMemorySmoke(
       query: SHARED_RECALL_QUERY,
       layers: ["L1"]
     });
-    assert(
-      typeof toolSearch === "string" && toolSearch.includes('<memmy_memory_context source="tool_search">'),
-      "Agent search tool must wrap the real HTTP result in a Memmy context packet"
-    );
+    assertToolMemoryPacket(toolSearch, "tool_search", runtime);
     assert(!toolSearch.includes("No relevant Memmy memories found."), "Agent search tool must expose imported memories");
     assertNoRawSecrets(toolSearch, fixtures, "Agent search tool result");
 
     const firstMemoryId = memoryIds[0];
     assert(firstMemoryId, "At least one imported memory id is required");
     const toolGet = await registry.execute("memmy_memory_get", { id: firstMemoryId });
-    assert(
-      typeof toolGet === "string" && toolGet.includes('<memmy_memory_context source="tool_get">'),
-      "Agent get tool must wrap the real HTTP result in a Memmy context packet"
-    );
+    assertToolMemoryPacket(toolGet, "tool_get", runtime);
     assert(toolGet.includes(`id: ${firstMemoryId}`), "Agent get tool must identify the requested memory");
     assertNoRawSecrets(toolGet, fixtures, "Agent get tool result");
 
@@ -645,6 +639,22 @@ function assertExecutorStateDeduplicated(
       `${sourceId} repeated scan must preserve its persisted source checkpoint`
     );
   }
+}
+
+function assertToolMemoryPacket(
+  value: unknown,
+  source: "tool_search" | "tool_get",
+  runtime: MemmyMemoryToolRuntime,
+): asserts value is string {
+  assert(typeof value === "string", `${source} must return a text context packet`);
+  const memory = value.match(/<memmy_memory_context\b([^>]*)>([\s\S]*?)<\/memmy_memory_context>/);
+  const turnId = runtime.currentTurnId() ?? "unscoped";
+  assert(memory?.[1]?.includes(`source="${source}"`), `${source} must identify the memory source`);
+  assert(memory?.[1]?.includes(`turn_id="${turnId}"`), `${source} must use the runtime memory turn`);
+  assert(memory?.[2]?.trim(), `${source} must include memory evidence`);
+  const request = value.match(/<current_user_request\b([^>]*)>([\s\S]*?)<\/current_user_request>/);
+  assert(request?.[1]?.includes(`turn_id="${turnId}"`), `${source} must scope the request to the same turn`);
+  assert(request?.[2]?.trim() === runtime.currentUserText(), `${source} must preserve the current user request`);
 }
 
 function createToolRuntime(sessionId: string): MemmyMemoryToolRuntime {
