@@ -73,7 +73,23 @@ describe("Work Memory pipeline", () => {
     }));
   });
 
-  it.each(["codex", "claude-code"])("%s 创建的工作记忆保留会话来源并支持管理页 Agent 筛选", async (source) => {
+  it.each([
+    { source: "memmy-agent", displayedSource: "memmy", filter: "memmy-agent" },
+    { source: "cursor", displayedSource: "cursor", filter: "cursor" },
+    { source: "claude_code", displayedSource: "claude_code", filter: "claude_code" },
+    { source: "codex", displayedSource: "codex", filter: "codex" },
+    { source: "opencode", displayedSource: "opencode", filter: "opencode" },
+    { source: "openclaw", displayedSource: "openclaw", filter: "openclaw" },
+    { source: "hermes", displayedSource: "hermes", filter: "hermes" },
+    { source: "deepseek_harness", displayedSource: "deepseek_harness", filter: "deepseek_harness" },
+    { source: "workbuddy", displayedSource: "workbuddy", filter: "workbuddy" },
+    { source: "pi", displayedSource: "pi", filter: "pi" },
+    { source: "qwenwork", displayedSource: "qwenwork", filter: "qwenwork" },
+    { source: "claude-code", displayedSource: "claude-code", filter: "claude_code" },
+    { source: "claude", displayedSource: "claude-code", filter: "claude_code" },
+    { source: "open-code", displayedSource: "opencode", filter: "opencode" },
+    { source: "deepseek-harness", displayedSource: "deepseek-harness", filter: "deepseek_harness" }
+  ])("$source 创建的工作记忆保留会话来源并支持管理页 Agent 筛选", async ({ source, displayedSource, filter }) => {
     const { db, service } = createTestService();
     const namespace = {
       source,
@@ -97,7 +113,7 @@ describe("Work Memory pipeline", () => {
     const boundaryNamespace = opened.projectId ? { ...namespace, projectId: opened.projectId } : namespace;
     service.l3WorldModelBoundary(opened.sessionId, {
       requestId: "work-memory-create-request",
-      adapterId: "codex-memory",
+      adapterId: `${source}-memory`,
       source,
       namespace: boundaryNamespace,
       trigger: "token_compaction",
@@ -146,13 +162,13 @@ describe("Work Memory pipeline", () => {
       }) }
     });
     const panelItem = service.panelItems({ layer: "L1" }).items.find((item) => item.id === rows[0]!.id);
-    expect(panelItem?.metadata?.source).toBe(source);
-    const filtered = service.panelItems({ layer: "L1", sourceAgent: source });
+    expect(panelItem?.metadata?.source).toBe(displayedSource);
+    const filtered = service.panelItems({ layer: "L1", sourceAgent: filter });
     expect(filtered.items.some((item) => item.id === rows[0]!.id)).toBe(true);
     const otherSource = source === "codex" ? "claude-code" : "codex";
     expect(service.panelItems({ layer: "L1", sourceAgent: otherSource }).items.some((item) => item.id === rows[0]!.id)).toBe(false);
     const detail = service.getMemory(rows[0]!.id, { namespace: boundaryNamespace });
-    expect(detail.item.metadata.source).toBe(source);
+    expect(detail.item.metadata.source).toBe(displayedSource);
     expect("workMemory" in detail.item ? detail.item.workMemory : undefined).toEqual({
       workTopic: "SFT training pipeline",
       requirement: "固定数据清洗流水线",
