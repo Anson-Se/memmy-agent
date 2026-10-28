@@ -2915,7 +2915,7 @@
   min-height: 30px;
   padding: 5px 10px;
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-btn, 8px);
   background: color-mix(in srgb, var(--color-text-ink) 3%, var(--color-background-paper));
   color: color-mix(in srgb, var(--color-text-ink) 66%, transparent);
   font-size: 12px;
@@ -2926,10 +2926,6 @@
 }
 .pinned-command-chip > svg {
   flex: none;
-}
-.pinned-command-chip--legal-shortcut {
-  min-width: 112px;
-  justify-content: center;
 }
 .pinned-command-chip:hover:not(:disabled) {
   background: color-mix(in srgb, var(--color-text-ink) 7%, var(--color-background-paper));
