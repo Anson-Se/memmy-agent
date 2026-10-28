@@ -356,6 +356,45 @@ class YunxiaoSyncTests(unittest.TestCase):
         self.assertIsNone(MODULE.description_source_url(f"Body mentions\nGitHub: {url}"))
         self.assertIsNone(MODULE.description_source_url(f"GitHub: {url}#issuecomment-1"))
 
+    def test_legacy_source_sections_accept_bom_and_paragraph_whitespace(self):
+        issue_url = MODULE.source_url("issue", 394, REPOSITORY)
+        pr_url = MODULE.source_url("pr", 395, REPOSITORY)
+        cases = (
+            (f"来源：GitHub Issue #394 \ufeff{issue_url}\ufeff \ufeff 问题现象", issue_url),
+            (f"来源：GitHub PR #395\n\n{pr_url}\n\n问题\nDetails", pr_url),
+            (f'<div>来源：GitHub PR #395</div><div><a href="{pr_url}">{pr_url}</a></div><div>Details</div>', pr_url),
+        )
+        for description, expected in cases:
+            with self.subTest(description=description):
+                self.assertEqual(MODULE.description_source_url(description), expected.casefold())
+
+    def test_legacy_source_sections_reject_quoted_or_mismatched_sources(self):
+        for description in (
+            "Body first\n来源：GitHub Issue #394\nhttps://github.com/MemTensor/memmy-agent/issues/394",
+            "来源：GitHub Issue #394\nhttps://github.com/MemTensor/memmy-agent/issues/395",
+            "来源：GitHub PR #395\nhttps://github.com/MemTensor/memmy-agent/issues/395",
+            "来源：GitHub Issue #394\nhttps://example.com/MemTensor/memmy-agent/issues/394",
+            "来源：GitHub Issue #394\nhttps://github.com/MemTensor/memmy-agent/issues/394#issuecomment-1",
+            "来源：GitHub Issue #394\nUnrelated text\nhttps://github.com/MemTensor/memmy-agent/issues/394",
+        ):
+            with self.subTest(description=description):
+                self.assertIsNone(MODULE.description_source_url(description))
+
+    def test_title_cleanup_accepts_verified_legacy_source_sections(self):
+        for kind, number in (("issue", 394), ("pr", 395)):
+            with self.subTest(kind=kind):
+                card = source_card(number=number, kind=kind, form="long")
+                card["description"] = (
+                    f"来源：GitHub {MODULE.SOURCE_LABELS[kind]} #{number}\n\n"
+                    f"{MODULE.source_url(kind, number, REPOSITORY)}\n\nDetails"
+                )
+                transport = MemoryTransport([card])
+                result, stats = self.rename(transport, apply=True)
+                self.assertEqual((result, stats["renamed"], stats["failed"]), (0, 1, 0))
+                self.assertEqual(transport.cards["card"]["description"], card["description"])
+                writes = [body for method, _, body in transport.calls if method == "PUT"]
+                self.assertEqual(writes, [{"subject": f"[{MODULE.SOURCE_LABELS[kind]} #{number}] Fix scheduler"}])
+
     def test_sync_after_create_and_after_rename_reuses_the_same_card(self):
         transport = MemoryTransport()
         self.assertEqual(self.sync(transport), "created")
