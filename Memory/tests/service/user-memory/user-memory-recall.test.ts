@@ -3,6 +3,7 @@ import { DEFAULT_MEMMY_CONFIG, createMemoryHttpServer } from "../../../src/index
 import { buildUserMemory } from "../../../src/service/user-memory/user-memory.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import { stableHash } from "../../../src/utils/id.js";
+import { insertActivePolicyMemory } from "../../fixtures/evolution-fixture.js";
 import {
   configWithMemoryGates,
   createFailingLlm,
@@ -31,6 +32,65 @@ function seedUserMemory(db: ReturnType<typeof createTestService>["db"]) {
 }
 
 describe("User Memory recall gate", () => {
+  it.each([
+    { mode: "search", poolSize: 12, includeL1: true, expectedCandidates: 8 },
+    { mode: "turn_start", poolSize: 12, includeL1: true, expectedCandidates: 8 },
+    { mode: "search", poolSize: 2, includeL1: true, expectedCandidates: 2 },
+    { mode: "turn_start", poolSize: 2, includeL1: true, expectedCandidates: 2 },
+    { mode: "search", poolSize: 12, includeL1: false, expectedCandidates: 5 },
+    { mode: "turn_start", poolSize: 12, includeL1: false, expectedCandidates: 5 }
+  ] as const)("preserves the Agent candidate budget across gate changes: $mode, pool=$poolSize, L1=$includeL1", async ({ mode, poolSize, includeL1, expectedCandidates }) => {
+    let config = configWithMemoryGates({ enableUserMemoryRecall: false });
+    config.algorithm.retrieval = {
+      ...config.algorithm.retrieval,
+      tier1TopK: 0,
+      tier2TopK: 5,
+      tier3TopK: 0,
+      relativeThresholdFloor: 0,
+      minRecallScore: 0,
+      smartSeed: false,
+      llmFilterEnabled: false
+    };
+    const { db, service } = createTestService({ config, configLoader: () => ({ config }) });
+    const namespace = { source: "codex", profileId: "default", userId };
+    const { sessionId } = service.openSession({ namespace });
+    seedUserMemory(db);
+    for (let index = 0; index < poolSize; index += 1) {
+      insertActivePolicyMemory(db, {
+        id: `policy_recall_quota_${index}`,
+        userId,
+        sessionId,
+        agentId: namespace.source,
+        appId: "memmy",
+        profileId: namespace.profileId,
+        sourceTraceId: `trace_quota_${index}`,
+        sourceEpisodeId: `episode_quota_${index}`
+      });
+    }
+    for (const enabled of [false, true, false]) {
+      config = { ...config, algorithm: { ...config.algorithm, enableUserMemoryRecall: enabled } };
+      expect(service.reloadConfig({ restartFailedProcessing: false }).requiresRestart).toBe(false);
+      const request = {
+        sessionId,
+        query: "python pytest failure inspection retry",
+        layers: includeL1 ? ["L1", "L2"] as const : ["L2"] as const
+      };
+      const result = mode === "turn_start"
+        ? await service.startTurn({ ...request, layers: [...request.layers] })
+        : await service.search({ ...request, layers: [...request.layers] });
+      const log = service.apiLogs({ tools: ["memory_search"], limit: 1 }).logs[0]!;
+      const output = JSON.parse(log.outputJson) as { candidates: Array<{ tier: string }> };
+      expect(output.candidates.filter((candidate) => candidate.tier === "L2")).toHaveLength(expectedCandidates);
+      expect(result.hits.length).toBeLessThanOrEqual(5);
+      if (!enabled) {
+        expect(result.hits).toHaveLength(Math.min(poolSize, 5));
+        expect(JSON.stringify(result)).not.toContain(userMemoryId);
+        expect(output.candidates).toHaveLength(expectedCandidates);
+      }
+    }
+    await service.stop();
+  });
+
   it.each(sources)("applies to turn start and both search formats for %s", async (source) => {
     let config = configWithMemoryGates({});
     const { db, service } = createTestService({ config, configLoader: () => ({ config }) });

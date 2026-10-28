@@ -1966,7 +1966,7 @@ export class RetrievalService {
     const retrievalLimit = timeFilter
       ? TIME_FILTERED_TRACE_LIMIT
       : request.limit ?? this.defaultRetrievalLimit(retrievalMode);
-    const agentLaneLimit = includeUserMemory && userMemoryRecallEnabled
+    const agentLaneLimit = includeUserMemory
       ? parallelMemoryLaneLimit(retrievalLimit)
       : retrievalLimit;
     const retrievalOutput = onboardingFirstReportHit && onboardingFirstReportMemory
