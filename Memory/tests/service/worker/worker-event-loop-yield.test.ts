@@ -90,6 +90,190 @@ function blockedBacklog(h: ReturnType<typeof harness>, count = 1000) {
 }
 
 describe("continuous worker event-loop fairness", () => {
+  describe.each(["available", "runAfter", "mainLease", "retryTime", "retryLease", "failed"] as const)("refreshing an old %s deadline", kind => {
+    it.each([0, 1])("retains the deadline when a new insert's snapshot crosses it by %i ms", async crossedBy => {
+      const h = harness(), abort = new AbortController();
+      let clock = Date.now();
+      h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+      const due = clock + 3_600_000, future = new Date(due).toISOString();
+      const retry = kind === "retryTime" || kind === "retryLease";
+      if (retry) {
+        h.repos.runtime.enqueueEmbeddingRetry({ id: "old-deadline", targetKind: "trace", targetId: "missing",
+          vectorField: "vec_summary", sourceText: "synthetic", now: due });
+        if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',next_attempt_at=?,lease_until=? WHERE id='old-deadline'").run(clock - 1, due);
+      } else {
+        h.job("old-deadline", "user_memory_embedding");
+        if (kind === "available" || kind === "failed") h.db.db.prepare("UPDATE evolution_jobs SET available_at=?,status=?,failure_count=? WHERE id='old-deadline'")
+          .run(future, kind === "failed" ? "failed" : "queued", kind === "failed" ? 1 : 0);
+        else if (kind === "runAfter") h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='old-deadline'").run(JSON.stringify({ runAfter: future }));
+        else h.db.db.prepare("UPDATE evolution_jobs SET status='leased',leased_until=? WHERE id='old-deadline'").run(future);
+      }
+      const backlog = blockedBacklog(h, 1);
+      h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+      if (retry) {
+        h.repos.runtime.enqueueEmbeddingRetry({ id: "later-blocked-retry", targetKind: "trace", targetId: "other-missing",
+          vectorField: "vec_summary", sourceText: "synthetic", now: clock - 1 });
+        const prepare = h.deps.prepareExecution!;
+        h.deps.prepareExecution = work => work.queue === "embedding_retry" && work.retry.id === "later-blocked-retry"
+          ? { providers: [{ key: "blocked-local", limit: 1 }], run: operation => operation() } : prepare(work);
+      }
+      h.repos.runtime.scheduling.refreshPolicies(100);
+      h.db.db.prepare("UPDATE evolution_jobs SET queue_lane='import'").run();
+      h.db.db.prepare("UPDATE embedding_retry_queue SET queue_lane='import'").run();
+      const claim = vi.spyOn(h.repos.runtime, "claimEmbeddingRetryById");
+      const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+      try {
+        for (let i = 0; i < 15; i++) await nextTurn();
+        expect(h.processed).toEqual([]);
+        expect(backlog.prepared()).toBe(1);
+        // The insert arrives one millisecond before the old deadline. SQLite
+        // crosses that deadline after the expiry check, without changing rows.
+        clock = due - 1;
+        const read = h.repos.runtime.scheduling.readSnapshot.bind(h.repos.runtime.scheduling);
+        const snapshot = vi.spyOn(h.repos.runtime.scheduling, "readSnapshot").mockImplementationOnce(callback => {
+          clock = due + crossedBy;
+          return read(callback);
+        });
+        h.job("fresh-live", "user_memory_embedding"); h.runner.notifyWorkAvailable();
+        for (let i = 0; i < 30; i++) await nextTurn();
+        expect(snapshot).toHaveBeenCalled();
+        expect(h.processed).toContain("fresh-live");
+        if (retry) expect(claim.mock.calls.some(([id]) => id === "old-deadline")).toBe(true);
+        else expect(h.processed).toContain("old-deadline");
+      } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+      h.expectClean();
+    });
+  });
+
+  it("invalidates old cursors when a timing edit arrives between the change probe and its snapshot", async () => {
+    const h = harness(), abort = new AbortController();
+    h.job("old-delayed", "user_memory_embedding", "old-delayed", true);
+    const backlog = blockedBacklog(h, 1);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 12; i++) await nextTurn();
+      expect(h.processed).toEqual([]);
+      const read = h.repos.runtime.scheduling.readSnapshot.bind(h.repos.runtime.scheduling);
+      const snapshot = vi.spyOn(h.repos.runtime.scheduling, "readSnapshot").mockImplementationOnce(callback => {
+        // A new enqueue caused the change probe; a producer then edits an
+        // already-scanned older row before the deadline snapshot begins.
+        h.db.db.prepare("UPDATE evolution_jobs SET available_at=NULL WHERE id='old-delayed'").run();
+        return read(callback);
+      });
+      h.job("new-task", "user_memory_embedding"); h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 20; i++) await nextTurn();
+      expect(snapshot).toHaveBeenCalled();
+      expect(h.processed).toContain("old-delayed");
+      expect(h.processed).toContain("new-task");
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it.each(["main", "retry"] as const)("discovers an earlier edited %s deadline while idle without another notification", async queue => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = harness(), abort = new AbortController();
+    let clock = Date.now();
+    h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    if (queue === "main") {
+      h.job("old-delayed", "user_memory_embedding");
+      h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='old-delayed'").run(new Date(clock + 10_000).toISOString());
+    } else h.repos.runtime.enqueueEmbeddingRetry({ id: "old-delayed", targetKind: "trace", targetId: "missing",
+      vectorField: "vec_summary", sourceText: "synthetic", now: clock + 10_000 });
+    const backlog = blockedBacklog(h, 1);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const claim = vi.spyOn(h.repos.runtime, "claimEmbeddingRetryById");
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 12; i++) await nextTurn();
+      if (queue === "main") h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='old-delayed'").run(new Date(clock + 100).toISOString());
+      else h.db.db.prepare("UPDATE embedding_retry_queue SET next_attempt_at=? WHERE id='old-delayed'").run(clock + 100);
+      h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 12; i++) await nextTurn();
+      expect(h.processed).toEqual([]); expect(claim).not.toHaveBeenCalled();
+      clock += 100;
+      await vi.advanceTimersByTimeAsync(100);
+      for (let i = 0; i < 12; i++) await nextTurn();
+      if (queue === "main") expect(h.processed).toEqual(["old-delayed"]);
+      else expect(claim.mock.calls.some(([id]) => id === "old-delayed")).toBe(true);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("discovers a delayed task derived by a successful handler without a producer notification", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = harness(), abort = new AbortController(), backlog = blockedBacklog(h, 1);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    let clock = Date.now(); h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    h.job("parent", "user_memory_embedding");
+    const process = h.deps.jobHandlers.processJob;
+    h.deps.jobHandlers.processJob = async job => {
+      await process(job);
+      if (job.id === "parent") {
+        h.job("child", "user_memory_embedding");
+        h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='child'").run(new Date(clock + 100).toISOString());
+      }
+    };
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      for (let i = 0; i < 15; i++) await nextTurn();
+      expect(h.processed).toEqual(["parent"]);
+      clock += 100; await vi.advanceTimersByTimeAsync(100);
+      for (let i = 0; i < 15; i++) await nextTurn();
+      expect(h.processed).toEqual(["parent", "child"]);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it.each(["available", "runAfter", "mainLease", "retryTime", "retryLease"] as const)("rechecks an old %s row edited during a deep scan", async kind => {
+    const h = harness(), abort = new AbortController();
+    const clock = Date.now(), future = new Date(clock + 10_000).toISOString(), past = new Date(clock - 1).toISOString();
+    h.deps.nowIso = () => new Date(clock).toISOString(); h.deps.nowMs = () => clock;
+    const retry = kind === "retryTime" || kind === "retryLease";
+    if (retry) {
+      h.repos.runtime.enqueueEmbeddingRetry({ id: "old-timed", targetKind: "trace", targetId: "missing",
+        vectorField: "vec_summary", sourceText: "synthetic", now: clock + 10_000 });
+      if (kind === "retryLease") h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',next_attempt_at=?,lease_until=? WHERE id='old-timed'").run(clock - 1, clock + 10_000);
+    } else {
+      h.job("old-timed", "user_memory_embedding");
+      if (kind === "available") h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='old-timed'").run(future);
+      else if (kind === "runAfter") h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='old-timed'").run(JSON.stringify({ runAfter: future }));
+      else h.db.db.prepare("UPDATE evolution_jobs SET status='leased',leased_until=? WHERE id='old-timed'").run(future);
+    }
+    const backlog = blockedBacklog(h, 2000);
+    h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();
+    const claim = vi.spyOn(h.repos.runtime, "claimEmbeddingRetryById");
+    const run = h.runner.runWorkerOnce(100, {}, { continuous: true, signal: abort.signal });
+    try {
+      await nextTurn(); expect(backlog.prepared()).toBeLessThan(2000);
+      if (kind === "available") h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='old-timed'").run(past);
+      else if (kind === "runAfter") h.db.db.prepare("UPDATE evolution_jobs SET payload_json=? WHERE id='old-timed'").run(JSON.stringify({ runAfter: past }));
+      else if (kind === "mainLease") h.db.db.prepare("UPDATE evolution_jobs SET leased_until=? WHERE id='old-timed'").run(past);
+      else if (kind === "retryTime") h.db.db.prepare("UPDATE embedding_retry_queue SET next_attempt_at=? WHERE id='old-timed'").run(clock - 1);
+      else h.db.db.prepare("UPDATE embedding_retry_queue SET lease_until=? WHERE id='old-timed'").run(clock - 1);
+      h.runner.notifyWorkAvailable();
+      for (let i = 0; i < 60; i++) await nextTurn();
+      if (retry) expect(claim.mock.calls.some(([id]) => id === "old-timed")).toBe(true);
+      else expect(h.processed).toEqual(["old-timed"]);
+    } finally { abort.abort(); h.runner.notifyWorkAvailable(); await run; backlog.held.release(); }
+    h.expectClean();
+  });
+
+  it("reuses deadline state for ordinary completions and unrelated capacity wakes", async () => {
+    const h = harness(); h.jobs();
+    const queries = vi.spyOn(h.repos.runtime, "nextWorkerRunAt");
+    const process = h.deps.jobHandlers.processJob;
+    h.deps.jobHandlers.processJob = async job => {
+      const permit = h.concurrency.tryAcquire({ resourceClass: "summary", providers: [{ key: "unrelated", limit: 1 }], scopeKeys: [] });
+      permit?.release();
+      await process(job);
+    };
+    const result = await h.runner.runWorkerOnce(total);
+    expect(result.succeeded).toBe(total);
+    expect(queries.mock.calls.length).toBeLessThanOrEqual(2);
+    h.expectClean();
+  });
+
   it.each([1, 10_000, 50_000])("bounds repeated candidate reads with %i blocked rows and ongoing arrivals", async count => {
     const h = harness(), backlog = blockedBacklog(h, count), abort = new AbortController();
     h.db.db.prepare("DELETE FROM evolution_jobs WHERE id='late-database'").run();

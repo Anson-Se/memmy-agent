@@ -589,7 +589,7 @@ export class WorkerRunner {
     let scanFilters = "";
     let scanDenied = false;
     let scanDeadline: number | undefined;
-    let deadlineWakeVersion = -1;
+    let deadlineRevision: { revision: number; rescanRevision: number } | undefined;
     let prepareExecution: WorkerRunnerDeps["prepareExecution"];
     const active = new Set<Promise<void>>();
     const selectedMain: string[] = [];
@@ -634,23 +634,31 @@ export class WorkerRunner {
         const filters = JSON.stringify([retryOnly, paused, this.deps.memoryBudgetModelSources(), this.summaryJobsHeld(),
           this.deps.configurationFingerprint?.()]);
         if (!scan.more) scanDenied = scan.waiting.size > 0;
-        if (scanFilters !== filters ||
-          (scanDeadline !== undefined && scanDeadline <= this.nowMs())) {
+        const revision = this.deps.repos.runtime.scheduling.getDeadlineRevision();
+        const filtersChanged = scanFilters !== filters;
+        // Use one cutoff for both the expiry check and the future-only query.
+        // A deadline crossed during the snapshot must survive until discovery
+        // revisits older sequences, rather than being filtered out and forgotten.
+        const deadlineNow = this.nowMs();
+        const deadlineExpired = scanDeadline !== undefined && scanDeadline <= deadlineNow;
+        const changed = revision.revision !== deadlineRevision?.revision;
+        const previousDeadlineRevision = deadlineRevision;
+        if (filtersChanged || deadlineExpired || changed) {
+          // Read the token and deadline in one snapshot. Notifications alone do
+          // not invalidate timing: ordinary completions only request a refill.
+          this.deps.repos.runtime.scheduling.readSnapshot(() => {
+            deadlineRevision = this.deps.repos.runtime.scheduling.getDeadlineRevision();
+            scanDeadline = this.nextAdmissionDeadline(deadlineNow, request.targetMemoryIds, retryOnly);
+          });
+        }
+        // Use the snapshot's token: another connection may edit an old row
+        // between the cheap change probe and opening that snapshot.
+        if (filtersChanged || deadlineExpired || (previousDeadlineRevision &&
+          deadlineRevision?.rescanRevision !== previousDeadlineRevision.rescanRevision)) {
           scan = createFairWorkerScan();
           scanFilters = filters;
           scanDenied = false;
-          scanDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
           prepareExecution = this.deps.prepareExecutionBatch?.() ?? this.deps.prepareExecution;
-        }
-        if (deadlineWakeVersion !== this.wakeVersion) {
-          // A new enqueue/retry can introduce an earlier due time while a deep
-          // scan is yielding. Expired saved deadlines were handled above first.
-          const nextDeadline = this.nextAdmissionDeadline(this.nowMs(), request.targetMemoryIds, retryOnly);
-          // Keep the earlier deadline until the next loop handles it, including
-          // when time advances between the expiry check and this query.
-          scanDeadline = scanDeadline === undefined ? nextDeadline
-            : nextDeadline === undefined ? scanDeadline : Math.min(scanDeadline, nextDeadline);
-          deadlineWakeVersion = this.wakeVersion;
         }
         const capacity = Math.min(remaining, this.concurrency.availableJobs(), FAIR_CLAIM_BATCH_LIMIT);
         if (filled && capacity > 0 && !retryOnly && options.algorithm === "legacy") {
@@ -662,7 +670,9 @@ export class WorkerRunner {
         }
         filled = true;
         claiming = true;
-        const work = capacity > 0 ? claimFairWorkerBatch(this.deps.repos, {
+        const work = capacity > 0 ? this.deps.repos.transaction(() => {
+          const before = this.deps.repos.runtime.scheduling.getDeadlineRevision();
+          const claimed = claimFairWorkerBatch(this.deps.repos, {
           at: this.deps.nowIso(), limit: capacity, targetMemoryIds: request.targetMemoryIds,
           priorityCohortOnly: request.priorityCohortOnly,
           allowedJobTypes: retryOnly ? [] : paused ? allowedMemoryBudgetJobTypes(this.deps.memoryBudgetModelSources()) : undefined,
@@ -717,6 +727,21 @@ export class WorkerRunner {
             previous = batchKey ? { key: batchKey, permit, group, count: shared ? share!.count + 1 : 1 } : undefined;
             return admission;
           }
+          });
+          // This transaction only classifies/claims rows. Account for its own
+          // leases without requerying the queue, but never acknowledge a change
+          // that was already present before it acquired the database snapshot.
+          const after = this.deps.repos.runtime.scheduling.getDeadlineRevision();
+          if (deadlineRevision?.revision === before.revision &&
+            after.revision - before.revision === claimed.length &&
+            after.rescanRevision - before.rescanRevision === claimed.length) {
+            deadlineRevision = after;
+            for (const item of claimed) {
+              const expiry = item.queue === "main" ? Date.parse(item.job.leasedUntil!) : item.retry.leaseUntil!;
+              if (Number.isFinite(expiry)) scanDeadline = scanDeadline === undefined ? expiry : Math.min(scanDeadline, expiry);
+            }
+          }
+          return claimed;
         }) : [];
         claiming = false;
         scanDenied = denied || scan.blocked;
@@ -788,16 +813,19 @@ export class WorkerRunner {
         // turn. Handle it before either exiting or replacing it with a future
         // deadline, otherwise a skipped older sequence can remain invisible.
         const now = this.nowMs();
-        if (scanDeadline !== undefined && scanDeadline <= now) continue;
+        if ((scanDeadline !== undefined && scanDeadline <= now) ||
+          this.deps.repos.runtime.scheduling.getDeadlineRevision().revision !== deadlineRevision?.revision) continue;
         if (active.size === 0) {
           const snapshot = this.concurrency.snapshot();
           if (!denied || (snapshot.activeJobs === 0 && snapshot.embeddingRequests === 0 && Object.keys(snapshot.providers).length === 0)) break;
         }
         const wake = waitForWake(this.wakeVersion);
-        const deadline = this.nextAdmissionDeadline(now, request.targetMemoryIds, retryOnly);
-        // Newly queued delays and retries may appear after the initial scan.
-        // Retain their wake deadline so an older sequence is revisited when due.
-        scanDeadline = deadline;
+        // Budget deadlines are cheap in-memory state and may change independently
+        // of durable queue timestamps. Do not issue another SQL query to combine them.
+        const deadlines = [scanDeadline, this.deps.memoryBudgetNextReconcileAtMs?.(),
+          ...(paused ? [this.deps.memoryBudgetNextWakeAtMs()] : [])]
+          .filter((time): time is number => time !== undefined && Number.isFinite(time) && time > now);
+        const deadline = deadlines.length ? Math.min(...deadlines) : undefined;
         // Already due rows may be blocked on a permit or dependency. They must
         // not hide a future deadline or create a repeating zero-delay timer.
         const timer = deadline === undefined ? undefined : setTimeout(
@@ -837,10 +865,7 @@ export class WorkerRunner {
       excludedJobTypes: this.summaryJobsHeld(),
       includeEmbeddingRetries: !(paused && this.deps.memoryBudgetJobConsumes("embedding"))
     });
-    const times = [scheduled, this.deps.memoryBudgetNextReconcileAtMs?.(),
-      ...(paused ? [this.deps.memoryBudgetNextWakeAtMs()] : [])]
-      .filter((time): time is number => time !== undefined && Number.isFinite(time) && time > now);
-    return times.length ? Math.min(...times) : undefined;
+    return scheduled;
   }
 
   private async runClaimedMainJobs(jobs: EvolutionJobRecord[], results: WorkerJobRunResult[], preserveRoleOrder = false): Promise<void> {

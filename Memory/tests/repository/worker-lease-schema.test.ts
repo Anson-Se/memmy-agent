@@ -226,6 +226,11 @@ function usingDatabase(run: (runtime: Repositories["runtime"]) => void): void {
 }
 
 function removeSchedulingSchema(db: MemoryDb): void {
+  for (const table of ["evolution_jobs", "embedding_retry_queue"])
+    for (const suffix of ["deadline_insert", "deadline_update"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
+  for (const index of ["worker_main_deadline", "worker_main_lease_deadline", "worker_retry_lease_deadline"])
+    db.db.exec(`DROP INDEX ${index}`);
+  db.db.exec("DROP TABLE worker_deadline_revision");
   for (const table of ["evolution_jobs", "embedding_retry_queue"]) {
     for (const suffix of ["enqueue_sequence", "policy_dirty"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
     db.db.exec(`DROP INDEX ${pendingPolicyIndex(table)}`);

@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryDb } from "../../src/storage/db.js";
+import { MAIN_DEADLINE, MAIN_TIMED, MAIN_LEASED, RETRY_DEADLINE, RETRY_LEASED } from "../../src/storage/queue-deadline-schema.js";
 import { Repositories } from "../../src/storage/repositories.js";
 
 const at = "2026-10-22T00:00:00.000Z", now = Date.parse(at);
@@ -21,13 +23,64 @@ function setup() {
     runtime.enqueueEmbeddingRetry({ id, targetKind: "trace", targetId: target,
       vectorField: "vec_summary", sourceText: "synthetic", now: now + delay });
   }
-  return { db, runtime, iso, job, retry };
+  return { root, db, runtime, iso, job, retry };
 }
 afterEach(() => {
   for (const { root, db } of resources.splice(0)) { db.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 describe("future worker wake deadlines", () => {
+  it("preserves tokens on reopen and observes writes from another connection", () => {
+    const h = setup(); h.job("timed", 5000);
+    const before = h.runtime.scheduling.getDeadlineRevision();
+    const other = new Database(join(h.root, "memory.sqlite"));
+    try {
+      other.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='timed'").run(h.iso(8000));
+    } finally { other.close(); }
+    const changed = h.runtime.scheduling.getDeadlineRevision();
+    expect(changed.rescanRevision).toBe(before.rescanRevision + 1);
+    h.db.close();
+    const reopened = new MemoryDb({ path: join(h.root, "memory.sqlite") });
+    try {
+      const runtime = new Repositories(reopened.db).runtime;
+      expect(runtime.scheduling.getDeadlineRevision()).toEqual(changed);
+      expect(runtime.nextWorkerRunAt({ futureAfterMs: now })).toBe(now + 8000);
+    } finally { reopened.close(); }
+  });
+  it("uses ordered partial indexes rather than scanning ordinary queued rows", () => {
+    const h = setup(); h.job("timed", 5000);
+    const queries = [
+      [`SELECT ${MAIN_DEADLINE} FROM evolution_jobs INDEXED BY worker_main_deadline WHERE ${MAIN_TIMED} AND ${MAIN_DEADLINE} > ? ORDER BY ${MAIN_DEADLINE} LIMIT 1`, at, "worker_main_deadline"],
+      [`SELECT leased_until FROM evolution_jobs INDEXED BY worker_main_lease_deadline WHERE ${MAIN_LEASED} AND leased_until > ? ORDER BY leased_until LIMIT 1`, at, "worker_main_lease_deadline"],
+      [`SELECT ${RETRY_DEADLINE} FROM embedding_retry_queue INDEXED BY worker_retry_lease_deadline WHERE ${RETRY_LEASED} AND ${RETRY_DEADLINE} > ? ORDER BY ${RETRY_DEADLINE} LIMIT 1`, now, "worker_retry_lease_deadline"]
+    ] as const;
+    for (const [sql, param, index] of queries) {
+      const plan = h.db.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(param) as Array<{ detail: string }>;
+      expect(plan.some(row => row.detail.includes(index) && row.detail.includes("SEARCH"))).toBe(true);
+      expect(plan.some(row => row.detail.includes("TEMP B-TREE"))).toBe(false);
+    }
+  });
+
+  it("tracks raw timing/filter edits transactionally but ignores ordinary completion", () => {
+    const h = setup(), revision = () => h.runtime.scheduling.getDeadlineRevision();
+    const initial = revision(); h.job("timed", 5000);
+    const inserted = revision();
+    expect(inserted.revision).toBeGreaterThan(initial.revision);
+    expect(inserted.rescanRevision).toBe(initial.rescanRevision);
+    h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='timed'").run(h.iso(8000));
+    const changed = revision(); expect(changed.rescanRevision).toBeGreaterThan(inserted.rescanRevision);
+    expect(() => h.db.db.transaction(() => {
+      h.db.db.prepare("UPDATE evolution_jobs SET available_at=? WHERE id='timed'").run(at);
+      throw new Error("rollback");
+    })()).toThrow("rollback");
+    expect(revision()).toEqual(changed);
+    h.db.db.prepare("UPDATE evolution_jobs SET status='succeeded',available_at=NULL WHERE id='timed'").run();
+    expect(revision()).toEqual(changed);
+    h.retry("retry", 5000); const retryBefore = revision();
+    h.db.db.prepare("UPDATE embedding_retry_queue SET next_attempt_at=? WHERE id='retry'").run(now + 2000);
+    expect(revision().rescanRevision).toBeGreaterThan(retryBefore.rescanRevision);
+  });
+
   it("ignores due blocked heads without hiding a later scheduled job", () => {
     const h = setup(); h.job("already-due", -1); h.job("later", 5_000);
     expect(h.runtime.nextWorkerRunAt({ futureAfterMs: now })).toBe(now + 5_000);

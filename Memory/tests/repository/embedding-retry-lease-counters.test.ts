@@ -92,6 +92,12 @@ describe("Embedding retry lease counters", () => {
 });
 
 function downgradeTo(db: MemoryDb, version: 9 | 12) {
+  // These auxiliary objects did not exist in either historical schema.
+  for (const table of ["evolution_jobs", "embedding_retry_queue"])
+    for (const suffix of ["deadline_insert", "deadline_update"]) db.db.exec(`DROP TRIGGER ${table}_${suffix}`);
+  for (const index of ["worker_main_deadline", "worker_main_lease_deadline", "worker_retry_lease_deadline"])
+    db.db.exec(`DROP INDEX ${index}`);
+  db.db.exec("DROP TABLE worker_deadline_revision");
   const columns = () => (db.db.prepare("PRAGMA table_info(embedding_retry_queue)").all() as Array<{ name: string }>).map(row => row.name);
   for (const column of counters) if (columns().includes(column)) db.db.exec(`ALTER TABLE embedding_retry_queue DROP COLUMN ${column}`);
   if (version === 9) {

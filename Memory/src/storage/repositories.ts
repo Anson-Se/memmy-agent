@@ -1,3 +1,4 @@
+import { MAIN_DEADLINE, MAIN_TIMED, MAIN_LEASED, RETRY_DEADLINE, RETRY_LEASED } from "./queue-deadline-schema.js";
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
@@ -3534,36 +3535,17 @@ export class RuntimeRepository {
     const futureIso = future === undefined ? undefined : new Date(future).toISOString();
     const mainParams = [...jobTypeParams, ...(targets ?? []), ...(futureIso ? [futureIso] : [])];
     const queuedJob = this.db
-      .prepare(
-        `SELECT MAX(COALESCE(available_at, ''),
-                    COALESCE(CAST(json_extract(payload_json, '$.runAfter') AS TEXT), '')) AS run_after
-         FROM evolution_jobs
-         WHERE status IN ('queued', 'failed')
-           AND failure_count < max_attempts
-           AND (blocked_reason IS NULL OR blocked_reason != 'configuration')
-           AND (available_at IS NOT NULL OR json_type(payload_json, '$.runAfter') = 'text')
-           ${jobTypeFilter}
-           ${excludeFilter}
-           ${targetFilter}
-           ${futureIso ? "AND MAX(COALESCE(available_at, ''), COALESCE(CAST(json_extract(payload_json, '$.runAfter') AS TEXT), '')) > ?" : ""}
-         ORDER BY run_after ASC
-         LIMIT 1`
-      )
+      .prepare(`SELECT ${MAIN_DEADLINE} AS run_after
+        FROM evolution_jobs INDEXED BY worker_main_deadline
+        WHERE ${MAIN_TIMED} ${jobTypeFilter} ${excludeFilter} ${targetFilter}
+          ${futureIso ? `AND ${MAIN_DEADLINE} > ?` : ""}
+        ORDER BY ${MAIN_DEADLINE} ASC LIMIT 1`)
       .get(...mainParams) as { run_after: string } | undefined;
     const leasedJob = this.db
-      .prepare(
-        `SELECT leased_until
-         FROM evolution_jobs
-         WHERE status = 'leased'
-           AND failure_count < max_attempts
-           AND leased_until IS NOT NULL
-           ${jobTypeFilter}
-           ${excludeFilter}
-           ${targetFilter}
-           ${futureIso ? "AND leased_until > ?" : ""}
-         ORDER BY leased_until ASC
-         LIMIT 1`
-      )
+      .prepare(`SELECT leased_until FROM evolution_jobs INDEXED BY worker_main_lease_deadline
+        WHERE ${MAIN_LEASED} ${jobTypeFilter} ${excludeFilter} ${targetFilter}
+          ${futureIso ? "AND leased_until > ?" : ""}
+        ORDER BY leased_until ASC LIMIT 1`)
       .get(...mainParams) as { leased_until: string } | undefined;
     const includeEmbeddingRetries = options?.includeEmbeddingRetries !== false;
     const pendingEmbedding = includeEmbeddingRetries
@@ -3582,12 +3564,11 @@ export class RuntimeRepository {
     const inProgressEmbedding = includeEmbeddingRetries
       ? this.db
         .prepare(
-          `SELECT MAX(next_attempt_at, lease_until) AS run_at
-           FROM embedding_retry_queue
-           WHERE status = 'in_progress'
-             AND lease_until IS NOT NULL
+          `SELECT ${RETRY_DEADLINE} AS run_at
+           FROM embedding_retry_queue INDEXED BY worker_retry_lease_deadline
+           WHERE ${RETRY_LEASED}
              ${retryTargetFilter}
-             ${future !== undefined ? "AND MAX(next_attempt_at, lease_until) > ?" : ""}
+             ${future !== undefined ? `AND ${RETRY_DEADLINE} > ?` : ""}
            ORDER BY run_at ASC
            LIMIT 1`
         )

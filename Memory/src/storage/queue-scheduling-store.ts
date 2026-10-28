@@ -49,6 +49,11 @@ export interface PolicyRefreshResult {
 export class QueueSchedulingStore {
   constructor(private readonly db: Database.Database) {}
 
+  getDeadlineRevision(): { revision: number; rescanRevision: number } {
+    return this.db.prepare("SELECT revision, rescan_revision AS rescanRevision FROM worker_deadline_revision WHERE singleton = 1")
+      .get() as { revision: number; rescanRevision: number };
+  }
+
   getSelectionRevision(): number {
     return selectionRevisions.get(this.db) ?? 0;
   }

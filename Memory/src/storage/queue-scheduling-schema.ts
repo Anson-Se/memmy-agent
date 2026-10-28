@@ -1,3 +1,4 @@
+import { installQueueDeadlineSchema } from "./queue-deadline-schema.js";
 import type Database from "better-sqlite3";
 import { JOB_POLICY_VERSION } from "../service/worker/job-policy-registry.js";
 
@@ -105,4 +106,5 @@ export function installQueueSchedulingSchema(db: Database.Database): void {
     UPDATE evolution_jobs SET policy_version = NULL WHERE target_memory_id = OLD.id;
     UPDATE embedding_retry_queue SET policy_version = NULL WHERE target_id = OLD.id;
   END`);
+  installQueueDeadlineSchema(db);
 }
