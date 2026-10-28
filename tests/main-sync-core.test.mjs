@@ -11,7 +11,7 @@ import { normalizeConfig, validateRelease } from '../scripts/main-sync/core.mjs'
 const roots=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 const source='a'.repeat(40),controller='b'.repeat(40),main='c'.repeat(40);
-const config=Buffer.from(JSON.stringify({schemaVersion:1,repository:'MemTensor/memmy-agent',targets:['v1.2.5','v1.2.6','1.2.7']}));
+const config=Buffer.from(JSON.stringify({schemaVersion:1,repository:'MemTensor/memmy-agent',targets:['v1.2.5','v1.2.6','v1.2.7']}));
 const env={GITHUB_REPOSITORY:'MemTensor/memmy-agent',GITHUB_REPOSITORY_ID:'1302496224',GITHUB_REF:'refs/heads/main',
  GITHUB_WORKFLOW_SHA:controller,GITHUB_RUN_ID:'12345',GITHUB_RUN_ATTEMPT:'1',GITHUB_EVENT_NAME:'workflow_dispatch',SYNC_SOURCE_SHA:source,SYNC_RELEASE_ID:'123'};
 function fixture() {
@@ -79,7 +79,7 @@ describe('CodingAgent Draft synchronization request',()=>{
   expect(request.pullRequestNumber).toBe(729);
  });
  it('keeps an explicit target allowlist and finite repair budgets',()=>{
-  expect(normalizeConfig(JSON.parse(config)).targets).toEqual(['v1.2.5','v1.2.6','1.2.7']);
+  expect(normalizeConfig(JSON.parse(config)).targets).toEqual(['v1.2.5','v1.2.6','v1.2.7']);
   for(const changed of [{targets:['main']},{targets:['v1.2.5','v1.2.5']},{maxRounds:100000},{maxDurationMinutes:0}])
    expect(()=>normalizeConfig({...JSON.parse(config),...changed})).toThrow();
  });

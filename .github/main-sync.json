@@ -4,7 +4,7 @@
   "targets": [
     "v1.2.5",
     "v1.2.6",
-    "1.2.7"
+    "v1.2.7"
   ],
   "maxRounds": 6,
   "maxNoProgress": 2,
