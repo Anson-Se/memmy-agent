@@ -9,6 +9,7 @@ import {
 import type { MemoryRow, RequestEnvelope } from "../../types.js";
 import { stableHash } from "../../utils/id.js";
 import { firstLine } from "../../utils/text.js";
+import { frontmatterBoolean, frontmatterString, parseSkillFrontmatter } from "@memmy/agent-source-core";
 import { importedSkillInfoFields, importedSkillInternalFields, memoryAddKey } from "./memory-import-pipeline.js";
 
 /** One SKILL.md found in the source Agent's skill directories. */
@@ -151,6 +152,81 @@ export class AgentSkillLibrary {
       }
     });
     return result;
+  }
+
+  /**
+   * Brings imported Skill records written before source reconciliation up to
+   * the current state version, using only what is stored. Facts that need the
+   * source files (openai.yaml policy, plugins, whether a file still exists)
+   * are settled by the next scan. Runs at startup; records that already carry
+   * the version are skipped, so it can be repeated safely.
+   */
+  migrateLegacyRecords(at: string, limit: number): { migrated: number; scrubbedDeleted: number } {
+    let migrated = 0;
+    let scrubbedDeleted = 0;
+    this.deps.repos.transaction(() => {
+      const legacy = this.deps.repos.memories.listImportedSkillsBelowStateVersion(IMPORTED_SKILL_STATE_VERSION, limit);
+      const bySource = new Map<string, MemoryRow[]>();
+      for (const memory of legacy) {
+        const sourceAgentId = String(memory.properties.internal_info.source_agent_id ?? "");
+        bySource.set(sourceAgentId, [...(bySource.get(sourceAgentId) ?? []), memory]);
+      }
+      for (const [sourceAgentId, records] of bySource) {
+        const pending = new Set(records.map((memory) => memory.id));
+        // Versions already migrated still count when choosing the current one.
+        const groups = groupBySourceIdentity(this.deps.repos.memories.listImportedSkillsForSource(sourceAgentId));
+        for (const versions of groups.values()) {
+          const live = versions.filter((version) => !isDeleted(version));
+          const current = live
+            .filter((version) => version.status === "activated" || version.status === "resolving")
+            .sort(compareImportRecency)[0];
+          for (const version of versions) {
+            if (!pending.has(version.id)) continue;
+            if (isDeleted(version)) {
+              this.deps.repos.memories.rewriteDeletedRow(stripBody(withImportFields(version, stateFields({ status: "archived" }), version.updatedAt), version.updatedAt));
+              this.deps.repos.runtime.scrubImportedSkillCopies(version.id);
+              scrubbedDeleted += 1;
+            } else {
+              this.migrateLiveRecord(version, current, at);
+            }
+            migrated += 1;
+          }
+        }
+      }
+    });
+    return { migrated, scrubbedDeleted };
+  }
+
+  private migrateLiveRecord(memory: MemoryRow, current: MemoryRow | undefined, at: string): void {
+    const internal = memory.properties.internal_info;
+    const frontmatter = parseSkillFrontmatter(memory.memoryValue);
+    const title = typeof internal.name === "string" ? internal.name
+      : typeof memory.info.title === "string" ? memory.info.title : "";
+    const description = frontmatterString(frontmatter.data, "description");
+    const legacyFields: Record<string, unknown> = {
+      source_kind: "skill",
+      normalized_name: normalizeSkillName(title),
+      source_modified_at: memory.timeline ?? memory.createdAt,
+      ...(description ? { skill_description: description } : {}),
+      invocation: { disable_model_invocation: frontmatterBoolean(frontmatter.data, "disable-model-invocation") === true }
+    };
+    let desired: DesiredState;
+    if (memory.status === "archived") {
+      desired = { status: "archived", reason: typeof internal.superseded_by_skill_id === "string" ? "superseded" : "user" };
+    } else if (current && current.id !== memory.id) {
+      desired = { status: "archived", reason: "superseded" };
+    } else if (frontmatterBoolean(frontmatter.data, "disable-model-invocation") === true) {
+      desired = { status: "archived", reason: "invocation_policy" };
+    } else {
+      desired = { status: "activated" };
+    }
+    const withFields = withImportFields(memory, legacyFields, memory.updatedAt);
+    if (desired.status === memory.status && (desired.reason === undefined || memory.status === "archived")) {
+      // Only metadata changes: keep the version and the stored updated_at.
+      this.deps.repos.memories.updateMaintenance(withImportFields(withFields, stateFields(desired), memory.updatedAt));
+      return;
+    }
+    this.applyState(withFields, desired, at, "agent_skill_state_migrated", desired.reason === "superseded" ? current?.id : undefined);
   }
 
   /** Records the user's own archive so later scans keep it. */
@@ -565,4 +641,13 @@ function isRegistrationGroup(versions: readonly MemoryRow[]): boolean {
 
 function isDeleted(memory: MemoryRow): boolean {
   return Boolean(memory.deletedAt) || memory.status === "deleted";
+}
+
+/** Newest import first: the version most recently written by an import is treated as current. */
+function compareImportRecency(left: MemoryRow, right: MemoryRow): number {
+  const time = (memory: MemoryRow) => {
+    const imported = memory.properties.internal_info.imported_at;
+    return typeof imported === "string" ? imported : memory.updatedAt;
+  };
+  return time(right).localeCompare(time(left)) || right.updatedAt.localeCompare(left.updatedAt);
 }

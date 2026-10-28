@@ -778,6 +778,33 @@ export class MemoryRepository {
     return rows.map((row) => this.hydrate(memoryFromSql(row)));
   }
 
+  /** Imported Skill records not yet carrying the given import state version, deleted ones included. */
+  listImportedSkillsBelowStateVersion(version: number, limit: number): MemoryRow[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM memories
+       WHERE memory_layer = 'Skill'
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND COALESCE(json_extract(properties_json, '$.internal_info.import_state_version'), 0) < ?
+       ORDER BY created_at, id
+       LIMIT ?`
+    ).all(version, limit) as MemorySqlRow[];
+    return rows.map((row) => this.hydrate(memoryFromSql(row)));
+  }
+
+  /**
+   * Rewrites the body and metadata of a row that is already soft-deleted;
+   * update() only touches live rows. Status, times and version stay as they are.
+   */
+  rewriteDeletedRow(memory: MemoryRow): void {
+    const sql = memoryToSql(prepareMemoryForStorage(memory).memory);
+    this.db.prepare(
+      `UPDATE memories
+       SET memory_value = @memoryValue, info_json = @infoJson, properties_json = @propertiesJson
+       WHERE id = @id AND (deleted_at IS NOT NULL OR status = 'deleted')`
+    ).run({ id: sql.id, memoryValue: sql.memoryValue, infoJson: sql.infoJson, propertiesJson: sql.propertiesJson });
+    this.db.prepare(`DELETE FROM memories_fts WHERE id = ?`).run(memory.id);
+  }
+
   archivePriorReadOnlySkillVersions(input: {
     sourceAgentId: string;
     sourceSkillIdentity: string;

@@ -3158,6 +3158,14 @@ export class MemoryService {
   }
 
   reconcileWorkerStartup(limit = 10000): ReturnType<WorkerRunner["reconcileWorkerStartup"]> {
+    if (this.memoryAddEnabled()) {
+      try {
+        const migration = this.agentSkills.migrateLegacyRecords(nowIso(), limit);
+        if (migration.migrated > 0) serviceLogger.info("agent_skill.legacy_migrated", migration);
+      } catch (error) {
+        serviceLogger.error("agent_skill.legacy_migration_failed", memoryErrorFields(error));
+      }
+    }
     const result = this.workerRunner.reconcileWorkerStartup(limit);
     this.reconcileAutomaticHistorySkills(nowIso(), limit);
     return result;
