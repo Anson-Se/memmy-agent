@@ -484,8 +484,7 @@ def search_workitems(
 def workitem_details(
     org: str, workitem: dict[str, Any], client: YunxiaoClient
 ) -> dict[str, Any]:
-    if "description" in workitem and "subject" in workitem:
-        return workitem
+    # Search results are projections; verify identity using the detail endpoint.
     identifier = item_id(workitem)
     detail = client.get(f"/oapi/v1/projex/organizations/{org}/workitems/{identifier}")
     if isinstance(detail, dict):
