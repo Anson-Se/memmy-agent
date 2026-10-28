@@ -290,8 +290,8 @@ describe("queue scheduling metadata and read-only candidates", () => {
     const h = harness();
     h.retry("ready", "target"); h.retry("later", "later-target", now + 1_000); h.retry("outside", "other");
     h.retry("valid", "valid-target"); h.retry("expired", "expired-target");
-    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',lease_until=? WHERE id='valid'").run(now + 1_000);
-    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',lease_until=? WHERE id='expired'").run(now);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by='fixture-worker',lease_until=? WHERE id='valid'").run(now + 1_000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET status='in_progress',claimed_by='fixture-worker',lease_until=? WHERE id='expired'").run(now);
     h.store.refreshPolicies();
     expect(h.ids()).toEqual(["expired", "outside", "ready"]);
     expect(h.ids({ targetMemoryIds: ["target"] })).toEqual(["ready"]);
@@ -526,8 +526,8 @@ describe("real-scheduler policy preparation", () => {
     h.rawJob("exhausted");
     h.db.db.prepare("UPDATE evolution_jobs SET failure_count=max_attempts WHERE id='exhausted'").run();
     h.retry("valid-lease"); h.retry("expired-lease");
-    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',lease_until=? WHERE id='valid-lease'").run(now+1000);
-    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',lease_until=? WHERE id='expired-lease'").run(now);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',claimed_by='fixture-worker',lease_until=? WHERE id='valid-lease'").run(now+1000);
+    h.db.db.prepare("UPDATE embedding_retry_queue SET policy_version=NULL,status='in_progress',claimed_by='fixture-worker',lease_until=? WHERE id='expired-lease'").run(now);
     expect(h.store.refreshRunnablePolicies({ at, maxRows: 1 })).toEqual({ refreshed: 1, unknown: [], hasMore: true });
     expect(h.runtime.getEmbeddingRetry("expired-lease")?.policyVersion).toBe(JOB_POLICY_VERSION);
     expect(h.runtime.getEmbeddingRetry("valid-lease")?.policyVersion).toBeNull();
