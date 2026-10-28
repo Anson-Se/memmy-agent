@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMemoryServiceFixture, createBatchReflectionLlm } from "../../fixtures/memory-service-fixture.js";
+import { createMemoryServiceFixture, createBatchReflectionLlm, settleCaptureAssignments, assignedEpisodeId } from "../../fixtures/memory-service-fixture.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 
 const fixture = createMemoryServiceFixture();
 afterEach(() => { vi.restoreAllMocks(); fixture.cleanup(); });
 
-function harness() {
+async function harness() {
   const h = fixture.createTestService({ llm: createBatchReflectionLlm([]) });
-  const captured = h.service.completeSourceTurn({
+  const captured = await h.service.completeSourceTurn({
     namespace: { source: "codex", profileId: "default", userId: "projection-user" },
     source: "codex", channel: "agent_source_scan", captureLegacyHistory: true,
     sourceTurn: { source: "codex", profileId: "default", conversationId: "projection-conversation", turnId: "turn-1",
@@ -17,6 +17,8 @@ function harness() {
   });
   expect(captured.status).toBe("stored");
   const result = captured.result!;
+  await settleCaptureAssignments(h.service);
+  result.episodeId = assignedEpisodeId(h.service, result);
   const repos = new Repositories(h.db.db);
   function memory(id: string, origin: unknown = "agent_source_scan", agentId = "codex", tags: string[] = [], deletedAt: string | null = null) {
     h.db.db.prepare(`INSERT INTO memories(id,timeline,user_id,memory_value,memory_layer,agent_id,tags_json,properties_json,
@@ -28,7 +30,7 @@ function harness() {
   return { ...h, repos, result, memory };
 }
 
-describe("episode title provenance uses metadata without memory/vector hydration", () => {
+describe("episode title provenance uses metadata without memory/vector hydration", async () => {
   it.each([
     { name: "wholly historical", ids: ["history"], expected: "import" },
     { name: "mixed historical/current", ids: ["history", "current"], expected: "interactive" },
@@ -44,8 +46,8 @@ describe("episode title provenance uses metadata without memory/vector hydration
     { name: "first report tag", ids: ["history", "first-report"], expected: "interactive" },
     { name: "onboarding report tag", ids: ["history", "onboarding-report"], expected: "interactive" },
     { name: "ordinary tag", ids: ["ordinary"], expected: "import" }
-  ])("keeps $name semantics without loading bodies", ({ ids, expected }) => {
-    const h = harness();
+  ])("keeps $name semantics without loading bodies", async ({ ids, expected }) => {
+    const h = await harness();
     h.memory("history"); h.memory("current", null); h.memory("unknown", "hook");
     h.memory("uppercase", "AGENT_SOURCE_SCAN"); h.memory("deleted", "agent_source_scan", "codex", [], "2020-01-01");
     h.memory("onboarding-agent", "agent_source_scan", "MeMmY-OnBoArDiNg");
@@ -66,11 +68,13 @@ describe("episode title provenance uses metadata without memory/vector hydration
     expect(sql.mock.calls.map(call => call[0]).join("\n")).not.toMatch(/SELECT\s+\*\s+FROM\s+memories|FROM\s+memory_vector_entries/i);
   });
 
-  it("does not hydrate a growing historical episode when refreshing a deduplicated provisional title", () => {
-    const h = harness();
+  it("does not hydrate a growing historical episode when refreshing a deduplicated provisional title", async () => {
+    const h = await harness();
     const episode = h.repos.runtime.getEpisode(h.result.episodeId)!;
     h.db.db.prepare("UPDATE episodes SET l1_memory_ids_json = ? WHERE id = ?")
       .run(JSON.stringify(Array.from({ length: 2000 }, () => h.result.l1MemoryId)), episode.id);
+    h.service["workerHandlers"].enqueueJob({ jobType: "episode_title", userId: episode.userId,
+      sessionId: episode.sessionId, episodeId: episode.id, payload: { stage: "provisional" } });
     const original = h.db.db.prepare("SELECT id,enqueue_seq FROM evolution_jobs WHERE episode_id = ? AND job_type = 'episode_title'")
       .get(episode.id) as { id: string; enqueue_seq: number };
     const memoryHydration = vi.spyOn(h.service["repos"].memories, "getMany");
@@ -84,16 +88,16 @@ describe("episode title provenance uses metadata without memory/vector hydration
     expect(vectorHydration).not.toHaveBeenCalled();
   });
 
-  it("matches memory hydration for malformed legacy tags without treating an object as an onboarding tag list", () => {
-    const h = harness();
+  it("matches memory hydration for malformed legacy tags without treating an object as an onboarding tag list", async () => {
+    const h = await harness();
     h.db.db.prepare("UPDATE memories SET tags_json = ? WHERE id = ?")
       .run(JSON.stringify({ label: "first-encounter-report" }), h.result.l1MemoryId);
     expect(h.repos.memories.getMany([h.result.l1MemoryId])[0]?.tags).not.toContain("first-encounter-report");
     expect(h.repos.memories.areAllHistoricalCaptureMemories([h.result.l1MemoryId])).toBe(true);
   });
 
-  it.each(["info_json", "properties_json"] as const)("keeps report tags stored only in %s interactive", column => {
-    const h = harness();
+  it.each(["info_json", "properties_json"] as const)("keeps report tags stored only in %s interactive", async column => {
+    const h = await harness();
     h.db.db.prepare(`UPDATE memories SET ${column} = json_set(${column}, '$.tags', json(?)) WHERE id = ?`)
       .run(JSON.stringify(["FIRST-ENCOUNTER-REPORT"]), h.result.l1MemoryId);
     expect(h.repos.memories.getMany([h.result.l1MemoryId])[0]?.tags).toContain("FIRST-ENCOUNTER-REPORT");
@@ -105,8 +109,8 @@ describe("episode title provenance uses metadata without memory/vector hydration
     expect(hydration).not.toHaveBeenCalled();
   });
 
-  it("ignores a caller-supplied historical origin when the title has no verified episode", () => {
-    const h = harness();
+  it("ignores a caller-supplied historical origin when the title has no verified episode", async () => {
+    const h = await harness();
     const queued = h.service["workerHandlers"].enqueueJob({ jobType: "episode_title", userId: "projection-user",
       payload: { stage: "final", captureOrigin: "agent_source_scan" } });
     expect(queued.queueLane).toBe("interactive");

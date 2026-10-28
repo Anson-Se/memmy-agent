@@ -147,7 +147,7 @@ describe("routed embedding request batches", () => {
     const namespace = { source: "codex", profileId: "default", userId: "isolated-work-memory-batch", sessionKey: "batch-session" };
     const opened = service.openSession({ namespace, l3WorldModelProtocolVersion: 2, l3WorldModelTransition: "resume_only",
       workspaceUri: "file:///tmp/isolated-work-memory-batch", workspaceHostId: "a".repeat(64) });
-    const completed = service.completeTurn("batch-turn", { sessionId: opened.sessionId,
+    const completed = await service.completeTurn("batch-turn", { sessionId: opened.sessionId,
       query: "Use the reproducible build pipeline.", answer: "The build pipeline is documented." });
     service.l3WorldModelBoundary(opened.sessionId, { requestId: "isolated-batch-boundary", adapterId: "codex-memory", source: "codex",
       namespace: { ...namespace, projectId: opened.projectId ?? undefined }, trigger: "token_compaction", throughL1MemoryId: completed.l1MemoryId });

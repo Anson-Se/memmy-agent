@@ -63,11 +63,12 @@ function harness() {
     embeddingJobs: { prepareEmbeddingJob: () => { throw new Error("Unexpected embedding job"); }, applyEmbeddingVector: () => {},
       persistEmbeddingVector: () => { throw new Error("Unexpected vector write"); }, enqueueEmbeddingRetryAfterFailure: () => false }
   }); runners.push(runner);
-  function assignment(index: number, projectId: string) {
+  async function assignment(index: number, projectId: string) {
     const session = service.openSession({ namespace: { source: "codex", profileId: `review-${index}`, userId: "review-user", projectId } });
-    const turn = service.completeTurn(`review-turn-${index}`, { sessionId: session.sessionId,
+    const turn = await service.completeTurn(`review-turn-${index}`, { sessionId: session.sessionId,
       query: "Review this code carefully", answer: "Reviewed this code" });
-    repos.runtime.updateEpisodeReward(turn.episodeId, { rTask: 0.5, rewardDetail: { source: "review" } });
+    expect(turn.episodeId).toBeDefined();
+    repos.runtime.updateEpisodeReward(turn.episodeId!, { rTask: 0.5, rewardDetail: { source: "review" } });
     return enqueueJob({ jobType: "skill_cluster_assign", userId: "review-user", sessionId: session.sessionId, episodeId: turn.episodeId, payload: {} });
   }
   async function initialCluster(job: EvolutionJobRecord) {
@@ -83,8 +84,8 @@ function harness() {
 describe("Skill cluster assignment/evolution admission", () => {
   it("keeps a new same-project assignment queued during evolution, preserves its new member and permits another project", async () => {
     const h = harness();
-    const first = h.assignment(1, "project-A"); const cluster = await h.initialCluster(first);
-    const sameProject = h.assignment(2, "project-A"), otherProject = h.assignment(3, "project-B");
+    const first = await h.assignment(1, "project-A"); const cluster = await h.initialCluster(first);
+    const sameProject = await h.assignment(2, "project-A"), otherProject = await h.assignment(3, "project-B");
     h.db.db.prepare("UPDATE evolution_jobs SET available_at='2100-01-01T00:00:00.000Z' WHERE job_type NOT IN ('skill_cluster_assign','skill_batch_evolve')").run();
     const run = h.runner.runWorkerOnce(100); await h.entered.promise;
     for (let i = 0; i < 500; i++) await Promise.resolve();
@@ -102,8 +103,8 @@ describe("Skill cluster assignment/evolution admission", () => {
   });
 
   it("resolves Skill scopes from authoritative episode/cluster metadata without a target or current session", async () => {
-    const h = harness(); const first = h.assignment(1, "project-A"), cluster = await h.initialCluster(first);
-    const second = h.assignment(2, "project-A"), other = h.assignment(3, "project-B");
+    const h = harness(); const first = await h.assignment(1, "project-A"), cluster = await h.initialCluster(first);
+    const second = await h.assignment(2, "project-A"), other = await h.assignment(3, "project-B");
     const evolution = h.repos.runtime.listJobs(undefined, 100).find(job => job.jobType === "skill_batch_evolve" && job.payload.clusterId === cluster.id)!;
     const evolveWithoutSession = { ...evolution, sessionId: undefined, episodeId: undefined };
     const assignWithoutSession = { ...second, sessionId: undefined };

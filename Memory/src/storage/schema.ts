@@ -208,7 +208,7 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS raw_turns (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    episode_id TEXT REFERENCES episodes(id) ON DELETE CASCADE,
     turn_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     conversation_id TEXT,
@@ -385,7 +385,7 @@ const statements = [
     project_id TEXT,
     skill_memory_id TEXT NOT NULL,
     session_id TEXT,
-    episode_id TEXT NOT NULL,
+    episode_id TEXT,
     l1_memory_id TEXT,
     raw_turn_id TEXT,
     turn_id TEXT,
@@ -734,6 +734,7 @@ export function migrate(db: Database.Database): void {
         addColumnIfMissing(db, "evolution_jobs", "scope_seq", "INTEGER");
       }
       if (tableExists(db, "evolution_jobs")) {
+        const needsFailureBackfill = !columnExists(db, "evolution_jobs", "failure_count");
         addColumnIfMissing(db, "evolution_jobs", "lease_owner", "TEXT");
         addColumnIfMissing(db, "evolution_jobs", "lease_token", "TEXT");
         addColumnIfMissing(db, "evolution_jobs", "available_at", "TEXT");
@@ -741,7 +742,7 @@ export function migrate(db: Database.Database): void {
         addColumnIfMissing(db, "evolution_jobs", "failure_count", "INTEGER NOT NULL DEFAULT 0");
         addColumnIfMissing(db, "evolution_jobs", "lease_count", "INTEGER NOT NULL DEFAULT 0");
         addColumnIfMissing(db, "evolution_jobs", "lease_recovery_count", "INTEGER NOT NULL DEFAULT 0");
-        if (version > 0 && version < 10) {
+        if (version > 0 && needsFailureBackfill) {
           // Historic attempts counted claims. A leased/succeeded row includes
           // the current or successful claim, which was not a business failure.
           db.prepare(`UPDATE evolution_jobs SET
@@ -762,6 +763,23 @@ export function migrate(db: Database.Database): void {
           db.prepare(`UPDATE embedding_retry_queue SET lease_count = MAX(0, attempts)
             + CASE WHEN status IN ('in_progress', 'succeeded') THEN 1 ELSE 0 END`).run();
         }
+      }
+      // Rebuild only the parent table, with foreign keys disabled outside this
+      // transaction. Preserve rowid: it is the tie-breaker for turn ordering.
+      if (tableExists(db, "raw_turns") && (db.prepare("PRAGMA table_info(raw_turns)").all() as Array<{ name: string; notnull: number }>).some(c => c.name === "episode_id" && c.notnull)) {
+        const create = statements.find(s => s.startsWith("CREATE TABLE IF NOT EXISTS raw_turns ("))!;
+        db.exec(create.replace("IF NOT EXISTS raw_turns", "raw_turns_pending"));
+        const columns = (db.prepare("PRAGMA table_info(raw_turns)").all() as Array<{ name: string }>).map(c => `"${c.name}"`).join(", ");
+        db.exec(`INSERT INTO raw_turns_pending(rowid, ${columns}) SELECT rowid, ${columns} FROM raw_turns`);
+        db.exec("DROP TABLE raw_turns");
+        db.exec("ALTER TABLE raw_turns_pending RENAME TO raw_turns");
+      }
+      if (tableExists(db, "skill_trials") && (db.prepare("PRAGMA table_info(skill_trials)").all() as Array<{ name: string; notnull: number }>).some(c => c.name === "episode_id" && c.notnull)) {
+        const create = statements.find(s => s.startsWith("CREATE TABLE IF NOT EXISTS skill_trials ("))!;
+        db.exec(create.replace("IF NOT EXISTS skill_trials", "skill_trials_pending"));
+        db.exec("INSERT INTO skill_trials_pending SELECT * FROM skill_trials ORDER BY rowid");
+        db.exec("DROP TABLE skill_trials");
+        db.exec("ALTER TABLE skill_trials_pending RENAME TO skill_trials");
       }
       for (const statement of statements) {
         db.prepare(statement).run();

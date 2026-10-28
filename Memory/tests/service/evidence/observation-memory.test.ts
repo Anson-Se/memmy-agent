@@ -30,6 +30,7 @@ function model(generate: (input: Input) => unknown | Promise<unknown> = semantic
   return { config: DEFAULT_MEMMY_CONFIG.summary, isConfigured: () => true,
     complete: async () => "", status: () => ({ provider: "test", configured: true, remote: false }),
     async completeJson<T extends Record<string, unknown>>(messages: LlmMessage[], options: LlmCompletionOptions) {
+      if (options?.operation === "episode.select.v1") return { episodeId: null, title: "Cursor backfill", summary: "Old Cursor question and answer." } as unknown as T;
       if (options?.operation !== "capture.observation_extract") return {} as T;
       expect(options.retryTokenCeiling).toBe(2_400);
       return await generate(JSON.parse(String(messages[1]!.content)) as Input) as T;

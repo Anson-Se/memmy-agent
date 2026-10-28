@@ -25,6 +25,7 @@ import {
 import { episodeTitleIsCurrent } from "../episode-title/episode-title-service.js";
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import { observationMemoryState } from "../observation-memory-state.js";
+import { isNeutralFeedback, turnJudgeJobFlags } from "../evolution/turn-judge.js";
 import {
   namespaceForMemory,
   namespaceForSession
@@ -381,7 +382,7 @@ export function finalizeClosedEpisode(
 ): EvolutionJobRecord[] {
   const current = deps.repos.runtime.getEpisode(episode.id) ?? episode;
   if (current.status !== "closed" || current.l1MemoryIds.length === 0) return [];
-  if (episodeHasPendingCaptureDecision(deps, current)) return [];
+  if (episodeHasPendingCaptureDecision(deps, current) || deps.repos.runtime.hasUnassignedTurns(current.sessionId)) return [];
   // Titling is independent of reward and reflection, so it must be queued before
   // the mutually exclusive branches below can return.
   const titleJobs = enqueueEpisodeTitle(deps, current, at, "final");
@@ -433,10 +434,11 @@ export function enqueueEpisodeRewardAfterReflection(
   ) return [];
   const target = deps.feedbackTargetFromEpisode(episode);
   if (!target) return [];
+  // The newest reaction with an attitude: neutral ones never displace it.
   const feedback = [...episode.feedbackIds]
     .reverse()
     .map((id) => deps.repos.runtime.getFeedback(id))
-    .find((item) => Boolean(item));
+    .find((item) => Boolean(item) && !isNeutralFeedback(item!));
   const feedbackWindowSec = Math.max(1, deps.reward.feedbackWindowSec);
   const runAfter = feedback
     ? at
@@ -517,7 +519,13 @@ export function enqueueImportSummaryIfMissing(
       userId: memory.userId,
       sessionId: memory.sessionId,
       targetMemoryId: memory.id,
-      payload: { source: "worker.embedding.summary_guard", contentHash: memory.contentHash },
+      payload: {
+        source: "worker.embedding.summary_guard",
+        contentHash: memory.contentHash,
+        ...(jobType === "trace_summary"
+          ? turnJudgeJobFlags(deps.repos.runtime.latestJobForTarget(memory.id, jobType)?.payload)
+          : {})
+      },
       maxAttempts: 3,
       createdAt: at
     });
@@ -554,7 +562,8 @@ export function episodeRewardWasSkipped(episode: EpisodeRecord): boolean {
 }
 
 export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
-  return job.jobType === "trace_summary" ||
+  return job.jobType === "episode_assignment" ||
+    job.jobType === "trace_summary" ||
     job.jobType === "import_summary" ||
     job.jobType === "observation_extract" ||
     job.jobType === "embedding" ||

@@ -7,7 +7,7 @@ import { Repositories } from "../../../src/storage/repositories.js";
 import type { SourceTurnCompleteRequest } from "../../../src/types.js";
 import { WorkerConcurrencyController } from "../../../src/service/worker/worker-concurrency.js";
 import {
-  createMemoryServiceFixture, createBatchReflectionLlm, createCapturingEmbedder
+  createMemoryServiceFixture, createBatchReflectionLlm, createCapturingEmbedder, settleCaptureAssignments, assignedEpisodeId
 } from "../../fixtures/memory-service-fixture.js";
 
 const fixture = createMemoryServiceFixture();
@@ -56,8 +56,8 @@ function jobs(db: MemoryDb, id: string) {
     }>;
 }
 
-function capture(h: ReturnType<typeof harness>, input: SourceTurnCompleteRequest) {
-  const result = h.service.completeSourceTurn(input);
+async function capture(h: ReturnType<typeof harness>, input: SourceTurnCompleteRequest) {
+  const result = await h.service.completeSourceTurn(input);
   expect(result.status).toBe("stored");
   expect(result.result?.l1MemoryIds).toHaveLength(1);
   return result.result!;
@@ -72,9 +72,9 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     ["current Hook", (index: number) => current(index), "interactive", undefined],
     ["current incremental scan", (index: number) => current(index, { channel: "agent_source_scan" }), "interactive", undefined],
     ["Hook with an irrelevant history flag", (index: number) => current(index, { captureLegacyHistory: true }), "interactive", undefined]
-  ] as const)("keeps %s on the native capture pipeline with the appropriate lane", (_label, input, lane, origin) => {
+  ] as const)("keeps %s on the native capture pipeline with the appropriate lane", async (_label, input, lane, origin) => {
     const h = harness();
-    const result = capture(h, input(1));
+    const result = await capture(h, input(1));
     const memory = h.repos.memories.get(result.l1MemoryId)!;
     expect(memory.properties.internal_info.plugin_algorithm).toBe("capture.v7");
     expect(memory.properties.internal_info.capture_origin).toBe(origin);
@@ -85,10 +85,10 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     expect(h.repos.processing.get(memory.id)?.state).toBe("summary_pending");
   });
 
-  it("preserves historical origin for a detached out-of-order source turn", () => {
+  it("preserves historical origin for a detached out-of-order source turn", async () => {
     const h = harness();
-    const newer = capture(h, turn(2));
-    const older = capture(h, turn(1));
+    const newer = await capture(h, turn(2));
+    const older = await capture(h, turn(1));
     expect(older.sessionId).not.toBe(newer.sessionId);
     expect(h.repos.memories.get(older.l1MemoryId)?.properties.internal_info.capture_origin).toBe("agent_source_scan");
     expect(jobs(h.db, older.l1MemoryId)[0]).toMatchObject({ job_type: "trace_summary", queue_lane: "import" });
@@ -96,7 +96,7 @@ describe("native source-turn historical scheduling through MemoryService", () =>
 
   it.each(["history", "current"] as const)("runs the real %s trace summarizer and inherits provenance in the generated embedding", async kind => {
     const h = harness();
-    const result = capture(h, kind === "history" ? turn(1) : current(1));
+    const result = await capture(h, kind === "history" ? turn(1) : current(1));
     const summary = jobs(h.db, result.l1MemoryId)[0]!;
     await h.service.runWorkerOnce(1, { targetMemoryIds: [result.l1MemoryId] });
     expect(h.calls.some(call => call.options.operation === "capture.summarize")).toBe(true);
@@ -113,21 +113,25 @@ describe("native source-turn historical scheduling through MemoryService", () =>
       .toBe(kind === "history" ? "agent_source_scan" : undefined);
   });
 
-  it.each(["history", "mixed", "current"] as const)("keeps provisional and final titles in the proper %s lane", kind => {
+  it.each(["history", "mixed", "current"] as const)("keeps provisional and final titles in the proper %s lane", async kind => {
     const h = harness();
     const input = kind === "current" ? current(1) : current(1, { channel: "agent_source_scan", captureLegacyHistory: true });
-    const first = capture(h, input);
+    const first = await capture(h, input);
     if (kind === "mixed") {
       const next = current(2);
       next.sourceTurn = { ...next.sourceTurn, conversationId: input.sourceTurn.conversationId,
         startedAt: "2099-01-01T10:01:00.000Z", completedAt: "2099-01-01T10:01:30.000Z" };
-      const second = capture(h, next);
+      const second = await capture(h, next);
       expect(second.episodeId).toBe(first.episodeId);
     }
+    await settleCaptureAssignments(h.service);
+    first.episodeId = assignedEpisodeId(h.service, first);
+    h.service["workerHandlers"].enqueueJob({ jobType: "episode_title", userId: namespace.userId,
+      sessionId: first.sessionId, episodeId: first.episodeId, payload: { stage: "provisional" } });
     const provisional = h.db.db.prepare("SELECT queue_lane,payload_json FROM evolution_jobs WHERE episode_id=? AND job_type='episode_title'")
       .all(first.episodeId) as Array<{queue_lane: string;payload_json: string}>;
     expect(provisional.length).toBeGreaterThan(0);
-    expect(provisional[0]!.queue_lane).toBe(kind === "current" ? "interactive" : "import");
+    expect(provisional[0]!.queue_lane).toBe(kind === "history" ? "import" : "interactive");
     h.service.closeSession(first.sessionId);
     // A final title is only produced once capture decisions finish. Exercise the
     // same production enqueuer directly with the now-closed real episode.
@@ -142,8 +146,8 @@ describe("native source-turn historical scheduling through MemoryService", () =>
 
   it("keeps historical embedding behind an earlier runnable historical summary in the same FIFO lane", async () => {
     const h = harness();
-    const first = capture(h, turn(1));
-    const second = capture(h, turn(2));
+    const first = await capture(h, turn(1));
+    const second = await capture(h, turn(2));
     await h.service.runWorkerOnce(1, { targetMemoryIds: [first.l1MemoryId] });
     const firstEmbedding = jobs(h.db, first.l1MemoryId).find(job => job.job_type === "embedding")!;
     const secondSummary = jobs(h.db, second.l1MemoryId)[0]!;
@@ -166,9 +170,9 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     for (let index = 1; index <= 48; index++) {
       const input = turn(index);
       if (separate) input.sourceTurn = { ...input.sourceTurn, conversationId: `history-conversation-${index}` };
-      historicalIds.push(capture(h, input).l1MemoryId);
+      historicalIds.push((await capture(h, input)).l1MemoryId);
     }
-    const live = capture(h, current(100));
+    const live = await capture(h, current(100));
     const executed: Array<{ jobType: string; targetMemoryId?: string }> = [];
     for (let round = 0; round < 24; round++) executed.push(...(await h.service.runWorkerOnce(1)).jobs);
     expect(executed).toEqual(expect.arrayContaining([
@@ -188,16 +192,16 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     const historical = { ...live, channel: "agent_source_scan" as const, captureLegacyHistory: true };
     const firstInput = order === "hook-first" ? live : historical;
     const secondInput = order === "hook-first" ? historical : live;
-    const first = capture(h, firstInput);
+    const first = await capture(h, firstInput);
     const expectedOrigin = order === "hook-first" ? undefined : "agent_source_scan";
     const expectedLane = order === "hook-first" ? "interactive" : "import";
     const before = jobs(h.db, first.l1MemoryId);
     expect(before[0]?.queue_lane).toBe(expectedLane);
-    const duplicate = h.service.completeSourceTurn(secondInput);
+    const duplicate = await h.service.completeSourceTurn(secondInput);
     expect(duplicate).toMatchObject({ status: "existing", result: { l1MemoryId: first.l1MemoryId, jobs: [], duplicate: true } });
     expect(jobs(h.db, first.l1MemoryId)).toEqual(before);
     expect(h.repos.memories.get(first.l1MemoryId)?.properties.internal_info.capture_origin).toBe(expectedOrigin);
-    expect(h.service.completeSourceTurn({ ...secondInput, answer: "A conflicting answer." }))
+    expect(await h.service.completeSourceTurn({ ...secondInput, answer: "A conflicting answer." }))
       .toMatchObject({ status: "conflict", reason: "source_turn_content_conflict" });
     expect(jobs(h.db, first.l1MemoryId)).toEqual(before);
     expect(h.repos.memories.get(first.l1MemoryId)?.properties.internal_info.capture_origin).toBe(expectedOrigin);
@@ -205,14 +209,14 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     h.db.close();
     const reopened = new MemoryDb({ path: join(h.root, "memory.sqlite") });
     const restarted = fixture.createTestMemoryService({ db: reopened, llm: createBatchReflectionLlm([]) });
-    expect(restarted.completeSourceTurn(secondInput)).toMatchObject({ status: "existing", result: { l1MemoryId: first.l1MemoryId, jobs: [] } });
+    expect(await restarted.completeSourceTurn(secondInput)).toMatchObject({ status: "existing", result: { l1MemoryId: first.l1MemoryId, jobs: [] } });
     expect(jobs(reopened, first.l1MemoryId)).toEqual(before);
     expect(new Repositories(reopened.db).memories.get(first.l1MemoryId)?.properties.internal_info.capture_origin).toBe(expectedOrigin);
   });
 
   it("keeps a real onboarding report and its embedding interactive during historical native backlog", async () => {
     const h = harness();
-    for (let index = 1; index <= 16; index++) capture(h, turn(index));
+    for (let index = 1; index <= 16; index++) await capture(h, turn(index));
     const report = h.service.addMemory({
       namespace, adapterId: "agent-source:memmy-onboarding", requestId: "scan-backlog-report", layer: "L1",
       source: "memmy-onboarding", tags: ["agent-source", "first-encounter-report", "onboarding-report"],
@@ -228,9 +232,9 @@ describe("native source-turn historical scheduling through MemoryService", () =>
     expect(h.repos.processing.get(report.id)?.state).toBe("ready");
   });
 
-  it.each(["manual", "startup"] as const)("keeps the %s recovery override ahead of historical origin", mode => {
+  it.each(["manual", "startup"] as const)("keeps the %s recovery override ahead of historical origin", async mode => {
     const h = harness();
-    const result = capture(h, turn(1));
+    const result = await capture(h, turn(1));
     // Represent an interrupted/missing queue row without changing the captured
     // memory. Recovery must use its existing API and retain native provenance.
     h.db.db.prepare("DELETE FROM evolution_jobs WHERE target_memory_id = ?").run(result.l1MemoryId);

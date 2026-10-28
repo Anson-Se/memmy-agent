@@ -74,6 +74,61 @@ export function mainQueueEligibility(at: string, options: QueueEligibilityOption
                  )
                )
              )`}
+             AND ${includeDependencyBlocked ? "1=1" : `NOT (
+               job_type = 'feedback_experience'
+               AND EXISTS (
+                 SELECT 1 FROM raw_turns pending_feedback_turn
+                 WHERE pending_feedback_turn.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                   AND pending_feedback_turn.deleted_at IS NULL AND pending_feedback_turn.redacted_at IS NULL
+                   AND (pending_feedback_turn.episode_id IS NULL OR
+                     json_extract(pending_feedback_turn.message_payload_json, '$.episode_assignment.status') IN ('pending', 'selected', 'applying'))
+               )
+             )
+             AND NOT (
+               job_type = 'trace_summary'
+               AND COALESCE(json_extract(payload_json, '$.turnJudge'), 0) = 1
+               AND EXISTS (
+                 SELECT 1
+                 FROM evolution_jobs AS earlier_turn_job
+                 WHERE earlier_turn_job.job_type = 'trace_summary'
+                   AND earlier_turn_job.session_id = evolution_jobs.session_id
+                   AND COALESCE(json_extract(earlier_turn_job.payload_json, '$.turnJudge'), 0) = 1
+                   AND earlier_turn_job.status IN ('queued', 'leased', 'failed')
+                   AND earlier_turn_job.id <> evolution_jobs.id
+                   AND (
+                     CAST(json_extract(earlier_turn_job.payload_json, '$.turnAt') AS TEXT)
+                       < CAST(json_extract(evolution_jobs.payload_json, '$.turnAt') AS TEXT)
+                     OR (json_extract(earlier_turn_job.payload_json, '$.turnAt') = json_extract(evolution_jobs.payload_json, '$.turnAt')
+                       AND COALESCE((SELECT rowid FROM raw_turns WHERE id = COALESCE(
+                         json_extract(earlier_turn_job.payload_json, '$.rawTurnId'),
+                         (SELECT json_extract(properties_json, '$.internal_info.trace.raw_turn_id') FROM memories WHERE id = earlier_turn_job.target_memory_id)
+                       )), earlier_turn_job.rowid)
+                       < COALESCE((SELECT rowid FROM raw_turns WHERE id = COALESCE(
+                         json_extract(evolution_jobs.payload_json, '$.rawTurnId'),
+                         (SELECT json_extract(properties_json, '$.internal_info.trace.raw_turn_id') FROM memories WHERE id = evolution_jobs.target_memory_id)
+                       )), evolution_jobs.rowid))
+                   )
+               )
+             )
+             AND NOT (
+               (job_type IN ('episode_assignment', 'episode_finalize') OR (job_type = 'trace_summary' AND COALESCE(json_extract(payload_json, '$.turnJudge'), 0) = 1))
+               AND json_extract(payload_json, '$.rawTurnId') IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM raw_turns prior JOIN raw_turns current ON current.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                 WHERE prior.session_id = current.session_id AND prior.deleted_at IS NULL AND prior.redacted_at IS NULL
+                   AND json_extract(prior.message_payload_json, '$.episode_assignment.status') IN ('pending', 'selected', 'applying')
+                   AND (prior.created_at < current.created_at OR (prior.created_at = current.created_at AND prior.rowid < current.rowid))
+               )
+             )
+             AND (job_type <> 'episode_finalize' OR EXISTS (
+               SELECT 1 FROM raw_turns r WHERE r.id = json_extract(evolution_jobs.payload_json, '$.rawTurnId')
+                 AND (r.deleted_at IS NOT NULL OR r.redacted_at IS NOT NULL OR (
+                   json_extract(r.message_payload_json, '$.episode_assignment.selection') IS NOT NULL
+                   AND (COALESCE(json_extract(r.message_payload_json, '$.episode_assignment.turnJudge'), 0) = 0
+                     OR json_extract(r.message_payload_json, '$.episode_assignment.judgment') IS NOT NULL
+                     OR json_extract(r.message_payload_json, '$.turn_judge.status') = 'skipped')
+                 ))
+             ))`}
              ${allowedJobTypes ? `AND job_type IN (${allowedJobTypes.map(() => "?").join(", ")})` : ""}
              ${excludedJobTypes?.length ? `AND job_type NOT IN (${excludedJobTypes.map(() => "?").join(", ")})` : ""}
              ${targetFilter}`,

@@ -55,8 +55,16 @@ describe("feedback experience worker model admission", () => {
     repos.runtime.setKv(MEMORY_BYOK_BUDGET_KV_KEY, { dailyUsed: 1_000_000,
       lifetimeUsed: 1_000_000, dailyDate: localCalendarDate() });
     const session = service.openSession({ namespace: { source: "codex", profileId: "review", userId: "review-user" } });
-    const complete = service.completeTurn("feedback-admission-turn", { sessionId: session.sessionId,
+    const complete = await service.completeTurn("feedback-admission-turn", { sessionId: session.sessionId,
       query: "Parse a SEC 13F filing and extract issuer CUSIP holdings.", answer: "Parsed the filing and validated the issuer field." });
+    const episode = repos.runtime.createEpisode({ id: "feedback-admission-episode", sessionId: session.sessionId,
+      userId: "review-user", status: "open", rawTurnIds: [complete.rawTurnId], l1MemoryIds: [complete.l1MemoryId],
+      feedbackIds: [], decisionRepairIds: [], l2PolicyIds: [], l3WorldModelIds: [], skillMemoryIds: [],
+      turnCount: 1, rewardDetail: {}, pipelineStatus: "idle", meta: {}, openedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    const raw = repos.runtime.getRawTurn(complete.rawTurnId)!;
+    repos.runtime.updateRawTurn({ ...raw, episodeId: episode.id,
+      messagePayload: { ...raw.messagePayload, episode_assignment: { status: "assigned" } } });
+    complete.episodeId = episode.id;
     const feedback = await service.feedback({ sessionId: session.sessionId, episodeId: complete.episodeId,
       l1MemoryId: complete.l1MemoryId, channel: "explicit", polarity: "positive", magnitude: 1,
       rationale: "Verifier feedback: success. Next time keep the issuer name out of the filename.", rawPayload: { source: "verifier", score: 1 } });

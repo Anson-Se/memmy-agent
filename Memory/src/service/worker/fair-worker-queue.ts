@@ -65,6 +65,10 @@ export function releaseFairWorkerResources(scan: FairWorkerScan, resources: read
 }
 
 function dependencyKey(job: EvolutionJobRecord): string | undefined {
+  if (job.sessionId && (["episode_assignment", "episode_finalize", "feedback_experience"].includes(job.jobType) ||
+    (job.jobType === "trace_summary" && job.payload.turnJudge === true))) {
+    return JSON.stringify(["dependency", "session", job.sessionId]);
+  }
   if (["l3_world_model_update", "work_memory_extract"].includes(job.jobType) && job.scopeKey) {
     return JSON.stringify(["dependency", "scope", job.jobType, job.scopeKey]);
   }
@@ -81,6 +85,7 @@ export function releaseFairWorkerDependencies(scan: FairWorkerScan, work: FairCl
     if (["l3_world_model_update", "work_memory_extract"].includes(work.job.jobType)) {
       const key = dependencyKey(work.job); if (key) keys.push(key);
     }
+    if (work.job.sessionId) keys.push(JSON.stringify(["dependency", "session", work.job.sessionId]));
     if (work.job.targetMemoryId) keys.push(JSON.stringify(["dependency", "memory", work.job.targetMemoryId]));
   } else keys.push(JSON.stringify(["dependency", "memory", work.retry.targetId]));
   releaseFairWorkerResources(scan, keys);

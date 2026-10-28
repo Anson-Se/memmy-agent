@@ -33,6 +33,7 @@ import {
   type PreparedEmbeddingJob
 } from "../embedding/embedding-job-processor.js";
 import type { PolicyEvidencePreflightReport } from "../evolution/evolution-job-processor.js";
+import { turnJudgeJobFlags } from "../evolution/turn-judge.js";
 import {
   embeddingTextForMemory,
   traceActionEmbeddingText,
@@ -66,7 +67,7 @@ export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
 export const WORKER_LEASE_SECONDS = 60;
 export const WORKER_HEARTBEAT_MS = 20_000;
-const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "observation_extract", "episode_title"];
+const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["episode_assignment", "trace_summary", "import_summary", "observation_extract", "episode_title"];
 const WORKER_TURN_JOB_LIMIT = 32;
 
 const workerLogger = createMemoryLogger("worker");
@@ -141,6 +142,8 @@ type EmbeddingRetryResult = {
  */
 export interface WorkerRunnerDeps {
   repos: Pick<Repositories, "transaction" | "memories" | "processing" | "runtime"> & Partial<Pick<Repositories, "l3WorldModels">>;
+  // Mark exhausted judgment attempts; durable assignment waits for an explicit retry.
+  onTurnJudgeDeadLetter?: (job: EvolutionJobRecord) => void;
   embedder: Embedder;
   capture: { embedAfterCapture: boolean };
   embeddingRetryWorkerId: string;
@@ -271,7 +274,7 @@ export class WorkerRunner {
     this.deps.enqueueObservationBackfill?.(Math.min(limit, 100), at);
     const interruptedJobs = this.deps.repos.runtime.requeueLeasedJobsAfterRestart(at);
     observeWorker(this.deps.observer, { type: "lease", queue: "main", action: "recovered", count: interruptedJobs.length });
-    const failedJobs = this.deps.repos.runtime.requeueFailedJobs(limit, at);
+    const failedJobs = [...this.deps.repos.runtime.requeueFailedEpisodeAssignments(at), ...this.deps.repos.runtime.requeueFailedJobs(limit, at)];
     for (const { before, after } of [...interruptedJobs, ...failedJobs]) {
       this.deps.appendJobChange(after, "queued", before);
     }
@@ -325,7 +328,10 @@ export class WorkerRunner {
             targetMemoryId: memory.id,
             payload: {
               source: "startup.processing_repair",
-              ...observationJobPayload(memory)
+              ...observationJobPayload(memory),
+              ...(jobType === "trace_summary"
+                ? turnJudgeJobFlags(this.deps.repos.runtime.latestJobForTarget(memory.id, jobType)?.payload)
+                : {})
             },
             maxAttempts: 3,
             createdAt: at
@@ -890,7 +896,7 @@ export class WorkerRunner {
       if (workerJobCanRunInParallel(job)) {
         const batchType = job.jobType;
         const batch: EvolutionJobRecord[] = [];
-        while (queue.length > 0 && queue[0]?.jobType === batchType) {
+        while (queue.length > 0 && (queue[0]?.jobType === batchType || (["trace_summary", "episode_assignment"].includes(batchType) && ["trace_summary", "episode_assignment"].includes(queue[0]!.jobType)))) {
           batch.push(queue.shift()!);
         }
         if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
@@ -1093,6 +1099,9 @@ export class WorkerRunner {
     const resumed = configurationBlocked && this.executionConfigurationChanged(job)
       ? this.resumeConfigurationBlockedMainJobs([job.id])[0]?.after
       : undefined;
+    if (failedJob.status === "dead_letter" && failedJob.jobType === "trace_summary" && failedJob.payload.turnJudge === true) {
+      this.deps.onTurnJudgeDeadLetter?.(failedJob);
+    }
     workerLogger.error("job.failed", {
       ...workerJobLogFields(failedJob),
       terminal: failedJob.status === "dead_letter",

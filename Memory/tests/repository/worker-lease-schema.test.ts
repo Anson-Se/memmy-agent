@@ -144,7 +144,7 @@ describe("worker lease schema migration", () => {
     }
   });
 
-  it("upgrades v9 without losing jobs, separates historic counters, and keeps a pre-migration backup", () => {
+  it.each([9, 10])("upgrades legacy v%i without losing jobs, separates historic counters, and keeps a pre-migration backup", version => {
     const root = mkdtempSync(join(tmpdir(), "memmy-worker-lease-migration-"));
     const path = join(root, "memory.sqlite");
     let db: MemoryDb | undefined;
@@ -162,7 +162,8 @@ describe("worker lease schema migration", () => {
       db.db.exec("ALTER TABLE embedding_retry_queue DROP COLUMN lease_token");
       db.db.exec("DELETE FROM schema_migrations");
       const at = "2026-10-22T00:00:00.000Z";
-      db.db.prepare("INSERT INTO schema_migrations VALUES ('009_token_usage_outbox', 9, ?, 'legacy')").run(at);
+      db.db.prepare("INSERT INTO schema_migrations VALUES (?, ?, ?, 'legacy')").run(
+        version === 9 ? "009_token_usage_outbox" : "010_pending_episode_assignment", version, at);
       const insert = db.db.prepare(`INSERT INTO evolution_jobs
         (id, job_type, status, user_id, attempts, max_attempts, leased_until, created_at, updated_at)
         VALUES (?, 'reflection', ?, 'migration-user', ?, 3, ?, ?, ?)`);

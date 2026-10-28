@@ -15,6 +15,18 @@ describe("job policy registry", () => {
     }
   });
 
+  it("admits episode assignment as model work and finalization as local work, retaining scan provenance", () => {
+    expect(registry.resolve({ jobType: "episode_assignment" })).toMatchObject({
+      queueLane: "interactive", resourceClass: "summary", concurrency: { providerRoles: ["summary"] }
+    });
+    expect(registry.resolve({ jobType: "episode_finalize" })).toMatchObject({
+      queueLane: "interactive", resourceClass: "database", concurrency: { providerRoles: [] }
+    });
+    for (const jobType of ["episode_assignment", "episode_finalize"]) {
+      expect(registry.resolve({ jobType, payload: { captureOrigin: "agent_source_scan" } }).queueLane).toBe("import");
+    }
+  });
+
   it("keeps unknown and inherited property names explicit errors", () => {
     for (const jobType of ["unregistered_task", "toString", "__proto__", ""]) {
       expect(() => registry.resolve({ jobType })).toThrow(UnknownJobPolicyError);

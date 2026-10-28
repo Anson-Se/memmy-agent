@@ -1,7 +1,7 @@
 import type { JobType } from "../../types.js";
 import { resolveWorkerLeaseOptions, type ResolvedWorkerLeaseOptions } from "./worker-lease-options.js";
 
-export const JOB_POLICY_VERSION = 3;
+export const JOB_POLICY_VERSION = 4;
 export const QUEUE_LANES = ["interactive", "repair_retry", "import", "evolution", "maintenance"] as const;
 export type QueueLane = typeof QUEUE_LANES[number];
 export const RESOURCE_CLASSES = ["summary", "embedding", "evolution_llm", "database", "scan"] as const;
@@ -65,6 +65,8 @@ function definition(
 // Resource classes describe the principal work; providerRoles also records secondary
 // model calls (for example Work Memory's retrieval query embedding).
 const DEFINITIONS: Readonly<Record<PolicyJobType, PolicyDefinition>> = Object.freeze({
+  episode_assignment: definition("interactive", "summary", 1, ["summary"], "none"),
+  episode_finalize: definition("interactive", "database", 1, [], "none"),
   episode_idle_close: definition("maintenance", "database", 10, [], "episode"),
   episode_title: definition("interactive", "summary", 15, ["summary"], "episode"),
   trace_summary: definition("interactive", "summary", 1, ["summary", "evolution"]),
@@ -144,7 +146,7 @@ export class JobPolicyRegistry {
       queueLane = "maintenance";
       basePriority = 90;
     } else if (input.operationMode === "historical_import" ||
-      (input.jobType === "episode_title" && input.payload?.captureOrigin === "agent_source_scan") ||
+      (["episode_title", "episode_assignment", "episode_finalize"].includes(input.jobType) && input.payload?.captureOrigin === "agent_source_scan") ||
       ((SUMMARY_JOB_TYPES.has(input.jobType) || input.jobType === "embedding") &&
         (source === "agent_source.scan.summary_stage" || reason === "import.summary.updated" ||
           input.target?.captureOrigin === "agent_source_scan" || isImportedPolicyTarget(input.target)))) {
