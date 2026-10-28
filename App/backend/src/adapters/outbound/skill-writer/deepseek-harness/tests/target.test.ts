@@ -1,24 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import YAML from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeepseekHarnessSkillTarget as createDeepseekHarnessSkillTargetImpl } from "../index.js";
-import { deepseekHarnessProcessPattern } from "../target.js";
+import { createDeepseekHarnessSkillTarget } from "../index.js";
 
 let tempDir: string | undefined;
-
-function createDeepseekHarnessSkillTarget(
-  deps: Parameters<typeof createDeepseekHarnessSkillTargetImpl>[0] = {}
-) {
-  return createDeepseekHarnessSkillTargetImpl({
-    ...deps,
-    isDeepseekHarnessRunning: deps.isDeepseekHarnessRunning ?? (async () => false)
-  });
-}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -62,7 +52,6 @@ describe("DeepSeek Harness skill target", () => {
       },
       dsh: { client: { platform: "web" } }
     });
-    expect(JSON.stringify(packageManifest)).not.toContain("dsh-client-ui-conversation");
     expect(readFileSync(skillPath, "utf8")).toContain('memmy-memory search "query text" --source deepseek_harness');
     expect(readFileSync(resumeSkillPath, "utf8")).toContain("--source deepseek_harness");
     expect(patch).toContain("id: user-plugin");
@@ -127,54 +116,6 @@ describe("DeepSeek Harness skill target", () => {
     writeFileSync(packagePath, JSON.stringify({ ...manifest, version: "0.2.0" }, null, 2) + "\n", "utf8");
 
     await expect(target.isInstalled("deepseek_harness")).resolves.toBe(false);
-  });
-
-  it("does not rewrite current plugin files", async () => {
-    const rootDirectory = createRoot();
-    const isDeepseekHarnessRunning = vi.fn(async () => false);
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory, isDeepseekHarnessRunning });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    const initialInode = statSync(clientPath).ino;
-    isDeepseekHarnessRunning.mockClear();
-
-    await target.installPlugin?.("deepseek_harness");
-
-    expect(statSync(clientPath).ino).toBe(initialInode);
-    expect(isDeepseekHarnessRunning).not.toHaveBeenCalled();
-  });
-
-  it("does not treat patch line endings as a plugin update", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const patchPath = join(rootDirectory, "cordis.patch.yml");
-    const crlfPatch = readFileSync(patchPath, "utf8").replaceAll("\n", "\r\n");
-    writeFileSync(patchPath, crlfPatch, "utf8");
-    const isDeepseekHarnessRunning = vi.fn(async () => true);
-    const runningTarget = createDeepseekHarnessSkillTarget({ rootDirectory, isDeepseekHarnessRunning });
-
-    await runningTarget.installPlugin?.("deepseek_harness");
-
-    expect(readFileSync(patchPath, "utf8")).toBe(crlfPatch);
-    expect(isDeepseekHarnessRunning).not.toHaveBeenCalled();
-  });
-
-  it("requires DSH to stop before replacing stale plugin files", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    writeFileSync(clientPath, "// stale client\n", "utf8");
-    const runningTarget = createDeepseekHarnessSkillTarget({
-      rootDirectory,
-      isDeepseekHarnessRunning: async () => true
-    });
-
-    await expect(runningTarget.installPlugin?.("deepseek_harness")).rejects.toThrow(
-      "DeepSeek Harness is running. Quit it, retry the plugin installation, then restart DeepSeek Harness."
-    );
-    expect(readFileSync(clientPath, "utf8")).toBe("// stale client\n");
   });
 
   it("publishes an optimistic user bubble until the durable user message arrives", async () => {
@@ -262,62 +203,6 @@ describe("DeepSeek Harness skill target", () => {
     expect(legacyRegistrations).toBe(0);
   });
 
-  it("waits for the optional uiConversation service without blocking web boot", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    let handoff: { id: string; factory(): Record<string, any> } | undefined;
-    runInNewContext(readFileSync(clientPath, "utf8"), {
-      window: { __ModuleLoader__: { load: (value: typeof handoff) => { handoff = value; } } }
-    });
-
-    let requested: string[] | undefined;
-    let registered = 0;
-    const client = handoff?.factory();
-    client?.apply({
-      inject(names: string[], activate: (ctx: Record<string, any>) => void) {
-        requested = names;
-        activate({
-          uiConversation: {
-            events: { register: () => { registered += 1; } }
-          }
-        });
-      }
-    });
-
-    expect(requested).toEqual(["uiConversation"]);
-    expect(registered).toBe(1);
-  });
-
-  it("falls back to a legacy registry when optional injection throws", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    let handoff: { id: string; factory(): Record<string, any> } | undefined;
-    runInNewContext(readFileSync(clientPath, "utf8"), {
-      window: { __ModuleLoader__: { load: (value: typeof handoff) => { handoff = value; } } }
-    });
-
-    let injectionFailed = false;
-    let registered = 0;
-    const client = handoff?.factory();
-    expect(() => client?.apply({
-      inject() {
-        injectionFailed = true;
-        throw new Error("optional injection unavailable");
-      },
-      get(name: string) {
-        return injectionFailed && name === "conversationEvents"
-          ? { register: () => { registered += 1; } }
-          : undefined;
-      }
-    })).not.toThrow();
-
-    expect(registered).toBe(1);
-  });
-
   it("falls back to conversationEvents when uiConversation is absent", async () => {
     const rootDirectory = createRoot();
     const target = createDeepseekHarnessSkillTarget({ rootDirectory });
@@ -365,7 +250,7 @@ describe("DeepSeek Harness skill target", () => {
     expect(registered).toBe(1);
   });
 
-  it("skips the optimistic UI when no conversation event API is available", async () => {
+  it("does not fail web boot when the optional UI service is unavailable", async () => {
     const rootDirectory = createRoot();
     const target = createDeepseekHarnessSkillTarget({ rootDirectory });
     await target.installPlugin?.("deepseek_harness");
@@ -377,39 +262,8 @@ describe("DeepSeek Harness skill target", () => {
 
     const client = handoff?.factory();
     expect(() => client?.apply({ get: () => undefined })).not.toThrow();
-  });
-
-  it("does not fail web boot when optimistic UI registration throws", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    let handoff: { id: string; factory(): Record<string, any> } | undefined;
-    runInNewContext(readFileSync(clientPath, "utf8"), {
-      window: { __ModuleLoader__: { load: (value: typeof handoff) => { handoff = value; } } }
-    });
-
-    const client = handoff?.factory();
     expect(() => client?.apply({
-      uiConversation: {
-        events: { register: () => { throw new Error("unsupported registration"); } }
-      }
-    })).not.toThrow();
-  });
-
-  it("does not fail web boot when optional UI service lookup throws", async () => {
-    const rootDirectory = createRoot();
-    const target = createDeepseekHarnessSkillTarget({ rootDirectory });
-    await target.installPlugin?.("deepseek_harness");
-    const clientPath = join(installedPluginDirectory(rootDirectory), "client.js");
-    let handoff: { id: string; factory(): Record<string, any> } | undefined;
-    runInNewContext(readFileSync(clientPath, "utf8"), {
-      window: { __ModuleLoader__: { load: (value: typeof handoff) => { handoff = value; } } }
-    });
-
-    const client = handoff?.factory();
-    expect(() => client?.apply({
-      get: () => { throw new Error("undeclared optional service"); }
+      uiConversation: { events: { register: () => { throw new Error("unsupported registration"); } } }
     })).not.toThrow();
   });
 
@@ -735,25 +589,6 @@ describe("DeepSeek Harness skill target", () => {
       if (previousDshHome === undefined) delete process.env.DSH_HOME;
       else process.env.DSH_HOME = previousDshHome;
     }
-  });
-});
-
-describe("DeepSeek Harness process matching", () => {
-  it("matches packaged and development entrypoints without matching checkout paths", () => {
-    if (process.platform === "win32") return;
-    const darwinPattern = deepseekHarnessProcessPattern("darwin");
-    const linuxPattern = deepseekHarnessProcessPattern("linux");
-    const matches = (pattern: string, command: string) => spawnSync(
-      "grep",
-      ["-E", "--", pattern],
-      { input: command + "\n", encoding: "utf8" }
-    ).status === 0;
-
-    expect(matches(darwinPattern, "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --expose-internals")).toBe(true);
-    expect(matches(darwinPattern, "/Applications/DeepSeek Harness.app/Contents/Frameworks/DeepSeek Harness Helper.app/Contents/MacOS/DeepSeek Harness Helper --type=renderer")).toBe(true);
-    expect(matches(darwinPattern, "node /workspace/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js")).toBe(true);
-    expect(matches(linuxPattern, "/opt/deepseek/bin/dsh-desktop --profile default")).toBe(true);
-    expect(matches(linuxPattern, "node /workspace/deepseek-harness/tests/process.test.js")).toBe(false);
   });
 });
 

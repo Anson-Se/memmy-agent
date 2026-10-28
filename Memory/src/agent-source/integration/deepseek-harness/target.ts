@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -24,12 +23,10 @@ const DISPLAY_NAME = "DeepSeek Harness";
 const PATCH_START = "# memmy-memory plugin:start";
 const PATCH_END = "# memmy-memory plugin:end";
 const PLUGIN_PACKAGE_NAME = "@memmy/memmy-memory";
-const PROCESS_PROBE_TIMEOUT_MS = 5_000;
 
 export interface CreateDeepseekHarnessSkillTargetDeps {
   rootDirectory?: string;
   memmyConfigPath?: string;
-  isDeepseekHarnessRunning?: () => Promise<boolean>;
 }
 
 export function createDeepseekHarnessSkillTarget(
@@ -37,7 +34,6 @@ export function createDeepseekHarnessSkillTarget(
 ): SkillTarget {
   const rootDirectory = deps.rootDirectory ?? resolveDeepseekHarnessHomeDirectory();
   const memmyConfigPath = deps.memmyConfigPath ?? join(homedir(), ".memmy", "config.yaml");
-  const isDeepseekHarnessRunning = deps.isDeepseekHarnessRunning ?? detectDeepseekHarnessProcess;
   const pluginDirectory = join(rootDirectory, "profiles", "node_modules", "@memmy", "memmy-memory");
   const patchPath = join(rootDirectory, "cordis.patch.yml");
 
@@ -80,30 +76,22 @@ export function createDeepseekHarnessSkillTarget(
       if (!(await this.resolveRootDirectory())) {
         throw new Error("DeepSeek Harness is not installed or its directory is unavailable");
       }
-      const generatedFiles: Array<readonly [string, string]> = [
-        [join(pluginDirectory, "package.json"), JSON.stringify(createDeepseekHarnessPluginPackageManifest(), null, 2) + "\n"],
-        [join(pluginDirectory, "index.mjs"), DEEPSEEK_HARNESS_PLUGIN_INDEX],
-        [join(pluginDirectory, "client.js"), DEEPSEEK_HARNESS_PLUGIN_CLIENT],
-        [join(pluginDirectory, "memmy-workspace-bridge.mjs"), await loadMemmyWorkspaceBridgeRuntimeAsset()],
-        [
-          join(pluginDirectory, "memmy-memory-config.json"),
-          JSON.stringify({ memmy_config_path: memmyConfigPath, ...(await readMemmyMemoryServiceConfig(memmyConfigPath)) }, null, 2) + "\n"
-        ]
-      ];
-      const currentPatch = await readTextFile(patchPath);
-      const nextPatch = renderPatchedContent(currentPatch, renderPluginPatch(memmyConfigPath));
-      const generatedFileContents = await Promise.all(generatedFiles.map(([filePath]) => readTextFile(filePath)));
-      const patchNeedsUpdate = normalizeLineEndings(nextPatch) !== normalizeLineEndings(currentPatch);
-      const pluginNeedsUpdate = patchNeedsUpdate || generatedFiles.some(([, content], index) => (
-        content !== generatedFileContents[index]
-      ));
-      if (pluginNeedsUpdate && await isDeepseekHarnessRunning()) {
-        throw new Error("DeepSeek Harness is running. Quit it, retry the plugin installation, then restart DeepSeek Harness.");
-      }
-      for (const [filePath, content] of generatedFiles) {
-        await writeFileIfChanged(filePath, content);
-      }
-      if (patchNeedsUpdate) await writeFileAtomically(patchPath, nextPatch);
+      await mkdir(pluginDirectory, { recursive: true });
+      await writeFileAtomically(
+        join(pluginDirectory, "package.json"),
+        JSON.stringify(createDeepseekHarnessPluginPackageManifest(), null, 2) + "\n"
+      );
+      await writeFileAtomically(join(pluginDirectory, "index.mjs"), DEEPSEEK_HARNESS_PLUGIN_INDEX);
+      await writeFileAtomically(join(pluginDirectory, "client.js"), DEEPSEEK_HARNESS_PLUGIN_CLIENT);
+      await writeFileAtomically(
+        join(pluginDirectory, "memmy-workspace-bridge.mjs"),
+        await loadMemmyWorkspaceBridgeRuntimeAsset()
+      );
+      await writeFileAtomically(
+        join(pluginDirectory, "memmy-memory-config.json"),
+        JSON.stringify({ memmy_config_path: memmyConfigPath, ...(await readMemmyMemoryServiceConfig(memmyConfigPath)) }, null, 2) + "\n"
+      );
+      await upsertPatch(patchPath, renderPluginPatch(memmyConfigPath));
       await replaceMemmySkillDirectory(rootDirectory, renderMemmyPluginSkillManifest(TARGET_ID));
       await replaceMemmyResumeSkillDirectory(rootDirectory, TARGET_ID);
     },
@@ -130,8 +118,8 @@ function renderPluginPatch(memmyConfigPath: string): string {
   ].join("\n");
 }
 
-function renderPatchedContent(current: string, block: string): string {
-  const existing = removePatchBlock(current);
+async function upsertPatch(filePath: string, block: string): Promise<void> {
+  const existing = removePatchBlock(await readTextFile(filePath));
   const lines = existing.split(/\r?\n/u);
   const contentLines = lines.filter((line) => {
     const trimmed = line.trim();
@@ -140,7 +128,7 @@ function renderPatchedContent(current: string, block: string): string {
   const base = contentLines.length === 1 && contentLines[0] === "[]"
     ? lines.filter((line) => line.trim() !== "[]").join("\n").trimEnd()
     : existing.trimEnd();
-  return [base, block, ""].filter((part, index) => part || index === 2).join("\n");
+  await writeFileAtomically(filePath, [base, block, ""].filter((part, index) => part || index === 2).join("\n"));
 }
 
 async function removePatch(filePath: string): Promise<void> {
@@ -151,7 +139,7 @@ async function removePatch(filePath: string): Promise<void> {
     const trimmed = line.trim();
     return trimmed && !trimmed.startsWith("#");
   });
-  await writeFileIfChanged(filePath, without + (without ? "\n" : "") + (hasEntries ? "" : "[]\n"));
+  await writeFileAtomically(filePath, without + (without ? "\n" : "") + (hasEntries ? "" : "[]\n"));
 }
 
 function removePatchBlock(value: string): string {
@@ -202,60 +190,6 @@ async function writeFileAtomically(filePath: string, content: string): Promise<v
     await rm(tempPath, { force: true });
     throw error;
   }
-}
-
-async function writeFileIfChanged(filePath: string, content: string): Promise<void> {
-  if (await readTextFile(filePath) === content) return;
-  await writeFileAtomically(filePath, content);
-}
-
-function normalizeLineEndings(value: string): string {
-  return value.replaceAll("\r\n", "\n");
-}
-
-async function detectDeepseekHarnessProcess(): Promise<boolean> {
-  if (process.platform === "win32") {
-    return commandOutputMatches("tasklist", ["/FO", "CSV", "/NH"], /DeepSeek Harness(?: Helper)?\.exe/iu);
-  }
-  return commandOutputMatches("pgrep", ["-f", deepseekHarnessProcessPattern(process.platform)], /\S/u, 1);
-}
-
-export function deepseekHarnessProcessPattern(platform: NodeJS.Platform): string {
-  const hostEntry = "/dsh-desktop-host/(lib/)?(cli|index|main)\\.js([[:space:]]|$)";
-  if (platform === "darwin") {
-    const appExecutable = "(^|/)DeepSeek Harness( Helper)?(\\.app/Contents/MacOS/DeepSeek Harness( Helper)?)?([[:space:]]|$)";
-    return appExecutable + "|(^|/)dsh-desktop([[:space:]]|$)|" + hostEntry;
-  }
-  return "(^|/)(deepseek-harness|dsh-desktop)([[:space:]]|$)|" + hostEntry;
-}
-
-function commandOutputMatches(
-  command: string,
-  args: string[],
-  pattern: RegExp,
-  noMatchExitCode?: number
-): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: PROCESS_PROBE_TIMEOUT_MS
-    }, (error, stdout) => {
-      if (!error) {
-        resolve(pattern.test(stdout));
-        return;
-      }
-      if (noMatchExitCode !== undefined && isNodeError(error) && Number(error.code) === noMatchExitCode) {
-        resolve(false);
-        return;
-      }
-      const probeError = new Error(
-        "Could not determine whether DeepSeek Harness is running. Quit DeepSeek Harness and retry the plugin installation."
-      );
-      (probeError as Error & { cause?: unknown }).cause = error;
-      reject(probeError);
-    });
-  });
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

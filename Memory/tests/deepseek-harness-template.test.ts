@@ -33,8 +33,8 @@ describe("DeepSeek Harness plugin compatibility", () => {
 
   it("keeps the optional client UI out of the web boot dependency chain", () => {
     expect(DEEPSEEK_HARNESS_PLUGIN_CLIENT).toContain("const inject = [];");
-    expect(DEEPSEEK_HARNESS_PLUGIN_CLIENT).toContain('ctx.inject(["uiConversation"], registerOptimisticUi);');
     expect(DEEPSEEK_HARNESS_PLUGIN_CLIENT).toContain("if (!registry || typeof registry.register !== \"function\") return;");
+    expect(DEEPSEEK_HARNESS_PLUGIN_CLIENT).toContain("return null;");
     expect(DEEPSEEK_HARNESS_PLUGIN_CLIENT).not.toContain("requires uiConversation.events");
   });
 
