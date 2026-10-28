@@ -129,15 +129,15 @@ describe("agent source service", () => {
   });
 
   it("imports scanned Agent skills with immutable source provenance", async () => {
-    const added: Parameters<MemoryClient["addMemory"]>[0][] = [];
+    const reconciled: Parameters<MemoryClient["reconcileAgentSkills"]>[0][] = [];
     const memoryClient = createMockMemoryClient();
     const service = createService({
       adapters: [createFakeAdapter("cursor", createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z"))],
       memoryClient: {
         ...memoryClient,
-        async addMemory(input, context) {
-          added.push(input);
-          return memoryClient.addMemory(input, context);
+        async reconcileAgentSkills(input, context) {
+          reconciled.push(input);
+          return memoryClient.reconcileAgentSkills(input, context);
         }
       },
       skillDistributionService: {
@@ -162,15 +162,19 @@ describe("agent source service", () => {
 
     await service.scanOne("cursor");
 
-    expect(added).toEqual([
+    expect(reconciled).toEqual([
       expect.objectContaining({
-        layer: "Skill",
         sourceAgentId: "cursor",
-        sourceSkillId: "review-code",
-        sourceSkillPath: "/tmp/cursor/skills/review-code/SKILL.md",
-        sourceSkillVersion: "v2",
-        sourceContentHash: "hash-v2",
-        tags: ["agent-source", "cross-agent-skill", "cursor"]
+        complete: true,
+        disconnected: false,
+        skills: [expect.objectContaining({
+          sourceSkillId: "review-code",
+          sourceSkillPath: "/tmp/cursor/skills/review-code/SKILL.md",
+          version: "v2",
+          contentHash: "hash-v2",
+          title: "review-code",
+          modifiedAt: "2026-05-28T09:00:00.000Z"
+        })]
       })
     ]);
   });
@@ -182,15 +186,25 @@ describe("agent source service", () => {
       adapters: [createFakeAdapter("cursor", [])],
       memoryClient: {
         ...memoryClient,
-        async addMemory(input, context) {
-          if (input.sourceSkillId === "duplicate-skill") {
-            return { ...(await memoryClient.addMemory(input, context)), duplicate: true };
-          }
-          if (input.sourceSkillId === "deleted-skill") {
-            return { ...(await memoryClient.addMemory(input, context)), status: "deleted" as const };
-          }
-          if (input.sourceSkillId === "failing-skill") throw new Error("skill import failed");
-          return memoryClient.addMemory(input, context);
+        async reconcileAgentSkills(input) {
+          const outcomes: Record<string, "created" | "unchanged" | "deleted_by_user" | "failed"> = {
+            "fresh-skill": "created",
+            "duplicate-skill": "unchanged",
+            "deleted-skill": "deleted_by_user",
+            "failing-skill": "failed"
+          };
+          return {
+            sourceAgentId: input.sourceAgentId,
+            skills: input.skills.map((skill) => {
+              const outcome = outcomes[skill.sourceSkillId]!;
+              return outcome === "failed"
+                ? { sourceSkillId: skill.sourceSkillId, outcome, error: "skill import failed" }
+                : { sourceSkillId: skill.sourceSkillId, outcome, ...(outcome === "deleted_by_user" ? {} : { memoryId: `${skill.sourceSkillId}-memory` }) };
+            }),
+            archived: 0,
+            registrations: 0,
+            serverTime: "2026-05-28T10:00:00.000Z"
+          };
         }
       },
       memoryAddAnalytics: createAddAnalyticsRecorder(events),
@@ -1312,6 +1326,33 @@ describe("agent source service", () => {
     );
   });
 
+  it("stops sharing an Agent's skills as soon as its connection is removed", async () => {
+    const repository = createRepository();
+    repository.upsertSource({ sourceId: "cursor", displayName: "Cursor", dataPath: "/tmp/cursor", builtin: true });
+    const reconciled: Parameters<MemoryClient["reconcileAgentSkills"]>[0][] = [];
+    const memoryClient = createMockMemoryClient();
+    const service = createService({
+      repository,
+      memoryClient: {
+        ...memoryClient,
+        async reconcileAgentSkills(input, context) {
+          reconciled.push(input);
+          return memoryClient.reconcileAgentSkills(input, context);
+        }
+      },
+      skillDistributionService: {
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    await service.uninstallSkill("cursor");
+
+    expect(reconciled).toEqual([{ sourceAgentId: "cursor", complete: false, disconnected: true, skills: [] }]);
+  });
+
   it("delegates skill install and uninstall then updates source status", async () => {
     const repository = createRepository();
     repository.upsertSource({
@@ -1642,18 +1683,68 @@ describe("agent source service", () => {
     expect(repository.getScanWatermark("cursor")).not.toBeNull();
   });
 
-  it("imports skills of an Agent that has no conversation data yet", async () => {
-    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-skill-only-"));
-    const added: Parameters<MemoryClient["addMemory"]>[0][] = [];
+  it("still scans an installed Agent whose skills directory is empty and has no conversation data", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-empty-skills-"));
+    const scanSkills = vi.fn(async () => ({ rootFound: true, complete: true, skills: [], errors: [] }));
+    const service = createService({
+      adapters: [createFakeAdapter("cursor", [], undefined, false)],
+      scanStoreDirectory: join(tempDir, "scans"),
+      memoryClient: createReadyMemoryClient(),
+      skillDistributionService: {
+        scanSkills,
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    await expect(service.scanOne("cursor", { scanJobId: "job-empty-skills", mode: "initial_subset" })).resolves.toBeDefined();
+    expect(scanSkills).toHaveBeenCalled();
+  });
+
+  it("reconciles an empty skill list so removed skills of an Agent without conversations get archived", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-empty-reconcile-"));
+    const reconciled: Parameters<MemoryClient["reconcileAgentSkills"]>[0][] = [];
     const memoryClient = createReadyMemoryClient();
     const service = createService({
       adapters: [createFakeAdapter("cursor", [], undefined, false)],
       scanStoreDirectory: join(tempDir, "scans"),
       memoryClient: {
         ...memoryClient,
-        async addMemory(input, context) {
-          added.push(input);
-          return memoryClient.addMemory(input, context);
+        async reconcileAgentSkills(input, context) {
+          reconciled.push(input);
+          return memoryClient.reconcileAgentSkills(input, context);
+        }
+      },
+      skillDistributionService: {
+        async scanSkills() {
+          return { rootFound: true, complete: true, skills: [], errors: [] };
+        },
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    await service.scanOne("cursor", { scanJobId: "job-empty-reconcile", mode: "initial_subset" });
+
+    expect(reconciled).toEqual([expect.objectContaining({ sourceAgentId: "cursor", complete: true, skills: [] })]);
+  });
+
+  it("imports skills of an Agent that has no conversation data yet", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-skill-only-"));
+    const reconciled: Parameters<MemoryClient["reconcileAgentSkills"]>[0][] = [];
+    const memoryClient = createReadyMemoryClient();
+    const service = createService({
+      adapters: [createFakeAdapter("cursor", [], undefined, false)],
+      scanStoreDirectory: join(tempDir, "scans"),
+      memoryClient: {
+        ...memoryClient,
+        async reconcileAgentSkills(input, context) {
+          reconciled.push(input);
+          return memoryClient.reconcileAgentSkills(input, context);
         }
       },
       skillDistributionService: {
@@ -1682,7 +1773,10 @@ describe("agent source service", () => {
 
     await service.scanOne("cursor", { scanJobId: "job-skill-only", mode: "initial_subset" });
 
-    expect(added).toEqual([expect.objectContaining({ layer: "Skill", sourceSkillId: "review-code" })]);
+    expect(reconciled).toEqual([expect.objectContaining({
+      sourceAgentId: "cursor",
+      skills: [expect.objectContaining({ sourceSkillId: "review-code" })]
+    })]);
   });
 
   it("emits memory_desktop add analytics for persistent scan writes", async () => {

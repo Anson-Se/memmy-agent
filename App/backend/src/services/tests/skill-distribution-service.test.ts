@@ -106,6 +106,38 @@ describe("skill distribution service", () => {
     }
   });
 
+  it("adds the shared skill directory and enabled plugin skills for Codex", async () => {
+    const home = mkdtempSync(join(tmpdir(), "memmy-agent-shared-skills-"));
+    const codexRoot = join(home, ".codex");
+    try {
+      mkdirSync(join(codexRoot, "skills", "own"), { recursive: true });
+      writeFileSync(join(codexRoot, "skills", "own", "SKILL.md"), "---\nname: own\n---\nOwn.\n", "utf8");
+      mkdirSync(join(home, ".agents", "skills", "lark-base"), { recursive: true });
+      writeFileSync(join(home, ".agents", "skills", "lark-base", "SKILL.md"), "---\nname: lark-base\n---\nShared.\n", "utf8");
+      mkdirSync(join(codexRoot, "plugins", "cache", "market", "superpowers", "7.0.1", "skills", "writing-plans"), { recursive: true });
+      writeFileSync(join(codexRoot, "plugins", "cache", "market", "superpowers", "7.0.1", "skills", "writing-plans", "SKILL.md"), "---\nname: writing-plans\n---\n", "utf8");
+      writeFileSync(join(codexRoot, "config.toml"), '[plugins."superpowers@market"]\nenabled = true\n', "utf8");
+      const service = createSkillDistributionService({
+        targetRegistry: createSkillTargetRegistry([
+          createFakeTarget({ targetId: "codex", resolveRootDirectory: () => codexRoot })
+        ]),
+        homeDirectory: () => home
+      });
+
+      const scan = await service.scanSkills?.("codex");
+
+      expect(scan?.skills.map((skill) => skill.sourceSkillId)).toEqual(["own", "shared:agents/lark-base"]);
+      expect(scan?.registrations).toEqual([expect.objectContaining({
+        sourceSkillId: "plugin:superpowers@market/writing-plans",
+        name: "writing-plans",
+        pluginId: "superpowers@market"
+      })]);
+      expect(scan?.registrationsComplete).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("renders and installs the fixed Memmy skill manifest", async () => {
     let installed: SkillManifest | undefined;
     const service = createSkillDistributionService({
@@ -278,6 +310,7 @@ describe("skill distribution service", () => {
 });
 
 function createFakeTarget(overrides: {
+  targetId?: string;
   resolveRootDirectory?: () => string | null;
   install?: (manifest: SkillManifest) => void;
   uninstall?: (targetId: string) => void;
@@ -287,7 +320,7 @@ function createFakeTarget(overrides: {
   detectMemoryPluginConflict?: () => MemoryPluginConflict | null;
 }): SkillTarget {
   return {
-    targetId: "cursor",
+    targetId: overrides.targetId ?? "cursor",
     displayName: "Cursor",
     async resolveRootDirectory() {
       return "resolveRootDirectory" in overrides ? overrides.resolveRootDirectory?.() ?? null : "/tmp/cursor/rules";

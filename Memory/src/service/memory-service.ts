@@ -1,3 +1,6 @@
+import { embeddingTextForMemory } from "./embedding/embedding-pipeline.js";
+import { AgentSkillLibrary, type AgentSkillReconcileRequest, type AgentSkillReconcileResult } from "./import/agent-skill-library.js";
+import { importedSkillMayEmbed, isImportedSkill } from "../storage/imported-skill.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -283,6 +286,7 @@ export class MemoryService {
   private readonly episodeReadModel: EpisodeReadModel;
   private readonly episodeTitle: EpisodeTitleService;
   private readonly importJobs: ImportJobProcessor;
+  private readonly agentSkills: AgentSkillLibrary;
   private readonly l3WorldModelContextReadModel: L3WorldModelContextReadModel;
   private readonly projectEnvironment: ProjectEnvironmentService;
   private readonly panelReadModel: PanelReadModel;
@@ -512,6 +516,15 @@ export class MemoryService {
       captureClaims: this.repos.captureClaims,
       processing: this.repos.processing,
       runtime: this.repos.runtime
+    });
+    this.agentSkills = new AgentSkillLibrary({
+      repos: this.repos,
+      nowIso,
+      embedAfterCapture: () => importJobOwner.config.algorithm.capture.embedAfterCapture,
+      resolveUserId: (request) => this.resolveContext(request).userId,
+      buildMemory: (input) => this.buildMemory(input as Parameters<MemoryService["buildMemory"]>[0]),
+      enqueueJob: (input) => this.enqueueJob(input),
+      namespaceIdFromMemory
     });
     const embeddingJobOwner = this;
     this.embeddingJobs = new EmbeddingJobProcessor({
@@ -1496,6 +1509,18 @@ export class MemoryService {
     return this.retrieval.retrievalTuningConfig();
   }
 
+  /** Brings the imported Skills of one source Agent in line with one scan of that Agent. */
+  reconcileAgentSkills(request: AgentSkillReconcileRequest): AgentSkillReconcileResult {
+    this.assertMemoryAddEnabled();
+    if (typeof request.sourceAgentId !== "string" || !request.sourceAgentId.trim()) {
+      throw new MemoryServiceError("invalid_argument", "agent skill reconcile requires sourceAgentId");
+    }
+    if (!Array.isArray(request.skills)) {
+      throw new MemoryServiceError("invalid_argument", "agent skill reconcile requires skills");
+    }
+    return this.agentSkills.reconcile(request);
+  }
+
   addMemory(request: MemoryAddRequest): {
     id: string;
     kind: MemoryKind;
@@ -2411,10 +2436,11 @@ export class MemoryService {
     this.assertMemoryInScope(memory, request.namespace);
     const kind = kindFromMemory(memory);
     const at = nowIso();
-    const archived = this.repos.memories.archive(memory.id, at);
+    let archived = this.repos.memories.archive(memory.id, at);
     if (!archived) {
       throw new MemoryServiceError("not_found", `memory not found: ${id}`);
     }
+    if (isImportedSkill(archived)) archived = this.agentSkills.markUserArchived(archived, at);
     const changeSeq = this.repos.runtime.appendChange({
       memoryId: archived.id,
       namespaceId: namespaceIdFromMemory(archived),
@@ -2536,6 +2562,8 @@ export class MemoryService {
     }
     const kind = kindFromMemory(memory);
     const at = nowIso();
+    const importedSkill = isImportedSkill(memory);
+    if (importedSkill) this.agentSkills.stripBeforeDelete(memory, at);
     const deleted = strictV2WorldModel
       ? this.repos.l3WorldModels.deleteScopeMemory(memory.id, at)?.deleted
       : this.repos.memories.softDelete(memory.id, at);
@@ -2576,6 +2604,9 @@ export class MemoryService {
       meta: { reason: request.reason },
       createdAt: deleted.updatedAt
     });
+    // A deleted imported skill keeps only its source identity; its body is
+    // also removed from the log and queue copies written above or earlier.
+    if (importedSkill) this.repos.runtime.scrubImportedSkillCopies(deleted.id);
     this.evolutionJobs.invalidateMemoryDependencies(memory, at);
     return {
       ok: true,
@@ -3025,7 +3056,14 @@ export class MemoryService {
     for (;;) {
       const memories = this.repos.memories.list({}, 250, offset);
       for (const memory of memories) {
-        this.workerHandlers.enqueueEmbeddingRetry(memory, memory.memoryValue, at);
+        if (isImportedSkill(memory)) {
+          // Imported skills embed their retrieval text, never the full SKILL.md,
+          // and only while they can be recalled.
+          if (!importedSkillMayEmbed(memory)) continue;
+          this.workerHandlers.enqueueEmbeddingRetry(memory, embeddingTextForMemory(memory), at);
+        } else {
+          this.workerHandlers.enqueueEmbeddingRetry(memory, memory.memoryValue, at);
+        }
         enqueued += 1;
       }
       if (memories.length < 250) break;

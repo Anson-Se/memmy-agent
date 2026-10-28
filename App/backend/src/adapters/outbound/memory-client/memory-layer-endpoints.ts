@@ -13,6 +13,7 @@ export const MEMORY_LAYER_PATHS = Object.freeze({
   completeSourceTurn: "/api/v1/source-turns/complete",
   search: "/api/v1/memory/search",
   addMemory: "/api/v1/memory/add",
+  reconcileAgentSkills: "/api/v1/agent-skills/reconcile",
   getMemory: "/api/v1/memory/:id",
   deleteMemory: "/api/v1/memory/:id",
   approveObservedSkill: "/api/v1/evidence/skills/:id/approve",

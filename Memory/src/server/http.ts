@@ -1,3 +1,4 @@
+import type { AgentSkillReconcileRequest } from "../service/import/agent-skill-library.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
@@ -80,6 +81,7 @@ export const API_ROUTES = [
   "POST /api/v1/memory/search",
   "GET /api/v1/memory/recalls/:queryId",
   "POST /api/v1/memory/add",
+  "POST /api/v1/agent-skills/reconcile",
   "POST /api/v1/evidence/sync",
   "POST /api/v1/evidence/status",
   "POST /api/v1/evidence/skills/suggest",
@@ -862,6 +864,14 @@ async function routeRequest(
     return result;
   }
 
+  if (method === "POST" && path === "/api/v1/agent-skills/reconcile") {
+    requireMemoryWrite(principal);
+    const request = agentSkillReconcileRequest(requestWithPrincipal<RequestEnvelope & Record<string, unknown>>(body, "agent-skills.reconcile", principal));
+    const result = service.reconcileAgentSkills(request);
+    autoWorker.schedule();
+    return result;
+  }
+
   if (method === "POST" && path === "/api/v1/evidence/sync") {
     requireMemoryWrite(principal);
     const request = evidenceEnvelopeWithPrincipal(asObject(body, "evidence.sync"), principal) as unknown as ExternalEvidenceSyncRequest;
@@ -1495,6 +1505,56 @@ function hasScope(principal: AuthPrincipal, scope: string): boolean {
   }
   const [domain] = scope.split(":");
   return principal.scopes.includes(`${domain}:*`);
+}
+
+/** Keeps only the documented reconcile fields; unknown fields are dropped. */
+function agentSkillReconcileRequest(request: RequestEnvelope & Record<string, unknown>): AgentSkillReconcileRequest {
+  const text = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+  const flag = (value: unknown): boolean | undefined => typeof value === "boolean" ? value : undefined;
+  const records = (value: unknown, field: string): Record<string, unknown>[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+      throw new MemoryServiceError("invalid_argument", `agent-skills.reconcile ${field} must be an array of objects`);
+    }
+    return value as Record<string, unknown>[];
+  };
+  const required = (item: Record<string, unknown>, key: string, field: string): string => {
+    const value = text(item[key]);
+    if (!value) throw new MemoryServiceError("invalid_argument", `agent-skills.reconcile ${field}.${key} is required`);
+    return value;
+  };
+  const sourceAgentId = text(request.sourceAgentId);
+  if (!sourceAgentId?.trim()) throw new MemoryServiceError("invalid_argument", "agent-skills.reconcile requires sourceAgentId");
+  return {
+    requestId: request.requestId,
+    adapterId: request.adapterId,
+    namespace: request.namespace,
+    timeZone: request.timeZone,
+    sourceAgentId,
+    complete: request.complete === true,
+    disconnected: request.disconnected === true,
+    registrationsComplete: request.registrationsComplete === true,
+    skills: records(request.skills, "skills").map((item) => ({
+      sourceSkillId: required(item, "sourceSkillId", "skills"),
+      sourceSkillPath: required(item, "sourceSkillPath", "skills"),
+      title: required(item, "title", "skills"),
+      content: required(item, "content", "skills"),
+      contentHash: required(item, "contentHash", "skills"),
+      modifiedAt: required(item, "modifiedAt", "skills"),
+      version: text(item.version),
+      description: text(item.description),
+      disableModelInvocation: flag(item.disableModelInvocation),
+      allowImplicitInvocation: flag(item.allowImplicitInvocation)
+    })),
+    ...(request.registrations === undefined ? {} : {
+      registrations: records(request.registrations, "registrations").map((item) => ({
+        sourceSkillId: required(item, "sourceSkillId", "registrations"),
+        sourceSkillPath: required(item, "sourceSkillPath", "registrations"),
+        name: required(item, "name", "registrations"),
+        pluginId: text(item.pluginId)
+      }))
+    })
+  };
 }
 
 function asObject(body: unknown, routeName: string): Record<string, unknown> {

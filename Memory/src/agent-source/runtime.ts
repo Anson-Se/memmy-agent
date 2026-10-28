@@ -1,10 +1,11 @@
+import type { AgentSkillReconcileSkill } from "../service/import/agent-skill-library.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { homedir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { loadMemmyConfig } from "../config/index.js";
 import { createMemoryLogger, memoryErrorFields } from "../logging/logger.js";
@@ -47,6 +48,9 @@ import {
   legacyImportTurnIdFromMessages,
   legacyTurnRequestId,
   readAgentSkillInventory,
+  readClaudeCodePluginSkills,
+  readCodexPluginSkills,
+  sharedSkillRootsForAgent,
   type ScanStore
 } from "@memmy/agent-source-core";
 import { openMemoryAgentSourceScanStore, type MemoryAgentSourceScanStore } from "./scan-store.js";
@@ -357,7 +361,8 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           options.resolveAgentSkillRoot,
           options.scheduleWorker,
           options.memoryAddAnalytics,
-          persistentScanMode(mode)
+          persistentScanMode(mode),
+          isUserDisconnected(state.sources[sourceId])
         );
         await checkpoint();
         const sourceErrorCount = stage.scanErrorCount + result.errorCount + skillResult.errorCount;
@@ -414,7 +419,8 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           options.resolveAgentSkillRoot,
           options.scheduleWorker,
           options.memoryAddAnalytics,
-          persistentScanMode(request.mode)
+          persistentScanMode(request.mode),
+          isUserDisconnected(state.sources[adapter.descriptor.sourceId])
         );
         failureCount += skillResult.errorCount;
         for (const detail of skillResult.errors) {
@@ -577,6 +583,13 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
     }
     state.sources[sourceId] = nextState;
     await persist(state);
+    if (method === "DELETE") {
+      try {
+        options.service.reconcileAgentSkills({ sourceAgentId: sourceId, complete: false, disconnected: true, skills: [] });
+      } catch (error) {
+        logger.warn("connection.skill_sharing_stop_failed", { sourceId, ...memoryErrorFields(error) });
+      }
+    }
     logger.info(method === "POST" ? "connection.installed" : "connection.removed", { sourceId, kind });
     return { ok: true, sourceId, status: state.sources[sourceId].status };
   }
@@ -1225,111 +1238,130 @@ async function ingestAgentSkills(
     MemoryDesktopAddAnalytics,
     "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed"
   >,
-  scanMode?: MemoryDesktopAddScanMode
+  scanMode?: MemoryDesktopAddScanMode,
+  disconnected = false
 ): Promise<{ written: number; memoryIdCount: number; errorCount: number; errors: string[] }> {
   const root = resolveAgentSkillRoot(sourceId);
   if (!root) return { written: 0, memoryIdCount: 0, errorCount: 0, errors: [] };
-  const skillsRoot = join(root, "skills");
   const errors: string[] = [];
   let written = 0;
   let memoryIdCount = 0;
   let errorCount = 0;
-  const pendingIds: string[] = [];
-  const flush = (force = false) => {
-    if (pendingIds.length === 0 || (!force && pendingIds.length < 100)) return;
-    service.enqueuePendingImportSummaries(INITIAL_SCAN_MESSAGE_LIMIT, pendingIds.splice(0));
-    scheduleWorker?.();
+  const reportScanErrors = (scanErrors: ReadonlyArray<{ path: string; reason: string }>) => {
+    for (const skillError of scanErrors) {
+      errorCount += 1;
+      errors.push(`skill:${skillError.path}: ${skillError.reason}`);
+      recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
+    }
   };
-  const inventory = await readAgentSkillInventory(skillsRoot, { checkpoint });
-  for (const skillError of inventory.errors) {
-    errorCount += 1;
-    errors.push(`skill:${skillError.path}: ${skillError.reason}`);
-    recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
+
+  const inventories = [{ prefix: "", inventory: await readAgentSkillInventory(join(root, "skills"), { checkpoint }) }];
+  // Skills from a shared directory belong to every Agent that loads it.
+  for (const shared of sharedSkillRootsForAgent(sourceId, homedir())) {
+    inventories.push({ prefix: `shared:${shared.id}/`, inventory: await readAgentSkillInventory(shared.root, { checkpoint }) });
   }
-  for (const skill of inventory.items) {
-    await checkpoint();
-    if (skill.frontmatterError || skill.policyError) {
-      logger.warn("skill.metadata_unreadable", {
-        sourceId,
+  const skills: AgentSkillReconcileSkill[] = [];
+  for (const { prefix, inventory } of inventories) {
+    reportScanErrors(inventory.errors);
+    for (const skill of inventory.items) {
+      if (skill.frontmatterError || skill.policyError) {
+        logger.warn("skill.metadata_unreadable", {
+          sourceId,
+          sourceSkillPath: skill.sourceSkillPath,
+          ...(skill.frontmatterError ? { frontmatterError: skill.frontmatterError } : {}),
+          ...(skill.policyError ? { policyError: skill.policyError } : {})
+        });
+      }
+      skills.push({
+        sourceSkillId: `${prefix}${skill.sourceSkillId}`,
         sourceSkillPath: skill.sourceSkillPath,
-        ...(skill.frontmatterError ? { frontmatterError: skill.frontmatterError } : {}),
-        ...(skill.policyError ? { policyError: skill.policyError } : {})
+        title: skill.name ?? skill.sourceSkillId,
+        content: skill.content,
+        contentHash: skill.contentHash,
+        modifiedAt: skill.modifiedAt,
+        ...(skill.version ? { version: skill.version } : {}),
+        ...(skill.description ? { description: skill.description } : {}),
+        disableModelInvocation: skill.disableModelInvocation,
+        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation })
       });
     }
-    const { content, contentHash, sourceSkillId } = skill;
-    const filePath = skill.sourceSkillPath;
-    const requestId = `agent-source-skill:${sourceId}:${sourceSkillId}:${contentHash}`;
-    const turnId = `skill:${sourceSkillId}:${contentHash}`;
-    const addAnalyticsBase = {
+  }
+  const plugins = sourceId === "claude_code"
+    ? await readClaudeCodePluginSkills(root, { checkpoint })
+    : sourceId === "codex" ? await readCodexPluginSkills(root, { checkpoint }) : undefined;
+  if (plugins) reportScanErrors(plugins.errors);
+
+  await checkpoint();
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = service.reconcileAgentSkills({
+      sourceAgentId: sourceId,
+      complete: inventories.every(({ inventory }) => inventory.complete),
+      disconnected,
+      skills,
+      ...(plugins ? {
+        registrations: plugins.items.map((plugin) => ({
+          sourceSkillId: `plugin:${plugin.pluginId}/${basename(dirname(plugin.sourceSkillPath))}`,
+          sourceSkillPath: plugin.sourceSkillPath,
+          name: plugin.name,
+          pluginId: plugin.pluginId
+        })),
+        registrationsComplete: plugins.complete
+      } : {})
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    recordScanItemSkip(store, sourceId, "skills", reason);
+    return { written, memoryIdCount, errorCount: errorCount + 1, errors: [...errors, `skills: ${reason}`] };
+  }
+  const contentHashes = new Map(skills.map((skill) => [skill.sourceSkillId, skill.contentHash]));
+  for (const item of result.skills) {
+    const analyticsBase = {
       adapterId: `agent-source:${sourceId}`,
-      conversationId: `skill:${sourceSkillId}`,
-      turnId,
+      conversationId: `skill:${item.sourceSkillId}`,
+      turnId: `skill:${item.sourceSkillId}:${contentHashes.get(item.sourceSkillId) ?? ""}`,
       layer: "Skill" as const,
       ...(scanMode ? { scanMode } : {})
     };
-    const addStartedAt = Date.now();
-    await checkpoint();
-    try {
-      const added = service.addMemory({
-        requestId,
-        adapterId: `agent-source:${sourceId}`,
-        content,
-        layer: "Skill",
-        title: skill.name ?? sourceSkillId,
-        tags: ["agent-source", "cross-agent-skill", sourceId],
-        source: sourceId,
-        turnId,
-        createdAt: skill.modifiedAt,
-        sourceAgentId: sourceId,
-        sourceSkillId,
-        sourceSkillPath: filePath,
-        sourceSkillVersion: skill.version ?? contentHash,
-        sourceContentHash: contentHash,
-        deferProcessing: true
-      });
-      if (added.duplicate !== true && added.status !== "deleted") {
-        memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
-        memoryAddAnalytics?.trackAddSucceeded({
-          ...addAnalyticsBase,
-          durationMs: Date.now() - addStartedAt,
-          storedCount: 1
-        });
-      }
-      written += 1;
-      memoryIdCount += 1;
-      store.saveResult({ sourceId, conversationId: `skill:${sourceSkillId}`, memoryId: added.id });
-      if (!added.duplicate) {
-        pendingIds.push(added.id);
-        flush();
-      }
-    } catch (error) {
-      recordScanItemSkip(
-        store,
-        sourceId,
-        `skill:${sourceSkillId}`,
-        error instanceof Error ? error.message : String(error)
-      );
+    if (item.outcome === "failed") {
       errorCount += 1;
-      errors.push(`skill:${sourceSkillId}: ${error instanceof Error ? error.message : String(error)}`);
-      memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
-      memoryAddAnalytics?.trackAddFailed({
-        ...addAnalyticsBase,
-        durationMs: Date.now() - addStartedAt,
-        error
-      });
+      errors.push(`skill:${item.sourceSkillId}: ${item.error ?? "skill import failed"}`);
+      recordScanItemSkip(store, sourceId, `skill:${item.sourceSkillId}`, item.error ?? "skill import failed");
+      memoryAddAnalytics?.trackAddStarted(analyticsBase);
+      memoryAddAnalytics?.trackAddFailed({ ...analyticsBase, durationMs: Date.now() - startedAt, error: new Error(item.error ?? "skill import failed") });
+      continue;
+    }
+    if (!item.memoryId) continue;
+    written += 1;
+    memoryIdCount += 1;
+    store.saveResult({ sourceId, conversationId: `skill:${item.sourceSkillId}`, memoryId: item.memoryId });
+    if (item.outcome === "created" || item.outcome === "updated") {
+      memoryAddAnalytics?.trackAddStarted(analyticsBase);
+      memoryAddAnalytics?.trackAddSucceeded({ ...analyticsBase, durationMs: Date.now() - startedAt, storedCount: 1 });
     }
   }
-  await checkpoint();
-  flush(true);
+  if (result.skills.some((item) => item.outcome === "created" || item.outcome === "updated")) scheduleWorker?.();
   return { written, memoryIdCount, errorCount, errors };
 }
 
+/** The user removed this Agent's connection; its skills stop being shared. */
+function isUserDisconnected(source: PersistedSourceState | undefined): boolean {
+  return source?.status === "not_connected" && source.autoInjectSuppressed === true;
+}
+
+/**
+ * Whether the Agent is installed as far as skills are concerned: its root
+ * exists, so its own, shared and plugin skills are scanned even when skills/
+ * is empty or missing. Shared directories alone do not count; no installed
+ * Agent loads them then.
+ */
 function hasAgentSkillsDirectory(
   sourceId: string,
   resolveAgentSkillRoot: (sourceId: string) => string | null = agentRootDirectory
 ): boolean {
   const root = resolveAgentSkillRoot(sourceId);
-  return Boolean(root && existsSync(join(root, "skills")));
+  return Boolean(root && existsSync(root));
 }
 
 function agentRootDirectory(sourceId: string): string | null {

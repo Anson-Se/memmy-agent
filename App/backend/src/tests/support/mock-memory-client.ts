@@ -201,6 +201,17 @@ export function createMockMemoryClient(options: CreateMockMemoryClientOptions = 
       };
     },
 
+    async reconcileAgentSkills(input) {
+      failIfNeeded();
+      return {
+        sourceAgentId: input.sourceAgentId,
+        skills: input.skills.map((skill) => ({ sourceSkillId: skill.sourceSkillId, outcome: "created" as const, memoryId: randomUUID() })),
+        archived: 0,
+        registrations: input.registrations?.length ?? 0,
+        serverTime: now()
+      };
+    },
+
     async getMemory(input) {
       failIfNeeded();
       const serverTime = now();

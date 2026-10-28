@@ -33,7 +33,7 @@ import {
   type IngestionStats
 } from "./ingestion-service.js";
 import { AgentSourceUnavailableError } from "./runtime-errors.js";
-import type { SkillDistributionService } from "./skill-distribution-service.js";
+import type { AgentSkillScan, SkillDistributionService } from "./skill-distribution-service.js";
 import {
   createAgentSourceLifecycleAnalytics,
   type AgentSourceInstallType,
@@ -132,7 +132,7 @@ export interface CreateAgentSourceServiceOptions {
   sourceRegistry: SourceRegistry;
   agentSourceRepository: AgentSourceRepository;
   ingestionService: IngestionService;
-  memoryClient: Pick<MemoryClient, "addMemory" | "completeSourceTurn" | "enqueueImportSummaries" | "getMemoryProcessingStatus" | "runWorker">;
+  memoryClient: Pick<MemoryClient, "addMemory" | "reconcileAgentSkills" | "completeSourceTurn" | "enqueueImportSummaries" | "getMemoryProcessingStatus" | "runWorker">;
   skillDistributionService: SkillDistributionService;
   agentSourceAnalytics?: AgentSourceLifecycleAnalytics;
   memoryAddAnalytics?: Pick<
@@ -401,6 +401,7 @@ export function createAgentSourceService(options: CreateAgentSourceServiceOption
         await options.skillDistributionService.uninstall(sourceId);
         ensureSourceExists(options, sourceId);
         options.agentSourceRepository.setConnectionState(sourceId, "not_connected", true);
+        await stopSharingAgentSkills(options, sourceId);
         agentSourceAnalytics.trackSkillUninstalled({
           sourceId,
           builtin,
@@ -476,6 +477,7 @@ export function createAgentSourceService(options: CreateAgentSourceServiceOption
         await options.skillDistributionService.uninstallPlugin(sourceId);
         ensureSourceExists(options, sourceId);
         options.agentSourceRepository.setConnectionState(sourceId, "not_connected", true);
+        await stopSharingAgentSkills(options, sourceId);
         agentSourceAnalytics.trackPluginUninstalled({
           sourceId,
           permission,
@@ -1340,7 +1342,8 @@ interface SkillScanOutcome {
 
 async function hasAgentSkills(options: CreateAgentSourceServiceOptions, sourceId: string): Promise<boolean> {
   const scan = await options.skillDistributionService.scanSkills?.(sourceId).catch(() => undefined);
-  return Boolean(scan && (scan.skills.length > 0 || scan.errors.length > 0));
+  if (!scan) return false;
+  return scan.rootFound ?? (scan.skills.length > 0 || scan.errors.length > 0);
 }
 
 async function ingestSourceSkills(
@@ -1356,28 +1359,22 @@ async function ingestSourceSkills(
   const errors: Array<{ conversationId: string; reason: string }> = [];
   let errorCount = 0;
   let memoryIdCount = 0;
-  let skills;
+  let scan: AgentSkillScan;
   try {
-    if (distribution.scanSkills) {
-      const scan = await distribution.scanSkills(sourceId);
-      skills = scan.skills;
-      for (const skillError of scan.errors) {
-        errorCount += 1;
-        errors.push({ conversationId: `skill:${skillError.path}`, reason: skillError.reason });
-        recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
-      }
-    } else {
-      skills = await distribution.listSkills!(sourceId);
-    }
+    scan = distribution.scanSkills
+      ? await distribution.scanSkills(sourceId)
+      : { complete: true, skills: await distribution.listSkills!(sourceId), errors: [] };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Agent Skill scan failed";
     recordScanItemSkip(store, sourceId, "skills", reason);
     return { errors: [{ conversationId: "skills", reason }], errorCount: 1, memoryIdCount: 0 };
   }
-
-  const scanMode = persistentScanMode(resolvedScanMode ?? scanOptions.mode);
-  for (const skill of skills) {
-    scanOptions.signal?.throwIfAborted();
+  for (const skillError of scan.errors) {
+    errorCount += 1;
+    errors.push({ conversationId: `skill:${skillError.path}`, reason: skillError.reason });
+    recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
+  }
+  for (const skill of scan.skills) {
     if (skill.frontmatterError || skill.policyError) {
       console.warn(`[agent-source] skill.metadata_unreadable ${JSON.stringify({
         sourceId,
@@ -1386,63 +1383,84 @@ async function ingestSourceSkills(
         ...(skill.policyError ? { policyError: skill.policyError } : {})
       })}`);
     }
-    const turnId = `skill:${skill.sourceSkillId}:${skill.sourceSkillVersion}`;
-    const addAnalyticsBase = {
+  }
+
+  scanOptions.signal?.throwIfAborted();
+  const scanMode = persistentScanMode(resolvedScanMode ?? scanOptions.mode);
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = await options.memoryClient.reconcileAgentSkills({
+      sourceAgentId: sourceId,
+      complete: scan.complete,
+      disconnected: isUserDisconnected(options, sourceId),
+      skills: scan.skills.map((skill) => ({
+        sourceSkillId: skill.sourceSkillId,
+        sourceSkillPath: skill.sourceSkillPath,
+        title: skill.title,
+        content: skill.content,
+        contentHash: skill.sourceContentHash,
+        modifiedAt: skill.updatedAt,
+        version: skill.sourceSkillVersion,
+        ...(skill.description ? { description: skill.description } : {}),
+        ...(skill.disableModelInvocation === undefined ? {} : { disableModelInvocation: skill.disableModelInvocation }),
+        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation })
+      })),
+      ...(scan.registrations ? {
+        registrations: scan.registrations,
+        registrationsComplete: scan.registrationsComplete === true
+      } : {})
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Agent Skill import failed";
+    recordScanItemSkip(store, sourceId, "skills", reason);
+    return { errors: [...errors, { conversationId: "skills", reason }], errorCount: errorCount + 1, memoryIdCount };
+  }
+  const versions = new Map(scan.skills.map((skill) => [skill.sourceSkillId, skill.sourceSkillVersion]));
+  for (const item of result.skills) {
+    const analyticsBase = {
       adapterId: `agent-source:${sourceId}`,
-      conversationId: `skill:${skill.sourceSkillId}`,
-      turnId,
+      conversationId: `skill:${item.sourceSkillId}`,
+      turnId: `skill:${item.sourceSkillId}:${versions.get(item.sourceSkillId) ?? ""}`,
       layer: "Skill" as const,
       ...(scanMode ? { scanMode } : {})
     };
-    const addStartedAt = Date.now();
-    try {
-      const added = await options.memoryClient.addMemory({
-        requestId: `agent-source-skill:${sourceId}:${skill.sourceSkillId}:${skill.sourceContentHash}`,
-        adapterId: `agent-source:${sourceId}`,
-        content: skill.content,
-        layer: "Skill",
-        title: skill.title,
-        tags: ["agent-source", "cross-agent-skill", sourceId],
-        source: sourceId,
-        turnId,
-        createdAt: skill.updatedAt,
-        sourceAgentId: sourceId,
-        sourceSkillId: skill.sourceSkillId,
-        sourceSkillPath: skill.sourceSkillPath,
-        sourceSkillVersion: skill.sourceSkillVersion,
-        sourceContentHash: skill.sourceContentHash
-      });
-      if (added.duplicate !== true && added.status !== "deleted") {
-        options.memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
-        options.memoryAddAnalytics?.trackAddSucceeded({
-          ...addAnalyticsBase,
-          durationMs: Date.now() - addStartedAt,
-          storedCount: 1
-        });
-      }
-      memoryIdCount += 1;
-      store?.saveResult({ sourceId, conversationId: `skill:${skill.sourceSkillId}`, memoryId: added.id });
-    } catch (error) {
-      recordScanItemSkip(
-        store,
-        sourceId,
-        `skill:${skill.sourceSkillId}`,
-        error instanceof Error ? error.message : "Agent Skill import failed"
-      );
+    if (item.outcome === "failed") {
+      const reason = item.error ?? "Agent Skill import failed";
       errorCount += 1;
-      errors.push({
-        conversationId: `skill:${skill.sourceSkillId}`,
-        reason: error instanceof Error ? error.message : "Agent Skill import failed"
-      });
-      options.memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
-      options.memoryAddAnalytics?.trackAddFailed({
-        ...addAnalyticsBase,
-        durationMs: Date.now() - addStartedAt,
-        error
-      });
+      errors.push({ conversationId: `skill:${item.sourceSkillId}`, reason });
+      recordScanItemSkip(store, sourceId, `skill:${item.sourceSkillId}`, reason);
+      options.memoryAddAnalytics?.trackAddStarted(analyticsBase);
+      options.memoryAddAnalytics?.trackAddFailed({ ...analyticsBase, durationMs: Date.now() - startedAt, error: new Error(reason) });
+      continue;
+    }
+    if (!item.memoryId) continue;
+    memoryIdCount += 1;
+    store?.saveResult({ sourceId, conversationId: `skill:${item.sourceSkillId}`, memoryId: item.memoryId });
+    if (item.outcome === "created" || item.outcome === "updated") {
+      options.memoryAddAnalytics?.trackAddStarted(analyticsBase);
+      options.memoryAddAnalytics?.trackAddSucceeded({ ...analyticsBase, durationMs: Date.now() - startedAt, storedCount: 1 });
     }
   }
   return { errors, errorCount, memoryIdCount };
+}
+
+/** The user removed this Agent's connection; its skills stop being shared. */
+function isUserDisconnected(options: CreateAgentSourceServiceOptions, sourceId: string): boolean {
+  return readSourceStatus(options, sourceId) === "not_connected"
+    && options.agentSourceRepository.isAutoInjectSuppressed(sourceId);
+}
+
+/** Stops sharing a disconnected Agent's skills right away instead of at the next scan. */
+async function stopSharingAgentSkills(options: CreateAgentSourceServiceOptions, sourceId: string): Promise<void> {
+  try {
+    await options.memoryClient.reconcileAgentSkills({ sourceAgentId: sourceId, complete: false, disconnected: true, skills: [] });
+  } catch (error) {
+    console.warn(`[agent-source] connection.skill_sharing_stop_failed ${JSON.stringify({
+      sourceId,
+      reason: error instanceof Error ? error.message : String(error)
+    })}`);
+  }
 }
 
 function filterCheckpointedConversations(

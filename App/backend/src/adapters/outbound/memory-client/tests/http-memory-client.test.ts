@@ -44,6 +44,7 @@ describe("HttpMemoryClient", () => {
       "/api/v1/source-turns/complete",
       "/api/v1/memory/search",
       "/api/v1/memory/add",
+      "/api/v1/agent-skills/reconcile",
       "/api/v1/memory/:id",
       "/api/v1/memory/:id",
       "/api/v1/evidence/skills/:id/approve",

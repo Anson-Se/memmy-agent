@@ -266,9 +266,8 @@ describe("standalone Agent source executor", () => {
       "---\nname: release-check\nversion: 1.0.0\n---\nVerify release evidence.\n",
       "utf8"
     );
-    const addMemory = vi.fn(({ layer }: { layer: string }) => ({
-      id: layer === "Skill" ? "skill-memory" : "trace-memory"
-    }));
+    const addMemory = vi.fn(() => ({ id: "trace-memory" }));
+    const reconcileAgentSkills = fakeReconcile();
     const resolveAgentSkillRoot = vi.fn(() => skillRoot);
     const adapter: SourceAdapter = {
       descriptor: {
@@ -286,6 +285,7 @@ describe("standalone Agent source executor", () => {
     const executor = createAgentSourceExecutor({
       service: {
         addMemory,
+        reconcileAgentSkills,
         enqueuePendingImportSummaries: vi.fn()
       } as unknown as MemoryService,
       configPath: join(root, "config.yaml"),
@@ -298,11 +298,15 @@ describe("standalone Agent source executor", () => {
     await waitForScan(executor);
 
     expect(resolveAgentSkillRoot).toHaveBeenCalledWith("cursor");
-    expect(addMemory).toHaveBeenCalledTimes(2);
-    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({
-      layer: "Skill",
-      sourceSkillId: "release-check",
-      sourceSkillPath: join(skillRoot, "skills", "release-check", "SKILL.md")
+    expect(addMemory).toHaveBeenCalledTimes(1);
+    expect(reconcileAgentSkills).toHaveBeenCalledWith(expect.objectContaining({
+      sourceAgentId: "cursor",
+      complete: true,
+      skills: [expect.objectContaining({
+        sourceSkillId: "release-check",
+        version: "1.0.0",
+        sourceSkillPath: join(skillRoot, "skills", "release-check", "SKILL.md")
+      })]
     }));
   });
 
@@ -614,11 +618,9 @@ describe("standalone Agent source executor", () => {
     mkdirSync(join(skillPath, ".."), { recursive: true });
     writeFileSync(skillPath, "---\nname: sample-skill\nversion: 1\n---\n\nUse the sample procedure.\n");
     vi.stubEnv("CODEX_HOME", codexRoot);
-    const addMemory = vi.fn(() => ({ id: "skill-memory-1" }));
-    const service = {
-      addMemory,
-      enqueuePendingImportSummaries: vi.fn()
-    } as unknown as MemoryService;
+    vi.stubEnv("HOME", root);
+    const reconcileAgentSkills = fakeReconcile();
+    const service = { reconcileAgentSkills, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
     const adapter: SourceAdapter = {
       descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
       detect: async () => true,
@@ -634,13 +636,11 @@ describe("standalone Agent source executor", () => {
     await executor.startScan({ sourceId: "codex" });
     await waitForScan(executor);
 
-    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({
-      layer: "Skill",
-      source: "codex",
+    expect(reconcileAgentSkills).toHaveBeenCalledWith(expect.objectContaining({
       sourceAgentId: "codex",
-      sourceSkillId: "sample",
-      sourceSkillPath: skillPath,
-      title: "sample-skill"
+      complete: true,
+      disconnected: false,
+      skills: [expect.objectContaining({ sourceSkillId: "sample", sourceSkillPath: skillPath, title: "sample-skill", version: "1" })]
     }));
   });
 
@@ -653,8 +653,9 @@ describe("standalone Agent source executor", () => {
     mkdirSync(join(codexRoot, "skills"), { recursive: true });
     symlinkSync(sharedSkill, join(codexRoot, "skills", "memory-systems"), "junction");
     vi.stubEnv("CODEX_HOME", codexRoot);
-    const addMemory = vi.fn(() => ({ id: "skill-memory-1" }));
-    const service = { addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
+    vi.stubEnv("HOME", root);
+    const reconcileAgentSkills = fakeReconcile();
+    const service = { reconcileAgentSkills, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
     const adapter: SourceAdapter = {
       descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
       detect: async () => true,
@@ -670,10 +671,8 @@ describe("standalone Agent source executor", () => {
     await executor.startScan({ sourceId: "codex" });
     await waitForScan(executor);
 
-    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({
-      layer: "Skill",
-      sourceSkillId: "memory-systems",
-      title: "memory-systems"
+    expect(reconcileAgentSkills).toHaveBeenCalledWith(expect.objectContaining({
+      skills: [expect.objectContaining({ sourceSkillId: "memory-systems", title: "memory-systems", description: "Design memory for agents." })]
     }));
     await executor.dispose();
   });
@@ -685,8 +684,9 @@ describe("standalone Agent source executor", () => {
     mkdirSync(join(skillPath, ".."), { recursive: true });
     writeFileSync(skillPath, "---\nname: sample-skill\n---\n\nBody\n");
     vi.stubEnv("CODEX_HOME", codexRoot);
-    const addMemory = vi.fn(() => ({ id: "skill-memory-1" }));
-    const service = { addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
+    vi.stubEnv("HOME", root);
+    const reconcileAgentSkills = fakeReconcile();
+    const service = { reconcileAgentSkills, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
     const adapter: SourceAdapter = {
       descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
       detect: async () => false,
@@ -703,7 +703,37 @@ describe("standalone Agent source executor", () => {
     await waitForScan(executor);
 
     expect(executor.scanStatus().error).toBeFalsy();
-    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({ layer: "Skill", sourceSkillId: "sample" }));
+    expect(reconcileAgentSkills).toHaveBeenCalledWith(expect.objectContaining({
+      skills: [expect.objectContaining({ sourceSkillId: "sample" })]
+    }));
+    await executor.dispose();
+  });
+
+  it("leaves shared skills alone while the Agent that loads them is not installed", async () => {
+    const root = tempRoot();
+    const sharedSkill = join(root, ".agents", "skills", "sample", "SKILL.md");
+    mkdirSync(join(sharedSkill, ".."), { recursive: true });
+    writeFileSync(sharedSkill, "---\nname: sample-skill\n---\n\nBody\n");
+    vi.stubEnv("CODEX_HOME", join(root, ".codex"));
+    vi.stubEnv("HOME", root);
+    const reconcileAgentSkills = fakeReconcile();
+    const service = { reconcileAgentSkills, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
+    const adapter: SourceAdapter = {
+      descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: join(root, ".codex") },
+      detect: async () => false,
+      async *scan() {}
+    };
+    const executor = createAgentSourceExecutor({
+      service,
+      configPath: join(root, "config.yaml"),
+      statePath: join(root, "agent-sources.json"),
+      sourceRegistry: createSourceRegistry([adapter])
+    });
+
+    await executor.startScan({ sourceId: "codex" });
+    await waitForScan(executor);
+
+    expect(reconcileAgentSkills).not.toHaveBeenCalled();
     await executor.dispose();
   });
 
@@ -714,8 +744,9 @@ describe("standalone Agent source executor", () => {
     mkdirSync(join(skillPath, ".."), { recursive: true });
     writeFileSync(skillPath, "---\nname: failing-skill\n---\n\nBody\n");
     vi.stubEnv("CODEX_HOME", codexRoot);
+    vi.stubEnv("HOME", root);
     const service = {
-      addMemory: vi.fn(() => { throw new Error("skill import failed"); }),
+      reconcileAgentSkills: fakeReconcile(() => "failed"),
       enqueuePendingImportSummaries: vi.fn()
     } as unknown as MemoryService;
     const adapter: SourceAdapter = {
@@ -748,15 +779,15 @@ describe("standalone Agent source executor", () => {
       mkdirSync(join(skillPath, ".."), { recursive: true });
       writeFileSync(skillPath, `---\nname: ${sourceSkillId}\nversion: 1\n---\n\n${sourceSkillId}\n`);
     }
+    vi.stubEnv("HOME", root);
     vi.stubEnv("CODEX_HOME", codexRoot);
     const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
     const service = {
-      addMemory: vi.fn((input: { sourceSkillId?: string }) => {
-        if (input.sourceSkillId === "duplicate-skill") return { id: "dup", duplicate: true, status: "activated" };
-        if (input.sourceSkillId === "deleted-skill") return { id: "gone", status: "deleted" };
-        if (input.sourceSkillId === "failing-skill") throw new Error("skill import failed");
-        return { id: "fresh", status: "activated" };
-      }),
+      reconcileAgentSkills: fakeReconcile((sourceSkillId) => ({
+        "duplicate-skill": "unchanged" as const,
+        "deleted-skill": "deleted_by_user" as const,
+        "failing-skill": "failed" as const
+      })[sourceSkillId] ?? "created"),
       enqueuePendingImportSummaries: vi.fn()
     } as unknown as MemoryService;
     const adapter: SourceAdapter = {
@@ -1001,4 +1032,19 @@ function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "memmy-agent-source-runtime-"));
   roots.push(root);
   return root;
+}
+
+/** A stand-in for MemoryService.reconcileAgentSkills that stores every scanned skill. */
+function fakeReconcile(outcome: (sourceSkillId: string) => "created" | "updated" | "unchanged" | "deleted_by_user" | "failed" = () => "created") {
+  return vi.fn((input: { sourceAgentId: string; skills: Array<{ sourceSkillId: string }> }) => ({
+    sourceAgentId: input.sourceAgentId,
+    skills: input.skills.map((skill) => {
+      const result = outcome(skill.sourceSkillId);
+      if (result === "failed") return { sourceSkillId: skill.sourceSkillId, outcome: result, error: "skill import failed" };
+      return { sourceSkillId: skill.sourceSkillId, outcome: result, ...(result === "deleted_by_user" ? {} : { memoryId: `${skill.sourceSkillId}-memory` }) };
+    }),
+    archived: 0,
+    registrations: 0,
+    serverTime: "2026-08-28T01:00:00.000Z"
+  }));
 }

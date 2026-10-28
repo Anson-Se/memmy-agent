@@ -95,6 +95,7 @@ describe("createMockMemoryClient", () => {
       "panelAnalysis",
       "panelItems",
       "panelOverview",
+      "reconcileAgentSkills",
       "reloadConfig",
       "retryMemoryProcessing",
       "runWorker",

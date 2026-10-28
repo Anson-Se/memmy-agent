@@ -1,3 +1,4 @@
+import { isIdentityOnlyImportedSkill } from "./imported-skill.js";
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
@@ -765,6 +766,18 @@ export class MemoryRepository {
     return rows.map((row) => this.hydrate(memoryFromSql(row)));
   }
 
+  /** All imported (read-only) Skill records of one source Agent, deleted ones included. */
+  listImportedSkillsForSource(sourceAgentId: string): MemoryRow[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM memories
+       WHERE memory_layer = 'Skill'
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND json_extract(properties_json, '$.internal_info.source_agent_id') = ?
+       ORDER BY created_at, id`
+    ).all(sourceAgentId) as MemorySqlRow[];
+    return rows.map((row) => this.hydrate(memoryFromSql(row)));
+  }
+
   archivePriorReadOnlySkillVersions(input: {
     sourceAgentId: string;
     sourceSkillIdentity: string;
@@ -1317,7 +1330,7 @@ export class MemoryRepository {
   reindexFts(memory: MemoryRow): void {
     try {
       this.db.prepare(`DELETE FROM memories_fts WHERE id = ?`).run(memory.id);
-      if (!memory.deletedAt && memory.status !== "deleted") {
+      if (!memory.deletedAt && memory.status !== "deleted" && !isIdentityOnlyImportedSkill(memory)) {
         this.db
           .prepare(`INSERT INTO memories_fts (id, identifier, memory_value, tags) VALUES (?, ?, ?, ?)`)
           .run(memory.id, memory.id, retrievalDocumentForMemory(memory), memory.tags.join(" "));
@@ -3138,6 +3151,94 @@ export class RuntimeRepository {
       .prepare(`UPDATE recall_events SET outcome = ? WHERE id = ?`)
       .run(outcome, id);
     return this.getRecallEvent(id);
+  }
+
+  /**
+   * Removes a deleted imported skill's body from the copies kept outside the
+   * memory row: embedding retries (all states), change and audit log payloads,
+   * search logs and recall snapshots. Ids, times and event structure are kept.
+   */
+  scrubImportedSkillCopies(memoryId: string): {
+    retries: number;
+    changeLogs: number;
+    auditLogs: number;
+    apiLogs: number;
+    recallEvents: number;
+  } {
+    const retries = this.db.prepare(`DELETE FROM embedding_retry_queue WHERE target_id = ?`).run(memoryId).changes;
+    let changeLogs = 0;
+    // Embedding retry changes are logged under the retry id with the skill id
+    // as targetId and the embedded text as sourceText.
+    for (const row of this.db.prepare(
+      `SELECT seq, before_json, after_json FROM memory_change_log
+       WHERE memory_id = ? OR entity_id = ?
+          OR json_extract(after_json, '$.targetId') = ?
+          OR json_extract(before_json, '$.targetId') = ?`
+    ).all(memoryId, memoryId, memoryId, memoryId) as Array<{ seq: number; before_json: string | null; after_json: string | null }>) {
+      this.db.prepare(`UPDATE memory_change_log SET before_json = ?, after_json = ? WHERE seq = ?`)
+        .run(redactSkillBodyJson(row.before_json), redactSkillBodyJson(row.after_json), row.seq);
+      changeLogs += 1;
+    }
+    let auditLogs = 0;
+    for (const row of this.db.prepare(
+      `SELECT id, before_json, after_json FROM audit_logs WHERE target_id = ?`
+    ).all(memoryId) as Array<{ id: string; before_json: string | null; after_json: string | null }>) {
+      this.db.prepare(`UPDATE audit_logs SET before_json = ?, after_json = ? WHERE id = ?`)
+        .run(redactSkillBodyJson(row.before_json), redactSkillBodyJson(row.after_json), row.id);
+      auditLogs += 1;
+    }
+    const needle = `%${escapeLikePattern(memoryId)}%`;
+    let apiLogs = 0;
+    for (const row of this.db.prepare(
+      `SELECT id, output_json FROM api_logs WHERE tool_name = 'memory_search' AND output_json LIKE ? ESCAPE '\\'`
+    ).all(needle) as Array<{ id: number; output_json: string }>) {
+      const output = parseJsonRecord(row.output_json);
+      let changed = false;
+      for (const key of ["candidates", "filtered", "droppedByLlm"]) {
+        const entries = output[key];
+        if (!Array.isArray(entries)) continue;
+        entries.forEach((entry, index) => {
+          if (isRecordLike(entry) && entry.refId === memoryId) {
+            entries[index] = redactSkillBody(entry);
+            changed = true;
+          }
+        });
+      }
+      if (!changed) continue;
+      this.db.prepare(`UPDATE api_logs SET output_json = ? WHERE id = ?`).run(JSON.stringify(output), row.id);
+      apiLogs += 1;
+    }
+    let recallEvents = 0;
+    for (const row of this.db.prepare(
+      `SELECT id, request_json FROM recall_events WHERE request_json LIKE ? ESCAPE '\\'`
+    ).all(needle) as Array<{ id: string; request_json: string }>) {
+      const request = parseJsonRecord(row.request_json);
+      const evidence = isRecordLike(request.recallEvidence) ? request.recallEvidence : undefined;
+      if (!evidence) continue;
+      let changed = false;
+      if (Array.isArray(evidence.hits)) {
+        const hits = evidence.hits;
+        hits.forEach((hit, index) => {
+          const memberIds = isRecordLike(hit) && Array.isArray(hit.memberMemoryIds) ? hit.memberMemoryIds : [];
+          if (isRecordLike(hit) && (hit.id === memoryId || memberIds.includes(memoryId))) {
+            hits[index] = redactSkillBody(hit);
+            changed = true;
+          }
+        });
+      }
+      if (Array.isArray(evidence.sections)) {
+        for (const section of evidence.sections) {
+          if (isRecordLike(section) && Array.isArray(section.memoryIds) && section.memoryIds.includes(memoryId)) {
+            section.content = "";
+            changed = true;
+          }
+        }
+      }
+      if (!changed) continue;
+      this.db.prepare(`UPDATE recall_events SET request_json = ? WHERE id = ?`).run(JSON.stringify(request), row.id);
+      recallEvents += 1;
+    }
+    return { retries, changeLogs, auditLogs, apiLogs, recallEvents };
   }
 
   appendChange(change: Omit<ChangeLogRecord, "seq">): number {
@@ -8247,4 +8348,49 @@ export function jobToRef(job: EvolutionJobRecord): JobRef {
     status: job.status,
     targetMemoryId: job.targetMemoryId
   };
+}
+
+const SKILL_BODY_KEYS = new Set([
+  "memoryValue",
+  "memory_value",
+  "invocation_guide",
+  "invocationGuide",
+  "procedure_json",
+  "procedureJson",
+  "content",
+  "snippet",
+  "sourceText",
+  "source_text",
+  "summary",
+  "description",
+  "skill_description"
+]);
+
+/** Blanks every skill-body field of a value, at any depth. */
+function redactSkillBody<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((item) => redactSkillBody(item)) as T;
+  if (!isRecordLike(value)) return value;
+  const next: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    next[key] = SKILL_BODY_KEYS.has(key) ? (typeof child === "string" ? "" : null) : redactSkillBody(child);
+  }
+  return next as T;
+}
+
+function redactSkillBodyJson(json: string | null): string | null {
+  if (json === null) return null;
+  try {
+    return JSON.stringify(redactSkillBody(JSON.parse(json) as unknown));
+  } catch {
+    return json;
+  }
+}
+
+function parseJsonRecord(json: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return isRecordLike(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
