@@ -8,9 +8,22 @@ import { ToolRegistry } from "../../App/memmy-agent/src/core/agent-runtime/tools
 import { MemmyMemoryClient } from "../../App/memmy-agent/src/memmy-memory/client.js";
 import { registerMemmyMemoryTools } from "../../App/memmy-agent/src/memmy-memory/tools.js";
 import type { MemmyMemoryToolRuntime } from "../../App/memmy-agent/src/memmy-memory/types.js";
-import { readExecutorState } from "./local-agent-memory-smoke.js";
+import { readExecutorState, runLocalAgentMemorySmoke } from "./local-agent-memory-smoke.js";
 
 describe("local agent memory smoke plan", () => {
+  it.each([
+    { source: "codex", messageCount: 3 },
+    { source: "cursor", messageCount: 2 },
+    { source: "claude_code", messageCount: 2 }
+  ])("imports, deduplicates, redacts, and recalls a native $source turn", async ({ source, messageCount }) => {
+    const result = await runLocalAgentMemorySmoke([source]);
+    expect(result.sources).toEqual([source]);
+    expect(result.scannedMessages).toBe(messageCount);
+    expect(result.memoryIds).toEqual([result.memoryId]);
+    expect(result.recallHitCount).toBe(1);
+    expect(result.panelItemCount).toBe(1);
+  });
+
   it("keeps the executable local-Agent and Cursor smoke entrypoints wired", () => {
     const repoRoot = resolve(import.meta.dirname, "../..");
     const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {

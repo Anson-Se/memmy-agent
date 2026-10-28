@@ -82,7 +82,7 @@ describe("User Memory recall gate", () => {
     const { db, service } = createTestService();
     const namespace = { source: "codex", profileId: "default", userId };
     const writer = service.openSession({ namespace });
-    const completed = service.completeTurn("code-feedback", {
+    const completed = await service.completeTurn("code-feedback", {
       sessionId: writer.sessionId,
       query: "你刚才写了很多兜底代码，我更喜欢简洁的代码，以后不要写不必要的兜底代码",
       answer: "已精简实现并通过测试。"
