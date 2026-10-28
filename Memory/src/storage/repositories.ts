@@ -778,6 +778,56 @@ export class MemoryRepository {
     return rows.map((row) => this.hydrate(memoryFromSql(row)));
   }
 
+  /**
+   * Normalized names of the skills an Agent already has installed: its own
+   * imported skills that are current, archived by the user (while the source
+   * file is still there), user-invoked only or disconnected, plus its plugin
+   * registrations.
+   */
+  listInstalledSkillNamesForAgent(sourceAgentId: string): Set<string> {
+    const normalized = sourceAgentId.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const rows = this.db.prepare(
+      `SELECT DISTINCT json_extract(properties_json, '$.internal_info.normalized_name') AS name
+       FROM memories
+       WHERE memory_layer = 'Skill'
+         AND deleted_at IS NULL
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND replace(replace(lower(trim(COALESCE(json_extract(properties_json, '$.internal_info.source_agent_id'), ''))), '-', '_'), ' ', '_') = ?
+         AND json_extract(properties_json, '$.internal_info.normalized_name') IS NOT NULL
+         AND (status IN ('activated', 'resolving')
+           OR json_extract(properties_json, '$.internal_info.archive_reason')
+             IN ('invocation_policy', 'disconnected', 'registration')
+           OR (json_extract(properties_json, '$.internal_info.archive_reason') = 'user'
+             AND COALESCE(json_extract(properties_json, '$.internal_info.source_state'), '') != 'source_missing'))`
+    ).all(normalized) as Array<{ name: string }>;
+    return new Set(rows.map((row) => row.name));
+  }
+
+  /**
+   * For each normalized name, the current imported skill (outside the given
+   * Agent) whose source file was modified most recently.
+   */
+  latestImportedSkillsByName(names: readonly string[], excludedSourceAgentId?: string): Map<string, string> {
+    const result = new Map<string, string>();
+    if (names.length === 0) return result;
+    const excluded = excludedSourceAgentId?.trim().toLowerCase().replace(/[\s-]+/g, "_") ?? "";
+    const rows = this.db.prepare(
+      `SELECT id, json_extract(properties_json, '$.internal_info.normalized_name') AS name
+       FROM memories
+       WHERE memory_layer = 'Skill'
+         AND deleted_at IS NULL
+         AND status IN ('activated', 'resolving')
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND json_extract(properties_json, '$.internal_info.normalized_name') IN (${names.map(() => "?").join(", ")})
+         AND replace(replace(lower(trim(COALESCE(json_extract(properties_json, '$.internal_info.source_agent_id'), ''))), '-', '_'), ' ', '_') != ?
+       ORDER BY COALESCE(json_extract(properties_json, '$.internal_info.source_modified_at'), timeline, created_at) DESC, id`
+    ).all(...names, excluded) as Array<{ id: string; name: string }>;
+    for (const row of rows) {
+      if (!result.has(row.name)) result.set(row.name, row.id);
+    }
+    return result;
+  }
+
   /** Imported Skill records not yet carrying the given import state version, deleted ones included. */
   listImportedSkillsBelowStateVersion(version: number, limit: number): MemoryRow[] {
     const rows = this.db.prepare(
@@ -7060,11 +7110,21 @@ function buildMemoryWhere(filter: MemoryFilter): { where: string; params: SqlVal
   addMemoryKindClause(filter.memoryKind);
   addWorkMemoryScopeClause(filter.workMemoryUserId, filter.workMemoryProjectId);
   addTagClauses(filter.tags);
+  addImportedSkillSourceExclusion(filter.excludedImportedSkillSourceAgentId);
 
   return {
     where: clauses.join(" AND "),
     params
   };
+
+  function addImportedSkillSourceExclusion(sourceAgentId: string | undefined): void {
+    const normalized = sourceAgentId?.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (!normalized) return;
+    clauses.push(`NOT (memory_layer = 'Skill'
+      AND json_extract(properties_json, '$.internal_info.read_only') = 1
+      AND replace(replace(lower(trim(COALESCE(json_extract(properties_json, '$.internal_info.source_agent_id'), ''))), '-', '_'), ' ', '_') = ?)`);
+    params.push(normalized);
+  }
 
   function addValueClause(column: string, value: string | undefined): void {
     if (value === undefined) {
