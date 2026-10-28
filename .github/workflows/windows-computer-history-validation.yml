@@ -218,6 +218,8 @@ jobs:
         id: history-contracts
         run: |
           $ErrorActionPreference = 'Stop'
+          node node_modules/vitest/vitest.mjs run tests/windows-memory-workflow.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows workflow and receipt contract regressions failed' }
           $tests = @(
             'App/memmy-agent/tests/tools/computer-history/win/application-icon.test.ts'
             'App/memmy-agent/tests/tools/computer-history/win/win11.test.ts'

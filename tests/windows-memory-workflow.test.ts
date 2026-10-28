@@ -227,6 +227,7 @@ describe("Windows History provider completion contract", () => {
     expect(historyStep("native-go").run).toContain("go vet -unsafeptr=false ./...");
     expect(historyStep("computer-use-go").run).toContain("go test ./...");
     expect(historyStep("computer-use-go").run).toContain("go vet ./...");
+    expect(historyStep("history-contracts").run).toContain("tests/windows-memory-workflow.test.ts");
     for (const id of ["workspace-dependencies", "agent-dependencies", "native-go", "source-build", "app-icons", "native-runtime", "history-contracts", "packaged-assets", "installer-boundary"]) {
       expect(historyStep(id).run, id).toContain("$LASTEXITCODE -ne 0");
     }
