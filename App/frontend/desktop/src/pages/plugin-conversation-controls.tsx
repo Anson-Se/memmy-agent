@@ -104,13 +104,15 @@ export function PinnedPluginCommandBar(props: {
         // of the top-bar page and pending material collection calls.
         const recording = target.command.topbar === true;
         const open = recording ? props.recordingOpen : props.active.has(`${target.plugin.id}:${target.command.capabilityId}`);
+        const legalShortcut = target.plugin.id === "legal-labor"
+          && (target.command.command === "/legal-guide" || target.command.command === "/legal-record");
         return (
           <button
             key={`${target.plugin.id}:${target.command.command}`}
             type="button"
             disabled={props.disabled}
             title={target.command.description}
-            className="pinned-command-chip"
+            className={`pinned-command-chip${legalShortcut ? " pinned-command-chip--legal-shortcut" : ""}`}
             // These buttons stay on screen while their card is open, so without
             // this the card and the button that raised it look unrelated.
             data-open={open ? "true" : undefined}

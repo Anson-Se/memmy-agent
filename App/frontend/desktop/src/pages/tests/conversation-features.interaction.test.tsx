@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n/i18n-provider.js";
 import { PluginUiProvider, usePluginUi } from "../../app/plugin-ui-context.js";
-import { conversationFeaturePanelOverlays, recordingArchiveMaterials, useConversationFeatures } from "../conversation-features.js";
+import { conversationFeaturePanelOverlays, recordingArchiveMaterials, recordingShortcutOpen, useConversationFeatures } from "../conversation-features.js";
 import type { AgentChatMessage } from "../../state/agent-chat-slice.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -89,6 +89,13 @@ describe("conversation feature integration", () => {
     expect(features.sidePanel).toBeNull();
     expect(features.sidePanelWidth).toBeNull();
     expect(features.pluginRecordingSession?.status).toBe("idle");
+  });
+
+  it("does not keep the recording shortcut active for a completed interview", () => {
+    expect(recordingShortcutOpen(false, { status: "recording" }, false)).toBe(true);
+    expect(recordingShortcutOpen(false, { status: "done" }, false)).toBe(false);
+    expect(recordingShortcutOpen(false, { status: "recording" }, true)).toBe(false);
+    expect(recordingShortcutOpen(true, { status: "done" }, false)).toBe(true);
   });
 
   it("overlays a standalone artifact preview when both columns cannot fit", () => {

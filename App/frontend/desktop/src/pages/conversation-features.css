@@ -2914,16 +2914,20 @@
   padding: 6px 11px;
   border: 0;
   border-radius: var(--radius-btn, 8px);
-  background: color-mix(in srgb, var(--color-action-sky) 4%, var(--color-background-paper));
+  background: color-mix(in srgb, var(--color-text-ink) 3%, var(--color-background-paper));
   color: color-mix(in srgb, var(--color-text-ink) 66%, transparent);
   font-size: 12px;
   line-height: 18px;
   cursor: pointer;
   transition: background-color 120ms ease, color 120ms ease;
 }
+.pinned-command-chip--legal-shortcut {
+  min-width: 112px;
+  justify-content: center;
+}
 .pinned-command-chip:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-action-sky) 10%, var(--color-background-paper));
-  color: var(--color-action-sky-hover);
+  background: color-mix(in srgb, var(--color-text-ink) 7%, var(--color-background-paper));
+  color: var(--color-text-ink);
 }
 .pinned-command-chip:focus-visible {
   outline: none;
@@ -2936,6 +2940,9 @@
 .pinned-command-chip[data-open="true"] {
   background: color-mix(in srgb, var(--color-action-sky) 14%, var(--color-background-paper));
   color: var(--color-action-sky-hover);
+}
+.pinned-command-chip[data-open="true"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-action-sky) 20%, var(--color-background-paper));
 }
 .agent-conversation-panel[data-waiting-card="true"] .agent-conversation-scroll {
   padding-bottom: calc(var(--agent-question-overlay-height, var(--agent-composer-overlay-height, 120px)) + 8px);

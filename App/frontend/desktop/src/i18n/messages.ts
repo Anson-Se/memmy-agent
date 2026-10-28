@@ -1244,7 +1244,7 @@ export const zhCNMessages = {
   "agent.activity.thinking": "思考中",
   "agent.activity.workedBriefly": "工作了一会儿",
   "agent.activity.workedFor": "工作了 {duration}",
-  "agent.activity.thoughtBriefly": "思考一下",
+  "agent.activity.thoughtBriefly": "简短思考",
   "agent.activity.thoughtFor": "已思考 {duration}",
   "agent.activity.stepsDone": "执行了 {count} 步",
   "agent.activity.stepsDoneOne": "执行了 1 步",

@@ -664,11 +664,11 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain("agent-activity-segment--narration");
     expect(html).toContain(draft);
     expect(html).not.toContain("agent-narration-block__preview");
-    expect(html).toContain("思考一下");
+    expect(html).toContain("简短思考");
     expect(html).not.toContain("先规划三轮循环。");
     expect(html).not.toContain("agent-chat-bubble--assistant");
     expect(html).not.toContain("agent-message-copy-button--left");
-    expect(html.indexOf("思考一下")).toBeLessThan(html.indexOf("我来帮你规划国庆出行方案"));
+    expect(html.indexOf("简短思考")).toBeLessThan(html.indexOf("我来帮你规划国庆出行方案"));
   });
 
   it("counts every row in the group label — web search plus grep reads 浏览了 2 处", () => {
@@ -1078,7 +1078,7 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain("工作中");
     // The thought was superseded by the tool step, so it folds to its
     // one-line label; the prose re-appears on demand, not by default.
-    expect(html).toContain("思考一下");
+    expect(html).toContain("简短思考");
     expect(html).not.toContain("先判断要不要查资料。");
     expect(html).toContain("准备读取本地说明。");
     expect(html).not.toContain("正在执行 2 个步骤");
@@ -1086,7 +1086,7 @@ describe("AgentThreadMessages", () => {
     expect(html).not.toContain("text-status-success");
   });
 
-  it("labels the live thought after a tool so the older thought heading cannot appear to own it", () => {
+  it("keeps the live thought after a tool while the earlier thought folds", () => {
     const html = renderToString(
       <I18nProvider language="zh-CN">
         <AgentThreadMessages chatScopeKey="chat-thought-tool-thought" isSending messages={[
@@ -1100,14 +1100,13 @@ describe("AgentThreadMessages", () => {
       </I18nProvider>
     );
 
-    const oldThought = html.indexOf("思考一下");
+    const oldThought = html.indexOf("简短思考");
     const tool = html.indexOf("Generate review sections");
-    const liveThought = html.indexOf("agent-activity-segment__live-thought-label");
     const liveBody = html.indexOf("All 4 paragraphs saved; continue.");
     expect(oldThought).toBeGreaterThanOrEqual(0);
     expect(tool).toBeGreaterThan(oldThought);
-    expect(liveThought).toBeGreaterThan(tool);
-    expect(liveBody).toBeGreaterThan(liveThought);
+    expect(liveBody).toBeGreaterThan(tool);
+    expect(html).not.toContain("agent-activity-segment__live-thought-label");
     expect(html).not.toContain("先生成小节。");
   });
 
@@ -1145,7 +1144,7 @@ describe("AgentThreadMessages", () => {
     expect(html).toContain("Keep markdown lists compact.");
     expect(html).toContain("<strong>Decision</strong>");
     expect(html).not.toContain("The user wants a detailed introduction<br");
-    expect(html).not.toContain("思考一下</span>");
+    expect(html).not.toContain("简短思考</span>");
   });
 
   it("renders the complete decoded Windows error in tool details", () => {
@@ -1629,7 +1628,7 @@ describe("AgentThreadMessages", () => {
     // header, separate from the always-visible final answer bubble below it.
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain('data-icon="chevron-right"');
-    expect(html).toContain("思考一下");
+    expect(html).toContain("简短思考");
     expect(html).not.toContain("data-reasoning-key=");
     expect(html).toContain("最终回答");
     // Reasoning body is only rendered when the user expands the collapsed cluster.
@@ -1681,7 +1680,7 @@ describe("AgentThreadMessages", () => {
     // Reasoning finished but answer is still streaming → cluster collapses (reasoning not running).
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain('data-icon="chevron-right"');
-    expect(html).toContain("思考一下");
+    expect(html).toContain("简短思考");
     expect(html).not.toContain("data-reasoning-key=");
     expect(html).toContain("正在回答");
     // Reasoning body is only rendered when the user expands the collapsed cluster.
@@ -1711,7 +1710,7 @@ describe("AgentThreadMessages", () => {
       </I18nProvider>
     );
 
-    expect(html).toContain("思考一下");
+    expect(html).toContain("简短思考");
     expect(html).toContain("data-activity-key=");
     expect(html).toContain("完成。");
     expect(html).not.toContain("data-reasoning-key=");
