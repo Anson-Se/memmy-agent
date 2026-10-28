@@ -4,6 +4,7 @@ import type {
   AddMemoryOutput,
   AgentSkillReconcileInput,
   AgentSkillReconcileOutput,
+  SkillArchiveStateOutput,
   CloseSessionInput,
   CloseSessionOutput,
   DeleteMemoryInput,
@@ -78,6 +79,8 @@ export interface MemoryClient {
   search(input: SearchInput, context?: MemoryRequestContext): Promise<SearchOutput>;
   addMemory(input: AddMemoryInput, context?: MemoryRequestContext): Promise<AddMemoryOutput>;
   reconcileAgentSkills(input: AgentSkillReconcileInput, context?: MemoryRequestContext): Promise<AgentSkillReconcileOutput>;
+  archiveSkill(skillId: string, context?: MemoryRequestContext): Promise<SkillArchiveStateOutput>;
+  reactivateSkill(skillId: string, context?: MemoryRequestContext): Promise<SkillArchiveStateOutput>;
   getMemory(input: { memoryId: string }, context?: MemoryRequestContext): Promise<GetMemoryOutput>;
   deleteMemory(input: DeleteMemoryInput & { memoryId: string }, context?: MemoryRequestContext): Promise<DeleteMemoryOutput>;
   approveObservedSkill(memoryId: string, context?: MemoryRequestContext): Promise<ApproveObservedSkillOutput>;

@@ -198,6 +198,8 @@ describe("agent skill reconcile", () => {
     expect(inFts(db, row!.id)).toBe(false);
     expect(db.db.prepare(`SELECT json_extract(properties_json, '$.internal_info.normalized_name') AS name FROM memories WHERE id = ?`).get(row!.id))
       .toEqual({ name: "brainstorming" });
+    const panel = service.panelItems({ namespace, layer: "Skill" });
+    expect(panel.items.map((item) => item.id)).not.toContain(row!.id);
 
     service.reconcileAgentSkills({ namespace, sourceAgentId: "claude_code", complete: true, skills: [], registrations: [], registrationsComplete: true });
     expect(rows(db, "plugin:superpowers@market/brainstorming")[0]?.reason).toBe("source_missing");
@@ -283,6 +285,89 @@ describe("agent skill reconcile", () => {
     expect(seen.some((text) => text.includes("MANUAL-ONLY"))).toBe(false);
     expect(seen.some((text) => text.includes("STALE TEXT"))).toBe(false);
     expect(db.db.prepare(`SELECT status FROM embedding_retry_queue WHERE id = 'retry-manual'`).get()).toEqual({ status: "succeeded" });
+  });
+
+  it("lets the user undo an archive, back to the state the source implies", () => {
+    const { db, service } = createTestService();
+    const [plain, manual] = service.reconcileAgentSkills({
+      namespace,
+      sourceAgentId: "codex",
+      complete: true,
+      skills: [skill("plain", "Plain body."), skill("manual", "Manual body.")]
+    }).skills;
+    service.archiveMemory(plain!.memoryId!, { namespace });
+    service.archiveMemory(manual!.memoryId!, { namespace });
+    // The source later marks one of them user-invoked only.
+    service.reconcileAgentSkills({
+      namespace,
+      sourceAgentId: "codex",
+      complete: true,
+      skills: [skill("plain", "Plain body."), skill("manual", "Manual body.", { disableModelInvocation: true })]
+    });
+
+    expect(service.reactivateSkill(plain!.memoryId!, { namespace }).status).toBe("activated");
+    expect(service.reactivateSkill(manual!.memoryId!, { namespace }).status).toBe("archived");
+    expect(rows(db, "manual")[0]).toMatchObject({ reason: "invocation_policy", memory_value: "" });
+
+    service.reconcileAgentSkills({
+      namespace,
+      sourceAgentId: "codex",
+      complete: true,
+      skills: [skill("plain", "Plain body."), skill("manual", "Manual body.", { disableModelInvocation: true })]
+    });
+    expect(rows(db, "plain")[0]).toMatchObject({ status: "activated", reason: null });
+  });
+
+  it("does not undo archives made by scans and reactivates generated skills", () => {
+    const { db, service } = createTestService();
+    service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: true, skills: [skill("gone", "Body.")] });
+    service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: true, skills: [] });
+    const gone = rows(db, "gone")[0]!;
+    expect(service.reactivateSkill(gone.id, { namespace }).status).toBe("archived");
+
+    const generated = service.addMemory({ namespace, layer: "Skill", title: "generated", content: "Generated body.", source: "codex" });
+    db.db.prepare(`UPDATE memories SET properties_json = json_set(properties_json, '$.internal_info.read_only', json('false')) WHERE id = ?`).run(generated.id);
+    service.archiveMemory(generated.id, { namespace });
+    expect(service.reactivateSkill(generated.id, { namespace }).status).toBe("activated");
+  });
+
+  it("restores a user archive to what happened at the source meanwhile", () => {
+    const { db, service } = createTestService();
+    const [gone, cut] = service.reconcileAgentSkills({
+      namespace,
+      sourceAgentId: "codex",
+      complete: true,
+      skills: [skill("gone-later", "Gone body."), skill("cut-later", "Cut body.")]
+    }).skills;
+    service.archiveMemory(gone!.memoryId!, { namespace });
+    service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: true, skills: [skill("cut-later", "Cut body.")] });
+
+    expect(service.reactivateSkill(gone!.memoryId!, { namespace }).status).toBe("archived");
+    expect(rows(db, "gone-later")[0]).toMatchObject({ reason: "source_missing" });
+
+    service.archiveMemory(cut!.memoryId!, { namespace });
+    service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: false, disconnected: true, skills: [] });
+
+    expect(service.reactivateSkill(cut!.memoryId!, { namespace }).status).toBe("archived");
+    expect(rows(db, "cut-later")[0]).toMatchObject({ reason: "disconnected", memory_value: "" });
+    expect(inFts(db, cut!.memoryId!)).toBe(false);
+  });
+
+  it("leaves plugin registrations out of the overview counts", () => {
+    const { db, service } = createTestService();
+    service.reconcileAgentSkills({
+      namespace,
+      sourceAgentId: "claude_code",
+      complete: true,
+      skills: [],
+      registrations: [{ sourceSkillId: "plugin:superpowers@market/brainstorming", sourceSkillPath: "/p/brainstorming/SKILL.md", name: "brainstorming" }],
+      registrationsComplete: true
+    });
+    const repos = new Repositories(db.db);
+
+    expect(repos.memories.countByLayer().Skill).toBe(0);
+    expect(repos.memories.countByStatus().archived).toBe(0);
+    expect(repos.memories.listStats()).toHaveLength(0);
   });
 
   it("keeps reconciling the current version after the user deletes an old one", () => {

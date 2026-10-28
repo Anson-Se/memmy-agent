@@ -278,10 +278,65 @@ export class AgentSkillLibrary {
     this.applyState(withFields, desired, at, "agent_skill_state_migrated", desired.reason === "superseded" ? current?.id : undefined);
   }
 
+  /**
+   * Undoes the user's archive of an imported skill. The record goes back to
+   * the state the rest of its source says it should have: superseded when a
+   * newer version is current, identity-only when the source Agent marks it
+   * user-invoked only, otherwise current again. Archives made by scans
+   * (superseded, source missing, ...) are not the user's and are left alone.
+   */
+  restoreUserArchive(memory: MemoryRow, at: string): MemoryRow {
+    if (importedSkillArchiveReason(memory) !== "user") return memory;
+    const identity = memory.properties.internal_info.source_skill_id;
+    const versions = this.deps.repos.memories
+      .listImportedSkillsForSource(String(memory.properties.internal_info.source_agent_id ?? ""))
+      .filter((version) => version.properties.internal_info.source_skill_id === identity);
+    const current = versions.find((version) => version.id !== memory.id && !isDeleted(version)
+      && (version.status === "activated" || importedSkillArchiveReason(version) === "user"));
+    const invocation = memory.properties.internal_info.invocation;
+    const policy = invocation && typeof invocation === "object" && !Array.isArray(invocation) ? invocation as Record<string, unknown> : {};
+    // Scans while the user kept it archived recorded what happened to the source.
+    const sourceState = memory.properties.internal_info.source_state;
+    const desired: DesiredState = sourceState === "disconnected"
+      ? { status: "archived", reason: "disconnected" }
+      : sourceState === "source_missing"
+        ? { status: "archived", reason: "source_missing" }
+        : current
+          ? { status: "archived", reason: "superseded" }
+          : sourceState === "invocation_policy" || policy.disable_model_invocation === true || policy.allow_implicit_invocation === false
+            ? { status: "archived", reason: "invocation_policy" }
+            : { status: "activated" };
+    if (desired.status === "archived") {
+      this.applyState(memory, desired, at, "agent_skill_user_restored", current?.id);
+      return this.deps.repos.memories.get(memory.id) ?? memory;
+    }
+    const internal = { ...memory.properties.internal_info };
+    delete internal.archive_reason;
+    delete internal.superseded_by_skill_id;
+    internal.skill = { ...skillRecord(memory), status: "active" };
+    const saved = this.deps.repos.memories.update({
+      ...memory,
+      status: "activated",
+      properties: { ...memory.properties, status: "activated", internal_info: internal },
+      updatedAt: at
+    });
+    this.appendChange(saved, memory, "updated", "agent_skill_user_restored", at);
+    if (!retrievalDocumentIsCurrent(saved) || !this.deps.repos.memories.hasVector(saved.id, "vec")) {
+      this.enqueueEmbedding(saved, at);
+    }
+    return saved;
+  }
+
   /** Records the user's own archive so later scans keep it. */
   markUserArchived(memory: MemoryRow, at: string): MemoryRow {
+    // Keep what an earlier scan said about the source; otherwise it is present.
+    const previous = importedSkillArchiveReason(memory);
+    const sourceState = previous === "disconnected" || previous === "source_missing" || previous === "invocation_policy"
+      ? previous
+      : previous === "user" ? memory.properties.internal_info.source_state ?? "present" : "present";
     return this.deps.repos.memories.update(withImportFields(memory, {
       archive_reason: "user",
+      source_state: sourceState,
       skill: { ...skillRecord(memory), status: "archived" }
     }, at));
   }

@@ -14,6 +14,8 @@ export const MEMORY_LAYER_PATHS = Object.freeze({
   search: "/api/v1/memory/search",
   addMemory: "/api/v1/memory/add",
   reconcileAgentSkills: "/api/v1/agent-skills/reconcile",
+  archiveSkill: "/api/v1/skills/archive",
+  reactivateSkill: "/api/v1/skills/reactivate",
   getMemory: "/api/v1/memory/:id",
   deleteMemory: "/api/v1/memory/:id",
   approveObservedSkill: "/api/v1/evidence/skills/:id/approve",

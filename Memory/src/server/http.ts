@@ -1070,6 +1070,21 @@ async function routeRequest(
     return publicDeletePanelTaskResponse(service.deletePanelTask(id, request));
   }
 
+  // The desktop App archives and reactivates skills with its service token,
+  // so these two viewer routes are also served here.
+  if (method === "POST" && (path === "/api/v1/skills/archive" || path === "/api/v1/skills/reactivate")) {
+    requireMemoryWrite(principal);
+    const operation = path.endsWith("/archive") ? "skill.archive" : "skill.reactivate";
+    const request = envelopeWithPrincipal(asObject(body, operation), principal) as MemoryGovernanceRequest & { skillId?: unknown };
+    requireStringField(request, "skillId", operation);
+    const { skillId, ...envelope } = request;
+    if (operation === "skill.archive") return service.archiveMemory(skillId as string, envelope);
+    const result = service.reactivateSkill(skillId as string, envelope);
+    // Reactivating can queue an embedding for a version that was never embedded.
+    autoWorker.schedule();
+    return result;
+  }
+
   const memoryDelete = match(path, /^\/api\/v1\/memory\/([^/]+)$/);
   if (method === "DELETE" && memoryDelete) {
     requireMemoryWrite(principal);

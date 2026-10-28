@@ -959,7 +959,8 @@ export class MemoryRepository {
                 ${memoryDisplayedSourceSql("json_extract(info_json, '$.source')")} AS info_source,
                 json_extract(properties_json, '$.internal_info.source') AS internal_source
          FROM memories
-         WHERE deleted_at IS NULL`
+         WHERE deleted_at IS NULL
+           AND ${NOT_PLUGIN_REGISTRATION_SQL}`
       )
       .all() as Array<{
         conversation_id: string | null;
@@ -1372,6 +1373,7 @@ export class MemoryRepository {
          FROM memories
          WHERE deleted_at IS NULL
            AND status != 'deleted'
+           AND ${NOT_PLUGIN_REGISTRATION_SQL}
          GROUP BY memory_layer`
       )
       .all() as Array<{ layer: MemoryLayer; count: number }>;
@@ -1390,6 +1392,7 @@ export class MemoryRepository {
         `SELECT status, COUNT(*) AS count
          FROM memories
          WHERE deleted_at IS NULL
+           AND ${NOT_PLUGIN_REGISTRATION_SQL}
          GROUP BY status`
       )
       .all() as Array<{ status: MemoryStatus; count: number }>;
@@ -7107,8 +7110,15 @@ function layerWeight(layer: MemoryLayer): number {
   }
 }
 
+// Plugin skill registrations only record which skills an Agent already has;
+// they are never listed, counted or searched as memories.
+const NOT_PLUGIN_REGISTRATION_SQL = "NOT (memory_layer = 'Skill' AND COALESCE(json_extract(properties_json, '$.internal_info.source_kind'), '') = 'plugin')";
+
 function buildMemoryWhere(filter: MemoryFilter): { where: string; params: SqlValue[] } {
-  const clauses = ["deleted_at IS NULL"];
+  const clauses = [
+    "deleted_at IS NULL",
+    NOT_PLUGIN_REGISTRATION_SQL
+  ];
   const params: SqlValue[] = [];
 
   addValueClause("user_id", filter.userId);

@@ -212,6 +212,16 @@ export function createMockMemoryClient(options: CreateMockMemoryClientOptions = 
       };
     },
 
+    async archiveSkill(skillId) {
+      failIfNeeded();
+      return { ok: true as const, id: skillId, status: "archived" as const, serverTime: now() };
+    },
+
+    async reactivateSkill(skillId) {
+      failIfNeeded();
+      return { ok: true as const, id: skillId, status: "activated" as const, serverTime: now() };
+    },
+
     async getMemory(input) {
       failIfNeeded();
       const serverTime = now();

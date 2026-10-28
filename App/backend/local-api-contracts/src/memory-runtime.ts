@@ -611,6 +611,15 @@ export const AgentSkillReconcileOutputSchema = z.object({
 });
 export type AgentSkillReconcileOutput = z.infer<typeof AgentSkillReconcileOutputSchema>;
 
+/** Schema for skill archive and reactivate output. */
+export const SkillArchiveStateOutputSchema = z.object({
+  ok: z.literal(true),
+  id: NonEmptyStringSchema,
+  status: MemoryStatusSchema,
+  serverTime: IsoTimeSchema
+});
+export type SkillArchiveStateOutput = z.infer<typeof SkillArchiveStateOutputSchema>;
+
 /** Schema for add memory output. */
 export const AddMemoryOutputSchema = z.object({
   id: NonEmptyStringSchema,

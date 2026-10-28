@@ -2490,6 +2490,65 @@ export class MemoryService {
     };
   }
 
+  /**
+   * Undoes a panel archive of a Skill. Imported skills return to the state
+   * their source implies (see AgentSkillLibrary.restoreUserArchive); other
+   * skills become active again.
+   */
+  reactivateSkill(id: string, request: MemoryGovernanceRequest = {}): {
+    ok: true;
+    id: string;
+    status: MemoryRow["status"];
+    serverTime: string;
+  } {
+    this.assertMemoryAddEnabled();
+    const memory = this.requireExistingMemory(id);
+    this.assertMemoryInScope(memory, request.namespace);
+    if (memory.memoryLayer !== "Skill") throw new MemoryServiceError("invalid_argument", `not a skill: ${id}`);
+    if (memory.status !== "archived") return { ok: true, id: memory.id, status: memory.status, serverTime: nowIso() };
+    const at = nowIso();
+    let restored: MemoryRow;
+    if (isImportedSkill(memory)) {
+      restored = this.agentSkills.restoreUserArchive(memory, at);
+    } else {
+      const internal = { ...memory.properties.internal_info };
+      if (isRecord(internal.skill)) internal.skill = { ...internal.skill, status: "active" };
+      restored = this.repos.memories.update({
+        ...memory,
+        status: "activated",
+        properties: { ...memory.properties, status: "activated", internal_info: internal },
+        updatedAt: at
+      });
+      this.repos.runtime.appendChange({
+        memoryId: restored.id,
+        namespaceId: namespaceIdFromMemory(restored),
+        kind: kindFromMemory(restored),
+        op: "updated",
+        entityId: restored.id,
+        userId: restored.userId,
+        changeType: "reactivate",
+        version: restored.version,
+        before: memory,
+        after: restored,
+        source: "panel.reactivate",
+        createdAt: at
+      });
+    }
+    this.repos.runtime.insertAudit({
+      userId: restored.userId,
+      sessionId: restored.sessionId,
+      actor: request.namespace ? { ...request.namespace } : {},
+      action: "reactivate",
+      targetKind: kindFromMemory(restored),
+      targetId: restored.id,
+      before: memory,
+      after: restored,
+      meta: { reason: request.reason },
+      createdAt: at
+    });
+    return { ok: true, id: restored.id, status: restored.status, serverTime: nowIso() };
+  }
+
   deleteMemory(id: string, request: MemoryGovernanceRequest = {}): {
     ok: true;
     id: string;
