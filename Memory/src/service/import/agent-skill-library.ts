@@ -1,5 +1,7 @@
 import type { EvolutionJobRecord, Repositories } from "../../storage/repositories.js";
+import { retrievalDocumentIsCurrent } from "../../algorithm/plugin-algorithms.js";
 import {
+  IMPORTED_SKILL_RETRIEVAL_VERSION,
   IMPORTED_SKILL_STATE_VERSION,
   importedSkillArchiveReason,
   isIdentityOnlyReason,
@@ -26,6 +28,8 @@ export interface AgentSkillReconcileSkill {
   description?: string;
   disableModelInvocation?: boolean;
   allowImplicitInvocation?: boolean;
+  /** The skill directory holds files besides SKILL.md. */
+  hasSupportingFiles?: boolean;
 }
 
 /** A skill shipped in an enabled plugin of the source Agent; only its identity is kept. */
@@ -197,6 +201,51 @@ export class AgentSkillLibrary {
     return { migrated, scrubbedDeleted };
   }
 
+  /**
+   * Switches existing imported skills to the description-based summary and
+   * retrieval text. The previous values are kept in `retrieval_previous` so
+   * restoreRetrievalRepresentation can put them back. Startup's retrieval
+   * index repair re-embeds the records whose retrieval text changed.
+   */
+  upgradeRetrievalRepresentation(limit: number): number {
+    let upgraded = 0;
+    this.deps.repos.transaction(() => {
+      for (const memory of this.deps.repos.memories.listImportedSkillsByRetrievalVersion(IMPORTED_SKILL_RETRIEVAL_VERSION, "below", limit)) {
+        const description = typeof memory.properties.internal_info.skill_description === "string"
+          ? memory.properties.internal_info.skill_description.trim()
+          : "";
+        const hasBody = memory.memoryValue.trim().length > 0;
+        const next = withRetrievalText(memory, hasBody && description ? description : undefined,
+          hasBody ? description || summaryOf(memory) : "");
+        this.deps.repos.memories.updateMaintenance(withImportFields(next, retrievalFields(memory, existingRetrievalBlurb(memory)), memory.updatedAt));
+        upgraded += 1;
+      }
+    });
+    return upgraded;
+  }
+
+  /** Puts back the summary and retrieval text imported skills had before the upgrade. */
+  restoreRetrievalRepresentation(limit: number): number {
+    let restored = 0;
+    this.deps.repos.transaction(() => {
+      for (const memory of this.deps.repos.memories.listImportedSkillsByRetrievalVersion(IMPORTED_SKILL_RETRIEVAL_VERSION, "at", limit)) {
+        const previous = memory.properties.internal_info.retrieval_previous;
+        const before = previous && typeof previous === "object" && !Array.isArray(previous) ? previous as Record<string, unknown> : {};
+        const next = withRetrievalText(
+          memory,
+          typeof before.blurb === "string" ? before.blurb : undefined,
+          typeof before.summary === "string" ? before.summary : firstLine(memory.memoryValue)
+        );
+        const internal = { ...next.properties.internal_info };
+        delete internal.retrieval_representation_version;
+        delete internal.retrieval_previous;
+        this.deps.repos.memories.updateMaintenance({ ...next, properties: { ...next.properties, internal_info: internal } });
+        restored += 1;
+      }
+    });
+    return restored;
+  }
+
   private migrateLiveRecord(memory: MemoryRow, current: MemoryRow | undefined, at: string): void {
     const internal = memory.properties.internal_info;
     const frontmatter = parseSkillFrontmatter(memory.memoryValue);
@@ -312,6 +361,7 @@ export class AgentSkillLibrary {
   ): MemoryRow {
     const identityOnly = isIdentityOnlyReason(desired.reason);
     const content = identityOnly ? "" : skill.content;
+    const summary = identityOnly ? "" : skillSummary(skill);
     const memory = this.deps.buildMemory({
       userId,
       agentId: sourceAgentId,
@@ -324,7 +374,7 @@ export class AgentSkillLibrary {
       tags: ["agent-source", "cross-agent-skill", sourceAgentId],
       info: {
         title: skill.title,
-        summary: firstLine(content),
+        summary,
         source: sourceAgentId,
         turn_id: `skill:${skill.sourceSkillId}:${skill.contentHash}`,
         ...importedSkillInfoFields(skill.title)
@@ -332,7 +382,7 @@ export class AgentSkillLibrary {
       internal: {
         source: sourceAgentId,
         title: skill.title,
-        summary: firstLine(content),
+        summary,
         turn_id: `skill:${skill.sourceSkillId}:${skill.contentHash}`,
         ...importedSkillInternalFields({
           sourceAgentId,
@@ -343,10 +393,12 @@ export class AgentSkillLibrary {
           importedAt: at,
           title: skill.title,
           content,
-          skillStatus: desired.status === "activated" ? "active" : "archived"
+          skillStatus: desired.status === "activated" ? "active" : "archived",
+          ...(identityOnly ? {} : { retrievalBlurb: skill.description })
         }),
         ...scanFields(skill),
-        ...stateFields(desired)
+        ...stateFields(desired),
+        ...retrievalFields(undefined, undefined)
       },
       createdAt: skill.modifiedAt
     });
@@ -359,6 +411,7 @@ export class AgentSkillLibrary {
   private rewriteVersion(existing: MemoryRow, skill: AgentSkillReconcileSkill, desired: DesiredState, at: string): MemoryRow {
     const identityOnly = isIdentityOnlyReason(desired.reason);
     const content = identityOnly ? "" : skill.content;
+    const summary = identityOnly ? "" : skillSummary(skill);
     const fields = importedSkillInternalFields({
       sourceAgentId: String(existing.properties.internal_info.source_agent_id),
       sourceSkillId: skill.sourceSkillId,
@@ -370,19 +423,21 @@ export class AgentSkillLibrary {
         : at,
       title: skill.title,
       content,
-      skillStatus: desired.status === "activated" ? "active" : "archived"
+      skillStatus: desired.status === "activated" ? "active" : "archived",
+      ...(identityOnly ? {} : { retrievalBlurb: skill.description })
     });
     const internal: MemoryRow["properties"]["internal_info"] = {
       ...existing.properties.internal_info,
       ...fields,
       title: skill.title,
-      summary: firstLine(content),
+      summary,
       ...scanFields(skill),
-      ...stateFields(desired)
+      ...stateFields(desired),
+      ...retrievalFields(existing, existingRetrievalBlurb(existing))
     };
     delete internal.superseded_by_skill_id;
     if (!desired.reason) delete internal.archive_reason;
-    const info = { ...existing.info, title: skill.title, summary: firstLine(content), ...importedSkillInfoFields(skill.title) };
+    const info = { ...existing.info, title: skill.title, summary, ...importedSkillInfoFields(skill.title) };
     const next: MemoryRow = {
       ...existing,
       status: desired.status,
@@ -403,7 +458,7 @@ export class AgentSkillLibrary {
     this.appendChange(saved, existing, "updated", "update", at);
     const bodyChanged = existing.memoryValue !== content;
     if (desired.status === "activated" && (bodyChanged || existing.status !== "activated"
-      || !this.deps.repos.memories.hasVector(saved.id, "vec"))) {
+      || !retrievalDocumentIsCurrent(saved) || !this.deps.repos.memories.hasVector(saved.id, "vec"))) {
       this.enqueueEmbedding(saved, at);
     }
     return saved;
@@ -552,6 +607,7 @@ function desiredState(skill: AgentSkillReconcileSkill, versions: readonly Memory
 function isUnchanged(existing: MemoryRow, skill: AgentSkillReconcileSkill, desired: DesiredState): boolean {
   const internal = existing.properties.internal_info;
   if (internal.import_state_version !== IMPORTED_SKILL_STATE_VERSION) return false;
+  if (internal.retrieval_representation_version !== IMPORTED_SKILL_RETRIEVAL_VERSION) return false;
   if (internal.source_content_hash !== skill.contentHash) return false;
   if (existing.status !== desired.status || importedSkillArchiveReason(existing) !== desired.reason) return false;
   if (desired.sourceState && internal.source_state !== desired.sourceState) return false;
@@ -567,6 +623,7 @@ function scanFields(skill: AgentSkillReconcileSkill): Record<string, unknown> {
     normalized_name: normalizeSkillName(skill.title),
     source_modified_at: skill.modifiedAt,
     ...(skill.description ? { skill_description: skill.description } : {}),
+    has_supporting_files: skill.hasSupportingFiles === true,
     invocation: {
       disable_model_invocation: skill.disableModelInvocation === true,
       ...(skill.allowImplicitInvocation === undefined ? {} : { allow_implicit_invocation: skill.allowImplicitInvocation })
@@ -602,6 +659,7 @@ function stripBody(memory: MemoryRow, at: string): MemoryRow {
   internal.skill = { ...skill, invocation_guide: "", procedure_json: { summary: "" } };
   delete internal.skill_description;
   delete internal.retrieval_index;
+  delete internal.retrieval_previous;
   return {
     ...memory,
     memoryValue: "",
@@ -650,4 +708,62 @@ function compareImportRecency(left: MemoryRow, right: MemoryRow): number {
     return typeof imported === "string" ? imported : memory.updatedAt;
   };
   return time(right).localeCompare(time(left)) || right.updatedAt.localeCompare(left.updatedAt);
+}
+
+/** The summary shown for an imported skill: its frontmatter description, else the first line. */
+function skillSummary(skill: AgentSkillReconcileSkill): string {
+  return skill.description?.trim() || firstLine(skill.content);
+}
+
+function existingRetrievalBlurb(memory: MemoryRow): string | null {
+  const procedure = skillRecord(memory).procedure_json;
+  const blurb = procedure && typeof procedure === "object" && !Array.isArray(procedure)
+    ? (procedure as Record<string, unknown>).retrievalBlurb
+    : undefined;
+  return typeof blurb === "string" ? blurb : null;
+}
+
+/**
+ * Marks the record as using the description-based summary and retrieval text,
+ * and remembers what it had before the first such write so it can be restored.
+ */
+function retrievalFields(existing: MemoryRow | undefined, previousBlurb: string | null | undefined): Record<string, unknown> {
+  const internal = existing?.properties.internal_info;
+  const alreadyUpgraded = internal?.retrieval_representation_version === IMPORTED_SKILL_RETRIEVAL_VERSION;
+  return {
+    retrieval_representation_version: IMPORTED_SKILL_RETRIEVAL_VERSION,
+    ...(alreadyUpgraded || !existing ? {} : {
+      retrieval_previous: {
+        blurb: previousBlurb ?? null,
+        summary: typeof internal?.summary === "string" ? internal.summary : null
+      }
+    })
+  };
+}
+
+function summaryOf(memory: MemoryRow): string {
+  return typeof memory.properties.internal_info.summary === "string" ? memory.properties.internal_info.summary : firstLine(memory.memoryValue);
+}
+
+/** Sets (or removes, when undefined) the retrieval blurb and sets the summary everywhere they are stored. */
+function withRetrievalText(memory: MemoryRow, blurb: string | undefined, summary: string): MemoryRow {
+  const internal = { ...memory.properties.internal_info };
+  const withBlurb = (procedure: unknown): Record<string, unknown> => {
+    const next = { ...(procedure && typeof procedure === "object" && !Array.isArray(procedure) ? procedure as Record<string, unknown> : {}) };
+    if (blurb) next.retrievalBlurb = blurb;
+    else delete next.retrievalBlurb;
+    return next;
+  };
+  internal.procedure_json = withBlurb(internal.procedure_json);
+  internal.skill = { ...skillRecord(memory), procedure_json: withBlurb(skillRecord(memory).procedure_json) };
+  internal.summary = summary;
+  return {
+    ...memory,
+    info: { ...memory.info, summary },
+    properties: {
+      ...memory.properties,
+      ...(memory.properties.info ? { info: { ...memory.properties.info, summary } } : {}),
+      internal_info: internal
+    }
+  };
 }

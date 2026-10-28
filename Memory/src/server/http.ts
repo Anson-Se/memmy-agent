@@ -1544,7 +1544,8 @@ function agentSkillReconcileRequest(request: RequestEnvelope & Record<string, un
       version: text(item.version),
       description: text(item.description),
       disableModelInvocation: flag(item.disableModelInvocation),
-      allowImplicitInvocation: flag(item.allowImplicitInvocation)
+      allowImplicitInvocation: flag(item.allowImplicitInvocation),
+      hasSupportingFiles: flag(item.hasSupportingFiles)
     })),
     ...(request.registrations === undefined ? {} : {
       registrations: records(request.registrations, "registrations").map((item) => ({

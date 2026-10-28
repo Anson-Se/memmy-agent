@@ -828,6 +828,20 @@ export class MemoryRepository {
     return result;
   }
 
+  /** Live imported Skill records whose retrieval representation version differs from the given one. */
+  listImportedSkillsByRetrievalVersion(version: number, mode: "below" | "at", limit: number): MemoryRow[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM memories
+       WHERE memory_layer = 'Skill'
+         AND deleted_at IS NULL
+         AND json_extract(properties_json, '$.internal_info.read_only') = 1
+         AND COALESCE(json_extract(properties_json, '$.internal_info.retrieval_representation_version'), 0) ${mode === "below" ? "<" : "="} ?
+       ORDER BY created_at, id
+       LIMIT ?`
+    ).all(version, limit) as MemorySqlRow[];
+    return rows.map((row) => this.hydrate(memoryFromSql(row)));
+  }
+
   /** Imported Skill records not yet carrying the given import state version, deleted ones included. */
   listImportedSkillsBelowStateVersion(version: number, limit: number): MemoryRow[] {
     const rows = this.db.prepare(

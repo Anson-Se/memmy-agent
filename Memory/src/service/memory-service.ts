@@ -1521,6 +1521,16 @@ export class MemoryService {
     return this.agentSkills.reconcile(request);
   }
 
+  /**
+   * Puts back the summary and retrieval text imported skills had before they
+   * switched to their frontmatter description. Run this before rolling the
+   * code back; the next startup re-embeds the affected records.
+   */
+  restoreImportedSkillRetrievalText(limit = 10000): { restored: number } {
+    this.assertMemoryAddEnabled();
+    return { restored: this.agentSkills.restoreRetrievalRepresentation(limit) };
+  }
+
   addMemory(request: MemoryAddRequest): {
     id: string;
     kind: MemoryKind;
@@ -3162,6 +3172,8 @@ export class MemoryService {
       try {
         const migration = this.agentSkills.migrateLegacyRecords(nowIso(), limit);
         if (migration.migrated > 0) serviceLogger.info("agent_skill.legacy_migrated", migration);
+        const upgraded = this.agentSkills.upgradeRetrievalRepresentation(limit);
+        if (upgraded > 0) serviceLogger.info("agent_skill.retrieval_text_upgraded", { upgraded });
       } catch (error) {
         serviceLogger.error("agent_skill.legacy_migration_failed", memoryErrorFields(error));
       }

@@ -1404,7 +1404,8 @@ async function ingestSourceSkills(
         version: skill.sourceSkillVersion,
         ...(skill.description ? { description: skill.description } : {}),
         ...(skill.disableModelInvocation === undefined ? {} : { disableModelInvocation: skill.disableModelInvocation }),
-        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation })
+        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation }),
+        ...(skill.hasSupportingFiles === undefined ? {} : { hasSupportingFiles: skill.hasSupportingFiles })
       })),
       ...(scan.registrations ? {
         registrations: scan.registrations,

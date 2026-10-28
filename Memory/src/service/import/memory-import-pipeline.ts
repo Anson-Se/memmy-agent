@@ -299,7 +299,10 @@ export function importedSkillInternalFields(input: {
   title: string;
   content: string;
   skillStatus?: "active" | "archived";
+  /** Short text recall indexes instead of the whole SKILL.md. */
+  retrievalBlurb?: string;
 }): Record<string, unknown> {
+  const procedure = { summary: input.content, ...(input.retrievalBlurb ? { retrievalBlurb: input.retrievalBlurb } : {}) };
   return {
     read_only: true,
     source_agent_id: input.sourceAgentId,
@@ -310,7 +313,7 @@ export function importedSkillInternalFields(input: {
     imported_at: input.importedAt,
     name: input.title,
     invocation_guide: input.content,
-    procedure_json: { summary: input.content },
+    procedure_json: procedure,
     eta: 0.5,
     support: 1,
     gain: 0,
@@ -327,7 +330,7 @@ export function importedSkillInternalFields(input: {
       source_world_model_ids: [],
       evidence_anchor_ids: [],
       invocation_guide: input.content,
-      procedure_json: { summary: input.content },
+      procedure_json: procedure,
       trials_attempted: 0,
       trials_passed: 0,
       success_rate: 0,

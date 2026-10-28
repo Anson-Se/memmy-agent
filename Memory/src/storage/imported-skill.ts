@@ -1,3 +1,4 @@
+import { dirname } from "node:path";
 import type { MemoryRow } from "../types.js";
 
 /**
@@ -8,6 +9,12 @@ import type { MemoryRow } from "../types.js";
 
 /** Records written by the source reconcile carry this version in `import_state_version`. */
 export const IMPORTED_SKILL_STATE_VERSION = 1;
+
+/**
+ * Records whose summary and retrieval text come from the frontmatter
+ * description carry this version in `retrieval_representation_version`.
+ */
+export const IMPORTED_SKILL_RETRIEVAL_VERSION = 1;
 
 /**
  * Why an imported skill is archived. The user's own decisions ("user") survive
@@ -74,4 +81,20 @@ export function importedSkillMayEmbed(memory: MemoryRow): boolean {
 /** Name used to group skills that share a name across Agents. */
 export function normalizeSkillName(name: string): string {
   return name.trim().toLowerCase().replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/** The frontmatter description of an imported skill, when the skill has one. */
+export function importedSkillDescription(memory: MemoryRow): string | undefined {
+  const description = memory.properties.internal_info.skill_description;
+  return typeof description === "string" && description.trim() ? description.trim() : undefined;
+}
+
+/**
+ * The source skill directory, shown only when it holds files besides SKILL.md
+ * that an Agent on the same machine may want to open.
+ */
+export function importedSkillSourceDir(memory: MemoryRow): string | undefined {
+  const internal = memory.properties.internal_info;
+  if (internal.has_supporting_files !== true || typeof internal.source_skill_path !== "string") return undefined;
+  return dirname(internal.source_skill_path);
 }

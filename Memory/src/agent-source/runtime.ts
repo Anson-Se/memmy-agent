@@ -1282,7 +1282,8 @@ async function ingestAgentSkills(
         ...(skill.version ? { version: skill.version } : {}),
         ...(skill.description ? { description: skill.description } : {}),
         disableModelInvocation: skill.disableModelInvocation,
-        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation })
+        ...(skill.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: skill.allowImplicitInvocation }),
+        hasSupportingFiles: skill.hasSupportingFiles
       });
     }
   }

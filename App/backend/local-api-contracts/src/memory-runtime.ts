@@ -573,7 +573,8 @@ export const AgentSkillReconcileSkillSchema = z.object({
   version: z.string().optional(),
   description: z.string().optional(),
   disableModelInvocation: z.boolean().optional(),
-  allowImplicitInvocation: z.boolean().optional()
+  allowImplicitInvocation: z.boolean().optional(),
+  hasSupportingFiles: z.boolean().optional()
 });
 
 /** A skill shipped in an enabled plugin of the source Agent; only its identity is sent. */
