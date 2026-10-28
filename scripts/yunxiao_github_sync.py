@@ -170,7 +170,20 @@ def description_source_url(description: Any) -> str | None:
         r"GitHub:\s+(https://github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/[1-9][0-9]*/?)",
         first_line,
     )
-    return match.group(1).rstrip("/").casefold() if match else None
+    if match:
+        return match.group(1).rstrip("/").casefold()
+    # Early manually imported cards used a source section before the URL.
+    legacy = re.match(
+        r"\A来源[：:]\s*GitHub\s+(Issue|PR)\s+#([1-9][0-9]*)\s+"
+        r"(https://github\.com/[^/\s]+/[^/\s]+/(issues|pull)/([1-9][0-9]*)/?)(?=\s|$)",
+        "".join(parser.parts).replace("\ufeff", " ").lstrip(),
+    )
+    if not legacy:
+        return None
+    label, number, url, path, url_number = legacy.groups()
+    if number != url_number or {"Issue": "issues", "PR": "pull"}[label] != path:
+        return None
+    return url.rstrip("/").casefold()
 
 
 def iso_after_days(value: str, days: int) -> str:
