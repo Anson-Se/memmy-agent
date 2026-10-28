@@ -17,6 +17,7 @@ export type LlmProviderName =
   | ""
   | "local_only"
   | "openai_compatible"
+  | "openai_responses"
   | "gemini"
   | "anthropic"
   | "bedrock"
@@ -92,6 +93,7 @@ export interface EmbeddingConfig {
   actualModelContext?: ActualModelContext;
   selectionError?: "model_selection_unavailable";
   maxInputTokens?: number;
+  maxInputBytes?: number;
   batchSize: number;
   timeoutMs: number;
   maxRetries: number;
@@ -237,6 +239,13 @@ export interface AlgorithmConfig {
   session: {
     followUpMode: "merge_follow_ups" | "episode_per_turn";
     mergeMaxGapMs: number;
+    // Test-period switch for the per-turn judgment (turn.judge.v1): one model call
+    // after each turn judges the task relation, feedback, L1 and User Memory. Off
+    // keeps the start-of-turn relation call and the capture-only decision.
+    turnJudge: boolean;
+    // Keep the full stored input of a judged turn (for checking what the model
+    // saw). Off: after a successful judgment only the small fields stay.
+    turnJudgeKeepInput: boolean;
   };
   retrieval: {
     tier1TopK: number;
@@ -495,7 +504,9 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
     },
     session: {
       followUpMode: "merge_follow_ups",
-      mergeMaxGapMs: 2 * 60 * 60 * 1000
+      mergeMaxGapMs: 2 * 60 * 60 * 1000,
+      turnJudge: true,
+      turnJudgeKeepInput: false
     },
     retrieval: {
       tier1TopK: 3,
@@ -626,6 +637,7 @@ function configFromEnv(): Record<string, unknown> {
       model: process.env.MEMMY_EMBEDDING_MODEL,
       apiKey: process.env.MEMMY_EMBEDDING_API_KEY,
       maxInputTokens: numberEnv("MEMMY_EMBEDDING_MAX_INPUT_TOKENS"),
+      maxInputBytes: numberEnv("MEMMY_EMBEDDING_MAX_INPUT_BYTES"),
       batchSize: numberEnv("MEMMY_EMBEDDING_BATCH_SIZE"),
       timeoutMs: numberEnv("MEMMY_EMBEDDING_TIMEOUT_MS"),
       maxRetries: numberEnv("MEMMY_EMBEDDING_MAX_RETRIES")
@@ -811,6 +823,7 @@ function normalizeEmbedding(input: Record<string, unknown>): EmbeddingConfig {
       ? input.selectionError
       : undefined,
     maxInputTokens: positiveInteger(input.maxInputTokens),
+    maxInputBytes: positiveInteger(input.maxInputBytes),
     batchSize: numberValue(input.batchSize, DEFAULT_MEMMY_CONFIG.embedding.batchSize),
     timeoutMs: numberValue(input.timeoutMs, DEFAULT_MEMMY_CONFIG.embedding.timeoutMs),
     maxRetries: numberValue(input.maxRetries, DEFAULT_MEMMY_CONFIG.embedding.maxRetries),
@@ -855,7 +868,7 @@ function resolveAssignedLlm(
   if (!resolved.ok || !llmProtocolSupported(resolved.context.protocol)) {
     return unavailableLlm(defaults);
   }
-  const runtimeProvider = memoryLlmProvider(resolved.context.provider);
+  const runtimeProvider = memoryRuntimeProvider(resolved.context.provider, resolved.context.protocol);
   return {
     ...defaults,
     provider: runtimeProvider,
@@ -899,6 +912,17 @@ function unavailableLlm(defaults: LlmConfig): Record<string, unknown> {
     model: "",
     selectionError: "model_selection_unavailable"
   };
+}
+
+function memoryRuntimeProvider(
+  provider: string,
+  protocol: ActualModelContext["protocol"]
+): LlmProviderName {
+  if (protocol === "bedrock-converse") return "bedrock";
+  if (protocol === "openai-responses") return "openai_responses";
+  if (protocol === "anthropic-messages") return "anthropic";
+  if (protocol === "gemini-generate-content") return "gemini";
+  return memoryLlmProvider(provider);
 }
 
 function memoryLlmProvider(provider: string): LlmProviderName {
@@ -1112,8 +1136,10 @@ function runtimeAssignmentMode(rootConfig: Record<string, unknown>): "account" |
 
 function llmProtocolSupported(protocol: ActualModelContext["protocol"]): boolean {
   return protocol === "openai-chat-completions"
+    || protocol === "openai-responses"
     || protocol === "anthropic-messages"
     || protocol === "gemini-generate-content"
+    || protocol === "bedrock-converse"
     || protocol === "memmy-account";
 }
 
@@ -1285,7 +1311,9 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
     },
     session: {
       followUpMode: "merge_follow_ups",
-      mergeMaxGapMs: numberValue(session.mergeMaxGapMs, DEFAULT_MEMMY_CONFIG.algorithm.session.mergeMaxGapMs)
+      mergeMaxGapMs: numberValue(session.mergeMaxGapMs, DEFAULT_MEMMY_CONFIG.algorithm.session.mergeMaxGapMs),
+      turnJudge: booleanValue(session.turnJudge, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudge),
+      turnJudgeKeepInput: booleanValue(session.turnJudgeKeepInput, DEFAULT_MEMMY_CONFIG.algorithm.session.turnJudgeKeepInput)
     },
     retrieval: {
       tier1TopK: numberValue(retrieval.tier1TopK, DEFAULT_MEMMY_CONFIG.algorithm.retrieval.tier1TopK),
@@ -1372,6 +1400,7 @@ function llmProvider(value: unknown, fallback: LlmProviderName): LlmProviderName
     provider === "" ||
     provider === "local_only" ||
     provider === "openai_compatible" ||
+    provider === "openai_responses" ||
     provider === "gemini" ||
     provider === "anthropic" ||
     provider === "bedrock" ||

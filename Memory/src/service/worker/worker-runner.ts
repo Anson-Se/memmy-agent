@@ -1,3 +1,4 @@
+import { ModelHttpError } from "../../model/http.js";
 /**
  * Worker scheduling and execution domain.
  *
@@ -28,8 +29,10 @@ import {
   type PreparedEmbeddingJob
 } from "../embedding/embedding-job-processor.js";
 import type { PolicyEvidencePreflightReport } from "../evolution/evolution-job-processor.js";
+import { turnJudgeJobFlags } from "../evolution/turn-judge.js";
 import {
   embeddingTextForMemory,
+  traceActionEmbeddingText,
   embeddingRetryBackoffMs,
   embeddingRetryToRunItem
 } from "../embedding/embedding-pipeline.js";
@@ -49,7 +52,7 @@ import { externalSkillGeneration, externalSkillJobPayload } from "../evidence/hi
 
 export const SUMMARY_WORKER_CONCURRENCY = 4;
 export const EMBEDDING_RETRY_LEASE_MS = 5 * 60_000;
-const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["trace_summary", "import_summary", "observation_extract", "episode_title"];
+const SUMMARY_JOBS_REQUIRING_MODEL: readonly string[] = ["episode_assignment", "trace_summary", "import_summary", "observation_extract", "episode_title"];
 
 const workerLogger = createMemoryLogger("worker");
 
@@ -114,6 +117,8 @@ type EmbeddingRetryResult = {
  */
 export interface WorkerRunnerDeps {
   repos: Pick<Repositories, "transaction" | "memories" | "processing" | "runtime">;
+  // Mark exhausted judgment attempts; the durable assignment waits for an explicit retry.
+  onTurnJudgeDeadLetter?: (job: EvolutionJobRecord) => void;
   embedder: Embedder;
   capture: { embedAfterCapture: boolean };
   embeddingRetryWorkerId: string;
@@ -206,7 +211,7 @@ export class WorkerRunner {
     const at = this.deps.nowIso();
     this.deps.enqueueObservationBackfill?.(Math.min(limit, 100), at);
     const interruptedJobs = this.deps.repos.runtime.requeueLeasedJobsAfterRestart(at);
-    const failedJobs = this.deps.repos.runtime.requeueFailedJobs(limit, at);
+    const failedJobs = [...this.deps.repos.runtime.requeueFailedEpisodeAssignments(at), ...this.deps.repos.runtime.requeueFailedJobs(limit, at)];
     for (const { before, after } of [...interruptedJobs, ...failedJobs]) {
       this.deps.appendJobChange(after, "queued", before);
     }
@@ -259,7 +264,10 @@ export class WorkerRunner {
             targetMemoryId: memory.id,
             payload: {
               source: "startup.processing_repair",
-              ...observationJobPayload(memory)
+              ...observationJobPayload(memory),
+              ...(jobType === "trace_summary"
+                ? turnJudgeJobFlags(this.deps.repos.runtime.latestJobForTarget(memory.id, jobType)?.payload)
+                : {})
             },
             maxAttempts: 3,
             createdAt: at
@@ -455,7 +463,7 @@ export class WorkerRunner {
       if (workerJobCanRunInParallel(job)) {
         const batchType = job.jobType;
         const batch: EvolutionJobRecord[] = [];
-        while (queue.length > 0 && queue[0]?.jobType === batchType) {
+        while (queue.length > 0 && (queue[0]?.jobType === batchType || (["trace_summary", "episode_assignment"].includes(batchType) && ["trace_summary", "episode_assignment"].includes(queue[0]!.jobType)))) {
           batch.push(queue.shift()!);
         }
         if (this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes(batchType)) {
@@ -480,6 +488,14 @@ export class WorkerRunner {
       }
       queue.shift();
       results.push(await this.runLeasedWorkerJob(job));
+    }
+    // Joining already-persisted results is local work. Finish ready bindings in
+    // this drain, without waiting for the next scheduler tick or another model.
+    const finalizeCapacity = Math.max(0, normalizedLimit - jobs.length);
+    if (finalizeCapacity > 0) {
+      const ready = this.deps.repos.runtime.leaseQueuedJobs(finalizeCapacity, 60, undefined, false, ["episode_finalize"]);
+      jobs.push(...ready);
+      for (const job of ready) results.push(await this.runLeasedWorkerJob(job));
     }
     const embeddingHeld = this.deps.memoryBudgetPaused() && this.deps.memoryBudgetJobConsumes("embedding");
     const embeddingRetries = !embeddingHeld && retryCapacity > 0
@@ -561,8 +577,7 @@ export class WorkerRunner {
           }
         }
       } catch (error) {
-        const classification = classifyProcessingError(error);
-        if (classification.code === "model_input_too_long" && batch.length > 1) {
+        if (batch.length > 1 && shouldIsolateEmbeddingBatch(error)) {
           for (const item of batch) results.push(await this.runLeasedEmbeddingItem(item));
           continue;
         }
@@ -645,6 +660,9 @@ export class WorkerRunner {
     const failOp = failedJob.status === "dead_letter" ? "dead_letter" : "failed";
     this.deps.appendJobChange(failedJob, failOp, job);
     this.updateProcessingAfterJobFailure(failedJob, error);
+    if (failedJob.status === "dead_letter" && failedJob.jobType === "trace_summary" && failedJob.payload.turnJudge === true) {
+      this.deps.onTurnJudgeDeadLetter?.(failedJob);
+    }
     workerLogger.error("job.failed", {
       ...workerJobLogFields(failedJob),
       terminal: failedJob.status === "dead_letter",
@@ -764,8 +782,7 @@ export class WorkerRunner {
           }
         }
       } catch (error) {
-        const classification = classifyProcessingError(error);
-        if (classification.code === "model_input_too_long" && batch.length > 1) {
+        if (batch.length > 1 && shouldIsolateEmbeddingBatch(error)) {
           for (const item of batch) {
             results.push(await this.runClaimedEmbeddingRetryItem(item.retry, item.claim, item.attemptNo));
           }
@@ -807,7 +824,10 @@ export class WorkerRunner {
     if (!memory) {
       throw new Error(`embedding retry target not found: ${retry.targetKind}:${retry.targetId}`);
     }
-    if ((memory.memoryLayer === "Skill" || memory.memoryLayer === "L3") && embeddingTextForMemory(memory) !== retry.sourceText) {
+    const currentText = retry.vectorField === "vec_action" ? traceActionEmbeddingText(memory)
+      : memory.memoryLayer === "Skill" || memory.memoryLayer === "L3" || memory.memoryLayer === "L2"
+        ? embeddingTextForMemory(memory) : undefined;
+    if (currentText !== undefined && currentText !== retry.sourceText) {
       const completed = this.deps.repos.runtime.markEmbeddingRetrySucceededClaimed(retry.id, {
         ...claim,
         now: this.nowMs()
@@ -815,7 +835,7 @@ export class WorkerRunner {
       if (completed) this.deps.appendEmbeddingRetryChange(completed, "succeeded", retry);
       const replacement = this.deps.enqueueEmbeddingRetry(
         memory,
-        embeddingTextForMemory(memory),
+        currentText,
         this.deps.nowIso(),
         retry.vectorField
       );
@@ -985,4 +1005,13 @@ function embeddingRetryLogFields(retry: EmbeddingRetryRecord): Record<string, un
     maxAttempts: retry.maxAttempts,
     nextAttemptAt: retry.nextAttemptAt
   };
+}
+
+// A rejected input can poison a whole provider request. Probe each original
+// item once; do not split authentication, quota, rate-limit or server failures.
+function shouldIsolateEmbeddingBatch(error: unknown): boolean {
+  const classification = classifyProcessingError(error);
+  return classification.code === "model_input_too_long" ||
+    (classification.code === "invalid_model_request" && error instanceof ModelHttpError &&
+      [400, 413, 422].includes(error.httpStatus));
 }

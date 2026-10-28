@@ -31,6 +31,60 @@ const {
 afterEach(cleanup);
 
 describe("MemoryService / import / processing", () => {
+  it("distinguishes new and interrupted work from failed automatic retries across all processing reads", async () => {
+    const root = createTestRoot("memmy-processing-retry-state-");
+    const db = new MemoryDb({ path: join(root, "memory.sqlite") });
+    const repos = new Repositories(db.db);
+    const baseLlm = createBatchReflectionLlm([], "summary recovered after retry");
+    let failSummary = true;
+    const llm: LlmClient = {
+      ...baseLlm,
+      async completeJson<T extends Record<string, unknown>>(messages: LlmMessage[], options: LlmCompletionOptions): Promise<T> {
+        if (failSummary) throw new Error("429 temporary provider failure");
+        return baseLlm.completeJson<T>(messages, options);
+      }
+    };
+    const service = createTestMemoryService({ db, mode: "dev", llm, embedder: createCapturingEmbedder([]) });
+    const namespace = { source: "codex", profileId: "default", userId: "retry-state-user" };
+    const added = addAgentSourceImport(service, namespace, "remember the import queue", "retry-state");
+    const expectAutomaticRetry = (expected: boolean) => {
+      const current = repos.processing.get(added.id)!;
+      expect(current.autoRetryScheduled).toBe(expected);
+      expect(repos.processing.getMany([added.id])[0]?.autoRetryScheduled).toBe(expected);
+      expect(repos.processing.listByStates([current.state]).find((item) => item.memoryId === added.id)?.autoRetryScheduled).toBe(expected);
+      expect(service.memoryProcessingStatus([added.id], { namespace }).items[0]?.autoRetryScheduled).toBe(expected);
+    };
+
+    expectAutomaticRetry(false);
+    expect(repos.runtime.leaseQueuedJobs(1, 60, [added.id])).toHaveLength(1);
+    expectAutomaticRetry(false);
+    const recovered = repos.runtime.requeueLeasedJobsAfterRestart();
+    expect(recovered[0]?.after).toMatchObject({ status: "queued", attempts: 0, lastError: null });
+    expectAutomaticRetry(false);
+
+    await service.runWorkerOnce(1);
+    expect(repos.processing.get(added.id)).toMatchObject({ state: "summary_pending", errorCode: "transient_provider_error" });
+    expectAutomaticRetry(true);
+    expect(repos.runtime.requeueFailedJobs(1, undefined, [added.id])).toHaveLength(1);
+    expectAutomaticRetry(true);
+    expect(repos.runtime.leaseQueuedJobs(1, 60, [added.id])).toHaveLength(1);
+    expectAutomaticRetry(false);
+    repos.runtime.requeueLeasedJobsAfterRestart();
+    expectAutomaticRetry(true);
+
+    failSummary = false;
+    await service.runWorkerOnce(1);
+    // The next stage retains the old summary error but has a fresh embedding job.
+    expect(repos.processing.get(added.id)).toMatchObject({ state: "embedding_pending", errorCode: "transient_provider_error" });
+    expectAutomaticRetry(false);
+    await service.runWorkerOnce(1);
+    expect(repos.processing.get(added.id)).toMatchObject({ state: "ready", errorMessage: null, failedAt: null });
+    expectAutomaticRetry(false);
+    expect(repos.memories.get(added.id)?.memoryValue).toContain("summary recovered after retry");
+    expect(repos.memories.hasVector(added.id, "vec_summary")).toBe(true);
+    db.close();
+  });
+
   it("imports L1 memory with async summary, default score, and embedding only", async () => {
     const root = createTestRoot("mindock-memory-import-add-");
     const db = new MemoryDb({
@@ -107,7 +161,7 @@ describe("MemoryService / import / processing", () => {
     expect(summaryCall?.options.thinkingMode).toBe("disabled");
     expect(summaryCall?.options.maxTokens).toBe(512);
     expect(summaryCall?.messages[0]?.content).toContain("at most 30 characters");
-    expect(summaryCall?.messages[0]?.content).toContain("at most 180 characters");
+    expect(summaryCall?.messages[0]?.content).toContain("at most 300 characters");
     expect(summaryCall?.messages[0]?.content).toContain("future retrieval");
     expect(summaryCall?.messages[0]?.content).toContain("concrete retrieval anchors");
     expect(summaryCall?.messages[0]?.content).toContain("atomic real-world facts");
@@ -466,6 +520,7 @@ describe("MemoryService / import / processing", () => {
         messages: LlmMessage[],
         options: LlmCompletionOptions
       ): Promise<T> {
+      if (options.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as T;
         summaryCalls.push({ messages, options });
         throw new Error("summary endpoint returned HTTP 405");
       }
@@ -525,6 +580,7 @@ describe("MemoryService / import / processing", () => {
         messages: LlmMessage[],
         options: LlmCompletionOptions
       ): Promise<T> {
+      if (options.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as T;
         if (failureMessage) throw new Error(failureMessage);
         return baseLlm.completeJson<T>(messages, options);
       }
@@ -641,7 +697,8 @@ describe("MemoryService / import / processing", () => {
     const baseLlm = createFailingLlm();
     const llm: LlmClient = {
       ...baseLlm,
-      async completeJson() {
+      async completeJson(_selectionMessages: unknown, selectionOptions: { operation: string }) {
+      if (selectionOptions.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as any;
         throw new ModelHttpError(
           "openai_compatible HTTP 403: quota exhausted",
           "openai_compatible",
@@ -705,7 +762,8 @@ describe("MemoryService / import / processing", () => {
     const baseLlm = createFailingLlm();
     const llm: LlmClient = {
       ...baseLlm,
-      async completeJson() {
+      async completeJson(_selectionMessages: unknown, selectionOptions: { operation: string }) {
+      if (selectionOptions.operation === "episode.select.v1") return { episodeId: null, title: "Test task", summary: "Test task summary" } as unknown as any;
         throw new Error(
           "openai_compatible HTTP 200: expected JSON but received HTML instead of a model API response; check the configured model endpoint"
         );
@@ -1025,13 +1083,13 @@ describe("MemoryService / import / processing", () => {
     db.close();
   });
 
-  it("clips imported L1 summaries to 180 characters", async () => {
+  it("clips imported L1 summaries to 300 characters", async () => {
     const root = createTestRoot("mindock-memory-import-summary-cap-");
     const db = new MemoryDb({
       path: join(root, "memory.sqlite")
     });
     const calls: Array<{ messages: LlmMessage[]; options: LlmCompletionOptions }> = [];
-    const longSummary = "s".repeat(240);
+    const longSummary = "s".repeat(360);
     const service = createTestMemoryService({
       db,
       mode: "dev",
@@ -1060,9 +1118,9 @@ describe("MemoryService / import / processing", () => {
       };
     };
     expect(calls.find((call) => call.options.operation === "capture.summarize")?.messages[0]?.content)
-      .toContain("at most 180 characters");
-    expect(properties.internal_info.trace.summary).toHaveLength(180);
-    expect(properties.internal_info.trace.summary).toBe(`${"s".repeat(177)}...`);
+      .toContain("at most 300 characters");
+    expect(properties.internal_info.trace.summary).toHaveLength(300);
+    expect(properties.internal_info.trace.summary).toBe(`${"s".repeat(297)}...`);
     db.close();
   });
 
@@ -1147,7 +1205,7 @@ describe("MemoryService / import / processing", () => {
     const summaryRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
     const embeddingRun = await service.runWorkerOnce(10, { targetMemoryIds: [first.id] });
 
-    expect(summaryRun.jobs).toEqual([
+    expect(summaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "import_summary", targetMemoryId: first.id })
     ]);
     expect(embeddingRun.jobs).toEqual([
@@ -1419,17 +1477,17 @@ describe("MemoryService / import / processing", () => {
       "2026-06-10T12:00:00.000Z"
     );
     const session = service.openSession({ namespace });
-    const live = service.completeTurn("turn-live-priority", {
+    const live = (await service.completeTurn("turn-live-priority", {
       sessionId: session.sessionId,
       query: "Remember the new interactive preference.",
       answer: "The new interactive preference is dark mode."
-    });
+    }));
 
     const summaryRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const embeddingRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
     const scanRun = await service.runWorkerOnce(4, { priorityCohortOnly: true });
 
-    expect(summaryRun.jobs).toEqual([
+    expect(summaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
     ]);
     expect(embeddingRun.jobs).toEqual([
@@ -1468,11 +1526,11 @@ describe("MemoryService / import / processing", () => {
       "first-report-priority-scan"
     );
     const session = service.openSession({ namespace });
-    const live = service.completeTurn("turn-first-report-priority-live", {
+    const live = (await service.completeTurn("turn-first-report-priority-live", {
       sessionId: session.sessionId,
       query: "Remember this interactive task.",
       answer: "The interactive task is queued."
-    });
+    }));
     const firstReport = service.addMemory({
       namespace,
       adapterId: "agent-source:memmy-onboarding",
@@ -1507,7 +1565,7 @@ describe("MemoryService / import / processing", () => {
     expect(reportEmbeddingRun.jobs).toEqual([
       expect.objectContaining({ jobType: "embedding", targetMemoryId: firstReport.id })
     ]);
-    expect(liveSummaryRun.jobs).toEqual([
+    expect(liveSummaryRun.jobs.filter(job => !["episode_assignment", "episode_finalize"].includes(job.jobType))).toEqual([
       expect.objectContaining({ jobType: "trace_summary", targetMemoryId: live.l1MemoryId })
     ]);
     expect(liveSummaryRun.jobs.map((job) => job.targetMemoryId)).not.toContain(scanned.id);

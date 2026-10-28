@@ -333,6 +333,20 @@ export async function readRuntimeMemmyConfigState(
   return deriveRuntimeMemmyConfigState(parsed, configPath, mode);
 }
 
+/** Reads the persisted runtime user mode without deriving a model selection. */
+export async function readRuntimeMemmyConfigUserMode(
+  configPath = resolveDefaultMemmyConfigPath()
+): Promise<UserMode | undefined> {
+  const content = await readMemmyConfigContent(configPath);
+  if (!content?.trim()) return undefined;
+  const parsed = YAML.parse(content) as unknown;
+  if (!isRecord(parsed)) return undefined;
+  const userMode = existingString(asRecord(parsed.app)?.userMode);
+  return userMode === "account" || userMode === "byok" || userMode === "unset"
+    ? userMode
+    : undefined;
+}
+
 /** Reads agents.defaults.timezone without inventing a configured value. */
 export async function readConfiguredAgentTimeZone(
   configPath = resolveDefaultMemmyConfigPath()
@@ -570,6 +584,11 @@ export async function writeAccountModelProjectionToMemmyConfig(
       appConfig,
       LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE
     );
+    // Projection repair also runs during migration; preserve an explicit BYOK choice.
+    const userMode = existingString(appConfig.userMode);
+    if (!userMode || userMode === "unset") {
+      appConfig.userMode = "account";
+    }
     if (normalizedCloudUuid) appConfig.cloudUuid = normalizedCloudUuid;
     if (normalizedUserId) appConfig.userId = normalizedUserId;
     delete appConfig[LEGACY_ACCOUNT_BYOK_LOCAL_SELECTION_BASELINE];
@@ -910,13 +929,15 @@ function updateAccountAssignment(
     imageGeneration: "image_generation"
   } as const;
   const next: Record<string, unknown> = { ...existing, ownerAccountId, agent };
+  const legacyLocalEmbedding = sameOwner
+    && asRecord(asRecord(config.memmyMemory)?.embedding)?.mode === "local";
   for (const [field, capability] of Object.entries(singles) as Array<[keyof typeof singles, AccountCapability]>) {
     const current = existingString(existing[field]);
     const keepBuiltInLocalEmbedding = field === "embedding"
       && sameOwner
-      && current === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID;
+      && (current === BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID || legacyLocalEmbedding);
     next[field] = keepBuiltInLocalEmbedding
-      ? current
+      ? BUILTIN_LOCAL_EMBEDDING_ASSIGNMENT_ID
       : current && assignmentPresetIsUsable(presets, current, capability, ownerAccountId)
         ? current
         : presetIds[capability];
