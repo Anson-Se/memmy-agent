@@ -66,6 +66,8 @@ export interface MemoryProcessingRecord {
   updatedAt: IsoTime;
 }
 export type JobType =
+  | "episode_assignment"
+  | "episode_finalize"
   | "episode_idle_close"
   | "episode_title"
   | "trace_summary"
@@ -297,7 +299,7 @@ export interface MemoryDetailItem extends MemoryListItem {
 
 export interface RawTurnSummary {
   rawTurnId: string;
-  episodeId: string;
+  episodeId?: string;
   turnId: string;
   userText?: string;
   assistantText?: string;
@@ -404,7 +406,8 @@ export interface SourceTurnCompleteRequest extends Omit<TurnCompleteRequest, "se
 export interface TurnCompletionResult {
   turnId: string;
   sessionId: string;
-  episodeId: string;
+  episodeId?: string;
+  assignmentStatus?: "pending" | "assigned";
   rawTurnId: string;
   userMemoryId: string;
   userMemoryIds: string[];
@@ -577,7 +580,7 @@ export interface FeedbackRequest extends RequestEnvelope {
 
 export interface SkillUseRequest extends RequestEnvelope {
   sessionId: string;
-  episodeId: string;
+  episodeId?: string;
   l1MemoryId?: string;
   rawTurnId?: string;
   turnId?: string;
