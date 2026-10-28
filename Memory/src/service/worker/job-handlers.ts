@@ -1,3 +1,4 @@
+import { EmbeddingInputLimitError } from "../../model/openai-embedding-inputs.js";
 /**
  * Worker job routing and durable write-back helpers.
  *
@@ -25,6 +26,7 @@ import { episodeTitleIsCurrent } from "../episode-title/episode-title-service.js
 import { memoryHasImportPipeline } from "../import/import-job-processor.js";
 import { observationMemoryState } from "../observation-memory-state.js";
 import { isTerminalL3WorldModelError } from "../evolution/l3-world-model-pipeline.js";
+import { isNeutralFeedback, turnJudgeJobFlags } from "../evolution/turn-judge.js";
 import {
   namespaceForMemory,
   namespaceForSession
@@ -383,7 +385,7 @@ export function finalizeClosedEpisode(
 ): EvolutionJobRecord[] {
   const current = deps.repos.runtime.getEpisode(episode.id) ?? episode;
   if (current.status !== "closed" || current.l1MemoryIds.length === 0) return [];
-  if (episodeHasPendingCaptureDecision(deps, current)) return [];
+  if (episodeHasPendingCaptureDecision(deps, current) || deps.repos.runtime.hasUnassignedTurns(current.sessionId)) return [];
   // Titling is independent of reward and reflection, so it must be queued before
   // the mutually exclusive branches below can return.
   const titleJobs = enqueueEpisodeTitle(deps, current, at, "final");
@@ -435,10 +437,11 @@ export function enqueueEpisodeRewardAfterReflection(
   ) return [];
   const target = deps.feedbackTargetFromEpisode(episode);
   if (!target) return [];
+  // The newest reaction with an attitude: neutral ones never displace it.
   const feedback = [...episode.feedbackIds]
     .reverse()
     .map((id) => deps.repos.runtime.getFeedback(id))
-    .find((item) => Boolean(item));
+    .find((item) => Boolean(item) && !isNeutralFeedback(item!));
   const feedbackWindowSec = Math.max(1, deps.reward.feedbackWindowSec);
   const runAfter = feedback
     ? at
@@ -519,7 +522,13 @@ export function enqueueImportSummaryIfMissing(
       userId: memory.userId,
       sessionId: memory.sessionId,
       targetMemoryId: memory.id,
-      payload: { source: "worker.embedding.summary_guard", contentHash: memory.contentHash },
+      payload: {
+        source: "worker.embedding.summary_guard",
+        contentHash: memory.contentHash,
+        ...(jobType === "trace_summary"
+          ? turnJudgeJobFlags(deps.repos.runtime.latestJobForTarget(memory.id, jobType)?.payload)
+          : {})
+      },
       maxAttempts: 3,
       createdAt: at
     });
@@ -556,7 +565,8 @@ export function episodeRewardWasSkipped(episode: EpisodeRecord): boolean {
 }
 
 export function workerJobCanRunInParallel(job: EvolutionJobRecord): boolean {
-  return job.jobType === "trace_summary" ||
+  return job.jobType === "episode_assignment" ||
+    job.jobType === "trace_summary" ||
     job.jobType === "import_summary" ||
     job.jobType === "observation_extract" ||
     job.jobType === "embedding" ||
@@ -595,6 +605,9 @@ export function classifyProcessingError(error: unknown): {
   code: string;
   retryAction: "retry" | "open_settings" | "none";
 } {
+  if (error instanceof EmbeddingInputLimitError) {
+    return { code: "model_input_too_long", retryAction: "none" };
+  }
   if (error instanceof ModelHttpError && error.errorCode === "40309") {
     return { code: "40309", retryAction: "open_settings" };
   }
@@ -605,6 +618,18 @@ export function classifyProcessingError(error: unknown): {
   const normalized = message.toLowerCase();
   if (!hasStructuredCode && /\b40309\b/.test(normalized)) {
     return { code: "40309", retryAction: "open_settings" };
+  }
+  // Providers can report shared model/account failures as HTTP 400. Classify
+  // their reason before generic 4xx handling, which permits item isolation.
+  if (error instanceof ModelHttpError) {
+    const providerCode = error.errorCode?.toLowerCase().replace(/[\s_-]/g, "");
+    if (providerCode === "operationnotsupported" || providerCode === "insufficientquota" ||
+      /operation.{0,80}(?:does not work|not supported)|insufficient[\s_-]+(?:quota|balance)/.test(normalized)) {
+      return { code: "model_configuration", retryAction: "open_settings" };
+    }
+    if (providerCode === "ratelimitexceeded" || /rate[\s_-]*limit/.test(normalized)) {
+      return { code: "transient_provider_error", retryAction: "retry" };
+    }
   }
   if (/api.?key|unauthorized|forbidden|\b401\b|\b403\b|\b404\b|model.+not configured|missing.+model|expected json|html instead of json|configured model endpoint/.test(normalized)) {
     return { code: "model_configuration", retryAction: "open_settings" };

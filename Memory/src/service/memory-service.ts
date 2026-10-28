@@ -1,3 +1,5 @@
+import { EmbeddingMaintenance } from "./embedding/embedding-maintenance.js";
+import { embeddingRetryTargetKindForMemory, embeddingRetryVectorFieldForMemory } from "./embedding/embedding-pipeline.js";
 import {
   assertJsonValue,
   canonicalJson,
@@ -60,10 +62,13 @@ import {
   type ChangeLogRecord,
   type EpisodeRecord,
   type EvolutionJobRecord,
+  type EmbeddingMaintenanceTask,
   type RawTurnRecord,
   type SessionRecord
 } from "../storage/repositories.js";
 import type { SerializedMemoryVector } from "../storage/sqlite-vec-store.js";
+import { memoryVectorEntries } from "../storage/memory-vector-state.js";
+import { embeddingTextForMemory, traceSummaryEmbeddingText, traceActionEmbeddingText } from "./embedding/embedding-pipeline.js";
 import type {
   FeedbackRequest,
   HealthResponse,
@@ -181,7 +186,7 @@ import {
   repairEvidenceValueDiff as sessionRepairEvidenceValueDiff
 } from "./session/session-turn-service.js";
 import { SkillTrialResolver } from "./trials/skill-trial-resolver.js";
-import { WorkMemoryPipeline } from "./work-memory/work-memory-pipeline.js";
+import { WorkMemoryPipeline, canonicalWorkMemoryText } from "./work-memory/work-memory-pipeline.js";
 import { ObservationMemoryPipeline } from "./evidence/observation-memory-pipeline.js";
 import { lookupExternalEvidence, lookupExternalEvidenceSkill, externalEvidenceSourceMatchesMemory, externalEvidenceNamespaceForMemory } from "./external-evidence-source.js";
 import { observationMemoryState, isObservationMemoryProcessed, OBSERVATION_SUMMARY_MODEL_UNCONFIGURED } from "./observation-memory-state.js";
@@ -301,6 +306,8 @@ export class MemoryService {
   private llm: LlmClient;
   private skillLlm: LlmClient;
   private embedder: Embedder;
+  private embeddingDimensionProbe?: { key: string; value: Promise<number> };
+  private embeddingUpgradeInFlight?: Promise<void>;
   private readonly embeddingRetryWorkerId = `embedding-retry-${newId("worker")}`;
   private readonly tokenBudgetLedger: MemoryTokenBudgetLedger;
   private readonly tokenUsageRecorder: HttpByokTokenUsageRecorder;
@@ -318,6 +325,7 @@ export class MemoryService {
     backoffMs: 1_000
   };
   private persistRecoveredListener?: () => void;
+  private capturePendingListener?: () => void;
   private closing = false;
   private viewerEndpoint?: string;
 
@@ -526,6 +534,11 @@ export class MemoryService {
       appendEmbeddingRetryChange: this.workerHandlers.appendEmbeddingRetryChange,
       summarizeTraceForCapture: this.evolutionJobs.summarizeTraceForCapture.bind(this.evolutionJobs),
       decideTurnMemoryForCapture: this.evolutionJobs.decideTurnMemoryForCapture.bind(this.evolutionJobs),
+      buildTurnJudgeSnapshot: this.evolutionJobs.buildTurnJudgeSnapshot.bind(this.evolutionJobs),
+      judgeTurnForCapture: this.evolutionJobs.judgeTurnForCapture.bind(this.evolutionJobs),
+      applyTurnJudgment: (input) => this.sessionTurns.applyTurnJudgment(input),
+      withEpisodeSelection: (context, operation) => this.sessionTurns.withEpisodeSelection(context, operation),
+      turnJudgeKeepInput: () => this.config.algorithm.session.turnJudgeKeepInput,
       finalizeClosedEpisode: (episode, at) => this.workerHandlers.finalizeClosedEpisode(episode, at, "capture_decided")
     });
     const observationOwner = this;
@@ -547,6 +560,7 @@ export class MemoryService {
     });
     const workerRunnerOwner = this;
     this.workerRunner = new WorkerRunner({
+      onTurnJudgeDeadLetter: (job) => this.embeddingJobs.markTurnJudgeFailed(job),
       repos: this.repos,
       get embedder() { return workerRunnerOwner.embedder; },
       get capture() { return workerRunnerOwner.config.algorithm.capture; },
@@ -572,7 +586,11 @@ export class MemoryService {
       appendEmbeddingRetryChange: this.workerHandlers.appendEmbeddingRetryChange,
       jobHandlers: {
         processJob: (job) => this.withModelTaskContext(
-          () => this.workerHandlers.processJob(job)
+          async () => job.jobType === "episode_assignment"
+            ? this.sessionTurns.assignEpisode(job)
+            : job.jobType === "episode_finalize"
+              ? this.sessionTurns.finalizeAssignment(job)
+              : this.workerHandlers.processJob(job)
         )
       },
       embeddingJobs: this.embeddingJobs
@@ -608,7 +626,19 @@ export class MemoryService {
       assertMemoryInScope: this.assertMemoryInScope.bind(this),
       assertSessionInScope: this.assertSessionInScope.bind(this),
       requireOpenSession: this.requireOpenSession.bind(this),
-      ensureEpisode: this.ensureEpisode.bind(this),
+      ensureEpisode: (session, episodeId) => this.sessionTurns.captureEpisode(session, episodeId),
+      persistSkillEvent: (session, skillId, request) => {
+        const at = nowIso();
+        const turnId = request.turnId ?? `skill:${request.adapterId ?? ""}:${request.requestId ?? newId("event")}`;
+        const existing = this.repos.runtime.getRawTurnBySessionTurn(session.id, turnId);
+        if (existing) return existing;
+        const raw = this.repos.runtime.insertRawTurn({ id: `raw_${stableHash(`${session.id}:${turnId}`).slice(0, 20)}`,
+          userId: session.userId, sessionId: session.id, turnId, createdAt: at,
+          conversationId: session.conversationId, userText: `Use skill ${skillId}`, toolCalls: [], toolResults: [],
+          sourceMemoryIds: [skillId], usage: {}, messagePayload: { skill_use: { skillId, toolCallId: request.toolCallId } }, status: "observed" });
+        this.sessionTurns.queueAssignment(raw);
+        return raw;
+      },
       resolveSkillTrialEvidence: this.skillTrials.resolveSkillTrialEvidence.bind(this.skillTrials),
       encodeChangeCursor: this.encodeChangeCursor.bind(this),
       skillMetaFromMemory,
@@ -708,6 +738,7 @@ export class MemoryService {
         llm: this.skillLlm
       }),
       shouldDeferBudgetedEvolutionLlm: () => this.shouldDeferBudgetedEvolutionLlm(),
+      shouldDeferEpisodeSelection: () => this.isMemoryBudgetPaused() && this.memoryBudgetJobConsumes("episode_title"),
       firstLine,
       memoryLayersForIntent,
       turnStartMemoryLayers,
@@ -726,6 +757,7 @@ export class MemoryService {
       stringifyForMemory,
       withDuplicateFlag
     });
+    this.sessionTurns.migrateLegacyCaptures();
     serviceLogger.info("initialized", memoryConfigLogFields(this.config));
     this.tokenUsageRecorder.start();
   }
@@ -778,6 +810,10 @@ export class MemoryService {
 
   private memoryBudgetJobConsumes(jobType: string): boolean {
     return jobTypeConsumesMemoryBudget(jobType, this.budgetModelSources());
+  }
+
+  private shouldDeferBudgetedEmbedding(): boolean {
+    return this.isMemoryBudgetPaused() && this.memoryBudgetJobConsumes("embedding");
   }
 
   private shouldDeferBudgetedEvolutionLlm(): boolean {
@@ -852,6 +888,10 @@ export class MemoryService {
 
   setAppBudgetReconcileListener(listener?: () => void): void {
     this.appBudgetReconcile.settledListener = listener;
+  }
+
+  setCapturePendingListener(listener?: () => void): void {
+    this.capturePendingListener = listener;
   }
 
   setPersistRecoveredListener(listener?: () => void): void {
@@ -1050,6 +1090,8 @@ export class MemoryService {
     this.startAppBudgetReconcile();
     if (!requiresRestart && request.restartFailedProcessing !== false) {
       this.restartFailedProcessing(reloadedAt);
+      for (const { before, after } of this.repos.runtime.requeueFailedEpisodeAssignments(reloadedAt)) this.workerHandlers.appendJobChange(after, "queued", before);
+      this.capturePendingListener?.();
     }
     serviceLogger.info("config.reloaded", {
       changed,
@@ -1320,7 +1362,7 @@ export class MemoryService {
     return this.l3WorldModelContextReadModel.load(session);
   }
 
-  compactSession(sessionId: string, request: SessionCompactRequest = {}): {
+  async compactSession(sessionId: string, request: SessionCompactRequest = {}): Promise<{
     memorySnapshot: {
       summary: string;
       sourceTurnIds: string[];
@@ -1334,8 +1376,11 @@ export class MemoryService {
     syncCursor?: string;
     jobs: JobRef[];
     serverTime: string;
-  } {
-    return this.sessionTurns.compactSession(sessionId, this.withTimeZone(request));
+  }> {
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.summary ?? "" },
+      () => this.sessionTurns.compactSession(sessionId, this.withTimeZone(request))
+    )));
   }
 
   async startTurn(request: TurnStartRequest & Record<string, unknown>): Promise<{
@@ -1359,19 +1404,28 @@ export class MemoryService {
     return this.withModelTaskContext(() => this.sessionTurns.startTurn(this.withTimeZone(request)));
   }
 
-  completeSourceTurn(request: SourceTurnCompleteRequest): SourceTurnCompleteResponse {
+  private async acceptCapture<T>(execute: () => Promise<T>): Promise<T> {
+    const result = await execute();
+    this.capturePendingListener?.();
+    return result;
+  }
+
+  async completeSourceTurn(request: SourceTurnCompleteRequest): Promise<SourceTurnCompleteResponse> {
     // Native scans have no Hook envelope. Use the configured owner only when
     // the request (including authenticated scope) did not provide one.
-    const response = this.sessionTurns.completeSourceTurn(this.withTimeZone({
-      ...request,
-      namespace: {
-        source: request.sourceTurn?.source,
-        profileId: request.sourceTurn?.profileId,
-        sessionKey: request.sourceTurn?.conversationId,
-        ...request.namespace,
-        userId: request.namespace?.userId ?? this.config.userId
-      }
-    }));
+    const response = await this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.query, turnId: request.sourceTurn?.turnId },
+      () => this.sessionTurns.completeSourceTurn(this.withTimeZone({
+        ...request,
+        namespace: {
+          source: request.sourceTurn?.source,
+          profileId: request.sourceTurn?.profileId,
+          sessionKey: request.sourceTurn?.conversationId,
+          ...request.namespace,
+          userId: request.namespace?.userId ?? this.config.userId
+        }
+      }))
+    )));
     serviceLogger.info("source_turn.complete", {
       source: request.sourceTurn?.source,
       profileId: request.sourceTurn?.profileId,
@@ -1388,8 +1442,11 @@ export class MemoryService {
     return response;
   }
 
-  completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): CompleteTurnResponse {
-    return this.sessionTurns.completeTurn(turnId, this.withTimeZone(request));
+  async completeTurn(turnId: string, request: TurnCompleteRequest & Record<string, unknown>): Promise<CompleteTurnResponse> {
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: request.query, turnId },
+      () => this.sessionTurns.completeTurn(turnId, this.withTimeZone(request))
+    )));
   }
 
   async observeTool(input: ToolObserveRequest): Promise<{
@@ -1401,11 +1458,11 @@ export class MemoryService {
     syncCursor?: string;
     serverTime: string;
   }> {
-    return this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input)));
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.observeTool(this.withTimeZone(input))));
   }
 
 
-  subagentStart(input: SubagentStartRequest): {
+  async subagentStart(input: SubagentStartRequest): Promise<{
     ok: true;
     eventId: string;
     childSessionId?: string;
@@ -1413,12 +1470,18 @@ export class MemoryService {
     changeSeq: number;
     syncCursor: string;
     serverTime: string;
-  } {
-    return this.sessionTurns.subagentStart(this.withTimeZone(input));
+  }> {
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: input.task ?? "" },
+      () => this.sessionTurns.subagentStart(this.withTimeZone(input))
+    )));
   }
 
-  subagentComplete(input: SubagentCompleteRequest): CompleteTurnResponse {
-    return this.sessionTurns.subagentComplete(this.withTimeZone(input));
+  async subagentComplete(input: SubagentCompleteRequest): Promise<CompleteTurnResponse> {
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: input.summary ?? "Subagent completed" },
+      () => this.sessionTurns.subagentComplete(this.withTimeZone(input))
+    )));
   }
 
   async repairSuggestion(input: RepairSuggestionRequest): Promise<{
@@ -2219,7 +2282,7 @@ export class MemoryService {
     return this.skillReadModel.getSkill(skillId, this.withTimeZone(request));
   }
 
-  useSkill(skillId: string, request: SkillUseRequest): {
+  async useSkill(skillId: string, request: SkillUseRequest): Promise<{
     skillId: string;
     trialId: string;
     status: "pending";
@@ -2227,8 +2290,11 @@ export class MemoryService {
     syncCursor: string;
     serverTime: string;
     duplicate?: boolean;
-  } {
-    return this.skillReadModel.useSkill(skillId, this.withTimeZone(request));
+  }> {
+    return this.acceptCapture(() => this.withModelTaskContext(() => this.sessionTurns.withEpisodeSelection(
+      { userText: `Use skill ${skillId}` },
+      () => this.skillReadModel.useSkill(skillId, this.withTimeZone(request))
+    )));
   }
 
   async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
@@ -2360,6 +2426,7 @@ export class MemoryService {
     const result = this.repos.runtime.importBundleTables(request.bundle.tables, {
       conflictStrategy: request.conflictStrategy ?? "skip"
     });
+    this.sessionTurns.migrateLegacyCaptures();
     const importedVectors = importedMemoryVectors(request.bundle.tables.memory_vectors);
     this.repos.vectors.importRows(importedVectors);
     result.inserted.memory_vectors = importedVectors.length;
@@ -2671,6 +2738,13 @@ export class MemoryService {
     const deletedMemoryIds: string[] = [];
 
     this.repos.transaction(() => {
+      const spanIds = new Set(this.repos.memories.listTaskSpanIds(
+        episode.userId, episode.id, episode.l1MemoryIds
+      ));
+      for (const spanId of spanIds) {
+        this.deleteMemory(spanId, request);
+        deletedMemoryIds.push(spanId);
+      }
       for (const memoryId of episode.l1MemoryIds) {
         if (!this.repos.memories.get(memoryId)) continue;
         this.deleteMemory(memoryId, request);
@@ -3008,85 +3082,148 @@ export class MemoryService {
     job?: JobRef;
     serverTime: string;
   } {
-    return this.importJobs.retryMemoryProcessing(memoryId, request);
+    // The existing operation validates memory ownership before touching its raw work.
+    const result = this.importJobs.retryMemoryProcessing(memoryId, request);
+    const memory = this.repos.memories.get(memoryId);
+    const rawId = memory ? rawTurnIdFromMemory(memory) : undefined;
+    const retried = rawId ? this.repos.runtime.requeueFailedEpisodeAssignments(nowIso(), rawId) : [];
+    for (const { before, after } of retried) this.workerHandlers.appendJobChange(after, "queued", before);
+    if (retried.length) this.capturePendingListener?.();
+    return retried.length ? { ...result, accepted: true, job: result.job ?? jobToRef(retried[0]!.after) } : result;
   }
 
-  rebuildEmbeddings(): {
-    accepted: true;
-    enqueued: number;
-    serverTime: string;
-  } {
+  private embeddingMaintenance(): EmbeddingMaintenance {
+    return new EmbeddingMaintenance({
+      repos: this.repos,
+      embedder: this.embedder,
+      userId: this.config.userId?.trim() || "local-user",
+      currentWork: dimension => this.currentEmbeddingMaintenanceState(this.config.userId?.trim() || "local-user", dimension),
+      enqueueMemory: (memory, text, at, vectorField = embeddingRetryVectorFieldForMemory(memory)) => {
+        const existing = this.repos.runtime.getEmbeddingRetryByTarget(
+          embeddingRetryTargetKindForMemory(memory), memory.id, vectorField
+        );
+        // Join an already running job without clearing its worker lease.
+        if (existing?.status === "pending" || existing?.status === "in_progress") return existing.id;
+        return this.workerHandlers.enqueueEmbeddingRetry(memory, text, at, vectorField).id;
+      },
+      enqueueUserMemory: (memory, at) => this.workerHandlers.enqueueJob({
+        jobType: "user_memory_embedding", userId: memory.userId, targetMemoryId: memory.id,
+        payload: { contentHash: stableHash(memory.content) }, maxAttempts: 6, createdAt: at
+      }).id
+    });
+  }
+
+  rebuildEmbeddings(mode: "repair" | "rebuild" = "rebuild") {
     this.assertMemoryAddEnabled();
-    const at = nowIso();
-    let offset = 0;
-    let enqueued = 0;
-    for (;;) {
-      const memories = this.repos.memories.list({}, 250, offset);
-      for (const memory of memories) {
-        this.workerHandlers.enqueueEmbeddingRetry(memory, memory.memoryValue, at);
-        enqueued += 1;
-      }
-      if (memories.length < 250) break;
-      offset += memories.length;
-    }
-    const userId = this.config.userId?.trim() || "local-user";
-    offset = 0;
-    for (;;) {
-      const userMemories = this.repos.userMemories.listForPanel({
-        userId,
-        status: "active",
-        limit: 250,
-        offset
-      });
-      for (const memory of userMemories) {
-        this.workerHandlers.enqueueJob({
-          jobType: "user_memory_embedding",
-          userId: memory.userId,
-          targetMemoryId: memory.id,
-          payload: { contentHash: stableHash(memory.content) },
-          maxAttempts: 6,
-          createdAt: at
-        });
-        enqueued += 1;
-      }
-      if (userMemories.length < 250) break;
-      offset += userMemories.length;
-    }
-    return { accepted: true, enqueued, serverTime: at };
+    return this.withModelTaskContext(async () => {
+      const dimension = mode === "repair" ? await this.currentEmbeddingDimension() : undefined;
+      if (mode === "repair" && !dimension) throw new MemoryServiceError("invalid_argument", "embedding model is not configured");
+      return this.embeddingMaintenance().start(mode, dimension);
+    });
   }
 
-  embeddingMaintenanceStats(): {
-    dimension: number;
-    available: boolean;
-    totalSlots: number;
-    ready: number;
-    missing: number;
-    dimMismatch: number;
-    needsRepair: number;
-  } {
-    const userId = this.config.userId?.trim() || "local-user";
-    const regular = this.repos.vectors.maintenanceDimensionCounts();
-    const user = this.repos.userMemories.embeddingDimensionCounts(userId);
-    const dimensions = new Map<number, number>();
-    for (const row of [...regular.dimensions, ...user.dimensions]) {
-      if (row.dimension > 0) dimensions.set(row.dimension, (dimensions.get(row.dimension) ?? 0) + row.count);
-    }
-    const [dimension = 0] = [...dimensions.entries()]
-      .sort((left, right) => right[1] - left[1] || right[0] - left[0])[0] ?? [];
-    const stored = [...dimensions.values()].reduce((sum, count) => sum + count, 0);
-    const totalSlots = regular.totalSlots + user.totalSlots;
-    const ready = dimension > 0 ? dimensions.get(dimension) ?? 0 : 0;
-    const missing = Math.max(0, totalSlots - stored);
-    const dimMismatch = Math.max(0, stored - ready);
-    return {
-      dimension,
-      available: this.embedder.status().configured,
-      totalSlots,
-      ready,
-      missing,
-      dimMismatch,
-      needsRepair: missing + dimMismatch
+  embeddingMaintenanceProgress(runId?: string) {
+    return this.withModelTaskContext(() => this.embeddingMaintenance().progress(runId));
+  }
+
+  embeddingMaintenanceStats() {
+    return this.withModelTaskContext(async () => {
+      try {
+        return this.embeddingMaintenance().stats(await this.currentEmbeddingDimension());
+      } catch (error) {
+        return { ...this.embeddingMaintenance().stats(0), dimensionError: error instanceof Error ? error.message : String(error) };
+      }
+    });
+  }
+
+  private currentEmbeddingMaintenanceState(userId: string, dimension: number) {
+    // Key by target and vector field so upstream action-vector maintenance also
+    // uses the same current-content checks as the panel and repair enqueueing.
+    const outdatedVectors = new Set<string>();
+    const memories = new Map<string, ReturnType<typeof this.repos.memories.get>>();
+    const userMemories = new Map<string, ReturnType<typeof this.repos.userMemories.get>>();
+    const model = this.embedder.config;
+    const isCurrentWork = (task: EmbeddingMaintenanceTask): boolean => {
+      const id = task.targetId;
+      // Pending, active and stale rows describe actual queue occupancy, even if
+      // their target was edited or deleted. Only historical failures are filtered.
+      const retainQueueRow = task.status !== "failed";
+      let vector: number[] | undefined;
+      let provider: string | null | undefined;
+      let embeddingModel: string | null | undefined;
+      let contentHash: string;
+      let sourceTexts: string[];
+      let vectorField = task.vectorField;
+      if (task.userMemory) {
+        if (!userMemories.has(id)) userMemories.set(id, this.repos.userMemories.get(id));
+        const memory = userMemories.get(id);
+        if (!memory || memory.status !== "active" || memory.deletedAt) return retainQueueRow;
+        contentHash = stableHash(memory.content);
+        vector = memory.embedding;
+        provider = memory.embeddingProvider;
+        embeddingModel = memory.embeddingModel;
+        sourceTexts = [memory.content];
+        vectorField = "vec";
+      } else {
+        if (!memories.has(id)) memories.set(id, this.repos.memories.get(id));
+        const memory = memories.get(id);
+        if (!memory || memory.status === "deleted" || memory.deletedAt) return retainQueueRow;
+        contentHash = memory.contentHash ?? stableHash(memory.memoryValue);
+        const primaryField = memory.memoryLayer === "L1" ? "vec_summary" : "vec";
+        vectorField ??= primaryField;
+        const entry = memoryVectorEntries(memory).find(value => value.vectorField === vectorField);
+        vector = entry?.vector;
+        provider = entry?.embeddingProvider;
+        embeddingModel = entry?.embeddingModel;
+        sourceTexts = (vectorField === "vec_action" ? [traceActionEmbeddingText(memory)]
+          : [memory.memoryValue, embeddingTextForMemory(memory), traceSummaryEmbeddingText(memory)])
+          .filter((text): text is string => text !== undefined);
+        if (kindFromMemory(memory) === "work_memory") {
+          const internal = memory.properties.internal_info;
+          sourceTexts.push(canonicalWorkMemoryText(
+            typeof internal.work_topic === "string" ? internal.work_topic : "Work requirements",
+            typeof internal.requirement === "string" ? internal.requirement : "",
+            typeof internal.reason === "string" ? internal.reason : ""
+          ));
+        }
+        if (task.sourceText && !sourceTexts.includes(task.sourceText)) return retainQueueRow;
+      }
+      if (task.contentHash && task.contentHash !== contentHash) return retainQueueRow;
+      // Merely retaining a vector does not prove current content was embedded.
+      if (dimension === 0 || vector?.length !== dimension ||
+          provider !== model.provider || embeddingModel !== (model.model ?? model.provider)) return true;
+      const completed = this.repos.runtime.hasSuccessfulEmbeddingWork({
+        targetId: id, userMemory: task.userMemory, vectorField,
+        contentHash, sourceTexts, since: task.updatedAt
+      });
+      if (!completed) outdatedVectors.add(`${task.userMemory ? "user_memory" : "memory"}:${id}:${vectorField}`);
+      return retainQueueRow || !completed;
     };
+    const retryQueue = this.repos.runtime.embeddingMaintenanceQueueStats(userId, Date.now(), isCurrentWork);
+    return { retryQueue, outdatedVectors };
+  }
+
+  private currentEmbeddingDimension(): Promise<number> {
+    if (!this.embedder.status().configured) return Promise.resolve(0);
+    const requested = this.embedder.config.extraBody?.dimensions;
+    if (typeof requested === "number" && Number.isSafeInteger(requested) && requested > 0) return Promise.resolve(requested);
+    if (this.embedder.config.provider === "local" && this.embedder.config.model === "Xenova/all-MiniLM-L6-v2") return Promise.resolve(384);
+    // Pin the routed model for the probe; changing any embedding configuration
+    // invalidates the cached result. Concurrent panel refreshes share one probe.
+    const key = stableHash(stableStringify(this.embedder.config));
+    if (this.embeddingDimensionProbe?.key === key) return this.embeddingDimensionProbe.value;
+    const value = probeEmbedding(this.embedder).then(result => {
+      if (!result.ok || !result.dimensions) {
+        throw new MemoryServiceError("internal", result.error ?? "embedding model returned no dimension", 502);
+      }
+      return result.dimensions;
+    });
+    const probe = { key, value };
+    this.embeddingDimensionProbe = probe;
+    void value.catch(() => {
+      if (this.embeddingDimensionProbe === probe) this.embeddingDimensionProbe = undefined;
+    });
+    return value;
   }
 
   private restartFailedProcessing(at: string, limit = 10000): number {
@@ -3102,7 +3239,11 @@ export class MemoryService {
   }
 
   nextWorkerRunAt(): number | undefined {
-    return this.workerRunner.nextWorkerRunAt();
+    const workerAt = this.workerRunner.nextWorkerRunAt();
+    const upgradeAt = this.config.algorithm.enableMemoryAdd && !this.shouldDeferBudgetedEmbedding()
+      ? this.embeddingMaintenance().nextUpgradeAttemptAt() : undefined;
+    const times = [workerAt, upgradeAt].filter((time): time is number => Number.isFinite(time));
+    return times.length ? Math.min(...times) : undefined;
   }
 
   memoryTokenBudgetSnapshot() {
@@ -3131,7 +3272,15 @@ export class MemoryService {
     } = {}
   ): ReturnType<WorkerRunner["runWorkerOnce"]> {
     await this.ensureAppBudgetReconciled();
+    // Run the bounded one-time provenance repair through the normal durable worker.
+    // Respect explicit write/budget gates and scoped worker requests.
+    if (this.config.algorithm.enableMemoryAdd && !this.shouldDeferBudgetedEmbedding() && !request.targetMemoryIds) {
+      this.embeddingUpgradeInFlight ??= this.withModelTaskContext(() => this.embeddingMaintenance().resumeUpgrade())
+        .finally(() => { this.embeddingUpgradeInFlight = undefined; });
+      await this.embeddingUpgradeInFlight;
+    }
     const result = await this.workerRunner.runWorkerOnce(limit, request);
+    if (this.config.algorithm.enableMemoryAdd) this.embeddingMaintenance().upgradeProgress();
     this.reconcileAutomaticHistorySkills(nowIso());
     return result;
   }
@@ -3402,7 +3551,7 @@ export class MemoryService {
     });
   }
 
-  private subagentStartNoWrite(input: SubagentStartRequest): ReturnType<MemoryService["subagentStart"]> {
+  private subagentStartNoWrite(input: SubagentStartRequest): Awaited<ReturnType<MemoryService["subagentStart"]>> {
     const cursor = this.readOnlyCursor(input.namespace);
     const rawTurnId = `raw_${stableHash(`readonly:subagent:${input.sessionId}:${input.subagentId ?? input.task}`).slice(0, 20)}`;
     return {
