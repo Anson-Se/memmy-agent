@@ -598,9 +598,13 @@ async function scanPersistent(
   let completed = false;
   try {
     const available: SourceAdapter[] = [];
+    // detect() looks for conversation data; an Agent can have skills before it
+    // has any conversations, so its skills are still imported.
+    const skillOnlySourceIds: string[] = [];
     for (const adapter of adapters) {
       scanOptions.signal?.throwIfAborted();
       if (await adapter.detect()) available.push(adapter);
+      else if (await hasAgentSkills(options, adapter.descriptor.sourceId)) skillOnlySourceIds.push(adapter.descriptor.sourceId);
       else if (requestedSourceId !== "all") throw new AgentSourceUnavailableError(adapter.descriptor.displayName);
     }
     const globalInitial = requestedSourceId === "all" && available.length > 0 &&
@@ -636,6 +640,21 @@ async function scanPersistent(
         errorCount: result.errorCount ?? result.errors.length,
         updatedAt: now(),
         ...(stage.since ? { watermarkedSince: stage.since } : {})
+      });
+    }
+    for (const sourceId of skillOnlySourceIds) {
+      scanOptions.signal?.throwIfAborted();
+      const skillResult = await ingestSourceSkills(options, sourceId, scanOptions, store, scanOptions.mode);
+      results.push({
+        sourceId,
+        discoveredConversations: 0,
+        emittedMessages: 0,
+        skipped: 0,
+        memoryIds: [],
+        memoryIdCount: skillResult.memoryIdCount,
+        errorCount: skillResult.errorCount,
+        detailsTruncated: skillResult.errorCount > 1000,
+        errors: skillResult.errors.slice(0, 1000)
       });
     }
     const hasErrors = results.some((result) => (result.errorCount ?? result.errors.length) > 0);
@@ -745,7 +764,9 @@ async function ingestPersistentStagedSource(
   const scannedAt = now();
   options.agentSourceRepository.setLastScannedAt(sourceId, scannedAt);
   const skillResult = await ingestSourceSkills(options, sourceId, scanOptions, store, mode);
-  if (stage.errors.length === 0 && ingestion.errors.length === 0 && skillResult.errorCount === 0 && !ingestion.hasUncommittedSkips) {
+  // Skill import errors are reported with the source, but a skill that keeps
+  // failing must not hold back the conversation watermark.
+  if (stage.errors.length === 0 && ingestion.errors.length === 0 && !ingestion.hasUncommittedSkips) {
     updatePersistentWatermark(options, sourceId, mode, ingestion.latestSeenAt, scannedAt, since, ingestion.retryFrom);
   }
   const allErrors = [...stage.errors, ...ingestion.errors, ...skillResult.errors];
@@ -1317,6 +1338,11 @@ interface SkillScanOutcome {
   memoryIdCount: number;
 }
 
+async function hasAgentSkills(options: CreateAgentSourceServiceOptions, sourceId: string): Promise<boolean> {
+  const scan = await options.skillDistributionService.scanSkills?.(sourceId).catch(() => undefined);
+  return Boolean(scan && (scan.skills.length > 0 || scan.errors.length > 0));
+}
+
 async function ingestSourceSkills(
   options: CreateAgentSourceServiceOptions,
   sourceId: string,
@@ -1324,23 +1350,42 @@ async function ingestSourceSkills(
   store?: AppAgentSourceScanStore,
   resolvedScanMode?: AgentSourceScanMode
 ): Promise<SkillScanOutcome> {
-  if (!options.skillDistributionService.listSkills) return { errors: [], errorCount: 0, memoryIdCount: 0 };
+  const distribution = options.skillDistributionService;
+  if (!distribution.scanSkills && !distribution.listSkills) return { errors: [], errorCount: 0, memoryIdCount: 0 };
 
   const errors: Array<{ conversationId: string; reason: string }> = [];
   let errorCount = 0;
   let memoryIdCount = 0;
   let skills;
   try {
-    skills = await options.skillDistributionService.listSkills(sourceId);
+    if (distribution.scanSkills) {
+      const scan = await distribution.scanSkills(sourceId);
+      skills = scan.skills;
+      for (const skillError of scan.errors) {
+        errorCount += 1;
+        errors.push({ conversationId: `skill:${skillError.path}`, reason: skillError.reason });
+        recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
+      }
+    } else {
+      skills = await distribution.listSkills!(sourceId);
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Agent Skill scan failed";
     recordScanItemSkip(store, sourceId, "skills", reason);
-    return { errors: [], errorCount: 0, memoryIdCount: 0 };
+    return { errors: [{ conversationId: "skills", reason }], errorCount: 1, memoryIdCount: 0 };
   }
 
   const scanMode = persistentScanMode(resolvedScanMode ?? scanOptions.mode);
   for (const skill of skills) {
     scanOptions.signal?.throwIfAborted();
+    if (skill.frontmatterError || skill.policyError) {
+      console.warn(`[agent-source] skill.metadata_unreadable ${JSON.stringify({
+        sourceId,
+        sourceSkillPath: skill.sourceSkillPath,
+        ...(skill.frontmatterError ? { frontmatterError: skill.frontmatterError } : {}),
+        ...(skill.policyError ? { policyError: skill.policyError } : {})
+      })}`);
+    }
     const turnId = `skill:${skill.sourceSkillId}:${skill.sourceSkillVersion}`;
     const addAnalyticsBase = {
       adapterId: `agent-source:${sourceId}`,
@@ -1384,6 +1429,11 @@ async function ingestSourceSkills(
         `skill:${skill.sourceSkillId}`,
         error instanceof Error ? error.message : "Agent Skill import failed"
       );
+      errorCount += 1;
+      errors.push({
+        conversationId: `skill:${skill.sourceSkillId}`,
+        reason: error instanceof Error ? error.message : "Agent Skill import failed"
+      });
       options.memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
       options.memoryAddAnalytics?.trackAddFailed({
         ...addAnalyticsBase,

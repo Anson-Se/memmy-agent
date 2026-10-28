@@ -1,7 +1,6 @@
 /** Skill distribution service module. */
-import { createHash } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join } from "node:path";
+import { readAgentSkillInventory } from "@memmy/agent-source-core";
 import { renderMemmyDefaultSkillManifest } from "../adapters/outbound/skill-writer/templates/memmy-default.js";
 import type { MemoryPluginConflict } from "../adapters/outbound/skill-writer/types.js";
 import type { SkillTargetRegistry } from "../adapters/outbound/skill-writer/target-registry.js";
@@ -16,11 +15,25 @@ export interface ScannedAgentSkill {
   title: string;
   content: string;
   updatedAt: string;
+  description?: string;
+  disableModelInvocation?: boolean;
+  allowImplicitInvocation?: boolean;
+  hasSupportingFiles?: boolean;
+  frontmatterError?: string;
+  policyError?: string;
+}
+
+/** Skills found under one Agent root; `complete` is false when any file could not be read. */
+export interface AgentSkillScan {
+  complete: boolean;
+  skills: ScannedAgentSkill[];
+  errors: Array<{ path: string; reason: string }>;
 }
 
 /** Contract for skill distribution service. */
 export interface SkillDistributionService {
   listSkills?(sourceId: string): Promise<ScannedAgentSkill[]>;
+  scanSkills?(sourceId: string): Promise<AgentSkillScan>;
   install(sourceId: string): Promise<void>;
   uninstall(sourceId: string): Promise<void>;
   installPlugin(sourceId: string): Promise<void>;
@@ -38,33 +51,40 @@ export interface CreateSkillDistributionServiceOptions {
 export function createSkillDistributionService(
   options: CreateSkillDistributionServiceOptions
 ): SkillDistributionService {
+  async function scanSkills(sourceId: string): Promise<AgentSkillScan> {
+    const target = options.targetRegistry.get(sourceId);
+    const root = await target?.resolveRootDirectory();
+    if (!root) return { complete: true, skills: [], errors: [] };
+
+    const inventory = await readAgentSkillInventory(join(root, "skills"));
+    return {
+      complete: inventory.complete,
+      errors: inventory.errors,
+      skills: inventory.items.map((item) => ({
+        sourceAgentId: sourceId,
+        sourceSkillId: item.sourceSkillId,
+        sourceSkillPath: item.sourceSkillPath,
+        sourceSkillVersion: item.version ?? item.contentHash,
+        sourceContentHash: item.contentHash,
+        title: item.name ?? item.sourceSkillId,
+        content: item.content,
+        updatedAt: item.modifiedAt,
+        ...(item.description ? { description: item.description } : {}),
+        disableModelInvocation: item.disableModelInvocation,
+        ...(item.allowImplicitInvocation === undefined ? {} : { allowImplicitInvocation: item.allowImplicitInvocation }),
+        hasSupportingFiles: item.hasSupportingFiles,
+        ...(item.frontmatterError ? { frontmatterError: item.frontmatterError } : {}),
+        ...(item.policyError ? { policyError: item.policyError } : {})
+      }))
+    };
+  }
+
   return {
     async listSkills(sourceId) {
-      const target = options.targetRegistry.get(sourceId);
-      const root = await target?.resolveRootDirectory();
-      if (!root) return [];
-
-      const skillsRoot = join(root, "skills");
-      const skillFiles = await findSkillFiles(skillsRoot);
-      return await Promise.all(skillFiles.map(async (filePath) => {
-        const content = await readFile(filePath, "utf8");
-        const contentHash = createHash("sha256").update(content).digest("hex");
-        const sourceSkillId = relative(skillsRoot, filePath)
-          .replace(/[/\\]SKILL\.md$/i, "")
-          .replaceAll("\\", "/");
-        const fileStat = await stat(filePath);
-        return {
-          sourceAgentId: sourceId,
-          sourceSkillId,
-          sourceSkillPath: filePath,
-          sourceSkillVersion: frontmatterValue(content, "version") ?? contentHash,
-          sourceContentHash: contentHash,
-          title: frontmatterValue(content, "name") ?? sourceSkillId,
-          content,
-          updatedAt: fileStat.mtime.toISOString()
-        };
-      }));
+      return (await scanSkills(sourceId)).skills;
     },
+
+    scanSkills,
 
     async install(sourceId) {
       const target = options.targetRegistry.require(sourceId);
@@ -119,49 +139,4 @@ export function createSkillDistributionService(
       return conflicts;
     }
   };
-}
-
-async function findSkillFiles(skillsRoot: string): Promise<string[]> {
-  const files: string[] = [];
-  await visit(skillsRoot, 0);
-  return files.sort();
-
-  async function visit(directory: string, depth: number): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return;
-      throw error;
-    }
-
-    for (const entry of entries) {
-      if (entry.name === "memmy-memory" || entry.name === "node_modules" || entry.name === ".git") continue;
-      const entryPath = join(directory, entry.name);
-      if (entry.isFile() && entry.name.toLowerCase() === "skill.md") {
-        files.push(entryPath);
-      } else if (depth < 2 && (entry.isDirectory() || entry.isSymbolicLink())) {
-        let entryStat;
-        try {
-          entryStat = await stat(entryPath);
-        } catch (error) {
-          if (isNodeError(error) && error.code === "ENOENT") continue;
-          throw error;
-        }
-        if (entryStat.isDirectory()) await visit(entryPath, depth + 1);
-      }
-    }
-  }
-}
-
-function frontmatterValue(content: string, key: string): string | undefined {
-  if (!content.startsWith("---")) return undefined;
-  const end = content.indexOf("\n---", 3);
-  if (end < 0) return undefined;
-  const match = content.slice(3, end).match(new RegExp(`^${key}:\\s*["']?([^\\n"']+)["']?\\s*$`, "im"));
-  return match?.[1]?.trim();
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
 }

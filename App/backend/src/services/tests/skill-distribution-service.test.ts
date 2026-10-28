@@ -1,5 +1,5 @@
 /** Skill distribution service tests. */
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -64,6 +64,44 @@ describe("skill distribution service", () => {
         expect.objectContaining({ sourceSkillId: "valid-skill" })
       ]);
     } finally {
+      rmSync(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports unreadable skills as an incomplete scan and reads multi-line frontmatter", async () => {
+    if (process.getuid?.() === 0) return;
+    const rootDirectory = mkdtempSync(join(tmpdir(), "memmy-agent-skill-scan-"));
+    const unreadable = join(rootDirectory, "skills", "unreadable", "SKILL.md");
+    try {
+      mkdirSync(join(rootDirectory, "skills", "humanizer"), { recursive: true });
+      mkdirSync(join(rootDirectory, "skills", "unreadable"), { recursive: true });
+      writeFileSync(
+        join(rootDirectory, "skills", "humanizer", "SKILL.md"),
+        "---\nname: humanizer\ndescription: |\n  Line one\n  Line two\ndisable-model-invocation: true\n---\nBody\n",
+        "utf8"
+      );
+      writeFileSync(unreadable, "---\nname: unreadable\n---\n", "utf8");
+      chmodSync(unreadable, 0o000);
+      const service = createSkillDistributionService({
+        targetRegistry: createSkillTargetRegistry([
+          createFakeTarget({ resolveRootDirectory: () => rootDirectory })
+        ])
+      });
+
+      const scan = await service.scanSkills?.("cursor");
+
+      expect(scan?.complete).toBe(false);
+      expect(scan?.errors).toEqual([expect.objectContaining({ path: unreadable })]);
+      expect(scan?.skills).toEqual([
+        expect.objectContaining({
+          sourceSkillId: "humanizer",
+          title: "humanizer",
+          description: "Line one\nLine two",
+          disableModelInvocation: true
+        })
+      ]);
+    } finally {
+      chmodSync(unreadable, 0o644);
       rmSync(rootDirectory, { recursive: true, force: true });
     }
   });

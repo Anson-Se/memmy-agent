@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, readdirSync, rmSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { homedir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { dirname, join, relative } from "node:path";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { loadMemmyConfig } from "../config/index.js";
 import { createMemoryLogger, memoryErrorFields } from "../logging/logger.js";
@@ -46,6 +46,7 @@ import {
   legacyTurnId,
   legacyImportTurnIdFromMessages,
   legacyTurnRequestId,
+  readAgentSkillInventory,
   type ScanStore
 } from "@memmy/agent-source-core";
 import { openMemoryAgentSourceScanStore, type MemoryAgentSourceScanStore } from "./scan-store.js";
@@ -297,10 +298,14 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
       });
       const available: SourceAdapter[] = [];
+      // detect() looks for conversation data; an Agent can have skills before it
+      // has any conversations, so its skills are still imported.
+      const skillOnly: SourceAdapter[] = [];
       for (const adapter of adapters) {
         await waitWhilePaused(signal);
         signal.throwIfAborted();
         if (await adapter.detect()) available.push(adapter);
+        else if (hasAgentSkillsDirectory(adapter.descriptor.sourceId, options.resolveAgentSkillRoot)) skillOnly.push(adapter);
         else if (request.sourceId !== "all") throw new MemoryServiceError("not_found", `${adapter.descriptor.displayName} is not installed`);
       }
       const preservedModes = new Map<string, "initial_subset" | "incremental" | "full">();
@@ -356,6 +361,9 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         );
         await checkpoint();
         const sourceErrorCount = stage.scanErrorCount + result.errorCount + skillResult.errorCount;
+        // Skill import errors are reported with the source, but a skill that keeps
+        // failing must not hold back the conversation watermark.
+        const conversationScanSucceeded = stage.scanErrorCount === 0 && result.errorCount === 0 && !result.hasUncommittedSkips;
         failureCount += sourceErrorCount;
         for (const detail of [...stage.errors, ...result.errors, ...skillResult.errors]) {
           if (failures.length >= 1000) break;
@@ -367,15 +375,15 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
           messageCount: mode === "incremental"
             ? stored.messageCount + result.messageCount
             : result.messageCount,
-          ...(stage.scanErrorCount === 0 && result.errorCount === 0 && skillResult.errorCount === 0 && !result.hasUncommittedSkips
+          ...(conversationScanSucceeded
             ? { lastScannedAt: now }
             : stored.lastScannedAt ? { lastScannedAt: stored.lastScannedAt } : {}),
-          ...(stage.scanErrorCount === 0 && result.errorCount === 0 && skillResult.errorCount === 0 && !result.hasUncommittedSkips && preparedContentHashes.has(sourceId)
+          ...(conversationScanSucceeded && preparedContentHashes.has(sourceId)
             ? { contentHash: preparedContentHashes.get(sourceId) }
             : stored.contentHash ? { contentHash: stored.contentHash } : {}),
           // An unfinished recent turn keeps the watermark at its latest activity,
           // so the next incremental scan re-reads its conversation and captures it.
-          latestSeenAt: stage.scanErrorCount === 0 && result.errorCount === 0 && skillResult.errorCount === 0 && !result.hasUncommittedSkips
+          latestSeenAt: conversationScanSucceeded
             ? (result.retryFrom ?? result.latestSeenAt ?? stored.latestSeenAt)
             : stored.latestSeenAt
         };
@@ -394,6 +402,25 @@ export function createAgentSourceExecutor(options: CreateAgentSourceExecutorOpti
         });
         store.saveMeta({ jobId, sourceId: store.getMeta()?.sourceId ?? request.sourceId, mode, phase: "summarize", createdAt: store.getMeta()?.createdAt ?? now, updatedAt: now });
         scan = { ...scan, progress: { sourceId, phase: "done", current: staged, total: staged, message: `Imported ${result.written} memories and ${skillResult.written} skills` } };
+      }
+      for (const adapter of skillOnly) {
+        await waitWhilePaused(signal);
+        signal.throwIfAborted();
+        const skillResult = await ingestAgentSkills(
+          options.service,
+          adapter.descriptor.sourceId,
+          store,
+          checkpoint,
+          options.resolveAgentSkillRoot,
+          options.scheduleWorker,
+          options.memoryAddAnalytics,
+          persistentScanMode(request.mode)
+        );
+        failureCount += skillResult.errorCount;
+        for (const detail of skillResult.errors) {
+          if (failures.length >= 1000) break;
+          failures.push(detail);
+        }
       }
       await checkpoint();
       store.saveMeta({ jobId, sourceId: request.sourceId, mode: request.mode ?? "incremental", phase: "done", createdAt: store.getMeta()?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
@@ -1213,14 +1240,25 @@ async function ingestAgentSkills(
     service.enqueuePendingImportSummaries(INITIAL_SCAN_MESSAGE_LIMIT, pendingIds.splice(0));
     scheduleWorker?.();
   };
-  for await (const filePath of findSkillFiles(skillsRoot, checkpoint)) {
+  const inventory = await readAgentSkillInventory(skillsRoot, { checkpoint });
+  for (const skillError of inventory.errors) {
+    errorCount += 1;
+    errors.push(`skill:${skillError.path}: ${skillError.reason}`);
+    recordScanItemSkip(store, sourceId, `skill:${skillError.path}`, skillError.reason);
+  }
+  for (const skill of inventory.items) {
     await checkpoint();
-    const content = await readFile(filePath, "utf8");
-    await checkpoint();
-    const contentHash = createHash("sha256").update(content).digest("hex");
-    const sourceSkillId = relative(skillsRoot, dirname(filePath)).replaceAll("\\", "/");
+    if (skill.frontmatterError || skill.policyError) {
+      logger.warn("skill.metadata_unreadable", {
+        sourceId,
+        sourceSkillPath: skill.sourceSkillPath,
+        ...(skill.frontmatterError ? { frontmatterError: skill.frontmatterError } : {}),
+        ...(skill.policyError ? { policyError: skill.policyError } : {})
+      });
+    }
+    const { content, contentHash, sourceSkillId } = skill;
+    const filePath = skill.sourceSkillPath;
     const requestId = `agent-source-skill:${sourceId}:${sourceSkillId}:${contentHash}`;
-    const fileStat = await stat(filePath);
     const turnId = `skill:${sourceSkillId}:${contentHash}`;
     const addAnalyticsBase = {
       adapterId: `agent-source:${sourceId}`,
@@ -1237,15 +1275,15 @@ async function ingestAgentSkills(
         adapterId: `agent-source:${sourceId}`,
         content,
         layer: "Skill",
-        title: frontmatterValue(content, "name") ?? sourceSkillId,
+        title: skill.name ?? sourceSkillId,
         tags: ["agent-source", "cross-agent-skill", sourceId],
         source: sourceId,
         turnId,
-        createdAt: fileStat.mtime.toISOString(),
+        createdAt: skill.modifiedAt,
         sourceAgentId: sourceId,
         sourceSkillId,
         sourceSkillPath: filePath,
-        sourceSkillVersion: frontmatterValue(content, "version") ?? contentHash,
+        sourceSkillVersion: skill.version ?? contentHash,
         sourceContentHash: contentHash,
         deferProcessing: true
       });
@@ -1271,6 +1309,8 @@ async function ingestAgentSkills(
         `skill:${sourceSkillId}`,
         error instanceof Error ? error.message : String(error)
       );
+      errorCount += 1;
+      errors.push(`skill:${sourceSkillId}: ${error instanceof Error ? error.message : String(error)}`);
       memoryAddAnalytics?.trackAddStarted(addAnalyticsBase);
       memoryAddAnalytics?.trackAddFailed({
         ...addAnalyticsBase,
@@ -1284,26 +1324,12 @@ async function ingestAgentSkills(
   return { written, memoryIdCount, errorCount, errors };
 }
 
-async function* findSkillFiles(root: string, checkpoint: () => Promise<void>): AsyncGenerator<string> {
-  yield* visit(root, 0);
-
-  async function* visit(directory: string, depth: number): AsyncGenerator<string> {
-    await checkpoint();
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return;
-      throw error;
-    }
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      await checkpoint();
-      if (entry.name === "memmy-memory" || entry.name === "node_modules" || entry.name === ".git") continue;
-      const path = join(directory, entry.name);
-      if (entry.isFile() && entry.name.toLowerCase() === "skill.md") yield path;
-      else if (depth < 2 && entry.isDirectory()) yield* visit(path, depth + 1);
-    }
-  }
+function hasAgentSkillsDirectory(
+  sourceId: string,
+  resolveAgentSkillRoot: (sourceId: string) => string | null = agentRootDirectory
+): boolean {
+  const root = resolveAgentSkillRoot(sourceId);
+  return Boolean(root && existsSync(join(root, "skills")));
 }
 
 function agentRootDirectory(sourceId: string): string | null {
@@ -1320,15 +1346,6 @@ function agentRootDirectory(sourceId: string): string | null {
     case "qwenwork": return resolveQwenworkHomeDirectory();
     default: return null;
   }
-}
-
-function frontmatterValue(content: string, key: string): string | undefined {
-  if (!content.startsWith("---")) return undefined;
-  const end = content.indexOf("\n---", 3);
-  if (end < 0) return undefined;
-  return content.slice(3, end)
-    .match(new RegExp(`^${key}:\\s*["']?([^\\n"']+)["']?\\s*$`, "im"))?.[1]
-    ?.trim();
 }
 
 function persistentScanMode(value: string | undefined): MemoryDesktopAddScanMode | undefined {

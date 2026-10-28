@@ -233,6 +233,34 @@ describe("agent source service", () => {
     });
   });
 
+  it("reports skill scan errors without holding back the conversation watermark", async () => {
+    const repository = createRepository();
+    const service = createService({
+      repository,
+      adapters: [createFakeAdapter("cursor", createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z"))],
+      skillDistributionService: {
+        async scanSkills() {
+          return {
+            complete: false,
+            skills: [],
+            errors: [{ path: "/tmp/cursor/skills/unreadable/SKILL.md", reason: "EACCES: permission denied" }]
+          };
+        },
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    const result = await service.scanOne("cursor");
+
+    expect(result.errors).toEqual(expect.arrayContaining([
+      { conversationId: "skill:/tmp/cursor/skills/unreadable/SKILL.md", reason: "EACCES: permission denied" }
+    ]));
+    expect(repository.listSources()[0]?.lastScannedAt).toEqual(expect.any(String));
+  });
+
   it("completes the scan and advances checkpoints when every memory is skipped", async () => {
     const repository = createRepository();
     const messages = createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z");
@@ -1585,6 +1613,76 @@ describe("agent source service", () => {
         error_code: "install failed",
       },
     });
+  });
+
+  it("keeps the persistent watermark moving when a skill cannot be read", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-skill-error-"));
+    const repository = createRepository();
+    const service = createService({
+      repository,
+      adapters: [createFakeAdapter("cursor", createCompleteMemoryMessages("cursor", 1, "2026-05-28T10:00:00.000Z"))],
+      scanStoreDirectory: join(tempDir, "scans"),
+      memoryClient: createReadyMemoryClient(),
+      skillDistributionService: {
+        async scanSkills() {
+          return { complete: false, skills: [], errors: [{ path: "/tmp/cursor/skills/x/SKILL.md", reason: "EACCES" }] };
+        },
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    const result = await service.scanOne("cursor", { scanJobId: "job-skill-error", mode: "initial_subset" });
+
+    expect(result.errors).toEqual(expect.arrayContaining([
+      { conversationId: "skill:/tmp/cursor/skills/x/SKILL.md", reason: "EACCES" }
+    ]));
+    expect(repository.getScanWatermark("cursor")).not.toBeNull();
+  });
+
+  it("imports skills of an Agent that has no conversation data yet", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "persistent-scan-skill-only-"));
+    const added: Parameters<MemoryClient["addMemory"]>[0][] = [];
+    const memoryClient = createReadyMemoryClient();
+    const service = createService({
+      adapters: [createFakeAdapter("cursor", [], undefined, false)],
+      scanStoreDirectory: join(tempDir, "scans"),
+      memoryClient: {
+        ...memoryClient,
+        async addMemory(input, context) {
+          added.push(input);
+          return memoryClient.addMemory(input, context);
+        }
+      },
+      skillDistributionService: {
+        async scanSkills() {
+          return {
+            complete: true,
+            errors: [],
+            skills: [{
+              sourceAgentId: "cursor",
+              sourceSkillId: "review-code",
+              sourceSkillPath: "/tmp/cursor/skills/review-code/SKILL.md",
+              sourceSkillVersion: "v1",
+              sourceContentHash: "hash-v1",
+              title: "review-code",
+              content: "Review changed code.",
+              updatedAt: "2026-05-28T09:00:00.000Z"
+            }]
+          };
+        },
+        async install() {},
+        async uninstall() {},
+        async installPlugin() {},
+        async uninstallPlugin() {}
+      }
+    });
+
+    await service.scanOne("cursor", { scanJobId: "job-skill-only", mode: "initial_subset" });
+
+    expect(added).toEqual([expect.objectContaining({ layer: "Skill", sourceSkillId: "review-code" })]);
   });
 
   it("emits memory_desktop add analytics for persistent scan writes", async () => {

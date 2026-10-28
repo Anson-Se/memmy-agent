@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -642,6 +642,102 @@ describe("standalone Agent source executor", () => {
       sourceSkillPath: skillPath,
       title: "sample-skill"
     }));
+  });
+
+  it("imports symlinked skill directories with multi-line frontmatter like the App importer", async () => {
+    const root = tempRoot();
+    const codexRoot = join(root, ".codex");
+    const sharedSkill = join(root, "shared", "memory-systems");
+    mkdirSync(sharedSkill, { recursive: true });
+    writeFileSync(join(sharedSkill, "SKILL.md"), "---\nname: memory-systems\ndescription: >\n  Design memory\n  for agents.\n---\n\nBody\n");
+    mkdirSync(join(codexRoot, "skills"), { recursive: true });
+    symlinkSync(sharedSkill, join(codexRoot, "skills", "memory-systems"), "junction");
+    vi.stubEnv("CODEX_HOME", codexRoot);
+    const addMemory = vi.fn(() => ({ id: "skill-memory-1" }));
+    const service = { addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
+    const adapter: SourceAdapter = {
+      descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
+      detect: async () => true,
+      async *scan() {}
+    };
+    const executor = createAgentSourceExecutor({
+      service,
+      configPath: join(root, "config.yaml"),
+      statePath: join(root, "agent-sources.json"),
+      sourceRegistry: createSourceRegistry([adapter])
+    });
+
+    await executor.startScan({ sourceId: "codex" });
+    await waitForScan(executor);
+
+    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({
+      layer: "Skill",
+      sourceSkillId: "memory-systems",
+      title: "memory-systems"
+    }));
+    await executor.dispose();
+  });
+
+  it("imports skills of an Agent that has no conversation data yet", async () => {
+    const root = tempRoot();
+    const codexRoot = join(root, ".codex");
+    const skillPath = join(codexRoot, "skills", "sample", "SKILL.md");
+    mkdirSync(join(skillPath, ".."), { recursive: true });
+    writeFileSync(skillPath, "---\nname: sample-skill\n---\n\nBody\n");
+    vi.stubEnv("CODEX_HOME", codexRoot);
+    const addMemory = vi.fn(() => ({ id: "skill-memory-1" }));
+    const service = { addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService;
+    const adapter: SourceAdapter = {
+      descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
+      detect: async () => false,
+      async *scan() {}
+    };
+    const executor = createAgentSourceExecutor({
+      service,
+      configPath: join(root, "config.yaml"),
+      statePath: join(root, "agent-sources.json"),
+      sourceRegistry: createSourceRegistry([adapter])
+    });
+
+    await executor.startScan({ sourceId: "codex" });
+    await waitForScan(executor);
+
+    expect(executor.scanStatus().error).toBeFalsy();
+    expect(addMemory).toHaveBeenCalledWith(expect.objectContaining({ layer: "Skill", sourceSkillId: "sample" }));
+    await executor.dispose();
+  });
+
+  it("reports a failed skill import without holding back the conversation watermark", async () => {
+    const root = tempRoot();
+    const codexRoot = join(root, ".codex");
+    const skillPath = join(codexRoot, "skills", "failing-skill", "SKILL.md");
+    mkdirSync(join(skillPath, ".."), { recursive: true });
+    writeFileSync(skillPath, "---\nname: failing-skill\n---\n\nBody\n");
+    vi.stubEnv("CODEX_HOME", codexRoot);
+    const service = {
+      addMemory: vi.fn(() => { throw new Error("skill import failed"); }),
+      enqueuePendingImportSummaries: vi.fn()
+    } as unknown as MemoryService;
+    const adapter: SourceAdapter = {
+      descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: codexRoot },
+      detect: async () => true,
+      async *scan() {}
+    };
+    const statePath = join(root, "agent-sources.json");
+    const executor = createAgentSourceExecutor({
+      service,
+      configPath: join(root, "config.yaml"),
+      statePath,
+      sourceRegistry: createSourceRegistry([adapter])
+    });
+
+    await executor.startScan({ sourceId: "codex", mode: "incremental" });
+    await waitForScan(executor);
+
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { sources: Record<string, { lastScannedAt: string | null }> };
+    expect(state.sources.codex?.lastScannedAt).toEqual(expect.any(String));
+    expect(executor.scanStatus().error).toContain("skill:failing-skill: skill import failed");
+    await executor.dispose();
   });
 
   it("emits add analytics only when a scanned skill is newly stored", async () => {
