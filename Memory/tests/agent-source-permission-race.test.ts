@@ -21,7 +21,7 @@ describe("revoking permission during automatic integration", () => {
     const release = deferred();
     let entered = false;
     const executor = createAgentSourceExecutor({
-      service: {} as MemoryService, configPath, statePath: join(root, "state.json"),
+      service: { withAgentSourceScanPermit: async <T>(_source: unknown, signal: AbortSignal, run: () => Promise<T>) => { signal.throwIfAborted(); return run(); } } as MemoryService, configPath, statePath: join(root, "state.json"),
       sourceRegistry: createSourceRegistry([{
         descriptor: { sourceId: "fixture", displayName: "Fixture", builtin: true, dataPath: root },
         async detect() { entered = true; await release.promise; return true; },
@@ -47,9 +47,9 @@ describe("revoking permission during automatic integration", () => {
         expect(failed).not.toHaveBeenCalled();
       }
       release.resolve();
-      await vi.waitFor(() => expect(executor.scanStatus()).toMatchObject({ running: false, jobId: null, error: null }));
+      await vi.waitFor(() => expect(executor.scanStatus()).toMatchObject({ running: false, status: "cancelled", error: null }));
       await executor.reconcileScanPermission!();
-      expect(executor.scanStatus()).toMatchObject({ running: false, jobId: null, error: null });
+      expect(executor.scanStatus()).toMatchObject({ running: false, status: "cancelled", error: null });
     } finally {
       release.resolve();
       await executor.dispose();
@@ -68,7 +68,7 @@ describe("revoking permission during automatic integration", () => {
     let detected = 0;
     const installs: string[] = [];
     const executor = createAgentSourceExecutor({
-      service: {} as MemoryService, configPath, statePath: join(root, "state.json"),
+      service: { withAgentSourceScanPermit: async <T>(_source: unknown, signal: AbortSignal, run: () => Promise<T>) => { signal.throwIfAborted(); return run(); } } as MemoryService, configPath, statePath: join(root, "state.json"),
       initialScanDelayMs: 1, scheduledScanIntervalMs: 60_000,
       sourceRegistry: createSourceRegistry(["cursor", "claude"].map(sourceId => ({
         descriptor: { sourceId, displayName: sourceId, builtin: true, dataPath: root },

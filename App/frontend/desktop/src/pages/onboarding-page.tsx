@@ -406,7 +406,7 @@ export function OnboardingPage() {
   }
 
   async function startFirstScanWithAnimation() {
-    if (!clients) {
+    if (!clients || state.agentSources.memoryDataClearing || state.agentSources.scanStateSyncRequired) {
       return;
     }
 
@@ -416,7 +416,7 @@ export function OnboardingPage() {
   }
 
   async function startFirstScanInBackground() {
-    if (!clients) {
+    if (!clients || state.agentSources.memoryDataClearing || state.agentSources.scanStateSyncRequired) {
       return;
     }
 

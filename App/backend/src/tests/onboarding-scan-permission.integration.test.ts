@@ -31,7 +31,7 @@ async function fixture() {
   const addMemory = vi.fn(() => ({ id: "fixture", duplicate: false }));
   const makeExecutor = () => {
     const executor = createAgentSourceExecutor({
-      service: { addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService,
+      service: { withAgentSourceScanPermit: async <T>(_source: unknown, signal: AbortSignal, run: () => Promise<T>) => { signal.throwIfAborted(); return run(); }, addMemory, enqueuePendingImportSummaries: vi.fn() } as unknown as MemoryService,
       configPath, statePath: join(root, "sources.json"), initialScanDelayMs: 1, scheduledScanIntervalMs: 10,
       sourceRegistry: createSourceRegistry([{
         descriptor: { sourceId: "fixture", displayName: "Fixture", builtin: true, dataPath: root }, detect,
@@ -135,7 +135,7 @@ it("denial also cancels a paused scan and repeated refusal is idempotent", async
     release();
     await saving;
     await f.service.updateOnboarding(deny);
-    expect(f.executor.scanStatus()).toMatchObject({ running: false, jobId: null, error: null });
+    expect(f.executor.scanStatus()).toMatchObject({ running: false, status: "cancelled", error: null });
     expect(f.addMemory).not.toHaveBeenCalled();
   } finally { release(); await saving; }
 });
@@ -159,43 +159,40 @@ it.each([false, true])("desktop HTTP refusal drains the %s paused writer before 
   await f.service.updateOnboarding({ scanPermission: "scan_only" });
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
-  let entered = false;
-  let aborted = false;
-  const writes = vi.fn();
+  f.detect.mockImplementationOnce(async () => { await held; return true; });
+  const reconcile = vi.spyOn(f.executor, "reconcileScanPermission");
   const app = createLocalApiServer({
     composioMcpToken: "synthetic", permissionManager: createPermissionManager({ appStateStore: f.store, runtimeToken: "synthetic" }),
     services: {
       appConfig: f.service, progressBus: createProgressBus(), agentAdapterRegistry: { listAdapters: () => [] },
       agentSourceAutoInject: { reconcilePermission: vi.fn(async () => {}) },
-      agentSources: {
-        supportsPersistentScan: true,
-        async scanAll(options: { signal: AbortSignal }) {
-          entered = true;
-          options.signal.addEventListener("abort", () => { aborted = true; });
-          await held;
-          options.signal.throwIfAborted();
-          writes();
-          return [];
-        }
-      }
+      agentSources: {},
+      memoryClient: { agentSources: {
+        list: () => f.executor.list(),
+        start: (input: unknown) => f.executor.startScan(input),
+        status: async () => f.executor.scanStatus(),
+        pause: () => f.executor.pauseScan(),
+        cancel: () => f.executor.cancelScan(),
+      } }
+
     } as unknown as BackendServices
   });
   const headers = { "x-memmy-local-token": "synthetic" };
   try {
     expect((await app.inject({ method: "POST", url: "/api/agent-sources/scan", headers })).statusCode).toBe(200);
-    await vi.waitFor(() => expect(entered).toBe(true));
+    await vi.waitFor(() => expect(f.detect).toHaveBeenCalled());
     if (paused) await app.inject({ method: "POST", url: "/api/agent-sources/scan/stop", headers });
     let acknowledged = false;
     const saving = app.inject({ method: "PATCH", url: "/api/app/onboarding", headers, payload: deny }).then(response => { acknowledged = true; return response; });
-    await vi.waitFor(() => expect(aborted).toBe(true));
+    await vi.waitFor(() => expect(reconcile).toHaveBeenCalled());
     await vi.waitFor(() => expect(f.access().scanPermission).toBe("none"));
     expect(acknowledged).toBe(false);
     expect(f.bootstrapRepository.getOnboardingState().scanPermission).toBe("scan_only");
     expect((await app.inject({ method: "POST", url: "/api/agent-sources/scan", headers })).statusCode).toBe(403);
     release();
     expect((await saving).statusCode).toBe(200);
-    expect(writes).not.toHaveBeenCalled();
-    expect((await app.inject({ method: "GET", url: "/api/agent-sources/scan/status", headers })).json()).toEqual({ active: false, progress: null });
+    expect(f.addMemory).not.toHaveBeenCalled();
+    expect((await app.inject({ method: "GET", url: "/api/agent-sources/scan/status", headers })).json()).toMatchObject({ active: false, progress: null, status: "cancelled" });
     expect((await app.inject({ method: "PATCH", url: "/api/app/onboarding", headers, payload: deny })).statusCode).toBe(200);
   } finally { release(); await app.close(); }
 });
