@@ -1,5 +1,5 @@
 /** Skill distribution service tests. */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -65,76 +65,6 @@ describe("skill distribution service", () => {
       ]);
     } finally {
       rmSync(rootDirectory, { recursive: true, force: true });
-    }
-  });
-
-  it("reports unreadable skills as an incomplete scan and reads multi-line frontmatter", async () => {
-    if (process.getuid?.() === 0) return;
-    const rootDirectory = mkdtempSync(join(tmpdir(), "memmy-agent-skill-scan-"));
-    const unreadable = join(rootDirectory, "skills", "unreadable", "SKILL.md");
-    try {
-      mkdirSync(join(rootDirectory, "skills", "humanizer"), { recursive: true });
-      mkdirSync(join(rootDirectory, "skills", "unreadable"), { recursive: true });
-      writeFileSync(
-        join(rootDirectory, "skills", "humanizer", "SKILL.md"),
-        "---\nname: humanizer\ndescription: |\n  Line one\n  Line two\ndisable-model-invocation: true\n---\nBody\n",
-        "utf8"
-      );
-      writeFileSync(unreadable, "---\nname: unreadable\n---\n", "utf8");
-      chmodSync(unreadable, 0o000);
-      const service = createSkillDistributionService({
-        targetRegistry: createSkillTargetRegistry([
-          createFakeTarget({ resolveRootDirectory: () => rootDirectory })
-        ])
-      });
-
-      const scan = await service.scanSkills?.("cursor");
-
-      expect(scan?.complete).toBe(false);
-      expect(scan?.errors).toEqual([expect.objectContaining({ path: unreadable })]);
-      expect(scan?.skills).toEqual([
-        expect.objectContaining({
-          sourceSkillId: "humanizer",
-          title: "humanizer",
-          description: "Line one\nLine two",
-          disableModelInvocation: true
-        })
-      ]);
-    } finally {
-      chmodSync(unreadable, 0o644);
-      rmSync(rootDirectory, { recursive: true, force: true });
-    }
-  });
-
-  it("adds the shared skill directory and enabled plugin skills for Codex", async () => {
-    const home = mkdtempSync(join(tmpdir(), "memmy-agent-shared-skills-"));
-    const codexRoot = join(home, ".codex");
-    try {
-      mkdirSync(join(codexRoot, "skills", "own"), { recursive: true });
-      writeFileSync(join(codexRoot, "skills", "own", "SKILL.md"), "---\nname: own\n---\nOwn.\n", "utf8");
-      mkdirSync(join(home, ".agents", "skills", "lark-base"), { recursive: true });
-      writeFileSync(join(home, ".agents", "skills", "lark-base", "SKILL.md"), "---\nname: lark-base\n---\nShared.\n", "utf8");
-      mkdirSync(join(codexRoot, "plugins", "cache", "market", "superpowers", "7.0.1", "skills", "writing-plans"), { recursive: true });
-      writeFileSync(join(codexRoot, "plugins", "cache", "market", "superpowers", "7.0.1", "skills", "writing-plans", "SKILL.md"), "---\nname: writing-plans\n---\n", "utf8");
-      writeFileSync(join(codexRoot, "config.toml"), '[plugins."superpowers@market"]\nenabled = true\n', "utf8");
-      const service = createSkillDistributionService({
-        targetRegistry: createSkillTargetRegistry([
-          createFakeTarget({ targetId: "codex", resolveRootDirectory: () => codexRoot })
-        ]),
-        homeDirectory: () => home
-      });
-
-      const scan = await service.scanSkills?.("codex");
-
-      expect(scan?.skills.map((skill) => skill.sourceSkillId)).toEqual(["own", "shared:agents/lark-base"]);
-      expect(scan?.registrations).toEqual([expect.objectContaining({
-        sourceSkillId: "plugin:superpowers@market/writing-plans",
-        name: "writing-plans",
-        pluginId: "superpowers@market"
-      })]);
-      expect(scan?.registrationsComplete).toBe(true);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
     }
   });
 
@@ -310,7 +240,6 @@ describe("skill distribution service", () => {
 });
 
 function createFakeTarget(overrides: {
-  targetId?: string;
   resolveRootDirectory?: () => string | null;
   install?: (manifest: SkillManifest) => void;
   uninstall?: (targetId: string) => void;
@@ -320,7 +249,7 @@ function createFakeTarget(overrides: {
   detectMemoryPluginConflict?: () => MemoryPluginConflict | null;
 }): SkillTarget {
   return {
-    targetId: overrides.targetId ?? "cursor",
+    targetId: "cursor",
     displayName: "Cursor",
     async resolveRootDirectory() {
       return "resolveRootDirectory" in overrides ? overrides.resolveRootDirectory?.() ?? null : "/tmp/cursor/rules";

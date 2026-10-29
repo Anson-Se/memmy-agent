@@ -117,7 +117,9 @@ export class AgentSkillLibrary {
       for (const skill of request.skills) {
         scannedIds.add(skill.sourceSkillId);
         try {
-          result.skills.push(this.reconcileSkill(sourceAgentId, userId, skill, groups.get(skill.sourceSkillId) ?? [], request.disconnected === true, at));
+          // Each skill is its own savepoint: a failed write leaves nothing half done.
+          result.skills.push(this.deps.repos.transaction(() =>
+            this.reconcileSkill(sourceAgentId, userId, skill, groups.get(skill.sourceSkillId) ?? [], request.disconnected === true, at)));
         } catch (error) {
           result.skills.push({
             sourceSkillId: skill.sourceSkillId,
@@ -325,6 +327,14 @@ export class AgentSkillLibrary {
       this.enqueueEmbedding(saved, at);
     }
     return saved;
+  }
+
+  /** Whether this Agent's skills were archived because the user disconnected it. */
+  isDisconnected(sourceAgentId: string): boolean {
+    return this.deps.repos.memories.listImportedSkillsForSource(sourceAgentId)
+      .some((memory) => !memory.deletedAt && (importedSkillArchiveReason(memory) === "disconnected"
+        // A skill the user archived keeps that reason and records the disconnect separately.
+        || memory.properties.internal_info.source_state === "disconnected"));
   }
 
   /** Records the user's own archive so later scans keep it. */

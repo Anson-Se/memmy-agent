@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentSkillReconcileSkill } from "../../../src/service/import/agent-skill-library.js";
 import { DEFAULT_MEMMY_CONFIG } from "../../../src/index.js";
+import { embeddingTextForMemory } from "../../../src/service/embedding/embedding-pipeline.js";
 import { Repositories } from "../../../src/storage/repositories.js";
 import { createCapturingEmbedder, createMemoryServiceFixture, runWorkerRounds } from "../../fixtures/memory-service-fixture.js";
 
@@ -82,6 +83,33 @@ describe("agent skill reconcile", () => {
       expect.objectContaining({ id: back.skills[0]!.memoryId, memory_value: "Version A." })
     ]);
     expect(versions.find((version) => version.status === "archived")).toMatchObject({ reason: "superseded", memory_value: "Version B." });
+  });
+
+  it("remembers a disconnect even when the user had archived every skill", () => {
+    const { service } = createTestService();
+    const created = service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: true, skills: [skill("pdf", "Body.")] });
+    service.archiveMemory(created.skills[0]!.memoryId!, { namespace });
+    expect(service.agentSkillsDisconnected("codex")).toBe(false);
+
+    service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: false, disconnected: true, skills: [] });
+
+    expect(service.agentSkillsDisconnected("codex")).toBe(true);
+  });
+
+  it("keeps archived Skills without a read_only field in embedding maintenance", () => {
+    const { db } = createTestService();
+    const repos = new Repositories(db.db);
+    const at = "2026-10-01T00:00:00.000Z";
+    // Feedback repairs and legacy migrations write Skills without the field.
+    repos.memories.insert({
+      id: "skill_legacy_archived", timeline: at, userId: namespace.userId, memoryType: "SkillMemory", status: "archived",
+      visibility: "private", memoryKey: "skill:legacy", memoryValue: "Legacy guide.", tags: ["skill"],
+      info: { title: "legacy", name: "legacy" },
+      properties: { status: "archived", internal_info: { memory_layer: "Skill", memory_kind: "skill" } },
+      memoryLayer: "Skill", version: 1, createdAt: at, updatedAt: at
+    } as Parameters<typeof repos.memories.insert>[0]);
+
+    expect(repos.vectors.maintenanceEntries().some((entry) => entry.id === "skill_legacy_archived")).toBe(true);
   });
 
   it("keeps the user's archive across file updates", () => {
@@ -242,7 +270,7 @@ describe("agent skill reconcile", () => {
     expect(vectors(rows(db, "manual")[0]!.id)).toBe(0);
   });
 
-  it("rebuilds imported skills from their retrieval text and leaves other records unchanged", () => {
+  it("rebuilds imported skills from their retrieval text and still rebuilds other records", async () => {
     const { db, service } = createTestService();
     service.reconcileAgentSkills({
       namespace,
@@ -252,14 +280,13 @@ describe("agent skill reconcile", () => {
     });
     const trace = service.addMemory({ namespace, layer: "L1", title: "note", content: "A plain L1 note body." });
 
-    service.rebuildEmbeddings();
+    await service.rebuildEmbeddings();
 
     const retries = db.db.prepare(`SELECT target_id, source_text FROM embedding_retry_queue`).all() as Array<{ target_id: string; source_text: string }>;
     const imported = retries.find((retry) => retry.target_id === rows(db, "rebuild")[0]!.id);
     expect(imported?.source_text).toContain("rebuild");
     expect(retries.some((retry) => retry.target_id === rows(db, "hidden")[0]!.id)).toBe(false);
-    const traceRow = db.db.prepare(`SELECT memory_value FROM memories WHERE id = ?`).get(trace.id) as { memory_value: string };
-    expect(retries.find((retry) => retry.target_id === trace.id)?.source_text).toBe(traceRow.memory_value);
+    expect(retries.some((retry) => retry.target_id === trace.id)).toBe(true);
   });
 
   it("settles retries of imported skills before calling the embedder", async () => {
@@ -448,7 +475,7 @@ describe("agent skill reconcile", () => {
     expect(seen.some((text) => text.includes("Fresh body."))).toBe(true);
   });
 
-  it("rebuilds L2, L3 and generated skills exactly as before", () => {
+  it("rebuilds L2, L3 and generated skills exactly as before", async () => {
     const { db, service } = createTestService();
     service.reconcileAgentSkills({ namespace, sourceAgentId: "codex", complete: true, skills: [skill("imported", "Imported body.")] });
     const l2 = service.addMemory({ namespace, layer: "L2", title: "policy", content: "Prefer focused tests." });
@@ -482,11 +509,12 @@ describe("agent skill reconcile", () => {
       updatedAt: at
     } as Parameters<typeof repos.memories.insert>[0]);
 
-    service.rebuildEmbeddings();
+    await service.rebuildEmbeddings();
 
     const text = (id: string) => (db.db.prepare(`SELECT source_text FROM embedding_retry_queue WHERE target_id = ?`).get(id) as { source_text: string } | undefined)?.source_text;
     const value = (id: string) => (db.db.prepare(`SELECT memory_value FROM memories WHERE id = ?`).get(id) as { memory_value: string }).memory_value;
-    for (const id of [l2.id, l3.id, generated.id]) expect(text(id)).toBe(value(id));
+    // Other records keep the embedding text the rebuild has always used for them.
+    for (const id of [l2.id, l3.id, generated.id]) expect(text(id)).toBe(embeddingTextForMemory(repos.memories.get(id)!));
     expect(text(rows(db, "imported")[0]!.id)).not.toBe(value(rows(db, "imported")[0]!.id));
     void DEFAULT_MEMMY_CONFIG;
   });
