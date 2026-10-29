@@ -152,9 +152,17 @@ describe("standalone Agent source executor", () => {
       await executor.startScan({ sourceId: "fixture-agent" });
       await vi.waitFor(() => expect(detect).toHaveBeenCalledTimes(1));
       const cancellation = executor.cancelScan();
+      let secondCancellationSettled = false;
+      const repeatedCancellation = executor.cancelScan().then(result => {
+        secondCancellationSettled = true;
+        return result;
+      });
+      await Promise.resolve();
+      expect(secondCancellationSettled).toBe(false);
       await expect(executor.startScan({ sourceId: "fixture-agent" })).rejects.toThrow("Canceling");
       finishFirst();
       await cancellation;
+      expect((await repeatedCancellation).outcome).toBe("applied");
       await executor.startScan({ sourceId: "fixture-agent" });
       await vi.waitFor(() => expect(detect).toHaveBeenCalledTimes(2));
       let completed = false;
