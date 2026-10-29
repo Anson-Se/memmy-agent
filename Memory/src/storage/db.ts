@@ -7,6 +7,9 @@ import { getLoadablePath as getSqliteVecLoadablePath } from "sqlite-vec";
 import { getSchemaVersion, migrate, SCHEMA_VERSION } from "./schema.js";
 import { SQLITE_VEC_VERSION } from "./sqlite-vec-store.js";
 import { protectJobLeaseWrites } from "./job-lease-context.js";
+import { createMemoryLogger } from "../logging/logger.js";
+
+const startupLogger = createMemoryLogger("storage");
 
 export interface MemoryDbOptions {
   path?: string;
@@ -18,16 +21,24 @@ export class MemoryDb {
   readonly db: Database.Database;
 
   constructor(options: MemoryDbOptions = {}) {
+    const startedAt = Date.now();
+    const stage = (phase: string): void => startupLogger.info("storage.startup_stage", {
+      phase,
+      elapsedMs: Date.now() - startedAt
+    });
     this.path = options.path ?? defaultDatabasePath();
     mkdirSync(dirname(this.path), { recursive: true });
+    stage("database.opening");
     const nativeBinding = packagedNativeBindingPath();
     this.db = new Database(this.path, {
       readonly: options.readonly ?? false,
       ...(nativeBinding ? { nativeBinding } : {})
     });
+    stage("database.opened");
     const extensionPath = packagedNativeAssetPath(getSqliteVecLoadablePath());
     const unpackedPath = extensionPath.replace(/app\.asar([\\/])/, "app.asar.unpacked$1");
     this.db.loadExtension(existsSync(unpackedPath) ? unpackedPath : extensionPath);
+    stage("sqlite_vec.loaded");
     const loadedVersion = (this.db.prepare(`SELECT vec_version() AS version`).get() as { version: string }).version;
     if (loadedVersion !== `v${SQLITE_VEC_VERSION}`) {
       this.db.close();
@@ -35,11 +46,17 @@ export class MemoryDb {
     }
     try {
       this.configure();
+      stage("database.configured");
       if (!options.readonly) {
+        stage("backup.checking");
         this.createPreMigrationBackup();
+        stage("backup.completed");
+        stage("migration.starting");
         migrate(this.db);
+        stage("migration.completed");
       }
       protectJobLeaseWrites(this.db);
+      stage("database.ready");
     } catch (error) {
       this.db.close();
       throw error;

@@ -56,6 +56,11 @@ async function runMemoryService(argv: string[], lifecycle: {
     shutdown(): void;
     setStopService(stop: () => void): void;
 }): Promise<boolean> {
+    const startupStartedAt = Date.now();
+    const startupStage = (phase: string): void => logger.info("service.startup_stage", {
+        phase,
+        elapsedMs: Date.now() - startupStartedAt
+    });
     const options = parseServeArgs(argv);
     const { config, path: configPath } = loadMemmyConfig(options.configPath);
     const host = options.host ?? process.env.MEMMY_MEMORY_HOST ?? process.env.MEMORY_SERVICE_HOST ?? "127.0.0.1";
@@ -78,6 +83,7 @@ async function runMemoryService(argv: string[], lifecycle: {
         configPath
     });
     const serviceLock = acquireUserServiceLock({ serviceHome, host, port });
+    startupStage("service_lock.acquired");
     let sqliteLock: SqliteServerLock | undefined;
     let backend: StorageBackend | undefined;
     let service: MemoryService | undefined;
@@ -93,6 +99,8 @@ async function runMemoryService(argv: string[], lifecycle: {
         sqliteLock = config.storage.backend === "openmem-cloud-rest"
             ? undefined
             : acquireSqliteServerLock({ sqlitePath, host, port });
+        startupStage("sqlite_lock.acquired");
+        startupStage("storage.opening");
         backend = createStorageBackend({
             mode: config.storage.mode,
             backend: config.storage.backend,
@@ -100,12 +108,16 @@ async function runMemoryService(argv: string[], lifecycle: {
             endpoint: config.storage.endpoint,
             token: config.storage.token
         });
+        startupStage("storage.ready");
+        startupStage("service.constructing");
         service = new MemoryService({
             backend,
             mode: config.storage.mode,
             configPath,
             config
         });
+        startupStage("service.ready");
+        startupStage("http.listening");
         const listening = await listenMemoryHttpServer({
             service,
             host,
@@ -125,6 +137,7 @@ async function runMemoryService(argv: string[], lifecycle: {
             startAgentSourceAutomation: true
         });
         server = listening.server;
+        startupStage("http.ready");
         const { url } = listening;
         service.setViewerEndpoint(url);
         if (configPath) {
