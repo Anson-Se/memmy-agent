@@ -242,7 +242,7 @@ function messageForEvent(component: string, event: string, fields: MemoryLogFiel
     case "service.listening":
       return `Memory service listening${details(fields, ["url", "mode", "storageBackend"])}`;
     case "storage.startup_stage":
-      return `Memory storage startup stage${details(fields, ["phase", "elapsedMs"])}`;
+      return `Memory storage startup stage${details(fields, ["phase", "elapsedMs", "currentSchemaVersion", "targetSchemaVersion"])}`;
     case "service.fatal":
       return `Memory service encountered a fatal error${details(fields, ["errorMessage"])}`;
     case "config.endpoint_write_failed":

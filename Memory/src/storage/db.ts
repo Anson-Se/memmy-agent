@@ -14,6 +14,16 @@ const startupLogger = createMemoryLogger("storage");
 export interface MemoryDbOptions {
   path?: string;
   readonly?: boolean;
+  /** The caller already prepared and verified this database in an isolated startup worker. */
+  skipMigrations?: boolean;
+  onStartupStage?: (stage: MemoryDbStartupStage) => void;
+}
+
+export interface MemoryDbStartupStage {
+  phase: string;
+  elapsedMs: number;
+  currentSchemaVersion?: number;
+  targetSchemaVersion: number;
 }
 
 export class MemoryDb {
@@ -22,10 +32,16 @@ export class MemoryDb {
 
   constructor(options: MemoryDbOptions = {}) {
     const startedAt = Date.now();
-    const stage = (phase: string): void => startupLogger.info("storage.startup_stage", {
-      phase,
-      elapsedMs: Date.now() - startedAt
-    });
+    const stage = (phase: string, currentSchemaVersion?: number): void => {
+      const snapshot: MemoryDbStartupStage = {
+        phase,
+        elapsedMs: Date.now() - startedAt,
+        ...(currentSchemaVersion === undefined ? {} : { currentSchemaVersion }),
+        targetSchemaVersion: SCHEMA_VERSION
+      };
+      startupLogger.info("storage.startup_stage", { ...snapshot });
+      options.onStartupStage?.(snapshot);
+    };
     this.path = options.path ?? defaultDatabasePath();
     mkdirSync(dirname(this.path), { recursive: true });
     stage("database.opening");
@@ -48,12 +64,21 @@ export class MemoryDb {
       this.configure();
       stage("database.configured");
       if (!options.readonly) {
-        stage("backup.checking");
-        this.createPreMigrationBackup();
-        stage("backup.completed");
-        stage("migration.starting");
-        migrate(this.db);
-        stage("migration.completed");
+        const currentSchemaVersion = this.currentSchemaVersion();
+        stage("schema.detected", currentSchemaVersion);
+        if (options.skipMigrations) {
+          if (currentSchemaVersion !== SCHEMA_VERSION) {
+            throw new Error(`Memory database preparation did not reach schema ${SCHEMA_VERSION}; received ${currentSchemaVersion}`);
+          }
+          stage("migration.prepared", currentSchemaVersion);
+        } else {
+          stage("backup.checking", currentSchemaVersion);
+          this.createPreMigrationBackup(currentSchemaVersion);
+          stage("backup.completed", currentSchemaVersion);
+          stage("migration.starting", currentSchemaVersion);
+          migrate(this.db);
+          stage("migration.completed", SCHEMA_VERSION);
+        }
       }
       protectJobLeaseWrites(this.db);
       stage("database.ready");
@@ -81,14 +106,16 @@ export class MemoryDb {
     this.db.pragma("busy_timeout = 5000");
   }
 
-  private createPreMigrationBackup(): void {
-    if (this.path === ":memory:" || !existsSync(this.path)) return;
-    let version = 0;
+  private currentSchemaVersion(): number {
     try {
-      version = getSchemaVersion(this.db).version;
+      return getSchemaVersion(this.db).version;
     } catch {
-      return;
+      return 0;
     }
+  }
+
+  private createPreMigrationBackup(version = this.currentSchemaVersion()): void {
+    if (this.path === ":memory:" || !existsSync(this.path)) return;
     if (version <= 0 || version >= SCHEMA_VERSION) return;
     const backupPath = `${this.path}.pre-v${SCHEMA_VERSION}.bak`;
     if (existsSync(backupPath)) return;
