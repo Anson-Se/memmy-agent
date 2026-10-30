@@ -8608,6 +8608,13 @@ function deserializeBundleRow(row: Record<string, unknown>): Record<string, unkn
 }
 
 function applyBundleDefaults(table: BundleTableName, row: Record<string, unknown>): Record<string, unknown> {
+  if (table === "evolution_jobs" || table === "embedding_retry_queue") {
+    // A queue position belongs to the database it was taken in: an imported row is numbered on
+    // insert, after what is already queued here, instead of colliding with (or, on replace,
+    // displacing) a local row that holds the same number.
+    const { enqueue_seq: _sourcePosition, ...rest } = row;
+    return rest;
+  }
   if (table === "sessions" && row.last_seen_at === undefined) {
     return {
       ...row,
